@@ -20,6 +20,7 @@ private def homeRoxPaths : IO (List System.FilePath) := do
   | some h =>
     let home := System.FilePath.mk h
     return [ home / ".elan"
+           , home / ".cache"
            , home / ".local" ]
   | none => return []
 
@@ -30,7 +31,10 @@ private def homeRwPaths : IO (List System.FilePath) := do
     let home := System.FilePath.mk h
     return [ home / ".claude"
            , home / ".claude.json"
-           , home / ".config" / "claude" ]
+           , home / ".gitconfig"
+           , home / ".config" / "claude"
+           , home / ".config" / "gh"
+           , home / ".config" / "git" ]
   | none => return []
 
 /--
@@ -51,7 +55,7 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
     (extraEnv : Array (String × Option String) := #[]) : IO UInt32 := do
   let mut args : Array String := #[]
   -- Read-write access to the repo and /tmp
-  args := args.push "--rw" |>.push repoPath.toString
+  args := args.push "--rwx" |>.push repoPath.toString
   args := args.push "--rw" |>.push "/tmp"
   -- Read+execute system paths (binaries, libraries)
   for p in roxPaths do
