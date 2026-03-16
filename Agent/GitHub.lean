@@ -96,4 +96,33 @@ def createPullRequest (pat : String) (upstream : String)
     "--body", body
   ] (env := #[("GH_TOKEN", some pat)])
 
+/--
+Fetch review threads for a pull request via the GitHub GraphQL API.
+Returns the raw parsed JSON response.
+If `pat` is non-empty it is used as the GH_TOKEN; otherwise the token already
+configured by `setupGhAuth` is used.
+-/
+def getPrReviewThreads (upstream : String) (prNumber : Nat) (pat : String) : IO Json := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let query :=
+    "query($owner:String!,$repo:String!,$number:Int!){" ++
+    "repository(owner:$owner,name:$repo){" ++
+    "pullRequest(number:$number){" ++
+    "reviewThreads(first:100){nodes{isResolved isOutdated " ++
+    "comments(first:100){nodes{" ++
+    "body path line author{login}}}}}}}}"
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let result ← runCmd "gh" #[
+    "api", "graphql",
+    "-f", s!"query={query}",
+    "-f", s!"owner={owner}",
+    "-f", s!"repo={repo}",
+    "-F", s!"number={prNumber}"
+  ] (env := env)
+  match Json.parse result with
+  | .error e => throw (.userError s!"failed to parse GraphQL response: {e}")
+  | .ok j => return j
+
 end Agent.GitHub

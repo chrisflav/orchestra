@@ -78,6 +78,29 @@ private def toolsList : Json :=
         ("required", .arr #["head"])
       ])
     ]
+    ,
+    Json.mkObj [
+      ("name", "get_pr_comments"),
+      ("description", "Fetch review comments on a pull request from the upstream repository."),
+      ("inputSchema", Json.mkObj [
+        ("type", "object"),
+        ("properties", Json.mkObj [
+          ("pr_number", Json.mkObj [
+            ("type", "integer"),
+            ("description", "Pull request number.")
+          ]),
+          ("unresolved_only", Json.mkObj [
+            ("type", "boolean"),
+            ("description", "Only show unresolved conversations (default: false).")
+          ]),
+          ("exclude_outdated", Json.mkObj [
+            ("type", "boolean"),
+            ("description", "Exclude outdated comments (default: false).")
+          ])
+        ]),
+        ("required", .arr #["pr_number"])
+      ])
+    ]
   ])]
 
 private def callTool (state : State) (name : String) (args : Json) : IO Json := do
@@ -119,6 +142,70 @@ private def callTool (state : State) (name : String) (args : Json) : IO Json := 
       return toolContent result
     catch e =>
       log s!"tool create_pr: error: {e}"
+      return toolContent (toString e) (isError := true)
+  | "get_pr_comments" =>
+    let some prNumJson := args.getObjVal? "pr_number" |>.toOption
+      | return toolContent "missing required argument: pr_number" (isError := true)
+    let some prNumInt := prNumJson.getInt? |>.toOption
+      | return toolContent "pr_number must be an integer" (isError := true)
+    if prNumInt <= 0 then
+      return toolContent "pr_number must be a positive integer" (isError := true)
+    let prNumber := prNumInt.toNat
+    let unresolvedOnly := args.getObjValAs? Bool "unresolved_only" |>.toOption |>.getD false
+    let excludeOutdated := args.getObjValAs? Bool "exclude_outdated" |>.toOption |>.getD false
+    log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
+      exclude_outdated={excludeOutdated}"
+    try
+      let response ← GitHub.getPrReviewThreads state.upstream prNumber state.pat
+      let threads :=
+        response.getObjVal? "data" |>.toOption
+        |>.bind (·.getObjVal? "repository" |>.toOption)
+        |>.bind (·.getObjVal? "pullRequest" |>.toOption)
+        |>.bind (·.getObjVal? "reviewThreads" |>.toOption)
+        |>.bind (·.getObjVal? "nodes" |>.toOption)
+        |>.bind (·.getArr? |>.toOption)
+        |>.getD #[]
+      let mut lines : Array String := #[]
+      let mut shown := 0
+      let mut filtered := 0
+      for thread in threads do
+        let isResolved := thread.getObjValAs? Bool "isResolved" |>.toOption |>.getD false
+        let isOutdated := thread.getObjValAs? Bool "isOutdated" |>.toOption |>.getD false
+        if unresolvedOnly && isResolved then filtered := filtered + 1; continue
+        if excludeOutdated && isOutdated then filtered := filtered + 1; continue
+        shown := shown + 1
+        let mut tags : Array String := #[]
+        if !isResolved then tags := tags.push "unresolved"
+        if isResolved then tags := tags.push "resolved"
+        if isOutdated then tags := tags.push "outdated"
+        let tagStr := if tags.isEmpty then "" else s!" ({String.join (tags.toList.intersperse ", ")})"
+        lines := lines.push s!"--- Thread {shown}{tagStr}"
+        let comments :=
+          thread.getObjVal? "comments" |>.toOption
+          |>.bind (·.getObjVal? "nodes" |>.toOption)
+          |>.bind (·.getArr? |>.toOption)
+          |>.getD #[]
+        for comment in comments do
+          let path   := comment.getObjValAs? String "path" |>.toOption |>.getD ""
+          let body   := comment.getObjValAs? String "body" |>.toOption |>.getD ""
+          let author := comment.getObjVal? "author" |>.toOption
+            |>.bind (·.getObjValAs? String "login" |>.toOption)
+            |>.getD "unknown"
+          let lineStr := match comment.getObjValAs? Nat "line" |>.toOption with
+            | some l => s!":{l}"
+            | none => ""
+          lines := lines.push s!"  @{author} — {path}{lineStr}"
+          for bodyLine in body.splitOn "\n" do
+            lines := lines.push s!"    {bodyLine}"
+        lines := lines.push ""
+      let summary :=
+        if filtered == 0 then s!"({shown} thread(s))"
+        else s!"({shown} thread(s) shown, {filtered} filtered)"
+      lines := lines.push summary
+      log s!"tool get_pr_comments: ok: {shown} threads shown"
+      return toolContent (String.join (lines.toList.intersperse "\n"))
+    catch e =>
+      log s!"tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)
   | _ =>
     log s!"tool {name}: unknown"

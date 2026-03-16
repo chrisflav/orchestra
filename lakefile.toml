@@ -1,6 +1,6 @@
 name = "agent"
 version = "0.1.0"
-defaultTargets = ["agent"]
+defaultTargets = ["agent", "agent-mcp-test"]
 
 [[require]]
 name = "Cli"
@@ -13,3 +13,7 @@ name = "Agent"
 [[lean_exe]]
 name = "agent"
 root = "Main"
+
+[[lean_exe]]
+name = "agent-mcp-test"
+root = "McpTest"

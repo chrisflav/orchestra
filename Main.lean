@@ -71,7 +71,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
 private def mcpServerHandler (p : Parsed) : IO UInt32 := do
   let upstream := p.positionalArg! "upstream" |>.as! String
   let fork := p.positionalArg! "fork" |>.as! String
-  let allowPR := p.hasFlag "allow-pr"
+  let allowPR := p.hasFlag "allow_pr"
   let configPath := p.flag? "config" |>.map (·.as! String)
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
@@ -124,7 +124,7 @@ private def mcpServerCmd : Cmd := `[Cli|
 
   FLAGS:
     c, config : String; "Path to config file (default: ~/.agent/config.json)"
-    «allow-pr»; "Allow the create_pr tool (disabled by default)"
+    allow_pr; "Allow the create_pr tool (disabled by default)"
 
   ARGS:
     "upstream" : String; "Upstream repository in 'owner/repo' format"
