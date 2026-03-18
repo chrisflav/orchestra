@@ -7,13 +7,23 @@ MCP server.
 
 ## prerequisites
 
+It is recommended to run orchestra inside a virtual machine or container. The
+[container section](#container) describes a ready-made NixOS incus image that
+provides the full environment.
+
+On the host machine you only need:
+
 - [Lean 4 / Lake](https://leanprover.github.io/lean4/doc/setup.html) to build
   the tool
+- A GitHub App with a private key, installed on the organization owning the fork
+
+Inside the container (or VM), the following must be available (all installed
+automatically when using the provided container image):
+
 - [landrun](https://github.com/Zouuup/landrun) for sandboxing
 - `claude` (Claude Code CLI) and/or `vibe` (mistral-vibe) installed and
   authenticated
 - `gh` (GitHub CLI) for repository operations
-- A GitHub App with a private key, installed on the organization owning the fork
 
 ## building
 
