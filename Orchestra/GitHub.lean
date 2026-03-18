@@ -2,7 +2,7 @@ import Lean.Data.Json
 
 open Lean (Json FromJson ToJson)
 
-namespace Agent.GitHub
+namespace Orchestra.GitHub
 
 private def runCmd (cmd : String) (args : Array String)
     (input : Option String := none)
@@ -125,4 +125,4 @@ def getPrReviewThreads (upstream : String) (prNumber : Nat) (pat : String) : IO 
   | .error e => throw (.userError s!"failed to parse GraphQL response: {e}")
   | .ok j => return j
 
-end Agent.GitHub
+end Orchestra.GitHub

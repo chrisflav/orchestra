@@ -2,7 +2,7 @@ import Lean.Data.Json
 
 open Lean (Json FromJson)
 
-namespace Agent.RepoConfig
+namespace Orchestra.RepoConfig
 
 structure ValidationConfig where
   retryPrompt : String := "Validation failed. Please review the issues and fix them."
@@ -91,4 +91,4 @@ def runValidation (repoPath : System.FilePath) : IO Bool := do
   let code ← child.wait
   return code == 0
 
-end Agent.RepoConfig
+end Orchestra.RepoConfig

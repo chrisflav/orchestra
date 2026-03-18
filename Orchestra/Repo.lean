@@ -1,4 +1,4 @@
-namespace Agent.Repo
+namespace Orchestra.Repo
 
 private def runGit (args : Array String) (cwd : Option System.FilePath := none) : IO String := do
   let child ← IO.Process.spawn {
@@ -62,4 +62,4 @@ def cleanup : IO Unit := do
   else
     IO.println "Nothing to clean up"
 
-end Agent.Repo
+end Orchestra.Repo

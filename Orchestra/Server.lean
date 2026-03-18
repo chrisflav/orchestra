@@ -1,13 +1,13 @@
 import Lean.Data.Json
 import Std.Internal.UV.TCP
 import Std.Net
-import Agent.GitHub
+import Orchestra.GitHub
 
 open Lean (Json)
 open Std.Net
 open Std.Internal.UV.TCP
 
-namespace Agent.Server
+namespace Orchestra.Server
 
 /-- Mutable state for the server, shared with request handlers. -/
 structure State where
@@ -352,4 +352,4 @@ def start (state : State) : IO (UInt16 × IO Unit) := do
     catch _ => pure ()
   return (port, shutdown)
 
-end Agent.Server
+end Orchestra.Server

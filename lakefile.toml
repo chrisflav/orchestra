@@ -1,6 +1,6 @@
-name = "agent"
+name = "orchestra"
 version = "0.1.0"
-defaultTargets = ["agent", "agent-mcp-test"]
+defaultTargets = ["orchestra", "orchestra-mcp-test"]
 
 [[require]]
 name = "Cli"
@@ -8,12 +8,12 @@ git = "https://github.com/leanprover/lean4-cli.git"
 rev = "main"
 
 [[lean_lib]]
-name = "Agent"
+name = "Orchestra"
 
 [[lean_exe]]
-name = "agent"
+name = "orchestra"
 root = "Main"
 
 [[lean_exe]]
-name = "agent-mcp-test"
+name = "orchestra-mcp-test"
 root = "McpTest"

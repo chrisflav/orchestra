@@ -2,7 +2,7 @@ import Lean.Data.Json
 
 open Lean (Json)
 
-namespace Agent.StreamFormat
+namespace Orchestra.StreamFormat
 
 -- Helpers
 
@@ -138,4 +138,4 @@ def format : Event → String
 def formatEvent (line : String) : Option String :=
   parseEvent line |>.map format
 
-end Agent.StreamFormat
+end Orchestra.StreamFormat

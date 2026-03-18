@@ -1,8 +1,8 @@
-import Agent
+import Orchestra
 import Cli
 
 open Cli
-open Agent
+open Orchestra
 
 -- Helpers
 
@@ -624,11 +624,11 @@ private def queueCmd : Cmd := `[Cli|
 ]
 
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
-  IO.eprintln "Use a subcommand. Try 'agent --help'."
+  IO.eprintln "Use a subcommand. Try 'orchestra --help'."
   return 1
 
-def agentCmd : Cmd := `[Cli|
-  agent VIA defaultHandler; ["0.1.0"]
+def orchestraCmd : Cmd := `[Cli|
+  orchestra VIA defaultHandler; ["0.1.0"]
   "CLI tool for managing and sandboxing coding agents."
 
   SUBCOMMANDS:
@@ -645,4 +645,4 @@ def agentCmd : Cmd := `[Cli|
 ]
 
 def main (args : List String) : IO UInt32 :=
-  agentCmd.validate args
+  orchestraCmd.validate args

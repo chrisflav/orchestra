@@ -1,9 +1,9 @@
 import Lean.Data.Json
-import Agent.Config
+import Orchestra.Config
 
 open Lean (Json FromJson ToJson)
 
-namespace Agent.Queue
+namespace Orchestra.Queue
 
 -- Types
 
@@ -217,4 +217,4 @@ def markStaleRunningAsUnfinished : IO Unit := do
     if entry.status == .running then
       saveEntry { entry with status := .unfinished }
 
-end Agent.Queue
+end Orchestra.Queue

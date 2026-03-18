@@ -1,10 +1,10 @@
 import Lean.Data.Json
-import Agent.Config
+import Orchestra.Config
 import Init.Data.String.Basic
 
 open Lean (Json FromJson ToJson)
 
-namespace Agent.TaskStore
+namespace Orchestra.TaskStore
 
 -- Types
 
@@ -191,4 +191,4 @@ def updateSeriesPointer (seriesName taskId : String) : IO Unit := do
   let path := dir / s!"{seriesName}.json"
   IO.FS.writeFile path (Lean.Json.compress (Json.mkObj [("latest_task_id", taskId)]))
 
-end Agent.TaskStore
+end Orchestra.TaskStore

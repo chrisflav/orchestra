@@ -1,7 +1,7 @@
-import Agent.AgentDef
-import Agent.StreamFormat
+import Orchestra.AgentDef
+import Orchestra.StreamFormat
 
-namespace Agent.Sandbox
+namespace Orchestra.Sandbox
 
 /-- Expand home-relative path strings to absolute FilePaths using $HOME. -/
 private def expandHomePaths (rel : List String) : IO (List System.FilePath) := do
@@ -144,4 +144,4 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   agentDef.cleanup mcpContext
   return { exitCode, sessionId, usageLimitHit }
 
-end Agent.Sandbox
+end Orchestra.Sandbox

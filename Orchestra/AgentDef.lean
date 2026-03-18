@@ -1,10 +1,10 @@
-import Agent.StreamFormat
+import Orchestra.StreamFormat
 import Lean.Data.Json
 
 open Lean (Json)
-open Agent.StreamFormat
+open Orchestra.StreamFormat
 
-namespace Agent
+namespace Orchestra
 
 -- Local JSON helpers (mirrors private helpers in StreamFormat)
 
@@ -258,4 +258,4 @@ def vibe : AgentDef where
 
 end AgentDef
 
-end Agent
+end Orchestra

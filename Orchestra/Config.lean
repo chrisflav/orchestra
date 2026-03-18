@@ -2,7 +2,7 @@ import Lean.Data.Json
 
 open Lean (Json FromJson ToJson)
 
-namespace Agent
+namespace Orchestra
 
 inductive TaskMode where
   | fork
@@ -110,4 +110,4 @@ def loadSystemPrompt (name : Option String := none) : IO (Option String) := do
   else
     return none
 
-end Agent
+end Orchestra
