@@ -7,23 +7,23 @@ MCP server.
 
 ## prerequisites
 
-It is recommended to run orchestra inside a virtual machine or container. The
+It is recommended to run all of orchestra inside a virtual machine or container. The
 [container section](#container) describes a ready-made NixOS incus image that
 provides the full environment.
 
-On the host machine you only need:
-
-- [Lean 4 / Lake](https://leanprover.github.io/lean4/doc/setup.html) to build
-  the tool
-- A GitHub App with a private key, installed on the organization owning the fork
+Before starting you will need to create a GitHub App with a private key, installed on the organization owning the fork. Download the private key.
 
 Inside the container (or VM), the following must be available (all installed
 automatically when using the provided container image):
 
+- [Lean 4 / Lake](https://leanprover.github.io/lean4/doc/setup.html) to build
+  the tool
 - [landrun](https://github.com/Zouuup/landrun) for sandboxing
 - `claude` (Claude Code CLI) and/or `vibe` (mistral-vibe) installed and
   authenticated
 - `gh` (GitHub CLI) for repository operations
+
+In addition, the private key from the GitHub App must be included as a file in the container.
 
 ## building
 
@@ -210,7 +210,10 @@ distrobuilder build-incus nixos.yaml
 Import and start the container:
 
 ```
-incus image import incus.tar.xz --alias orchestra
-incus launch orchestra my-orchestra
+incus image import incus.tar.xz rootfs.squashfs  --alias orchestra
+incus launch orchestra my-orchestra --config security.nesting=true
 incus shell my-orchestra
+# nixos-rebuild switch
 ```
+
+The last command installs the software in the container.
