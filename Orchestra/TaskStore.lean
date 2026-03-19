@@ -66,22 +66,14 @@ instance : ToJson TaskRecord where
       ("status",     ToJson.toJson r.status)
     ]
     let fields := base
-      |> fun acc => match r.sessionId with
-          | none => acc | some s => acc ++ [("session_id", Json.str s)]
-      |> fun acc => match r.continuesFrom with
-          | none => acc | some s => acc ++ [("continues_from", Json.str s)]
-      |> fun acc => match r.series with
-          | none => acc | some s => acc ++ [("series", Json.str s)]
-      |> fun acc => match r.backend with
-          | none => acc | some s => acc ++ [("backend", Json.str s)]
-      |> fun acc => match r.model with
-          | none => acc | some s => acc ++ [("model", Json.str s)]
-      |> fun acc => match r.agent with
-          | none => acc | some s => acc ++ [("agent", Json.str s)]
-      |> fun acc => match r.systemPrompt with
-          | none => acc | some s => acc ++ [("system_prompt", Json.str s)]
-      |> fun acc => match r.budget with
-          | none => acc | some b => acc ++ [("budget", ToJson.toJson b)]
+    let fields := if let some s := r.sessionId     then fields ++ [("session_id",    Json.str s)]      else fields
+    let fields := if let some s := r.continuesFrom then fields ++ [("continues_from", Json.str s)]     else fields
+    let fields := if let some s := r.series        then fields ++ [("series",         Json.str s)]     else fields
+    let fields := if let some s := r.backend       then fields ++ [("backend",        Json.str s)]     else fields
+    let fields := if let some s := r.model         then fields ++ [("model",          Json.str s)]     else fields
+    let fields := if let some s := r.agent         then fields ++ [("agent",          Json.str s)]     else fields
+    let fields := if let some s := r.systemPrompt  then fields ++ [("system_prompt",  Json.str s)]     else fields
+    let fields := if let some b := r.budget        then fields ++ [("budget",         ToJson.toJson b)] else fields
     Json.mkObj fields
 
 instance : FromJson TaskRecord where

@@ -59,7 +59,7 @@ deriving Repr
 
 instance : ToJson QueueEntry where
   toJson e :=
-    let base : List (String × Json) := [
+    let fields : List (String × Json) := [
       ("id",         e.id),
       ("created_at", e.createdAt),
       ("status",     ToJson.toJson e.status),
@@ -68,25 +68,15 @@ instance : ToJson QueueEntry where
       ("mode",       ToJson.toJson e.mode),
       ("prompt",     e.prompt)
     ]
-    let fields := base
-      |> fun acc => match e.agent with
-          | none => acc | some s => acc ++ [("agent", Json.str s)]
-      |> fun acc => match e.systemPrompt with
-          | none => acc | some s => acc ++ [("system_prompt", Json.str s)]
-      |> fun acc => match e.backend with
-          | none => acc | some s => acc ++ [("backend", Json.str s)]
-      |> fun acc => match e.model with
-          | none => acc | some s => acc ++ [("model", Json.str s)]
-      |> fun acc => match e.continuesFrom with
-          | none => acc | some s => acc ++ [("continues_from", Json.str s)]
-      |> fun acc => match e.series with
-          | none => acc | some s => acc ++ [("series", Json.str s)]
-      |> fun acc => match e.taskId with
-          | none => acc | some s => acc ++ [("task_id", Json.str s)]
-      |> fun acc => match e.configPath with
-          | none => acc | some s => acc ++ [("config_path", Json.str s)]
-      |> fun acc => match e.budget with
-          | none => acc | some b => acc ++ [("budget", ToJson.toJson b)]
+    let fields := if let some s := e.agent         then fields ++ [("agent",           Json.str s)]      else fields
+    let fields := if let some s := e.systemPrompt  then fields ++ [("system_prompt",   Json.str s)]      else fields
+    let fields := if let some s := e.backend       then fields ++ [("backend",         Json.str s)]      else fields
+    let fields := if let some s := e.model         then fields ++ [("model",           Json.str s)]      else fields
+    let fields := if let some s := e.continuesFrom then fields ++ [("continues_from",  Json.str s)]      else fields
+    let fields := if let some s := e.series        then fields ++ [("series",          Json.str s)]      else fields
+    let fields := if let some s := e.taskId        then fields ++ [("task_id",         Json.str s)]      else fields
+    let fields := if let some s := e.configPath    then fields ++ [("config_path",     Json.str s)]      else fields
+    let fields := if let some b := e.budget        then fields ++ [("budget",          ToJson.toJson b)] else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where

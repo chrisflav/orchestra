@@ -196,11 +196,15 @@ private def vibeConfigToml (serverPort : UInt16) (model : Option String) (base :
   match model with
   | none => withMcp
   | some m =>
-    -- Replace the active_model line in-place to preserve surrounding config
     let lines := withMcp.splitOn "\n"
-    let updated := lines.map (fun l =>
-      if l.startsWith "active_model = " then s!"active_model = \"{m}\"" else l)
-    String.intercalate "\n" updated
+    if lines.any (fun l => l.startsWith "active_model = ") then
+      -- Replace the existing active_model line in-place
+      let updated := lines.map (fun l =>
+        if l.startsWith "active_model = " then s!"active_model = \"{m}\"" else l)
+      String.intercalate "\n" updated
+    else
+      -- Prepend the setting so it takes effect even when absent from the base config
+      s!"active_model = \"{m}\"\n" ++ withMcp
 
 /-- The Vibe (Mistral AI) coding agent backend. -/
 def vibe : AgentDef where

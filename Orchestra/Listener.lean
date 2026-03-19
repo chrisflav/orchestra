@@ -78,18 +78,12 @@ instance : ToJson ActionConfig where
       ("prompt_template", a.promptTemplate)
     ]
     let fields := base
-      |> fun acc => match a.series with
-          | none => acc | some s => acc ++ [("series", Json.str s)]
-      |> fun acc => match a.backend with
-          | none => acc | some s => acc ++ [("backend", Json.str s)]
-      |> fun acc => match a.model with
-          | none => acc | some s => acc ++ [("model", Json.str s)]
-      |> fun acc => match a.agent with
-          | none => acc | some s => acc ++ [("agent", Json.str s)]
-      |> fun acc => match a.systemPrompt with
-          | none => acc | some s => acc ++ [("system_prompt", Json.str s)]
-      |> fun acc => match a.budget with
-          | none => acc | some b => acc ++ [("budget", ToJson.toJson b)]
+    let fields := if let some s := a.series       then fields ++ [("series",        Json.str s)]      else fields
+    let fields := if let some s := a.backend      then fields ++ [("backend",       Json.str s)]      else fields
+    let fields := if let some s := a.model        then fields ++ [("model",         Json.str s)]      else fields
+    let fields := if let some s := a.agent        then fields ++ [("agent",         Json.str s)]      else fields
+    let fields := if let some s := a.systemPrompt then fields ++ [("system_prompt", Json.str s)]      else fields
+    let fields := if let some b := a.budget       then fields ++ [("budget",        ToJson.toJson b)] else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -103,7 +97,15 @@ instance : FromJson ActionConfig where
     let model        := j.getObjValAs? String "model"         |>.toOption
     let agent        := j.getObjValAs? String "agent"         |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
-    let budget       := j.getObjValAs? Float  "budget"        |>.toOption
+    -- Accept budget as either a JSON number (2.0) or a JSON string ("2.0")
+    let budget : Option Float :=
+      match j.getObjVal? "budget" |>.toOption with
+      | none => none
+      | some (.num n) => some n.toFloat
+      | some (.str s) => match Lean.Json.parse s with
+          | .ok (.num n) => some n.toFloat
+          | _ => none
+      | _ => none
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
              budget }
 
@@ -182,10 +184,10 @@ def loadAllListenerConfigs (dir : System.FilePath) : IO (Array ListenerConfig) :
     -- skip the state subdirectory entry (it has no .json extension anyway)
     let raw ← IO.FS.readFile entry.path
     match Json.parse raw with
-    | .error _ => pure ()
+    | .error e => IO.eprintln s!"Warning: failed to parse listener config {name}: {e}"
     | .ok j    =>
-      match FromJson.fromJson? j with
-      | .error _ => pure ()
+      match FromJson.fromJson? j (α := ListenerConfig) with
+      | .error e => IO.eprintln s!"Warning: failed to load listener config {name}: {e}"
       | .ok cfg  => configs := configs.push cfg
   return configs
 
@@ -220,6 +222,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
   let createdAt ← TaskStore.currentIso8601
   let prompt    := renderTemplate action.promptTemplate vars
   let mode      := action.mode
+  IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent}"
   return {
     id, createdAt, status := .pending,
     upstream     := action.upstream
