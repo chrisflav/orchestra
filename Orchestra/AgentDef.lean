@@ -45,8 +45,9 @@ structure AgentDef where
   setupMcp : UInt16 → Option String → Option String → IO (String × Array (String × Option String))
   /-- Build command-line args for a specific invocation.
       Receives: context string from setupMcp, plugin directories, sub-agent name,
-      model override, appended system prompt, session ID to resume, and the user prompt. -/
-  buildArgs : String → Array String → Option String → Option String → Option String → Option String → String
+      model override, appended system prompt, session ID to resume, budget in USD,
+      and the user prompt. -/
+  buildArgs : String → Array String → Option String → Option String → Option String → Option String → Float → String
             → Array String
   /-- Parse one line of the agent's stdout stream output.
       Returns `none` for events that should be suppressed. -/
@@ -101,10 +102,11 @@ def claude : AgentDef where
     let path := s!"/tmp/agent-mcp-{ts}.json"
     IO.FS.writeFile (System.FilePath.mk path) mcpConfig.compress
     return (path, #[])
-  buildArgs mcpConfigPath pluginDirs subAgent model systemPrompt resume prompt := Id.run do
+  buildArgs mcpConfigPath pluginDirs subAgent model systemPrompt resume budget prompt := Id.run do
     let mut args : Array String := #[
       "--print", "--output-format=stream-json", "--verbose",
-      "--dangerously-skip-permissions", "--mcp-config", mcpConfigPath
+      "--dangerously-skip-permissions", "--mcp-config", mcpConfigPath,
+      "--max-budget-usd", s!"{budget}"
     ]
     for p in pluginDirs do
       args := args.push "--plugin-dir" |>.push p
@@ -237,7 +239,7 @@ def vibe : AgentDef where
       ("VIBE_HOME", some vibeHome),
       ("MISTRAL_API_KEY", mistralKey)
     ])
-  buildArgs _ctx _pluginDirs subAgent _model systemPrompt resume prompt := Id.run do
+  buildArgs _ctx _pluginDirs subAgent _model systemPrompt resume _budget prompt := Id.run do
     let mut args : Array String := #["-p", prompt, "--output", "streaming"]
     -- Use the task agent (with custom system prompt) if one was configured in setupMcp,
     -- or the explicitly requested sub-agent; otherwise let vibe default to auto-approve.

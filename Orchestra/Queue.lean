@@ -53,6 +53,8 @@ structure QueueEntry where
   series        : Option String := none
   taskId        : Option String := none
   configPath    : Option String := none
+  /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
+  budget        : Option Float  := none
 deriving Repr
 
 instance : ToJson QueueEntry where
@@ -83,6 +85,8 @@ instance : ToJson QueueEntry where
           | none => acc | some s => acc ++ [("task_id", Json.str s)]
       |> fun acc => match e.configPath with
           | none => acc | some s => acc ++ [("config_path", Json.str s)]
+      |> fun acc => match e.budget with
+          | none => acc | some b => acc ++ [("budget", ToJson.toJson b)]
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -102,8 +106,10 @@ instance : FromJson QueueEntry where
     let series        := j.getObjValAs? String "series"         |>.toOption
     let taskId        := j.getObjValAs? String "task_id"        |>.toOption
     let configPath    := j.getObjValAs? String "config_path"    |>.toOption
+    let budget        := j.getObjValAs? Float  "budget"         |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
-             agent, systemPrompt, backend, model, continuesFrom, series, taskId, configPath }
+             agent, systemPrompt, backend, model, continuesFrom, series, taskId, configPath,
+             budget }
 
 -- Directories and paths
 

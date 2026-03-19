@@ -6,6 +6,11 @@ open Orchestra
 
 -- Helpers
 
+private def parseFloat? (s : String) : Option Float :=
+  match Lean.Json.parse s with
+  | .ok (.num n) => some n.toFloat
+  | _ => none
+
 private def padRight (s : String) (n : Nat) : String :=
   let truncated := String.ofList (s.toList.take n)
   truncated ++ String.ofList (List.replicate (n - truncated.length) ' ')
@@ -31,7 +36,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     upstream := task.upstream, fork := task.fork, mode := task.mode, prompt := task.prompt
     continuesFrom, series
     backend := task.backend, model := task.model, agent := task.agent
-    systemPrompt := task.systemPrompt
+    systemPrompt := task.systemPrompt, budget := task.budget
   }
   TaskStore.saveTask initialRecord
   -- Resolve initial resume session from the continued task
@@ -88,6 +93,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
       (debug := debug) (pluginDirs := appConfig.pluginDirs) (subAgent := task.agent)
       (model := task.model) (systemPrompt := systemPrompt) (resume := resume)
+      (budget := task.budget.getD 4.0)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     if result.usageLimitHit then
@@ -134,6 +140,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let debug         := p.hasFlag "debug"
   let continuesFrom := p.flag? "continues" |>.map (·.as! String)
   let series        := p.flag? "series"    |>.map (·.as! String)
+  let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   let taskFileData ← loadTaskFile taskFile
   if taskFileData.tasks.isEmpty then
@@ -153,7 +160,11 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let series ← inheritSeries continuesFrom series
   for i in [:tasks.size] do
     try
-      let _ ← runTask appConfig tasks[i]! i debug (continuesFrom := continuesFrom) (series := series)
+      -- CLI --budget overrides the task file budget
+      let task := match budgetFlag with
+        | none   => tasks[i]!
+        | some b => { tasks[i]! with budget := some b }
+      let _ ← runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
   return (0 : UInt32)
@@ -268,8 +279,9 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
   let prompt     := p.flag? "prompt" |>.map (·.as! String) |>.getD ""
   if prompt.isEmpty then
     throw (.userError "missing required flag: --prompt")
-  let configPath := p.flag? "config" |>.map (·.as! String)
-  let debug      := p.hasFlag "debug"
+  let configPath  := p.flag? "config"  |>.map (·.as! String)
+  let debug       := p.hasFlag "debug"
+  let budgetFlag  := p.flag? "budget"  |>.bind (fun v => parseFloat? (v.as! String))
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   let some prevId ← TaskStore.latestInSeries seriesName
     | throw (.userError s!"series '{seriesName}' not found")
@@ -284,6 +296,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
     model        := prevRecord.model
     agent        := prevRecord.agent
     systemPrompt := prevRecord.systemPrompt
+    budget       := budgetFlag.orElse (fun _ => prevRecord.budget)
   }
   let _ ← runTask appConfig task 0 debug (continuesFrom := some prevId) (series := some seriesName)
   return (0 : UInt32)
@@ -304,6 +317,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
   let series        := p.flag? "series"    |>.map (·.as! String)
   let resumeSeries  := p.flag? "resume"    |>.map (·.as! String)
   let prompt        := p.flag? "prompt"    |>.map (·.as! String)
+  let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
   let taskFile?     := (p.variableArgsAs? String |>.getD #[])[0]?
   match resumeSeries, taskFile? with
   | some _, some _ =>
@@ -336,6 +350,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       model         := prevRecord.model
       agent         := prevRecord.agent
       systemPrompt  := prevRecord.systemPrompt
+      budget        := budgetFlag.orElse (fun _ => prevRecord.budget)
     }
     Queue.saveEntry entry
     IO.println entry.id
@@ -373,6 +388,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         model        := task.model
         continuesFrom, series
         configPath
+        budget       := budgetFlag.orElse (fun _ => task.budget)
       }
       Queue.saveEntry entry
       IO.println entry.id
@@ -424,6 +440,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         systemPrompt := entry.systemPrompt
         backend      := entry.backend
         model        := entry.model
+        budget       := entry.budget
       }
       let cfg ← match entry.configPath with
         | none    => pure appConfig
@@ -523,6 +540,7 @@ private def runCmd' : Cmd := `[Cli|
     d, debug; "Print the landrun command before executing it"
     continues : String; "Continue from a previous task by ID (requires --task with multi-task files)"
     series : String; "Assign this run to a named task series"
+    budget : String; "Maximum spend in USD, overrides task file (default: 4.0)"
 
   ARGS:
     "task-file" : String; "Path to the JSON task file"
@@ -593,6 +611,7 @@ private def resumeCmd : Cmd := `[Cli|
     c, config : String; "Path to config file (default: ~/.agent/config.json)"
     p, prompt : String; "Prompt for the new agent run"
     d, debug; "Print the landrun command before executing it"
+    budget : String; "Maximum spend in USD (default: inherited from previous task, or 4.0)"
 
   ARGS:
     "series" : String; "Series name to resume"
@@ -609,6 +628,7 @@ private def queueAddCmd : Cmd := `[Cli|
     series : String; "Assign queued task(s) to a named series (task-file mode only)"
     r, resume : String; "Continue the latest run in a named series (requires --prompt)"
     p, prompt : String; "Prompt for the new agent run (used with --resume)"
+    budget : String; "Maximum spend in USD, overrides task file (default: 4.0)"
 
   ARGS:
     ..."task-file" : String; "Path to the JSON task file (omit when using --resume)"

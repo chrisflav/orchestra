@@ -39,7 +39,8 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (subAgent : Option String := none)
     (model : Option String := none)
     (systemPrompt : Option String := none)
-    (resume : Option String := none) : IO LaunchResult := do
+    (resume : Option String := none)
+    (budget : Float := 4.0) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -92,7 +93,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- Separator and the actual command with its args
   args := args.push "--"
   args := args.push agentDef.command
-  let agentArgs := agentDef.buildArgs mcpContext pluginDirs subAgent model systemPrompt resume prompt
+  let agentArgs := agentDef.buildArgs mcpContext pluginDirs subAgent model systemPrompt resume budget prompt
   args := args ++ agentArgs
   if debug then
     let argsStr := String.intercalate " " (args.toList.map shellEscape)

@@ -10,9 +10,11 @@ namespace Orchestra.Listener
 -- Source configuration
 
 inductive SourceConfig where
-  | githubIssues   (repo : String) (labels : List String)
+  | githubIssues    (repo : String) (labels : List String)
   | githubPrReviews (repo : String) (labels : List String)
-  | shell          (command : String) (args : List String)
+  /-- Reacts to new issue/PR comments containing `trigger` with a rocket emoji and enqueues a task. -/
+  | githubComments  (repo : String) (labels : List String) (trigger : String)
+  | shell           (command : String) (args : List String)
 
 instance : ToJson SourceConfig where
   toJson
@@ -22,6 +24,9 @@ instance : ToJson SourceConfig where
     | .githubPrReviews repo labels =>
         Json.mkObj [("type", "github-pr-reviews"), ("repo", repo),
                     ("labels", ToJson.toJson labels)]
+    | .githubComments repo labels trigger =>
+        Json.mkObj [("type", "github-comments"), ("repo", repo),
+                    ("labels", ToJson.toJson labels), ("trigger", trigger)]
     | .shell cmd args =>
         Json.mkObj [("type", "shell"), ("command", cmd),
                     ("args", ToJson.toJson args)]
@@ -38,6 +43,11 @@ instance : FromJson SourceConfig where
         let repo   ← j.getObjValAs? String "repo"
         let labels  := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
         return .githubPrReviews repo labels
+    | "github-comments" =>
+        let repo    ← j.getObjValAs? String "repo"
+        let labels   := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
+        let trigger ← j.getObjValAs? String "trigger"
+        return .githubComments repo labels trigger
     | "shell" =>
         let cmd  ← j.getObjValAs? String "command"
         let args  := j.getObjValAs? (List String) "args" |>.toOption |>.getD []
@@ -56,6 +66,8 @@ structure ActionConfig where
   model          : Option String := none
   agent          : Option String := none
   systemPrompt   : Option String := none
+  /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
+  budget         : Option Float  := none
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -76,6 +88,8 @@ instance : ToJson ActionConfig where
           | none => acc | some s => acc ++ [("agent", Json.str s)]
       |> fun acc => match a.systemPrompt with
           | none => acc | some s => acc ++ [("system_prompt", Json.str s)]
+      |> fun acc => match a.budget with
+          | none => acc | some b => acc ++ [("budget", ToJson.toJson b)]
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -84,12 +98,14 @@ instance : FromJson ActionConfig where
     let fork           ← j.getObjValAs? String "fork"
     let mode           ← j.getObjValAs? TaskMode "mode"
     let promptTemplate ← j.getObjValAs? String "prompt_template"
-    let series       := j.getObjValAs? String "series"       |>.toOption
-    let backend      := j.getObjValAs? String "backend"      |>.toOption
-    let model        := j.getObjValAs? String "model"        |>.toOption
-    let agent        := j.getObjValAs? String "agent"        |>.toOption
+    let series       := j.getObjValAs? String "series"        |>.toOption
+    let backend      := j.getObjValAs? String "backend"       |>.toOption
+    let model        := j.getObjValAs? String "model"         |>.toOption
+    let agent        := j.getObjValAs? String "agent"         |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
-    return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt }
+    let budget       := j.getObjValAs? Float  "budget"        |>.toOption
+    return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
+             budget }
 
 -- Listener config
 
@@ -215,6 +231,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     backend      := action.backend
     model        := action.model
     series       := action.series
+    budget       := action.budget
   }
 
 -- GitHub helpers
@@ -233,6 +250,21 @@ private def runGhApi (endpoint : String) (ghToken : String) : IO (Option Json) :
   let out ← child.stdout.readToEnd
   let _   ← child.wait
   return (Json.parse out.trimAscii.toString).toOption
+
+private def reactToComment (repo : String) (commentId : Nat) (ghToken : String) : IO Unit := do
+  let env : Array (String × Option String) :=
+    if ghToken.isEmpty then #[] else #[("GH_TOKEN", some ghToken)]
+  let child ← IO.Process.spawn {
+    cmd  := "gh"
+    args := #["api", "--method", "POST",
+              s!"/repos/{repo}/issues/comments/{commentId}/reactions",
+              "-f", "content=rocket"]
+    env
+    stdin  := .null
+    stdout := .null
+    stderr := .null
+  }
+  let _ ← child.wait
 
 -- Source polling
 
@@ -313,6 +345,70 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           ("url",        url)
         ]
         events := events.push (ridStr, vars)
+    return events
+
+  | .githubComments repo labels trigger => do
+    -- On the first run lastChecked is empty: initialise state and return nothing,
+    -- so we don't flood the queue with all historical comments.
+    if state.lastChecked.isEmpty then return #[]
+    -- Helper: extract an event from one comment JSON object, react with 🚀, return vars.
+    let processComment : Json → IO (Option (String × List (String × String))) :=
+      fun comment => do
+        let .ok idNum := comment.getObjValAs? Nat "id" | return none
+        let idStr := toString idNum
+        if state.processedIds.contains idStr then return none
+        let body := comment.getObjValAs? String "body" |>.toOption |>.getD ""
+        -- Only process comments that contain the trigger string
+        if !(body.splitOn trigger).length > 1 then return none
+        -- React with a rocket emoji (best-effort; ignore failures)
+        try reactToComment repo idNum ghToken catch _ => pure ()
+        let author   := match comment.getObjVal? "user" |>.toOption with
+          | none   => ""
+          | some u => u.getObjValAs? String "login" |>.toOption |>.getD ""
+        let url      := comment.getObjValAs? String "html_url" |>.toOption |>.getD ""
+        -- Extract issue/PR number from the issue_url field
+        let issueUrl := comment.getObjValAs? String "issue_url" |>.toOption |>.getD ""
+        let issueNum := issueUrl.splitOn "/" |>.getLast? |>.getD ""
+        let vars := [("comment_id", idStr), ("body", body), ("author", author),
+                     ("url", url), ("issue_number", issueNum)]
+        return some (idStr, vars)
+    let mut events : Array (String × List (String × String)) := #[]
+    if labels.isEmpty then
+      -- Use the global issue comments endpoint with a `since` filter
+      let endpoint :=
+        s!"/repos/{repo}/issues/comments?since={state.lastChecked}&per_page=100&direction=asc"
+      let jsonOpt ← runGhApi endpoint ghToken
+      let comments ← match jsonOpt with
+        | none   => pure (#[] : Array Json)
+        | some j => match j.getArr? with
+          | .ok a    => pure a
+          | .error _ => pure #[]
+      for comment in comments do
+        if let some ev ← processComment comment then
+          events := events.push ev
+    else
+      -- Fetch only issues/PRs that carry one of the requested labels
+      let labelParam := ",".intercalate labels
+      let issuesOpt ← runGhApi
+        s!"/repos/{repo}/issues?state=open&labels={labelParam}&per_page=100" ghToken
+      let issues ← match issuesOpt with
+        | none   => pure (#[] : Array Json)
+        | some j => match j.getArr? with
+          | .ok a    => pure a
+          | .error _ => pure #[]
+      for issue in issues do
+        let .ok issNum := issue.getObjValAs? Nat "number" | continue
+        let commentsOpt ← runGhApi
+          s!"/repos/{repo}/issues/{issNum}/comments?since={state.lastChecked}&per_page=100"
+          ghToken
+        let comments ← match commentsOpt with
+          | none   => pure (#[] : Array Json)
+          | some j => match j.getArr? with
+            | .ok a    => pure a
+            | .error _ => pure #[]
+        for comment in comments do
+          if let some ev ← processComment comment then
+            events := events.push ev
     return events
 
   | .shell cmd args => do

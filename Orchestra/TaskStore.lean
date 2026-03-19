@@ -50,6 +50,8 @@ structure TaskRecord where
   agent         : Option String := none
   /-- System prompt file name used for this run. Inherited by continuations. -/
   systemPrompt  : Option String := none
+  /-- Maximum spend in USD used for this run. -/
+  budget        : Option Float  := none
 deriving Repr
 
 instance : ToJson TaskRecord where
@@ -78,6 +80,8 @@ instance : ToJson TaskRecord where
           | none => acc | some s => acc ++ [("agent", Json.str s)]
       |> fun acc => match r.systemPrompt with
           | none => acc | some s => acc ++ [("system_prompt", Json.str s)]
+      |> fun acc => match r.budget with
+          | none => acc | some b => acc ++ [("budget", ToJson.toJson b)]
     Json.mkObj fields
 
 instance : FromJson TaskRecord where
@@ -96,8 +100,9 @@ instance : FromJson TaskRecord where
     let model         := j.getObjValAs? String "model"          |>.toOption
     let agent         := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt  := j.getObjValAs? String "system_prompt"  |>.toOption
+    let budget        := j.getObjValAs? Float  "budget"         |>.toOption
     return { id, createdAt, upstream, fork, mode, prompt, status, sessionId,
-             continuesFrom, series, backend, model, agent, systemPrompt }
+             continuesFrom, series, backend, model, agent, systemPrompt, budget }
 
 -- Directories
 

@@ -31,6 +31,8 @@ structure Task where
   backend : Option String := none
   /-- Model override passed to the agent (e.g. "sonnet", "devstral-small"). -/
   model : Option String := none
+  /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
+  budget : Option Float := none
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -43,7 +45,8 @@ instance : FromJson Task where
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
     let backend := j.getObjValAs? String "backend" |>.toOption
     let model := j.getObjValAs? String "model" |>.toOption
-    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model }
+    let budget := j.getObjValAs? Float "budget" |>.toOption
+    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget }
 
 structure AppConfig where
   appId : Nat
