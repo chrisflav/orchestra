@@ -35,7 +35,8 @@ private def shellQuote (s : String) : String :=
 private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (continuesFrom : Option String := none)
     (series : Option String := none)
-    (cancelToken : Option Std.CancellationToken := none) : IO (String × Bool) := do
+    (cancelToken : Option Std.CancellationToken := none)
+    (interactive : Bool := true) : IO (String × Bool) := do
   IO.println s!"=== Task {idx}: {task.fork} ({repr task.mode}) ==="
   -- Record this run in the task store
   let taskId ← TaskStore.generateId
@@ -69,7 +70,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   IO.println "  Token ready"
   -- 2. Clone / update repo
   IO.println s!"Cloning/updating {task.fork}..."
-  let repoPath ← Repo.ensureCloned task.fork task.upstream
+  let repoPath ← Repo.ensureCloned task.fork task.upstream interactive
   IO.println s!"  Repo at {repoPath}"
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   let serverState : Server.State := {
@@ -533,7 +534,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       try
         let (taskId, usageLimitHit) ← runTask cfg task 0 debug
           (continuesFrom := entry.continuesFrom) (series := entry.series)
-          (cancelToken := some taskToken)
+          (cancelToken := some taskToken) (interactive := false)
         currentTaskToken.atomically (·.set none)
         if ← taskToken.isCancelled then
           Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
