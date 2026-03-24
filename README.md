@@ -47,13 +47,20 @@ Create `~/.agent/config.json`:
   "github": {
     "pat": "github_pat_..."
   },
-  "plugin_dirs": []
+  "plugin_dirs": [],
+  "claude_token": "..."
 }
 ```
 
 `installation_id` is optional; if omitted it is looked up automatically.
 `pat` is a personal access token used to create pull requests to the upstream
 repository. The agent itself never sees this token.
+
+`claude_token` is an optional long-lived Claude OAuth token. Claude login
+sessions lapse frequently; a stable token avoids repeated re-authentication.
+Obtain one by running `claude setup-token` and copy the token value here. When
+set, it is passed to the agent as the `CLAUDE_CODE_OAUTH_TOKEN` environment
+variable.
 
 System prompts can be placed in `~/.agent/prompts/`. The file
 `~/.agent/prompts/default.md` is loaded automatically; named prompts can be

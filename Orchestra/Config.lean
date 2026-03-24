@@ -84,6 +84,9 @@ structure AppConfig where
   installationId : Option Nat := none
   pat : String := ""
   pluginDirs : Array String := #[]
+  /-- Long-lived Claude OAuth token set via `claude setup-token`.
+      Exposed to the agent as `CLAUDE_CODE_OAUTH_TOKEN`. -/
+  claudeToken : Option String := none
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -97,7 +100,8 @@ instance : FromJson AppConfig where
       gh.getObjValAs? String "pat"
     ) |>.toOption |>.getD ""
     let pluginDirs := j.getObjValAs? (Array String) "plugin_dirs" |>.toOption |>.getD #[]
-    return { appId, privateKeyPath, installationId, pat, pluginDirs }
+    let claudeToken := j.getObjValAs? String "claude_token" |>.toOption
+    return { appId, privateKeyPath, installationId, pat, pluginDirs, claudeToken }
 
 structure TaskFile where
   tasks : Array Task

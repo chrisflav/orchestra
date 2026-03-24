@@ -147,10 +147,15 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     let agentDef := match task.backend with
       | some "vibe" => AgentDef.vibe
       | _           => AgentDef.claude
+    let claudeEnv : Array (String × Option String) :=
+      match appConfig.claudeToken with
+      | some tok => #[("CLAUDE_CODE_OAUTH_TOKEN", some tok)]
+      | none => #[]
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
-      (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
-      (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
-      (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
+      (debug := debug) (extraEnv := claudeEnv) (pluginDirs := appConfig.pluginDirs)
+      (memoryDirs := memoryDirs) (subAgent := task.agent) (model := task.model)
+      (systemPrompt := systemPrompt) (resume := resume) (budget := task.budget.getD 4.0)
+      (cancelToken := cancelToken)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     if result.wasCancelled then
