@@ -39,6 +39,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (debug : Bool := false)
     (extraEnv : Array (String × Option String) := #[])
     (pluginDirs : Array String := #[])
+    (memoryDirs : Array String := #[])
     (subAgent : Option String := none)
     (model : Option String := none)
     (systemPrompt : Option String := none)
@@ -76,6 +77,10 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   for p in pluginDirs do
     if ← System.FilePath.pathExists p then
       args := args.push "--rox" |>.push p
+  -- Memory directories (read-write access so the agent can persist memories)
+  for p in memoryDirs do
+    if ← System.FilePath.pathExists p then
+      args := args.push "--rw" |>.push p
   -- Network: allow connecting to the local MCP server and external HTTPS
   args := args.push "--connect-tcp" |>.push (toString serverPort)
   args := args.push "--connect-tcp" |>.push "443"
@@ -97,7 +102,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- Separator and the actual command with its args
   args := args.push "--"
   args := args.push agentDef.command
-  let agentArgs := agentDef.buildArgs mcpContext pluginDirs subAgent model systemPrompt resume budget prompt
+  -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
+  let allPluginDirs := pluginDirs ++ memoryDirs
+  let agentArgs := agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
   args := args ++ agentArgs
   if debug then
     let argsStr := String.intercalate " " (args.toList.map shellEscape)

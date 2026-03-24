@@ -20,6 +20,33 @@ instance : ToJson TaskMode where
     | .fork => "fork"
     | .pr => "pr"
 
+/-- Controls which memory directories are made available to the agent.
+    - `none`    – no memory directories
+    - `global`  – global memory only (`~/.agent/memory/`)
+    - `project` – per-project memory only (`~/.agent/memory/<project>/`)
+    - `both`    – global and per-project memory (default) -/
+inductive MemoryMode where
+  | none
+  | global
+  | project
+  | both
+deriving Repr, Inhabited
+
+instance : FromJson MemoryMode where
+  fromJson?
+    | .str "none"    => .ok .none
+    | .str "global"  => .ok .global
+    | .str "project" => .ok .project
+    | .str "both"    => .ok .both
+    | j => .error s!"expected \"none\", \"global\", \"project\", or \"both\", got {j}"
+
+instance : ToJson MemoryMode where
+  toJson
+    | .none    => "none"
+    | .global  => "global"
+    | .project => "project"
+    | .both    => "both"
+
 structure Task where
   upstream : String
   fork : String
@@ -33,6 +60,8 @@ structure Task where
   model : Option String := none
   /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
   budget : Option Float := none
+  /-- Which memory directories to make available to the agent. Defaults to `both`. -/
+  memory : MemoryMode := .both
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -46,7 +75,8 @@ instance : FromJson Task where
     let backend := j.getObjValAs? String "backend" |>.toOption
     let model := j.getObjValAs? String "model" |>.toOption
     let budget := j.getObjValAs? Float "budget" |>.toOption
-    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget }
+    let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
+    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory }
 
 structure AppConfig where
   appId : Nat

@@ -28,6 +28,44 @@ private def stripExt (s ext : String) : String :=
 private def shellQuote (s : String) : String :=
   "'" ++ s.replace "'" "'\\''" ++ "'"
 
+-- Memory helpers
+
+/-- Sanitize a `owner/repo` string into a safe directory name, e.g. `owner-repo`. -/
+private def sanitizeProjectName (upstream : String) : String :=
+  upstream.map (fun c => if c == '/' then '-' else c)
+
+/-- Return the active memory directories for the given mode and upstream repo.
+    Creates the directories if they do not yet exist. -/
+private def resolveMemoryDirs (mode : MemoryMode) (upstream : String) : IO (Array String) := do
+  match ← IO.getEnv "HOME" with
+  | none => return #[]
+  | some home =>
+    let memBase := System.FilePath.mk home / ".agent" / "memory"
+    let globalDir  := memBase
+    let projectDir := memBase / sanitizeProjectName upstream
+    let dirs : Array System.FilePath :=
+      match mode with
+      | .none    => #[]
+      | .global  => #[globalDir]
+      | .project => #[projectDir]
+      | .both    => #[globalDir, projectDir]
+    for dir in dirs do
+      IO.FS.createDirAll dir
+    return dirs.map (·.toString)
+
+/-- Build a system-prompt addition describing the available memory directories. -/
+private def memorySystemPrompt (memoryDirs : Array String) : Option String :=
+  if memoryDirs.isEmpty then none
+  else
+    let bullet := fun d => s!"- {d}"
+    let list   := String.intercalate "\n" (memoryDirs.toList.map bullet)
+    some s!"## Memory\n\nYou have access to a persistent memory system. \
+The following director{if memoryDirs.size == 1 then "y is" else "ies are"} \
+mounted read-write inside your sandbox:\n\n{list}\n\n\
+Use these directories to store information that should persist across tasks. \
+For example, maintain a `MEMORY.md` file with important context, decisions, and findings \
+that will be valuable for future runs."
+
 -- Task execution
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.
@@ -88,7 +126,15 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   RepoConfig.runInitIfNeeded repoPath
   let repoConfig ← RepoConfig.loadRepoConfig repoPath
   -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
-  let systemPrompt ← loadSystemPrompt task.systemPrompt
+  let baseSystemPrompt ← loadSystemPrompt task.systemPrompt
+  -- 5a. Resolve memory directories and amend system prompt
+  let memoryDirs ← resolveMemoryDirs task.memory task.upstream
+  let systemPrompt :=
+    match baseSystemPrompt, memorySystemPrompt memoryDirs with
+    | none,    none    => none
+    | some sp, none    => some sp
+    | none,    some mp => some mp
+    | some sp, some mp => some (sp ++ "\n\n" ++ mp)
   let mut sessionId : Option String := none
   let mut usageLimitHit := false
   let mut wasCancelled := false
@@ -102,9 +148,9 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       | some "vibe" => AgentDef.vibe
       | _           => AgentDef.claude
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
-      (debug := debug) (pluginDirs := appConfig.pluginDirs) (subAgent := task.agent)
-      (model := task.model) (systemPrompt := systemPrompt) (resume := resume)
-      (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
+      (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
+      (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
+      (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     if result.wasCancelled then
@@ -527,6 +573,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         backend      := entry.backend
         model        := entry.model
         budget       := entry.budget
+        memory       := entry.memory
       }
       let cfg ← match entry.configPath with
         | none    => pure appConfig

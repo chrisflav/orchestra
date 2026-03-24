@@ -55,6 +55,8 @@ structure QueueEntry where
   configPath    : Option String := none
   /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
   budget        : Option Float  := none
+  /-- Which memory directories to make available to the agent. Defaults to `both`. -/
+  memory        : MemoryMode    := .both
 deriving Repr
 
 instance : ToJson QueueEntry where
@@ -77,6 +79,7 @@ instance : ToJson QueueEntry where
     let fields := if let some s := e.taskId        then fields ++ [("task_id",         Json.str s)]      else fields
     let fields := if let some s := e.configPath    then fields ++ [("config_path",     Json.str s)]      else fields
     let fields := if let some b := e.budget        then fields ++ [("budget",          ToJson.toJson b)] else fields
+    let fields := fields ++ [("memory", ToJson.toJson e.memory)]
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -96,10 +99,11 @@ instance : FromJson QueueEntry where
     let series        := j.getObjValAs? String "series"         |>.toOption
     let taskId        := j.getObjValAs? String "task_id"        |>.toOption
     let configPath    := j.getObjValAs? String "config_path"    |>.toOption
-    let budget        := j.getObjValAs? Float  "budget"         |>.toOption
+    let budget        := j.getObjValAs? Float      "budget"  |>.toOption
+    let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget }
+             budget, memory }
 
 -- Directories and paths
 

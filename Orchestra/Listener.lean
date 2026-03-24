@@ -68,6 +68,8 @@ structure ActionConfig where
   systemPrompt   : Option String := none
   /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
   budget         : Option Float  := none
+  /-- Which memory directories to make available to the agent. Defaults to `both`. -/
+  memory         : MemoryMode    := .both
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -84,6 +86,7 @@ instance : ToJson ActionConfig where
     let fields := if let some s := a.agent        then fields ++ [("agent",         Json.str s)]      else fields
     let fields := if let some s := a.systemPrompt then fields ++ [("system_prompt", Json.str s)]      else fields
     let fields := if let some b := a.budget       then fields ++ [("budget",        ToJson.toJson b)] else fields
+    let fields := fields ++ [("memory", ToJson.toJson a.memory)]
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -106,8 +109,9 @@ instance : FromJson ActionConfig where
           | .ok (.num n) => some n.toFloat
           | _ => none
       | _ => none
+    let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget }
+             budget, memory }
 
 -- Listener config
 
@@ -236,6 +240,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     model        := action.model
     series
     budget       := action.budget
+    memory       := action.memory
   }
 
 -- GitHub helpers
