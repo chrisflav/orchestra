@@ -45,7 +45,8 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (systemPrompt : Option String := none)
     (resume : Option String := none)
     (budget : Float := 4.0)
-    (cancelToken : Option Std.CancellationToken := none) : IO LaunchResult := do
+    (cancelToken : Option Std.CancellationToken := none)
+    (debugLogFile : Option System.FilePath := none) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -142,6 +143,10 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
             let _ ← killer.wait
           catch _ => pure ()
         | _ => pure ()  -- "done" or other reason: child already exited, nothing to do
+  -- Open debug log file if requested (one per task, created fresh)
+  let debugHandle : Option IO.FS.Handle ← match debugLogFile with
+    | none      => pure none
+    | some path => some <$> IO.FS.Handle.mk path .write
   -- Stream stdout, parse events and format for display; capture session ID if emitted
   let sessionIdRef ← IO.mkRef (none : Option String)
   let outTask ← IO.asTask (prio := .dedicated) do
@@ -149,6 +154,10 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     repeat do
       let line ← child.stdout.getLine
       if line.isEmpty then return
+      -- Write every raw line to the debug log
+      if let some h := debugHandle then
+        h.putStrLn line
+        h.flush
       match agentDef.parseOutputLine line with
       | none => pure ()
       | some event =>

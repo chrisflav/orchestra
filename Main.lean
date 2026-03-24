@@ -135,27 +135,39 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     | some sp, none    => some sp
     | none,    some mp => some mp
     | some sp, some mp => some (sp ++ "\n\n" ++ mp)
+  -- 5b. Load prepend prompt and apply to task prompt
+  let prependPrompt ← loadPrependPrompt
+  let baseTaskPrompt :=
+    match prependPrompt with
+    | none    => task.prompt
+    | some pp => pp ++ "\n\n" ++ task.prompt
   let mut sessionId : Option String := none
   let mut usageLimitHit := false
   let mut wasCancelled := false
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
     RepoConfig.runHook repoPath "before.sh"
-    let prompt := if attempt == 0 then task.prompt else repoConfig.validation.retryPrompt
+    let prompt := if attempt == 0 then baseTaskPrompt else repoConfig.validation.retryPrompt
     let resume := if attempt == 0 then initialResume else sessionId
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
     let agentDef := match task.backend with
       | some "vibe" => AgentDef.vibe
       | _           => AgentDef.claude
-    let claudeEnv : Array (String × Option String) :=
-      match appConfig.claudeToken with
-      | some tok => #[("CLAUDE_CODE_OAUTH_TOKEN", some tok)]
-      | none => #[]
+    let apiKeyEnv : Array (String × Option String) :=
+      #[("ANTHROPIC_API_KEY", appConfig.anthropicApiKey),
+        ("ANTHROPIC_BASE_URL", appConfig.anthropicBaseUrl),
+        ("ANTHROPIC_AUTH_TOKEN", appConfig.anthropicAuthToken),
+	("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)]
+    let debugLogFile : Option System.FilePath ←
+      if debug then
+        let suffix := if attempt == 0 then "" else s!".retry{attempt}"
+        pure (some ((← TaskStore.tasksDir) / s!"{taskId}{suffix}.debug.jsonl"))
+      else pure none
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
-      (debug := debug) (extraEnv := claudeEnv) (pluginDirs := appConfig.pluginDirs)
-      (memoryDirs := memoryDirs) (subAgent := task.agent) (model := task.model)
-      (systemPrompt := systemPrompt) (resume := resume) (budget := task.budget.getD 4.0)
-      (cancelToken := cancelToken)
+      (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
+      (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
+      (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
+      (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     if result.wasCancelled then
@@ -693,17 +705,31 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
   let active := all.filter (fun e => e.status == .running || e.status == .pending)
   if active.isEmpty then
     IO.println "Queue: empty"
-    return 0
-  IO.println s!"Queue: {active.size} task(s)"
-  IO.println ""
-  IO.println s!"{padRight "ID" 16} {padRight "FORK" 32} {padRight "STATUS" 9} SERIES"
-  IO.println (String.ofList (List.replicate 70 '-'))
-  -- Show running first, then pending in oldest-first order
-  let running := active.filter (fun e => e.status == .running)
-  let pending := (active.filter (fun e => e.status == .pending)).toList.reverse.toArray
-  for e in running ++ pending do
-    let status := if e.status == .running then "running" else "pending"
-    IO.println s!"{padRight e.id 16} {padRight e.fork 32} {padRight status 9} {e.series.getD ""}"
+  else
+    IO.println s!"Queue: {active.size} task(s)"
+    IO.println ""
+    IO.println s!"{padRight "ID" 16} {padRight "FORK" 32} {padRight "STATUS" 9} SERIES"
+    IO.println (String.ofList (List.replicate 70 '-'))
+    -- Show running first, then pending in oldest-first order
+    let running := active.filter (fun e => e.status == .running)
+    let pending := (active.filter (fun e => e.status == .pending)).toList.reverse.toArray
+    for e in running ++ pending do
+      let status := if e.status == .running then "running" else "pending"
+      IO.println s!"{padRight e.id 16} {padRight e.fork 32} {padRight status 9} {e.series.getD ""}"
+  -- Listener status
+  let listenerConfigs ← Listener.loadAllListenerConfigs (← Listener.listenersDir)
+  if !listenerConfigs.isEmpty then
+    IO.println ""
+    IO.println s!"Listeners: {listenerConfigs.size}"
+    IO.println ""
+    IO.println s!"{padRight "LISTENER" 20} {padRight "INTERVAL" 9} {padRight "LAST CHECKED" 22} QUEUED"
+    IO.println (String.ofList (List.replicate 70 '-'))
+    for cfg in listenerConfigs do
+      let state       ← Listener.loadListenerState cfg.name
+      let lastChecked := if state.lastChecked.isEmpty then "never" else state.lastChecked
+      let queued      := toString state.processedIds.size ++ " events"
+      let interval    := s!"{cfg.intervalSeconds}s"
+      IO.println s!"{padRight cfg.name 20} {padRight interval 9} {padRight lastChecked 22} {queued}"
   return 0
 
 private def queueShutdownHandler (p : Parsed) : IO UInt32 := do

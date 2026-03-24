@@ -87,6 +87,12 @@ structure AppConfig where
   /-- Long-lived Claude OAuth token set via `claude setup-token`.
       Exposed to the agent as `CLAUDE_CODE_OAUTH_TOKEN`. -/
   claudeToken : Option String := none
+  /-- Anthropic API key passed to the agent as ANTHROPIC_API_KEY. -/
+  anthropicApiKey : Option String := none
+  /-- Anthropic base URL passed to the agent as ANTHROPIC_BASE_URL. -/
+  anthropicBaseUrl : Option String := none
+  /-- Anthropic auth token passed to the agent as ANTHROPIC_AUTH_TOKEN. -/
+  anthropicAuthToken : Option String := none
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -101,7 +107,11 @@ instance : FromJson AppConfig where
     ) |>.toOption |>.getD ""
     let pluginDirs := j.getObjValAs? (Array String) "plugin_dirs" |>.toOption |>.getD #[]
     let claudeToken := j.getObjValAs? String "claude_token" |>.toOption
-    return { appId, privateKeyPath, installationId, pat, pluginDirs, claudeToken }
+    let anthropicApiKey := j.getObjValAs? String "anthropic_api_key" |>.toOption
+    let anthropicBaseUrl := j.getObjValAs? String "anthropic_base_url" |>.toOption
+    let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
+    return { appId, privateKeyPath, installationId, pat, pluginDirs,
+             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken }
 
 structure TaskFile where
   tasks : Array Task
@@ -142,6 +152,18 @@ If `name` is `none`, reads `default.md`. Returns `none` if the file does not exi
 def loadSystemPrompt (name : Option String := none) : IO (Option String) := do
   let promptName := name.getD "default"
   let promptPath ← expandHome s!"~/.agent/prompts/{promptName}.md"
+  if ← promptPath.pathExists then
+    return some (← IO.FS.readFile promptPath)
+  else
+    return none
+
+/--
+Load a prepend prompt from `~/.agent/prompts/default-prepend.md`.
+If the file exists, its contents will be prepended to every task prompt.
+Returns `none` if the file does not exist.
+-/
+def loadPrependPrompt : IO (Option String) := do
+  let promptPath ← expandHome "~/.agent/prompts/default-prepend.md"
   if ← promptPath.pathExists then
     return some (← IO.FS.readFile promptPath)
   else
