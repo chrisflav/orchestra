@@ -162,11 +162,18 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
         pure (some ((← TaskStore.tasksDir) / s!"{taskId}{suffix}.debug.jsonl"))
       else pure none
+    -- Structured JSON log: ~/.agent/logs/{fork}/{taskId}.log (always)
+    let taskLogFile : Option System.FilePath ← do
+      match ← IO.getEnv "HOME" with
+      | none => pure none
+      | some home =>
+        let suffix := if attempt == 0 then "" else s!".retry{attempt}"
+        pure (some (System.FilePath.mk home / ".agent" / "logs" / task.fork / s!"{taskId}{suffix}.log"))
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
       (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
       (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
       (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
-      (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile)
+      (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     if result.wasCancelled then
