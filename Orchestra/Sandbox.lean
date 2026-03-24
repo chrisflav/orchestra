@@ -46,7 +46,8 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (resume : Option String := none)
     (budget : Float := 4.0)
     (cancelToken : Option Std.CancellationToken := none)
-    (debugLogFile : Option System.FilePath := none) : IO LaunchResult := do
+    (debugLogFile : Option System.FilePath := none)
+    (logFile : Option System.FilePath := none) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -147,6 +148,13 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let debugHandle : Option IO.FS.Handle ← match debugLogFile with
     | none      => pure none
     | some path => some <$> IO.FS.Handle.mk path .write
+  -- Open the structured JSON log file (one per task, always created when path is given)
+  let logHandle : Option IO.FS.Handle ← match logFile with
+    | none      => pure none
+    | some path =>
+      if let some dir := path.parent then
+        IO.FS.createDirAll dir
+      some <$> IO.FS.Handle.mk path .write
   -- Stream stdout, parse events and format for display; capture session ID if emitted
   let sessionIdRef ← IO.mkRef (none : Option String)
   let outTask ← IO.asTask (prio := .dedicated) do
@@ -165,6 +173,10 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
           sessionIdRef.set (some sid)
         out.putStrLn (StreamFormat.format event)
         out.flush
+        -- Write the parsed event as a JSON line to the structured log
+        if let some h := logHandle then
+          h.putStrLn (Lean.Json.compress (Lean.ToJson.toJson event))
+          h.flush
   -- Stream stderr to console and capture it for usage-limit detection
   let stderrRef ← IO.mkRef ""
   let errTask ← IO.asTask (prio := .dedicated) do
