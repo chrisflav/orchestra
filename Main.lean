@@ -157,7 +157,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       #[("ANTHROPIC_API_KEY", appConfig.anthropicApiKey),
         ("ANTHROPIC_BASE_URL", appConfig.anthropicBaseUrl),
         ("ANTHROPIC_AUTH_TOKEN", appConfig.anthropicAuthToken),
-	("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)]
+        ("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)]
     let debugLogFile : Option System.FilePath ←
       if debug then
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
