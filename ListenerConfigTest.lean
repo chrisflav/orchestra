@@ -21,18 +21,18 @@ private def expectEq [BEq α] [Repr α] (msg : String) (expected : α) (got : α
 def main : IO Unit := do
 
   -- Test 1: RepoEntry round-trip via JSON
-  let entry : RepoEntry := { upstream := "org/repo", repo := "my-org/fork" }
+  let entry : RepoEntry := { upstream := "org/repo", fork := "my-org/fork" }
   let entryJson := ToJson.toJson entry
   match FromJson.fromJson? entryJson (α := RepoEntry) with
   | .error e => fail s!"RepoEntry round-trip parse: {e}"
   | .ok got  =>
     expectEq "RepoEntry.upstream round-trip" "org/repo"     got.upstream
-    expectEq "RepoEntry.repo round-trip"     "my-org/fork"  got.repo
+    expectEq "RepoEntry.fork round-trip"     "my-org/fork"  got.fork
 
   -- Test 2: Parse github-comments with new `repos` array format
   let newFormat := r#"
     {"type": "github-comments",
-     "repos": [{"upstream": "org/repo", "repo": "my-org/fork"}],
+     "repos": [{"upstream": "org/repo", "fork": "my-org/fork"}],
      "trigger": "@bot",
      "authorized_users": ["alice", "bob"]}
   "#
@@ -43,14 +43,14 @@ def main : IO Unit := do
     match repos with
     | [r] =>
       expectEq "github-comments repos[0].upstream"  "org/repo"     r.upstream
-      expectEq "github-comments repos[0].repo"      "my-org/fork"  r.repo
+      expectEq "github-comments repos[0].fork"      "my-org/fork"  r.fork
     | _ => fail "github-comments repos not a singleton"
     expectEq "github-comments trigger"              "@bot"         trigger
     expectEq "github-comments authorized_users"     ["alice", "bob"] authorizedUsers
   | .ok _ => fail "github-comments: unexpected SourceConfig variant"
 
-  -- Test 3: Backward compat — single `repo` string for github-comments
-  let oldFormat := r#"{"type": "github-comments", "repo": "org/repo", "trigger": "@bot"}"#
+  -- Test 3: Backward compat — single `fork` string for github-comments
+  let oldFormat := r#"{"type": "github-comments", "fork": "org/repo", "trigger": "@bot"}"#
   match Json.parse oldFormat >>= FromJson.fromJson? (α := SourceConfig) with
   | .error e => fail s!"backward compat parse: {e}"
   | .ok (.githubComments repos _labels _trigger authorizedUsers) =>
@@ -58,7 +58,7 @@ def main : IO Unit := do
     match repos with
     | [r] =>
       expectEq "backward compat upstream"     "org/repo" r.upstream
-      expectEq "backward compat repo"         "org/repo" r.repo
+      expectEq "backward compat fork"         "org/repo" r.fork
     | _ => fail "backward compat repos not a singleton"
     expectEq "backward compat authorized_users empty" [] authorizedUsers
   | .ok _ => fail "backward compat: unexpected SourceConfig variant"
@@ -66,8 +66,8 @@ def main : IO Unit := do
   -- Test 4: github-issues with new repos format and authorized_users
   let issuesFormat := r#"
     {"type": "github-issues",
-     "repos": [{"upstream": "org/repo", "repo": "my-org/fork"},
-               {"upstream": "org/other", "repo": "my-org/other"}],
+     "repos": [{"upstream": "org/repo", "fork": "my-org/fork"},
+               {"upstream": "org/other", "fork": "my-org/other"}],
      "labels": ["bug"],
      "authorized_users": ["carol"]}
   "#
@@ -83,7 +83,7 @@ def main : IO Unit := do
   -- Test 4b: github-issues with trigger
   let issuesWithTriggerFormat := r#"
     {"type": "github-issues",
-     "repos": [{"upstream": "org/repo", "repo": "my-org/fork"}],
+     "repos": [{"upstream": "org/repo", "fork": "my-org/fork"}],
      "trigger": "@bot",
      "authorized_users": []}
   "#
@@ -96,7 +96,7 @@ def main : IO Unit := do
   -- Test 4c: github-pr-reviews with trigger
   let reviewsWithTriggerFormat := r#"
     {"type": "github-pr-reviews",
-     "repos": [{"upstream": "org/repo", "repo": "my-org/fork"}],
+     "repos": [{"upstream": "org/repo", "fork": "my-org/fork"}],
      "trigger": "@orchestra",
      "authorized_users": []}
   "#
@@ -109,7 +109,7 @@ def main : IO Unit := do
   -- Test 5: github-pr-reviews with new repos format
   let reviewsFormat := r#"
     {"type": "github-pr-reviews",
-     "repos": [{"upstream": "org/repo", "repo": "my-org/fork"}],
+     "repos": [{"upstream": "org/repo", "fork": "my-org/fork"}],
      "labels": []}
   "#
   match Json.parse reviewsFormat >>= FromJson.fromJson? (α := SourceConfig) with
@@ -122,7 +122,7 @@ def main : IO Unit := do
 
   -- Test 6: SourceConfig round-trip (ToJson → FromJson) for github-comments
   let sc : SourceConfig := .githubComments
-    [{ upstream := "pimotte-agents/orchestra", repo := "my-fork/orchestra" }]
+    [{ upstream := "pimotte-agents/orchestra", fork := "my-fork/orchestra" }]
     ["agent"] "@orchestra" ["dave"]
   match FromJson.fromJson? (ToJson.toJson sc) (α := SourceConfig) with
   | .error e => fail s!"SourceConfig round-trip: {e}"
@@ -133,7 +133,7 @@ def main : IO Unit := do
     match repos with
     | [r] =>
       expectEq "round-trip upstream"  "pimotte-agents/orchestra"  r.upstream
-      expectEq "round-trip repo"      "my-fork/orchestra"         r.repo
+      expectEq "round-trip fork"      "my-fork/orchestra"         r.fork
     | _ => fail "round-trip repos not a singleton"
   | .ok _ => fail "SourceConfig round-trip: wrong variant"
 
