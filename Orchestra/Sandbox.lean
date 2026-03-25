@@ -14,12 +14,14 @@ private def expandHomePaths (rel : List String) : IO (List System.FilePath) := d
 
 /-- Result of launching an agent. -/
 structure LaunchResult where
-  exitCode      : UInt32
-  sessionId     : Option String
+  exitCode       : UInt32
+  sessionId      : Option String
   /-- True if the agent exited because it hit a usage or quota limit. -/
-  usageLimitHit : Bool
+  usageLimitHit  : Bool
   /-- True if the agent was killed because the cancel token was signalled. -/
-  wasCancelled  : Bool := false
+  wasCancelled   : Bool := false
+  /-- The subtype from the agent's result event, if one was emitted. -/
+  resultSubtype  : Option StreamFormat.ResultSubtype := none
 
 /--
 Launch the coding agent inside a landrun sandbox.
@@ -156,7 +158,8 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
         IO.FS.createDirAll dir
       some <$> IO.FS.Handle.mk path .write
   -- Stream stdout, parse events and format for display; capture session ID if emitted
-  let sessionIdRef ← IO.mkRef (none : Option String)
+  let sessionIdRef    ← IO.mkRef (none : Option String)
+  let resultSubtypeRef ← IO.mkRef (none : Option StreamFormat.ResultSubtype)
   let outTask ← IO.asTask (prio := .dedicated) do
     let out ← IO.getStdout
     repeat do
@@ -171,6 +174,8 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
       | some event =>
         if let .init sid _ := event then
           sessionIdRef.set (some sid)
+        if let .result sub _ _ _ _ := event then
+          resultSubtypeRef.set (some sub)
         out.putStrLn (StreamFormat.format event)
         out.flush
         -- Write the parsed event as a JSON line to the structured log
@@ -208,8 +213,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     | some ct => do
       let reason ← ct.getCancellationReason
       pure (reason == some .cancel)
+  let resultSubtype ← resultSubtypeRef.get
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
-  return { exitCode, sessionId, usageLimitHit, wasCancelled }
+  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype }
 
 end Orchestra.Sandbox

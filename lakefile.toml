@@ -1,6 +1,6 @@
 name = "orchestra"
 version = "0.1.0"
-defaultTargets = ["orchestra", "orchestra-mcp-test"]
+defaultTargets = ["orchestra", "orchestra-mcp-test", "listener-config-test", "stream-format-test"]
 
 [[require]]
 name = "Cli"
@@ -17,3 +17,11 @@ root = "Main"
 [[lean_exe]]
 name = "orchestra-mcp-test"
 root = "McpTest"
+
+[[lean_exe]]
+name = "listener-config-test"
+root = "ListenerConfigTest"
+
+[[lean_exe]]
+name = "stream-format-test"
+root = "StreamFormatTest"

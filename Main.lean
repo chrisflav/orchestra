@@ -144,6 +144,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   let mut sessionId : Option String := none
   let mut usageLimitHit := false
   let mut wasCancelled := false
+  let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
     RepoConfig.runHook repoPath "before.sh"
@@ -177,6 +178,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
+    lastResultSubtype := result.resultSubtype
     if result.wasCancelled then
       IO.println "  Agent was cancelled."
       wasCancelled := true
@@ -197,8 +199,10 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   -- 7. Persist final task state
   let finalStatus :=
     if wasCancelled then .cancelled
-    else if usageLimitHit then .unfinished
-    else .completed
+    else match lastResultSubtype with
+      | some .success           => .completed
+      | some .errorMaxBudgetUsd => .unfinished
+      | _                       => if usageLimitHit then .unfinished else .completed
   TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
   if let some seriesName := series then
     TaskStore.updateSeriesPointer seriesName taskId
