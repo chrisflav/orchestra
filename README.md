@@ -48,7 +48,8 @@ Create `~/.agent/config.json`:
     "pat": "github_pat_..."
   },
   "plugin_dirs": [],
-  "claude_token": "..."
+  "claude_token": "...",
+  "authorized_users": ["<GitHub_username>"]
 }
 ```
 
