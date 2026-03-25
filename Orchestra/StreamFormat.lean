@@ -30,17 +30,32 @@ inductive ContentItem where
   | toolUse (name : String) (input : Json)
   | text (text : String)
 
+/-- The subtype of a result event emitted by the agent. -/
+inductive ResultSubtype where
+  | success
+  | errorMaxBudgetUsd
+  | unknown (raw : String)
+deriving BEq, Repr
+
 /-- A parsed stream-json event. -/
 inductive Event where
   | init (sessionId : String) (model : String)
   | system (subtype : String)
   | assistant (item : ContentItem)
   | toolResult (stdout : String) (stderr : String)
-  | result (subtype : String) (numTurns : Option Nat) (durationMs : Option Nat)
+  | result (subtype : ResultSubtype) (numTurns : Option Nat) (durationMs : Option Nat)
             (costUsd : Option Json) (res : String)
   | unknown (type : String)
 
 -- Serialisation
+
+private def resultSubtypeStr : ResultSubtype → String
+  | .success          => "success"
+  | .errorMaxBudgetUsd => "error_max_budget_usd"
+  | .unknown raw      => raw
+
+instance : ToJson ResultSubtype where
+  toJson sub := Json.str (resultSubtypeStr sub)
 
 instance : ToJson ContentItem where
   toJson
@@ -61,7 +76,7 @@ instance : ToJson Event where
     | .result sub numTurns durationMs costUsd res =>
       let fields : List (String × Json) := [
         ("type",    "result"),
-        ("subtype", sub),
+        ("subtype", ToJson.toJson sub),
         ("result",  res)
       ]
       let fields := match numTurns  with | some n => fields ++ [("num_turns",   ToJson.toJson n)]   | none => fields
@@ -109,8 +124,12 @@ def parseEvent (line : String) : Option Event := do
     if stdout.isEmpty && stderr.isEmpty then none
     else some (.toolResult stdout stderr)
   | "result" =>
+    let sub := match jStr json "subtype" with
+      | "success"              => ResultSubtype.success
+      | "error_max_budget_usd" => ResultSubtype.errorMaxBudgetUsd
+      | raw                    => ResultSubtype.unknown raw
     some (.result
-      (jStr json "subtype")
+      sub
       (json.getObjValAs? Nat "num_turns" |>.toOption)
       (json.getObjValAs? Nat "duration_ms" |>.toOption)
       (jVal json "total_cost_usd")
@@ -161,7 +180,7 @@ def format : Event → String
     let dur := match durationMs with | some ms => s!" | {ms / 1000}s" | none => ""
     let cost := match costUsd with | some v => s!" | ${v.compress}" | none => ""
     let resPart := if res.isEmpty then "" else s!"\n{truncate res 300}"
-    s!"[done] {sub}{turns}{dur}{cost}{resPart}"
+    s!"[done] {resultSubtypeStr sub}{turns}{dur}{cost}{resPart}"
   | .unknown t => s!"[{t}]"
 
 /-- Parse and format a single stream-json event line for human-readable display.
