@@ -119,6 +119,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     privateKeyPath := appConfig.privateKeyPath
     installationId
     pat := appConfig.pat
+    informalContextRepo := appConfig.informalContextRepo
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"
@@ -276,6 +277,7 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
     privateKeyPath := appConfig.privateKeyPath
     installationId
     pat := appConfig.pat
+    informalContextRepo := appConfig.informalContextRepo
   }
   let (port, _shutdown) ← Server.start serverState
   IO.println s!"MCP server listening on port {port}"
@@ -973,6 +975,97 @@ private def defaultHandler (_ : Parsed) : IO UInt32 := do
   IO.eprintln "Use a subcommand. Try 'orchestra --help'."
   return 1
 
+-- Informal context handlers
+
+private def informalSetupHandler (p : Parsed) : IO UInt32 := do
+  let webRepo   := p.positionalArg! "web-repo" |>.as! String
+  let configPath := p.flag? "config" |>.map (·.as! String)
+  let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  let repo := match p.flag? "repo" |>.map (·.as! String) with
+    | some r => r
+    | none   => match appConfig.informalContextRepo with
+      | some r => r
+      | none   => webRepo
+  IO.println s!"Setting up informal-context CI in '{repo}'..."
+  InformalContext.setupWebRepo repo appConfig.pat
+  IO.println s!"Done. Enable GitHub Pages (source: GitHub Actions) in the repository settings."
+  return 0
+
+private def informalAnnotateHandler (p : Parsed) : IO UInt32 := do
+  let prNumber   := p.positionalArg! "pr-number" |>.as! Nat
+  let jsonFile   := p.positionalArg! "json-file"  |>.as! String
+  let upstream   := p.flag? "upstream"  |>.map (·.as! String)
+  let webRepo    := p.flag? "web-repo"  |>.map (·.as! String)
+  let configPath := p.flag? "config"    |>.map (·.as! String)
+  let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  -- Determine upstream repo
+  let upstreamRepo ← match upstream with
+    | some u => pure u
+    | none   =>
+      IO.eprintln "Missing required flag: --upstream <owner/repo>"
+      return 1
+  -- Determine web repo
+  let wRepo ← match webRepo with
+    | some w => pure w
+    | none   =>
+      match appConfig.informalContextRepo with
+      | some r => pure r
+      | none   =>
+        IO.eprintln "Missing required flag: --web-repo (or set informal_context_repo in config)"
+        return 1
+  -- Read and parse the JSON file
+  let jsonContent ← IO.FS.readFile jsonFile
+  match InformalContext.parseAnnotations jsonContent with
+  | .error e =>
+    IO.eprintln s!"Invalid annotations JSON: {e}"
+    return 1
+  | .ok annotations =>
+    IO.println s!"Pushing {annotations.size} annotation(s) for {upstreamRepo} PR #{prNumber}..."
+    InformalContext.pushAnnotations wRepo upstreamRepo prNumber annotations appConfig.pat
+    IO.println s!"Done. View at: https://<org>.github.io/<web-repo>/{upstreamRepo.map (fun c => if c == '/' then '-' else c)}/pr-{prNumber}/"
+    return 0
+
+-- Informal context CLI definitions
+
+private def informalSetupCmd : Cmd := `[Cli|
+  setup VIA informalSetupHandler; ["0.1.0"]
+  "Set up the GitHub Actions CI and site generator in the informal-context web repository."
+
+  FLAGS:
+    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    repo : String; "Web repository in 'owner/repo' format (overrides config)"
+
+  ARGS:
+    "web-repo" : String; "Web repository in 'owner/repo' format"
+]
+
+private def informalAnnotateCmd : Cmd := `[Cli|
+  annotate VIA informalAnnotateHandler; ["0.1.0"]
+  "Annotate a pull request with informal context from a JSON file."
+
+  FLAGS:
+    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    upstream : String; "Upstream repository in 'owner/repo' format"
+    web_repo : String; "Web repository in 'owner/repo' format (overrides config)"
+
+  ARGS:
+    "pr-number" : Nat;    "Pull request number to annotate"
+    "json-file" : String; "Path to the annotations JSON file"
+]
+
+private def informalDefaultHandler (_ : Parsed) : IO UInt32 := do
+  IO.eprintln "Use a subcommand. Try 'orchestra informal --help'."
+  return 1
+
+private def informalCmd : Cmd := `[Cli|
+  informal VIA informalDefaultHandler; ["0.1.0"]
+  "Manage informal context for pull request reviews."
+
+  SUBCOMMANDS:
+    informalSetupCmd;
+    informalAnnotateCmd
+]
+
 def orchestraCmd : Cmd := `[Cli|
   orchestra VIA defaultHandler; ["0.1.0"]
   "CLI tool for managing and sandboxing coding agents."
@@ -987,7 +1080,8 @@ def orchestraCmd : Cmd := `[Cli|
     seriesCmd;
     tagCmd;
     resumeCmd;
-    queueCmd
+    queueCmd;
+    informalCmd
 ]
 
 def main (args : List String) : IO UInt32 := do
