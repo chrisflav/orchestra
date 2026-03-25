@@ -93,6 +93,9 @@ structure AppConfig where
   anthropicBaseUrl : Option String := none
   /-- Anthropic auth token passed to the agent as ANTHROPIC_AUTH_TOKEN. -/
   anthropicAuthToken : Option String := none
+  /-- GitHub logins allowed to trigger any listener. Empty = allow everyone.
+      Can be overridden per listener via `authorized_users` in the source config. -/
+  authorizedUsers : List String := []
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -110,8 +113,9 @@ instance : FromJson AppConfig where
     let anthropicApiKey := j.getObjValAs? String "anthropic_api_key" |>.toOption
     let anthropicBaseUrl := j.getObjValAs? String "anthropic_base_url" |>.toOption
     let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
+    let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
-             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken }
+             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers }
 
 structure TaskFile where
   tasks : Array Task

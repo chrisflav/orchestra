@@ -633,7 +633,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       if now >= due then
         try
           let state  ← Listener.loadListenerState lcfg.name
-          let events ← Listener.pollSource lcfg.source state appConfig.pat
+          let events ← Listener.pollSource lcfg.source state appConfig.pat appConfig.authorizedUsers
           for ev in (events : Array (String × List (String × String))) do
             let qentry ← Listener.buildQueueEntry lcfg.action ev.2
             Queue.saveEntry qentry

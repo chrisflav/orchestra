@@ -7,47 +7,100 @@ open Lean (Json FromJson ToJson)
 
 namespace Orchestra.Listener
 
+-- Repo entry: upstream + fork as full org/name strings
+
+/-- A source/fork repo pair for a listener.
+    `upstream` is the org/name of the repo to watch (e.g. `"my-account/orchestra"`).
+    `fork` is the org/name of the fork to use for the action (e.g. `"my-fork/orchestra"`). -/
+structure RepoEntry where
+  upstream : String
+  fork     : String
+deriving BEq, Repr
+
+instance : ToJson RepoEntry where
+  toJson e := Json.mkObj [("upstream", e.upstream), ("fork", e.fork)]
+
+instance : FromJson RepoEntry where
+  fromJson? j := do
+    let upstream ← j.getObjValAs? String "upstream"
+    let fork     ← j.getObjValAs? String "fork"
+    return { upstream, fork }
+
 -- Source configuration
 
 inductive SourceConfig where
-  | githubIssues    (repo : String) (labels : List String)
-  | githubPrReviews (repo : String) (labels : List String)
-  /-- Reacts to new issue/PR comments containing `trigger` with a rocket emoji and enqueues a task. -/
-  | githubComments  (repo : String) (labels : List String) (trigger : String)
+  /-- Poll open issues. Optionally filtered by `labels`.
+      If `trigger` is non-empty, only issues whose body contains `trigger` will fire.
+      Only users in `authorizedUsers` may trigger (empty = allow all). -/
+  | githubIssues    (repos : List RepoEntry) (labels : List String) (trigger : String)
+                    (authorizedUsers : List String)
+  /-- Poll PR reviews. Optionally filtered by `labels`.
+      If `trigger` is non-empty, only reviews whose body contains `trigger` will fire.
+      Only users in `authorizedUsers` may trigger (empty = allow all). -/
+  | githubPrReviews (repos : List RepoEntry) (labels : List String) (trigger : String)
+                    (authorizedUsers : List String)
+  /-- Reacts to new issue/PR comments containing `trigger` with a rocket emoji and enqueues a task.
+      Only users in `authorizedUsers` may trigger (empty = allow all). -/
+  | githubComments  (repos : List RepoEntry) (labels : List String) (trigger : String)
+                    (authorizedUsers : List String)
   | shell           (command : String) (args : List String)
 
 instance : ToJson SourceConfig where
   toJson
-    | .githubIssues repo labels =>
-        Json.mkObj [("type", "github-issues"), ("repo", repo),
-                    ("labels", ToJson.toJson labels)]
-    | .githubPrReviews repo labels =>
-        Json.mkObj [("type", "github-pr-reviews"), ("repo", repo),
-                    ("labels", ToJson.toJson labels)]
-    | .githubComments repo labels trigger =>
-        Json.mkObj [("type", "github-comments"), ("repo", repo),
-                    ("labels", ToJson.toJson labels), ("trigger", trigger)]
+    | .githubIssues repos labels trigger authorizedUsers =>
+        Json.mkObj [("type", "github-issues"),
+                    ("repos", ToJson.toJson repos),
+                    ("labels", ToJson.toJson labels),
+                    ("trigger", trigger),
+                    ("authorized_users", ToJson.toJson authorizedUsers)]
+    | .githubPrReviews repos labels trigger authorizedUsers =>
+        Json.mkObj [("type", "github-pr-reviews"),
+                    ("repos", ToJson.toJson repos),
+                    ("labels", ToJson.toJson labels),
+                    ("trigger", trigger),
+                    ("authorized_users", ToJson.toJson authorizedUsers)]
+    | .githubComments repos labels trigger authorizedUsers =>
+        Json.mkObj [("type", "github-comments"),
+                    ("repos", ToJson.toJson repos),
+                    ("labels", ToJson.toJson labels),
+                    ("trigger", trigger),
+                    ("authorized_users", ToJson.toJson authorizedUsers)]
     | .shell cmd args =>
         Json.mkObj [("type", "shell"), ("command", cmd),
                     ("args", ToJson.toJson args)]
+
+/-- Parse a `repos` list from JSON.  If `"repos"` is absent, fall back to the singular
+    `"fork"` string (treated as both `upstream` and `fork`). -/
+private def parseRepos (j : Json) : Except String (List RepoEntry) :=
+  match j.getObjValAs? (List RepoEntry) "repos" |>.toOption with
+  | some rs => .ok rs
+  | none    =>
+    match j.getObjValAs? String "fork" with
+    | .ok r  => .ok [{ upstream := r, fork := r }]
+    | .error e => .error e
 
 instance : FromJson SourceConfig where
   fromJson? j := do
     let ty ← j.getObjValAs? String "type"
     match ty with
     | "github-issues" =>
-        let repo   ← j.getObjValAs? String "repo"
-        let labels  := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
-        return .githubIssues repo labels
+        let repos          ← parseRepos j
+        let labels          := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
+        let trigger         := j.getObjValAs? String "trigger" |>.toOption |>.getD ""
+        let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
+        return .githubIssues repos labels trigger authorizedUsers
     | "github-pr-reviews" =>
-        let repo   ← j.getObjValAs? String "repo"
-        let labels  := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
-        return .githubPrReviews repo labels
+        let repos          ← parseRepos j
+        let labels          := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
+        let trigger         := j.getObjValAs? String "trigger" |>.toOption |>.getD ""
+        let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
+        return .githubPrReviews repos labels trigger authorizedUsers
     | "github-comments" =>
-        let repo    ← j.getObjValAs? String "repo"
-        let labels   := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
-        let trigger ← j.getObjValAs? String "trigger"
-        return .githubComments repo labels trigger
+        let repos          ← parseRepos j
+        let labels          := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
+        let trigger        ← j.getObjValAs? String "trigger"
+        let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
+        return .githubComments repos labels trigger authorizedUsers
     | "shell" =>
         let cmd  ← j.getObjValAs? String "command"
         let args  := j.getObjValAs? (List String) "args" |>.toOption |>.getD []
@@ -57,8 +110,12 @@ instance : FromJson SourceConfig where
 -- Action template
 
 structure ActionConfig where
-  upstream       : String
-  fork           : String
+  /-- Upstream org/name. May be a template string (e.g. `"{{upstream}}"`).
+      Defaults to `""`, in which case the `upstream` template variable is used. -/
+  upstream       : String := ""
+  /-- Fork org/name. May be a template string (e.g. `"{{fork}}"`).
+      Defaults to `""`, in which case the `fork` template variable is used. -/
+  fork           : String := ""
   mode           : TaskMode
   promptTemplate : String
   series         : Option String := none
@@ -91,8 +148,8 @@ instance : ToJson ActionConfig where
 
 instance : FromJson ActionConfig where
   fromJson? j := do
-    let upstream       ← j.getObjValAs? String "upstream"
-    let fork           ← j.getObjValAs? String "fork"
+    let upstream       := j.getObjValAs? String "upstream" |>.toOption |>.getD ""
+    let fork           := j.getObjValAs? String "fork"     |>.toOption |>.getD ""
     let mode           ← j.getObjValAs? TaskMode "mode"
     let promptTemplate ← j.getObjValAs? String "prompt_template"
     let series       := j.getObjValAs? String "series"        |>.toOption
@@ -227,11 +284,20 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
   let prompt    := renderTemplate action.promptTemplate vars
   let series    := action.series.map (renderTemplate · vars)
   let mode      := action.mode
+  -- Render upstream/fork through templates; fall back to {{upstream}}/{{fork}} vars if empty.
+  let lookupVar (key : String) : String :=
+    vars.find? (fun p => p.1 == key) |>.map (·.2) |>.getD ""
+  let upstream :=
+    let rendered := renderTemplate action.upstream vars
+    if rendered.isEmpty then lookupVar "upstream" else rendered
+  let fork :=
+    let rendered := renderTemplate action.fork vars
+    if rendered.isEmpty then lookupVar "fork" else rendered
   IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent}"
   return {
     id, createdAt, status := .pending,
-    upstream     := action.upstream
-    fork         := action.fork
+    upstream
+    fork
     mode
     prompt
     agent        := action.agent
@@ -275,150 +341,192 @@ private def reactToComment (repo : String) (commentId : Nat) (ghToken : String) 
   }
   let _ ← child.wait
 
+-- Authorization helper
+
+/-- Return the effective allowed-user list: source list if non-empty, else global list. -/
+private def effectiveAllowed (sourceUsers globalUsers : List String) : List String :=
+  if !sourceUsers.isEmpty then sourceUsers else globalUsers
+
+/-- Return `true` if `author` is allowed to trigger given the effective allowed list.
+    An empty list means "allow everyone". -/
+private def isAuthorized (allowed : List String) (author : String) : Bool :=
+  allowed.isEmpty || allowed.contains author
+
 -- Source polling
 
 /--
 Poll a source for new events not yet in `state.processedIds`.
 Returns an array of `(eventId, templateVars)` pairs.
 `eventId` is `""` for shell sources (no deduplication by ID).
+Event IDs for GitHub sources are prefixed with the upstream slug
+(e.g. `"my-account/orchestra:12345"`) so a single state file
+correctly deduplicates events across multiple repos.
 -/
 def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String)
+    (globalAuthorizedUsers : List String := [])
     : IO (Array (String × List (String × String))) := do
   match source with
 
-  | .githubIssues repo labels => do
+  | .githubIssues repos labels trigger sourceAuthorizedUsers => do
+    let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
     let labelParam := if labels.isEmpty then "" else "&labels=" ++ ",".intercalate labels
-    let endpoint := s!"/repos/{repo}/issues?state=open&per_page=100{labelParam}"
-    let jsonOpt ← runGhApi endpoint ghToken
-    match jsonOpt with
-    | none => return #[]
-    | some json =>
-      let .ok items := json.getArr? | return #[]
-      let mut events : Array (String × List (String × String)) := #[]
-      for item in items do
-        -- skip pull requests (issues endpoint returns PRs too)
-        if (item.getObjVal? "pull_request").isOk then continue
-        let .ok numJson := item.getObjVal? "number" | continue
-        let numStr := toString numJson
-        if state.processedIds.contains numStr then continue
-        let title  := item.getObjValAs? String "title"    |>.toOption |>.getD ""
-        let body   := item.getObjValAs? String "body"     |>.toOption |>.getD ""
-        let url    := item.getObjValAs? String "html_url" |>.toOption |>.getD ""
-        let vars   := [("issue_number", numStr), ("title", title), ("body", body), ("url", url)]
-        events := events.push (numStr, vars)
-      return events
+    let mut allEvents : Array (String × List (String × String)) := #[]
+    for entry in repos do
+      let endpoint := s!"/repos/{entry.upstream}/issues?state=open&per_page=100{labelParam}"
+      let jsonOpt ← runGhApi endpoint ghToken
+      match jsonOpt with
+      | none => pure ()
+      | some json =>
+        let .ok items := json.getArr? | pure ()
+        for item in items do
+          -- skip pull requests (issues endpoint returns PRs too)
+          if (item.getObjVal? "pull_request").isOk then continue
+          let .ok numJson := item.getObjVal? "number" | continue
+          let numStr  := toString numJson
+          let eventId := s!"{entry.upstream}:{numStr}"
+          if state.processedIds.contains eventId then continue
+          let author :=
+            match item.getObjVal? "user" |>.toOption with
+            | none   => ""
+            | some u => u.getObjValAs? String "login" |>.toOption |>.getD ""
+          if !isAuthorized allowed author then continue
+          let title  := item.getObjValAs? String "title"    |>.toOption |>.getD ""
+          let body   := item.getObjValAs? String "body"     |>.toOption |>.getD ""
+          -- If a trigger is set, skip issues whose body does not contain it
+          if !trigger.isEmpty && !(body.splitOn trigger).length > 1 then continue
+          let url    := item.getObjValAs? String "html_url" |>.toOption |>.getD ""
+          let vars   := [("issue_number", numStr), ("title", title), ("body", body),
+                         ("url", url), ("author", author),
+                         ("upstream", entry.upstream), ("fork", entry.fork)]
+          allEvents := allEvents.push (eventId, vars)
+    return allEvents
 
-  | .githubPrReviews repo labels => do
-    -- Fetch open PRs
-    let prJsonOpt ← runGhApi s!"/repos/{repo}/pulls?state=open&per_page=100" ghToken
-    let prArr ← match prJsonOpt with
-      | none    => return #[]
-      | some j  => match j.getArr? with
-        | .ok a  => pure a
-        | .error _ => return #[]
-    let mut events : Array (String × List (String × String)) := #[]
-    for pr in prArr do
-      let .ok prNum := pr.getObjValAs? Nat "number" | continue
-      let prTitle := pr.getObjValAs? String "title" |>.toOption |>.getD ""
-      -- Filter by label if any are configured
-      if !labels.isEmpty then
-        let prLabels : List String :=
-          (pr.getObjValAs? (Array Json) "labels" |>.toOption |>.getD #[]).toList.filterMap
-            (fun l => l.getObjValAs? String "name" |>.toOption)
-        if !labels.any (fun l => prLabels.contains l) then continue
-      -- Fetch reviews for this PR
-      let reviewJsonOpt ← runGhApi s!"/repos/{repo}/pulls/{prNum}/reviews?per_page=100" ghToken
-      let reviews ← match reviewJsonOpt with
-        | none   => pure (#[] : Array Json)
-        | some j => match j.getArr? with
+  | .githubPrReviews repos labels trigger sourceAuthorizedUsers => do
+    let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
+    let mut allEvents : Array (String × List (String × String)) := #[]
+    for entry in repos do
+      -- Fetch open PRs
+      let prJsonOpt ← runGhApi s!"/repos/{entry.upstream}/pulls?state=open&per_page=100" ghToken
+      let prArr ← match prJsonOpt with
+        | none    => pure (#[] : Array Json)
+        | some j  => match j.getArr? with
           | .ok a  => pure a
           | .error _ => pure #[]
-      for review in reviews do
-        let .ok ridJson := review.getObjVal? "id" | continue
-        let ridStr := toString ridJson
-        if state.processedIds.contains ridStr then continue
-        -- Only include submitted reviews with a non-empty body
-        let reviewState := review.getObjValAs? String "state" |>.toOption |>.getD ""
-        if reviewState != "COMMENTED" && reviewState != "CHANGES_REQUESTED" &&
-           reviewState != "APPROVED" then continue
-        let body     := review.getObjValAs? String "body" |>.toOption |>.getD ""
-        let reviewer := match review.getObjVal? "user" |>.toOption with
-          | none   => ""
-          | some u => u.getObjValAs? String "login" |>.toOption |>.getD ""
-        let url      := review.getObjValAs? String "html_url" |>.toOption |>.getD ""
-        let vars := [
-          ("pr_number",  toString prNum),
-          ("pr_title",   prTitle),
-          ("reviewer",   reviewer),
-          ("body",       body),
-          ("url",        url)
-        ]
-        events := events.push (ridStr, vars)
-    return events
+      for pr in prArr do
+        let .ok prNum := pr.getObjValAs? Nat "number" | continue
+        let prTitle := pr.getObjValAs? String "title" |>.toOption |>.getD ""
+        -- Filter by label if any are configured
+        if !labels.isEmpty then
+          let prLabels : List String :=
+            (pr.getObjValAs? (Array Json) "labels" |>.toOption |>.getD #[]).toList.filterMap
+              (fun l => l.getObjValAs? String "name" |>.toOption)
+          if !labels.any (fun l => prLabels.contains l) then continue
+        -- Fetch reviews for this PR
+        let reviewJsonOpt ← runGhApi
+          s!"/repos/{entry.upstream}/pulls/{prNum}/reviews?per_page=100" ghToken
+        let reviews ← match reviewJsonOpt with
+          | none   => pure (#[] : Array Json)
+          | some j => match j.getArr? with
+            | .ok a  => pure a
+            | .error _ => pure #[]
+        for review in reviews do
+          let .ok ridJson := review.getObjVal? "id" | continue
+          let ridStr  := toString ridJson
+          let eventId := s!"{entry.upstream}:{ridStr}"
+          if state.processedIds.contains eventId then continue
+          -- Only include submitted reviews with a non-empty body
+          let reviewState := review.getObjValAs? String "state" |>.toOption |>.getD ""
+          if reviewState != "COMMENTED" && reviewState != "CHANGES_REQUESTED" &&
+             reviewState != "APPROVED" then continue
+          let reviewer := match review.getObjVal? "user" |>.toOption with
+            | none   => ""
+            | some u => u.getObjValAs? String "login" |>.toOption |>.getD ""
+          if !isAuthorized allowed reviewer then continue
+          let body := review.getObjValAs? String "body" |>.toOption |>.getD ""
+          -- If a trigger is set, skip reviews whose body does not contain it
+          if !trigger.isEmpty && !(body.splitOn trigger).length > 1 then continue
+          let url  := review.getObjValAs? String "html_url" |>.toOption |>.getD ""
+          let vars := [
+            ("pr_number",  toString prNum),
+            ("pr_title",   prTitle),
+            ("reviewer",   reviewer),
+            ("body",       body),
+            ("url",        url),
+            ("upstream",   entry.upstream),
+            ("fork",       entry.fork)
+          ]
+          allEvents := allEvents.push (eventId, vars)
+    return allEvents
 
-  | .githubComments repo labels trigger => do
+  | .githubComments repos labels trigger sourceAuthorizedUsers => do
     -- On the first run lastChecked is empty: initialise state and return nothing,
     -- so we don't flood the queue with all historical comments.
     if state.lastChecked.isEmpty then return #[]
-    -- Helper: extract an event from one comment JSON object, react with 🚀, return vars.
-    let processComment : Json → IO (Option (String × List (String × String))) :=
-      fun comment => do
-        let .ok idNum := comment.getObjValAs? Nat "id" | return none
-        let idStr := toString idNum
-        if state.processedIds.contains idStr then return none
-        let body := comment.getObjValAs? String "body" |>.toOption |>.getD ""
-        -- Only process comments that contain the trigger string
-        if !(body.splitOn trigger).length > 1 then return none
-        -- React with a rocket emoji (best-effort; ignore failures)
-        try reactToComment repo idNum ghToken catch _ => pure ()
-        let author   := match comment.getObjVal? "user" |>.toOption with
-          | none   => ""
-          | some u => u.getObjValAs? String "login" |>.toOption |>.getD ""
-        let url      := comment.getObjValAs? String "html_url" |>.toOption |>.getD ""
-        -- Extract issue/PR number from the issue_url field
-        let issueUrl := comment.getObjValAs? String "issue_url" |>.toOption |>.getD ""
-        let issueNum := issueUrl.splitOn "/" |>.getLast? |>.getD ""
-        let vars := [("comment_id", idStr), ("body", body), ("author", author),
-                     ("url", url), ("issue_number", issueNum)]
-        return some (idStr, vars)
-    let mut events : Array (String × List (String × String)) := #[]
-    if labels.isEmpty then
-      -- Use the global issue comments endpoint with a `since` filter
-      let endpoint :=
-        s!"/repos/{repo}/issues/comments?since={state.lastChecked}&per_page=100&direction=asc"
-      let jsonOpt ← runGhApi endpoint ghToken
-      let comments ← match jsonOpt with
-        | none   => pure (#[] : Array Json)
-        | some j => match j.getArr? with
-          | .ok a    => pure a
-          | .error _ => pure #[]
-      for comment in comments do
-        if let some ev ← processComment comment then
-          events := events.push ev
-    else
-      -- Fetch only issues/PRs that carry one of the requested labels
-      let labelParam := ",".intercalate labels
-      let issuesOpt ← runGhApi
-        s!"/repos/{repo}/issues?state=open&labels={labelParam}&per_page=100" ghToken
-      let issues ← match issuesOpt with
-        | none   => pure (#[] : Array Json)
-        | some j => match j.getArr? with
-          | .ok a    => pure a
-          | .error _ => pure #[]
-      for issue in issues do
-        let .ok issNum := issue.getObjValAs? Nat "number" | continue
-        let commentsOpt ← runGhApi
-          s!"/repos/{repo}/issues/{issNum}/comments?since={state.lastChecked}&per_page=100"
-          ghToken
-        let comments ← match commentsOpt with
+    let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
+    let mut allEvents : Array (String × List (String × String)) := #[]
+    for entry in repos do
+      -- Helper: extract an event from one comment JSON object, react with 🚀, return vars.
+      let processComment : Json → IO (Option (String × List (String × String))) :=
+        fun comment => do
+          let .ok idNum := comment.getObjValAs? Nat "id" | return none
+          let idStr   := toString idNum
+          let eventId := s!"{entry.upstream}:{idStr}"
+          if state.processedIds.contains eventId then return none
+          let body := comment.getObjValAs? String "body" |>.toOption |>.getD ""
+          -- Only process comments that contain the trigger string
+          if !(body.splitOn trigger).length > 1 then return none
+          let author := match comment.getObjVal? "user" |>.toOption with
+            | none   => ""
+            | some u => u.getObjValAs? String "login" |>.toOption |>.getD ""
+          -- Authorization check: skip unauthorized users (no reaction either)
+          if !isAuthorized allowed author then return none
+          -- React with a rocket emoji (best-effort; ignore failures)
+          try reactToComment entry.upstream idNum ghToken catch _ => pure ()
+          let url      := comment.getObjValAs? String "html_url" |>.toOption |>.getD ""
+          -- Extract issue/PR number from the issue_url field
+          let issueUrl := comment.getObjValAs? String "issue_url" |>.toOption |>.getD ""
+          let issueNum := issueUrl.splitOn "/" |>.getLast? |>.getD ""
+          let vars := [("comment_id", idStr), ("body", body), ("author", author),
+                       ("url", url), ("issue_number", issueNum),
+                       ("upstream", entry.upstream), ("fork", entry.fork)]
+          return some (eventId, vars)
+      if labels.isEmpty then
+        -- Use the global issue comments endpoint with a `since` filter
+        let endpoint :=
+          s!"/repos/{entry.upstream}/issues/comments?since={state.lastChecked}&per_page=100&direction=asc"
+        let jsonOpt ← runGhApi endpoint ghToken
+        let comments ← match jsonOpt with
           | none   => pure (#[] : Array Json)
           | some j => match j.getArr? with
             | .ok a    => pure a
             | .error _ => pure #[]
         for comment in comments do
           if let some ev ← processComment comment then
-            events := events.push ev
-    return events
+            allEvents := allEvents.push ev
+      else
+        -- Fetch only issues/PRs that carry one of the requested labels
+        let labelParam := ",".intercalate labels
+        let issuesOpt ← runGhApi
+          s!"/repos/{entry.upstream}/issues?state=open&labels={labelParam}&per_page=100" ghToken
+        let issues ← match issuesOpt with
+          | none   => pure (#[] : Array Json)
+          | some j => match j.getArr? with
+            | .ok a    => pure a
+            | .error _ => pure #[]
+        for issue in issues do
+          let .ok issNum := issue.getObjValAs? Nat "number" | continue
+          let commentsOpt ← runGhApi
+            s!"/repos/{entry.upstream}/issues/{issNum}/comments?since={state.lastChecked}&per_page=100"
+            ghToken
+          let comments ← match commentsOpt with
+            | none   => pure (#[] : Array Json)
+            | some j => match j.getArr? with
+              | .ok a    => pure a
+              | .error _ => pure #[]
+          for comment in comments do
+            if let some ev ← processComment comment then
+              allEvents := allEvents.push ev
+    return allEvents
 
   | .shell cmd args => do
     let child ← IO.Process.spawn {

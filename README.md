@@ -48,7 +48,8 @@ Create `~/.agent/config.json`:
     "pat": "github_pat_..."
   },
   "plugin_dirs": [],
-  "claude_token": "..."
+  "claude_token": "...",
+  "authorized_users": ["<GitHub_username>"]
 }
 ```
 
@@ -185,6 +186,43 @@ file:
   }
 }
 ```
+
+## listeners
+
+Listeners poll event sources and automatically enqueue tasks. Listener configs
+are JSON files placed in `~/.agent/listeners/`.
+
+Example — respond to issue comments containing a trigger word:
+
+```json
+{
+  "name": "issue-comments",
+  "source": {
+    "type": "github-comments",
+    "repos": [
+      {"upstream": "upstream-org/upstream-repo", "fork": "your-org/upstream-repo"}
+    ],
+    "trigger": "@orchestra",
+    "authorized_users": ["alice", "bob"]
+  },
+  "action": {
+    "upstream": "{{upstream}}",
+    "fork": "{{fork}}",
+    "mode": "fork",
+    "prompt_template": "A comment has been left on issue/PR #{{issue_number}}.\n\nAuthor: {{author}}\nURL: {{url}}\n\n{{body}}\n\nPlease read the comment and take the appropriate action.",
+    "series": "issue-{{issue_number}}"
+  },
+  "interval_seconds": 120
+}
+```
+
+Fields:
+
+- `source.type` — `"github-issues"`, `"github-comments"`, `"github-pr-reviews"`, or `"shell"`
+- `source.repos` — list of `{"upstream": "...", "fork": "..."}` pairs
+- `source.trigger` — only events whose body contains this string are processed
+- `source.authorized_users` — list of GitHub logins that may trigger the listener; empty means allow everyone
+- `action.prompt_template` — template rendered with event variables (e.g. `{{upstream}}`, `{{fork}}`, `{{issue_number}}`, `{{body}}`, `{{author}}`)
 
 ## other commands
 
