@@ -93,6 +93,8 @@ structure AppConfig where
   anthropicBaseUrl : Option String := none
   /-- Anthropic auth token passed to the agent as ANTHROPIC_AUTH_TOKEN. -/
   anthropicAuthToken : Option String := none
+  /-- Repository in 'owner/repo' format that hosts informal context for PR reviews. -/
+  informalContextRepo : Option String := none
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -110,8 +112,10 @@ instance : FromJson AppConfig where
     let anthropicApiKey := j.getObjValAs? String "anthropic_api_key" |>.toOption
     let anthropicBaseUrl := j.getObjValAs? String "anthropic_base_url" |>.toOption
     let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
+    let informalContextRepo := j.getObjValAs? String "informal_context_repo" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
-             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken }
+             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken,
+             informalContextRepo }
 
 structure TaskFile where
   tasks : Array Task

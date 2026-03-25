@@ -2,6 +2,7 @@ import Lean.Data.Json
 import Std.Internal.UV.TCP
 import Std.Net
 import Orchestra.GitHub
+import Orchestra.InformalContext
 
 open Lean (Json)
 open Std.Net
@@ -18,6 +19,8 @@ structure State where
   privateKeyPath : String
   installationId : Nat
   pat : String
+  /-- Repository for storing informal PR review context, e.g. 'owner/context-repo'. -/
+  informalContextRepo : Option String := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -99,6 +102,24 @@ private def toolsList : Json :=
         ]),
         ("required", .arr #["pr_number"])
       ])
+    ],
+    Json.mkObj [
+      ("name", "add_informal_context"),
+      ("description", "Attach informal annotations (line-range comments) to a pull request and push them to the informal-context web repository for review visualization."),
+      ("inputSchema", Json.mkObj [
+        ("type", "object"),
+        ("properties", Json.mkObj [
+          ("pr_number", Json.mkObj [
+            ("type", "integer"),
+            ("description", "Pull request number to annotate.")
+          ]),
+          ("annotations", Json.mkObj [
+            ("type", "string"),
+            ("description", "JSON string: array of {startLine, endLine, comment} objects.")
+          ])
+        ]),
+        ("required", .arr #["pr_number", "annotations"])
+      ])
     ]
   ])]
 
@@ -110,6 +131,7 @@ inductive ToolCall where
   | refreshToken
   | createPr (title : String) (body : String) (head : String) (base : String)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
+  | addInformalContext (prNumber : Nat) (annotationsJson : String)
   | unknown (name : String)
   | parseError (msg : String)
 
@@ -146,6 +168,18 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
           let unresolvedOnly  := args.getObjValAs? Bool "unresolved_only"  |>.toOption |>.getD false
           let excludeOutdated := args.getObjValAs? Bool "exclude_outdated" |>.toOption |>.getD false
           .getPrComments prNumInt.toNat unresolvedOnly excludeOutdated
+  | "add_informal_context" =>
+    match args.getObjVal? "pr_number" |>.toOption with
+    | none => .parseError "missing required argument: pr_number"
+    | some prNumJson =>
+      match prNumJson.getInt? |>.toOption with
+      | none => .parseError "pr_number must be an integer"
+      | some prNumInt =>
+        if prNumInt <= 0 then .parseError "pr_number must be a positive integer"
+        else
+          match args.getObjValAs? String "annotations" |>.toOption with
+          | none => .parseError "missing required argument: annotations"
+          | some annJson => .addInformalContext prNumInt.toNat annJson
   | _ => .unknown name
 
 /-- Parse a JSON-RPC message into a typed `Request`.
@@ -257,6 +291,25 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     catch e =>
       log s!"tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)
+  | .addInformalContext prNumber annotationsJson =>
+    log s!"tool add_informal_context: pr={prNumber}"
+    match state.informalContextRepo with
+    | none =>
+      log "tool add_informal_context: error: informalContextRepo not configured"
+      return toolContent "informal_context_repo not set in config" (isError := true)
+    | some webRepo =>
+      match InformalContext.parseAnnotations annotationsJson with
+      | .error e =>
+        log s!"tool add_informal_context: validation error: {e}"
+        return toolContent s!"invalid annotations: {e}" (isError := true)
+      | .ok annotations =>
+        try
+          InformalContext.pushAnnotations webRepo state.upstream prNumber annotations state.pat
+          log s!"tool add_informal_context: ok: pushed {annotations.size} annotation(s)"
+          return toolContent s!"Pushed {annotations.size} annotation(s) for PR #{prNumber} to {webRepo}"
+        catch e =>
+          log s!"tool add_informal_context: error: {e}"
+          return toolContent (toString e) (isError := true)
   | .unknown name =>
     log s!"tool {name}: unknown"
     return toolContent s!"unknown tool: {name}" (isError := true)
