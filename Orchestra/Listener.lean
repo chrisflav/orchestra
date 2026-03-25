@@ -10,21 +10,21 @@ namespace Orchestra.Listener
 -- Repo entry: upstream + fork as full org/name strings
 
 /-- A source/fork repo pair for a listener.
-    `upstream` is the org/name of the repo to watch (e.g. `"pimotte-agents/orchestra"`).
-    `repo` is the org/name of the fork to use for the action (e.g. `"my-fork/orchestra"`). -/
+    `upstream` is the org/name of the repo to watch (e.g. `"my-account/orchestra"`).
+    `fork` is the org/name of the fork to use for the action (e.g. `"my-fork/orchestra"`). -/
 structure RepoEntry where
   upstream : String
-  repo     : String
+  fork     : String
 deriving BEq, Repr
 
 instance : ToJson RepoEntry where
-  toJson e := Json.mkObj [("upstream", e.upstream), ("repo", e.repo)]
+  toJson e := Json.mkObj [("upstream", e.upstream), ("fork", e.fork)]
 
 instance : FromJson RepoEntry where
   fromJson? j := do
     let upstream ← j.getObjValAs? String "upstream"
-    let repo     ← j.getObjValAs? String "repo"
-    return { upstream, repo }
+    let fork     ← j.getObjValAs? String "fork"
+    return { upstream, fork }
 
 -- Source configuration
 
@@ -70,13 +70,13 @@ instance : ToJson SourceConfig where
                     ("args", ToJson.toJson args)]
 
 /-- Parse a `repos` list from JSON.  If `"repos"` is absent, fall back to the singular
-    `"repo"` string (treated as both `upstream` and `repo`). -/
+    `"fork"` string (treated as both `upstream` and `fork`). -/
 private def parseRepos (j : Json) : Except String (List RepoEntry) :=
   match j.getObjValAs? (List RepoEntry) "repos" |>.toOption with
   | some rs => .ok rs
   | none    =>
-    match j.getObjValAs? String "repo" with
-    | .ok r  => .ok [{ upstream := r, repo := r }]
+    match j.getObjValAs? String "fork" with
+    | .ok r  => .ok [{ upstream := r, fork := r }]
     | .error e => .error e
 
 instance : FromJson SourceConfig where
@@ -113,8 +113,8 @@ structure ActionConfig where
   /-- Upstream org/name. May be a template string (e.g. `"{{upstream}}"`).
       Defaults to `""`, in which case the `upstream` template variable is used. -/
   upstream       : String := ""
-  /-- Fork org/name. May be a template string (e.g. `"{{repo}}"`).
-      Defaults to `""`, in which case the `repo` template variable is used. -/
+  /-- Fork org/name. May be a template string (e.g. `"{{fork}}"`).
+      Defaults to `""`, in which case the `fork` template variable is used. -/
   fork           : String := ""
   mode           : TaskMode
   promptTemplate : String
@@ -284,7 +284,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
   let prompt    := renderTemplate action.promptTemplate vars
   let series    := action.series.map (renderTemplate · vars)
   let mode      := action.mode
-  -- Render upstream/fork through templates; fall back to {{upstream}}/{{repo}} vars if empty.
+  -- Render upstream/fork through templates; fall back to {{upstream}}/{{fork}} vars if empty.
   let lookupVar (key : String) : String :=
     vars.find? (fun p => p.1 == key) |>.map (·.2) |>.getD ""
   let upstream :=
@@ -292,7 +292,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     if rendered.isEmpty then lookupVar "upstream" else rendered
   let fork :=
     let rendered := renderTemplate action.fork vars
-    if rendered.isEmpty then lookupVar "repo" else rendered
+    if rendered.isEmpty then lookupVar "fork" else rendered
   IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent}"
   return {
     id, createdAt, status := .pending,
@@ -359,7 +359,7 @@ Poll a source for new events not yet in `state.processedIds`.
 Returns an array of `(eventId, templateVars)` pairs.
 `eventId` is `""` for shell sources (no deduplication by ID).
 Event IDs for GitHub sources are prefixed with the upstream slug
-(e.g. `"pimotte-agents/orchestra:12345"`) so a single state file
+(e.g. `"my-account/orchestra:12345"`) so a single state file
 correctly deduplicates events across multiple repos.
 -/
 def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String)
@@ -397,7 +397,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           let url    := item.getObjValAs? String "html_url" |>.toOption |>.getD ""
           let vars   := [("issue_number", numStr), ("title", title), ("body", body),
                          ("url", url), ("author", author),
-                         ("upstream", entry.upstream), ("repo", entry.repo)]
+                         ("upstream", entry.upstream), ("fork", entry.fork)]
           allEvents := allEvents.push (eventId, vars)
     return allEvents
 
@@ -453,7 +453,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
             ("body",       body),
             ("url",        url),
             ("upstream",   entry.upstream),
-            ("repo",       entry.repo)
+            ("fork",       entry.fork)
           ]
           allEvents := allEvents.push (eventId, vars)
     return allEvents
@@ -488,7 +488,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           let issueNum := issueUrl.splitOn "/" |>.getLast? |>.getD ""
           let vars := [("comment_id", idStr), ("body", body), ("author", author),
                        ("url", url), ("issue_number", issueNum),
-                       ("upstream", entry.upstream), ("repo", entry.repo)]
+                       ("upstream", entry.upstream), ("fork", entry.fork)]
           return some (eventId, vars)
       if labels.isEmpty then
         -- Use the global issue comments endpoint with a `since` filter

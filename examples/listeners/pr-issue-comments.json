@@ -3,14 +3,14 @@
   "source": {
     "type": "github-comments",
     "repos": [
-      {"upstream": "upstream-org/upstream-repo", "repo": "your-org/upstream-repo"}
+      {"upstream": "upstream-org/upstream-repo", "fork": "your-org/upstream-repo"}
     ],
     "trigger": "@orchestra",
     "authorized_users": []
   },
   "action": {
     "upstream": "{{upstream}}",
-    "fork": "{{repo}}",
+    "fork": "{{fork}}",
     "mode": "fork",
     "prompt_template": "A comment has been left on issue/PR #{{issue_number}}.\n\nAuthor: {{author}}\nURL: {{url}}\n\n{{body}}\n\nPlease read the comment and take the appropriate action.",
     "series": "issue-{{issue_number}}"
