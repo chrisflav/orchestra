@@ -28,6 +28,44 @@ private def stripExt (s ext : String) : String :=
 private def shellQuote (s : String) : String :=
   "'" ++ s.replace "'" "'\\''" ++ "'"
 
+-- Memory helpers
+
+/-- Sanitize a `owner/repo` string into a safe directory name, e.g. `owner-repo`. -/
+private def sanitizeProjectName (upstream : String) : String :=
+  upstream.map (fun c => if c == '/' then '-' else c)
+
+/-- Return the active memory directories for the given mode and upstream repo.
+    Creates the directories if they do not yet exist. -/
+private def resolveMemoryDirs (mode : MemoryMode) (upstream : String) : IO (Array String) := do
+  match ← IO.getEnv "HOME" with
+  | none => return #[]
+  | some home =>
+    let memBase := System.FilePath.mk home / ".agent" / "memory"
+    let globalDir  := memBase
+    let projectDir := memBase / sanitizeProjectName upstream
+    let dirs : Array System.FilePath :=
+      match mode with
+      | .none    => #[]
+      | .global  => #[globalDir]
+      | .project => #[projectDir]
+      | .both    => #[globalDir, projectDir]
+    for dir in dirs do
+      IO.FS.createDirAll dir
+    return dirs.map (·.toString)
+
+/-- Build a system-prompt addition describing the available memory directories. -/
+private def memorySystemPrompt (memoryDirs : Array String) : Option String :=
+  if memoryDirs.isEmpty then none
+  else
+    let bullet := fun d => s!"- {d}"
+    let list   := String.intercalate "\n" (memoryDirs.toList.map bullet)
+    some s!"## Memory\n\nYou have access to a persistent memory system. \
+The following director{if memoryDirs.size == 1 then "y is" else "ies are"} \
+mounted read-write inside your sandbox:\n\n{list}\n\n\
+Use these directories to store information that should persist across tasks. \
+For example, maintain a `MEMORY.md` file with important context, decisions, and findings \
+that will be valuable for future runs."
+
 -- Task execution
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.
@@ -35,7 +73,8 @@ private def shellQuote (s : String) : String :=
 private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (continuesFrom : Option String := none)
     (series : Option String := none)
-    (cancelToken : Option Std.CancellationToken := none) : IO (String × Bool) := do
+    (cancelToken : Option Std.CancellationToken := none)
+    (interactive : Bool := true) : IO (String × Bool) := do
   IO.println s!"=== Task {idx}: {task.fork} ({repr task.mode}) ==="
   -- Record this run in the task store
   let taskId ← TaskStore.generateId
@@ -69,7 +108,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   IO.println "  Token ready"
   -- 2. Clone / update repo
   IO.println s!"Cloning/updating {task.fork}..."
-  let repoPath ← Repo.ensureCloned task.fork task.upstream
+  let repoPath ← Repo.ensureCloned task.fork task.upstream interactive
   IO.println s!"  Repo at {repoPath}"
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   let serverState : Server.State := {
@@ -87,25 +126,59 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   RepoConfig.runInitIfNeeded repoPath
   let repoConfig ← RepoConfig.loadRepoConfig repoPath
   -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
-  let systemPrompt ← loadSystemPrompt task.systemPrompt
+  let baseSystemPrompt ← loadSystemPrompt task.systemPrompt
+  -- 5a. Resolve memory directories and amend system prompt
+  let memoryDirs ← resolveMemoryDirs task.memory task.upstream
+  let systemPrompt :=
+    match baseSystemPrompt, memorySystemPrompt memoryDirs with
+    | none,    none    => none
+    | some sp, none    => some sp
+    | none,    some mp => some mp
+    | some sp, some mp => some (sp ++ "\n\n" ++ mp)
+  -- 5b. Load prepend prompt and apply to task prompt
+  let prependPrompt ← loadPrependPrompt
+  let baseTaskPrompt :=
+    match prependPrompt with
+    | none    => task.prompt
+    | some pp => pp ++ "\n\n" ++ task.prompt
   let mut sessionId : Option String := none
   let mut usageLimitHit := false
   let mut wasCancelled := false
+  let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
     RepoConfig.runHook repoPath "before.sh"
-    let prompt := if attempt == 0 then task.prompt else repoConfig.validation.retryPrompt
+    let prompt := if attempt == 0 then baseTaskPrompt else repoConfig.validation.retryPrompt
     let resume := if attempt == 0 then initialResume else sessionId
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
     let agentDef := match task.backend with
       | some "vibe" => AgentDef.vibe
       | _           => AgentDef.claude
+    let apiKeyEnv : Array (String × Option String) :=
+      #[("ANTHROPIC_API_KEY", appConfig.anthropicApiKey),
+        ("ANTHROPIC_BASE_URL", appConfig.anthropicBaseUrl),
+        ("ANTHROPIC_AUTH_TOKEN", appConfig.anthropicAuthToken),
+        ("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)]
+    let debugLogFile : Option System.FilePath ←
+      if debug then
+        let suffix := if attempt == 0 then "" else s!".retry{attempt}"
+        pure (some ((← TaskStore.tasksDir) / s!"{taskId}{suffix}.debug.jsonl"))
+      else pure none
+    -- Structured JSON log: ~/.agent/logs/{fork}/{taskId}.log (always)
+    let taskLogFile : Option System.FilePath ← do
+      match ← IO.getEnv "HOME" with
+      | none => pure none
+      | some home =>
+        let suffix := if attempt == 0 then "" else s!".retry{attempt}"
+        pure (some (System.FilePath.mk home / ".agent" / "logs" / task.fork / s!"{taskId}{suffix}.log"))
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
-      (debug := debug) (pluginDirs := appConfig.pluginDirs) (subAgent := task.agent)
-      (model := task.model) (systemPrompt := systemPrompt) (resume := resume)
-      (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
+      (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
+      (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
+      (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
+      (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
+    lastResultSubtype := result.resultSubtype
     if result.wasCancelled then
       IO.println "  Agent was cancelled."
       wasCancelled := true
@@ -126,8 +199,10 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   -- 7. Persist final task state
   let finalStatus :=
     if wasCancelled then .cancelled
-    else if usageLimitHit then .unfinished
-    else .completed
+    else match lastResultSubtype with
+      | some .success           => .completed
+      | some .errorMaxBudgetUsd => .unfinished
+      | _                       => if usageLimitHit then .unfinished else .completed
   TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
   if let some seriesName := series then
     TaskStore.updateSeriesPointer seriesName taskId
@@ -526,6 +601,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         backend      := entry.backend
         model        := entry.model
         budget       := entry.budget
+        memory       := entry.memory
       }
       let cfg ← match entry.configPath with
         | none    => pure appConfig
@@ -533,7 +609,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       try
         let (taskId, usageLimitHit) ← runTask cfg task 0 debug
           (continuesFrom := entry.continuesFrom) (series := entry.series)
-          (cancelToken := some taskToken)
+          (cancelToken := some taskToken) (interactive := false)
         currentTaskToken.atomically (·.set none)
         if ← taskToken.isCancelled then
           Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
@@ -561,7 +637,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       if now >= due then
         try
           let state  ← Listener.loadListenerState lcfg.name
-          let events ← Listener.pollSource lcfg.source state appConfig.pat
+          let events ← Listener.pollSource lcfg.source state appConfig.pat appConfig.authorizedUsers
           for ev in (events : Array (String × List (String × String))) do
             let qentry ← Listener.buildQueueEntry lcfg.action ev.2
             Queue.saveEntry qentry
@@ -640,17 +716,31 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
   let active := all.filter (fun e => e.status == .running || e.status == .pending)
   if active.isEmpty then
     IO.println "Queue: empty"
-    return 0
-  IO.println s!"Queue: {active.size} task(s)"
-  IO.println ""
-  IO.println s!"{padRight "ID" 16} {padRight "FORK" 32} {padRight "STATUS" 9} SERIES"
-  IO.println (String.ofList (List.replicate 70 '-'))
-  -- Show running first, then pending in oldest-first order
-  let running := active.filter (fun e => e.status == .running)
-  let pending := (active.filter (fun e => e.status == .pending)).toList.reverse.toArray
-  for e in running ++ pending do
-    let status := if e.status == .running then "running" else "pending"
-    IO.println s!"{padRight e.id 16} {padRight e.fork 32} {padRight status 9} {e.series.getD ""}"
+  else
+    IO.println s!"Queue: {active.size} task(s)"
+    IO.println ""
+    IO.println s!"{padRight "ID" 16} {padRight "FORK" 32} {padRight "STATUS" 9} SERIES"
+    IO.println (String.ofList (List.replicate 70 '-'))
+    -- Show running first, then pending in oldest-first order
+    let running := active.filter (fun e => e.status == .running)
+    let pending := (active.filter (fun e => e.status == .pending)).toList.reverse.toArray
+    for e in running ++ pending do
+      let status := if e.status == .running then "running" else "pending"
+      IO.println s!"{padRight e.id 16} {padRight e.fork 32} {padRight status 9} {e.series.getD ""}"
+  -- Listener status
+  let listenerConfigs ← Listener.loadAllListenerConfigs (← Listener.listenersDir)
+  if !listenerConfigs.isEmpty then
+    IO.println ""
+    IO.println s!"Listeners: {listenerConfigs.size}"
+    IO.println ""
+    IO.println s!"{padRight "LISTENER" 20} {padRight "INTERVAL" 9} {padRight "LAST CHECKED" 22} QUEUED"
+    IO.println (String.ofList (List.replicate 70 '-'))
+    for cfg in listenerConfigs do
+      let state       ← Listener.loadListenerState cfg.name
+      let lastChecked := if state.lastChecked.isEmpty then "never" else state.lastChecked
+      let queued      := toString state.processedIds.size ++ " events"
+      let interval    := s!"{cfg.intervalSeconds}s"
+      IO.println s!"{padRight cfg.name 20} {padRight interval 9} {padRight lastChecked 22} {queued}"
   return 0
 
 private def queueShutdownHandler (p : Parsed) : IO UInt32 := do

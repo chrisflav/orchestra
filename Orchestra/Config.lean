@@ -20,6 +20,33 @@ instance : ToJson TaskMode where
     | .fork => "fork"
     | .pr => "pr"
 
+/-- Controls which memory directories are made available to the agent.
+    - `none`    – no memory directories
+    - `global`  – global memory only (`~/.agent/memory/`)
+    - `project` – per-project memory only (`~/.agent/memory/<project>/`)
+    - `both`    – global and per-project memory (default) -/
+inductive MemoryMode where
+  | none
+  | global
+  | project
+  | both
+deriving Repr, Inhabited
+
+instance : FromJson MemoryMode where
+  fromJson?
+    | .str "none"    => .ok .none
+    | .str "global"  => .ok .global
+    | .str "project" => .ok .project
+    | .str "both"    => .ok .both
+    | j => .error s!"expected \"none\", \"global\", \"project\", or \"both\", got {j}"
+
+instance : ToJson MemoryMode where
+  toJson
+    | .none    => "none"
+    | .global  => "global"
+    | .project => "project"
+    | .both    => "both"
+
 structure Task where
   upstream : String
   fork : String
@@ -33,6 +60,8 @@ structure Task where
   model : Option String := none
   /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
   budget : Option Float := none
+  /-- Which memory directories to make available to the agent. Defaults to `both`. -/
+  memory : MemoryMode := .both
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -46,7 +75,8 @@ instance : FromJson Task where
     let backend := j.getObjValAs? String "backend" |>.toOption
     let model := j.getObjValAs? String "model" |>.toOption
     let budget := j.getObjValAs? Float "budget" |>.toOption
-    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget }
+    let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
+    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory }
 
 structure AppConfig where
   appId : Nat
@@ -54,6 +84,18 @@ structure AppConfig where
   installationId : Option Nat := none
   pat : String := ""
   pluginDirs : Array String := #[]
+  /-- Long-lived Claude OAuth token set via `claude setup-token`.
+      Exposed to the agent as `CLAUDE_CODE_OAUTH_TOKEN`. -/
+  claudeToken : Option String := none
+  /-- Anthropic API key passed to the agent as ANTHROPIC_API_KEY. -/
+  anthropicApiKey : Option String := none
+  /-- Anthropic base URL passed to the agent as ANTHROPIC_BASE_URL. -/
+  anthropicBaseUrl : Option String := none
+  /-- Anthropic auth token passed to the agent as ANTHROPIC_AUTH_TOKEN. -/
+  anthropicAuthToken : Option String := none
+  /-- GitHub logins allowed to trigger any listener. Empty = allow everyone.
+      Can be overridden per listener via `authorized_users` in the source config. -/
+  authorizedUsers : List String := []
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -67,7 +109,13 @@ instance : FromJson AppConfig where
       gh.getObjValAs? String "pat"
     ) |>.toOption |>.getD ""
     let pluginDirs := j.getObjValAs? (Array String) "plugin_dirs" |>.toOption |>.getD #[]
-    return { appId, privateKeyPath, installationId, pat, pluginDirs }
+    let claudeToken := j.getObjValAs? String "claude_token" |>.toOption
+    let anthropicApiKey := j.getObjValAs? String "anthropic_api_key" |>.toOption
+    let anthropicBaseUrl := j.getObjValAs? String "anthropic_base_url" |>.toOption
+    let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
+    let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
+    return { appId, privateKeyPath, installationId, pat, pluginDirs,
+             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers }
 
 structure TaskFile where
   tasks : Array Task
@@ -108,6 +156,18 @@ If `name` is `none`, reads `default.md`. Returns `none` if the file does not exi
 def loadSystemPrompt (name : Option String := none) : IO (Option String) := do
   let promptName := name.getD "default"
   let promptPath ← expandHome s!"~/.agent/prompts/{promptName}.md"
+  if ← promptPath.pathExists then
+    return some (← IO.FS.readFile promptPath)
+  else
+    return none
+
+/--
+Load a prepend prompt from `~/.agent/prompts/default-prepend.md`.
+If the file exists, its contents will be prepended to every task prompt.
+Returns `none` if the file does not exist.
+-/
+def loadPrependPrompt : IO (Option String) := do
+  let promptPath ← expandHome "~/.agent/prompts/default-prepend.md"
   if ← promptPath.pathExists then
     return some (← IO.FS.readFile promptPath)
   else

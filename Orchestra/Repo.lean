@@ -33,20 +33,51 @@ def splitRepo (s : String) : IO (String × String) := do
 /--
 Ensure the fork is cloned and the upstream remote is configured.
 Returns the path to the local repository.
+When `interactive` is false (e.g. queue mode), user prompts are suppressed and
+an error is thrown instead.
 -/
-def ensureCloned (fork upstream : String) : IO System.FilePath := do
+def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO System.FilePath := do
   let (forkOwner, forkRepo) ← splitRepo fork
   let base ← workDir
   let repoPath := base / forkOwner / forkRepo
   if ← repoPath.pathExists then
-    -- Verify it's a git repo
-    let _ ← runGit #["rev-parse", "--git-dir"] repoPath
-    -- Make sure upstream remote exists
-    let remotes ← runGit #["remote"] repoPath
-    let hasUpstream := remotes.splitOn "\n" |>.any (· == "upstream")
-    if !hasUpstream then
+    let entries ← repoPath.readDir
+    if entries.isEmpty then
+      -- Empty directory left over from a failed clone: remove and retry
+      IO.println s!"  Directory '{repoPath}' is empty; removing and re-cloning..."
+      IO.FS.removeDirAll repoPath
+      IO.FS.createDirAll repoPath
+      runGit' #["clone", s!"https://github.com/{fork}.git", repoPath.toString]
       runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
-    return repoPath
+      return repoPath
+    else
+      -- Non-empty: verify it's a valid git repo
+      let isGitRepo : Bool ← do
+        try
+          let _ ← runGit #["rev-parse", "--git-dir"] repoPath
+          pure true
+        catch _ =>
+          pure false
+      if !isGitRepo then
+        if !interactive then
+          throw (IO.userError s!"Directory '{repoPath}' exists but is not a valid git repository. Remove it manually and try again.")
+        IO.eprint s!"Directory '{repoPath}' exists but is not a valid git repository.\nDelete it and re-clone? [y/N] "
+        let stdin ← IO.getStdin
+        let answer := (← stdin.getLine).trimAscii.toString.toLower
+        if answer == "y" || answer == "yes" then
+          IO.FS.removeDirAll repoPath
+          IO.FS.createDirAll repoPath
+          runGit' #["clone", s!"https://github.com/{fork}.git", repoPath.toString]
+          runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+          return repoPath
+        else
+          throw (IO.userError s!"Directory '{repoPath}' is not a valid git repository. Remove it manually and try again.")
+      -- Make sure upstream remote exists
+      let remotes ← runGit #["remote"] repoPath
+      let hasUpstream := remotes.splitOn "\n" |>.any (· == "upstream")
+      if !hasUpstream then
+        runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+      return repoPath
   else
     IO.FS.createDirAll repoPath
     runGit' #["clone", s!"https://github.com/{fork}.git", repoPath.toString]
