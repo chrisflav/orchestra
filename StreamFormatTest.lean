@@ -5,9 +5,13 @@ open Lean (Json ToJson)
 open Orchestra
 open Orchestra.StreamFormat
 
+deriving instance DecidableEq for ResultSubtype
+
 @[test]
 def resultSubtypeSuccess : Test := do
-  let line := r#"{"type":"result","subtype":"success","result":"all done","num_turns":5,"duration_ms":3000,"total_cost_usd":0.01}"#
+  let line := "{\"type\":\"result\",\"subtype\":\"success\"," ++
+    "\"result\":\"all done\",\"num_turns\":5," ++
+    "\"duration_ms\":3000,\"total_cost_usd\":0.01}"
   match parseEvent line with
   | some (.result sub _ _ _ _) =>
     TestM.assertEqual sub ResultSubtype.success (msg := "success subtype")
