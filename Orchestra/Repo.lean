@@ -18,6 +18,24 @@ private def runGit (args : Array String) (cwd : Option System.FilePath := none) 
 private def runGit' (args : Array String) (cwd : Option System.FilePath := none) : IO Unit := do
   let _ ← runGit args cwd
 
+private def runGh (args : Array String) (cwd : Option System.FilePath := none) : IO String := do
+  let child ← IO.Process.spawn {
+    cmd := "gh"
+    args
+    cwd
+    stdout := .piped
+    stderr := .piped
+  }
+  let stdout ← child.stdout.readToEnd
+  let stderr ← child.stderr.readToEnd
+  let code ← child.wait
+  if code != 0 then
+    throw (.userError s!"gh {args[0]!} failed (exit {code}):\n{stderr}")
+  return stdout.trimAscii.toString
+
+private def runGh' (args : Array String) (cwd : Option System.FilePath := none) : IO Unit := do
+  let _ ← runGh args cwd
+
 /-- Base directory for all agent work. -/
 def workDir : IO System.FilePath := do
   match ← IO.getEnv "HOME" with
@@ -30,11 +48,17 @@ def splitRepo (s : String) : IO (String × String) := do
   | [owner, repo] => return (owner, repo)
   | _ => throw (.userError s!"invalid repo format '{s}', expected 'owner/repo'")
 
+/-- Build a plain GitHub HTTPS URL (no credentials). -/
+private def githubUrl (repo : String) : String :=
+  s!"https://github.com/{repo}.git"
+
 /--
 Ensure the fork is cloned and the upstream remote is configured.
 Returns the path to the local repository.
 When `interactive` is false (e.g. queue mode), user prompts are suppressed and
 an error is thrown instead.
+Cloning is performed via `gh repo clone`, which uses the GitHub App authentication
+already configured by `GitHub.setupGhAuth`.
 -/
 def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO System.FilePath := do
   let (forkOwner, forkRepo) ← splitRepo fork
@@ -47,8 +71,8 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
       IO.println s!"  Directory '{repoPath}' is empty; removing and re-cloning..."
       IO.FS.removeDirAll repoPath
       IO.FS.createDirAll repoPath
-      runGit' #["clone", s!"https://github.com/{fork}.git", repoPath.toString]
-      runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+      runGh' #["repo", "clone", fork, repoPath.toString]
+      runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
       return repoPath
     else
       -- Non-empty: verify it's a valid git repo
@@ -67,8 +91,8 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
         if answer == "y" || answer == "yes" then
           IO.FS.removeDirAll repoPath
           IO.FS.createDirAll repoPath
-          runGit' #["clone", s!"https://github.com/{fork}.git", repoPath.toString]
-          runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+          runGh' #["repo", "clone", fork, repoPath.toString]
+          runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
           return repoPath
         else
           throw (IO.userError s!"Directory '{repoPath}' is not a valid git repository. Remove it manually and try again.")
@@ -76,12 +100,12 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
       let remotes ← runGit #["remote"] repoPath
       let hasUpstream := remotes.splitOn "\n" |>.any (· == "upstream")
       if !hasUpstream then
-        runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+        runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
       return repoPath
   else
     IO.FS.createDirAll repoPath
-    runGit' #["clone", s!"https://github.com/{fork}.git", repoPath.toString]
-    runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+    runGh' #["repo", "clone", fork, repoPath.toString]
+    runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
     return repoPath
 
 /-- Remove all cloned repositories. -/
