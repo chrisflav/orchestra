@@ -1,4 +1,5 @@
 import Orchestra.StreamFormat
+import Orchestra.Config
 import Lean.Data.Json
 
 open Lean (Json)
@@ -61,6 +62,10 @@ structure AgentDef where
   /-- Return true if the agent exited because it hit a usage/quota limit.
       Receives the process exit code and the full stderr content. -/
   isUsageLimitError : UInt32 → String → Bool
+  /-- Map the raw fields of an authentication source to environment variable names for this backend.
+      Called to determine which environment variables to inject when a specific auth source is selected.
+      Keys in `AuthSourceRaw.fields` that are not recognised by the backend are silently ignored. -/
+  envVarsOfAuthSource : AuthSourceRaw → Array (String × String)
 
 namespace AgentDef
 
@@ -123,6 +128,13 @@ def claude : AgentDef where
   extractSessionId _ := pure none
   cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()
   isUsageLimitError := stdUsageLimitError
+  envVarsOfAuthSource src :=
+    src.fields.filterMap fun (k, v) => match k with
+      | "anthropic_api_key"    => some ("ANTHROPIC_API_KEY", v)
+      | "anthropic_base_url"   => some ("ANTHROPIC_BASE_URL", v)
+      | "anthropic_auth_token" => some ("ANTHROPIC_AUTH_TOKEN", v)
+      | "claude_token"         => some ("CLAUDE_CODE_OAUTH_TOKEN", v)
+      | _ => none
 
 -- Vibe
 
@@ -261,6 +273,10 @@ def vibe : AgentDef where
   isUsageLimitError exitCode stderr :=
     stdUsageLimitError exitCode stderr ||
     (exitCode != 0 && containsCI stderr "quota exceeded")
+  envVarsOfAuthSource src :=
+    src.fields.filterMap fun (k, v) => match k with
+      | "mistral_api_key" => some ("MISTRAL_API_KEY", v)
+      | _ => none
 
 end AgentDef
 

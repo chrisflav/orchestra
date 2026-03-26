@@ -57,6 +57,8 @@ structure QueueEntry where
   budget        : Option Float  := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory        : MemoryMode    := .both
+  /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
+  authSource    : Option String := none
 deriving Repr
 
 instance : ToJson QueueEntry where
@@ -80,6 +82,7 @@ instance : ToJson QueueEntry where
     let fields := if let some s := e.configPath    then fields ++ [("config_path",     Json.str s)]      else fields
     let fields := if let some b := e.budget        then fields ++ [("budget",          ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson e.memory)]
+    let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -101,9 +104,10 @@ instance : FromJson QueueEntry where
     let configPath    := j.getObjValAs? String "config_path"    |>.toOption
     let budget        := j.getObjValAs? Float      "budget"  |>.toOption
     let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
+    let authSource    := j.getObjValAs? String "auth_source" |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget, memory }
+             budget, memory, authSource }
 
 -- Directories and paths
 

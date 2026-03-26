@@ -127,6 +127,8 @@ structure ActionConfig where
   budget         : Option Float  := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory         : MemoryMode    := .both
+  /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
+  authSource     : Option String := none
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -144,6 +146,7 @@ instance : ToJson ActionConfig where
     let fields := if let some s := a.systemPrompt then fields ++ [("system_prompt", Json.str s)]      else fields
     let fields := if let some b := a.budget       then fields ++ [("budget",        ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson a.memory)]
+    let fields := if let some s := a.authSource   then fields ++ [("auth_source",   Json.str s)]      else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -167,8 +170,9 @@ instance : FromJson ActionConfig where
           | _ => none
       | _ => none
     let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
+    let authSource := j.getObjValAs? String "auth_source" |>.toOption
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory }
+             budget, memory, authSource }
 
 -- Listener config
 
@@ -307,6 +311,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     series
     budget       := action.budget
     memory       := action.memory
+    authSource   := action.authSource
   }
 
 -- GitHub helpers

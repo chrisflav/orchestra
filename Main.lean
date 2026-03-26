@@ -68,6 +68,48 @@ that will be valuable for future runs."
 
 -- Task execution
 
+/-- Resolve the authentication environment variables for a given backend and optional auth source label.
+    If the task specifies an auth source label (or a default is configured), looks it up in the
+    per-agent auth configs and returns its env vars via the agent's `envVarsOfAuthSource`.
+    Falls back to the legacy flat API key fields when no per-agent auth is configured,
+    preserving backward compatibility with existing configs. -/
+private def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
+    (backendName : String) (requestedLabel : Option String)
+    : IO (Array (String × Option String)) := do
+  match appConfig.agentAuthConfigs.find? (fun c => c.name == backendName) with
+  | none =>
+    -- No per-agent auth configured: use legacy flat fields for backward compatibility
+    return #[("ANTHROPIC_API_KEY",       appConfig.anthropicApiKey),
+             ("ANTHROPIC_BASE_URL",      appConfig.anthropicBaseUrl),
+             ("ANTHROPIC_AUTH_TOKEN",    appConfig.anthropicAuthToken),
+             ("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)]
+  | some agentAuth =>
+    -- Determine which label to use
+    let label ← match requestedLabel with
+      | some l => pure l
+      | none   =>
+        match agentAuth.defaultAuthSource with
+        | some d => pure d
+        | none   =>
+          if agentAuth.authSources.size == 1 then
+            pure agentAuth.authSources[0]!.label
+          else
+            throw (.userError
+              s!"Multiple auth sources configured for backend '{backendName}'. \
+                 Specify one via the 'auth_source' field.")
+    -- Validate label uniqueness (warn on duplicates)
+    let dupeCount := agentAuth.authSources.filter (fun s => s.label == label) |>.size
+    if dupeCount > 1 then
+      IO.eprintln s!"  Warning: duplicate auth source label '{label}' for backend '{backendName}'"
+    -- Find the source with the matching label
+    match agentAuth.authSources.find? (fun s => s.label == label) with
+    | none => throw (.userError
+        s!"Auth source '{label}' not found for backend '{backendName}'. \
+           Available: {", ".intercalate (agentAuth.authSources.toList.map (·.label))}")
+    | some src =>
+      let vars := agentDef.envVarsOfAuthSource src
+      return vars.map fun (k, v) => (k, some v)
+
 /-- Run a single task: clone repo, start MCP server, run validation loop.
     Returns the task ID and whether the run was cut short by a usage limit. -/
 private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
@@ -154,11 +196,8 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     let agentDef := match task.backend with
       | some "vibe" => AgentDef.vibe
       | _           => AgentDef.claude
-    let apiKeyEnv : Array (String × Option String) :=
-      #[("ANTHROPIC_API_KEY", appConfig.anthropicApiKey),
-        ("ANTHROPIC_BASE_URL", appConfig.anthropicBaseUrl),
-        ("ANTHROPIC_AUTH_TOKEN", appConfig.anthropicAuthToken),
-        ("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)]
+    let backendName := task.backend.getD "claude"
+    let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName task.authSource
     let debugLogFile : Option System.FilePath ←
       if debug then
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
@@ -481,6 +520,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         continuesFrom, series
         configPath
         budget       := budgetFlag.orElse (fun _ => task.budget)
+        authSource   := task.authSource
       }
       Queue.saveEntry entry
       IO.println entry.id
@@ -602,6 +642,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         model        := entry.model
         budget       := entry.budget
         memory       := entry.memory
+        authSource   := entry.authSource
       }
       let cfg ← match entry.configPath with
         | none    => pure appConfig

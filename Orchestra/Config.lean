@@ -47,6 +47,50 @@ instance : ToJson MemoryMode where
     | .project => "project"
     | .both    => "both"
 
+/-- A single authentication source for an agent backend, as stored in the configuration.
+    The `fields` array contains agent-specific key-value pairs parsed from the JSON object
+    (all non-label string fields). Each backend's `AgentDef` defines which keys are recognised
+    and how they map to environment variables. -/
+structure AuthSourceRaw where
+  /-- Unique label identifying this source within its agent backend. -/
+  label  : String
+  /-- Agent-specific configuration fields (e.g., `"anthropic_api_key"`). -/
+  fields : Array (String × String) := #[]
+deriving Repr, Inhabited
+
+instance : FromJson AuthSourceRaw where
+  fromJson? j := do
+    let label ← j.getObjValAs? String "label"
+    -- Collect all other string-valued fields from the JSON object
+    let fields : Array (String × String) :=
+      match j with
+      | .obj kvs =>
+        kvs.foldl (init := #[]) fun acc k v =>
+          if k == "label" then acc
+          else match v with
+          | .str s => acc.push (k, s)
+          | _ => acc
+      | _ => #[]
+    return { label, fields }
+
+/-- Authentication source configuration for one agent backend. -/
+structure AgentAuthConfig where
+  /-- Backend name (e.g., `"claude"`, `"vibe"`). -/
+  name : String
+  /-- Available authentication sources for this backend. Labels must be unique. -/
+  authSources : Array AuthSourceRaw := #[]
+  /-- Label of the default authentication source.
+      If absent and exactly one source is configured, that source is used automatically. -/
+  defaultAuthSource : Option String := none
+deriving Repr, Inhabited
+
+instance : FromJson AgentAuthConfig where
+  fromJson? j := do
+    let name             ← j.getObjValAs? String "name"
+    let authSources       := j.getObjValAs? (Array AuthSourceRaw) "auth_sources" |>.toOption |>.getD #[]
+    let defaultAuthSource := j.getObjValAs? String "default_auth_source" |>.toOption
+    return { name, authSources, defaultAuthSource }
+
 structure Task where
   upstream : String
   fork : String
@@ -62,6 +106,9 @@ structure Task where
   budget : Option Float := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory : MemoryMode := .both
+  /-- Label of the authentication source to use for this task.
+      Must match a label in the agent's `auth_sources` config. -/
+  authSource : Option String := none
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -76,7 +123,9 @@ instance : FromJson Task where
     let model := j.getObjValAs? String "model" |>.toOption
     let budget := j.getObjValAs? Float "budget" |>.toOption
     let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
-    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory }
+    let authSource := j.getObjValAs? String "auth_source" |>.toOption
+    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory,
+             authSource }
 
 structure AppConfig where
   appId : Nat
@@ -96,6 +145,9 @@ structure AppConfig where
   /-- GitHub logins allowed to trigger any listener. Empty = allow everyone.
       Can be overridden per listener via `authorized_users` in the source config. -/
   authorizedUsers : List String := []
+  /-- Per-backend authentication source configurations.
+      Allows configuring multiple named authentication sources for each agent backend. -/
+  agentAuthConfigs : Array AgentAuthConfig := #[]
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -114,8 +166,10 @@ instance : FromJson AppConfig where
     let anthropicBaseUrl := j.getObjValAs? String "anthropic_base_url" |>.toOption
     let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
     let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
+    let agentAuthConfigs := j.getObjValAs? (Array AgentAuthConfig) "agents" |>.toOption |>.getD #[]
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
-             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers }
+             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
+             agentAuthConfigs }
 
 structure TaskFile where
   tasks : Array Task
