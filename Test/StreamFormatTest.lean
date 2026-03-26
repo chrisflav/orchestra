@@ -1,5 +1,5 @@
-import Orchestra.TestM
-import Orchestra.StreamFormat
+import Test.TestM
+import Orchestra
 
 open Lean (Json ToJson)
 open Orchestra

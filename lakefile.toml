@@ -12,10 +12,7 @@ rev = "main"
 name = "Orchestra"
 
 [[lean_lib]]
-name = "ListenerConfigTest"
-
-[[lean_lib]]
-name = "StreamFormatTest"
+name = "Test"
 
 [[lean_exe]]
 name = "orchestra"

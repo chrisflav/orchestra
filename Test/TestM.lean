@@ -1,5 +1,5 @@
 import Lean
-import Orchestra.Config
+import Orchestra
 
 /-!
 # Test monad and `@[test]` attribute
