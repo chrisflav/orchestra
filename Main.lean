@@ -108,7 +108,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   IO.println "  Token ready"
   -- 2. Clone / update repo
   IO.println s!"Cloning/updating {task.fork}..."
-  let repoPath ← Repo.ensureCloned task.fork task.upstream interactive (token := some token)
+  let repoPath ← Repo.ensureCloned task.fork task.upstream interactive
   IO.println s!"  Repo at {repoPath}"
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   let serverState : Server.State := {
