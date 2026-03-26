@@ -47,38 +47,54 @@ instance : ToJson MemoryMode where
     | .project => "project"
     | .both    => "both"
 
-/-- A single authentication source for an agent backend, as stored in the configuration.
-    The `fields` array contains agent-specific key-value pairs parsed from the JSON object
-    (all non-label string fields). Each backend's `AgentDef` defines which keys are recognised
-    and how they map to environment variables. -/
-structure AuthSourceRaw where
-  /-- Unique label identifying this source within its agent backend. -/
-  label  : String
-  /-- Agent-specific configuration fields (e.g., `"anthropic_api_key"`). -/
-  fields : Array (String × String) := #[]
+/-- The kind of authentication for an agent backend. -/
+inductive AuthKind where
+  /-- An OAuth token. -/
+  | oauthToken (token : String)
+  /-- An API key with an optional base URL. -/
+  | apiKey (key : String) (baseUrl : Option String := none)
 deriving Repr, Inhabited
 
-instance : FromJson AuthSourceRaw where
+instance : FromJson AuthKind where
+  fromJson? j := do
+    -- Determine the kind from the fields present in the JSON object
+    if let .ok token := j.getObjValAs? String "oauth_token" then
+      return .oauthToken token
+    if let .ok key := j.getObjValAs? String "api_key" then
+      let baseUrl := j.getObjValAs? String "base_url" |>.toOption
+      return .apiKey key baseUrl
+    .error "expected \"oauth_token\" or \"api_key\" field"
+
+instance : ToJson AuthKind where
+  toJson
+    | .oauthToken token => Json.mkObj [("oauth_token", token)]
+    | .apiKey key baseUrl =>
+      let fields : List (String × Json) := [("api_key", key)]
+      let fields := match baseUrl with
+        | some url => fields ++ [("base_url", Json.str url)]
+        | none => fields
+      Json.mkObj fields
+
+/-- A single authentication source for an agent backend. -/
+structure AuthSource where
+  /-- Unique label identifying this source within its agent backend. -/
+  label : String
+  /-- The authentication kind and its credentials. -/
+  kind  : AuthKind
+deriving Repr, Inhabited
+
+instance : FromJson AuthSource where
   fromJson? j := do
     let label ← j.getObjValAs? String "label"
-    -- Collect all other string-valued fields from the JSON object
-    let fields : Array (String × String) :=
-      match j with
-      | .obj kvs =>
-        kvs.foldl (init := #[]) fun acc k v =>
-          if k == "label" then acc
-          else match v with
-          | .str s => acc.push (k, s)
-          | _ => acc
-      | _ => #[]
-    return { label, fields }
+    let kind ← @FromJson.fromJson? AuthKind _ j
+    return { label, kind }
 
 /-- Authentication source configuration for one agent backend. -/
 structure AgentAuthConfig where
   /-- Backend name (e.g., `"claude"`, `"vibe"`). -/
   name : String
   /-- Available authentication sources for this backend. Labels must be unique. -/
-  authSources : Array AuthSourceRaw := #[]
+  authSources : Array AuthSource := #[]
   /-- Label of the default authentication source.
       If absent and exactly one source is configured, that source is used automatically. -/
   defaultAuthSource : Option String := none
@@ -87,7 +103,7 @@ deriving Repr, Inhabited
 instance : FromJson AgentAuthConfig where
   fromJson? j := do
     let name             ← j.getObjValAs? String "name"
-    let authSources       := j.getObjValAs? (Array AuthSourceRaw) "auth_sources" |>.toOption |>.getD #[]
+    let authSources       := j.getObjValAs? (Array AuthSource) "auth_sources" |>.toOption |>.getD #[]
     let defaultAuthSource := j.getObjValAs? String "default_auth_source" |>.toOption
     return { name, authSources, defaultAuthSource }
 
