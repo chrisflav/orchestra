@@ -397,7 +397,9 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           let url    := item.getObjValAs? String "html_url" |>.toOption |>.getD ""
           let vars   := [("issue_number", numStr), ("title", title), ("body", body),
                          ("url", url), ("author", author),
-                         ("upstream", entry.upstream), ("fork", entry.fork)]
+                         ("upstream", entry.upstream), ("fork", entry.fork),
+                         ("upstream_escaped", entry.upstream.replace "/" "_"),
+                         ("fork_escaped", entry.fork.replace "/" "_")]
           allEvents := allEvents.push (eventId, vars)
     return allEvents
 
@@ -453,7 +455,9 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
             ("body",       body),
             ("url",        url),
             ("upstream",   entry.upstream),
-            ("fork",       entry.fork)
+            ("fork",       entry.fork),
+            ("upstream_escaped", entry.upstream.replace "/" "_"),
+            ("fork_escaped",     entry.fork.replace "/" "_")
           ]
           allEvents := allEvents.push (eventId, vars)
     return allEvents
@@ -488,7 +492,9 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           let issueNum := issueUrl.splitOn "/" |>.getLast? |>.getD ""
           let vars := [("comment_id", idStr), ("body", body), ("author", author),
                        ("url", url), ("issue_number", issueNum),
-                       ("upstream", entry.upstream), ("fork", entry.fork)]
+                       ("upstream", entry.upstream), ("fork", entry.fork),
+                       ("upstream_escaped", entry.upstream.replace "/" "_"),
+                       ("fork_escaped", entry.fork.replace "/" "_")]
           return some (eventId, vars)
       if labels.isEmpty then
         -- Use the global issue comments endpoint with a `since` filter
