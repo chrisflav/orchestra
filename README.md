@@ -63,6 +63,69 @@ Obtain one by running `claude setup-token` and copy the token value here. When
 set, it is passed to the agent as the `CLAUDE_CODE_OAUTH_TOKEN` environment
 variable.
 
+## authentication sources
+
+The `agents` array in `config.json` lets you configure multiple named
+authentication sources per backend. Each source carries either an OAuth token
+or an API key:
+
+```json
+{
+  "github_app": { "..." : "..." },
+  "agents": [
+    {
+      "name": "claude",
+      "auth_sources": [
+        { "label": "work", "oauth_token": "sk-ant-oat-..." },
+        { "label": "personal", "api_key": "sk-ant-api-..." }
+      ],
+      "default_auth_source": "work"
+    },
+    {
+      "name": "vibe",
+      "auth_sources": [
+        { "label": "main", "api_key": "mistral-..." }
+      ]
+    }
+  ]
+}
+```
+
+Each authentication source object has the following fields:
+
+- `label` — unique name within the backend, used to reference the source
+- `oauth_token` — an OAuth token (sets `CLAUDE_CODE_OAUTH_TOKEN` for the
+  claude backend)
+- `api_key` — an API key (sets `ANTHROPIC_API_KEY` for claude,
+  `MISTRAL_API_KEY` for vibe)
+- `base_url` — optional base URL used with `api_key` (sets
+  `ANTHROPIC_BASE_URL` for claude)
+
+Exactly one of `oauth_token` or `api_key` must be present per source.
+
+The `default_auth_source` field selects which source is used when a task does
+not specify one. When omitted and only one source is configured, that source
+is selected automatically.
+
+To select a specific source in a task, set the `auth_source` field:
+
+```json
+{
+  "upstream": "owner/repo",
+  "fork": "org/repo",
+  "mode": "pr",
+  "prompt": "Fix the bug.",
+  "auth_source": "personal"
+}
+```
+
+The same `auth_source` field is available on queue entries and listener
+actions.
+
+The legacy flat fields (`claude_token`, `anthropic_api_key`,
+`anthropic_base_url`, `anthropic_auth_token`) still work when no `agents`
+array is present, so existing configurations remain valid.
+
 System prompts can be placed in `~/.agent/prompts/`. The file
 `~/.agent/prompts/default.md` is loaded automatically; named prompts can be
 referenced via the `system_prompt` field in a task file.
