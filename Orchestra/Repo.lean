@@ -73,7 +73,6 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
       IO.FS.createDirAll repoPath
       runGh' #["repo", "clone", fork, repoPath.toString]
       runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
-      return repoPath
     else
       -- Non-empty: verify it's a valid git repo
       let isGitRepo : Bool ← do
@@ -93,20 +92,27 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
           IO.FS.createDirAll repoPath
           runGh' #["repo", "clone", fork, repoPath.toString]
           runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
-          return repoPath
         else
           throw (IO.userError s!"Directory '{repoPath}' is not a valid git repository. Remove it manually and try again.")
-      -- Make sure upstream remote exists
-      let remotes ← runGit #["remote"] repoPath
-      let hasUpstream := remotes.splitOn "\n" |>.any (· == "upstream")
-      if !hasUpstream then
-        runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
-      return repoPath
+      else
+        -- Make sure upstream remote exists
+        let remotes ← runGit #["remote"] repoPath
+        let hasUpstream := remotes.splitOn "\n" |>.any (· == "upstream")
+        if !hasUpstream then
+          runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
+        -- Make sure origin points at the fork HTTPS URL
+        let originUrl ← runGit #["remote", "get-url", "origin"] repoPath
+        let expectedOriginUrl := githubUrl fork
+        if originUrl != expectedOriginUrl then
+          IO.println s!"  Fixing origin URL: {originUrl} → {expectedOriginUrl}"
+          runGit' #["remote", "set-url", "origin", expectedOriginUrl] repoPath
   else
     IO.FS.createDirAll repoPath
     runGh' #["repo", "clone", fork, repoPath.toString]
     runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
-    return repoPath
+  -- Ensure gh credentials are wired into git for authenticated pushes
+  runGh' #["auth", "setup-git"] none
+  return repoPath
 
 /-- Remove all cloned repositories. -/
 def cleanup : IO Unit := do
