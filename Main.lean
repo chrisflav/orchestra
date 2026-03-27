@@ -429,7 +429,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     let exePath ← IO.appPath
     let quotedArgs := filteredArgs.map shellQuote |> String.intercalate " "
     let shellCmd :=
-      s!"exec {shellQuote exePath.toString} {quotedArgs} >> {shellQuote logFile.toString} 2>&1 & echo $!"
+      s!"exec stdbuf -oL {shellQuote exePath.toString} {quotedArgs} >> {shellQuote logFile.toString} 2>&1 & echo $!"
     let launcher ← IO.Process.spawn {
       cmd := "sh"
       args := #["-c", shellCmd]
