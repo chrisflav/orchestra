@@ -34,6 +34,7 @@ inductive ContentItem where
 inductive ResultSubtype where
   | success
   | errorMaxBudgetUsd
+  | error (msg : String)
   | unknown (raw : String)
 deriving BEq, Repr
 
@@ -50,9 +51,10 @@ inductive Event where
 -- Serialisation
 
 private def resultSubtypeStr : ResultSubtype → String
-  | .success          => "success"
+  | .success           => "success"
   | .errorMaxBudgetUsd => "error_max_budget_usd"
-  | .unknown raw      => raw
+  | .error _           => "error"
+  | .unknown raw       => raw
 
 instance : ToJson ResultSubtype where
   toJson sub := Json.str (resultSubtypeStr sub)
@@ -124,16 +126,20 @@ def parseEvent (line : String) : Option Event := do
     if stdout.isEmpty && stderr.isEmpty then none
     else some (.toolResult stdout stderr)
   | "result" =>
-    let sub := match jStr json "subtype" with
-      | "success"              => ResultSubtype.success
-      | "error_max_budget_usd" => ResultSubtype.errorMaxBudgetUsd
-      | raw                    => ResultSubtype.unknown raw
+    let isError := json.getObjValAs? Bool "is_error" |>.toOption |>.getD false
+    let res := jStr json "result"
+    let sub :=
+      if isError then ResultSubtype.error res
+      else match jStr json "subtype" with
+        | "success"              => ResultSubtype.success
+        | "error_max_budget_usd" => ResultSubtype.errorMaxBudgetUsd
+        | raw                    => ResultSubtype.unknown raw
     some (.result
       sub
       (json.getObjValAs? Nat "num_turns" |>.toOption)
       (json.getObjValAs? Nat "duration_ms" |>.toOption)
       (jVal json "total_cost_usd")
-      (jStr json "result"))
+      res)
   | "rate_limit_event" => none
   | other => some (.unknown other)
 
@@ -179,7 +185,9 @@ def format : Event → String
     let turns := match numTurns with | some n => s!" | {n} turns" | none => ""
     let dur := match durationMs with | some ms => s!" | {ms / 1000}s" | none => ""
     let cost := match costUsd with | some v => s!" | ${v.compress}" | none => ""
-    let resPart := if res.isEmpty then "" else s!"\n{truncate res 300}"
+    let resPart := match sub with
+      | .error msg => s!"\n{truncate msg 300}"
+      | _ => if res.isEmpty then "" else s!"\n{truncate res 300}"
     s!"[done] {resultSubtypeStr sub}{turns}{dur}{cost}{resPart}"
   | .unknown t => s!"[{t}]"
 

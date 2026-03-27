@@ -241,6 +241,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     else match lastResultSubtype with
       | some .success           => .completed
       | some .errorMaxBudgetUsd => .unfinished
+      | some (.error _)         => .failed
       | _                       => if usageLimitHit then .unfinished else .completed
   TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
   if let some seriesName := series then

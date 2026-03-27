@@ -28,6 +28,16 @@ def resultSubtypeErrorMaxBudget : Test := do
   | _ => TestM.fail "expected result event"
 
 @[test]
+def resultSubtypeIsError : Test := do
+  let line :=
+    r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: permission denied"}"#
+  match parseEvent line with
+  | some (.result sub _ _ _ _) =>
+    TestM.assertEqual sub (ResultSubtype.error "API Error: permission denied")
+      (msg := "is_error=true should produce error subtype with message")
+  | _ => TestM.fail "expected result event"
+
+@[test]
 def resultSubtypeUnknown : Test := do
   let line :=
     r#"{"type":"result","subtype":"some_new_error","result":""}"#
@@ -45,6 +55,8 @@ def resultSubtypeToJson : Test := do
     (msg := "toJson success")
   TestM.assertEqual (toJsonStr ResultSubtype.errorMaxBudgetUsd)
     "\"error_max_budget_usd\"" (msg := "toJson errorMaxBudgetUsd")
+  TestM.assertEqual (toJsonStr (ResultSubtype.error "some message"))
+    "\"error\"" (msg := "toJson error")
   TestM.assertEqual (toJsonStr (ResultSubtype.unknown "my_error"))
     "\"my_error\"" (msg := "toJson unknown")
 
