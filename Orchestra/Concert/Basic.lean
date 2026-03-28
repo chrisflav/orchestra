@@ -25,19 +25,7 @@ abbrev ConcertM (α : Type) := StateM ConcertState α
 def run (task : SerieslessTask) : ConcertM Unit := do
   let state ← get
   let fullTask : Task := {
-    upstream := task.upstream
-    fork := task.fork
-    mode := task.mode
-    prompt := task.prompt
-    agent := task.agent
-    systemPrompt := task.systemPrompt
-    backend := task.backend
-    model := task.model
-    budget := task.budget
-    memory := task.memory
-    authSource := task.authSource
-    tools := task.tools
-    readOnly := task.readOnly
+    toSerieslessTask := task
     series := state.currentSeries.map (·.name)
   }
   set { state with tasks := state.tasks.push fullTask }
