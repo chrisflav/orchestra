@@ -681,9 +681,10 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           let state  ← Listener.loadListenerState lcfg.name
           let events ← Listener.pollSource lcfg.source state appConfig.pat appConfig.authorizedUsers
           for ev in (events : Array (String × List (String × String))) do
-            let qentry ← Listener.buildQueueEntry lcfg.action ev.2
-            Queue.saveEntry qentry
-            IO.println s!"  Listener '{lcfg.name}': queued entry {qentry.id}"
+            for action in lcfg.actions do
+              let qentry ← Listener.buildQueueEntry action ev.2
+              Queue.saveEntry qentry
+              IO.println s!"  Listener '{lcfg.name}': queued entry {qentry.id}"
           -- Update state: record processed IDs and last-checked timestamp
           let newIds   := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)

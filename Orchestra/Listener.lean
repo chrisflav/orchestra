@@ -179,14 +179,16 @@ instance : FromJson ActionConfig where
 structure ListenerConfig where
   name            : String
   source          : SourceConfig
-  action          : ActionConfig
+  /-- The list of actions to enqueue (in order) when an event fires.
+      Tasks are enqueued sequentially and the FIFO queue ensures they run in order. -/
+  actions         : List ActionConfig
   intervalSeconds : Nat := 60
 
 instance : ToJson ListenerConfig where
   toJson l := Json.mkObj [
     ("name",             l.name),
     ("source",           ToJson.toJson l.source),
-    ("action",           ToJson.toJson l.action),
+    ("actions",          ToJson.toJson l.actions),
     ("interval_seconds", l.intervalSeconds)
   ]
 
@@ -194,9 +196,15 @@ instance : FromJson ListenerConfig where
   fromJson? j := do
     let name            ← j.getObjValAs? String "name"
     let source          ← j.getObjValAs? SourceConfig "source"
-    let action          ← j.getObjValAs? ActionConfig "action"
+    -- Accept both `"actions": [...]` (new) and `"action": {...}` (legacy single-action).
+    let actions ←
+      match j.getObjValAs? (List ActionConfig) "actions" |>.toOption with
+      | some as => pure as
+      | none    => do
+          let a ← j.getObjValAs? ActionConfig "action"
+          pure [a]
     let intervalSeconds  := j.getObjValAs? Nat "interval_seconds" |>.toOption |>.getD 60
-    return { name, source, action, intervalSeconds }
+    return { name, source, actions, intervalSeconds }
 
 -- Listener state
 

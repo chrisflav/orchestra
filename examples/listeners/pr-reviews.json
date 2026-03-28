@@ -8,13 +8,15 @@
     "labels": ["orchestra"],
     "authorized_users": []
   },
-  "action": {
-    "upstream": "{{upstream}}",
-    "fork": "{{fork}}",
-    "mode": "fork",
-    "prompt_template": "A reviewer has left feedback on pull request #{{pr_number}} (\"{{pr_title}}\").\n\nReviewer: {{reviewer}}\nURL: {{url}}\n\n{{body}}\n\nPlease address the reviewer's comments and push updated commits to the pull request branch.",
-    "series": "pr-{{pr_number}}",
-    "budget": 2.0
-  },
+  "actions": [
+    {
+      "upstream": "{{upstream}}",
+      "fork": "{{fork}}",
+      "mode": "fork",
+      "prompt_template": "A reviewer has left feedback on pull request #{{pr_number}} (\"{{pr_title}}\").\n\nReviewer: {{reviewer}}\nURL: {{url}}\n\n{{body}}\n\nPlease address the reviewer's comments and push updated commits to the pull request branch.",
+      "series": "pr-{{pr_number}}",
+      "budget": 2.0
+    }
+  ],
   "interval_seconds": 120
 }
