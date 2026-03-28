@@ -8,23 +8,6 @@ structure Series where
   private mk ::
   name : String
 
-/-- A task without series information, used as input to the Concert DSL. -/
-structure SerieslessTask where
-  upstream : String
-  fork : String
-  mode : TaskMode
-  prompt : String
-  agent : Option String := none
-  systemPrompt : Option String := none
-  backend : Option String := none
-  model : Option String := none
-  budget : Option Float := none
-  memory : MemoryMode := .both
-  authSource : Option String := none
-  tools : Option (List String) := none
-  readOnly : Bool := false
-deriving Repr, Inhabited
-
 /-- The state maintained during Concert program execution. -/
 structure ConcertState where
   /-- The accumulated list of tasks (the eventual output when compiling). -/
