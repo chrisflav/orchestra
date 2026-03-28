@@ -51,16 +51,31 @@ instance : ToJson MemoryMode where
 structure SerieslessTask where
   upstream : String
   fork : String
+  /-- Legacy mode field (deprecated). Use `tools` instead.
+      If `tools` is absent, this field is used to derive the allowed tools:
+      - `fork` → no tools
+      - `pr`   → `["create_pr"]` -/
   mode : TaskMode
   prompt : String
   agent : Option String := none
   systemPrompt : Option String := none
+  /-- Agent backend to use: "claude" (default) or "vibe". -/
   backend : Option String := none
+  /-- Model override passed to the agent (e.g. "sonnet", "devstral-small"). -/
   model : Option String := none
+  /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
   budget : Option Float := none
+  /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory : MemoryMode := .both
+  /-- Label of the authentication source to use for this task.
+      Must match a label in the agent's `auth_sources` config. -/
   authSource : Option String := none
+  /-- Optional tools to enable beyond the always-available ones (health, refresh_token,
+      get_pr_comments). Currently the only optional tool is `"create_pr"`.
+      When absent, the allowed tools are derived from `mode` for backwards compatibility. -/
   tools : Option (List String) := none
+  /-- If true, the project folder is mounted read-only in the sandbox.
+      Useful for tasks that should only read the codebase (e.g. review tasks). -/
   readOnly : Bool := false
 deriving Repr, Inhabited
 
