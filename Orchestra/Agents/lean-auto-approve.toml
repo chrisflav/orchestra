@@ -1,0 +1,23 @@
+display_name = "Lean (auto-edit)"
+description = "Lean 4 proof assistant that auto-approves file edits"
+safety = "destructive"
+auto_approve = true
+active_model = "leanstral"
+system_prompt_id = "lean"
+
+[[providers]]
+name = "mistral"
+api_base = "https://api.mistral.ai/v1"
+api_key_env_var = "MISTRAL_API_KEY"
+backend = "mistral"
+
+[[models]]
+name = "labs-leanstral-2603"
+provider = "mistral"
+alias = "leanstral"
+thinking = "high"
+temperature = 1.0
+auto_compact_threshold = 168000
+
+[tools.bash]
+default_timeout = 1200 
