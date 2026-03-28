@@ -49,13 +49,18 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (budget : Float := 4.0)
     (cancelToken : Option Std.CancellationToken := none)
     (debugLogFile : Option System.FilePath := none)
-    (logFile : Option System.FilePath := none) : IO LaunchResult := do
+    (logFile : Option System.FilePath := none)
+    -- If true, mount the project repository read-only in the sandbox.
+    (readOnly : Bool := false) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
   let mut args : Array String := #[]
-  -- Read-write access to the repo and /tmp
-  args := args.push "--rwx" |>.push repoPath.toString
+  -- Repo access: read-only or read-write depending on the task's readOnly flag
+  if readOnly then
+    args := args.push "--rox" |>.push repoPath.toString
+  else
+    args := args.push "--rwx" |>.push repoPath.toString
   args := args.push "--rw" |>.push "/tmp"
   -- Read+execute system paths (binaries, libraries)
   for p in paths.rox do

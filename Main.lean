@@ -66,6 +66,22 @@ Use these directories to store information that should persist across tasks. \
 For example, maintain a `MEMORY.md` file with important context, decisions, and findings \
 that will be valuable for future runs."
 
+-- Tools helpers
+
+/-- Derive the list of allowed optional tools from a task's `tools` and `mode` fields.
+    If `tools` is `some list`, use it directly.
+    If `tools` is `none`, fall back to mode-based rules for backwards compatibility:
+    - `pr`   → `["create_pr"]`
+    - `fork` → `[]`
+    Returns the resolved tool list and a flag indicating whether the legacy `mode` fallback was used. -/
+private def resolveTools (mode : TaskMode) (tools : Option (List String)) :
+    List String × Bool :=
+  match tools with
+  | some ts => (ts, false)
+  | none    => match mode with
+    | .pr   => (["create_pr"], true)
+    | .fork => ([], true)
+
 -- Task execution
 
 /-- Resolve the authentication environment variables for a given backend and optional auth source label.
@@ -153,10 +169,15 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   let repoPath ← Repo.ensureCloned task.fork task.upstream interactive
   IO.println s!"  Repo at {repoPath}"
   -- 3. Start MCP server (runs in this process, outside the sandbox)
+  -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
+  let (allowedTools, usingModeFallback) := resolveTools task.mode task.tools
+  if usingModeFallback then
+    IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
+      Use 'tools' instead (e.g. {repr allowedTools}) and optionally 'read_only: true/false'."
   let serverState : Server.State := {
     upstream := task.upstream
     fork := task.fork
-    allowPR := match task.mode with | .pr => true | .fork => false
+    allowedTools
     appId := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
     installationId
@@ -215,6 +236,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
       (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
+      (readOnly := task.readOnly)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     lastResultSubtype := result.resultSubtype
@@ -315,7 +337,8 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
   let token ← GitHub.createInstallationToken jwt installationId
   GitHub.setupGhAuth token
   let serverState : Server.State := {
-    upstream, fork, allowPR
+    upstream, fork
+    allowedTools := if allowPR then ["create_pr"] else []
     appId := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
     installationId
@@ -522,6 +545,8 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         configPath
         budget       := budgetFlag.orElse (fun _ => task.budget)
         authSource   := task.authSource
+        tools        := task.tools
+        readOnly     := task.readOnly
       }
       Queue.saveEntry entry
       IO.println entry.id
@@ -644,6 +669,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         budget       := entry.budget
         memory       := entry.memory
         authSource   := entry.authSource
+        tools        := entry.tools
+        readOnly     := entry.readOnly
       }
       let cfg ← match entry.configPath with
         | none    => pure appConfig
