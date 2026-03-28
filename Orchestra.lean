@@ -1,4 +1,5 @@
 import Orchestra.AgentDef
+import Orchestra.Concert
 import Orchestra.Config
 import Orchestra.GitHub
 import Orchestra.Listener
