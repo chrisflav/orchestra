@@ -39,6 +39,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (serverPort : UInt16)
     (ghToken : String)
     (debug : Bool := false)
+    (dryRun : Bool := false)
     (extraEnv : Array (String × Option String) := #[])
     (pluginDirs : Array String := #[])
     (memoryDirs : Array String := #[])
@@ -111,9 +112,12 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let allPluginDirs := pluginDirs ++ memoryDirs
   let agentArgs := agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
   args := args ++ agentArgs
-  if debug then
+  if debug || dryRun then
     let argsStr := String.intercalate " " (args.toList.map shellEscape)
     IO.eprintln s!"[debug] cd {shellEscape repoPath.toString} && landrun {argsStr}"
+  if dryRun then
+    agentDef.cleanup mcpContext
+    return { exitCode := 0, sessionId := none, usageLimitHit := false, wasCancelled := false }
   let child ← IO.Process.spawn {
     cmd := "landrun"
     args

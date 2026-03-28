@@ -116,7 +116,8 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     (continuesFrom : Option String := none)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
-    (interactive : Bool := true) : IO (String × Bool) := do
+    (interactive : Bool := true)
+    (dryRun : Bool := false) : IO (String × Bool) := do
   IO.println s!"=== Task {idx}: {task.fork} ({repr task.mode}) ==="
   -- Record this run in the task store
   let taskId ← TaskStore.generateId
@@ -189,7 +190,8 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
-    RepoConfig.runHook repoPath "before.sh"
+    if !dryRun then
+      RepoConfig.runHook repoPath "before.sh"
     let prompt := if attempt == 0 then baseTaskPrompt else repoConfig.validation.retryPrompt
     let resume := if attempt == 0 then initialResume else sessionId
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
@@ -211,10 +213,11 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
         pure (some (System.FilePath.mk home / ".agent" / "logs" / task.fork / s!"{taskId}{suffix}.log"))
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
-      (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
+      (debug := debug) (dryRun := dryRun) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
       (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
       (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
+    if dryRun then break
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     lastResultSubtype := result.resultSubtype
@@ -233,7 +236,8 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     else
       IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
   -- 6. Run after hook and shut down MCP server
-  RepoConfig.runHook repoPath "after.sh"
+  if !dryRun then
+    RepoConfig.runHook repoPath "after.sh"
   shutdown
   -- 7. Persist final task state
   let finalStatus :=
@@ -270,6 +274,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let configPath    := p.flag? "config"    |>.map (·.as! String)
   let taskIdx       := p.flag? "task"      |>.map (·.as! Nat)
   let debug         := p.hasFlag "debug"
+  let dryRun        := p.hasFlag "dry_run"
   let continuesFrom := p.flag? "continues" |>.map (·.as! String)
   let series        := p.flag? "series"    |>.map (·.as! String)
   let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
@@ -296,7 +301,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
       let task := match budgetFlag with
         | none   => tasks[i]!
         | some b => { tasks[i]! with budget := some b }
-      let _ ← runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
+      let _ ← runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series) (dryRun := dryRun)
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
   return (0 : UInt32)
@@ -818,6 +823,7 @@ private def runCmd' : Cmd := `[Cli|
     c, config : String; "Path to config file (default: ~/.agent/config.json)"
     t, task : Nat; "Run only the task at this index (0-based)"
     d, debug; "Print the landrun command before executing it"
+    dry_run; "Print the landrun command without launching the agent"
     continues : String; "Continue from a previous task by ID (requires --task with multi-task files)"
     series : String; "Assign this run to a named task series"
     budget : String; "Maximum spend in USD, overrides task file (default: 4.0)"

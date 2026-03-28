@@ -19,7 +19,13 @@ private def jArr' (j : Json) (key : String) : Option (Array Json) :=
   | _ => none
 
 /-- Parse one line of vibe's `--output streaming` (newline-delimited LLMMessage JSON)
-    into a `StreamFormat.Event`. Returns `none` for suppressed messages. -/
+    into a `StreamFormat.Event`. Returns `none` for suppressed messages.
+
+    Vibe's log format uses role-tagged JSON objects:
+    - "assistant": LLM response, with optional `tool_calls` array and/or `content`/`reasoning_content`
+    - "tool": tool result; content may be wrapped in `<tool_error>…</tool_error>` on failure
+    - "system"/"user": the initial system/user prompts — suppressed from display
+-/
 private def vibeParseOutputLine (line : String) : Option Event :=
   match (Json.parse line.trimAscii.toString).toOption with
   | none => none
@@ -31,7 +37,7 @@ private def vibeParseOutputLine (line : String) : Option Event :=
       if !reasoning.isEmpty then
         some (.assistant (.thinking reasoning))
       else
-        -- Tool calls
+        -- Tool calls: `tool_calls` is a JSON array of {id, function: {name, arguments}} objects
         let toolCallEvent : Option Event :=
           match jArr' json "tool_calls" with
           | none => none
@@ -52,7 +58,22 @@ private def vibeParseOutputLine (line : String) : Option Event :=
           if content.isEmpty then none
           else some (.assistant (.text content))
     | "tool" =>
-      some (.toolResult (jStr' json "content") "")
+      -- Tool results: strip `<tool_error>…</tool_error>` wrapper and route to stderr
+      let raw := jStr' json "content"
+      let (stdout, stderr) :=
+        if raw.startsWith "<tool_error>" then
+          let inner := (raw.drop "<tool_error>".length).toString
+          let content := match inner.splitOn "</tool_error>" with
+            | head :: _ => head
+            | _         => inner
+          ("", content)
+        else
+          (raw, "")
+      if stdout.isEmpty && stderr.isEmpty then none
+      else some (.toolResult stdout stderr)
+    | "system" | "user" =>
+      -- Suppress the initial system/user prompt messages; they are not agent events
+      none
     | _ => none
 
 /-- Read the full session ID from the most recent session log under `vibeHome/logs/session/`. -/
@@ -106,7 +127,7 @@ def vibe : AgentDef where
     ro      := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw      := ["/dev/null"]
     homeRox := [".elan", ".cache", ".local"]
-    homeRw  := [".gitconfig", ".config/gh", ".config/git"]
+    homeRw  := [".gitconfig", ".config/gh", ".config/git", ".vibe"]
   }
   setupMcp port model systemPrompt := do
     let ts ← IO.monoNanosNow
@@ -121,7 +142,8 @@ def vibe : AgentDef where
         let src := System.FilePath.mk h / ".vibe" / "config.toml"
         if ← src.pathExists then IO.FS.readFile src else pure ""
       | none => pure ""
-    IO.FS.writeFile (vibeHomePath / "config.toml") (vibeConfigToml port model baseConfig)
+    let configWithMcp := vibeConfigToml port model baseConfig
+    IO.FS.writeFile (vibeHomePath / "config.toml") configWithMcp
     -- If a system prompt is provided, write a custom agent profile and prompt file
     if let some sp := systemPrompt then
       IO.FS.createDir (vibeHomePath / "agents")
@@ -137,13 +159,15 @@ def vibe : AgentDef where
     ])
   buildArgs _ctx _pluginDirs subAgent _model systemPrompt resume _budget prompt := Id.run do
     let mut args : Array String := #["-p", prompt, "--output", "streaming"]
-    -- Use the task agent (with custom system prompt) if one was configured in setupMcp,
-    -- or the explicitly requested sub-agent; otherwise let vibe default to auto-approve.
-    let agentName := match subAgent with
-      | some n => some n
-      | none   => if systemPrompt.isSome then some "task" else none
-    if let some name := agentName then
+    -- Use the explicitly requested sub-agent if provided
+    if let some name := subAgent then
       args := args.push "--agent" |>.push name
+    else
+      -- Default to lean-auto-approve agent for auto-approval of edits
+      args := args.push "--agent" |>.push "lean-auto-approve"
+      -- If a custom system prompt is provided, also register the task agent
+      if systemPrompt.isSome then
+        args := args.push "task"
     if let some sid := resume then
       args := args.push "--resume" |>.push sid
     return args
