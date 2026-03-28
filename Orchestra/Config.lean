@@ -110,6 +110,10 @@ instance : FromJson AgentAuthConfig where
 structure Task where
   upstream : String
   fork : String
+  /-- Legacy mode field (deprecated). Use `tools` instead.
+      If `tools` is absent, this field is used to derive the allowed tools:
+      - `fork` → no tools
+      - `pr`   → `["create_pr"]` -/
   mode : TaskMode
   prompt : String
   agent : Option String := none
@@ -125,6 +129,13 @@ structure Task where
   /-- Label of the authentication source to use for this task.
       Must match a label in the agent's `auth_sources` config. -/
   authSource : Option String := none
+  /-- Optional tools to enable beyond the always-available ones (health, refresh_token,
+      get_pr_comments). Currently the only optional tool is `"create_pr"`.
+      When absent, the allowed tools are derived from `mode` for backwards compatibility. -/
+  tools : Option (List String) := none
+  /-- If true, the project folder is mounted read-only in the sandbox.
+      Useful for tasks that should only read the codebase (e.g. review tasks). -/
+  readOnly : Bool := false
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -140,8 +151,10 @@ instance : FromJson Task where
     let budget := j.getObjValAs? Float "budget" |>.toOption
     let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
+    let tools := j.getObjValAs? (List String) "tools" |>.toOption
+    let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory,
-             authSource }
+             authSource, tools, readOnly }
 
 structure AppConfig where
   appId : Nat

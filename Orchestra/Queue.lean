@@ -59,6 +59,11 @@ structure QueueEntry where
   memory        : MemoryMode    := .both
   /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
   authSource    : Option String := none
+  /-- Optional tools to enable beyond the always-available ones.
+      When absent, allowed tools are derived from `mode` for backwards compatibility. -/
+  tools         : Option (List String) := none
+  /-- If true, the project folder is mounted read-only in the sandbox. -/
+  readOnly      : Bool := false
 deriving Repr
 
 instance : ToJson QueueEntry where
@@ -83,6 +88,8 @@ instance : ToJson QueueEntry where
     let fields := if let some b := e.budget        then fields ++ [("budget",          ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson e.memory)]
     let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
+    let fields := if let some t := e.tools         then fields ++ [("tools",           ToJson.toJson t)] else fields
+    let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -105,9 +112,11 @@ instance : FromJson QueueEntry where
     let budget        := j.getObjValAs? Float      "budget"  |>.toOption
     let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
     let authSource    := j.getObjValAs? String "auth_source" |>.toOption
+    let tools         := j.getObjValAs? (List String) "tools" |>.toOption
+    let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget, memory, authSource }
+             budget, memory, authSource, tools, readOnly }
 
 -- Directories and paths
 
