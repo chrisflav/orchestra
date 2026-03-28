@@ -8,14 +8,27 @@ structure Series where
   private mk ::
   name : String
 
-/-- A task with associated series information, produced by the Concert DSL. -/
-structure ConcertTask extends Task where
-  series : Option String := none
+/-- A task without series information, used as input to the Concert DSL. -/
+structure SerieslessTask where
+  upstream : String
+  fork : String
+  mode : TaskMode
+  prompt : String
+  agent : Option String := none
+  systemPrompt : Option String := none
+  backend : Option String := none
+  model : Option String := none
+  budget : Option Float := none
+  memory : MemoryMode := .both
+  authSource : Option String := none
+  tools : Option (List String) := none
+  readOnly : Bool := false
+deriving Repr, Inhabited
 
 /-- The state maintained during Concert program execution. -/
 structure ConcertState where
   /-- The accumulated list of tasks (the eventual output when compiling). -/
-  tasks : Array ConcertTask := #[]
+  tasks : Array Task := #[]
   /-- All series created during this concert. -/
   series : Array Series := #[]
   /-- The currently active series (if any). -/
@@ -25,15 +38,26 @@ structure ConcertState where
 abbrev ConcertM (α : Type) := StateM ConcertState α
 
 /-- Append a new task to the current task list.
-    The series of the task is taken from the current series in the state.
-    Note: the `series` field of `task` is ignored; use `setSeries`/`withSeries` to control it. -/
-def run (task : Task) : ConcertM Unit := do
+    The series of the task is taken from the current series in the state. -/
+def run (task : SerieslessTask) : ConcertM Unit := do
   let state ← get
-  let ctask : ConcertTask := {
-    toTask := task
+  let fullTask : Task := {
+    upstream := task.upstream
+    fork := task.fork
+    mode := task.mode
+    prompt := task.prompt
+    agent := task.agent
+    systemPrompt := task.systemPrompt
+    backend := task.backend
+    model := task.model
+    budget := task.budget
+    memory := task.memory
+    authSource := task.authSource
+    tools := task.tools
+    readOnly := task.readOnly
     series := state.currentSeries.map (·.name)
   }
-  set { state with tasks := state.tasks.push ctask }
+  set { state with tasks := state.tasks.push fullTask }
 
 /-- Create a fresh `Series` with the given name and register it in the state. -/
 def freshSeries (name : String) : ConcertM Series := do
@@ -54,8 +78,8 @@ def withSeries {α : Type} (s : Series) (action : ConcertM α) : ConcertM α := 
   modify fun state => { state with currentSeries := prevSeries }
   return result
 
-/-- Compile a Concert program into an array of `ConcertTask`s. -/
-def compile (program : ConcertM Unit) : Array ConcertTask :=
+/-- Compile a Concert program into an array of `Task`s. -/
+def compile (program : ConcertM Unit) : Array Task :=
   (program.run {}).2.tasks
 
 end Orchestra.Concert
