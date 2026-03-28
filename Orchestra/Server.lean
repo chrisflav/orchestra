@@ -13,7 +13,10 @@ namespace Orchestra.Server
 structure State where
   upstream : String
   fork : String
-  allowPR : Bool
+  /-- Optional tools enabled for this run.
+      Always-available tools (health, refresh_token, get_pr_comments) are never in this list.
+      Currently the only optional tool is `"create_pr"`. -/
+  allowedTools : List String
   appId : Nat
   privateKeyPath : String
   installationId : Nat
@@ -49,58 +52,65 @@ private def initializeResult : Json :=
     ("serverInfo", Json.mkObj [("name", "agent"), ("version", "0.1.0")])
   ]
 
-private def toolsList : Json :=
-  Json.mkObj [("tools", .arr #[
-    Json.mkObj [
-      ("name", "health"),
-      ("description", "Check that the agent MCP server is running."),
-      ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
-    ],
-    Json.mkObj [
-      ("name", "refresh_token"),
-      ("description", "Refresh the GitHub App installation token and reconfigure the gh CLI."),
-      ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
-    ],
-    Json.mkObj [
-      ("name", "create_pr"),
-      ("description", "Create a pull request on the upstream repository."),
-      ("inputSchema", Json.mkObj [
-        ("type", "object"),
-        ("properties", Json.mkObj [
-          ("title", Json.mkObj [("type", "string")]),
-          ("body", Json.mkObj [("type", "string")]),
-          ("head", Json.mkObj [
-            ("type", "string"),
-            ("description", "Branch name in the fork.")
-          ]),
-          ("base", Json.mkObj [("type", "string")])
+private def alwaysAvailableTools : Array Json := #[
+  Json.mkObj [
+    ("name", "health"),
+    ("description", "Check that the agent MCP server is running."),
+    ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
+  ],
+  Json.mkObj [
+    ("name", "refresh_token"),
+    ("description", "Refresh the GitHub App installation token and reconfigure the gh CLI."),
+    ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
+  ],
+  Json.mkObj [
+    ("name", "get_pr_comments"),
+    ("description", "Fetch review comments on a pull request from the upstream repository."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("pr_number", Json.mkObj [
+          ("type", "integer"),
+          ("description", "Pull request number.")
         ]),
-        ("required", .arr #["head"])
-      ])
-    ],
-    Json.mkObj [
-      ("name", "get_pr_comments"),
-      ("description", "Fetch review comments on a pull request from the upstream repository."),
-      ("inputSchema", Json.mkObj [
-        ("type", "object"),
-        ("properties", Json.mkObj [
-          ("pr_number", Json.mkObj [
-            ("type", "integer"),
-            ("description", "Pull request number.")
-          ]),
-          ("unresolved_only", Json.mkObj [
-            ("type", "boolean"),
-            ("description", "Only show unresolved conversations (default: false).")
-          ]),
-          ("exclude_outdated", Json.mkObj [
-            ("type", "boolean"),
-            ("description", "Exclude outdated comments (default: false).")
-          ])
+        ("unresolved_only", Json.mkObj [
+          ("type", "boolean"),
+          ("description", "Only show unresolved conversations (default: false).")
         ]),
-        ("required", .arr #["pr_number"])
-      ])
-    ]
-  ])]
+        ("exclude_outdated", Json.mkObj [
+          ("type", "boolean"),
+          ("description", "Exclude outdated comments (default: false).")
+        ])
+      ]),
+      ("required", .arr #["pr_number"])
+    ])
+  ]
+]
+
+private def optionalToolDefs : List (String × Json) := [
+  ("create_pr", Json.mkObj [
+    ("name", "create_pr"),
+    ("description", "Create a pull request on the upstream repository."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("title", Json.mkObj [("type", "string")]),
+        ("body", Json.mkObj [("type", "string")]),
+        ("head", Json.mkObj [
+          ("type", "string"),
+          ("description", "Branch name in the fork.")
+        ]),
+        ("base", Json.mkObj [("type", "string")])
+      ]),
+      ("required", .arr #["head"])
+    ])
+  ])
+]
+
+private def toolsList (allowedTools : List String) : Json :=
+  let optional := optionalToolDefs.filterMap fun entry =>
+    if allowedTools.contains entry.1 then some entry.2 else none
+  Json.mkObj [("tools", .arr (alwaysAvailableTools ++ optional.toArray))]
 
 -- Types
 
@@ -184,9 +194,9 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       log s!"tool refresh_token: error: {e}"
       return toolContent (toString e) (isError := true)
   | .createPr title body head base =>
-    if !state.allowPR then
-      log "tool create_pr: denied (fork-only mode)"
-      return toolContent "PR creation not allowed in fork-only mode" (isError := true)
+    if !state.allowedTools.contains "create_pr" then
+      log "tool create_pr: denied (not in allowed tools)"
+      return toolContent "PR creation is not enabled for this task" (isError := true)
     if state.pat.isEmpty then
       log "tool create_pr: error: PAT not configured"
       return toolContent "github.pat not set in config" (isError := true)
@@ -275,7 +285,7 @@ private def evalRequest (state : State) (req : Request) : IO (Option Json) := do
     return none
   | .toolsList id =>
     log "tools/list"
-    return some (jsonrpcResult id toolsList)
+    return some (jsonrpcResult id (toolsList state.allowedTools))
   | .toolsCall id call =>
     let result ← evalToolCall state call
     return some (jsonrpcResult id result)

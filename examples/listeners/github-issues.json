@@ -2,12 +2,15 @@
   "name": "github-issues",
   "source": {
     "type": "github-issues",
-    "repo": "upstream-org/upstream-repo",
-    "labels": ["orchestra"]
+    "repos": [
+      {"upstream": "upstream-org/upstream-repo", "fork": "your-org/upstream-repo"}
+    ],
+    "labels": ["orchestra"],
+    "authorized_users": ["alice", "bob"]
   },
   "action": {
-    "upstream": "upstream-org/upstream-repo",
-    "fork": "your-org/upstream-repo",
+    "upstream": "{{upstream}}",
+    "fork": "{{fork}}",
     "mode": "pr",
     "prompt_template": "A new GitHub issue has been filed that is labelled for automated handling.\n\nIssue #{{issue_number}}: {{title}}\nURL: {{url}}\n\n{{body}}\n\nPlease investigate and implement a fix or feature as described in the issue. Open a pull request with your changes.",
     "series": "issue-{{issue_number}}"
