@@ -92,11 +92,12 @@ private def piParseOutputLine (line : String) : Option Event :=
 def pi : AgentDef where
   command := "pi"
   sandboxPaths := {
-    rox     := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
-    ro      := ["/etc", "/run", "/dev", "/proc", "/sys"]
-    rw      := ["/dev/null"]
-    homeRox := [".elan", ".cache", ".local"]
-    homeRw  := [".pi", ".gitconfig", ".config/gh", ".config/git"]
+    rox        := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
+    ro         := ["/etc", "/run", "/dev", "/proc", "/sys"]
+    rw         := ["/dev/null"]
+    homeRox    := [".elan", ".cache", ".local"]
+    homeRw     := [".pi", ".gitconfig", ".config/gh", ".config/git"]
+    extraPorts := [11434]  -- Ollama
   }
   -- Pi does not have native MCP support.  Return an empty context and inject
   -- PI_SKIP_VERSION_CHECK so the sandbox startup is quiet.

@@ -19,6 +19,8 @@ structure SandboxPaths where
   homeRox : List String := []
   /-- Paths relative to $HOME needing read-write access. -/
   homeRw : List String := []
+  /-- Additional TCP ports to allow outbound connections to (besides 443 and the MCP server port). -/
+  extraPorts : List UInt16 := []
 
 /-- Describes how to invoke and communicate with a specific coding agent backend. -/
 structure AgentDef where
