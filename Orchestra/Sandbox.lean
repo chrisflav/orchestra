@@ -93,6 +93,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- Network: allow connecting to the local MCP server and external HTTPS
   args := args.push "--connect-tcp" |>.push (toString serverPort)
   args := args.push "--connect-tcp" |>.push "443"
+  -- Agent-specific extra ports (e.g. local Ollama on 11434)
+  for p in paths.extraPorts do
+    args := args.push "--connect-tcp" |>.push (toString p)
   -- Environment variables for the sandboxed command
   args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
   args := args.push "--env" |>.push "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"
@@ -168,6 +171,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let resultSubtypeRef ← IO.mkRef (none : Option StreamFormat.ResultSubtype)
   let outTask ← IO.asTask (prio := .dedicated) do
     let out ← IO.getStdout
+    let err ← IO.getStderr
     repeat do
       let line ← child.stdout.getLine
       if line.isEmpty then return
@@ -175,8 +179,15 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
       if let some h := debugHandle then
         h.putStrLn line
         h.flush
+      -- When debug is on, echo every raw stdout line to stderr
+      if debug then
+        err.putStrLn s!"[raw] {line.trimAscii}"
+        err.flush
       match agentDef.parseOutputLine line with
-      | none => pure ()
+      | none =>
+        if debug then
+          err.putStrLn s!"[suppressed] {line.trimAscii}"
+          err.flush
       | some event =>
         if let .init sid _ := event then
           sessionIdRef.set (some sid)
