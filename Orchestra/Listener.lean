@@ -357,6 +357,21 @@ private def reactToComment (repo : String) (commentId : Nat) (ghToken : String) 
   }
   let _ ← child.wait
 
+private def reactToPullsComment (repo : String) (commentId : Nat) (ghToken : String) : IO Unit := do
+  let env : Array (String × Option String) :=
+    if ghToken.isEmpty then #[] else #[("GH_TOKEN", some ghToken)]
+  let child ← IO.Process.spawn {
+    cmd  := "gh"
+    args := #["api", "--method", "POST",
+              s!"/repos/{repo}/pulls/comments/{commentId}/reactions",
+              "-f", "content=rocket"]
+    env
+    stdin  := .null
+    stdout := .null
+    stderr := .null
+  }
+  let _ ← child.wait
+
 -- Authorization helper
 
 /-- Return the effective allowed-user list: source list if non-empty, else global list. -/
@@ -512,6 +527,33 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
                        ("upstream_escaped", entry.upstream.replace "/" "_"),
                        ("fork_escaped", entry.fork.replace "/" "_")]
           return some (eventId, vars)
+      -- Helper: extract an event from one inline PR review comment JSON object.
+      let processInlineComment : Json → IO (Option (String × List (String × String))) :=
+        fun comment => do
+          let .ok idNum := comment.getObjValAs? Nat "id" | return none
+          let idStr   := s!"inline:{toString idNum}"
+          let eventId := s!"{entry.upstream}:{idStr}"
+          if state.processedIds.contains eventId then return none
+          let body := comment.getObjValAs? String "body" |>.toOption |>.getD ""
+          -- Only process comments that contain the trigger string
+          if !(body.splitOn trigger).length > 1 then return none
+          let author := match comment.getObjVal? "user" |>.toOption with
+            | none   => ""
+            | some u => u.getObjValAs? String "login" |>.toOption |>.getD ""
+          -- Authorization check: skip unauthorized users (no reaction either)
+          if !isAuthorized allowed author then return none
+          -- React with a rocket emoji (best-effort; ignore failures)
+          try reactToPullsComment entry.upstream idNum ghToken catch _ => pure ()
+          let url := comment.getObjValAs? String "html_url" |>.toOption |>.getD ""
+          -- Extract PR number from the pull_request_url field
+          let prUrl  := comment.getObjValAs? String "pull_request_url" |>.toOption |>.getD ""
+          let prNum  := prUrl.splitOn "/" |>.getLast? |>.getD ""
+          let vars := [("comment_id", idStr), ("body", body), ("author", author),
+                       ("url", url), ("issue_number", prNum),
+                       ("upstream", entry.upstream), ("fork", entry.fork),
+                       ("upstream_escaped", entry.upstream.replace "/" "_"),
+                       ("fork_escaped", entry.fork.replace "/" "_")]
+          return some (eventId, vars)
       if labels.isEmpty then
         -- Use the global issue comments endpoint with a `since` filter
         let endpoint :=
@@ -524,6 +566,18 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
             | .error _ => pure #[]
         for comment in comments do
           if let some ev ← processComment comment then
+            allEvents := allEvents.push ev
+        -- Also fetch inline PR review comments
+        let inlineEndpoint :=
+          s!"/repos/{entry.upstream}/pulls/comments?since={state.lastChecked}&per_page=100&direction=asc"
+        let inlineJsonOpt ← runGhApi inlineEndpoint ghToken
+        let inlineComments ← match inlineJsonOpt with
+          | none   => pure (#[] : Array Json)
+          | some j => match j.getArr? with
+            | .ok a    => pure a
+            | .error _ => pure #[]
+        for comment in inlineComments do
+          if let some ev ← processInlineComment comment then
             allEvents := allEvents.push ev
       else
         -- Fetch only issues/PRs that carry one of the requested labels
@@ -547,6 +601,18 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
               | .error _ => pure #[]
           for comment in comments do
             if let some ev ← processComment comment then
+              allEvents := allEvents.push ev
+          -- Also fetch inline PR review comments for this PR
+          let inlineCommentsOpt ← runGhApi
+            s!"/repos/{entry.upstream}/pulls/{issNum}/comments?since={state.lastChecked}&per_page=100"
+            ghToken
+          let inlineComments ← match inlineCommentsOpt with
+            | none   => pure (#[] : Array Json)
+            | some j => match j.getArr? with
+              | .ok a    => pure a
+              | .error _ => pure #[]
+          for comment in inlineComments do
+            if let some ev ← processInlineComment comment then
               allEvents := allEvents.push ev
     return allEvents
 
