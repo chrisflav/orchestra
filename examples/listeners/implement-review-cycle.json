@@ -1,0 +1,35 @@
+{
+  "name": "implement-review-cycle",
+  "source": {
+    "type": "github-issues",
+    "repos": [
+      {"upstream": "upstream-org/upstream-repo", "fork": "your-org/upstream-repo"}
+    ],
+    "labels": ["orchestra"],
+    "authorized_users": ["alice", "bob"]
+  },
+  "actions": [
+    {
+      "upstream": "{{upstream}}",
+      "fork": "{{fork}}",
+      "mode": "pr",
+      "prompt_template": "A new GitHub issue has been filed.\n\nIssue #{{issue_number}}: {{title}}\nURL: {{url}}\n\n{{body}}\n\nPlease implement a fix or feature as described in the issue and open a pull request.",
+      "series": "issue-{{issue_number}}"
+    },
+    {
+      "upstream": "{{upstream}}",
+      "fork": "{{fork}}",
+      "mode": "pr",
+      "prompt_template": "Review the pull request you just opened for issue #{{issue_number}}. Check for correctness, style, and completeness. Leave review comments if needed.",
+      "series": "review-{{issue_number}}"
+    },
+    {
+      "upstream": "{{upstream}}",
+      "fork": "{{fork}}",
+      "mode": "pr",
+      "prompt_template": "Address any review comments left on the pull request for issue #{{issue_number}} and push updated commits.",
+      "series": "issue-{{issue_number}}"
+    }
+  ],
+  "interval_seconds": 300
+}

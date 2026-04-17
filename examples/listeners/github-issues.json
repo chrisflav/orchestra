@@ -8,12 +8,14 @@
     "labels": ["orchestra"],
     "authorized_users": ["alice", "bob"]
   },
-  "action": {
-    "upstream": "{{upstream}}",
-    "fork": "{{fork}}",
-    "mode": "pr",
-    "prompt_template": "A new GitHub issue has been filed that is labelled for automated handling.\n\nIssue #{{issue_number}}: {{title}}\nURL: {{url}}\n\n{{body}}\n\nPlease investigate and implement a fix or feature as described in the issue. Open a pull request with your changes.",
-    "series": "issue-{{issue_number}}"
-  },
+  "actions": [
+    {
+      "upstream": "{{upstream}}",
+      "fork": "{{fork}}",
+      "mode": "pr",
+      "prompt_template": "A new GitHub issue has been filed that is labelled for automated handling.\n\nIssue #{{issue_number}}: {{title}}\nURL: {{url}}\n\n{{body}}\n\nPlease investigate and implement a fix or feature as described in the issue. Open a pull request with your changes.",
+      "series": "issue-{{issue_number}}"
+    }
+  ],
   "interval_seconds": 300
 }

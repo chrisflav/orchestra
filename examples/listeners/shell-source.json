@@ -5,12 +5,14 @@
     "command": "/path/to/your/source-script.sh",
     "args": []
   },
-  "action": {
-    "upstream": "upstream-org/upstream-repo",
-    "fork": "your-org/upstream-repo",
-    "mode": "fork",
-    "prompt_template": "{{output}}",
-    "series": "shell-tasks"
-  },
+  "actions": [
+    {
+      "upstream": "upstream-org/upstream-repo",
+      "fork": "your-org/upstream-repo",
+      "mode": "fork",
+      "prompt_template": "{{output}}",
+      "series": "shell-tasks"
+    }
+  ],
   "interval_seconds": 600
 }
