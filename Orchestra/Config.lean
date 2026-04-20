@@ -62,6 +62,8 @@ structure Task where
   budget : Option Float := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory : MemoryMode := .both
+  /-- Extra TCP ports to allow in the sandbox, in addition to what the agent backend requires. -/
+  extraPorts : List Nat := []
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -76,7 +78,9 @@ instance : FromJson Task where
     let model := j.getObjValAs? String "model" |>.toOption
     let budget := j.getObjValAs? Float "budget" |>.toOption
     let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
-    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory }
+    let extraPorts := j.getObjValAs? (List Nat) "extra_ports" |>.toOption |>.getD []
+    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory,
+             extraPorts }
 
 structure AppConfig where
   appId : Nat

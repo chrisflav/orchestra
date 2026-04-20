@@ -17,3 +17,7 @@ root = "Main"
 [[lean_exe]]
 name = "orchestra-mcp-test"
 root = "McpTest"
+
+[[lean_exe]]
+name = "orchestra-test"
+root = "OrchestraTest"

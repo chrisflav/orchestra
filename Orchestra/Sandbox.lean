@@ -45,7 +45,8 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (systemPrompt : Option String := none)
     (resume : Option String := none)
     (budget : Float := 4.0)
-    (cancelToken : Option Std.CancellationToken := none) : IO LaunchResult := do
+    (cancelToken : Option Std.CancellationToken := none)
+    (extraPorts : List Nat := []) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -81,9 +82,12 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   for p in memoryDirs do
     if ← System.FilePath.pathExists p then
       args := args.push "--rw" |>.push p
-  -- Network: allow connecting to the local MCP server and external HTTPS
+  -- Network: allow connecting to the local MCP server, backend-required ports, and extra ports
   args := args.push "--connect-tcp" |>.push (toString serverPort)
-  args := args.push "--connect-tcp" |>.push "443"
+  for p in agentDef.ports do
+    args := args.push "--connect-tcp" |>.push (toString p)
+  for p in extraPorts do
+    args := args.push "--connect-tcp" |>.push (toString p)
   -- Environment variables for the sandboxed command
   args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
   -- Pass through inherited env vars by name

@@ -38,6 +38,8 @@ structure AgentDef where
   command : String
   /-- Filesystem paths the agent needs inside the sandbox. -/
   sandboxPaths : SandboxPaths
+  /-- TCP ports the agent backend requires in addition to the MCP server port. -/
+  ports : List UInt16 := [443]
   /-- Set up agent-specific infrastructure before launch (e.g., write MCP config files).
       Receives the MCP server port, optional model override, and optional appended system prompt.
       Returns a context string (passed to buildArgs, extractSessionId, and cleanup)

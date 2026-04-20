@@ -151,6 +151,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
       (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
       (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
+      (extraPorts := task.extraPorts)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     if result.wasCancelled then
@@ -453,6 +454,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         continuesFrom, series
         configPath
         budget       := budgetFlag.orElse (fun _ => task.budget)
+        extraPorts   := task.extraPorts
       }
       Queue.saveEntry entry
       IO.println entry.id
@@ -574,6 +576,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         model        := entry.model
         budget       := entry.budget
         memory       := entry.memory
+        extraPorts   := entry.extraPorts
       }
       let cfg ← match entry.configPath with
         | none    => pure appConfig
@@ -893,6 +896,7 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
       continuesFrom
       series       := entry.series
       configPath   := entry.configPath
+      extraPorts   := entry.extraPorts
     }
     Queue.saveEntry newEntry
     IO.println newEntry.id
