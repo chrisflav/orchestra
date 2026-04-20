@@ -72,7 +72,9 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
       IO.FS.removeDirAll repoPath
       IO.FS.createDirAll repoPath
       runGh' #["repo", "clone", fork, repoPath.toString]
-      runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
+      let remotes₁ ← runGit #["remote"] repoPath
+      if !(remotes₁.splitOn "\n" |>.any (· == "upstream")) then
+        runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
     else
       -- Non-empty: verify it's a valid git repo
       let isGitRepo : Bool ← do
@@ -91,7 +93,9 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
           IO.FS.removeDirAll repoPath
           IO.FS.createDirAll repoPath
           runGh' #["repo", "clone", fork, repoPath.toString]
-          runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
+          let remotes₂ ← runGit #["remote"] repoPath
+          if !(remotes₂.splitOn "\n" |>.any (· == "upstream")) then
+            runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
         else
           throw (IO.userError s!"Directory '{repoPath}' is not a valid git repository. Remove it manually and try again.")
       else
@@ -109,7 +113,9 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
   else
     IO.FS.createDirAll repoPath
     runGh' #["repo", "clone", fork, repoPath.toString]
-    runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
+    let remotes₃ ← runGit #["remote"] repoPath
+    if !(remotes₃.splitOn "\n" |>.any (· == "upstream")) then
+      runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
   -- Ensure gh credentials are wired into git for authenticated pushes
   runGh' #["auth", "setup-git"] none
   return repoPath
