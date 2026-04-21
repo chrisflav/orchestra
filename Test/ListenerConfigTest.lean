@@ -160,3 +160,23 @@ def appConfigDefaultAuthorizedUsers : Test := do
   | .ok cfg =>
     TestM.assertEqual cfg.authorizedUsers ([] : List String)
       (msg := "authorizedUsers default empty")
+
+@[test]
+def agentAuthConfigExtraPorts : Test := do
+  let json := r#"
+    {"name": "claude", "extra_ports": [8080, 9090]}
+  "#
+  match Json.parse json >>= FromJson.fromJson? (α := AgentAuthConfig) with
+  | .error e => TestM.fail s!"AgentAuthConfig extra_ports parse: {e}"
+  | .ok cfg =>
+    TestM.assertEqual cfg.extraPorts #[8080, 9090] (msg := "extraPorts")
+
+@[test]
+def agentAuthConfigExtraPortsDefault : Test := do
+  let json := r#"
+    {"name": "claude"}
+  "#
+  match Json.parse json >>= FromJson.fromJson? (α := AgentAuthConfig) with
+  | .error e => TestM.fail s!"AgentAuthConfig no extra_ports: {e}"
+  | .ok cfg =>
+    TestM.assertEqual cfg.extraPorts (#[] : Array Nat) (msg := "extraPorts default empty")

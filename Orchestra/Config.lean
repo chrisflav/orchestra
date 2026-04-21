@@ -98,6 +98,9 @@ structure AgentAuthConfig where
   /-- Label of the default authentication source.
       If absent and exactly one source is configured, that source is used automatically. -/
   defaultAuthSource : Option String := none
+  /-- Additional TCP ports the agent is allowed to connect to inside the sandbox.
+      Appended to the ports the agent backend already opens (MCP server port + 443). -/
+  extraPorts : Array Nat := #[]
 deriving Repr, Inhabited
 
 instance : FromJson AgentAuthConfig where
@@ -105,7 +108,8 @@ instance : FromJson AgentAuthConfig where
     let name             ← j.getObjValAs? String "name"
     let authSources       := j.getObjValAs? (Array AuthSource) "auth_sources" |>.toOption |>.getD #[]
     let defaultAuthSource := j.getObjValAs? String "default_auth_source" |>.toOption
-    return { name, authSources, defaultAuthSource }
+    let extraPorts        := j.getObjValAs? (Array Nat) "extra_ports" |>.toOption |>.getD #[]
+    return { name, authSources, defaultAuthSource, extraPorts }
 
 structure Task where
   upstream : String

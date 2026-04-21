@@ -51,7 +51,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (debugLogFile : Option System.FilePath := none)
     (logFile : Option System.FilePath := none)
     -- If true, mount the project repository read-only in the sandbox.
-    (readOnly : Bool := false) : IO LaunchResult := do
+    (readOnly : Bool := false)
+    -- Additional TCP ports to allow, beyond what the agent backend already opens.
+    (extraPorts : Array Nat := #[]) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -95,6 +97,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   args := args.push "--connect-tcp" |>.push "443"
   -- Agent-specific extra ports (e.g. local Ollama on 11434)
   for p in paths.extraPorts do
+    args := args.push "--connect-tcp" |>.push (toString p)
+  -- Task-level extra ports configured in the action/task config
+  for p in extraPorts do
     args := args.push "--connect-tcp" |>.push (toString p)
   -- Environment variables for the sandboxed command
   args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
