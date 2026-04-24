@@ -140,6 +140,9 @@ structure Task where
   /-- If true, the project folder is mounted read-only in the sandbox.
       Useful for tasks that should only read the codebase (e.g. review tasks). -/
   readOnly : Bool := false
+  /-- Priority of this task. Natural number; higher = more important.
+      Defaults to 10 if not set. -/
+  priority : Nat := 10
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -157,8 +160,9 @@ instance : FromJson Task where
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
     let tools := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
+    let priority := j.getObjValAs? Nat "priority" |>.toOption |>.getD 10
     return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory,
-             authSource, tools, readOnly }
+             authSource, tools, readOnly, priority }
 
 structure AppConfig where
   appId : Nat

@@ -143,6 +143,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     continuesFrom, series
     backend := task.backend, model := task.model, agent := task.agent
     systemPrompt := task.systemPrompt, budget := task.budget
+    priority := task.priority
   }
   TaskStore.saveTask initialRecord
   -- Resolve initial resume session from the continued task
@@ -455,6 +456,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
     agent        := prevRecord.agent
     systemPrompt := prevRecord.systemPrompt
     budget       := budgetFlag.orElse (fun _ => prevRecord.budget)
+    priority     := prevRecord.priority
   }
   let _ ← runTask appConfig task 0 debug (continuesFrom := some prevId) (series := some seriesName)
   return (0 : UInt32)
@@ -476,6 +478,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
   let resumeSeries  := p.flag? "resume"    |>.map (·.as! String)
   let prompt        := p.flag? "prompt"    |>.map (·.as! String)
   let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
+  let priorityFlag  := p.flag? "priority"  |>.map (·.as! Nat)
   let taskFile?     := (p.variableArgsAs? String |>.getD #[])[0]?
   match resumeSeries, taskFile? with
   | some _, some _ =>
@@ -509,6 +512,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       agent         := prevRecord.agent
       systemPrompt  := prevRecord.systemPrompt
       budget        := budgetFlag.orElse (fun _ => prevRecord.budget)
+      priority      := priorityFlag.getD prevRecord.priority
     }
     Queue.saveEntry entry
     IO.println entry.id
@@ -550,6 +554,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         authSource   := task.authSource
         tools        := task.tools
         readOnly     := task.readOnly
+        priority     := priorityFlag.getD task.priority
       }
       Queue.saveEntry entry
       IO.println entry.id
@@ -674,6 +679,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         authSource   := entry.authSource
         tools        := entry.tools
         readOnly     := entry.readOnly
+        priority     := entry.priority
       }
       let cfg ← match entry.configPath with
         | none    => pure appConfig
@@ -747,13 +753,13 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
     IO.println "No queue entries found."
     return (0 : UInt32)
   IO.println ""
-  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 9} SERIES"
-  IO.println (String.ofList (List.replicate 85 '-'))
+  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 9} PRIORITY SERIES"
+  IO.println (String.ofList (List.replicate 93 '-'))
   for e in entries do
     let status := match e.status with
       | .pending => "pending" | .running => "running" | .done => "done" | .failed => "failed"
       | .unfinished => "unfinished" | .cancelled => "cancelled"
-    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {e.series.getD ""}"
+    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {padRight (toString e.priority) 8} {e.series.getD ""}"
   return (0 : UInt32)
 
 private def queueListenersHandler (p : Parsed) : IO UInt32 := do
@@ -791,14 +797,15 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
   else
     IO.println s!"Queue: {active.size} task(s)"
     IO.println ""
-    IO.println s!"{padRight "ID" 16} {padRight "FORK" 32} {padRight "STATUS" 9} SERIES"
-    IO.println (String.ofList (List.replicate 70 '-'))
-    -- Show running first, then pending in oldest-first order
+    IO.println s!"{padRight "ID" 16} {padRight "FORK" 32} {padRight "STATUS" 9} PRIORITY SERIES"
+    IO.println (String.ofList (List.replicate 78 '-'))
+    -- Show running first, then pending ordered by priority desc, then oldest first
     let running := active.filter (fun e => e.status == .running)
-    let pending := (active.filter (fun e => e.status == .pending)).toList.reverse.toArray
-    for e in running ++ pending do
+    let pendingArr := active.filter (fun e => e.status == .pending)
+    let pendingByPriority := pendingArr.qsort (fun a b => a.priority > b.priority)
+    for e in running ++ pendingByPriority do
       let status := if e.status == .running then "running" else "pending"
-      IO.println s!"{padRight e.id 16} {padRight e.fork 32} {padRight status 9} {e.series.getD ""}"
+      IO.println s!"{padRight e.id 16} {padRight e.fork 32} {padRight status 9} {padRight (toString e.priority) 8} {e.series.getD ""}"
   -- Listener status
   let listenerConfigs ← Listener.loadAllListenerConfigs (← Listener.listenersDir)
   if !listenerConfigs.isEmpty then
@@ -939,6 +946,7 @@ private def queueAddCmd : Cmd := `[Cli|
     r, resume : String; "Continue the latest run in a named series (requires --prompt)"
     p, prompt : String; "Prompt for the new agent run (used with --resume)"
     budget : String; "Maximum spend in USD, overrides task file (default: 4.0)"
+    priority : Nat; "Priority for the queued entry (default: 10)"
 
   ARGS:
     ..."task-file" : String; "Path to the JSON task file (omit when using --resume)"
@@ -1007,6 +1015,7 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
       continuesFrom
       series       := entry.series
       configPath   := entry.configPath
+      priority     := entry.priority
     }
     Queue.saveEntry newEntry
     IO.println newEntry.id

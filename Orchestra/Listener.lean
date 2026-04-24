@@ -134,6 +134,8 @@ structure ActionConfig where
   tools          : Option (List String) := none
   /-- If true, the project folder is mounted read-only in the sandbox. -/
   readOnly       : Bool := false
+  /-- Priority of the queue entry. Defaults to 10. -/
+  priority       : Nat  := 10
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -154,6 +156,7 @@ instance : ToJson ActionConfig where
     let fields := if let some s := a.authSource   then fields ++ [("auth_source",   Json.str s)]      else fields
     let fields := if let some t := a.tools        then fields ++ [("tools",         ToJson.toJson t)] else fields
     let fields := if a.readOnly                   then fields ++ [("read_only",      Json.bool true)]  else fields
+    let fields := if a.priority != 10          then fields ++ [("priority",       Json.num a.priority)] else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -180,8 +183,9 @@ instance : FromJson ActionConfig where
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
     let tools := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
+    let priority := j.getObjValAs? Nat "priority" |>.toOption |>.getD 10
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, tools, readOnly }
+             budget, memory, authSource, tools, readOnly, priority }
 
 -- Listener config
 
@@ -306,7 +310,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
   let fork :=
     let rendered := renderTemplate action.fork vars
     if rendered.isEmpty then lookupVar "fork" else rendered
-  IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent}"
+  IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent} priority={action.priority}"
   return {
     id, createdAt, status := .pending,
     upstream
@@ -323,6 +327,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     authSource   := action.authSource
     tools        := action.tools
     readOnly     := action.readOnly
+    priority     := action.priority
   }
 
 -- GitHub helpers
