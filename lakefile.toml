@@ -1,6 +1,7 @@
 name = "orchestra"
 version = "0.1.0"
 defaultTargets = ["orchestra", "orchestra-mcp-test"]
+testDriver = "orchestraTest"
 
 [[require]]
 name = "Cli"
@@ -10,6 +11,9 @@ rev = "main"
 [[lean_lib]]
 name = "Orchestra"
 
+[[lean_lib]]
+name = "Test"
+
 [[lean_exe]]
 name = "orchestra"
 root = "Main"
@@ -17,3 +21,7 @@ root = "Main"
 [[lean_exe]]
 name = "orchestra-mcp-test"
 root = "McpTest"
+
+[[lean_exe]]
+name = "orchestraTest"
+root = "TestDriver"

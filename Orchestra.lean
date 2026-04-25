@@ -1,4 +1,7 @@
 import Orchestra.AgentDef
+import Orchestra.Agents.Claude
+import Orchestra.Agents.Pi
+import Orchestra.Agents.Vibe
 import Orchestra.Config
 import Orchestra.GitHub
 import Orchestra.Listener

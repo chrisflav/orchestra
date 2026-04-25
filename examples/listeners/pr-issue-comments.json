@@ -2,12 +2,15 @@
   "name": "pr-issue-comments",
   "source": {
     "type": "github-comments",
-    "repo": "your-org/upstream-repo",
-    "trigger": "@orchestra"
+    "repos": [
+      {"upstream": "upstream-org/upstream-repo", "fork": "your-org/upstream-repo"}
+    ],
+    "trigger": "@orchestra",
+    "authorized_users": []
   },
   "action": {
-    "upstream": "upstream-org/upstream-repo",
-    "fork": "your-org/upstream-repo",
+    "upstream": "{{upstream}}",
+    "fork": "{{fork}}",
     "mode": "fork",
     "prompt_template": "A comment has been left on issue/PR #{{issue_number}}.\n\nAuthor: {{author}}\nURL: {{url}}\n\n{{body}}\n\nPlease read the comment and take the appropriate action.",
     "series": "issue-{{issue_number}}"

@@ -55,6 +55,18 @@ structure QueueEntry where
   configPath    : Option String := none
   /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
   budget        : Option Float  := none
+  /-- Which memory directories to make available to the agent. Defaults to `both`. -/
+  memory        : MemoryMode    := .both
+  /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
+  authSource    : Option String := none
+  /-- Optional tools to enable beyond the always-available ones.
+      When absent, allowed tools are derived from `mode` for backwards compatibility. -/
+  tools         : Option (List String) := none
+  /-- If true, the project folder is mounted read-only in the sandbox. -/
+  readOnly      : Bool := false
+  /-- Priority of this queue entry. Natural number; higher = more important.
+      Defaults to 10 if not set. -/
+  priority      : Nat := 10
 deriving Repr
 
 instance : ToJson QueueEntry where
@@ -77,6 +89,11 @@ instance : ToJson QueueEntry where
     let fields := if let some s := e.taskId        then fields ++ [("task_id",         Json.str s)]      else fields
     let fields := if let some s := e.configPath    then fields ++ [("config_path",     Json.str s)]      else fields
     let fields := if let some b := e.budget        then fields ++ [("budget",          ToJson.toJson b)] else fields
+    let fields := fields ++ [("memory", ToJson.toJson e.memory)]
+    let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
+    let fields := if let some t := e.tools         then fields ++ [("tools",           ToJson.toJson t)] else fields
+    let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
+    let fields := if e.priority != 10              then fields ++ [("priority",         Json.num e.priority)] else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -96,10 +113,15 @@ instance : FromJson QueueEntry where
     let series        := j.getObjValAs? String "series"         |>.toOption
     let taskId        := j.getObjValAs? String "task_id"        |>.toOption
     let configPath    := j.getObjValAs? String "config_path"    |>.toOption
-    let budget        := j.getObjValAs? Float  "budget"         |>.toOption
+    let budget        := j.getObjValAs? Float      "budget"  |>.toOption
+    let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
+    let authSource    := j.getObjValAs? String "auth_source" |>.toOption
+    let tools         := j.getObjValAs? (List String) "tools" |>.toOption
+    let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
+    let priority      := j.getObjValAs? Nat "priority" |>.toOption |>.getD 10
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget }
+             budget, memory, authSource, tools, readOnly, priority }
 
 -- Directories and paths
 
@@ -176,11 +198,18 @@ def loadAllEntries : IO (Array QueueEntry) := do
         result := result.push e
   return result.qsort (fun a b => a.id > b.id)
 
-/-- Return the oldest pending entry, or none.
-    loadAllEntries returns newest-first, so back? gives the oldest. -/
+/-- Return the next pending entry to run.
+    Entries are ordered by priority (higher first), with older entries breaking ties.
+    Returns none if no pending entries exist. -/
 def nextPending : IO (Option QueueEntry) := do
   let all ← loadAllEntries
-  return (all.filter (fun e => e.status == .pending)).back?
+  let pending := all.filter (fun e => e.status == .pending)
+  if pending.isEmpty then return none
+  -- Find the maximum priority
+  let maxPri := pending.foldl (·.max ·.priority) 0
+  -- Among entries with max priority, pick the oldest (last in newest-first array)
+  let maxPriEntries := pending.filter (·.priority == maxPri)
+  return (maxPriEntries.back? |>.filter (·.priority == maxPri))
 
 -- PID file management
 

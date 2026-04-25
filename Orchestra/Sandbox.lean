@@ -14,12 +14,14 @@ private def expandHomePaths (rel : List String) : IO (List System.FilePath) := d
 
 /-- Result of launching an agent. -/
 structure LaunchResult where
-  exitCode      : UInt32
-  sessionId     : Option String
+  exitCode       : UInt32
+  sessionId      : Option String
   /-- True if the agent exited because it hit a usage or quota limit. -/
-  usageLimitHit : Bool
+  usageLimitHit  : Bool
   /-- True if the agent was killed because the cancel token was signalled. -/
-  wasCancelled  : Bool := false
+  wasCancelled   : Bool := false
+  /-- The subtype from the agent's result event, if one was emitted. -/
+  resultSubtype  : Option StreamFormat.ResultSubtype := none
 
 /--
 Launch the coding agent inside a landrun sandbox.
@@ -39,18 +41,28 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (debug : Bool := false)
     (extraEnv : Array (String × Option String) := #[])
     (pluginDirs : Array String := #[])
+    (memoryDirs : Array String := #[])
     (subAgent : Option String := none)
     (model : Option String := none)
     (systemPrompt : Option String := none)
     (resume : Option String := none)
     (budget : Float := 4.0)
-    (cancelToken : Option Std.CancellationToken := none) : IO LaunchResult := do
+    (cancelToken : Option Std.CancellationToken := none)
+    (debugLogFile : Option System.FilePath := none)
+    (logFile : Option System.FilePath := none)
+    -- If true, mount the project repository read-only in the sandbox.
+    (readOnly : Bool := false)
+    -- Additional TCP ports to allow, beyond what the agent backend already opens.
+    (extraPorts : Array Nat := #[]) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
   let mut args : Array String := #[]
-  -- Read-write access to the repo and /tmp
-  args := args.push "--rwx" |>.push repoPath.toString
+  -- Repo access: read-only or read-write depending on the task's readOnly flag
+  if readOnly then
+    args := args.push "--rox" |>.push repoPath.toString
+  else
+    args := args.push "--rwx" |>.push repoPath.toString
   args := args.push "--rw" |>.push "/tmp"
   -- Read+execute system paths (binaries, libraries)
   for p in paths.rox do
@@ -76,11 +88,22 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   for p in pluginDirs do
     if ← System.FilePath.pathExists p then
       args := args.push "--rox" |>.push p
+  -- Memory directories (read-write access so the agent can persist memories)
+  for p in memoryDirs do
+    if ← System.FilePath.pathExists p then
+      args := args.push "--rw" |>.push p
   -- Network: allow connecting to the local MCP server and external HTTPS
   args := args.push "--connect-tcp" |>.push (toString serverPort)
   args := args.push "--connect-tcp" |>.push "443"
+  -- Agent-specific extra ports (e.g. local Ollama on 11434)
+  for p in paths.extraPorts do
+    args := args.push "--connect-tcp" |>.push (toString p)
+  -- Task-level extra ports configured in the action/task config
+  for p in extraPorts do
+    args := args.push "--connect-tcp" |>.push (toString p)
   -- Environment variables for the sandboxed command
   args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
+  args := args.push "--env" |>.push "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"
   -- Pass through inherited env vars by name
   for name in ["SHELL", "PATH", "HOME", "USER", "TERM"] do
     args := args.push "--env" |>.push name
@@ -97,7 +120,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- Separator and the actual command with its args
   args := args.push "--"
   args := args.push agentDef.command
-  let agentArgs := agentDef.buildArgs mcpContext pluginDirs subAgent model systemPrompt resume budget prompt
+  -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
+  let allPluginDirs := pluginDirs ++ memoryDirs
+  let agentArgs := agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
   args := args ++ agentArgs
   if debug then
     let argsStr := String.intercalate " " (args.toList.map shellEscape)
@@ -135,20 +160,50 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
             let _ ← killer.wait
           catch _ => pure ()
         | _ => pure ()  -- "done" or other reason: child already exited, nothing to do
+  -- Open debug log file if requested (one per task, created fresh)
+  let debugHandle : Option IO.FS.Handle ← match debugLogFile with
+    | none      => pure none
+    | some path => some <$> IO.FS.Handle.mk path .write
+  -- Open the structured JSON log file (one per task, always created when path is given)
+  let logHandle : Option IO.FS.Handle ← match logFile with
+    | none      => pure none
+    | some path =>
+      if let some dir := path.parent then
+        IO.FS.createDirAll dir
+      some <$> IO.FS.Handle.mk path .write
   -- Stream stdout, parse events and format for display; capture session ID if emitted
-  let sessionIdRef ← IO.mkRef (none : Option String)
+  let sessionIdRef    ← IO.mkRef (none : Option String)
+  let resultSubtypeRef ← IO.mkRef (none : Option StreamFormat.ResultSubtype)
   let outTask ← IO.asTask (prio := .dedicated) do
     let out ← IO.getStdout
+    let err ← IO.getStderr
     repeat do
       let line ← child.stdout.getLine
       if line.isEmpty then return
+      -- Write every raw line to the debug log
+      if let some h := debugHandle then
+        h.putStrLn line
+        h.flush
+      -- When debug is on, echo every raw stdout line to stderr
+      if debug then
+        err.putStrLn s!"[raw] {line.trimAscii}"
+        err.flush
       match agentDef.parseOutputLine line with
-      | none => pure ()
+      | none =>
+        if debug then
+          err.putStrLn s!"[suppressed] {line.trimAscii}"
+          err.flush
       | some event =>
         if let .init sid _ := event then
           sessionIdRef.set (some sid)
+        if let .result sub _ _ _ _ := event then
+          resultSubtypeRef.set (some sub)
         out.putStrLn (StreamFormat.format event)
         out.flush
+        -- Write the parsed event as a JSON line to the structured log
+        if let some h := logHandle then
+          h.putStrLn (Lean.Json.compress (Lean.ToJson.toJson event))
+          h.flush
   -- Stream stderr to console and capture it for usage-limit detection
   let stderrRef ← IO.mkRef ""
   let errTask ← IO.asTask (prio := .dedicated) do
@@ -180,8 +235,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     | some ct => do
       let reason ← ct.getCancellationReason
       pure (reason == some .cancel)
+  let resultSubtype ← resultSubtypeRef.get
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
-  return { exitCode, sessionId, usageLimitHit, wasCancelled }
+  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype }
 
 end Orchestra.Sandbox

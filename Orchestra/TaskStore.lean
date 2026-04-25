@@ -56,6 +56,8 @@ structure TaskRecord where
   systemPrompt  : Option String := none
   /-- Maximum spend in USD used for this run. -/
   budget        : Option Float  := none
+  /-- Priority used for queue ordering. Defaults to 10. -/
+  priority      : Nat           := 10
 deriving Repr
 
 instance : ToJson TaskRecord where
@@ -78,6 +80,7 @@ instance : ToJson TaskRecord where
     let fields := if let some s := r.agent         then fields ++ [("agent",          Json.str s)]     else fields
     let fields := if let some s := r.systemPrompt  then fields ++ [("system_prompt",  Json.str s)]     else fields
     let fields := if let some b := r.budget        then fields ++ [("budget",         ToJson.toJson b)] else fields
+    let fields := if r.priority != 10           then fields ++ [("priority",         Json.num r.priority)] else fields
     Json.mkObj fields
 
 instance : FromJson TaskRecord where
@@ -97,8 +100,9 @@ instance : FromJson TaskRecord where
     let agent         := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt  := j.getObjValAs? String "system_prompt"  |>.toOption
     let budget        := j.getObjValAs? Float  "budget"         |>.toOption
+    let priority      := j.getObjValAs? Nat   "priority"      |>.toOption |>.getD 10
     return { id, createdAt, upstream, fork, mode, prompt, status, sessionId,
-             continuesFrom, series, backend, model, agent, systemPrompt, budget }
+             continuesFrom, series, backend, model, agent, systemPrompt, budget, priority }
 
 -- Directories
 
