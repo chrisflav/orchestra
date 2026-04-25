@@ -255,8 +255,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       IO.println "  Agent hit usage limit."
       usageLimitHit := true
       break
-    let validationScript := repoPath / ".agent" / "validation.sh"
-    if !(← validationScript.pathExists) then
+    if !(← RepoConfig.hasValidationScript repoPath) then
       IO.println "  No validation script found, skipping validation."
       break
     IO.println "  Running validation script..."
