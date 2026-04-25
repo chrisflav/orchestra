@@ -255,11 +255,18 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       IO.println "  Agent hit usage limit."
       usageLimitHit := true
       break
+    let validationScript := repoPath / ".agent" / "validation.sh"
+    if !(← validationScript.pathExists) then
+      IO.println "  No validation script found, skipping validation."
+      break
+    IO.println "  Running validation script..."
     let (valid, validationOutput) ← RepoConfig.runValidation repoPath
     lastValidationOutput := validationOutput
     if !validationOutput.isEmpty then
       IO.println s!"  Validation output:\n{validationOutput}"
-    if valid then break
+    if valid then
+      IO.println "  Validation passed."
+      break
     if attempt + 1 < maxAttempts then
       IO.println s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
     else
