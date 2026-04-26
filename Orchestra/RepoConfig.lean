@@ -73,22 +73,30 @@ def runInitIfNeeded (repoPath : System.FilePath) : IO Unit := do
   runHook repoPath "init.sh"
   IO.FS.writeFile markerPath ""
 
+/-- Returns `true` if `.agent/validation.sh` exists in the repository. -/
+def hasValidationScript (repoPath : System.FilePath) : IO Bool :=
+  (agentDir repoPath / "validation.sh").pathExists
+
 /--
 Run `.agent/validation.sh`.
-Returns `true` if the script passes (exit 0) or does not exist.
-Returns `false` if the script exits non-zero. Does not throw.
+Returns `(true, "")` if the script passes (exit 0) or does not exist.
+Returns `(false, output)` if the script exits non-zero, where `output` is the
+combined stdout and stderr of the script. Does not throw.
 -/
-def runValidation (repoPath : System.FilePath) : IO Bool := do
+def runValidation (repoPath : System.FilePath) : IO (Bool × String) := do
+  if !(← hasValidationScript repoPath) then return (true, "")
   let hookPath := agentDir repoPath / "validation.sh"
-  if !(← hookPath.pathExists) then return true
   let child ← IO.Process.spawn {
     cmd  := "bash"
     args := #[hookPath.toString]
     cwd  := repoPath
-    stdout := .inherit
-    stderr := .inherit
+    stdout := .piped
+    stderr := .piped
   }
+  let stdout ← child.stdout.readToEnd
+  let stderr ← child.stderr.readToEnd
   let code ← child.wait
-  return code == 0
+  let combined := (stdout ++ stderr).trimAscii.toString
+  return (code == 0, combined)
 
 end Orchestra.RepoConfig

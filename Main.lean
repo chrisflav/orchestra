@@ -208,11 +208,14 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   let mut sessionId : Option String := none
   let mut usageLimitHit := false
   let mut wasCancelled := false
+  let mut lastValidationOutput : String := ""
   let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
     RepoConfig.runHook repoPath "before.sh"
-    let prompt := if attempt == 0 then baseTaskPrompt else repoConfig.validation.retryPrompt
+    let prompt :=
+      if attempt == 0 then baseTaskPrompt
+      else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
     let resume := if attempt == 0 then initialResume else sessionId
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
     let agentDef := match task.backend with
@@ -252,8 +255,17 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       IO.println "  Agent hit usage limit."
       usageLimitHit := true
       break
-    let valid ← RepoConfig.runValidation repoPath
-    if valid then break
+    if !(← RepoConfig.hasValidationScript repoPath) then
+      IO.println "  No validation script found, skipping validation."
+      break
+    IO.println "  Running validation script..."
+    let (valid, validationOutput) ← RepoConfig.runValidation repoPath
+    lastValidationOutput := validationOutput
+    if !validationOutput.isEmpty then
+      IO.println s!"  Validation output:\n{validationOutput}"
+    if valid then
+      IO.println "  Validation passed."
+      break
     if attempt + 1 < maxAttempts then
       IO.println s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
     else
