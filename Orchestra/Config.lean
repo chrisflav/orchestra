@@ -47,8 +47,90 @@ instance : ToJson MemoryMode where
     | .project => "project"
     | .both    => "both"
 
-/-- A task without series information, used as input to the Concert DSL. -/
-structure SerieslessTask where
+/-- The set of types that tasks may use as input or output. -/
+inductive ResultType where
+  | string
+  | int
+  | nat
+  | bool
+  | list (t : ResultType)
+  | unit
+  deriving Repr, Inhabited
+
+/-- The Lean `Type` corresponding to a `ResultType`. -/
+abbrev ResultType.Type : ResultType → Type
+  | .string   => String
+  | .unit     => Unit
+  | .bool     => Bool
+  | .nat      => Nat
+  | .int      => Int
+  | .list t   => List t.Type
+
+instance (t : ResultType) : Inhabited t.Type :=
+  match t with
+  | .string => ⟨""⟩
+  | .unit   => ⟨()⟩
+  | .bool   => ⟨false⟩
+  | .nat    => ⟨0⟩
+  | .int    => ⟨0⟩
+  | .list _ => ⟨[]⟩
+
+private partial def resultTypeFromJson : Json → Except String ResultType
+  | .str "string" => .ok .string
+  | .str "int"    => .ok .int
+  | .str "nat"    => .ok .nat
+  | .str "bool"   => .ok .bool
+  | .str "unit"   => .ok .unit
+  | j =>
+      match j.getObjVal? "list" |>.toOption with
+      | some inner => resultTypeFromJson inner |>.map .list
+      | none       => .error s!"expected ResultType, got {j.compress}"
+
+instance : FromJson ResultType where
+  fromJson? := resultTypeFromJson
+
+private def resultTypeToJson : ResultType → Json
+  | .string   => "string"
+  | .int      => "int"
+  | .nat      => "nat"
+  | .bool     => "bool"
+  | .unit     => "unit"
+  | .list t   => Json.mkObj [("list", resultTypeToJson t)]
+
+instance : ToJson ResultType where
+  toJson := resultTypeToJson
+
+/-- JSON Schema describing values of the given result type. -/
+def ResultType.toJsonSchema : ResultType → Json
+  | .string => Json.mkObj [("type", "string")]
+  | .int    => Json.mkObj [("type", "integer")]
+  | .nat    => Json.mkObj [("type", "integer")]
+  | .bool   => Json.mkObj [("type", "boolean")]
+  | .unit   => Json.mkObj [("type", "null")]
+  | .list t => Json.mkObj [("type", "array"), ("items", t.toJsonSchema)]
+
+/-- Serialize a value of the Lean type corresponding to `t` into JSON. -/
+partial def ResultType.valueToJson : (t : ResultType) → t.Type → Json
+  | .string, s => ToJson.toJson s
+  | .int, i    => ToJson.toJson i
+  | .nat, n    => ToJson.toJson n
+  | .bool, b   => ToJson.toJson b
+  | .unit, ()  => .null
+  | .list t, l => .arr (l.map (ResultType.valueToJson t) |>.toArray)
+
+/-- Deserialize a JSON value into the Lean type corresponding to `t`. -/
+partial def ResultType.valueFromJson : (t : ResultType) → Json → Except String t.Type
+  | .string, j => FromJson.fromJson? j
+  | .int, j    => FromJson.fromJson? j
+  | .nat, j    => FromJson.fromJson? j
+  | .bool, j   => FromJson.fromJson? j
+  | .unit, _   => .ok ()
+  | .list t, j => do
+      let arr ← j.getArr?
+      arr.toList.mapM (ResultType.valueFromJson t)
+
+/-- A typed task with phantom input type `i` and output type `o`. -/
+structure IOTask (i o : ResultType) where
   upstream : String
   fork : String
   /-- Legacy mode field (deprecated). Use `tools` instead.
@@ -77,6 +159,8 @@ structure SerieslessTask where
   /-- If true, the project folder is mounted read-only in the sandbox.
       Useful for tasks that should only read the codebase (e.g. review tasks). -/
   readOnly : Bool := false
+  /-- Optional series name for grouping tasks in a sequence. -/
+  series : Option String := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -139,29 +223,35 @@ instance : FromJson AgentAuthConfig where
     let defaultAuthSource := j.getObjValAs? String "default_auth_source" |>.toOption
     return { name, authSources, defaultAuthSource }
 
-structure Task extends SerieslessTask where
-  /-- Optional series name for grouping tasks in a sequence. -/
-  series : Option String := none
+structure Task where
+  /-- The input type of this task. -/
+  i : ResultType
+  /-- The output type of this task. -/
+  o : ResultType
+  /-- The task configuration. -/
+  ioTask : IOTask i o
 deriving Repr, Inhabited
 
 instance : FromJson Task where
   fromJson? j := do
-    let upstream ← j.getObjValAs? String "upstream"
-    let fork ← j.getObjValAs? String "fork"
-    let mode ← j.getObjValAs? TaskMode "mode"
-    let prompt ← j.getObjValAs? String "prompt"
-    let agent := j.getObjValAs? String "agent" |>.toOption
+    let i          := j.getObjValAs? ResultType "input_type"  |>.toOption |>.getD .unit
+    let o          := j.getObjValAs? ResultType "output_type" |>.toOption |>.getD .unit
+    let upstream   ← j.getObjValAs? String "upstream"
+    let fork       ← j.getObjValAs? String "fork"
+    let mode       ← j.getObjValAs? TaskMode "mode"
+    let prompt     ← j.getObjValAs? String "prompt"
+    let agent      := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
-    let backend := j.getObjValAs? String "backend" |>.toOption
-    let model := j.getObjValAs? String "model" |>.toOption
-    let budget := j.getObjValAs? Float "budget" |>.toOption
-    let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
-    let authSource := j.getObjValAs? String "auth_source" |>.toOption
-    let tools := j.getObjValAs? (List String) "tools" |>.toOption
-    let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
-    let series := j.getObjValAs? String "series" |>.toOption
-    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory,
-             authSource, tools, readOnly, series }
+    let backend    := j.getObjValAs? String "backend"        |>.toOption
+    let model      := j.getObjValAs? String "model"          |>.toOption
+    let budget     := j.getObjValAs? Float "budget"          |>.toOption
+    let memory     := j.getObjValAs? MemoryMode "memory"     |>.toOption |>.getD .both
+    let authSource := j.getObjValAs? String "auth_source"    |>.toOption
+    let tools      := j.getObjValAs? (List String) "tools"   |>.toOption
+    let readOnly   := j.getObjValAs? Bool "read_only"        |>.toOption |>.getD false
+    let series     := j.getObjValAs? String "series"         |>.toOption
+    return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, backend, model,
+                                budget, memory, authSource, tools, readOnly, series } }
 
 structure AppConfig where
   appId : Nat

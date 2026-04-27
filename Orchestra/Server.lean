@@ -1,6 +1,7 @@
 import Lean.Data.Json
 import Std.Internal.UV.TCP
 import Std.Net
+import Orchestra.Config
 import Orchestra.GitHub
 
 open Lean (Json)
@@ -21,6 +22,14 @@ structure State where
   privateKeyPath : String
   installationId : Nat
   pat : String
+  /-- Input type of the current task. When not `.unit`, the `get_task_input` tool is exposed. -/
+  inputType : ResultType := .unit
+  /-- Output type of the current task. When not `.unit`, the `submit_task_output` tool is exposed. -/
+  outputType : ResultType := .unit
+  /-- The task input serialized as JSON. `none` when `inputType = .unit`. -/
+  inputJson : Option Json := none
+  /-- Mutable cell where the agent stores its typed output via `submit_task_output`. -/
+  outputRef : Option (IO.Ref (Option Json)) := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -107,10 +116,34 @@ private def optionalToolDefs : List (String × Json) := [
   ])
 ]
 
-private def toolsList (allowedTools : List String) : Json :=
+private def ioToolDefs (inputType outputType : ResultType) : Array Json :=
+  let inputTool := match inputType with
+    | .unit => #[]
+    | t => #[Json.mkObj [
+        ("name", "get_task_input"),
+        ("description", s!"Get the typed input for this task. Returns a JSON value (schema: {t.toJsonSchema.compress})."),
+        ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
+      ]]
+  let outputTool := match outputType with
+    | .unit => #[]
+    | t => #[Json.mkObj [
+        ("name", "submit_task_output"),
+        ("description", s!"Submit the typed output for this task. The value must conform to the schema: {t.toJsonSchema.compress}."),
+        ("inputSchema", Json.mkObj [
+          ("type", "object"),
+          ("properties", Json.mkObj [
+            ("value", t.toJsonSchema)
+          ]),
+          ("required", Json.arr #[.str "value"])
+        ])
+      ]]
+  inputTool ++ outputTool
+
+private def toolsList (state : State) : Json :=
   let optional := optionalToolDefs.filterMap fun entry =>
-    if allowedTools.contains entry.1 then some entry.2 else none
-  Json.mkObj [("tools", .arr (alwaysAvailableTools ++ optional.toArray))]
+    if state.allowedTools.contains entry.1 then some entry.2 else none
+  let io := ioToolDefs state.inputType state.outputType
+  Json.mkObj [("tools", .arr (alwaysAvailableTools ++ optional.toArray ++ io))]
 
 -- Types
 
@@ -120,6 +153,8 @@ inductive ToolCall where
   | refreshToken
   | createPr (title : String) (body : String) (head : String) (base : String)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
+  | getTaskInput
+  | submitTaskOutput (value : Json)
   | unknown (name : String)
   | parseError (msg : String)
 
@@ -156,6 +191,11 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
           let unresolvedOnly  := args.getObjValAs? Bool "unresolved_only"  |>.toOption |>.getD false
           let excludeOutdated := args.getObjValAs? Bool "exclude_outdated" |>.toOption |>.getD false
           .getPrComments prNumInt.toNat unresolvedOnly excludeOutdated
+  | "get_task_input" => .getTaskInput
+  | "submit_task_output" =>
+    match args.getObjVal? "value" with
+    | .ok v  => .submitTaskOutput v
+    | .error _ => .parseError "missing required 'value' argument"
   | _ => .unknown name
 
 /-- Parse a JSON-RPC message into a typed `Request`.
@@ -267,6 +307,19 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     catch e =>
       log s!"tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)
+  | .getTaskInput =>
+    log "tool get_task_input"
+    match state.inputJson with
+    | some j => return toolContent j.compress
+    | none   => return toolContent "no input available" (isError := true)
+  | .submitTaskOutput value =>
+    log s!"tool submit_task_output: {value.compress.take 200}"
+    match state.outputRef with
+    | some ref =>
+      ref.set (some value)
+      return toolContent "output recorded"
+    | none =>
+      return toolContent "output submission not available for this task" (isError := true)
   | .unknown name =>
     log s!"tool {name}: unknown"
     return toolContent s!"unknown tool: {name}" (isError := true)
@@ -285,7 +338,7 @@ private def evalRequest (state : State) (req : Request) : IO (Option Json) := do
     return none
   | .toolsList id =>
     log "tools/list"
-    return some (jsonrpcResult id (toolsList state.allowedTools))
+    return some (jsonrpcResult id (toolsList state))
   | .toolsCall id call =>
     let result ← evalToolCall state call
     return some (jsonrpcResult id result)

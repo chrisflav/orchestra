@@ -22,6 +22,8 @@ structure LaunchResult where
   wasCancelled   : Bool := false
   /-- The subtype from the agent's result event, if one was emitted. -/
   resultSubtype  : Option StreamFormat.ResultSubtype := none
+  /-- The result text from the agent's result event, if one was emitted. -/
+  resultText     : Option String := none
 
 /--
 Launch the coding agent inside a landrun sandbox.
@@ -166,6 +168,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- Stream stdout, parse events and format for display; capture session ID if emitted
   let sessionIdRef    ← IO.mkRef (none : Option String)
   let resultSubtypeRef ← IO.mkRef (none : Option StreamFormat.ResultSubtype)
+  let resultTextRef   ← IO.mkRef (none : Option String)
   let outTask ← IO.asTask (prio := .dedicated) do
     let out ← IO.getStdout
     repeat do
@@ -180,8 +183,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
       | some event =>
         if let .init sid _ := event then
           sessionIdRef.set (some sid)
-        if let .result sub _ _ _ _ := event then
+        if let .result sub _ _ _ res := event then
           resultSubtypeRef.set (some sub)
+          unless res.isEmpty do resultTextRef.set (some res)
         out.putStrLn (StreamFormat.format event)
         out.flush
         -- Write the parsed event as a JSON line to the structured log
@@ -220,8 +224,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
       let reason ← ct.getCancellationReason
       pure (reason == some .cancel)
   let resultSubtype ← resultSubtypeRef.get
+  let resultText    ← resultTextRef.get
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
-  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype }
+  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype, resultText }
 
 end Orchestra.Sandbox

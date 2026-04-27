@@ -2,55 +2,50 @@ import Orchestra.Config
 
 namespace Orchestra.Concert
 
-/-- A named series for grouping tasks in a sequence.
-    The constructor is private so that users must create series via `freshSeries`. -/
-structure Series where
-  private mk ::
-  name : String
+instance : CoeSort ResultType Type where
+  coe t := t.Type
 
-/-- The state maintained during Concert program execution. -/
-structure ConcertState where
-  /-- The accumulated list of tasks (the eventual output when compiling). -/
-  tasks : Array Task := #[]
-  /-- All series created during this concert. -/
-  series : Array Series := #[]
-  /-- The currently active series (if any). -/
-  currentSeries : Option Series := none
+/-- A typed task with input type `i` and output type `o`. -/
+structure Task (i o : ResultType) where
+  toIOTask : i → IOTask i o
 
-/-- The Concert monad: a state monad over `ConcertState`. -/
-abbrev ConcertM (α : Type) := StateM ConcertState α
+mutual
+  /-- Primitive operations in the Concert language. -/
+  inductive ConcertOp : Type → Type 1 where
+    /-- Run a task with the given input. `o` is explicit so the evaluator can recover it. -/
+    | run   : (o : ResultType) → Task i o → i → ConcertOp o
+    | while : Concert Bool → Concert Unit → ConcertOp Unit
 
-/-- Append a new task to the current task list.
-    The series of the task is taken from the current series in the state. -/
-def run (task : SerieslessTask) : ConcertM Unit := do
-  let state ← get
-  let fullTask : Task := {
-    toSerieslessTask := task
-    series := state.currentSeries.map (·.name)
-  }
-  set { state with tasks := state.tasks.push fullTask }
+  /-- A Concert program: a free monad over `ConcertOp`.
+      `abort` represents a cancelled or failed program. -/
+  inductive Concert : Type → Type 1 where
+    | pure  : α → Concert α
+    | op    : ConcertOp β → (β → Concert α) → Concert α
+    | abort : Concert α
+end
 
-/-- Create a fresh `Series` with the given name and register it in the state. -/
-def freshSeries (name : String) : ConcertM Series := do
-  let s := Series.mk name
-  modify fun state => { state with series := state.series.push s }
-  return s
+instance : Inhabited (Concert α) := ⟨.abort⟩
 
-/-- Set the current series. -/
-def setSeries (s : Series) : ConcertM Unit :=
-  modify fun state => { state with currentSeries := some s }
+@[inline]
+private def bindConcert {α β : Type} : Concert α → (α → Concert β) → Concert β
+  | .pure a, f  => f a
+  | .op op k, f => .op op (fun x => bindConcert (k x) f)
+  | .abort, _   => .abort
 
-/-- Run the given action with the current series temporarily set to `s`,
-    then restore the previous series. -/
-def withSeries {α : Type} (s : Series) (action : ConcertM α) : ConcertM α := do
-  let prevSeries := (← get).currentSeries
-  setSeries s
-  let result ← action
-  modify fun state => { state with currentSeries := prevSeries }
-  return result
+instance : Monad Concert where
+  pure := Concert.pure
+  bind := bindConcert
 
-/-- Compile a Concert program into an array of `Task`s. -/
-def compile (program : ConcertM Unit) : Array Task :=
-  (program.run {}).2.tasks
+/-- Lift a typed task into Concert. -/
+def task {i o : ResultType} (t : Task i o) (input : i) : Concert o :=
+  .op (.run o t input) .pure
+
+/-- Loop `body` while `cond` evaluates to true. -/
+def whileM (cond : Concert Bool) (body : Concert Unit) : Concert Unit :=
+  .op (.while cond body) .pure
+
+/-- Convenience: lift a `IOTask .unit .unit` directly into Concert. -/
+def run {i o : ResultType} (spec : IOTask i o) (x : i) : Concert o :=
+  task { toIOTask := fun _ => spec } x
 
 end Orchestra.Concert
