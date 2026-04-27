@@ -127,12 +127,14 @@ private def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
       return vars.map fun (k, v) => (k, some v)
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.
-    Returns the task ID and whether the run was cut short by a usage limit. -/
+    Returns the task ID, whether the run was cut short by a usage limit, and
+    whether validation had failed at least once (requiring the queue entry to be
+    marked as failed rather than unfinished on a usage-limit abort). -/
 private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (continuesFrom : Option String := none)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
-    (interactive : Bool := true) : IO (String × Bool) := do
+    (interactive : Bool := true) : IO (String × Bool × Bool) := do
   IO.println s!"=== Task {idx}: {task.fork} ({repr task.mode}) ==="
   -- Record this run in the task store
   let taskId ← TaskStore.generateId
@@ -208,6 +210,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   let mut sessionId : Option String := none
   let mut usageLimitHit := false
   let mut wasCancelled := false
+  let mut validationFailed := false
   let mut lastValidationOutput : String := ""
   let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
   let maxAttempts := repoConfig.validation.maxRetries + 1
@@ -251,7 +254,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       IO.println "  Agent was cancelled."
       wasCancelled := true
       break
-    if result.usageLimitHit then
+    if result.usageLimitHit || result.resultSubtype == some .errorMaxBudgetUsd then
       IO.println "  Agent hit usage limit."
       usageLimitHit := true
       break
@@ -266,6 +269,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     if valid then
       IO.println "  Validation passed."
       break
+    validationFailed := true
     if attempt + 1 < maxAttempts then
       IO.println s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
     else
@@ -276,6 +280,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   -- 7. Persist final task state
   let finalStatus :=
     if wasCancelled then .cancelled
+    else if usageLimitHit && validationFailed then .failed
     else match lastResultSubtype with
       | some .success           => .completed
       | some .errorMaxBudgetUsd => .unfinished
@@ -285,7 +290,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   if let some seriesName := series then
     TaskStore.updateSeriesPointer seriesName taskId
   IO.println s!"=== Task {idx} done ===\n"
-  return (taskId, usageLimitHit)
+  return (taskId, usageLimitHit, validationFailed)
 
 -- Helpers
 
@@ -697,7 +702,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         | none    => pure appConfig
         | some cp => loadAppConfig (some (System.FilePath.mk cp))
       try
-        let (taskId, usageLimitHit) ← runTask cfg task 0 debug
+        let (taskId, usageLimitHit, validationFailed) ← runTask cfg task 0 debug
           (continuesFrom := entry.continuesFrom) (series := entry.series)
           (cancelToken := some taskToken) (interactive := false)
         currentTaskToken.atomically (·.set none)
@@ -705,7 +710,10 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
           IO.println s!"  Task cancelled."
         else if usageLimitHit then
-          Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
+          -- If validation had already failed before hitting the usage limit, mark as failed
+          -- so this queue entry is not re-launched (it won't make progress under a limit).
+          let queueStatus := if validationFailed then .failed else .unfinished
+          Queue.saveEntry { entry with status := queueStatus, taskId := some taskId }
           Queue.cancelPendingByBackend entry.backend entry.id
           Queue.cancelDependents taskId
           IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
