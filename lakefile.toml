@@ -10,7 +10,6 @@ rev = "main"
 
 [[lean_lib]]
 name = "Orchestra"
-autoImplicit = false
 
 [[lean_lib]]
 name = "Test"
