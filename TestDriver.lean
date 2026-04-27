@@ -7,7 +7,7 @@
 
   Add an import for each new test file you create.
 -/
-import Test
+import OrchestraTest
 
 def main : IO UInt32 := do
   let passed ← Orchestra.runTests

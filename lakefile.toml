@@ -12,7 +12,7 @@ rev = "main"
 name = "Orchestra"
 
 [[lean_lib]]
-name = "Test"
+name = "OrchestraTest"
 
 [[lean_exe]]
 name = "orchestra"
@@ -25,3 +25,8 @@ root = "McpTest"
 [[lean_exe]]
 name = "orchestraTest"
 root = "TestDriver"
+
+[[require]]
+name = "Yaml"
+git = "https://github.com/chrisflav/lean-yaml"
+rev = "master"
