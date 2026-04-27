@@ -161,6 +161,9 @@ structure IOTask (i o : ResultType) where
   readOnly : Bool := false
   /-- Optional series name for grouping tasks in a sequence. -/
   series : Option String := none
+  /-- Priority of this task. Natural number; higher = more important.
+      Defaults to 10 if not set. -/
+  priority : Nat := 10
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -214,6 +217,9 @@ structure AgentAuthConfig where
   /-- Label of the default authentication source.
       If absent and exactly one source is configured, that source is used automatically. -/
   defaultAuthSource : Option String := none
+  /-- Additional TCP ports the agent is allowed to connect to inside the sandbox.
+      Appended to the ports the agent backend already opens (MCP server port + 443). -/
+  extraPorts : Array Nat := #[]
 deriving Repr, Inhabited
 
 instance : FromJson AgentAuthConfig where
@@ -221,7 +227,8 @@ instance : FromJson AgentAuthConfig where
     let name             ← j.getObjValAs? String "name"
     let authSources       := j.getObjValAs? (Array AuthSource) "auth_sources" |>.toOption |>.getD #[]
     let defaultAuthSource := j.getObjValAs? String "default_auth_source" |>.toOption
-    return { name, authSources, defaultAuthSource }
+    let extraPorts        := j.getObjValAs? (Array Nat) "extra_ports" |>.toOption |>.getD #[]
+    return { name, authSources, defaultAuthSource, extraPorts }
 
 structure Task where
   /-- The input type of this task. -/
@@ -250,8 +257,9 @@ instance : FromJson Task where
     let tools      := j.getObjValAs? (List String) "tools"   |>.toOption
     let readOnly   := j.getObjValAs? Bool "read_only"        |>.toOption |>.getD false
     let series     := j.getObjValAs? String "series"         |>.toOption
+    let priority   := j.getObjValAs? Nat "priority"          |>.toOption |>.getD 10
     return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, backend, model,
-                                budget, memory, authSource, tools, readOnly, series } }
+                                budget, memory, authSource, tools, readOnly, series, priority } }
 
 structure AppConfig where
   appId : Nat

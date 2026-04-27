@@ -53,7 +53,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (debugLogFile : Option System.FilePath := none)
     (logFile : Option System.FilePath := none)
     -- If true, mount the project repository read-only in the sandbox.
-    (readOnly : Bool := false) : IO LaunchResult := do
+    (readOnly : Bool := false)
+    -- Additional TCP ports to allow, beyond what the agent backend already opens.
+    (extraPorts : Array Nat := #[]) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -95,6 +97,12 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- Network: allow connecting to the local MCP server and external HTTPS
   args := args.push "--connect-tcp" |>.push (toString serverPort)
   args := args.push "--connect-tcp" |>.push "443"
+  -- Agent-specific extra ports (e.g. local Ollama on 11434)
+  for p in paths.extraPorts do
+    args := args.push "--connect-tcp" |>.push (toString p)
+  -- Task-level extra ports configured in the action/task config
+  for p in extraPorts do
+    args := args.push "--connect-tcp" |>.push (toString p)
   -- Environment variables for the sandboxed command
   args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
   args := args.push "--env" |>.push "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"
@@ -171,6 +179,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let resultTextRef   ← IO.mkRef (none : Option String)
   let outTask ← IO.asTask (prio := .dedicated) do
     let out ← IO.getStdout
+    let err ← IO.getStderr
     repeat do
       let line ← child.stdout.getLine
       if line.isEmpty then return
@@ -178,8 +187,15 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
       if let some h := debugHandle then
         h.putStrLn line
         h.flush
+      -- When debug is on, echo every raw stdout line to stderr
+      if debug then
+        err.putStrLn s!"[raw] {line.trimAscii}"
+        err.flush
       match agentDef.parseOutputLine line with
-      | none => pure ()
+      | none =>
+        if debug then
+          err.putStrLn s!"[suppressed] {line.trimAscii}"
+          err.flush
       | some event =>
         if let .init sid _ := event then
           sessionIdRef.set (some sid)
