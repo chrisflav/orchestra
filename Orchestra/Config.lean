@@ -100,6 +100,15 @@ private def resultTypeToJson : ResultType → Json
 instance : ToJson ResultType where
   toJson := resultTypeToJson
 
+/-- Human-readable description of a value of the given result type, for use in tool descriptions. -/
+def ResultType.toDescription : ResultType → String
+  | .string   => "a JSON string"
+  | .int      => "a JSON integer (may be negative)"
+  | .nat      => "a JSON non-negative integer"
+  | .bool     => "a JSON boolean"
+  | .unit     => "null"
+  | .list t   => s!"a JSON array where each element is {t.toDescription}"
+
 /-- JSON Schema describing values of the given result type. -/
 def ResultType.toJsonSchema : ResultType → Json
   | .string => Json.mkObj [("type", "string")]

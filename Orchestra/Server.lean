@@ -121,14 +121,19 @@ private def ioToolDefs (inputType outputType : ResultType) : Array Json :=
     | .unit => #[]
     | t => #[Json.mkObj [
         ("name", "get_task_input"),
-        ("description", s!"Get the typed input for this task. Returns a JSON value (schema: {t.toJsonSchema.compress})."),
+        ("description", s!"Retrieve the input value for this task. \
+The value is {t.toDescription}. \
+JSON schema: {t.toJsonSchema.compress}"),
         ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
       ]]
   let outputTool := match outputType with
     | .unit => #[]
     | t => #[Json.mkObj [
         ("name", "submit_task_output"),
-        ("description", s!"Submit the typed output for this task. The value must conform to the schema: {t.toJsonSchema.compress}."),
+        ("description", s!"Submit the output value for this task. \
+The value must be {t.toDescription}. \
+JSON schema for the 'value' field: {t.toJsonSchema.compress}. \
+Call this tool exactly once when the task is complete."),
         ("inputSchema", Json.mkObj [
           ("type", "object"),
           ("properties", Json.mkObj [
