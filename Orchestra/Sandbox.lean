@@ -98,9 +98,13 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- Agent-specific extra ports (e.g. local Ollama on 11434)
   for p in paths.extraPorts do
     args := args.push "--connect-tcp" |>.push (toString p)
+    args := args.push "--bind-tcp" |>.push (toString p)
   -- Task-level extra ports configured in the action/task config
   for p in extraPorts do
     args := args.push "--connect-tcp" |>.push (toString p)
+    args := args.push "--bind-tcp" |>.push (toString p)
+
+
   -- Environment variables for the sandboxed command
   args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
   args := args.push "--env" |>.push "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"
