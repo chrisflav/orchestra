@@ -116,6 +116,9 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
     let remotes₃ ← runGit #["remote"] repoPath
     if !(remotes₃.splitOn "\n" |>.any (· == "upstream")) then
       runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
+  -- Fetch upstream to keep remote tracking branches up to date
+  IO.println "  Fetching upstream..."
+  runGit' #["fetch", "upstream"] repoPath
   -- Ensure gh credentials are wired into git for authenticated pushes
   runGh' #["auth", "setup-git"] none
   return repoPath
