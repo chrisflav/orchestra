@@ -94,6 +94,8 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
   let readOnly :=
     (mappingLookup pairs "read-only").bind (nodeAsString · |>.toOption)
     |>.map (· == "true") |>.getD false
+  let upstream := (mappingLookup pairs "upstream").bind (nodeAsString · |>.toOption)
+  let fork     := (mappingLookup pairs "fork").bind     (nodeAsString · |>.toOption)
   let input ← match mappingLookup pairs "input" with
     | none      => pure []
     | some iNode => do
@@ -107,7 +109,7 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
         outPairs.toList.mapM fun (k, v) => do
           let name ← nodeAsString k
           parseOutputSpec name v
-  return { agent, model, prompt, readOnly, input, output, context }
+  return { agent, model, prompt, readOnly, input, output, context, upstream, fork }
 
 private def parseWriteAction (node : Node) : Except String StepAction := do
   let s ← nodeAsString node
@@ -161,8 +163,10 @@ def WorkflowProgram.parseYaml (input : String) : Except String WorkflowProgram :
   let doc   ← orError stream.documents[0]? "empty YAML document"
   let root  ← orError doc.root "YAML document has no root node"
   let pairs ← nodeAsMapping root
-  let name  ← nodeAsString (← orError (mappingLookup pairs "name") "missing 'name'")
+  let name     ← nodeAsString (← orError (mappingLookup pairs "name") "missing 'name'")
   let description := (mappingLookup pairs "description").bind (nodeAsString · |>.toOption)
+  let upstream := (mappingLookup pairs "upstream").bind (nodeAsString · |>.toOption) |>.getD ""
+  let fork     := (mappingLookup pairs "fork").bind     (nodeAsString · |>.toOption) |>.getD ""
   let variables ← match mappingLookup pairs "variables" with
     | none      => pure []
     | some node => parseVariables node
@@ -173,6 +177,6 @@ def WorkflowProgram.parseYaml (input : String) : Except String WorkflowProgram :
         stepPairs.toList.mapM fun (k, v) => do
           let stepName ← nodeAsString k
           parseStep stepName v
-  return { name, description, variables, steps }
+  return { name, description, upstream, fork, variables, steps }
 
 end Orchestra.Workflow

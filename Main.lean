@@ -57,6 +57,9 @@ private def inheritSeries (continuesFrom : Option String) (series : Option Strin
 
 -- Handlers
 
+private def isWorkflowFile (path : String) : Bool :=
+  path.endsWith ".yaml" || path.endsWith ".yml"
+
 private def runHandler (p : Parsed) : IO UInt32 := do
   let taskFile      := p.positionalArg! "task-file" |>.as! String
   let configPath    := p.flag? "config"    |>.map (·.as! String)
@@ -66,6 +69,16 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let series        := p.flag? "series"    |>.map (·.as! String)
   let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  if isWorkflowFile taskFile then
+    let yaml ← IO.FS.readFile taskFile
+    match Workflow.WorkflowProgram.parseYaml yaml with
+    | .error e =>
+      IO.eprintln s!"Failed to parse workflow: {e}"
+      return 1
+    | .ok prog =>
+      let concert := Workflow.WorkflowProgram.toConcert prog
+      Concert.eval appConfig debug none concert
+      return 0
   let taskFileData ← loadTaskFile taskFile
   if taskFileData.tasks.isEmpty then
     IO.eprintln "No tasks found in task file"

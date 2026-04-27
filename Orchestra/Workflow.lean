@@ -47,6 +47,10 @@ structure TaskSpec where
   input    : List VarRef     := []
   output   : List OutputSpec := []
   context  : Option String   := none
+  /-- Override the program-level upstream repository for this step. -/
+  upstream : Option String   := none
+  /-- Override the program-level fork repository for this step. -/
+  fork     : Option String   := none
   deriving Repr
 
 /-- Specifies that a step iterates over a list. -/
@@ -142,10 +146,12 @@ private def writeOutput (stepName : String) (spec : OutputSpec)
 private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSpec)
     (accumulate : Bool := false) : WorkflowM Unit := do
   let (env, _) ← get
+  let upstream     := spec.upstream.getD prog.upstream
+  let fork         := spec.fork.getD prog.fork
   let inputSection := buildInputSection env spec.input
   if spec.output.isEmpty then
     let ioTask : IOTask .unit .unit := {
-      upstream := prog.upstream, fork := prog.fork, mode := .fork
+      upstream, fork, mode := .fork
       prompt := spec.prompt ++ inputSection
       agent := spec.agent, model := spec.model, readOnly := spec.readOnly
     }
@@ -154,7 +160,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
     let schema := Json.mkObj (spec.output.map fun o => (o.name, o.type.toJsonSchema))
     let outInstr := s!"\n\nReturn a JSON object with these fields:\n{schema.compress}"
     let ioTask : IOTask .unit .string := {
-      upstream := prog.upstream, fork := prog.fork, mode := .fork
+      upstream, fork, mode := .fork
       prompt := spec.prompt ++ inputSection ++ outInstr
       agent := spec.agent, model := spec.model, readOnly := spec.readOnly
     }
