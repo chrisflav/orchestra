@@ -221,6 +221,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     let agentDef := match task.backend with
       | some "pi"   => AgentDef.pi
       | some "vibe" => AgentDef.vibe
+      | some "test"  => AgentDef.testAgent
       | _           => AgentDef.claude
     let backendName := task.backend.getD "claude"
     let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName task.authSource
