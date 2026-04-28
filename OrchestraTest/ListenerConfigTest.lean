@@ -1,4 +1,4 @@
-import Test.TestM
+import OrchestraTest.TestM
 import Orchestra
 
 open Lean (Json FromJson ToJson)

@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Orchestra.Config
+import Orchestra.TaskStore
 
 open Lean (Json FromJson ToJson)
 
@@ -67,7 +68,15 @@ structure QueueEntry where
   /-- Priority of this queue entry. Natural number; higher = more important.
       Defaults to 10 if not set. -/
   priority      : Nat := 10
-deriving Repr
+  /-- Key linking this entry to a suspended concert fiber. When set, the queue
+      daemon signals the ConcertManager with the task output after completion. -/
+  concertStepKey : Option String := none
+  /-- Input type for the task. Controls which MCP tools are exposed. -/
+  inputType     : ResultType     := .unit
+  /-- Output type for the task. Controls which MCP tools are exposed. -/
+  outputType    : ResultType     := .unit
+  /-- Serialized task input, delivered via the `get_task_input` MCP tool. -/
+  inputJson     : Option Json    := none
 
 instance : ToJson QueueEntry where
   toJson e :=
@@ -93,7 +102,11 @@ instance : ToJson QueueEntry where
     let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
     let fields := if let some t := e.tools         then fields ++ [("tools",           ToJson.toJson t)] else fields
     let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
-    let fields := if e.priority != 10              then fields ++ [("priority",         Json.num e.priority)] else fields
+    let fields := if e.priority != 10              then fields ++ [("priority",         Json.num e.priority)]           else fields
+    let fields := if let some s := e.concertStepKey then fields ++ [("concert_step_key", Json.str s)]                  else fields
+    let fields := if e.inputType != .unit           then fields ++ [("input_type",       ToJson.toJson e.inputType)]   else fields
+    let fields := if e.outputType != .unit          then fields ++ [("output_type",      ToJson.toJson e.outputType)]  else fields
+    let fields := if let some j := e.inputJson      then fields ++ [("input_json",       j)]                           else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -118,10 +131,15 @@ instance : FromJson QueueEntry where
     let authSource    := j.getObjValAs? String "auth_source" |>.toOption
     let tools         := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
-    let priority      := j.getObjValAs? Nat "priority" |>.toOption |>.getD 10
+    let priority       := j.getObjValAs? Nat        "priority"         |>.toOption |>.getD 10
+    let concertStepKey := j.getObjValAs? String    "concert_step_key" |>.toOption
+    let inputType      := j.getObjValAs? ResultType "input_type"      |>.toOption |>.getD .unit
+    let outputType     := j.getObjValAs? ResultType "output_type"     |>.toOption |>.getD .unit
+    let inputJson      := j.getObjVal?   "input_json"                 |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget, memory, authSource, tools, readOnly, priority }
+             budget, memory, authSource, tools, readOnly, priority,
+             concertStepKey, inputType, outputType, inputJson }
 
 -- Directories and paths
 
@@ -270,5 +288,13 @@ def markStaleRunningAsUnfinished : IO Unit := do
   for entry in all do
     if entry.status == .running then
       saveEntry { entry with status := .unfinished }
+
+/-- On daemon startup, cancel any unfinished concert-linked entries.
+    Their concert fibers died with the previous daemon and can never be resumed. -/
+def cancelStaleConcertEntries : IO Unit := do
+  let all ← loadAllEntries
+  for entry in all do
+    if entry.status == .unfinished && entry.concertStepKey.isSome then
+      saveEntry { entry with status := .cancelled }
 
 end Orchestra.Queue

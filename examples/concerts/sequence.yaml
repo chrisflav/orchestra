@@ -1,0 +1,23 @@
+name: sequence
+description: Simple sequence of tasks
+
+steps:
+  plan:
+    task:
+      agent: claude
+      model: sonnet
+      read-only: true
+      prompt: "Make a detailed plan for implementing the given task."
+
+  implement:
+    task:
+      agent: claude
+      model: sonnet
+      prompt: "Implement the plan step by step."
+
+  review:
+    task:
+      agent: claude
+      model: sonnet
+      read-only: true
+      prompt: "Review the completed work and compare to the assigned task."

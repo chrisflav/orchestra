@@ -1,7 +1,9 @@
 import Orchestra.AgentDef
+import Orchestra.ConcertManager
 import Orchestra.Agents.Claude
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
+import Orchestra.Concert
 import Orchestra.Config
 import Orchestra.GitHub
 import Orchestra.Listener
@@ -11,4 +13,7 @@ import Orchestra.RepoConfig
 import Orchestra.Sandbox
 import Orchestra.Server
 import Orchestra.StreamFormat
+import Orchestra.TaskRunner
 import Orchestra.TaskStore
+import Orchestra.Workflow
+import Orchestra.WorkflowParser

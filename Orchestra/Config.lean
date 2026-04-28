@@ -47,6 +47,134 @@ instance : ToJson MemoryMode where
     | .project => "project"
     | .both    => "both"
 
+/-- The set of types that tasks may use as input or output. -/
+inductive ResultType where
+  | string
+  | int
+  | nat
+  | bool
+  | list (t : ResultType)
+  | unit
+  deriving Repr, BEq, Inhabited
+
+/-- The Lean `Type` corresponding to a `ResultType`. -/
+abbrev ResultType.Type : ResultType → Type
+  | .string   => String
+  | .unit     => Unit
+  | .bool     => Bool
+  | .nat      => Nat
+  | .int      => Int
+  | .list t   => List t.Type
+
+instance (t : ResultType) : Inhabited t.Type :=
+  match t with
+  | .string => ⟨""⟩
+  | .unit   => ⟨()⟩
+  | .bool   => ⟨false⟩
+  | .nat    => ⟨0⟩
+  | .int    => ⟨0⟩
+  | .list _ => ⟨[]⟩
+
+private partial def resultTypeFromJson : Json → Except String ResultType
+  | .str "string" => .ok .string
+  | .str "int"    => .ok .int
+  | .str "nat"    => .ok .nat
+  | .str "bool"   => .ok .bool
+  | .str "unit"   => .ok .unit
+  | j =>
+      match j.getObjVal? "list" |>.toOption with
+      | some inner => resultTypeFromJson inner |>.map .list
+      | none       => .error s!"expected ResultType, got {j.compress}"
+
+instance : FromJson ResultType where
+  fromJson? := resultTypeFromJson
+
+private def resultTypeToJson : ResultType → Json
+  | .string   => "string"
+  | .int      => "int"
+  | .nat      => "nat"
+  | .bool     => "bool"
+  | .unit     => "unit"
+  | .list t   => Json.mkObj [("list", resultTypeToJson t)]
+
+instance : ToJson ResultType where
+  toJson := resultTypeToJson
+
+/-- Human-readable description of a value of the given result type, for use in tool descriptions. -/
+def ResultType.toDescription : ResultType → String
+  | .string   => "a JSON string"
+  | .int      => "a JSON integer (may be negative)"
+  | .nat      => "a JSON non-negative integer"
+  | .bool     => "a JSON boolean"
+  | .unit     => "null"
+  | .list t   => s!"a JSON array where each element is {t.toDescription}"
+
+/-- JSON Schema describing values of the given result type. -/
+def ResultType.toJsonSchema : ResultType → Json
+  | .string => Json.mkObj [("type", "string")]
+  | .int    => Json.mkObj [("type", "integer")]
+  | .nat    => Json.mkObj [("type", "integer")]
+  | .bool   => Json.mkObj [("type", "boolean")]
+  | .unit   => Json.mkObj [("type", "null")]
+  | .list t => Json.mkObj [("type", "array"), ("items", t.toJsonSchema)]
+
+/-- Serialize a value of the Lean type corresponding to `t` into JSON. -/
+partial def ResultType.valueToJson : (t : ResultType) → t.Type → Json
+  | .string, s => ToJson.toJson s
+  | .int, i    => ToJson.toJson i
+  | .nat, n    => ToJson.toJson n
+  | .bool, b   => ToJson.toJson b
+  | .unit, ()  => .null
+  | .list t, l => .arr (l.map (ResultType.valueToJson t) |>.toArray)
+
+/-- Deserialize a JSON value into the Lean type corresponding to `t`. -/
+partial def ResultType.valueFromJson : (t : ResultType) → Json → Except String t.Type
+  | .string, j => FromJson.fromJson? j
+  | .int, j    => FromJson.fromJson? j
+  | .nat, j    => FromJson.fromJson? j
+  | .bool, j   => FromJson.fromJson? j
+  | .unit, _   => .ok ()
+  | .list t, j => do
+      let arr ← j.getArr?
+      arr.toList.mapM (ResultType.valueFromJson t)
+
+/-- A typed task with phantom input type `i` and output type `o`. -/
+structure IOTask (i o : ResultType) where
+  upstream : String
+  fork : String
+  /-- Legacy mode field (deprecated). Use `tools` instead.
+      If `tools` is absent, this field is used to derive the allowed tools:
+      - `fork` → no tools
+      - `pr`   → `["create_pr"]` -/
+  mode : TaskMode
+  prompt : String
+  agent : Option String := none
+  systemPrompt : Option String := none
+  /-- Agent backend to use: "claude" (default) or "vibe". -/
+  backend : Option String := none
+  /-- Model override passed to the agent (e.g. "sonnet", "devstral-small"). -/
+  model : Option String := none
+  /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
+  budget : Option Float := none
+  /-- Which memory directories to make available to the agent. Defaults to `both`. -/
+  memory : MemoryMode := .both
+  /-- Label of the authentication source to use for this task.
+      Must match a label in the agent's `auth_sources` config. -/
+  authSource : Option String := none
+  /-- Optional tools to enable beyond the always-available ones (health, refresh_token,
+      get_pr_comments). Currently the only optional tool is `"create_pr"`.
+      When absent, the allowed tools are derived from `mode` for backwards compatibility. -/
+  tools : Option (List String) := none
+  /-- If true, the project folder is mounted read-only in the sandbox.
+      Useful for tasks that should only read the codebase (e.g. review tasks). -/
+  readOnly : Bool := false
+  /-- Optional series name for grouping tasks in a sequence. -/
+  series : Option String := none
+  /-- Priority of this task. Natural number; higher = more important.
+      Defaults to 10 if not set. -/
+  priority : Nat := 10
+deriving Repr, Inhabited
+
 /-- The kind of authentication for an agent backend. -/
 inductive AuthKind where
   /-- An OAuth token. -/
@@ -112,57 +240,35 @@ instance : FromJson AgentAuthConfig where
     return { name, authSources, defaultAuthSource, extraPorts }
 
 structure Task where
-  upstream : String
-  fork : String
-  /-- Legacy mode field (deprecated). Use `tools` instead.
-      If `tools` is absent, this field is used to derive the allowed tools:
-      - `fork` → no tools
-      - `pr`   → `["create_pr"]` -/
-  mode : TaskMode
-  prompt : String
-  agent : Option String := none
-  systemPrompt : Option String := none
-  /-- Agent backend to use: "claude" (default) or "vibe". -/
-  backend : Option String := none
-  /-- Model override passed to the agent (e.g. "sonnet", "devstral-small"). -/
-  model : Option String := none
-  /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
-  budget : Option Float := none
-  /-- Which memory directories to make available to the agent. Defaults to `both`. -/
-  memory : MemoryMode := .both
-  /-- Label of the authentication source to use for this task.
-      Must match a label in the agent's `auth_sources` config. -/
-  authSource : Option String := none
-  /-- Optional tools to enable beyond the always-available ones (health, refresh_token,
-      get_pr_comments). Currently the only optional tool is `"create_pr"`.
-      When absent, the allowed tools are derived from `mode` for backwards compatibility. -/
-  tools : Option (List String) := none
-  /-- If true, the project folder is mounted read-only in the sandbox.
-      Useful for tasks that should only read the codebase (e.g. review tasks). -/
-  readOnly : Bool := false
-  /-- Priority of this task. Natural number; higher = more important.
-      Defaults to 10 if not set. -/
-  priority : Nat := 10
+  /-- The input type of this task. -/
+  i : ResultType
+  /-- The output type of this task. -/
+  o : ResultType
+  /-- The task configuration. -/
+  ioTask : IOTask i o
 deriving Repr, Inhabited
 
 instance : FromJson Task where
   fromJson? j := do
-    let upstream ← j.getObjValAs? String "upstream"
-    let fork ← j.getObjValAs? String "fork"
-    let mode ← j.getObjValAs? TaskMode "mode"
-    let prompt ← j.getObjValAs? String "prompt"
-    let agent := j.getObjValAs? String "agent" |>.toOption
+    let i          := j.getObjValAs? ResultType "input_type"  |>.toOption |>.getD .unit
+    let o          := j.getObjValAs? ResultType "output_type" |>.toOption |>.getD .unit
+    let upstream   ← j.getObjValAs? String "upstream"
+    let fork       ← j.getObjValAs? String "fork"
+    let mode       ← j.getObjValAs? TaskMode "mode"
+    let prompt     ← j.getObjValAs? String "prompt"
+    let agent      := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
-    let backend := j.getObjValAs? String "backend" |>.toOption
-    let model := j.getObjValAs? String "model" |>.toOption
-    let budget := j.getObjValAs? Float "budget" |>.toOption
-    let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
-    let authSource := j.getObjValAs? String "auth_source" |>.toOption
-    let tools := j.getObjValAs? (List String) "tools" |>.toOption
-    let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
-    let priority := j.getObjValAs? Nat "priority" |>.toOption |>.getD 10
-    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory,
-             authSource, tools, readOnly, priority }
+    let backend    := j.getObjValAs? String "backend"        |>.toOption
+    let model      := j.getObjValAs? String "model"          |>.toOption
+    let budget     := j.getObjValAs? Float "budget"          |>.toOption
+    let memory     := j.getObjValAs? MemoryMode "memory"     |>.toOption |>.getD .both
+    let authSource := j.getObjValAs? String "auth_source"    |>.toOption
+    let tools      := j.getObjValAs? (List String) "tools"   |>.toOption
+    let readOnly   := j.getObjValAs? Bool "read_only"        |>.toOption |>.getD false
+    let series     := j.getObjValAs? String "series"         |>.toOption
+    let priority   := j.getObjValAs? Nat "priority"          |>.toOption |>.getD 10
+    return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, backend, model,
+                                budget, memory, authSource, tools, readOnly, series, priority } }
 
 structure AppConfig where
   appId : Nat

@@ -1,0 +1,47 @@
+name: joke-machine
+description: Machine generated and evaluated jokes
+
+variables:
+  total-joke-score:
+    type: int
+
+steps:
+  choose-animals:
+    task:
+      agent: claude
+      model: opus
+      read-only: true
+      prompt: "Choose 5 different animals and return them as a list."
+      output:
+        animals:
+          type: list string
+
+  joke:
+    # For each animal in the chosen animals
+    for:
+      animal: choose-animals.animals
+    task:
+      agent: claude
+      model: sonnet
+      read-only: true
+      input:
+        - animal
+      prompt: "Tell a joke that involves the given animal and return the joke."
+      output:
+        joke:
+          type: string
+
+  evaluate-jokes:
+    task:
+      agent: claude
+      model: opus
+      read-only: true
+      prompt: "Evaluate the given jokes. Return a total score between 0 and 5 for the jokes."
+      context: plan
+      input:
+        - choose-animals.animals
+        - joke.joke
+      output:
+        summary:
+          type: int
+          write_to: total-joke-score

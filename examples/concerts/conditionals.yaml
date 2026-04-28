@@ -1,0 +1,26 @@
+name: conditionals
+description: Conditionals and output
+
+steps:
+  evaluate-difficulty:
+    task:
+      agent: claude
+      model: sonnet
+      read-only: true
+      prompt: "Evaluate the difficulty of the assigned task and return a number between 0 and 10."
+      output:
+        difficulty:
+          type: int
+      context: evaluation
+
+  check-difficulty:
+    if:
+      evaluate-difficulty.difficulty > 8
+    flow:
+      exit
+
+  implement:
+    task:
+      agent: claude
+      model: sonnet
+      prompt: "Implement the task."

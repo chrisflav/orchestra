@@ -28,103 +28,7 @@ private def stripExt (s ext : String) : String :=
 private def shellQuote (s : String) : String :=
   "'" ++ s.replace "'" "'\\''" ++ "'"
 
--- Memory helpers
-
-/-- Sanitize a `owner/repo` string into a safe directory name, e.g. `owner-repo`. -/
-private def sanitizeProjectName (upstream : String) : String :=
-  upstream.map (fun c => if c == '/' then '-' else c)
-
-/-- Return the active memory directories for the given mode and upstream repo.
-    Creates the directories if they do not yet exist. -/
-private def resolveMemoryDirs (mode : MemoryMode) (upstream : String) : IO (Array String) := do
-  match ← IO.getEnv "HOME" with
-  | none => return #[]
-  | some home =>
-    let memBase := System.FilePath.mk home / ".agent" / "memory"
-    let globalDir  := memBase
-    let projectDir := memBase / sanitizeProjectName upstream
-    let dirs : Array System.FilePath :=
-      match mode with
-      | .none    => #[]
-      | .global  => #[globalDir]
-      | .project => #[projectDir]
-      | .both    => #[globalDir, projectDir]
-    for dir in dirs do
-      IO.FS.createDirAll dir
-    return dirs.map (·.toString)
-
-/-- Build a system-prompt addition describing the available memory directories. -/
-private def memorySystemPrompt (memoryDirs : Array String) : Option String :=
-  if memoryDirs.isEmpty then none
-  else
-    let bullet := fun d => s!"- {d}"
-    let list   := String.intercalate "\n" (memoryDirs.toList.map bullet)
-    some s!"## Memory\n\nYou have access to a persistent memory system. \
-The following director{if memoryDirs.size == 1 then "y is" else "ies are"} \
-mounted read-write inside your sandbox:\n\n{list}\n\n\
-Use these directories to store information that should persist across tasks. \
-For example, maintain a `MEMORY.md` file with important context, decisions, and findings \
-that will be valuable for future runs."
-
--- Tools helpers
-
-/-- Derive the list of allowed optional tools from a task's `tools` and `mode` fields.
-    If `tools` is `some list`, use it directly.
-    If `tools` is `none`, fall back to mode-based rules for backwards compatibility:
-    - `pr`   → `["create_pr"]`
-    - `fork` → `[]`
-    Returns the resolved tool list and a flag indicating whether the legacy `mode` fallback was used. -/
-private def resolveTools (mode : TaskMode) (tools : Option (List String)) :
-    List String × Bool :=
-  match tools with
-  | some ts => (ts, false)
-  | none    => match mode with
-    | .pr   => (["create_pr"], true)
-    | .fork => ([], true)
-
 -- Task execution
-
-/-- Resolve the authentication environment variables for a given backend and optional auth source label.
-    If the task specifies an auth source label (or a default is configured), looks it up in the
-    per-agent auth configs and returns its env vars via the agent's `envVarsOfAuthSource`.
-    Falls back to the legacy flat API key fields when no per-agent auth is configured,
-    preserving backward compatibility with existing configs. -/
-private def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
-    (backendName : String) (requestedLabel : Option String)
-    : IO (Array (String × Option String)) := do
-  match appConfig.agentAuthConfigs.find? (fun c => c.name == backendName) with
-  | none =>
-    -- No per-agent auth configured: use legacy flat fields for backward compatibility
-    return #[("ANTHROPIC_API_KEY",       appConfig.anthropicApiKey),
-             ("ANTHROPIC_BASE_URL",      appConfig.anthropicBaseUrl),
-             ("ANTHROPIC_AUTH_TOKEN",    appConfig.anthropicAuthToken),
-             ("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)]
-  | some agentAuth =>
-    -- Determine which label to use
-    let label ← match requestedLabel with
-      | some l => pure l
-      | none   =>
-        match agentAuth.defaultAuthSource with
-        | some d => pure d
-        | none   =>
-          if agentAuth.authSources.size == 1 then
-            pure agentAuth.authSources[0]!.label
-          else
-            throw (.userError
-              s!"Multiple auth sources configured for backend '{backendName}'. \
-                 Specify one via the 'auth_source' field.")
-    -- Validate label uniqueness (warn on duplicates)
-    let dupeCount := agentAuth.authSources.filter (fun s => s.label == label) |>.size
-    if dupeCount > 1 then
-      IO.eprintln s!"  Warning: duplicate auth source label '{label}' for backend '{backendName}'"
-    -- Find the source with the matching label
-    match agentAuth.authSources.find? (fun s => s.label == label) with
-    | none => throw (.userError
-        s!"Auth source '{label}' not found for backend '{backendName}'. \
-           Available: {", ".intercalate (agentAuth.authSources.toList.map (·.label))}")
-    | some src =>
-      let vars := agentDef.envVarsOfAuthSource src
-      return vars.map fun (k, v) => (k, some v)
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.
     Returns the task ID and whether the run was cut short by a usage limit. -/
@@ -132,160 +36,11 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     (continuesFrom : Option String := none)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
-    (interactive : Bool := true) : IO (String × Bool) := do
-  IO.println s!"=== Task {idx}: {task.fork} ({repr task.mode}) ==="
-  -- Record this run in the task store
-  let taskId ← TaskStore.generateId
-  let createdAt ← TaskStore.currentIso8601
-  let initialRecord : TaskStore.TaskRecord := {
-    id := taskId, createdAt
-    upstream := task.upstream, fork := task.fork, mode := task.mode, prompt := task.prompt
-    continuesFrom, series
-    backend := task.backend, model := task.model, agent := task.agent
-    systemPrompt := task.systemPrompt, budget := task.budget
-    priority := task.priority
-  }
-  TaskStore.saveTask initialRecord
-  -- Resolve initial resume session from the continued task
-  let initialResume : Option String ← match continuesFrom with
-    | none => pure none
-    | some prevId =>
-      match ← TaskStore.loadTask prevId with
-      | none =>
-        IO.eprintln s!"  Warning: task '{prevId}' not found, ignoring --continues"
-        pure none
-      | some prev => pure prev.sessionId
-  -- 1. Create GitHub App token
-  IO.println "  Creating GitHub App token..."
-  let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let (forkOwner, _) ← Repo.splitRepo task.fork
-  let installationId ← match appConfig.installationId with
-    | some id => pure id
-    | none => GitHub.getInstallationId jwt forkOwner
-  let token ← GitHub.createInstallationToken jwt installationId
-  GitHub.setupGhAuth token
-  IO.println "  Token ready"
-  -- 2. Clone / update repo
-  IO.println s!"Cloning/updating {task.fork}..."
-  let repoPath ← Repo.ensureCloned task.fork task.upstream interactive
-  IO.println s!"  Repo at {repoPath}"
-  -- 3. Start MCP server (runs in this process, outside the sandbox)
-  -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
-  let (allowedTools, usingModeFallback) := resolveTools task.mode task.tools
-  if usingModeFallback then
-    IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
-      Use 'tools' instead (e.g. {repr allowedTools}) and optionally 'read_only: true/false'."
-  let serverState : Server.State := {
-    upstream := task.upstream
-    fork := task.fork
-    allowedTools
-    appId := appConfig.appId
-    privateKeyPath := appConfig.privateKeyPath
-    installationId
-    pat := appConfig.pat
-  }
-  let (port, shutdown) ← Server.start serverState
-  IO.println s!"  MCP server on port {port}"
-  -- 4. Run init hook and load per-repository config
-  RepoConfig.runInitIfNeeded repoPath
-  let repoConfig ← RepoConfig.loadRepoConfig repoPath
-  -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
-  let baseSystemPrompt ← loadSystemPrompt task.systemPrompt
-  -- 5a. Resolve memory directories and amend system prompt
-  let memoryDirs ← resolveMemoryDirs task.memory task.upstream
-  let systemPrompt :=
-    match baseSystemPrompt, memorySystemPrompt memoryDirs with
-    | none,    none    => none
-    | some sp, none    => some sp
-    | none,    some mp => some mp
-    | some sp, some mp => some (sp ++ "\n\n" ++ mp)
-  -- 5b. Load prepend prompt and apply to task prompt
-  let prependPrompt ← loadPrependPrompt
-  let baseTaskPrompt :=
-    match prependPrompt with
-    | none    => task.prompt
-    | some pp => pp ++ "\n\n" ++ task.prompt
-  let mut sessionId : Option String := none
-  let mut usageLimitHit := false
-  let mut wasCancelled := false
-  let mut lastValidationOutput : String := ""
-  let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
-  let maxAttempts := repoConfig.validation.maxRetries + 1
-  for attempt in List.range maxAttempts do
-    RepoConfig.runHook repoPath "before.sh"
-    let prompt :=
-      if attempt == 0 then baseTaskPrompt
-      else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
-    let resume := if attempt == 0 then initialResume else sessionId
-    IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
-    let agentDef := match task.backend with
-      | some "pi"   => AgentDef.pi
-      | some "vibe" => AgentDef.vibe
-      | _           => AgentDef.claude
-    let backendName := task.backend.getD "claude"
-    let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName task.authSource
-    let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
-      |>.map (·.extraPorts) |>.getD #[]
-    let debugLogFile : Option System.FilePath ←
-      if debug then
-        let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-        pure (some ((← TaskStore.tasksDir) / s!"{taskId}{suffix}.debug.jsonl"))
-      else pure none
-    -- Structured JSON log: ~/.agent/logs/{fork}/{taskId}.log (always)
-    let taskLogFile : Option System.FilePath ← do
-      match ← IO.getEnv "HOME" with
-      | none => pure none
-      | some home =>
-        let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-        pure (some (System.FilePath.mk home / ".agent" / "logs" / task.fork / s!"{taskId}{suffix}.log"))
-    let result ← Sandbox.launchAgent agentDef repoPath prompt port token
-      (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
-      (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
-      (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
-      (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
-      (readOnly := task.readOnly) (extraPorts := extraPorts)
-    IO.println s!"  Agent exited with code {result.exitCode}"
-    sessionId := result.sessionId
-    lastResultSubtype := result.resultSubtype
-    if result.wasCancelled then
-      IO.println "  Agent was cancelled."
-      wasCancelled := true
-      break
-    if result.usageLimitHit then
-      IO.println "  Agent hit usage limit."
-      usageLimitHit := true
-      break
-    if !(← RepoConfig.hasValidationScript repoPath) then
-      IO.println "  No validation script found, skipping validation."
-      break
-    IO.println "  Running validation script..."
-    let (valid, validationOutput) ← RepoConfig.runValidation repoPath
-    lastValidationOutput := validationOutput
-    if !validationOutput.isEmpty then
-      IO.println s!"  Validation output:\n{validationOutput}"
-    if valid then
-      IO.println "  Validation passed."
-      break
-    if attempt + 1 < maxAttempts then
-      IO.println s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
-    else
-      IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
-  -- 6. Run after hook and shut down MCP server
-  RepoConfig.runHook repoPath "after.sh"
-  shutdown
-  -- 7. Persist final task state
-  let finalStatus :=
-    if wasCancelled then .cancelled
-    else match lastResultSubtype with
-      | some .success           => .completed
-      | some .errorMaxBudgetUsd => .unfinished
-      | some (.error _)         => .failed
-      | _                       => if usageLimitHit then .unfinished else .completed
-  TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
-  if let some seriesName := series then
-    TaskStore.updateSeriesPointer seriesName taskId
-  IO.println s!"=== Task {idx} done ===\n"
-  return (taskId, usageLimitHit)
+    (interactive : Bool := true) : IO (String × Bool × Option Lean.Json) := do
+  let ((taskId, usageLimitHit), _, outputJson) ←
+    TaskRunner.runIOTask appConfig task.ioTask idx debug default
+      continuesFrom series cancelToken interactive
+  return (taskId, usageLimitHit, outputJson)
 
 -- Helpers
 
@@ -303,6 +58,9 @@ private def inheritSeries (continuesFrom : Option String) (series : Option Strin
 
 -- Handlers
 
+private def isWorkflowFile (path : String) : Bool :=
+  path.endsWith ".yaml" || path.endsWith ".yml"
+
 private def runHandler (p : Parsed) : IO UInt32 := do
   let taskFile      := p.positionalArg! "task-file" |>.as! String
   let configPath    := p.flag? "config"    |>.map (·.as! String)
@@ -312,6 +70,16 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let series        := p.flag? "series"    |>.map (·.as! String)
   let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  if isWorkflowFile taskFile then
+    let yaml ← IO.FS.readFile taskFile
+    match Workflow.WorkflowProgram.parseYaml yaml with
+    | .error e =>
+      IO.eprintln s!"Failed to parse workflow: {e}"
+      return 1
+    | .ok prog =>
+      let concert := Workflow.WorkflowProgram.toConcert prog
+      Concert.eval appConfig debug none concert
+      return 0
   let taskFileData ← loadTaskFile taskFile
   if taskFileData.tasks.isEmpty then
     IO.eprintln "No tasks found in task file"
@@ -333,10 +101,13 @@ private def runHandler (p : Parsed) : IO UInt32 := do
       -- CLI --budget overrides the task file budget
       let task := match budgetFlag with
         | none   => tasks[i]!
-        | some b => { tasks[i]! with budget := some b }
+        | some b =>
+          let t := tasks[i]!
+          { t with ioTask := { t.ioTask with budget := some b } }
       let _ ← runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
+
   return (0 : UInt32)
 
 private def mcpServerHandler (p : Parsed) : IO UInt32 := do
@@ -459,18 +230,22 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
   let some prevRecord ← TaskStore.loadTask prevId
     | throw (.userError s!"task '{prevId}' not found in store")
   let task : Task := {
-    upstream     := prevRecord.upstream
-    fork         := prevRecord.fork
-    mode         := prevRecord.mode
-    prompt
-    backend      := prevRecord.backend
-    model        := prevRecord.model
-    agent        := prevRecord.agent
-    systemPrompt := prevRecord.systemPrompt
-    budget       := budgetFlag.orElse (fun _ => prevRecord.budget)
-    priority     := prevRecord.priority
+    i := .unit, o := .unit
+    ioTask := {
+      upstream     := prevRecord.upstream
+      fork         := prevRecord.fork
+      mode         := prevRecord.mode
+      prompt
+      backend      := prevRecord.backend
+      model        := prevRecord.model
+      agent        := prevRecord.agent
+      systemPrompt := prevRecord.systemPrompt
+      budget       := budgetFlag.orElse (fun _ => prevRecord.budget)
+      priority     := prevRecord.priority
+    }
   }
-  let _ ← runTask appConfig task 0 debug (continuesFrom := some prevId) (series := some seriesName)
+  let _ ← runTask appConfig task 0 debug
+    (continuesFrom := some prevId) (series := some seriesName)
   return (0 : UInt32)
 
 -- Queue helpers
@@ -552,21 +327,21 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       let createdAt ← TaskStore.currentIso8601
       let entry : Queue.QueueEntry := {
         id, createdAt
-        upstream     := task.upstream
-        fork         := task.fork
-        mode         := task.mode
-        prompt       := task.prompt
-        agent        := task.agent
-        systemPrompt := task.systemPrompt
-        backend      := task.backend
-        model        := task.model
+        upstream     := task.ioTask.upstream
+        fork         := task.ioTask.fork
+        mode         := task.ioTask.mode
+        prompt       := task.ioTask.prompt
+        agent        := task.ioTask.agent
+        systemPrompt := task.ioTask.systemPrompt
+        backend      := task.ioTask.backend
+        model        := task.ioTask.model
         continuesFrom, series
         configPath
-        budget       := budgetFlag.orElse (fun _ => task.budget)
-        authSource   := task.authSource
-        tools        := task.tools
-        readOnly     := task.readOnly
-        priority     := priorityFlag.getD task.priority
+        budget       := budgetFlag.orElse (fun _ => task.ioTask.budget)
+        authSource   := task.ioTask.authSource
+        tools        := task.ioTask.tools
+        readOnly     := task.ioTask.readOnly
+        priority     := priorityFlag.getD task.ioTask.priority
       }
       Queue.saveEntry entry
       IO.println entry.id
@@ -623,61 +398,53 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   let pid ← getOwnPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
-  -- Mark entries left in 'running' by a previously killed daemon as unfinished
+  -- Startup cleanup
   Queue.markStaleRunningAsUnfinished
-  -- Clear any sentinel files left over from a previous run
+  Queue.cancelStaleConcertEntries
   Queue.clearShutdownRequest
   Queue.clearCancelRequest
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
-  -- Shutdown token: cancelled by the file watcher when shutdown.request appears
-  let shutdownToken ← Std.CancellationToken.new
-  -- Current task cancel token: set while a task is running, read by the file watcher
-  let currentTaskToken ← Std.Mutex.new (none : Option Std.CancellationToken)
-  -- File watcher task: polls sentinel files every 500ms and updates tokens.
-  -- This is the only place that reads the filesystem for control signals.
+  -- Shared concurrency primitives
+  let shutdownToken  ← Std.CancellationToken.new
+  -- Map of (id → cancel token) for all currently running tasks (one per worker).
+  let activeTaskTokens ← Std.Mutex.new (Array.empty : Array (Nat × Std.CancellationToken))
+  let nextTokenId ← IO.mkRef (0 : Nat)
+  -- Mutex serialising the "find next pending + mark running" claim operation.
+  let claimMutex ← Std.BaseMutex.new
+  -- Concert manager: handles suspended concert fibers waiting for task results.
+  let concertMgr ← ConcertManager.new
+  -- File watcher: polls sentinel files every 500ms.
   let _watcher ← IO.asTask (prio := .dedicated) do
     while !(← shutdownToken.isCancelled) do
       IO.sleep 500
       if ← Queue.checkCancelRequested then
         Queue.clearCancelRequest
-        let optToken ← currentTaskToken.atomically (·.get)
-        if let some token := optToken then
+        let pairs ← activeTaskTokens.atomically (·.get)
+        for (_, token) in pairs do
           token.cancel .cancel
       if ← Queue.checkShutdownRequested then
         Queue.clearShutdownRequest
         shutdownToken.cancel .shutdown
-  -- Load listener configs
-  let lDir ← match listenerDir with
-    | some d => pure (System.FilePath.mk d)
-    | none   => Listener.listenersDir
-  let listenerConfigs ← Listener.loadAllListenerConfigs lDir
-  if !listenerConfigs.isEmpty then
-    IO.println s!"Loaded {listenerConfigs.size} listener(s) from {lDir}"
-  -- Next-poll timestamps: (listenerName, nextPollNanos) pairs. Nat matches IO.monoNanosNow.
-  -- Initialised empty so every listener fires on the first iteration (due = 0).
-  let nextPollRef ← IO.mkRef (Array.empty : Array (String × Nat))
-  -- Helper: look up due time for a listener (0 = always due)
-  let getDue (arr : Array (String × Nat)) (name : String) : Nat :=
-    arr.find? (fun p => p.1 == name) |>.map (·.2) |>.getD 0
-  -- Helper: upsert due time
-  let setDue (arr : Array (String × Nat)) (name : String) (t : Nat) : Array (String × Nat) :=
-    match arr.findIdx? (fun p => p.1 == name) with
-    | some i => arr.set! i (name, t)
-    | none   => arr.push (name, t)
-  try
-  while true do
-    -- Check for graceful shutdown request between tasks
-    if ← shutdownToken.isCancelled then
-      break
-    -- Run the next pending queue entry (if any)
-    match ← Queue.nextPending with
-    | none => pure ()
-    | some entry =>
-      -- Create a fresh cancel token for this task
-      let taskToken ← Std.CancellationToken.new
-      currentTaskToken.atomically (·.set (some taskToken))
-      Queue.saveEntry { entry with status := .running }
-      let task : Task := {
+  -- Helper: atomically claim the next pending entry, marking it as running.
+  -- Serialised by claimMutex so that multiple workers cannot claim the same entry.
+  let claimNextEntry : IO (Option Queue.QueueEntry) := do
+    claimMutex.lock
+    let entry ← Queue.nextPending
+    if let some e := entry then
+      Queue.saveEntry { e with status := .running }
+    claimMutex.unlock
+    return entry
+  -- Helper: run one queue entry to completion and update its status.
+  -- Also signals the ConcertManager if the entry belongs to a concert.
+  let runEntry (entry : Queue.QueueEntry) : IO Unit := do
+    let taskToken ← Std.CancellationToken.new
+    let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
+    activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
+    let removeToken : IO Unit :=
+      activeTaskTokens.atomically (·.modify (·.filter (·.1 != tokenId)))
+    let task : Task := {
+      i := entry.inputType, o := entry.outputType
+      ioTask := {
         upstream     := entry.upstream
         fork         := entry.fork
         mode         := entry.mode
@@ -693,47 +460,91 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         readOnly     := entry.readOnly
         priority     := entry.priority
       }
-      let cfg ← match entry.configPath with
-        | none    => pure appConfig
-        | some cp => loadAppConfig (some (System.FilePath.mk cp))
-      try
-        let (taskId, usageLimitHit) ← runTask cfg task 0 debug
-          (continuesFrom := entry.continuesFrom) (series := entry.series)
-          (cancelToken := some taskToken) (interactive := false)
-        currentTaskToken.atomically (·.set none)
-        if ← taskToken.isCancelled then
-          Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
-          IO.println s!"  Task cancelled."
-        else if usageLimitHit then
-          Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
-          Queue.cancelPendingByBackend entry.backend entry.id
-          Queue.cancelDependents taskId
-          IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
-        else
-          Queue.saveEntry { entry with status := .done, taskId := some taskId }
-      catch e =>
-        currentTaskToken.atomically (·.set none)
-        if ← taskToken.isCancelled then
-          IO.eprintln s!"  Task cancelled (with error: {e})"
-          try Queue.saveEntry { entry with status := .cancelled } catch _ => pure ()
-        else
-          IO.eprintln s!"Queue entry {entry.id} failed: {e}"
-          try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
-    -- Poll each listener whose interval has elapsed
-    let now ← IO.monoNanosNow
-    let nextPoll ← nextPollRef.get
-    for lcfg in listenerConfigs do
-      let due := getDue nextPoll lcfg.name
-      if now >= due then
+    }
+    let cfg ← match entry.configPath with
+      | none    => pure appConfig
+      | some cp => loadAppConfig (some (System.FilePath.mk cp))
+    try
+      let (taskId, usageLimitHit, outputJson) ← runTask cfg task 0 debug
+        (continuesFrom := entry.continuesFrom) (series := entry.series)
+        (cancelToken := some taskToken) (interactive := false)
+      removeToken
+      if ← taskToken.isCancelled then
+        Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
+        IO.println s!"  Task cancelled."
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+      else if usageLimitHit then
+        Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
+        Queue.cancelPendingByBackend entry.backend entry.id
+        Queue.cancelDependents taskId
+        IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+      else
+        Queue.saveEntry { entry with status := .done, taskId := some taskId }
+        if let some key := entry.concertStepKey then
+          ConcertManager.signal concertMgr key outputJson
+    catch e =>
+      removeToken
+      if ← taskToken.isCancelled then
+        IO.eprintln s!"  Task cancelled (with error: {e})"
+        try Queue.saveEntry { entry with status := .cancelled } catch _ => pure ()
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+      else
+        IO.eprintln s!"Queue entry {entry.id} failed: {e}"
+        try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+  -- Load listener configs and spawn one fiber per listener.
+  let lDir ← match listenerDir with
+    | some d => pure (System.FilePath.mk d)
+    | none   => Listener.listenersDir
+  let listenerConfigs ← Listener.loadAllListenerConfigs lDir
+  if !listenerConfigs.isEmpty then
+    IO.println s!"Loaded {listenerConfigs.size} listener(s) from {lDir}"
+  for lcfg in listenerConfigs do
+    let _listenerTask ← IO.asTask (prio := .dedicated) do
+      -- Fire immediately on first iteration, then respect the configured interval.
+      let mut firstRun := true
+      while !(← shutdownToken.isCancelled) do
+        if !firstRun then
+          IO.sleep (lcfg.intervalSeconds * 1000).toUInt32
+        firstRun := false
         try
           let state  ← Listener.loadListenerState lcfg.name
-          let events ← Listener.pollSource lcfg.source state appConfig.pat appConfig.authorizedUsers
-          for ev in (events : Array (String × List (String × String))) do
-            let qentry ← Listener.buildQueueEntry lcfg.action ev.2
-            Queue.saveEntry qentry
-            IO.println s!"  Listener '{lcfg.name}': queued entry {qentry.id}"
-          -- Update state: record processed IDs and last-checked timestamp
-          let newIds   := events.filterMap (fun ev =>
+          let events ← Listener.pollSource lcfg.source state appConfig.pat
+            appConfig.authorizedUsers
+          for (_, vars) in (events : Array (String × List (String × String))) do
+            if let some wfPath := lcfg.action.workflowPath then
+              -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
+              let resolvedPath := Listener.renderTemplate wfPath vars
+              try
+                let yaml ← IO.FS.readFile resolvedPath
+                match Workflow.WorkflowProgram.parseYaml yaml with
+                | .error e =>
+                  IO.eprintln s!"  Listener '{lcfg.name}': workflow parse error: {e}"
+                | .ok prog =>
+                  let upstream :=
+                    let r := Listener.renderTemplate lcfg.action.upstream vars
+                    if r.isEmpty then vars.find? (·.1 == "upstream") |>.map (·.2) |>.getD ""
+                    else r
+                  let fork :=
+                    let r := Listener.renderTemplate lcfg.action.fork vars
+                    if r.isEmpty then vars.find? (·.1 == "fork") |>.map (·.2) |>.getD ""
+                    else r
+                  let prog := { prog with upstream, fork }
+                  let concert := Workflow.WorkflowProgram.toConcert prog
+                  IO.println s!"  Listener '{lcfg.name}': starting concert from {resolvedPath}"
+                  let _concertTask ← IO.asTask (prio := .dedicated) do
+                    try Concert.evalQueued concertMgr appConfig debug none concert
+                    catch e => IO.eprintln s!"  Concert failed: {e}"
+                  pure ()
+              catch e =>
+                IO.eprintln s!"  Listener '{lcfg.name}': failed to load workflow: {e}"
+            else
+              -- Single-task mode: enqueue a QueueEntry as before.
+              let qentry ← Listener.buildQueueEntry lcfg.action vars
+              Queue.saveEntry qentry
+              IO.println s!"  Listener '{lcfg.name}': queued entry {qentry.id}"
+          let newIds := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)
           let newState : Listener.ListenerState := {
             lastChecked  := ← TaskStore.currentIso8601
@@ -742,12 +553,15 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           Listener.saveListenerState lcfg.name newState
         catch e =>
           IO.eprintln s!"  Listener '{lcfg.name}' poll error: {e}"
-        -- Schedule next poll regardless of success/failure
-        let intervalNanos := lcfg.intervalSeconds * 1_000_000_000
-        nextPollRef.modify (setDue · lcfg.name (now + intervalNanos))
-    IO.sleep 2000
-  -- Graceful shutdown: remaining pending tasks stay queued for next restart
+  -- Queue worker loop: claim and run entries one at a time.
+  -- To support parallel execution in the future, spawn multiple copies of this loop.
+  try
+    while !(← shutdownToken.isCancelled) do
+      match ← claimNextEntry with
+      | none       => IO.sleep 1000
+      | some entry => runEntry entry
   finally
+    ConcertManager.cancelAll concertMgr
     Queue.deletePid
   IO.println "Queue daemon shut down gracefully."
   return 0
