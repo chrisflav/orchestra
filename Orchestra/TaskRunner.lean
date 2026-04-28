@@ -114,7 +114,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (continuesFrom : Option String := none)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
-    (interactive : Bool := true) : IO ((String × Bool) × Option o.Type) := do
+    (interactive : Bool := true) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   let taskId ← TaskStore.generateId
@@ -273,8 +273,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   if let some seriesName := series then
     TaskStore.updateSeriesPointer seriesName taskId
   IO.println s!"=== Task {idx} done ===\n"
+  let outputJson ← outputRef.get
   let typedOutput : Option o.Type ← do
-    match ← outputRef.get with
+    match outputJson with
     | none => pure none
     | some j =>
       match ResultType.valueFromJson o j with
@@ -282,6 +283,6 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | .error e =>
         IO.eprintln s!"  Warning: failed to parse task output: {e}"
         pure none
-  return ((taskId, usageLimitHit), typedOutput)
+  return ((taskId, usageLimitHit), typedOutput, outputJson)
 
 end Orchestra.TaskRunner

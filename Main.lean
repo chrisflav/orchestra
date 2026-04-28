@@ -36,10 +36,11 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     (continuesFrom : Option String := none)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
-    (interactive : Bool := true) : IO (String × Bool) := do
-  let (result, _) ← TaskRunner.runIOTask appConfig task.ioTask idx debug default
-    continuesFrom series cancelToken interactive
-  return result
+    (interactive : Bool := true) : IO (String × Bool × Option Lean.Json) := do
+  let ((taskId, usageLimitHit), _, outputJson) ←
+    TaskRunner.runIOTask appConfig task.ioTask idx debug default
+      continuesFrom series cancelToken interactive
+  return (taskId, usageLimitHit, outputJson)
 
 -- Helpers
 
@@ -106,6 +107,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
       let _ ← runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
+
   return (0 : UInt32)
 
 private def mcpServerHandler (p : Parsed) : IO UInt32 := do
@@ -242,7 +244,8 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
       priority     := prevRecord.priority
     }
   }
-  let _ ← runTask appConfig task 0 debug (continuesFrom := some prevId) (series := some seriesName)
+  let _ ← runTask appConfig task 0 debug
+    (continuesFrom := some prevId) (series := some seriesName)
   return (0 : UInt32)
 
 -- Queue helpers
@@ -395,120 +398,153 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   let pid ← getOwnPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
-  -- Mark entries left in 'running' by a previously killed daemon as unfinished
+  -- Startup cleanup
   Queue.markStaleRunningAsUnfinished
-  -- Clear any sentinel files left over from a previous run
+  Queue.cancelStaleConcertEntries
   Queue.clearShutdownRequest
   Queue.clearCancelRequest
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
-  -- Shutdown token: cancelled by the file watcher when shutdown.request appears
-  let shutdownToken ← Std.CancellationToken.new
-  -- Current task cancel token: set while a task is running, read by the file watcher
-  let currentTaskToken ← Std.Mutex.new (none : Option Std.CancellationToken)
-  -- File watcher task: polls sentinel files every 500ms and updates tokens.
-  -- This is the only place that reads the filesystem for control signals.
+  -- Shared concurrency primitives
+  let shutdownToken  ← Std.CancellationToken.new
+  -- Map of (id → cancel token) for all currently running tasks (one per worker).
+  let activeTaskTokens ← Std.Mutex.new (Array.empty : Array (Nat × Std.CancellationToken))
+  let nextTokenId ← IO.mkRef (0 : Nat)
+  -- Mutex serialising the "find next pending + mark running" claim operation.
+  let claimMutex ← Std.BaseMutex.new
+  -- Concert manager: handles suspended concert fibers waiting for task results.
+  let concertMgr ← ConcertManager.new
+  -- File watcher: polls sentinel files every 500ms.
   let _watcher ← IO.asTask (prio := .dedicated) do
     while !(← shutdownToken.isCancelled) do
       IO.sleep 500
       if ← Queue.checkCancelRequested then
         Queue.clearCancelRequest
-        let optToken ← currentTaskToken.atomically (·.get)
-        if let some token := optToken then
+        let pairs ← activeTaskTokens.atomically (·.get)
+        for (_, token) in pairs do
           token.cancel .cancel
       if ← Queue.checkShutdownRequested then
         Queue.clearShutdownRequest
         shutdownToken.cancel .shutdown
-  -- Load listener configs
+  -- Helper: atomically claim the next pending entry, marking it as running.
+  -- Serialised by claimMutex so that multiple workers cannot claim the same entry.
+  let claimNextEntry : IO (Option Queue.QueueEntry) := do
+    claimMutex.lock
+    let entry ← Queue.nextPending
+    if let some e := entry then
+      Queue.saveEntry { e with status := .running }
+    claimMutex.unlock
+    return entry
+  -- Helper: run one queue entry to completion and update its status.
+  -- Also signals the ConcertManager if the entry belongs to a concert.
+  let runEntry (entry : Queue.QueueEntry) : IO Unit := do
+    let taskToken ← Std.CancellationToken.new
+    let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
+    activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
+    let removeToken : IO Unit :=
+      activeTaskTokens.atomically (·.modify (·.filter (·.1 != tokenId)))
+    let task : Task := {
+      i := entry.inputType, o := entry.outputType
+      ioTask := {
+        upstream     := entry.upstream
+        fork         := entry.fork
+        mode         := entry.mode
+        prompt       := entry.prompt
+        agent        := entry.agent
+        systemPrompt := entry.systemPrompt
+        backend      := entry.backend
+        model        := entry.model
+        budget       := entry.budget
+        memory       := entry.memory
+        authSource   := entry.authSource
+        tools        := entry.tools
+        readOnly     := entry.readOnly
+        priority     := entry.priority
+      }
+    }
+    let cfg ← match entry.configPath with
+      | none    => pure appConfig
+      | some cp => loadAppConfig (some (System.FilePath.mk cp))
+    try
+      let (taskId, usageLimitHit, outputJson) ← runTask cfg task 0 debug
+        (continuesFrom := entry.continuesFrom) (series := entry.series)
+        (cancelToken := some taskToken) (interactive := false)
+      removeToken
+      if ← taskToken.isCancelled then
+        Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
+        IO.println s!"  Task cancelled."
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+      else if usageLimitHit then
+        Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
+        Queue.cancelPendingByBackend entry.backend entry.id
+        Queue.cancelDependents taskId
+        IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+      else
+        Queue.saveEntry { entry with status := .done, taskId := some taskId }
+        if let some key := entry.concertStepKey then
+          ConcertManager.signal concertMgr key outputJson
+    catch e =>
+      removeToken
+      if ← taskToken.isCancelled then
+        IO.eprintln s!"  Task cancelled (with error: {e})"
+        try Queue.saveEntry { entry with status := .cancelled } catch _ => pure ()
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+      else
+        IO.eprintln s!"Queue entry {entry.id} failed: {e}"
+        try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+  -- Load listener configs and spawn one fiber per listener.
   let lDir ← match listenerDir with
     | some d => pure (System.FilePath.mk d)
     | none   => Listener.listenersDir
   let listenerConfigs ← Listener.loadAllListenerConfigs lDir
   if !listenerConfigs.isEmpty then
     IO.println s!"Loaded {listenerConfigs.size} listener(s) from {lDir}"
-  -- Next-poll timestamps: (listenerName, nextPollNanos) pairs. Nat matches IO.monoNanosNow.
-  -- Initialised empty so every listener fires on the first iteration (due = 0).
-  let nextPollRef ← IO.mkRef (Array.empty : Array (String × Nat))
-  -- Helper: look up due time for a listener (0 = always due)
-  let getDue (arr : Array (String × Nat)) (name : String) : Nat :=
-    arr.find? (fun p => p.1 == name) |>.map (·.2) |>.getD 0
-  -- Helper: upsert due time
-  let setDue (arr : Array (String × Nat)) (name : String) (t : Nat) : Array (String × Nat) :=
-    match arr.findIdx? (fun p => p.1 == name) with
-    | some i => arr.set! i (name, t)
-    | none   => arr.push (name, t)
-  try
-  while true do
-    -- Check for graceful shutdown request between tasks
-    if ← shutdownToken.isCancelled then
-      break
-    -- Run the next pending queue entry (if any)
-    match ← Queue.nextPending with
-    | none => pure ()
-    | some entry =>
-      -- Create a fresh cancel token for this task
-      let taskToken ← Std.CancellationToken.new
-      currentTaskToken.atomically (·.set (some taskToken))
-      Queue.saveEntry { entry with status := .running }
-      let task : Task := {
-        i := .unit, o := .unit
-        ioTask := {
-          upstream     := entry.upstream
-          fork         := entry.fork
-          mode         := entry.mode
-          prompt       := entry.prompt
-          agent        := entry.agent
-          systemPrompt := entry.systemPrompt
-          backend      := entry.backend
-          model        := entry.model
-          budget       := entry.budget
-          memory       := entry.memory
-          authSource   := entry.authSource
-          tools        := entry.tools
-          readOnly     := entry.readOnly
-          priority     := entry.priority
-        }
-      }
-      let cfg ← match entry.configPath with
-        | none    => pure appConfig
-        | some cp => loadAppConfig (some (System.FilePath.mk cp))
-      try
-        let (taskId, usageLimitHit) ← runTask cfg task 0 debug
-          (continuesFrom := entry.continuesFrom) (series := entry.series)
-          (cancelToken := some taskToken) (interactive := false)
-        currentTaskToken.atomically (·.set none)
-        if ← taskToken.isCancelled then
-          Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
-          IO.println s!"  Task cancelled."
-        else if usageLimitHit then
-          Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
-          Queue.cancelPendingByBackend entry.backend entry.id
-          Queue.cancelDependents taskId
-          IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
-        else
-          Queue.saveEntry { entry with status := .done, taskId := some taskId }
-      catch e =>
-        currentTaskToken.atomically (·.set none)
-        if ← taskToken.isCancelled then
-          IO.eprintln s!"  Task cancelled (with error: {e})"
-          try Queue.saveEntry { entry with status := .cancelled } catch _ => pure ()
-        else
-          IO.eprintln s!"Queue entry {entry.id} failed: {e}"
-          try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
-    -- Poll each listener whose interval has elapsed
-    let now ← IO.monoNanosNow
-    let nextPoll ← nextPollRef.get
-    for lcfg in listenerConfigs do
-      let due := getDue nextPoll lcfg.name
-      if now >= due then
+  for lcfg in listenerConfigs do
+    let _listenerTask ← IO.asTask (prio := .dedicated) do
+      -- Fire immediately on first iteration, then respect the configured interval.
+      let mut firstRun := true
+      while !(← shutdownToken.isCancelled) do
+        if !firstRun then
+          IO.sleep (lcfg.intervalSeconds * 1000).toUInt32
+        firstRun := false
         try
           let state  ← Listener.loadListenerState lcfg.name
-          let events ← Listener.pollSource lcfg.source state appConfig.pat appConfig.authorizedUsers
-          for ev in (events : Array (String × List (String × String))) do
-            let qentry ← Listener.buildQueueEntry lcfg.action ev.2
-            Queue.saveEntry qentry
-            IO.println s!"  Listener '{lcfg.name}': queued entry {qentry.id}"
-          -- Update state: record processed IDs and last-checked timestamp
-          let newIds   := events.filterMap (fun ev =>
+          let events ← Listener.pollSource lcfg.source state appConfig.pat
+            appConfig.authorizedUsers
+          for (_, vars) in (events : Array (String × List (String × String))) do
+            if let some wfPath := lcfg.action.workflowPath then
+              -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
+              let resolvedPath := Listener.renderTemplate wfPath vars
+              try
+                let yaml ← IO.FS.readFile resolvedPath
+                match Workflow.WorkflowProgram.parseYaml yaml with
+                | .error e =>
+                  IO.eprintln s!"  Listener '{lcfg.name}': workflow parse error: {e}"
+                | .ok prog =>
+                  let upstream :=
+                    let r := Listener.renderTemplate lcfg.action.upstream vars
+                    if r.isEmpty then vars.find? (·.1 == "upstream") |>.map (·.2) |>.getD ""
+                    else r
+                  let fork :=
+                    let r := Listener.renderTemplate lcfg.action.fork vars
+                    if r.isEmpty then vars.find? (·.1 == "fork") |>.map (·.2) |>.getD ""
+                    else r
+                  let prog := { prog with upstream, fork }
+                  let concert := Workflow.WorkflowProgram.toConcert prog
+                  IO.println s!"  Listener '{lcfg.name}': starting concert from {resolvedPath}"
+                  let _concertTask ← IO.asTask (prio := .dedicated) do
+                    try Concert.evalQueued concertMgr appConfig debug none concert
+                    catch e => IO.eprintln s!"  Concert failed: {e}"
+                  pure ()
+              catch e =>
+                IO.eprintln s!"  Listener '{lcfg.name}': failed to load workflow: {e}"
+            else
+              -- Single-task mode: enqueue a QueueEntry as before.
+              let qentry ← Listener.buildQueueEntry lcfg.action vars
+              Queue.saveEntry qentry
+              IO.println s!"  Listener '{lcfg.name}': queued entry {qentry.id}"
+          let newIds := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)
           let newState : Listener.ListenerState := {
             lastChecked  := ← TaskStore.currentIso8601
@@ -517,12 +553,15 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           Listener.saveListenerState lcfg.name newState
         catch e =>
           IO.eprintln s!"  Listener '{lcfg.name}' poll error: {e}"
-        -- Schedule next poll regardless of success/failure
-        let intervalNanos := lcfg.intervalSeconds * 1_000_000_000
-        nextPollRef.modify (setDue · lcfg.name (now + intervalNanos))
-    IO.sleep 2000
-  -- Graceful shutdown: remaining pending tasks stay queued for next restart
+  -- Queue worker loop: claim and run entries one at a time.
+  -- To support parallel execution in the future, spawn multiple copies of this loop.
+  try
+    while !(← shutdownToken.isCancelled) do
+      match ← claimNextEntry with
+      | none       => IO.sleep 1000
+      | some entry => runEntry entry
   finally
+    ConcertManager.cancelAll concertMgr
     Queue.deletePid
   IO.println "Queue daemon shut down gracefully."
   return 0

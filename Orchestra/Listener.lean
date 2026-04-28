@@ -136,6 +136,10 @@ structure ActionConfig where
   readOnly       : Bool := false
   /-- Priority of the queue entry. Defaults to 10. -/
   priority       : Nat  := 10
+  /-- Path to a workflow YAML file. When set, a concert is started instead of a
+      single task. Template variables are applied to the workflow's upstream/fork
+      before conversion. -/
+  workflowPath   : Option String := none
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -156,7 +160,8 @@ instance : ToJson ActionConfig where
     let fields := if let some s := a.authSource   then fields ++ [("auth_source",   Json.str s)]      else fields
     let fields := if let some t := a.tools        then fields ++ [("tools",         ToJson.toJson t)] else fields
     let fields := if a.readOnly                   then fields ++ [("read_only",      Json.bool true)]  else fields
-    let fields := if a.priority != 10          then fields ++ [("priority",       Json.num a.priority)] else fields
+    let fields := if a.priority != 10             then fields ++ [("priority",        Json.num a.priority)] else fields
+    let fields := if let some p := a.workflowPath then fields ++ [("workflow_path",  Json.str p)]          else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -183,9 +188,10 @@ instance : FromJson ActionConfig where
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
     let tools := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
-    let priority := j.getObjValAs? Nat "priority" |>.toOption |>.getD 10
+    let priority     := j.getObjValAs? Nat    "priority"      |>.toOption |>.getD 10
+    let workflowPath := j.getObjValAs? String "workflow_path" |>.toOption
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, tools, readOnly, priority }
+             budget, memory, authSource, tools, readOnly, priority, workflowPath }
 
 -- Listener config
 

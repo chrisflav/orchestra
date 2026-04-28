@@ -55,7 +55,7 @@ inductive ResultType where
   | bool
   | list (t : ResultType)
   | unit
-  deriving Repr, Inhabited
+  deriving Repr, BEq, Inhabited
 
 /-- The Lean `Type` corresponding to a `ResultType`. -/
 abbrev ResultType.Type : ResultType → Type

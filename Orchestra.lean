@@ -1,4 +1,5 @@
 import Orchestra.AgentDef
+import Orchestra.ConcertManager
 import Orchestra.Agents.Claude
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
