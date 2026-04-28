@@ -47,7 +47,6 @@ def parseOpencodeOutput (line : String) : Option Event := do
       none
   | other => some (.unknown other)
 
-
 /-- The opencode coding agent backend. -/
 def opencode : AgentDef where
   command := "opencode"
