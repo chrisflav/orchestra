@@ -62,10 +62,23 @@ def opencode : AgentDef where
     homeRw  := [".config/opencode", ".gitconfig", ".local/share/opencode"]
     extraPorts := [4096]
   }
-  setupMcp _ _ _ := do
-    -- TODO: Implement MCP configuration for opencode
-    return ("", #[])
-  buildArgs _ _ _ model _ resume _ prompt := Id.run do
+  setupMcp port _ _ := do
+    let mcpConfig := Json.mkObj [("mcp", Json.mkObj [
+      ("agent", Json.mkObj [
+        ("type", .str "local"),
+        ("command", .arr #[.str "nc", .str "127.0.0.1", .str (toString port)]),
+        ("enabled", .bool true)
+      ])
+    ])]
+    match ← IO.getEnv "HOME" with
+    | none => return ("", #[])
+    | some home =>
+      let configDir := System.FilePath.mk home / ".config" / "opencode"
+      IO.FS.createDirAll configDir
+      let configPath := configDir / "opencode.json"
+      IO.FS.writeFile configPath mcpConfig.compress
+      return (configPath.toString, #[])
+  buildArgs _ctx _pluginDirs _subAgent model _systemPrompt resume _budget prompt := Id.run do
     let mut args : Array String := #[
       "run", "--format", "json",
       "--log-level", "ERROR", "--port", "4096",
@@ -80,7 +93,7 @@ def opencode : AgentDef where
     return args
   parseOutputLine := parseOpencodeOutput
   extractSessionId _ := pure none
-  cleanup _ := pure ()
+  cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()
   isUsageLimitError := stdUsageLimitError
   envVarsOfAuthSource _ := #[]
 
