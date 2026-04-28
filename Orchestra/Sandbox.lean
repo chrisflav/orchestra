@@ -103,6 +103,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     args := args.push "--connect-tcp" |>.push (toString p)
   -- Environment variables for the sandboxed command
   args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
+  args := args.push "--env" |>.push s!"ORCHESTRA_MCP_PORT={serverPort}"
   args := args.push "--env" |>.push "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"
   -- Pass through inherited env vars by name
   for name in ["SHELL", "PATH", "HOME", "USER", "TERM"] do
