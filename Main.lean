@@ -225,9 +225,8 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       | _               => AgentDef.claude
     let backendName := task.backend.getD "claude"
     let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName task.authSource
-    let configExtraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
+    let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
       |>.map (·.extraPorts) |>.getD #[]
-    let extraPorts := (agentDef.sandboxPaths.extraPorts.map (·.toNat)).toArray ++ configExtraPorts
     let debugLogFile : Option System.FilePath ←
       if debug then
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
