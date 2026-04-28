@@ -62,7 +62,6 @@ def opencode : AgentDef where
     homeRw  := [".config/opencode", ".gitconfig", ".local/share/opencode"]
     extraPorts := [4096]
   }
-
   setupMcp _ _ _ := do
     -- TODO: Implement MCP configuration for opencode
     return ("", #[])
