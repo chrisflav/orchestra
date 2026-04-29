@@ -219,9 +219,10 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     let resume := if attempt == 0 then initialResume else sessionId
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
     let agentDef := match task.backend with
-      | some "pi"   => AgentDef.pi
-      | some "vibe" => AgentDef.vibe
-      | _           => AgentDef.claude
+      | some "pi"       => AgentDef.pi
+      | some "vibe"     => AgentDef.vibe
+      | some "opencode" => AgentDef.opencode
+      | _               => AgentDef.claude
     let backendName := task.backend.getD "claude"
     let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName task.authSource
     let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)

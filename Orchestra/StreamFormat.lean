@@ -151,12 +151,14 @@ private def formatContentItem : ContentItem → String
     let desc := jStr input "description"
     let cmd := jStr input "command"
     let fp := jStr input "file_path"
+    let fpAlt := jStr input "filePath"
+    let fpFinal := if !fp.isEmpty then fp else fpAlt
     let pat := jStr input "pattern"
     let detail :=
       if !cmd.isEmpty then
         let header := if !desc.isEmpty then s!"{desc}\n" else ""
         s!"{header}  > {truncate cmd}"
-      else if !fp.isEmpty then fp
+      else if !fpFinal.isEmpty then fpFinal
       else if !pat.isEmpty then s!"pattern: {pat}"
       else desc
     s!"[tool] {name}: {detail}"
