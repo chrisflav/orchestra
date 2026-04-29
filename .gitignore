@@ -2,3 +2,4 @@
 tasks.json
 container/*.squashfs
 container/*.tar.xz
+.agent/.initialized

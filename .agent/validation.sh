@@ -4,7 +4,7 @@ set -euo pipefail
 echo "==> Building..."
 lake build
 
-echo "==> Running listener-config-test..."
-.lake/build/bin/listener-config-test
+echo "==> Running tests..."
+lake test
 
 echo "==> All checks passed."
