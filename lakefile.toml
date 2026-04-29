@@ -12,7 +12,7 @@ rev = "main"
 name = "Orchestra"
 
 [[lean_lib]]
-name = "Test"
+name = "OrchestraTest"
 
 [[lean_exe]]
 name = "orchestra"
