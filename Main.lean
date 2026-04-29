@@ -28,8 +28,6 @@ private def stripExt (s ext : String) : String :=
 private def shellQuote (s : String) : String :=
   "'" ++ s.replace "'" "'\\''" ++ "'"
 
-private def runTask := TaskRunner.runTask
-
 -- Helpers
 
 /-- If `series` is already set, return it unchanged.
@@ -77,7 +75,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
       let task := match budgetFlag with
         | none   => tasks[i]!
         | some b => { tasks[i]! with budget := some b }
-      let _ ← runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
+      let _ ← TaskRunner.runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
   return (0 : UInt32)
@@ -214,7 +212,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
     budget       := budgetFlag.orElse (fun _ => prevRecord.budget)
     priority     := prevRecord.priority
   }
-  let _ ← runTask appConfig task 0 debug (continuesFrom := some prevId) (series := some seriesName)
+  let _ ← TaskRunner.runTask appConfig task 0 debug (continuesFrom := some prevId) (series := some seriesName)
   return (0 : UInt32)
 
 -- Queue helpers
@@ -444,7 +442,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         | none    => pure appConfig
         | some cp => loadAppConfig (some (System.FilePath.mk cp))
       try
-        let (taskId, usageLimitHit) ← runTask cfg task 0 debug
+        let (taskId, usageLimitHit) ← TaskRunner.runTask cfg task 0 debug
           (continuesFrom := entry.continuesFrom) (series := entry.series)
           (cancelToken := some taskToken) (interactive := false)
         currentTaskToken.atomically (·.set none)
