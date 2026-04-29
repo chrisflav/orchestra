@@ -12,4 +12,5 @@ import Orchestra.RepoConfig
 import Orchestra.Sandbox
 import Orchestra.Server
 import Orchestra.StreamFormat
+import Orchestra.TaskRunner
 import Orchestra.TaskStore
