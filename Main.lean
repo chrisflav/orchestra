@@ -200,7 +200,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     | none,    some mp => some mp
     | some sp, some mp => some (sp ++ "\n\n" ++ mp)
   -- 5b. Load prepend prompt and apply to task prompt
-  let prependPrompt ← loadPrependPrompt
+  let prependPrompt ← loadPrependPrompt task.prependPrompt
   let baseTaskPrompt :=
     match prependPrompt with
     | none    => task.prompt
@@ -468,6 +468,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
     model        := prevRecord.model
     agent        := prevRecord.agent
     systemPrompt := prevRecord.systemPrompt
+    prependPrompt := prevRecord.prependPrompt
     budget       := budgetFlag.orElse (fun _ => prevRecord.budget)
     priority     := prevRecord.priority
   }
@@ -524,6 +525,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       model         := prevRecord.model
       agent         := prevRecord.agent
       systemPrompt  := prevRecord.systemPrompt
+      prependPrompt := prevRecord.prependPrompt
       budget        := budgetFlag.orElse (fun _ => prevRecord.budget)
       priority      := priorityFlag.getD prevRecord.priority
     }
@@ -559,6 +561,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         prompt       := task.prompt
         agent        := task.agent
         systemPrompt := task.systemPrompt
+        prependPrompt := task.prependPrompt
         backend      := task.backend
         model        := task.model
         continuesFrom, series
@@ -685,6 +688,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         prompt       := entry.prompt
         agent        := entry.agent
         systemPrompt := entry.systemPrompt
+        prependPrompt := entry.prependPrompt
         backend      := entry.backend
         model        := entry.model
         budget       := entry.budget

@@ -54,6 +54,8 @@ structure TaskRecord where
   agent         : Option String := none
   /-- System prompt file name used for this run. Inherited by continuations. -/
   systemPrompt  : Option String := none
+  /-- Prepend prompt file name used for this run. Inherited by continuations. -/
+  prependPrompt : Option String := none
   /-- Maximum spend in USD used for this run. -/
   budget        : Option Float  := none
   /-- Priority used for queue ordering. Defaults to 10. -/
@@ -79,6 +81,7 @@ instance : ToJson TaskRecord where
     let fields := if let some s := r.model         then fields ++ [("model",          Json.str s)]     else fields
     let fields := if let some s := r.agent         then fields ++ [("agent",          Json.str s)]     else fields
     let fields := if let some s := r.systemPrompt  then fields ++ [("system_prompt",  Json.str s)]     else fields
+    let fields := if let some s := r.prependPrompt   then fields ++ [("prepend_prompt",  Json.str s)]     else fields
     let fields := if let some b := r.budget        then fields ++ [("budget",         ToJson.toJson b)] else fields
     let fields := if r.priority != 10           then fields ++ [("priority",         Json.num r.priority)] else fields
     Json.mkObj fields
@@ -99,10 +102,11 @@ instance : FromJson TaskRecord where
     let model         := j.getObjValAs? String "model"          |>.toOption
     let agent         := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt  := j.getObjValAs? String "system_prompt"  |>.toOption
+    let prependPrompt   := j.getObjValAs? String "prepend_prompt"  |>.toOption
     let budget        := j.getObjValAs? Float  "budget"         |>.toOption
     let priority      := j.getObjValAs? Nat   "priority"      |>.toOption |>.getD 10
     return { id, createdAt, upstream, fork, mode, prompt, status, sessionId,
-             continuesFrom, series, backend, model, agent, systemPrompt, budget, priority }
+             continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority }
 
 -- Directories
 
