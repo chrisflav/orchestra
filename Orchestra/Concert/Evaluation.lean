@@ -5,6 +5,8 @@ import Orchestra.TaskRunner
 import Orchestra.TaskStore
 import Std.Sync
 
+open Lean (Json)
+
 namespace Orchestra.Concert
 
 open Orchestra.TaskRunner (runIOTask)
@@ -88,6 +90,66 @@ mutual
     | .op (.while cond body) k => do
         evalQueuedWhile mgr appConfig debug cancelToken cond body
         evalQueued mgr appConfig debug cancelToken (k ())
+end
+
+private partial def pollEntry (entryId : String) : IO (Option Json) := do
+  IO.sleep 1000
+  match ← Queue.loadEntry entryId with
+  | none => pollEntry entryId
+  | some e =>
+    match e.status with
+    | .done      => return e.outputJson
+    | .failed    => return none
+    | .cancelled => return none
+    | _          => pollEntry entryId
+
+mutual
+  private partial def evalQueuedPollingWhile
+      (cond : Concert Bool) (body : Concert Unit) : IO Unit := do
+    if ← evalQueuedPolling cond then
+      evalQueuedPolling body
+      evalQueuedPollingWhile cond body
+
+  /-- Evaluate a Concert program by submitting each task as a `QueueEntry` and polling
+      the queue file for completion. Suitable for use in a process external to the daemon. -/
+  partial def evalQueuedPolling : Concert α → IO α
+    | .pure a  => pure a
+    | .abort   => throw (IO.userError "Concert aborted")
+    | .op (.run o t input) k => do
+        let spec      := t.toIOTask input
+        let entryId   ← TaskStore.generateId
+        let createdAt ← TaskStore.currentIso8601
+        let entry : Queue.QueueEntry := {
+          id           := entryId
+          createdAt
+          status       := .pending
+          upstream     := spec.upstream
+          fork         := spec.fork
+          mode         := spec.mode
+          prompt       := spec.prompt
+          agent        := spec.agent
+          systemPrompt := spec.systemPrompt
+          backend      := spec.backend
+          model        := spec.model
+          budget       := spec.budget
+          memory       := spec.memory
+          authSource   := spec.authSource
+          tools        := spec.tools
+          readOnly     := spec.readOnly
+          priority     := spec.priority
+          outputType   := o
+          inputJson    := none
+        }
+        Queue.saveEntry entry
+        let resultJson ← pollEntry entryId
+        let result :=
+          match resultJson.bind (ResultType.valueFromJson o · |>.toOption) with
+          | some v => v
+          | none   => default
+        evalQueuedPolling (k result)
+    | .op (.while cond body) k => do
+        evalQueuedPollingWhile cond body
+        evalQueuedPolling (k ())
 end
 
 def evalWithConfig (c : Concert α) : IO α := do
