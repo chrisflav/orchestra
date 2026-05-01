@@ -160,7 +160,7 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
         let cid ← e.concertId
         allConcerts.find? (fun cr => cr.id == cid)
       match mConcert with
-      | some run => run.name.getD run.id
+      | some run => run.id
       | none     => r.series.getD ""
     IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork 28} {padRight status 11} {concertLabel}"
   return (0 : UInt32)
@@ -723,7 +723,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     ConcertManager.cancelAll concertMgr
     Queue.deletePid
   IO.println "Queue daemon shut down gracefully."
-  return 0
+  IO.Process.exit 0
 
 private def queueListHandler (p : Parsed) : IO UInt32 := do
   let limit := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
@@ -751,14 +751,13 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
   IO.println ""
   IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 9} {padRight "PRI" 4} CONCERT"
   IO.println (String.ofList (List.replicate 93 '-'))
-  let allConcerts ← Queue.loadAllConcertRuns
   for e in entries do
     let status := match e.status with
       | .pending => "pending" | .running => "running" | .done => "done" | .failed => "failed"
       | .unfinished => "unfinished" | .cancelled => "cancelled"
-    let concertLabel := match e.concertId.bind (fun cid => allConcerts.find? (fun cr => cr.id == cid)) with
-      | some r => r.name.getD r.id
-      | none   => e.series.getD ""
+    let concertLabel := match e.concertId with
+      | some cid => cid
+      | none     => e.series.getD ""
     IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {padRight (toString e.priority) 4} {concertLabel}"
   return (0 : UInt32)
 
@@ -817,9 +816,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
     let pendingByPriority := pendingArr.qsort (fun a b => a.priority > b.priority)
     for e in running ++ pendingByPriority do
       let status := if e.status == .running then "running" else "pending"
-      let concertLabel := match e.concertId.bind (fun cid => allConcerts.find? (fun cr => cr.id == cid)) with
-        | some r => r.name.getD r.id
-        | none   => ""
+      let concertLabel := e.concertId.getD ""
       IO.println s!"{padRight e.id 16} {padRight e.fork 28} {padRight status 9} {padRight (toString e.priority) 8} {concertLabel}"
   -- Listener status
   let listenerConfigs ← Listener.loadAllListenerConfigs (← Listener.listenersDir)
