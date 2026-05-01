@@ -148,8 +148,8 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
     return (0 : UInt32)
   let queueEntries ← Queue.loadAllEntries
   let allConcerts ← Queue.loadAllConcertRuns
-  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 11} CONCERT"
-  IO.println (String.ofList (List.replicate 100 '-'))
+  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 11} {padRight "SERIES" 16} CONCERT"
+  IO.println (String.ofList (List.replicate 117 '-'))
   for r in records do
     let status := match r.status with
       | .running => "running" | .completed => "completed" | .failed => "failed"
@@ -161,8 +161,9 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
         allConcerts.find? (fun cr => cr.id == cid)
       match mConcert with
       | some run => run.id
-      | none     => r.series.getD ""
-    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork 28} {padRight status 11} {concertLabel}"
+      | none     => ""
+    let seriesLabel := r.series.getD ""
+    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 private def taskShowHandler (p : Parsed) : IO UInt32 := do
@@ -736,16 +737,15 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
     IO.println "No queue entries found."
     return (0 : UInt32)
   IO.println ""
-  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 9} {padRight "PRI" 4} CONCERT"
-  IO.println (String.ofList (List.replicate 93 '-'))
+  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 9} {padRight "PRI" 4} {padRight "SERIES" 16} CONCERT"
+  IO.println (String.ofList (List.replicate 110 '-'))
   for e in entries do
     let status := match e.status with
       | .pending => "pending" | .running => "running" | .done => "done" | .failed => "failed"
       | .unfinished => "unfinished" | .cancelled => "cancelled"
-    let concertLabel := match e.concertId with
-      | some cid => cid
-      | none     => e.series.getD ""
-    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {padRight (toString e.priority) 4} {concertLabel}"
+    let concertLabel := e.concertId.getD ""
+    let seriesLabel := e.series.getD ""
+    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 private def queueListenersHandler (p : Parsed) : IO UInt32 := do
@@ -795,8 +795,8 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
     IO.println ""
     IO.println s!"Queue: {active.size} task(s)"
     IO.println ""
-    IO.println s!"{padRight "ID" 16} {padRight "FORK" 28} {padRight "STATUS" 9} {padRight "PRIORITY" 8} CONCERT"
-    IO.println (String.ofList (List.replicate 85 '-'))
+    IO.println s!"{padRight "ID" 16} {padRight "FORK" 28} {padRight "STATUS" 9} {padRight "PRIORITY" 8} {padRight "SERIES" 16} CONCERT"
+    IO.println (String.ofList (List.replicate 102 '-'))
     -- Show running first, then pending ordered by priority desc, then oldest first
     let running := active.filter (fun e => e.status == .running)
     let pendingArr := active.filter (fun e => e.status == .pending)
@@ -804,7 +804,8 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
     for e in running ++ pendingByPriority do
       let status := if e.status == .running then "running" else "pending"
       let concertLabel := e.concertId.getD ""
-      IO.println s!"{padRight e.id 16} {padRight e.fork 28} {padRight status 9} {padRight (toString e.priority) 8} {concertLabel}"
+      let seriesLabel := e.series.getD ""
+      IO.println s!"{padRight e.id 16} {padRight e.fork 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
   -- Listener status
   let listenerConfigs ← Listener.loadAllListenerConfigs (← Listener.listenersDir)
   if !listenerConfigs.isEmpty then
