@@ -9,6 +9,7 @@ import Orchestra.Config
 import Orchestra.GitHub
 import Orchestra.Listener
 import Orchestra.Queue
+import Orchestra.UnixSocket
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.Sandbox

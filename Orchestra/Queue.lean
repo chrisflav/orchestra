@@ -72,11 +72,6 @@ structure QueueEntry where
   /-- Key linking this entry to a suspended concert fiber. When set, the queue
       daemon signals the ConcertManager with the task output after completion. -/
   concertStepKey : Option String := none
-  /-- Path to a workflow YAML file. When set, the daemon starts a concert fiber
-      instead of running a regular agent task. -/
-  workflowFile   : Option String := none
-  /-- Initial variable bindings for the concert, serialized as a JSON object. -/
-  workflowVars   : Option Json   := none
   /-- Input type for the task. Controls which MCP tools are exposed. -/
   inputType     : ResultType     := .unit
   /-- Output type for the task. Controls which MCP tools are exposed. -/
@@ -113,8 +108,6 @@ instance : ToJson QueueEntry where
     let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
     let fields := if e.priority != 10              then fields ++ [("priority",         Json.num e.priority)]           else fields
     let fields := if let some s := e.concertStepKey then fields ++ [("concert_step_key", Json.str s)]                  else fields
-    let fields := if let some s := e.workflowFile   then fields ++ [("workflow_file",    Json.str s)]                  else fields
-    let fields := if let some j := e.workflowVars   then fields ++ [("workflow_vars",    j)]                           else fields
     let fields := if e.inputType != .unit           then fields ++ [("input_type",       ToJson.toJson e.inputType)]   else fields
     let fields := if e.outputType != .unit          then fields ++ [("output_type",      ToJson.toJson e.outputType)]  else fields
     let fields := if let some j := e.inputJson      then fields ++ [("input_json",       j)]                           else fields
@@ -150,13 +143,10 @@ instance : FromJson QueueEntry where
     let outputType     := j.getObjValAs? ResultType "output_type"     |>.toOption |>.getD .unit
     let inputJson      := j.getObjVal?   "input_json"  |>.toOption
     let outputJson     := j.getObjVal?   "output_json" |>.toOption
-    let workflowFile   := j.getObjValAs? String "workflow_file" |>.toOption
-    let workflowVars   := j.getObjVal?   "workflow_vars"        |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
-             concertStepKey, inputType, outputType, inputJson, outputJson,
-             workflowFile, workflowVars }
+             concertStepKey, inputType, outputType, inputJson, outputJson }
 
 -- Directories and paths
 
@@ -168,34 +158,11 @@ def queueDir : IO System.FilePath := do
 def pidFile : IO System.FilePath :=
   return (← queueDir) / "daemon.pid"
 
-def shutdownRequestFile : IO System.FilePath :=
-  return (← queueDir) / "shutdown.request"
-
-def cancelRequestFile : IO System.FilePath :=
-  return (← queueDir) / "cancel.request"
+def socketFile : IO System.FilePath :=
+  return (← queueDir) / "daemon.sock"
 
 def daemonLogFile : IO System.FilePath :=
   return (← queueDir) / "daemon.log"
-
-/-- Write a graceful-shutdown sentinel. The daemon will exit after the current task finishes. -/
-def requestShutdown : IO Unit := do
-  IO.FS.writeFile (← shutdownRequestFile) ""
-
-/-- Write a cancel sentinel. The daemon will kill the currently running agent. -/
-def requestCancel : IO Unit := do
-  IO.FS.writeFile (← cancelRequestFile) ""
-
-def checkShutdownRequested : IO Bool := do
-  (← shutdownRequestFile).pathExists
-
-def checkCancelRequested : IO Bool := do
-  (← cancelRequestFile).pathExists
-
-def clearShutdownRequest : IO Unit := do
-  try IO.FS.removeFile (← shutdownRequestFile) catch _ => pure ()
-
-def clearCancelRequest : IO Unit := do
-  try IO.FS.removeFile (← cancelRequestFile) catch _ => pure ()
 
 -- Storage
 
@@ -311,8 +278,7 @@ def markStaleRunningAsUnfinished : IO Unit := do
 def cancelStaleConcertEntries : IO Unit := do
   let all ← loadAllEntries
   for entry in all do
-    if entry.status == .unfinished &&
-        (entry.concertStepKey.isSome || entry.workflowFile.isSome) then
+    if entry.status == .unfinished && entry.concertStepKey.isSome then
       saveEntry { entry with status := .cancelled }
 
 end Orchestra.Queue
