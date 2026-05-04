@@ -202,6 +202,8 @@ def createPrReview (pat : String) (upstream : String) (prNumber : Nat)
   let owner := parts[0]?.getD ""
   let repo  := parts[1]?.getD ""
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let commitId ← if comments.isEmpty then pure ""
+                 else getPrLatestCommit pat upstream prNumber
   let commentsJson := comments.map fun c =>
     Json.mkObj [
       ("path", c.path),
@@ -209,20 +211,38 @@ def createPrReview (pat : String) (upstream : String) (prNumber : Nat)
       ("body", c.body),
       ("side", c.side)
     ]
-  let payload := Json.mkObj [
-    ("body", body),
-    ("event", "COMMENT"),
-    ("comments", .arr commentsJson)
-  ]
+  let baseFields : List (String × Json) :=
+    [("body", body), ("event", "COMMENT"), ("comments", Json.arr commentsJson)]
+  let payload := Json.mkObj (
+    baseFields ++ if commitId.isEmpty then [] else [("commit_id", Json.str commitId)])
   runCmd "gh" #[
     "api", "--method", "POST",
     s!"/repos/{owner}/{repo}/pulls/{prNumber}/reviews",
     "--input", "-"
   ] (input := payload.compress) (env := env)
 
+/-- Return the pull-request number that a review comment belongs to. -/
+def getPrReviewCommentPrNumber (pat : String) (upstream : String) (commentId : Nat) : IO Nat := do
+  let parts := upstream.splitOn "/"
+  let owner := parts[0]?.getD ""
+  let repo  := parts[1]?.getD ""
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let url ← runCmd "gh" #[
+    "api",
+    s!"/repos/{owner}/{repo}/pulls/comments/{commentId}",
+    "--jq", ".pull_request_url"
+  ] (env := env)
+  let trimmed : String := url.trimAscii.toString
+  match trimmed.splitOn "/" |>.getLast? with
+  | some s => match s.toNat? with
+    | some n => return n
+    | none => throw (.userError s!"unexpected pull_request_url: {trimmed}")
+  | none => throw (.userError s!"unexpected pull_request_url: {trimmed}")
+
 /-- Send a report email via the `sendmail` command. -/
 def sendEmail (to : String) (subject : String) (body : String) : IO Unit := do
-  let message := s!"To: {to}\nSubject: {subject}\n\n{body}"
+  let safeSubject := subject.replace "\n" " " |>.replace "\r" " "
+  let message := s!"To: {to}\nSubject: {safeSubject}\n\n{body}"
   runCmd' "sendmail" #["-t"] (input := message)
 
 end Orchestra.GitHub

@@ -248,13 +248,13 @@ private def toolsList (state : State) : Json :=
 /-- The action performed by the `comment` tool. -/
 inductive CommentAction where
   /-- Post a top-level comment on the issue or PR. -/
-  | issue
+  | issue (body : String)
   /-- Post a pull-request review body with optional inline comments (COMMENT event, no approval/rejection). -/
-  | review (inlineComments : Array GitHub.InlineComment)
+  | review (body : String) (inlineComments : Array GitHub.InlineComment)
   /-- Reply to an existing inline PR review comment. -/
-  | replyInline (commentId : Nat)
+  | replyInline (body : String) (commentId : Nat)
   /-- Create a new inline PR review comment on a specific file and line. -/
-  | newInline (path : String) (line : Nat) (side : String)
+  | newInline (comment : GitHub.InlineComment)
 
 /-- A parsed and validated tool call. `parseError` carries an argument validation failure. -/
 inductive ToolCall where
@@ -262,7 +262,7 @@ inductive ToolCall where
   | refreshToken
   | createPr (title : String) (body : String) (head : String) (base : String)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
-  | comment (body : String) (action : CommentAction)
+  | comment (action : CommentAction)
   | report (subject : String) (body : String)
   | getTaskInput
   | submitTaskOutput (value : Json)
@@ -331,14 +331,14 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
                       let s := item.getObjValAs? String "side" |>.toOption |>.getD "RIGHT"
                       some { path := p, line := l, body := b, side := s }
                     | _, _, _ => none
-            .comment body (.review inlineComments)
+            .comment (.review body inlineComments)
           | _, _, _          =>
             .parseError "'review' is mutually exclusive with 'reply_to_comment_id' and 'path'/'line'"
         else
           match replyToId, path, line with
-          | some cid, none, none => .comment body (.replyInline cid)
-          | none, some p, some l => .comment body (.newInline p l side)
-          | none, none, none     => .comment body .issue
+          | some cid, none, none => .comment (.replyInline body cid)
+          | none, some p, some l => .comment (.newInline { path := p, line := l, body, side })
+          | none, none, none     => .comment (.issue body)
           | some _, _, _         =>
             .parseError "'reply_to_comment_id' and 'path'/'line' are mutually exclusive"
           | none, some _, none   => .parseError "'path' requires 'line'"
@@ -465,7 +465,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     catch e =>
       log s!"tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)
-  | .comment body action =>
+  | .comment action =>
     if !state.allowedTools.contains "comment" then
       log "tool comment: denied (not in allowed tools)"
       return toolContent "comment tool is not enabled for this task" (isError := true)
@@ -475,7 +475,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       return toolContent "no issue_number configured for this task" (isError := true)
     | some n =>
       match action with
-      | .issue =>
+      | .issue body =>
         log s!"tool comment: posting to {state.upstream}#{n}"
         try
           let result ← GitHub.createIssueComment state.pat state.upstream n body
@@ -484,7 +484,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
-      | .review inlineComments =>
+      | .review body inlineComments =>
         log s!"tool comment: posting review to {state.upstream}#{n} \
           ({inlineComments.size} inline comments)"
         try
@@ -494,19 +494,25 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
-      | .replyInline cid =>
+      | .replyInline body cid =>
         log s!"tool comment: replying to inline comment {cid} on {state.upstream}#{n}"
         try
+          let cidPr ← GitHub.getPrReviewCommentPrNumber state.pat state.upstream cid
+          if cidPr ≠ n then
+            log s!"tool comment: comment {cid} belongs to PR #{cidPr}, not #{n}"
+            return toolContent s!"comment {cid} does not belong to issue #{n}" (isError := true)
           let result ← GitHub.replyToPrReviewComment state.pat state.upstream cid body
           log "tool comment: ok"
           return toolContent result
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
-      | .newInline path line side =>
-        log s!"tool comment: new inline comment on {state.upstream}#{n} {path}:{line} ({side})"
+      | .newInline comment =>
+        log s!"tool comment: new inline comment on {state.upstream}#{n} \
+          {comment.path}:{comment.line} ({comment.side})"
         try
-          let result ← GitHub.createPrReviewComment state.pat state.upstream n body path line side
+          let result ← GitHub.createPrReviewComment state.pat state.upstream n
+            comment.body comment.path comment.line comment.side
           log "tool comment: ok"
           return toolContent result
         catch e =>
