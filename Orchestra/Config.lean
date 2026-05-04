@@ -306,6 +306,31 @@ instance : FromJson Task where
                                 budget, memory, authSource, tools, readOnly, series, priority,
                                 issueNumber } }
 
+/-- Filesystem paths to expose inside the landrun sandbox. -/
+structure SandboxPaths where
+  /-- Absolute paths needing read+execute (binaries/libraries). -/
+  rox : List String := []
+  /-- Absolute paths needing read-only access. -/
+  ro : List String := []
+  /-- Absolute paths needing read-write access. -/
+  rw : List String := []
+  /-- Paths relative to $HOME needing read+execute. -/
+  homeRox : List String := []
+  /-- Paths relative to $HOME needing read-write access. -/
+  homeRw : List String := []
+  /-- Additional TCP ports to allow outbound connections to (besides 443 and the MCP server port). -/
+  extraPorts : List UInt16 := []
+deriving Repr
+
+instance : FromJson SandboxPaths where
+  fromJson? j := do
+    let rox     := j.getObjValAs? (List String) "rox"      |>.toOption |>.getD []
+    let ro      := j.getObjValAs? (List String) "ro"       |>.toOption |>.getD []
+    let rw      := j.getObjValAs? (List String) "rw"       |>.toOption |>.getD []
+    let homeRox := j.getObjValAs? (List String) "home_rox" |>.toOption |>.getD []
+    let homeRw  := j.getObjValAs? (List String) "home_rw"  |>.toOption |>.getD []
+    return { rox, ro, rw, homeRox, homeRw }
+
 structure AppConfig where
   appId : Nat
   privateKeyPath : String
@@ -327,6 +352,10 @@ structure AppConfig where
   /-- Per-backend authentication source configurations.
       Allows configuring multiple named authentication sources for each agent backend. -/
   agentAuthConfigs : Array AgentAuthConfig := #[]
+  /-- Additional sandbox paths to expose to every agent launched by this instance.
+      Merged on top of the agent-backend's built-in paths.
+      Useful for granting rw access to directories like `.cache`. -/
+  additionalSandboxPaths : SandboxPaths := {}
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -346,9 +375,10 @@ instance : FromJson AppConfig where
     let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
     let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
     let agentAuthConfigs := j.getObjValAs? (Array AgentAuthConfig) "agents" |>.toOption |>.getD #[]
+    let additionalSandboxPaths := j.getObjValAs? SandboxPaths "additional_sandbox_paths" |>.toOption |>.getD {}
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs }
+             agentAuthConfigs, additionalSandboxPaths }
 
 structure TaskFile where
   tasks : Array Task

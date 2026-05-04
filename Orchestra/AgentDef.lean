@@ -7,21 +7,6 @@ open Orchestra.StreamFormat
 
 namespace Orchestra
 
-/-- Filesystem paths to expose inside the landrun sandbox. -/
-structure SandboxPaths where
-  /-- Absolute paths needing read+execute (binaries/libraries). -/
-  rox : List String := []
-  /-- Absolute paths needing read-only access. -/
-  ro : List String := []
-  /-- Absolute paths needing read-write access. -/
-  rw : List String := []
-  /-- Paths relative to $HOME needing read+execute. -/
-  homeRox : List String := []
-  /-- Paths relative to $HOME needing read-write access. -/
-  homeRw : List String := []
-  /-- Additional TCP ports to allow outbound connections to (besides 443 and the MCP server port). -/
-  extraPorts : List UInt16 := []
-
 /-- Describes how to invoke and communicate with a specific coding agent backend. -/
 structure AgentDef where
   /-- The executable name (e.g., "claude"). -/

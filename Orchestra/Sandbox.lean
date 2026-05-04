@@ -55,7 +55,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     -- If true, mount the project repository read-only in the sandbox.
     (readOnly : Bool := false)
     -- Additional TCP ports to allow, beyond what the agent backend already opens.
-    (extraPorts : Array Nat := #[]) : IO LaunchResult := do
+    (extraPorts : Array Nat := #[])
+    -- Additional sandbox paths from global app config, merged with the agent-backend's built-in paths.
+    (additionalPaths : SandboxPaths := {}) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -86,6 +88,25 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   for p in ← expandHomePaths paths.homeRw do
     if ← p.pathExists then
       args := args.push "--rw" |>.push p.toString
+  -- Additional paths from global app config
+  for p in additionalPaths.rox do
+    if ← System.FilePath.pathExists p then
+      args := args.push "--rox" |>.push p
+  for p in additionalPaths.ro do
+    if ← System.FilePath.pathExists p then
+      args := args.push "--ro" |>.push p
+  for p in additionalPaths.rw do
+    if ← System.FilePath.pathExists p then
+      args := args.push "--rw" |>.push p
+  for p in ← expandHomePaths additionalPaths.homeRox do
+    if ← p.pathExists then
+      args := args.push "--rox" |>.push p.toString
+  for p in ← expandHomePaths additionalPaths.homeRw do
+    if ← p.pathExists then
+      args := args.push "--rw" |>.push p.toString
+  for p in additionalPaths.extraPorts do
+    args := args.push "--connect-tcp" |>.push (toString p)
+    args := args.push "--bind-tcp" |>.push (toString p)
   -- Plugin directories (read+execute access)
   for p in pluginDirs do
     if ← System.FilePath.pathExists p then
