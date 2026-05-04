@@ -122,7 +122,6 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
     privateKeyPath := appConfig.privateKeyPath
     installationId
     pat := appConfig.pat
-    email := appConfig.email
   }
   let (port, _shutdown) ← Server.start serverState
   IO.println s!"MCP server listening on port {port}"

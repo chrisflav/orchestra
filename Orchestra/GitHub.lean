@@ -244,11 +244,4 @@ def getPrReviewCommentPrNumber (pat : String) (upstream : String) (commentId : N
     | none => throw (.userError s!"unexpected pull_request_url: {trimmed}")
   | none => throw (.userError s!"unexpected pull_request_url: {trimmed}")
 
-/-- Send a report email via the `sendmail` command. -/
-def sendEmail (to : String) (subject : String) (body : String) : IO Unit := do
-  let safeTo := to.replace "\n" " " |>.replace "\r" " "
-  let safeSubject := subject.replace "\n" " " |>.replace "\r" " "
-  let message := s!"To: {safeTo}\nSubject: {safeSubject}\n\n{body}"
-  runCmd' "sendmail" #["-t"] (input := message)
-
 end Orchestra.GitHub

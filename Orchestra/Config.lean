@@ -327,8 +327,6 @@ structure AppConfig where
   /-- Per-backend authentication source configurations.
       Allows configuring multiple named authentication sources for each agent backend. -/
   agentAuthConfigs : Array AgentAuthConfig := #[]
-  /-- Email address for the `report` tool. When set, agents may send reports to this address. -/
-  email : Option String := none
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -348,10 +346,9 @@ instance : FromJson AppConfig where
     let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
     let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
     let agentAuthConfigs := j.getObjValAs? (Array AgentAuthConfig) "agents" |>.toOption |>.getD #[]
-    let email := j.getObjValAs? String "email" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs, email }
+             agentAuthConfigs }
 
 structure TaskFile where
   tasks : Array Task

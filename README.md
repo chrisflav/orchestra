@@ -2,8 +2,8 @@
 
 A CLI tool for managing and sandboxing coding agents. It clones repositories,
 authenticates via a GitHub App, runs an agent inside a landrun sandbox, and
-optionally creates pull requests to an upstream repository through a built-in
-MCP server.
+exposes GitHub actions (creating pull requests, posting comments) to the agent
+through a built-in MCP server.
 
 ## prerequisites
 
@@ -159,6 +159,24 @@ Fields:
   `.md`); defaults to `default.md` if present
 - `backend` — `"claude"` (default) or `"vibe"`
 - `model` — optional model override passed to the agent
+
+## MCP tools
+
+The agent has access to the following tools via the built-in MCP server:
+
+- `health` — check that the MCP server is running
+- `refresh_token` — refresh the GitHub App installation token
+- `get_pr_comments` — fetch review threads for a pull request
+- `create_pr` — create a pull request on the upstream repository (requires `mode: "pr"`)
+- `comment` — post a comment on the issue or pull request the task was launched from.
+  Supports four modes:
+  - **regular comment**: provide only `body`
+  - **PR review**: provide `body` and set `review: true`; optionally include `inline_comments`
+  - **reply to inline comment**: provide `body` and `reply_to_comment_id`
+  - **new inline comment**: provide `body`, `path`, and `line`
+
+  The `comment` tool requires the task to carry an `issue_number` (set automatically by the
+  listener when triggered from an issue or pull request).
 
 ## running tasks
 

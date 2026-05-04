@@ -32,8 +32,6 @@ structure State where
   outputRef : Option (IO.Ref (Option Json)) := none
   /-- Issue or PR number this task was launched from. Required for the `comment` tool. -/
   issueNumber : Option Nat := none
-  /-- Email address for the `report` tool. -/
-  email : Option String := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -189,24 +187,6 @@ private def optionalToolDefs : List (String × Json) := [
       ("required", .arr #["body"])
     ])
   ]),
-  ("report", Json.mkObj [
-    ("name", "report"),
-    ("description", "Send a private report via email to the configured address."),
-    ("inputSchema", Json.mkObj [
-      ("type", "object"),
-      ("properties", Json.mkObj [
-        ("subject", Json.mkObj [
-          ("type", "string"),
-          ("description", "Email subject line.")
-        ]),
-        ("body", Json.mkObj [
-          ("type", "string"),
-          ("description", "Email body text.")
-        ])
-      ]),
-      ("required", .arr #["subject", "body"])
-    ])
-  ])
 ]
 
 private def ioToolDefs (inputType outputType : ResultType) : Array Json :=
@@ -263,7 +243,6 @@ inductive ToolCall where
   | createPr (title : String) (body : String) (head : String) (base : String)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
   | comment (action : CommentAction)
-  | report (subject : String) (body : String)
   | getTaskInput
   | submitTaskOutput (value : Json)
   | unknown (name : String)
@@ -343,12 +322,6 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
             .parseError "'reply_to_comment_id' and 'path'/'line' are mutually exclusive"
           | none, some _, none   => .parseError "'path' requires 'line'"
           | none, none, some _   => .parseError "'line' requires 'path'"
-  | "report" =>
-    let subject := args.getObjValAs? String "subject" |>.toOption |>.getD ""
-    let body    := args.getObjValAs? String "body"    |>.toOption |>.getD ""
-    if subject.isEmpty then .parseError "missing required 'subject' argument"
-    else if body.isEmpty then .parseError "missing required 'body' argument"
-    else .report subject body
   | "get_task_input" => .getTaskInput
   | "submit_task_output" =>
     match args.getObjVal? "value" with
@@ -518,23 +491,6 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
-  | .report subject body =>
-    if !state.allowedTools.contains "report" then
-      log "tool report: denied (not in allowed tools)"
-      return toolContent "report tool is not enabled for this task" (isError := true)
-    match state.email with
-    | none =>
-      log "tool report: no email configured"
-      return toolContent "no email address configured (set 'email' in config)" (isError := true)
-    | some addr =>
-      log s!"tool report: sending to {addr}, subject={repr subject}"
-      try
-        GitHub.sendEmail addr subject body
-        log s!"tool report: ok"
-        return toolContent s!"Report sent to {addr}"
-      catch e =>
-        log s!"tool report: error: {e}"
-        return toolContent (toString e) (isError := true)
   | .getTaskInput =>
     log "tool get_task_input"
     match state.inputJson with
