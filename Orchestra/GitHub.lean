@@ -147,23 +147,25 @@ def createIssueComment (pat : String) (upstream : String) (issueNumber : Nat) (b
   let owner := parts[0]?.getD ""
   let repo  := parts[1]?.getD ""
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let payload := Json.mkObj [("body", body)]
   runCmd "gh" #[
     "api", "--method", "POST",
     s!"/repos/{owner}/{repo}/issues/{issueNumber}/comments",
-    "-f", s!"body={body}"
-  ] (env := env)
+    "--input", "-"
+  ] (input := payload.compress) (env := env)
 
 /-- Reply to an inline PR review comment. -/
-def replyToPrReviewComment (pat : String) (upstream : String) (commentId : Nat) (body : String) : IO String := do
+def replyToPrReviewComment (pat : String) (upstream : String) (prNumber : Nat) (commentId : Nat) (body : String) : IO String := do
   let parts := upstream.splitOn "/"
   let owner := parts[0]?.getD ""
   let repo  := parts[1]?.getD ""
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let payload := Json.mkObj [("body", body)]
   runCmd "gh" #[
     "api", "--method", "POST",
-    s!"/repos/{owner}/{repo}/pulls/comments/{commentId}/replies",
-    "-f", s!"body={body}"
-  ] (env := env)
+    s!"/repos/{owner}/{repo}/pulls/{prNumber}/comments/{commentId}/replies",
+    "--input", "-"
+  ] (input := payload.compress) (env := env)
 
 /-- Get the latest commit SHA of a pull request. -/
 private def getPrLatestCommit (pat : String) (upstream : String) (prNumber : Nat) : IO String := do
@@ -185,15 +187,18 @@ def createPrReviewComment (pat : String) (upstream : String) (prNumber : Nat)
   let repo  := parts[1]?.getD ""
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
   let commitId ← getPrLatestCommit pat upstream prNumber
+  let payload := Json.mkObj [
+    ("body", body),
+    ("path", path),
+    ("side", side),
+    ("commit_id", commitId),
+    ("line", Json.num ⟨(line : Int), 0⟩)
+  ]
   runCmd "gh" #[
     "api", "--method", "POST",
     s!"/repos/{owner}/{repo}/pulls/{prNumber}/comments",
-    "-f", s!"body={body}",
-    "-f", s!"path={path}",
-    "-f", s!"side={side}",
-    "-f", s!"commit_id={commitId}",
-    "-F", s!"line={line}"
-  ] (env := env)
+    "--input", "-"
+  ] (input := payload.compress) (env := env)
 
 /-- Post a review (with optional inline comments) on a pull request. -/
 def createPrReview (pat : String) (upstream : String) (prNumber : Nat)
@@ -241,8 +246,9 @@ def getPrReviewCommentPrNumber (pat : String) (upstream : String) (commentId : N
 
 /-- Send a report email via the `sendmail` command. -/
 def sendEmail (to : String) (subject : String) (body : String) : IO Unit := do
+  let safeTo := to.replace "\n" " " |>.replace "\r" " "
   let safeSubject := subject.replace "\n" " " |>.replace "\r" " "
-  let message := s!"To: {to}\nSubject: {safeSubject}\n\n{body}"
+  let message := s!"To: {safeTo}\nSubject: {safeSubject}\n\n{body}"
   runCmd' "sendmail" #["-t"] (input := message)
 
 end Orchestra.GitHub

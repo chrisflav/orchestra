@@ -501,7 +501,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
           if cidPr ≠ n then
             log s!"tool comment: comment {cid} belongs to PR #{cidPr}, not #{n}"
             return toolContent s!"comment {cid} does not belong to issue #{n}" (isError := true)
-          let result ← GitHub.replyToPrReviewComment state.pat state.upstream cid body
+          let result ← GitHub.replyToPrReviewComment state.pat state.upstream n cid body
           log "tool comment: ok"
           return toolContent result
         catch e =>
