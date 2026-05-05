@@ -14,8 +14,8 @@ private instance : ToJson Unit where
 
 instance {i o : ResultType} : ToJson (IOTask i o) where
   toJson t := Json.mkObj
-    [ ("upstream",      .str t.upstream)
-    , ("fork",          .str t.fork)
+    [ ("upstream",      ToJson.toJson t.upstream)
+    , ("fork",          ToJson.toJson t.fork)
     , ("mode",          ToJson.toJson t.mode)
     , ("prompt",        .str t.prompt)
     , ("agent",         ToJson.toJson t.agent)
@@ -34,8 +34,8 @@ instance {i o : ResultType} : ToJson (IOTask i o) where
 
 instance {i o : ResultType} : FromJson (IOTask i o) where
   fromJson? j := do
-    let upstream     ← j.getObjValAs? String "upstream"
-    let fork         ← j.getObjValAs? String "fork"
+    let upstream     ← j.getObjValAs? Repository "upstream"
+    let fork         ← j.getObjValAs? Repository "fork"
     let mode         ← j.getObjValAs? TaskMode "mode"
     let prompt       ← j.getObjValAs? String "prompt"
     let agent        := j.getObjValAs? String "agent" |>.toOption

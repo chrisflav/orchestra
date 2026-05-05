@@ -17,12 +17,12 @@ open Orchestra
 
 namespace Orchestra.TaskRunner
 
-private def sanitizeProjectName (upstream : String) : String :=
-  upstream.map (fun c => if c == '/' then '-' else c)
+private def sanitizeProjectName (upstream : Repository) : String :=
+  s!"{upstream.owner}-{upstream.name}"
 
 /-- Return the active memory directories for the given mode and upstream repo.
     Creates the directories if they do not yet exist. -/
-private def resolveMemoryDirs (mode : MemoryMode) (upstream : String) : IO (Array String) := do
+private def resolveMemoryDirs (mode : MemoryMode) (upstream : Repository) : IO (Array String) := do
   match ← IO.getEnv "HOME" with
   | none => return #[]
   | some home =>
@@ -141,7 +141,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- 1. Create GitHub App token
   IO.println "  Creating GitHub App token..."
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let (forkOwner, _) ← Repo.splitRepo ioTask.fork
+  let forkOwner := ioTask.fork.owner
   let installationId ← match appConfig.installationId with
     | some id => pure id
     | none => GitHub.getInstallationId jwt forkOwner
@@ -228,7 +228,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | none => pure none
       | some home =>
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-        pure (some (System.FilePath.mk home / ".agent" / "logs" / ioTask.fork / s!"{taskId}{suffix}.log"))
+        pure (some (System.FilePath.mk home / ".agent" / "logs" / ioTask.fork.toString / s!"{taskId}{suffix}.log"))
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
       (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
       (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)

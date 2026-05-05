@@ -1,3 +1,5 @@
+import Orchestra.Config
+
 namespace Orchestra.Repo
 
 private def runGit (args : Array String) (cwd : Option System.FilePath := none) : IO String := do
@@ -42,14 +44,8 @@ def workDir : IO System.FilePath := do
   | some h => return System.FilePath.mk h / ".agent" / "repos"
   | none => throw (.userError "HOME not set")
 
-/-- Parse "owner/repo" into (owner, repo). -/
-def splitRepo (s : String) : IO (String × String) := do
-  match s.splitOn "/" with
-  | [owner, repo] => return (owner, repo)
-  | _ => throw (.userError s!"invalid repo format '{s}', expected 'owner/repo'")
-
 /-- Build a plain GitHub HTTPS URL (no credentials). -/
-private def githubUrl (repo : String) : String :=
+private def githubUrl (repo : Repository) : String :=
   s!"https://github.com/{repo}.git"
 
 /--
@@ -60,10 +56,9 @@ an error is thrown instead.
 Cloning is performed via `gh repo clone`, which uses the GitHub App authentication
 already configured by `GitHub.setupGhAuth`.
 -/
-def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO System.FilePath := do
-  let (forkOwner, forkRepo) ← splitRepo fork
+def ensureCloned (fork upstream : Repository) (interactive : Bool := true) : IO System.FilePath := do
   let base ← workDir
-  let repoPath := base / forkOwner / forkRepo
+  let repoPath := base / fork.owner / fork.name
   if ← repoPath.pathExists then
     let entries ← repoPath.readDir
     if entries.isEmpty then
@@ -71,7 +66,7 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
       IO.println s!"  Directory '{repoPath}' is empty; removing and re-cloning..."
       IO.FS.removeDirAll repoPath
       IO.FS.createDirAll repoPath
-      runGh' #["repo", "clone", fork, repoPath.toString]
+      runGh' #["repo", "clone", fork.toString, repoPath.toString]
       let remotes₁ ← runGit #["remote"] repoPath
       if !(remotes₁.splitOn "\n" |>.any (· == "upstream")) then
         runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
@@ -92,7 +87,7 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
         if answer == "y" || answer == "yes" then
           IO.FS.removeDirAll repoPath
           IO.FS.createDirAll repoPath
-          runGh' #["repo", "clone", fork, repoPath.toString]
+          runGh' #["repo", "clone", fork.toString, repoPath.toString]
           let remotes₂ ← runGit #["remote"] repoPath
           if !(remotes₂.splitOn "\n" |>.any (· == "upstream")) then
             runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
@@ -112,7 +107,7 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
           runGit' #["remote", "set-url", "origin", expectedOriginUrl] repoPath
   else
     IO.FS.createDirAll repoPath
-    runGh' #["repo", "clone", fork, repoPath.toString]
+    runGh' #["repo", "clone", fork.toString, repoPath.toString]
     let remotes₃ ← runGit #["remote"] repoPath
     if !(remotes₃.splitOn "\n" |>.any (· == "upstream")) then
       runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath

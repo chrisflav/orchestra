@@ -88,8 +88,8 @@ structure QueueEntry where
   id            : String
   createdAt     : String
   status        : QueueStatus   := .pending
-  upstream      : String
-  fork          : String
+  upstream      : Repository
+  fork          : Repository
   mode          : TaskMode
   prompt        : String
   agent         : Option String := none
@@ -137,8 +137,8 @@ instance : ToJson QueueEntry where
       ("id",         e.id),
       ("created_at", e.createdAt),
       ("status",     ToJson.toJson e.status),
-      ("upstream",   e.upstream),
-      ("fork",       e.fork),
+      ("upstream",   ToJson.toJson e.upstream),
+      ("fork",       ToJson.toJson e.fork),
       ("mode",       ToJson.toJson e.mode),
       ("prompt",     e.prompt)
     ]
@@ -171,8 +171,8 @@ instance : FromJson QueueEntry where
     let id           ← j.getObjValAs? String "id"
     let createdAt    ← j.getObjValAs? String "created_at"
     let status       ← j.getObjValAs? QueueStatus "status"
-    let upstream     ← j.getObjValAs? String "upstream"
-    let fork         ← j.getObjValAs? String "fork"
+    let upstream     ← j.getObjValAs? Repository "upstream"
+    let fork         ← j.getObjValAs? Repository "fork"
     let mode         ← j.getObjValAs? TaskMode "mode"
     let prompt       ← j.getObjValAs? String "prompt"
     let agent         := j.getObjValAs? String "agent"          |>.toOption

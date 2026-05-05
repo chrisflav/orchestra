@@ -7,23 +7,23 @@ open Lean (Json FromJson ToJson)
 
 namespace Orchestra.Listener
 
--- Repo entry: upstream + fork as full org/name strings
+-- Repo entry: upstream + fork as Repository values
 
 /-- A source/fork repo pair for a listener.
-    `upstream` is the org/name of the repo to watch (e.g. `"my-account/orchestra"`).
-    `fork` is the org/name of the fork to use for the action (e.g. `"my-fork/orchestra"`). -/
+    `upstream` is the repository to watch (e.g. `"my-account/orchestra"`).
+    `fork` is the fork repository to use for the action (e.g. `"my-fork/orchestra"`). -/
 structure RepoEntry where
-  upstream : String
-  fork     : String
+  upstream : Repository
+  fork     : Repository
 deriving BEq, Repr
 
 instance : ToJson RepoEntry where
-  toJson e := Json.mkObj [("upstream", e.upstream), ("fork", e.fork)]
+  toJson e := Json.mkObj [("upstream", ToJson.toJson e.upstream), ("fork", ToJson.toJson e.fork)]
 
 instance : FromJson RepoEntry where
   fromJson? j := do
-    let upstream ← j.getObjValAs? String "upstream"
-    let fork     ← j.getObjValAs? String "fork"
+    let upstream ← j.getObjValAs? Repository "upstream"
+    let fork     ← j.getObjValAs? Repository "fork"
     return { upstream, fork }
 
 -- Source configuration
@@ -75,7 +75,7 @@ private def parseRepos (j : Json) : Except String (List RepoEntry) :=
   match j.getObjValAs? (List RepoEntry) "repos" |>.toOption with
   | some rs => .ok rs
   | none    =>
-    match j.getObjValAs? String "fork" with
+    match j.getObjValAs? Repository "fork" with
     | .ok r  => .ok [{ upstream := r, fork := r }]
     | .error e => .error e
 
@@ -316,12 +316,14 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
   -- Render upstream/fork through templates; fall back to {{upstream}}/{{fork}} vars if empty.
   let lookupVar (key : String) : String :=
     vars.find? (fun p => p.1 == key) |>.map (·.2) |>.getD ""
-  let upstream :=
+  let upstreamStr :=
     let rendered := renderTemplate action.upstream vars
     if rendered.isEmpty then lookupVar "upstream" else rendered
-  let fork :=
+  let forkStr :=
     let rendered := renderTemplate action.fork vars
     if rendered.isEmpty then lookupVar "fork" else rendered
+  let upstream ← IO.ofExcept (Repository.parse upstreamStr)
+  let fork     ← IO.ofExcept (Repository.parse forkStr)
   -- Resolve issue_number: prefer the explicit template field from the action config;
   -- fall back to the `issue_number` variable supplied by the event source.
   let issueNumber : Option Nat :=
@@ -439,9 +441,9 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           let url    := item.getObjValAs? String "html_url" |>.toOption |>.getD ""
           let vars   := [("issue_number", numStr), ("title", title), ("body", body),
                          ("url", url), ("author", author),
-                         ("upstream", entry.upstream), ("fork", entry.fork),
-                         ("upstream_escaped", entry.upstream.replace "/" "_"),
-                         ("fork_escaped", entry.fork.replace "/" "_")]
+                         ("upstream", entry.upstream.toString), ("fork", entry.fork.toString),
+                         ("upstream_escaped", entry.upstream.toString.replace "/" "_"),
+                         ("fork_escaped", entry.fork.toString.replace "/" "_")]
           allEvents := allEvents.push (eventId, vars)
     return allEvents
 
@@ -496,10 +498,10 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
             ("reviewer",   reviewer),
             ("body",       body),
             ("url",        url),
-            ("upstream",   entry.upstream),
-            ("fork",       entry.fork),
-            ("upstream_escaped", entry.upstream.replace "/" "_"),
-            ("fork_escaped",     entry.fork.replace "/" "_")
+            ("upstream",   entry.upstream.toString),
+            ("fork",       entry.fork.toString),
+            ("upstream_escaped", entry.upstream.toString.replace "/" "_"),
+            ("fork_escaped",     entry.fork.toString.replace "/" "_")
           ]
           allEvents := allEvents.push (eventId, vars)
     return allEvents
@@ -529,7 +531,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           -- Authorization check: skip unauthorized users (no reaction either)
           if !isAuthorized allowed author then return none
           -- React with a rocket emoji (best-effort; ignore failures)
-          try reactToComment entry.upstream idNum ghToken inline catch _ => pure ()
+          try reactToComment entry.upstream.toString idNum ghToken inline catch _ => pure ()
           let url           := comment.getObjValAs? String "html_url" |>.toOption |>.getD ""
           -- Extract issue/PR number from the relevant parent URL field
           let parentUrlField := if inline then "pull_request_url" else "issue_url"
@@ -541,9 +543,9 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           let vars := [("comment_id", idStr), ("inline_comment_id", inlineCommentId),
                        ("body", body), ("author", author),
                        ("url", url), ("issue_number", issueNum),
-                       ("upstream", entry.upstream), ("fork", entry.fork),
-                       ("upstream_escaped", entry.upstream.replace "/" "_"),
-                       ("fork_escaped", entry.fork.replace "/" "_")]
+                       ("upstream", entry.upstream.toString), ("fork", entry.fork.toString),
+                       ("upstream_escaped", entry.upstream.toString.replace "/" "_"),
+                       ("fork_escaped", entry.fork.toString.replace "/" "_")]
           return some (eventId, vars)
       if labels.isEmpty then
         -- Use the global issue comments endpoint with a `since` filter

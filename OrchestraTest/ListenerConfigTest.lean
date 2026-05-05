@@ -7,14 +7,15 @@ open Orchestra.Listener
 
 @[test]
 def repoEntryRoundTrip : Test := do
-  let entry : RepoEntry := { upstream := "org/repo", fork := "my-org/fork" }
+  let entry : RepoEntry := { upstream := { owner := "org", name := "repo" },
+                             fork := { owner := "my-org", name := "fork" } }
   let entryJson := ToJson.toJson entry
   match FromJson.fromJson? entryJson (α := RepoEntry) with
   | .error e => TestM.fail s!"RepoEntry round-trip parse: {e}"
   | .ok got =>
-    TestM.assertEqual got.upstream "org/repo"
+    TestM.assertEqual got.upstream.toString "org/repo"
       (msg := "RepoEntry.upstream round-trip")
-    TestM.assertEqual got.fork "my-org/fork"
+    TestM.assertEqual got.fork.toString "my-org/fork"
       (msg := "RepoEntry.fork round-trip")
 
 @[test]
@@ -31,8 +32,8 @@ def githubCommentsNewFormat : Test := do
     TestM.assertEqual repos.length 1 (msg := "repos length")
     match repos with
     | [r] =>
-      TestM.assertEqual r.upstream "org/repo" (msg := "repos[0].upstream")
-      TestM.assertEqual r.fork "my-org/fork" (msg := "repos[0].fork")
+      TestM.assertEqual r.upstream.toString "org/repo" (msg := "repos[0].upstream")
+      TestM.assertEqual r.fork.toString "my-org/fork" (msg := "repos[0].fork")
     | _ => TestM.fail "repos not a singleton"
     TestM.assertEqual trigger "@bot" (msg := "trigger")
     TestM.assertEqual authorizedUsers ["alice", "bob"]
@@ -49,8 +50,8 @@ def githubCommentsBackwardCompat : Test := do
     TestM.assertEqual repos.length 1 (msg := "repos length")
     match repos with
     | [r] =>
-      TestM.assertEqual r.upstream "org/repo" (msg := "upstream")
-      TestM.assertEqual r.fork "org/repo" (msg := "fork")
+      TestM.assertEqual r.upstream.toString "org/repo" (msg := "upstream")
+      TestM.assertEqual r.fork.toString "org/repo" (msg := "fork")
     | _ => TestM.fail "repos not a singleton"
     TestM.assertEqual authorizedUsers ([] : List String)
       (msg := "authorized_users empty")
@@ -121,8 +122,8 @@ def githubPrReviewsNewFormat : Test := do
 @[test]
 def sourceConfigRoundTrip : Test := do
   let sc : SourceConfig := .githubComments
-    [{ upstream := "pimotte-agents/orchestra"
-       fork := "my-fork/orchestra" }]
+    [{ upstream := { owner := "pimotte-agents", name := "orchestra" }
+       fork := { owner := "my-fork", name := "orchestra" } }]
     ["agent"] "@orchestra" ["dave"]
   match FromJson.fromJson? (ToJson.toJson sc) (α := SourceConfig) with
   | .error e => TestM.fail s!"SourceConfig round-trip: {e}"
@@ -132,9 +133,9 @@ def sourceConfigRoundTrip : Test := do
     TestM.assertEqual authorizedUsers ["dave"] (msg := "authorized_users")
     match repos with
     | [r] =>
-      TestM.assertEqual r.upstream "pimotte-agents/orchestra"
+      TestM.assertEqual r.upstream.toString "pimotte-agents/orchestra"
         (msg := "upstream")
-      TestM.assertEqual r.fork "my-fork/orchestra" (msg := "fork")
+      TestM.assertEqual r.fork.toString "my-fork/orchestra" (msg := "fork")
     | _ => TestM.fail "repos not a singleton"
   | .ok _ => TestM.fail "wrong variant"
 

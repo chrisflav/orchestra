@@ -12,8 +12,8 @@ namespace Orchestra.Server
 
 /-- Mutable state for the server, shared with request handlers. -/
 structure State where
-  upstream : String
-  fork : String
+  upstream : Repository
+  fork : Repository
   /-- Optional tools enabled for this run.
       Always-available tools (health, refresh_token, get_pr_comments) are never in this list.
       Currently the only optional tool is `"create_pr"`. -/
@@ -372,10 +372,9 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       log "tool create_pr: error: PAT not configured"
       return toolContent "github.pat not set in config" (isError := true)
     log s!"tool create_pr: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
-    let forkOwner := (state.fork.splitOn "/")[0]!
     try
       let result ← GitHub.createPullRequest state.pat state.upstream
-        s!"{forkOwner}:{head}" base title body
+        s!"{state.fork.owner}:{head}" base title body
       log s!"tool create_pr: ok: {result.trimAscii}"
       return toolContent result
     catch e =>

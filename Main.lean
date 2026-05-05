@@ -103,16 +103,15 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   return (0 : UInt32)
 
 private def mcpServerHandler (p : Parsed) : IO UInt32 := do
-  let upstream := p.positionalArg! "upstream" |>.as! String
-  let fork := p.positionalArg! "fork" |>.as! String
+  let upstream ← IO.ofExcept (Repository.parse (p.positionalArg! "upstream" |>.as! String))
+  let fork ← IO.ofExcept (Repository.parse (p.positionalArg! "fork" |>.as! String))
   let allowPR := p.hasFlag "allow_pr"
   let configPath := p.flag? "config" |>.map (·.as! String)
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let (forkOwner, _) ← Repo.splitRepo fork
   let installationId ← match appConfig.installationId with
     | some id => pure id
-    | none => GitHub.getInstallationId jwt forkOwner
+    | none => GitHub.getInstallationId jwt fork.owner
   let token ← GitHub.createInstallationToken jwt installationId
   GitHub.setupGhAuth token
   let serverState : Server.State := {
@@ -130,8 +129,8 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
   return (0 : UInt32)
 
 private def prepareHandler (p : Parsed) : IO UInt32 := do
-  let upstream := p.positionalArg! "upstream" |>.as! String
-  let fork := p.positionalArg! "fork" |>.as! String
+  let upstream ← IO.ofExcept (Repository.parse (p.positionalArg! "upstream" |>.as! String))
+  let fork ← IO.ofExcept (Repository.parse (p.positionalArg! "fork" |>.as! String))
   let repoPath ← Repo.ensureCloned fork upstream
   IO.println repoPath.toString
   return (0 : UInt32)
@@ -163,7 +162,7 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
       | some run => run.id
       | none     => ""
     let seriesLabel := r.series.getD ""
-    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
+    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork.toString 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 private def taskShowHandler (p : Parsed) : IO UInt32 := do
@@ -652,14 +651,16 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                 | .error e =>
                   IO.eprintln s!"  Listener '{lcfg.name}': workflow parse error: {e}"
                 | .ok prog =>
-                  let upstream :=
+                  let upstreamStr :=
                     let r := Listener.renderTemplate lcfg.action.upstream vars
                     if r.isEmpty then vars.find? (·.1 == "upstream") |>.map (·.2) |>.getD ""
                     else r
-                  let fork :=
+                  let forkStr :=
                     let r := Listener.renderTemplate lcfg.action.fork vars
                     if r.isEmpty then vars.find? (·.1 == "fork") |>.map (·.2) |>.getD ""
                     else r
+                  let upstream := Repository.parse upstreamStr |>.toOption
+                  let fork     := Repository.parse forkStr     |>.toOption
                   let prog := { prog with upstream, fork }
                   let jsonVars := vars.map fun (k, v) => (k, Lean.Json.str v)
                   let concert := Workflow.WorkflowProgram.toConcert prog jsonVars
@@ -747,7 +748,7 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
       | .unfinished => "unfinished" | .cancelled => "cancelled"
     let concertLabel := e.concertId.getD ""
     let seriesLabel := e.series.getD ""
-    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
+    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork.toString 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 private def queueListenersHandler (p : Parsed) : IO UInt32 := do
@@ -807,7 +808,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
       let status := if e.status == .running then "running" else "pending"
       let concertLabel := e.concertId.getD ""
       let seriesLabel := e.series.getD ""
-      IO.println s!"{padRight e.id 16} {padRight e.fork 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
+      IO.println s!"{padRight e.id 16} {padRight e.fork.toString 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
   -- Listener status
   let listenerConfigs ← Listener.loadAllListenerConfigs (← Listener.listenersDir)
   if !listenerConfigs.isEmpty then

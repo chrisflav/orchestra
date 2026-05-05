@@ -48,9 +48,9 @@ structure TaskSpec where
   output        : List OutputSpec := []
   context       : Option String   := none
   /-- Override the program-level upstream repository for this step. -/
-  upstream      : Option String   := none
+  upstream      : Option Repository := none
   /-- Override the program-level fork repository for this step. -/
-  fork          : Option String   := none
+  fork          : Option Repository := none
   systemPrompt  : Option String   := none
   prependPrompt : Option String   := none
   backend       : Option String   := none
@@ -82,8 +82,8 @@ structure Step where
 structure WorkflowProgram where
   name        : String
   description : Option String          := none
-  upstream    : String := ""
-  fork        : String := ""
+  upstream    : Option Repository := none
+  fork        : Option Repository := none
   variables   : List (String × ResultType) := []
   steps       : List Step
   deriving Repr
@@ -149,8 +149,12 @@ private def writeOutput (stepName : String) (spec : OutputSpec)
 private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSpec)
     (accumulate : Bool := false) : WorkflowM Unit := do
   let (env, _) ← get
-  let upstream     := spec.upstream.getD prog.upstream
-  let fork         := spec.fork.getD prog.fork
+  let upstream ← match spec.upstream <|> prog.upstream with
+    | some r => pure r
+    | none   => StateT.lift Concert.abort
+  let fork ← match spec.fork <|> prog.fork with
+    | some r => pure r
+    | none   => StateT.lift Concert.abort
   let inputSection := buildInputSection env spec.input
   if spec.output.isEmpty then
     let ioTask : IOTask .unit .unit := {

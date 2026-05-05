@@ -4,6 +4,32 @@ open Lean (Json FromJson ToJson)
 
 namespace Orchestra
 
+/-- A GitHub repository identified by its owner and name. -/
+structure Repository where
+  owner : String
+  name  : String
+deriving BEq, Repr, Inhabited
+
+/-- Parse `"owner/repo"` into a `Repository`. -/
+def Repository.parse (s : String) : Except String Repository :=
+  match s.splitOn "/" with
+  | [owner, repo] => .ok { owner, name := repo }
+  | _ => .error s!"invalid repository format '{s}', expected 'owner/repo'"
+
+/-- Return the canonical `"owner/repo"` string. -/
+def Repository.toString (r : Repository) : String := s!"{r.owner}/{r.name}"
+
+instance : ToString Repository where
+  toString r := r.toString
+
+instance : ToJson Repository where
+  toJson r := Json.str r.toString
+
+instance : FromJson Repository where
+  fromJson? j := do
+    let s ← FromJson.fromJson? (α := String) j
+    Repository.parse s |>.mapError id
+
 inductive TaskMode where
   | fork
   | pr
@@ -169,8 +195,8 @@ partial def ResultType.valueFromJson : (t : ResultType) → Json → Except Stri
 
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
-  upstream : String
-  fork : String
+  upstream : Repository
+  fork : Repository
   /-- Legacy mode field (deprecated). Use `tools` instead.
       If `tools` is absent, this field is used to derive the allowed tools:
       - `fork` → no tools
@@ -285,8 +311,8 @@ instance : FromJson Task where
   fromJson? j := do
     let i          := j.getObjValAs? ResultType "input_type"  |>.toOption |>.getD .unit
     let o          := j.getObjValAs? ResultType "output_type" |>.toOption |>.getD .unit
-    let upstream   ← j.getObjValAs? String "upstream"
-    let fork       ← j.getObjValAs? String "fork"
+    let upstream   ← j.getObjValAs? Repository "upstream"
+    let fork       ← j.getObjValAs? Repository "fork"
     let mode       ← j.getObjValAs? TaskMode "mode"
     let prompt     ← j.getObjValAs? String "prompt"
     let agent      := j.getObjValAs? String "agent"          |>.toOption

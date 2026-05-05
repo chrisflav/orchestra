@@ -38,8 +38,8 @@ instance : FromJson TaskStatus where
 structure TaskRecord where
   id            : String
   createdAt     : String
-  upstream      : String
-  fork          : String
+  upstream      : Repository
+  fork          : Repository
   mode          : TaskMode
   prompt        : String
   sessionId     : Option String := none
@@ -67,8 +67,8 @@ instance : ToJson TaskRecord where
     let base : List (String × Json) := [
       ("id",         r.id),
       ("created_at", r.createdAt),
-      ("upstream",   r.upstream),
-      ("fork",       r.fork),
+      ("upstream",   ToJson.toJson r.upstream),
+      ("fork",       ToJson.toJson r.fork),
       ("mode",       ToJson.toJson r.mode),
       ("prompt",     r.prompt),
       ("status",     ToJson.toJson r.status)
@@ -90,8 +90,8 @@ instance : FromJson TaskRecord where
   fromJson? j := do
     let id           ← j.getObjValAs? String "id"
     let createdAt    ← j.getObjValAs? String "created_at"
-    let upstream     ← j.getObjValAs? String "upstream"
-    let fork         ← j.getObjValAs? String "fork"
+    let upstream     ← j.getObjValAs? Repository "upstream"
+    let fork         ← j.getObjValAs? Repository "fork"
     let mode         ← j.getObjValAs? TaskMode "mode"
     let prompt       ← j.getObjValAs? String "prompt"
     let status       ← j.getObjValAs? TaskStatus "status"

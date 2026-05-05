@@ -95,7 +95,9 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
     (mappingLookup pairs "read-only").bind (nodeAsString · |>.toOption)
     |>.map (· == "true") |>.getD false
   let upstream      := (mappingLookup pairs "upstream").bind       (nodeAsString · |>.toOption)
+                       |>.map (Repository.parse · |>.toOption) |>.join
   let fork          := (mappingLookup pairs "fork").bind           (nodeAsString · |>.toOption)
+                       |>.map (Repository.parse · |>.toOption) |>.join
   let systemPrompt  := (mappingLookup pairs "system-prompt").bind  (nodeAsString · |>.toOption)
   let prependPrompt := (mappingLookup pairs "prepend-prompt").bind (nodeAsString · |>.toOption)
   let backend       := (mappingLookup pairs "backend").bind        (nodeAsString · |>.toOption)
@@ -169,8 +171,10 @@ def WorkflowProgram.parseYaml (input : String) : Except String WorkflowProgram :
   let pairs ← nodeAsMapping root
   let name     ← nodeAsString (← orError (mappingLookup pairs "name") "missing 'name'")
   let description := (mappingLookup pairs "description").bind (nodeAsString · |>.toOption)
-  let upstream := (mappingLookup pairs "upstream").bind (nodeAsString · |>.toOption) |>.getD ""
-  let fork     := (mappingLookup pairs "fork").bind     (nodeAsString · |>.toOption) |>.getD ""
+  let upstream := (mappingLookup pairs "upstream").bind (nodeAsString · |>.toOption)
+                  |>.bind (Repository.parse · |>.toOption)
+  let fork     := (mappingLookup pairs "fork").bind     (nodeAsString · |>.toOption)
+                  |>.bind (Repository.parse · |>.toOption)
   let variables ← match mappingLookup pairs "variables" with
     | none      => pure []
     | some node => parseVariables node

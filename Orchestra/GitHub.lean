@@ -1,4 +1,5 @@
 import Lean.Data.Json
+import Orchestra.Config
 
 open Lean (Json FromJson ToJson)
 
@@ -101,11 +102,11 @@ def setupGhAuth (token : String) : IO Unit := do
   runCmd' "sh" #["-c", s!"echo '{token}' | gh auth login --with-token"]
 
 /-- Create a pull request on the upstream repo using a PAT. -/
-def createPullRequest (pat : String) (upstream : String)
+def createPullRequest (pat : String) (upstream : Repository)
     (head base title body : String) : IO String := do
   runCmd "gh" #[
     "pr", "create",
-    "--repo", upstream,
+    "--repo", upstream.toString,
     "--head", head,
     "--base", base,
     "--title", title,
@@ -118,10 +119,7 @@ Returns the raw parsed JSON response.
 If `pat` is non-empty it is used as the GH_TOKEN; otherwise the token already
 configured by `setupGhAuth` is used.
 -/
-def getPrReviewThreads (upstream : String) (prNumber : Nat) (pat : String) : IO Json := do
-  let parts := upstream.splitOn "/"
-  let owner := parts[0]?.getD ""
-  let repo  := parts[1]?.getD ""
+def getPrReviewThreads (upstream : Repository) (prNumber : Nat) (pat : String) : IO Json := do
   let query :=
     "query($owner:String!,$repo:String!,$number:Int!){" ++
     "repository(owner:$owner,name:$repo){" ++
@@ -133,8 +131,8 @@ def getPrReviewThreads (upstream : String) (prNumber : Nat) (pat : String) : IO 
   let result ← runCmd "gh" #[
     "api", "graphql",
     "-f", s!"query={query}",
-    "-f", s!"owner={owner}",
-    "-f", s!"repo={repo}",
+    "-f", s!"owner={upstream.owner}",
+    "-f", s!"repo={upstream.name}",
     "-F", s!"number={prNumber}"
   ] (env := env)
   match Json.parse result with
@@ -142,49 +140,37 @@ def getPrReviewThreads (upstream : String) (prNumber : Nat) (pat : String) : IO 
   | .ok j => return j
 
 /-- Post a comment on an issue or pull request. -/
-def createIssueComment (pat : String) (upstream : String) (issueNumber : Nat) (body : String) : IO String := do
-  let parts := upstream.splitOn "/"
-  let owner := parts[0]?.getD ""
-  let repo  := parts[1]?.getD ""
+def createIssueComment (pat : String) (upstream : Repository) (issueNumber : Nat) (body : String) : IO String := do
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
   let payload := Json.mkObj [("body", body)]
   runCmd "gh" #[
     "api", "--method", "POST",
-    s!"/repos/{owner}/{repo}/issues/{issueNumber}/comments",
+    s!"/repos/{upstream.owner}/{upstream.name}/issues/{issueNumber}/comments",
     "--input", "-"
   ] (input := payload.compress) (env := env)
 
 /-- Reply to an inline PR review comment. -/
-def replyToPrReviewComment (pat : String) (upstream : String) (prNumber : Nat) (commentId : Nat) (body : String) : IO String := do
-  let parts := upstream.splitOn "/"
-  let owner := parts[0]?.getD ""
-  let repo  := parts[1]?.getD ""
+def replyToPrReviewComment (pat : String) (upstream : Repository) (prNumber : Nat) (commentId : Nat) (body : String) : IO String := do
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
   let payload := Json.mkObj [("body", body)]
   runCmd "gh" #[
     "api", "--method", "POST",
-    s!"/repos/{owner}/{repo}/pulls/{prNumber}/comments/{commentId}/replies",
+    s!"/repos/{upstream.owner}/{upstream.name}/pulls/{prNumber}/comments/{commentId}/replies",
     "--input", "-"
   ] (input := payload.compress) (env := env)
 
 /-- Get the latest commit SHA of a pull request. -/
-private def getPrLatestCommit (pat : String) (upstream : String) (prNumber : Nat) : IO String := do
-  let parts := upstream.splitOn "/"
-  let owner := parts[0]?.getD ""
-  let repo  := parts[1]?.getD ""
+private def getPrLatestCommit (pat : String) (upstream : Repository) (prNumber : Nat) : IO String := do
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
   runCmd "gh" #[
     "api",
-    s!"/repos/{owner}/{repo}/pulls/{prNumber}",
+    s!"/repos/{upstream.owner}/{upstream.name}/pulls/{prNumber}",
     "--jq", ".head.sha"
   ] (env := env)
 
 /-- Create a new inline PR review comment on a specific file and line. -/
-def createPrReviewComment (pat : String) (upstream : String) (prNumber : Nat)
+def createPrReviewComment (pat : String) (upstream : Repository) (prNumber : Nat)
     (body path : String) (line : Nat) (side : String) : IO String := do
-  let parts := upstream.splitOn "/"
-  let owner := parts[0]?.getD ""
-  let repo  := parts[1]?.getD ""
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
   let commitId ← getPrLatestCommit pat upstream prNumber
   let payload := Json.mkObj [
@@ -196,16 +182,13 @@ def createPrReviewComment (pat : String) (upstream : String) (prNumber : Nat)
   ]
   runCmd "gh" #[
     "api", "--method", "POST",
-    s!"/repos/{owner}/{repo}/pulls/{prNumber}/comments",
+    s!"/repos/{upstream.owner}/{upstream.name}/pulls/{prNumber}/comments",
     "--input", "-"
   ] (input := payload.compress) (env := env)
 
 /-- Post a review (with optional inline comments) on a pull request. -/
-def createPrReview (pat : String) (upstream : String) (prNumber : Nat)
+def createPrReview (pat : String) (upstream : Repository) (prNumber : Nat)
     (body : String) (comments : Array InlineComment := #[]) : IO String := do
-  let parts := upstream.splitOn "/"
-  let owner := parts[0]?.getD ""
-  let repo  := parts[1]?.getD ""
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
   let commitId ← if comments.isEmpty then pure ""
                  else getPrLatestCommit pat upstream prNumber
@@ -222,19 +205,16 @@ def createPrReview (pat : String) (upstream : String) (prNumber : Nat)
     baseFields ++ if commitId.isEmpty then [] else [("commit_id", Json.str commitId)])
   runCmd "gh" #[
     "api", "--method", "POST",
-    s!"/repos/{owner}/{repo}/pulls/{prNumber}/reviews",
+    s!"/repos/{upstream.owner}/{upstream.name}/pulls/{prNumber}/reviews",
     "--input", "-"
   ] (input := payload.compress) (env := env)
 
 /-- Return the pull-request number that a review comment belongs to. -/
-def getPrReviewCommentPrNumber (pat : String) (upstream : String) (commentId : Nat) : IO Nat := do
-  let parts := upstream.splitOn "/"
-  let owner := parts[0]?.getD ""
-  let repo  := parts[1]?.getD ""
+def getPrReviewCommentPrNumber (pat : String) (upstream : Repository) (commentId : Nat) : IO Nat := do
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
   let url ← runCmd "gh" #[
     "api",
-    s!"/repos/{owner}/{repo}/pulls/comments/{commentId}",
+    s!"/repos/{upstream.owner}/{upstream.name}/pulls/comments/{commentId}",
     "--jq", ".pull_request_url"
   ] (env := env)
   let trimmed : String := url.trimAscii.toString
