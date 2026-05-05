@@ -161,19 +161,19 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     stderr := .piped
   }
   -- If a cancel token is provided, set up an async kill task.
-  -- It blocks (without polling) until the token is cancelled, then kills the child.
-  -- When the child exits normally we signal the token with a custom "done" reason
-  -- so this task wakes up and exits, breaking any reference cycles.
+  -- Polls every 50 ms: if the token carries .cancel, kill the child; if the process
+  -- has already exited (processExited flag), stop polling.  Using a flag instead of
+  -- signalling the outer token with a "done" reason keeps the token usable for future
+  -- cancel requests across validation retries.
+  let processExited ← IO.mkRef false
   if let some ct := cancelToken then
     let _killTask ← IO.asTask (prio := .dedicated) do
-      let asyncTask ← ct.wait
-      let result ← IO.wait asyncTask
-      match result with
-      | .error _ => pure ()  -- token dropped unexpectedly
-      | .ok () =>
-        match ← ct.getCancellationReason with
-        | some .cancel =>
-          -- User-requested cancellation: kill the child process
+      let mut done := false
+      while !done do
+        IO.sleep 50
+        if ← processExited.get then
+          done := true
+        else if (← ct.getCancellationReason) == some .cancel then
           try
             let killer ← IO.Process.spawn {
               cmd := "kill"
@@ -184,7 +184,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
             }
             let _ ← killer.wait
           catch _ => pure ()
-        | _ => pure ()  -- "done" or other reason: child already exited, nothing to do
+          done := true
   -- Open debug log file if requested (one per task, created fresh)
   let debugHandle : Option IO.FS.Handle ← match debugLogFile with
     | none      => pure none
@@ -245,10 +245,13 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let _ ← IO.wait outTask
   let _ ← IO.wait errTask
   let exitCode ← child.wait
-  -- Signal the kill task to clean up (breaks reference cycle; no-op if already cancelled)
-  if let some ct := cancelToken then
-    if !(← ct.isCancelled) then
-      ct.cancel (.custom "done")
+  -- Determine cancellation before signalling the kill task to stop, so a cancel
+  -- that arrives in the narrow window before process exit is still captured.
+  let wasCancelledEarly ← match cancelToken with
+    | none    => pure false
+    | some ct => pure ((← ct.getCancellationReason) == some .cancel)
+  -- Signal the kill task to stop polling (process has exited).
+  processExited.set true
   -- If the stream didn't yield a session ID, ask the backend (e.g. read from log files)
   let sessionId ← match ← sessionIdRef.get with
     | some sid => pure (some sid)
@@ -256,12 +259,13 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- Detect usage limit from exit code and captured stderr
   let stderrContent ← stderrRef.get
   let usageLimitHit := agentDef.isUsageLimitError exitCode stderrContent
-  -- Determine whether this run ended due to user cancellation
-  let wasCancelled ← match cancelToken with
-    | none => pure false
-    | some ct => do
-      let reason ← ct.getCancellationReason
-      pure (reason == some .cancel)
+  -- Determine whether this run ended due to user cancellation.
+  -- wasCancelledEarly captured the reason before processExited was set; combine with
+  -- a final check in case cancel arrived after the early check.
+  let wasCancelledLate ← match cancelToken with
+    | none    => pure false
+    | some ct => pure ((← ct.getCancellationReason) == some .cancel)
+  let wasCancelled := wasCancelledEarly || wasCancelledLate
   let resultSubtype ← resultSubtypeRef.get
   let resultText    ← resultTextRef.get
   -- Clean up agent-specific resources (e.g. temp MCP config file)
