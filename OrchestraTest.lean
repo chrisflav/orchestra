@@ -2,3 +2,6 @@ import OrchestraTest.TestM
 import OrchestraTest.ListenerConfigTest
 import OrchestraTest.StreamFormatTest
 import OrchestraTest.WorkflowParserTest
+import OrchestraTest.ProjectClaimTest
+import OrchestraTest.ProjectFieldsTest
+import OrchestraTest.ProjectToolsTest

@@ -8,6 +8,8 @@ import Orchestra.GitHub
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.Sandbox
+import Orchestra.Project
+import Orchestra.Queue
 import Orchestra.Server
 import Orchestra.StreamFormat
 import Orchestra.TaskStore
@@ -16,6 +18,116 @@ import Std.Sync
 open Orchestra
 
 namespace Orchestra.TaskRunner
+
+/-- Process-wide claim manager. The Std.BaseMutex inside it serialises
+    intra-process claim acquisition; on-disk files survive restarts. -/
+initialize globalClaimManager : Project.ClaimManager ← Project.ClaimManager.new
+
+/-- Enqueue a merger task for `pr` so the queue daemon will merge it later.
+    Used by `decide_issue approve` via the `enqueueMerger` hook. Returns the
+    new queue entry's ID on success. -/
+def enqueueMergerImpl (pid : Project.ProjectId) (iid : Project.IssueId)
+    (pr : Project.PRRef) : IO (Except String String) := do
+  try
+    let id ← TaskStore.generateId
+    let createdAt ← TaskStore.currentIso8601
+    let entry : Queue.QueueEntry :=
+      { id, createdAt
+      , upstream := pr.repo, fork := pr.repo
+      , mode := .pr
+      , prompt := s!"merge {pr.repo}#{pr.number}"
+      , backend := some "merger"
+      , projectId := some pid
+      , issueId := some iid
+      , priority := 100 }
+    Queue.saveEntry entry
+    return .ok id
+  catch e =>
+    return .error (toString e)
+
+/-- Render the reviewer prompt template with the PR / issue context. -/
+private def renderReviewerPrompt (tmpl : String) (pr : Project.PRRef) (iid : Project.IssueId)
+    : String :=
+  tmpl.replace "{{repo}}"      pr.repo.toString
+    |>.replace "{{pr_number}}" (toString pr.number)
+    |>.replace "{{branch}}"    pr.branch
+    |>.replace "{{issue_id}}"  iid.value
+
+/-- Enqueue a reviewer task for `pr` against `tmpl`. Used by `attach_pr` via
+    the `enqueueReviewer` hook when a project has a `reviewer` template. -/
+def enqueueReviewerImpl (project : Project.Project) (iid : Project.IssueId)
+    (pr : Project.PRRef) (tmpl : Project.ReviewerTemplate) : IO (Except String String) := do
+  try
+    let id ← TaskStore.generateId
+    let createdAt ← TaskStore.currentIso8601
+    let entry : Queue.QueueEntry :=
+      { id, createdAt
+      , upstream := pr.repo, fork := pr.repo
+      , mode := .pr
+      , prompt := renderReviewerPrompt tmpl.promptTemplate pr iid
+      , backend := tmpl.backend
+      , projectId := some project.id
+      , issueId := some iid
+      -- The reviewer needs review tools but should also be able to comment / read PRs.
+      , tools := some ["review_issues", "comment", "get_pr_comments"]
+      , readOnly := true
+      , issueNumber := some pr.number
+      , priority := 50 }
+    Queue.saveEntry entry
+    return .ok id
+  catch e =>
+    return .error (toString e)
+
+/-- Run a merger task: shell out to `gh pr merge` for the latest attached PR
+    on the issue, then mark the issue completed. Skips the entire agent /
+    sandbox / MCP path. Used when `ioTask.backend = some "merger"`. -/
+private def runMerger {i o : ResultType} (ioTask : IOTask i o)
+    (taskId : String) (createdAt : String) : IO Unit := do
+  IO.println "  [merger] non-agentic task"
+  let some pid := ioTask.projectId
+    | throw (.userError "merger task missing project_id")
+  let some iid := ioTask.issueId
+    | throw (.userError "merger task missing issue_id")
+  let some (_, issue) ← Project.findIssue iid
+    | throw (.userError s!"merger: issue {iid.value} not found")
+  let some pr := issue.attachedPRs.toList.reverse.head?
+    | throw (.userError s!"merger: issue {iid.value} has no attached PRs")
+  let prRef := s!"{pr.repo}#{pr.number}"
+  IO.println s!"  [merger] gh pr merge {prRef}"
+  let child ← IO.Process.spawn
+    { cmd := "gh"
+      args := #["pr", "merge", toString pr.number, "--repo", pr.repo.toString, "--squash", "--delete-branch"]
+      stdout := .piped
+      stderr := .piped }
+  let stdout ← child.stdout.readToEnd
+  let stderr ← child.stderr.readToEnd
+  let exit ← child.wait
+  let now ← TaskStore.currentIso8601
+  if exit != 0 then
+    IO.eprintln s!"  [merger] gh pr merge failed (exit {exit}):\n{stderr}"
+    -- Persist failure record; leave the issue in .inReview so the reviewer can
+    -- rerun the merger or re-decide.
+    TaskStore.saveTask
+      { id := taskId, createdAt
+      , upstream := ioTask.upstream, fork := ioTask.fork, mode := ioTask.mode
+      , prompt := ioTask.prompt
+      , backend := ioTask.backend
+      , projectId := ioTask.projectId
+      , issueId   := ioTask.issueId
+      , status := .failed }
+    throw (.userError s!"gh pr merge {prRef} failed")
+  IO.println s!"  [merger] merged {prRef}\n{stdout}"
+  -- Mark the issue completed and clear any lingering claim.
+  Project.saveIssue { issue with status := .completed, updatedAt := now }
+  let _ ← Project.forceRelease globalClaimManager pid iid
+  TaskStore.saveTask
+    { id := taskId, createdAt
+    , upstream := ioTask.upstream, fork := ioTask.fork, mode := ioTask.mode
+    , prompt := ioTask.prompt
+    , backend := ioTask.backend
+    , projectId := ioTask.projectId
+    , issueId   := ioTask.issueId
+    , status := .completed }
 
 private def sanitizeProjectName (upstream : Repository) : String :=
   s!"{upstream.owner}-{upstream.name}"
@@ -120,6 +232,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Record this run in the task store
   let taskId ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
+  -- Merger: built-in non-agentic backend that just runs `gh pr merge`.
+  if ioTask.backend == some "merger" then
+    runMerger ioTask taskId createdAt
+    return ((taskId, false), none, none)
   let initialRecord : TaskStore.TaskRecord := {
     id := taskId, createdAt
     upstream := ioTask.upstream, fork := ioTask.fork, mode := ioTask.mode
@@ -173,6 +289,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     inputJson
     outputRef := some outputRef
     issueNumber := ioTask.issueNumber
+    claimManager := some globalClaimManager
+    taskId := some taskId
+    agentBackend := ioTask.backend.getD "claude"
+    series
+    enqueueMerger   := some enqueueMergerImpl
+    enqueueReviewer := some enqueueReviewerImpl
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"
@@ -274,6 +396,25 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | some (.error _)         => .failed
       | _                       => if usageLimitHit then .unfinished else .completed
   TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
+  -- Release the orchestra-issue claim on terminal status. If the worker
+  -- already moved the issue to .inReview via attach_pr, leave that status
+  -- alone and only delete the lock file (forceRelease). Otherwise hand the
+  -- issue back to the open pool so another worker can pick it up.
+  match ioTask.projectId, ioTask.issueId with
+  | some _pid, some iid =>
+    match ← Project.findIssue iid with
+    | some (project, issue) =>
+      let now ← TaskStore.currentIso8601
+      let succeeded := finalStatus matches .completed
+      if succeeded && issue.status == .inReview then
+        let _ ← Project.forceRelease globalClaimManager project.id iid
+      else if succeeded then
+        -- Worker reported success but never attached a PR — release back to open.
+        let _ ← Project.release globalClaimManager project.id iid .open now
+      else
+        let _ ← Project.release globalClaimManager project.id iid .open now
+    | none => pure ()
+  | _, _ => pure ()
   if let some seriesName := series then
     TaskStore.updateSeriesPointer seriesName taskId
   IO.println s!"=== Task {idx} done ===\n"

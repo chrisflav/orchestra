@@ -1,0 +1,14 @@
+{
+  "id": "0123456789abcdef",
+  "name": "API v2",
+  "description": "Migrate the public API from v1 to v2.",
+  "created_at": "2026-05-05T00:00:00Z",
+  "default_target": {
+    "repo": "myorg/api",
+    "branch": "main"
+  },
+  "reviewer": {
+    "backend": "claude",
+    "prompt_template": "Review PR {{repo}}#{{pr_number}} on branch {{branch}} for orchestra issue {{issue_id}}. Use review_issues to approve or reject."
+  }
+}

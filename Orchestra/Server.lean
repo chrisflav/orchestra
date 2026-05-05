@@ -3,6 +3,7 @@ import Std.Internal.UV.TCP
 import Std.Net
 import Orchestra.Config
 import Orchestra.GitHub
+import Orchestra.Project.Tools
 
 open Lean (Json)
 open Std.Net
@@ -32,6 +33,22 @@ structure State where
   outputRef : Option (IO.Ref (Option Json)) := none
   /-- Issue or PR number this task was launched from. Required for the `comment` tool. -/
   issueNumber : Option Nat := none
+  /-- Claim manager handle. Required for `claim_issue` / `release_claim` /
+      `decide_issue reject`. `none` outside the daemon. -/
+  claimManager : Option Project.ClaimManager := none
+  /-- Orchestra task ID, recorded as the holder when claims are taken. -/
+  taskId : Option String := none
+  /-- Backend label of the running agent (e.g. "claude"). Recorded with claims. -/
+  agentBackend : String := "unknown"
+  /-- Series the task belongs to. Recorded with claims. -/
+  series : Option String := none
+  /-- Hook that enqueues a merger task, set by the daemon. Plumbed by
+      `Project.Tools.Env` so `decide_issue approve` can request a merge. -/
+  enqueueMerger : Option (Project.ProjectId → Project.IssueId → Project.PRRef →
+                          IO (Except String String)) := none
+  /-- Optional auto-reviewer hook (F1). Plumbed to `Project.Tools.Env.enqueueReviewer`. -/
+  enqueueReviewer : Option (Project.Project → Project.IssueId → Project.PRRef →
+                            Project.ReviewerTemplate → IO (Except String String)) := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -220,8 +237,11 @@ Call this tool exactly once when the task is complete."),
 private def toolsList (state : State) : Json :=
   let optional := optionalToolDefs.filterMap fun entry =>
     if state.allowedTools.contains entry.1 then some entry.2 else none
+  let project := Project.Tools.toolDefs.filterMap fun (perm, _name, def_) =>
+    if state.allowedTools.contains perm then some def_ else none
   let io := ioToolDefs state.inputType state.outputType
-  Json.mkObj [("tools", .arr (alwaysAvailableTools ++ optional.toArray ++ io))]
+  Json.mkObj [("tools",
+    .arr (alwaysAvailableTools ++ optional.toArray ++ project.toArray ++ io))]
 
 -- Types
 
@@ -245,6 +265,8 @@ inductive ToolCall where
   | comment (action : CommentAction)
   | getTaskInput
   | submitTaskOutput (value : Json)
+  /-- A project / issue tool from `Orchestra.Project.Tools`. -/
+  | project (call : Project.Tools.ProjectTool)
   | unknown (name : String)
   | parseError (msg : String)
 
@@ -327,7 +349,11 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
     match args.getObjVal? "value" with
     | .ok v  => .submitTaskOutput v
     | .error _ => .parseError "missing required 'value' argument"
-  | _ => .unknown name
+  | _ =>
+    match Project.Tools.tryParseToolCall name args with
+    | some (.ok call) => .project call
+    | some (.error e) => .parseError e
+    | none            => .unknown name
 
 /-- Parse a JSON-RPC message into a typed `Request`.
     Returns `none` if the message has no method field. -/
@@ -503,6 +529,16 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       return toolContent "output recorded"
     | none =>
       return toolContent "output submission not available for this task" (isError := true)
+  | .project call =>
+    let env : Project.Tools.Env :=
+      { claimManager  := state.claimManager
+      , allowedTools  := state.allowedTools
+      , taskId        := state.taskId
+      , agentBackend  := state.agentBackend
+      , series          := state.series
+      , enqueueMerger   := state.enqueueMerger
+      , enqueueReviewer := state.enqueueReviewer }
+    Project.Tools.evalProjectTool env call
   | .unknown name =>
     log s!"tool {name}: unknown"
     return toolContent s!"unknown tool: {name}" (isError := true)

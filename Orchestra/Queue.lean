@@ -5,6 +5,7 @@ import Orchestra.TaskStore
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra.Queue
+open Orchestra.Project (ProjectId IssueId)
 
 -- Types
 
@@ -130,6 +131,11 @@ structure QueueEntry where
   outputJson    : Option Json    := none
   /-- Issue or PR number this task was launched from. Enables the `comment` tool. -/
   issueNumber : Option Nat := none
+  /-- Orchestra project this entry belongs to (optional).
+      Distinct from `issueNumber` (a GitHub issue number). -/
+  projectId : Option ProjectId := none
+  /-- Orchestra issue this entry is working on (optional). -/
+  issueId : Option IssueId := none
 
 instance : ToJson QueueEntry where
   toJson e :=
@@ -164,6 +170,8 @@ instance : ToJson QueueEntry where
     let fields := if let some j := e.inputJson       then fields ++ [("input_json",          j)]                           else fields
     let fields := if let some j := e.outputJson      then fields ++ [("output_json",         j)]                           else fields
     let fields := if let some n := e.issueNumber then fields ++ [("issue_number", Json.num n)] else fields
+    let fields := if let some p := e.projectId then fields ++ [("project_id", ToJson.toJson p)] else fields
+    let fields := if let some i := e.issueId   then fields ++ [("issue_id",   ToJson.toJson i)] else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -197,11 +205,13 @@ instance : FromJson QueueEntry where
     let inputJson        := j.getObjVal?   "input_json"          |>.toOption
     let outputJson       := j.getObjVal?   "output_json"         |>.toOption
     let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
+    let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
+    let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
-             issueNumber }
+             issueNumber, projectId, issueId }
 
 -- Directories and paths
 

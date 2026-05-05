@@ -5,6 +5,7 @@ import Init.Data.String.Basic
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra.TaskStore
+open Orchestra.Project (ProjectId IssueId)
 
 -- Types
 
@@ -60,6 +61,10 @@ structure TaskRecord where
   budget        : Option Float  := none
   /-- Priority used for queue ordering. Defaults to 10. -/
   priority      : Nat           := 10
+  /-- Orchestra project this task belongs to (optional). -/
+  projectId     : Option ProjectId := none
+  /-- Orchestra issue this task is/was working on (optional). -/
+  issueId       : Option IssueId   := none
 deriving Repr
 
 instance : ToJson TaskRecord where
@@ -84,6 +89,8 @@ instance : ToJson TaskRecord where
     let fields := if let some s := r.prependPrompt   then fields ++ [("prepend_prompt",  Json.str s)]     else fields
     let fields := if let some b := r.budget        then fields ++ [("budget",         ToJson.toJson b)] else fields
     let fields := if r.priority != 10           then fields ++ [("priority",         Json.num r.priority)] else fields
+    let fields := if let some p := r.projectId   then fields ++ [("project_id",       ToJson.toJson p)]    else fields
+    let fields := if let some i := r.issueId     then fields ++ [("issue_id",         ToJson.toJson i)]    else fields
     Json.mkObj fields
 
 instance : FromJson TaskRecord where
@@ -105,8 +112,11 @@ instance : FromJson TaskRecord where
     let prependPrompt   := j.getObjValAs? String "prepend_prompt"  |>.toOption
     let budget        := j.getObjValAs? Float  "budget"         |>.toOption
     let priority      := j.getObjValAs? Nat   "priority"      |>.toOption |>.getD 10
+    let projectId     := j.getObjValAs? ProjectId "project_id" |>.toOption
+    let issueId       := j.getObjValAs? IssueId   "issue_id"   |>.toOption
     return { id, createdAt, upstream, fork, mode, prompt, status, sessionId,
-             continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority }
+             continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority,
+             projectId, issueId }
 
 -- Directories
 

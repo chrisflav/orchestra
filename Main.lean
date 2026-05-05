@@ -218,6 +218,11 @@ private def tagHandler (p : Parsed) : IO UInt32 := do
   IO.println s!"Task {id} added to series '{seriesName}'"
   return (0 : UInt32)
 
+-- The project / issue subcommands live in `Orchestra.Project.Cli` so the
+-- domain code stays self-contained. We only re-export the top-level cmds
+-- here so the macro that builds `orchestraCmd` can find them by name.
+open Orchestra.Project.Cli (projectCmd issueCmd)
+
 private def resumeHandler (p : Parsed) : IO UInt32 := do
   let seriesName := p.positionalArg! "series" |>.as! String
   let prompt     := p.flag? "prompt" |>.map (·.as! String) |>.getD ""
@@ -1076,7 +1081,9 @@ def orchestraCmd : Cmd := `[Cli|
     seriesCmd;
     tagCmd;
     resumeCmd;
-    queueCmd
+    queueCmd;
+    projectCmd;
+    issueCmd
 ]
 
 def main (args : List String) : IO UInt32 := do
