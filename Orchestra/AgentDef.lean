@@ -40,6 +40,16 @@ structure AgentDef where
       Called to determine which environment variables to inject when a specific auth source is selected.
       Authentication kinds not supported by the backend produce an empty array. -/
   envVarsOfAuthSource : AuthSource → Array (String × String)
+  /-- Query the provider API to find when the usage limit for the given auth source will reset.
+      Returns an ISO 8601 UTC timestamp string if the limit is currently active and the backend
+      supports this query. Returns `none` if the backend does not support proactive limit checking
+      or if no limit is currently active. -/
+  queryUsageReset : AuthSource → IO (Option String) := fun _ => pure none
+  /-- Proactively query all current usage limits for the given auth source before starting a task.
+      Checks every limit type the backend exposes (e.g. per-session, weekly all-models,
+      weekly per-model).  Returns `some resetTime` (ISO 8601 UTC) if *any* limit is currently
+      exhausted, `none` when there is sufficient headroom. -/
+  checkCurrentUsageLimits : AuthSource → IO (Option String) := fun _ => pure none
 
 namespace AgentDef
 

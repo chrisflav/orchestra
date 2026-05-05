@@ -255,18 +255,26 @@ def loadAllEntries : IO (Array QueueEntry) := do
         result := result.push e
   return result.qsort (fun a b => a.id > b.id)
 
-/-- Return the next pending entry to run.
-    Entries are ordered by priority (higher first), with older entries breaking ties.
-    Returns none if no pending entries exist. -/
-def nextPending : IO (Option QueueEntry) := do
+-- Cascade cancellation
+
+/-- Normalize backend: treat `none` and `some "claude"` as the same backend. -/
+private def effectiveBackend (backend : Option String) : String :=
+  backend.getD "claude"
+
+/-- Return the next pending entry to run, skipping entries whose (backend, authSource) pair
+    appears in `blocked`. Entries are ordered by: unblocked first, then priority (higher first),
+    with older entries breaking ties. Returns none if no eligible pending entries exist. -/
+def nextPending (blocked : Array (String × Option String) := #[]) : IO (Option QueueEntry) := do
   let all ← loadAllEntries
-  let pending := all.filter (fun e => e.status == .pending)
-  if pending.isEmpty then return none
-  -- Find the maximum priority
-  let maxPri := pending.foldl (·.max ·.priority) 0
+  let pending := all.filter (·.status == .pending)
+  let eligible := pending.filter fun e =>
+    !blocked.any fun (b, as) => effectiveBackend e.backend == b && e.authSource == as
+  if eligible.isEmpty then return none
+  -- Find the maximum priority among eligible entries
+  let maxPri := eligible.foldl (·.max ·.priority) 0
   -- Among entries with max priority, pick the oldest (last in newest-first array)
-  let maxPriEntries := pending.filter (·.priority == maxPri)
-  return (maxPriEntries.back? |>.filter (·.priority == maxPri))
+  let maxPriEntries := eligible.filter (·.priority == maxPri)
+  return maxPriEntries.back?
 
 -- PID file management
 
@@ -290,12 +298,6 @@ def daemonRunning : IO Bool := do
   | none => return false
   | some pid =>
     return ← (System.FilePath.mk s!"/proc/{pid}").pathExists
-
--- Cascade cancellation
-
-/-- Normalize backend: treat `none` and `some "claude"` as the same backend. -/
-private def effectiveBackend (backend : Option String) : String :=
-  backend.getD "claude"
 
 /-- Cancel all pending entries that have continuesFrom = taskId, then recurse. -/
 partial def cancelDependents (taskId : String) : IO Unit := do

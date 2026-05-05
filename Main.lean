@@ -524,6 +524,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   Queue.markStaleRunningAsUnfinished
   Queue.cancelStaleConcertEntries
   Queue.cancelStaleRunningConcerts
+  -- Remove expired usage limit blocks so work can resume after a reset
+  UsageLimits.clearExpiredBlocksOnStartup
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
@@ -549,9 +551,12 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     catch _ => pure ()
   -- Helper: atomically claim the next pending entry, marking it as running.
   -- Serialised by claimMutex so that multiple workers cannot claim the same entry.
+  -- Skips entries whose (backend, authSource) is currently usage-limit-blocked.
   let claimNextEntry : IO (Option Queue.QueueEntry) := do
     claimMutex.lock
-    let entry ← Queue.nextPending
+    UsageLimits.clearExpiredBlocks
+    let blocked ← UsageLimits.blockedSources
+    let entry ← Queue.nextPending blocked
     if let some e := entry then
       Queue.saveEntry { e with status := .running }
     claimMutex.unlock
@@ -588,6 +593,34 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     let cfg ← match entry.configPath with
       | none    => pure appConfig
       | some cp => loadAppConfig (some (System.FilePath.mk cp))
+    let backend := entry.backend.getD "claude"
+    let agentDef := match entry.backend with
+      | some "pi"       => AgentDef.pi
+      | some "vibe"     => AgentDef.vibe
+      | some "opencode" => AgentDef.opencode
+      | _               => AgentDef.claude
+    -- Resolve the auth source for this entry so we can query and block per source.
+    let authSrc : Option AuthSource := do
+      let ac ← cfg.agentAuthConfigs.find? (fun c => c.name == backend)
+      match entry.authSource with
+      | some label => ac.authSources.find? (fun s => s.label == label)
+      | none =>
+        match ac.defaultAuthSource with
+        | some defLabel => ac.authSources.find? (fun s => s.label == defLabel)
+        | none => if ac.authSources.size == 1 then ac.authSources[0]? else none
+    -- Proactively query all current usage limits before starting the task.
+    -- This catches session, weekly all-models, and weekly per-model limits.
+    if let some src := authSrc then
+      match ← try agentDef.checkCurrentUsageLimits src catch _ => pure none with
+      | some resetAt =>
+        removeToken
+        Queue.saveEntry { entry with status := .unfinished }
+        UsageLimits.blockSource backend entry.authSource (some resetAt)
+        Queue.cancelDependents entry.id
+        IO.println s!"  Pre-task limit check: {backend}{match entry.authSource with | some s => s!" ({s})" | none => ""} is over quota. Task delayed (resets at {resetAt})."
+        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+        return
+      | none => pure ()
     try
       let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
@@ -603,9 +636,16 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") outputJson
       else if usageLimitHit then
         Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
-        Queue.cancelPendingByBackend entry.backend entry.id
+        -- Try to get an accurate reset time from the provider API.
+        let resetAt ← match authSrc with
+          | none    => pure none
+          | some s  => try agentDef.queryUsageReset s catch _ => pure none
+        UsageLimits.blockSource backend entry.authSource resetAt
         Queue.cancelDependents taskId
-        IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
+        let resetMsg ← match ← UsageLimits.resetTimeFor backend entry.authSource with
+          | some t => pure s!" (resets at {t})"
+          | none   => pure ""
+        IO.println s!"  Usage limit hit for {backend}{match entry.authSource with | some s => s!" ({s})" | none => ""}. Pending tasks delayed{resetMsg}."
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
       else
         Queue.saveEntry { entry with status := .done, taskId := some taskId, outputJson }
