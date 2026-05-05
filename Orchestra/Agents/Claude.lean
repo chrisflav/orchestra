@@ -10,8 +10,11 @@ namespace Orchestra.AgentDef
 /-- Run curl with the given args; return (stdout, exit code). -/
 private def runCurl (args : Array String) : IO (String × UInt32) := do
   let child ← IO.Process.spawn {
-    cmd := "curl"; args
-    stdout := .piped; stderr := .null; stdin := .null
+    cmd  := "curl"
+    args := args
+    stdout := .piped
+    stderr := .null
+    stdin  := .null
   }
   let out ← child.stdout.readToEnd
   let code ← child.wait
@@ -30,35 +33,35 @@ private def findHeader (output : String) (name : String) : Option String :=
     (e.g. weekly Sonnet / weekly all-models limits). -/
 private def exhaustedResetTime (headers : String) : Option String :=
   let buckets := [
-    -- Per-minute / per-day limits
     "requests", "tokens", "input-tokens", "output-tokens"
   ]
-  -- Collect the reset times of all exhausted buckets.
-  let resetTimes := buckets.filterMap fun bucket =>
+  -- Collect the reset times of all exhausted standard buckets.
+  let standardResets := buckets.filterMap fun bucket =>
     let remKey := s!"anthropic-ratelimit-{bucket}-remaining"
     let rstKey := s!"anthropic-ratelimit-{bucket}-reset"
     match findHeader headers remKey with
     | none => none
     | some rem =>
-      if rem.trim == "0" then findHeader headers rstKey
+      if rem.trimAscii.toString == "0" then findHeader headers rstKey
       else none
-  -- Also capture any model-specific limit headers (e.g. weekly Sonnet-only, weekly all-models).
+  -- Also capture any model-specific limit headers (weekly Sonnet-only, weekly all-models).
   -- These follow the pattern: anthropic-ratelimit-<model-slug>-tokens-remaining
   let modelSpecific := headers.splitOn "\n" |>.filterMap fun line =>
     let lower := line.toLower
     if lower.startsWith "anthropic-ratelimit-" && lower.contains "-remaining:" then
-      let parts := lower.splitOn "-remaining:"
-      let remStr := parts.getD 1 "" |>.trim
+      let remStr := (lower.splitOn "-remaining:" |>.getD 1 "").trimAscii.toString
       if remStr == "0" then
-        -- Derive the reset key by replacing -remaining: with -reset:
         let resetLine := line.replace "-remaining:" "-reset:"
-        let resetVal := resetLine.splitOn "-reset:" |>.getD 1 "" |>.trim
+        let resetVal := (resetLine.splitOn "-reset:" |>.getD 1 "").trimAscii.toString
         if resetVal.isEmpty then none else some resetVal
       else none
     else none
-  let allResets := resetTimes ++ modelSpecific
+  let allResets := standardResets ++ modelSpecific
   -- Return the earliest reset time (lexicographic ISO 8601 comparison is correct).
-  allResets.foldl (fun acc t => match acc with | none => some t | some a => some (min a t)) none
+  allResets.foldl (fun acc t =>
+    match acc with
+    | none   => some t
+    | some a => some (if a ≤ t then a else t)) none
 
 /-- Proactively query the Anthropic API to check whether any usage limit is currently
     exhausted.  Makes a minimal probe request (1 output token) and inspects the
@@ -91,9 +94,8 @@ private def queryClaudeUsageLimits (src : AuthSource) : IO (Option String) := do
   | "429" =>
     -- Currently rate-limited: pick the earliest reset from the response headers.
     let resetTime :=
-      exhaustedResetTime output
-        |>.orElse (findHeader output "retry-after")
-        |>.orElse (findHeader output "x-ratelimit-reset")
+      (exhaustedResetTime output).orElse (fun _ => findHeader output "retry-after")
+        |>.orElse (fun _ => findHeader output "x-ratelimit-reset")
     match resetTime with
     | some t => return some t
     | none   => return some (← UsageLimits.estimateResetTime)
