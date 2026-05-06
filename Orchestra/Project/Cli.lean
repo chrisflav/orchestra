@@ -1,7 +1,9 @@
 import Cli
 import Orchestra.Config
+import Orchestra.Queue
 import Orchestra.TaskStore
 import Orchestra.Project.Basic
+import Orchestra.Project.Claim
 
 open Cli
 open Orchestra (Repository Task)
@@ -194,6 +196,61 @@ def issueShowHandler (p : Parsed) : IO UInt32 := do
       IO.println s!"  {line}"
     return (0 : UInt32)
 
+/-- Default tools granted to a continuation that doesn't override `--tools`.
+    Matches the canonical worker tool set: project work tools + PR + comment. -/
+private def defaultContinueTools : List String :=
+  ["work_issues", "create_pr", "comment"]
+
+def issueContinueHandler (p : Parsed) : IO UInt32 := do
+  let id      := p.positionalArg! "id" |>.as! String
+  let prompt? := p.flag? "prompt" |>.map (·.as! String)
+  let toolsOverride? := p.flag? "tools" |>.map (fun v =>
+    (v.as! String).splitOn "," |>.map (·.trim) |>.filter (fun s => !s.isEmpty))
+  let priorityFlag := p.flag? "priority" |>.map (·.as! Nat)
+  let prompt ← match prompt? with
+    | some t => pure t
+    | none   => IO.eprintln "orchestra issue continue: --prompt is required"; return 1
+  -- 1. Locate issue + claim.
+  let some (project, issue) ← findIssue ⟨id⟩
+    | IO.eprintln s!"Issue '{id}' not found"; return 1
+  let some claim ← loadClaim project.id issue.id
+    | IO.eprintln s!"Issue '{id}' has no active claim — nothing to continue. \
+        Either claim it first or use 'orchestra queue add'."; return 1
+  -- 2. Pull repo / backend / model details from the prior task record.
+  let some prevRecord ← TaskStore.loadTask claim.taskId
+    | IO.eprintln s!"Claim references task '{claim.taskId}' which is not in the task store"
+      return 1
+  -- 3. Build the continuation entry. projectId/issueId are inherited from the
+  --    issue (so the daemon's claim-release hook fires on terminal status).
+  let id ← TaskStore.generateId
+  let createdAt ← currentIso8601
+  let entry : Queue.QueueEntry :=
+    { id, createdAt
+    , upstream      := prevRecord.upstream
+    , fork          := prevRecord.fork
+    , mode          := prevRecord.mode
+    , prompt
+    , continuesFrom := some claim.taskId
+    , series        := claim.series
+    , backend       := prevRecord.backend
+    , model         := prevRecord.model
+    , agent         := prevRecord.agent
+    , systemPrompt  := prevRecord.systemPrompt
+    , prependPrompt := prevRecord.prependPrompt
+    , budget        := prevRecord.budget
+    , priority      := priorityFlag.getD prevRecord.priority
+    , projectId     := some project.id
+    , issueId       := some issue.id
+    , tools         := some (toolsOverride?.getD defaultContinueTools) }
+  -- 4. Drop into the queue dir; the running daemon picks it up on next poll.
+  --    No daemon-running precheck — the entry persists and runs whenever the
+  --    daemon next starts, matching how task files behave.
+  Queue.saveEntry entry
+  IO.println entry.id
+  if claim.series.isNone then
+    IO.eprintln s!"  (note: claim has no series — new task continues from {claim.taskId} but is not series-tagged)"
+  return 0
+
 def issueCloseHandler (p : Parsed) : IO UInt32 := do
   let id := p.positionalArg! "id" |>.as! String
   match ← findIssue ⟨id⟩ with
@@ -288,6 +345,19 @@ private def issueCloseCmd : Cmd := `[Cli|
     "id" : String; "Issue ID"
 ]
 
+private def issueContinueCmd : Cmd := `[Cli|
+  «continue» VIA issueContinueHandler; ["0.1.0"]
+  "Enqueue a new task continuing the holder's series on a claimed issue."
+
+  FLAGS:
+    p, prompt : String; "New prompt for the continuation (required)"
+    tools     : String; "Comma-separated tools list (default: work_issues,create_pr,comment)"
+    priority  : Nat;    "Priority for the queued entry (default: inherited from prior task)"
+
+  ARGS:
+    "id" : String; "Issue ID currently held by a worker task"
+]
+
 def issueCmd : Cmd := `[Cli|
   issue VIA subcommandDefault; ["0.1.0"]
   "Manage project issues."
@@ -296,7 +366,8 @@ def issueCmd : Cmd := `[Cli|
     issueAddCmd;
     issueListCmd;
     issueShowCmd;
-    issueCloseCmd
+    issueCloseCmd;
+    issueContinueCmd
 ]
 
 end Orchestra.Project.Cli
