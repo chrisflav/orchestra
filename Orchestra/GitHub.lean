@@ -113,6 +113,21 @@ def createPullRequest (pat : String) (upstream : Repository)
     "--body", body
   ] (env := #[("GH_TOKEN", some pat)])
 
+/-- Create a pull request entirely within a single repository (no cross-repo
+    `owner:branch` head prefix), authenticated by `token` — typically a fresh
+    GitHub App installation token. Used when the agent wants to open a PR on
+    its fork rather than the upstream. -/
+def createPullRequestOnRepo (token : String) (repo : Repository)
+    (head base title body : String) : IO String := do
+  runCmd "gh" #[
+    "pr", "create",
+    "--repo", repo.toString,
+    "--head", head,
+    "--base", base,
+    "--title", title,
+    "--body", body
+  ] (env := #[("GH_TOKEN", some token)])
+
 /--
 Fetch review threads for a pull request via the GitHub GraphQL API.
 Returns the raw parsed JSON response.

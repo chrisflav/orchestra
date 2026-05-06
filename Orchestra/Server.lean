@@ -118,7 +118,12 @@ private def alwaysAvailableTools : Array Json := #[
 private def optionalToolDefs : List (String × Json) := [
   ("create_pr", Json.mkObj [
     ("name", "create_pr"),
-    ("description", "Create a pull request on the upstream repository."),
+    ("description",
+      "Create a pull request. By default the PR is opened on the upstream " ++
+      "repository (cross-repo, head=fork-owner:branch, authenticated by the " ++
+      "configured PAT). Set target=\"fork\" to open the PR on the fork " ++
+      "repository instead — same-repo head, authenticated by a freshly-minted " ++
+      "GitHub App installation token, no PAT required."),
     ("inputSchema", Json.mkObj [
       ("type", "object"),
       ("properties", Json.mkObj [
@@ -128,7 +133,15 @@ private def optionalToolDefs : List (String × Json) := [
           ("type", "string"),
           ("description", "Branch name in the fork.")
         ]),
-        ("base", Json.mkObj [("type", "string")])
+        ("base", Json.mkObj [("type", "string")]),
+        ("target", Json.mkObj [
+          ("type", "string"),
+          ("enum", Json.arr #["upstream", "fork"]),
+          ("description",
+            "Where to open the PR. \"upstream\" (default) targets " ++
+            "state.upstream via PAT; \"fork\" targets state.fork via the " ++
+            "GitHub App installation token.")
+        ])
       ]),
       ("required", .arr #["head"])
     ])
@@ -245,6 +258,16 @@ private def toolsList (state : State) : Json :=
 
 -- Types
 
+/-- Where a `create_pr` call should open its PR. -/
+inductive PrTarget where
+  /-- Cross-repo PR: head=`fork.owner:branch`, against `state.upstream`. PAT-auth.
+      This is the default and the original behaviour. -/
+  | upstream
+  /-- Same-repo PR: head=bare branch, against `state.fork`. Authenticated by a
+      freshly-minted GitHub App installation token, no PAT required. -/
+  | fork
+deriving Repr, Inhabited
+
 /-- The action performed by the `comment` tool. -/
 inductive CommentAction where
   /-- Post a top-level comment on the issue or PR. -/
@@ -260,7 +283,9 @@ inductive CommentAction where
 inductive ToolCall where
   | health
   | refreshToken
+  /-- Where a `create_pr` call should open its PR. -/
   | createPr (title : String) (body : String) (head : String) (base : String)
+             (target : PrTarget)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
   | comment (action : CommentAction)
   | getTaskInput
@@ -289,8 +314,17 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
     let body  := args.getObjValAs? String "body"  |>.toOption |>.getD ""
     let head  := args.getObjValAs? String "head"  |>.toOption |>.getD ""
     let base  := args.getObjValAs? String "base"  |>.toOption |>.getD "main"
-    if head.isEmpty then .parseError "missing 'head' (branch name)"
-    else .createPr title body head base
+    let targetStr := args.getObjValAs? String "target" |>.toOption |>.getD "upstream"
+    let target? : Option PrTarget := match targetStr with
+      | "upstream" => some .upstream
+      | "fork"     => some .fork
+      | _          => none
+    match target? with
+    | none =>
+      .parseError s!"invalid 'target' (expected \"upstream\" or \"fork\", got {repr targetStr})"
+    | some target =>
+      if head.isEmpty then .parseError "missing 'head' (branch name)"
+      else .createPr title body head base target
   | "get_pr_comments" =>
     match args.getObjVal? "pr_number" |>.toOption with
     | none => .parseError "missing required argument: pr_number"
@@ -390,22 +424,40 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     catch e =>
       log s!"tool refresh_token: error: {e}"
       return toolContent (toString e) (isError := true)
-  | .createPr title body head base =>
+  | .createPr title body head base target =>
     if !state.allowedTools.contains "create_pr" then
       log "tool create_pr: denied (not in allowed tools)"
       return toolContent "PR creation is not enabled for this task" (isError := true)
-    if state.pat.isEmpty then
-      log "tool create_pr: error: PAT not configured"
-      return toolContent "github.pat not set in config" (isError := true)
-    log s!"tool create_pr: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
-    try
-      let result ← GitHub.createPullRequest state.pat state.upstream
-        s!"{state.fork.owner}:{head}" base title body
-      log s!"tool create_pr: ok: {result.trimAscii}"
-      return toolContent result
-    catch e =>
-      log s!"tool create_pr: error: {e}"
-      return toolContent (toString e) (isError := true)
+    match target with
+    | .upstream =>
+      if state.pat.isEmpty then
+        log "tool create_pr: error: PAT not configured (target=upstream)"
+        return toolContent
+          "github.pat not set in config (required when target=upstream; pass target=\"fork\" to use the App token)"
+          (isError := true)
+      log s!"tool create_pr [upstream]: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
+      try
+        let result ← GitHub.createPullRequest state.pat state.upstream
+          s!"{state.fork.owner}:{head}" base title body
+        log s!"tool create_pr: ok: {result.trimAscii}"
+        return toolContent result
+      catch e =>
+        log s!"tool create_pr: error: {e}"
+        return toolContent (toString e) (isError := true)
+    | .fork =>
+      log s!"tool create_pr [fork]: {state.fork}:{head} base={base} title={repr title}"
+      try
+        -- Mint a fresh installation token so the PR is attributed to the
+        -- GitHub App, not the PAT owner.
+        let jwt ← GitHub.createJWT state.appId state.privateKeyPath
+        let token ← GitHub.createInstallationToken jwt state.installationId
+        let result ← GitHub.createPullRequestOnRepo token state.fork
+          head base title body
+        log s!"tool create_pr: ok: {result.trimAscii}"
+        return toolContent result
+      catch e =>
+        log s!"tool create_pr: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .getPrComments prNumber unresolvedOnly excludeOutdated =>
     log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
       exclude_outdated={excludeOutdated}"
