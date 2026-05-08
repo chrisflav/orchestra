@@ -160,15 +160,25 @@ def projectReleaseOrphansHandler (p : Parsed) : IO UInt32 := do
     IO.eprintln s!"Project '{id}' not found"
     return (1 : UInt32)
   | some _ =>
-    let orphans ← findOrphanedIssues pid
-    if orphans.isEmpty then
-      IO.println "No orphaned claims found."
-      return (0 : UInt32)
     let mgr ← Project.ClaimManager.new
     let now ← TaskStore.currentIso8601
+    -- Release orphaned claimed issues.
+    let orphans ← findOrphanedIssues pid
     for (issue, tid) in orphans do
       let _ ← Project.release mgr pid issue.id .open now
       IO.println s!"[released]  {issue.id.value}  {issue.title}  (was claimed by {tid})"
+    -- Unblock blocked issues whose children are all completed.
+    let allIssues ← loadIssues pid
+    let blocked := allIssues.filter (·.status == .blocked)
+    let mut unblocked : Nat := 0
+    for issue in blocked do
+      let children ← childrenOf pid issue.id
+      if children.all (·.status == .completed) then
+        Project.saveIssue { issue with status := .open, updatedAt := now }
+        IO.println s!"[unblocked] {issue.id.value}  {issue.title}  (all children completed)"
+        unblocked := unblocked + 1
+    if orphans.isEmpty && unblocked == 0 then
+      IO.println "Nothing to do."
     return (0 : UInt32)
 
 def projectShowHandler (p : Parsed) : IO UInt32 := do
