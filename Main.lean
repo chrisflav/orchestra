@@ -761,10 +761,12 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
               IO.println s!"  Listener '{liveCfg.name}': queued entry {qentry.id}"
           let newIds := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)
+          -- Re-read enabled so a disable issued mid-tick is not overwritten.
+          let currentEnabled := (← Listener.loadListenerState lcfg.name).enabled
           let newState : Listener.ListenerState := {
             lastChecked  := ← TaskStore.currentIso8601
             processedIds := state.processedIds ++ newIds
-            enabled      := state.enabled
+            enabled      := currentEnabled
           }
           Listener.saveListenerState lcfg.name newState
         catch e =>
