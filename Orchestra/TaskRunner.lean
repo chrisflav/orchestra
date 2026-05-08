@@ -140,6 +140,16 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
   Project.saveIssue { issue with status := .completed, updatedAt := now }
   let _ ← Project.forceRelease globalClaimManager pid iid
   TaskStore.saveTask { initialRecord with status := .completed }
+  -- If this issue has a parent that is blocked, check whether all siblings
+  -- are now completed and unblock the parent if so.
+  if let some parentId := issue.parentId then
+    if let some parent ← Project.loadIssue pid parentId then
+      if parent.status == .blocked then
+        let siblings ← Project.childrenOf pid parentId
+        if siblings.all (·.status == .completed) then
+          let now2 ← TaskStore.currentIso8601
+          Project.saveIssue { parent with status := .open, updatedAt := now2 }
+          IO.println s!"  [merger] all children of {parentId.value} completed; unblocked → open"
 
 private def sanitizeProjectName (upstream : Repository) : String :=
   s!"{upstream.owner}-{upstream.name}"
