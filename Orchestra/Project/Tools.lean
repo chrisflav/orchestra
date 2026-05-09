@@ -479,6 +479,11 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     if target.isNone && project.defaultTarget.isNone then
       return content
         "project has no default target; pass target_repo and target_branch" (isError := true)
+    if let some parentId := parent then
+      match ← findIssue parentId with
+      | none => return content s!"parent issue {parentId.value} not found" (isError := true)
+      | some (_, parentIssue) =>
+        saveIssue { parentIssue with status := .blocked, updatedAt := now }
     let iid ← freshIssueId
     let issue : Issue :=
       { id := iid, projectId := pid, parentId := parent, title, description := descr
