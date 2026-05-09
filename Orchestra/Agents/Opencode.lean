@@ -91,6 +91,15 @@ def opencode : AgentDef where
     -- opencode run takes the prompt as a positional argument
     args := args.push prompt
     return args
+  buildInteractiveArgs _ctx _pluginDirs _subAgent model _systemPrompt resume _budget := Id.run do
+    let mut args : Array String := #[
+      "run", "--port", "4096", "--thinking", "--dangerously-skip-permissions"
+    ]
+    if let some m := model then
+      args := args.push "--model" |>.push m
+    if let some sid := resume then
+      args := args.push "-s" |>.push sid
+    return args
   parseOutputLine := parseOpencodeOutput
   extractSessionId _ := pure none
   cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()

@@ -57,7 +57,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     -- Additional TCP ports to allow, beyond what the agent backend already opens.
     (extraPorts : Array Nat := #[])
     -- Additional sandbox paths from global app config, merged with the agent-backend's built-in paths.
-    (additionalPaths : SandboxPaths := {}) : IO LaunchResult := do
+    (additionalPaths : SandboxPaths := {})
+    -- If true, launch the agent in interactive (TUI) mode: inherit stdio and omit -p <prompt>.
+    (interactiveAgent : Bool := false) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -147,11 +149,60 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   args := args.push agentDef.command
   -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
   let allPluginDirs := pluginDirs ++ memoryDirs
-  let agentArgs := agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
+  let agentArgs :=
+    if interactiveAgent then
+      agentDef.buildInteractiveArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget
+    else
+      agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
   args := args ++ agentArgs
   if debug then
     let argsStr := String.intercalate " " (args.toList.map shellEscape)
     IO.eprintln s!"[debug] cd {shellEscape repoPath.toString} && landrun {argsStr}"
+  if interactiveAgent then
+    -- Interactive mode: inherit stdio so the user drops into the agent TUI.
+    -- No stream parsing; just wait for the process to exit.
+    let child ← IO.Process.spawn {
+      cmd := "landrun"
+      args
+      cwd := repoPath
+      stdin := .inherit
+      stdout := .inherit
+      stderr := .inherit
+    }
+    if let some ct := cancelToken then
+      let _killTask ← IO.asTask (prio := .dedicated) do
+        let asyncTask ← ct.wait
+        let result ← IO.wait asyncTask
+        match result with
+        | .error _ => pure ()
+        | .ok () =>
+          match ← ct.getCancellationReason with
+          | some .cancel =>
+            try
+              let killer ← IO.Process.spawn {
+                cmd := "kill"
+                args := #["-9", toString child.pid]
+                stdin := .null
+                stdout := .null
+                stderr := .null
+              }
+              let _ ← killer.wait
+            catch _ => pure ()
+          | _ => pure ()
+    let exitCode ← child.wait
+    if let some ct := cancelToken then
+      if !(← ct.isCancelled) then
+        ct.cancel (.custom "done")
+    let wasCancelled ← match cancelToken with
+      | none => pure false
+      | some ct => do
+        let reason ← ct.getCancellationReason
+        pure (reason == some .cancel)
+    let sessionId ← agentDef.extractSessionId mcpContext
+    agentDef.cleanup mcpContext
+    return { exitCode, sessionId, usageLimitHit := false, wasCancelled }
+  else
+  -- Non-interactive (headless) mode: pipe stdio and parse the output stream.
   let child ← IO.Process.spawn {
     cmd := "landrun"
     args

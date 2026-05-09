@@ -149,6 +149,15 @@ def pi : AgentDef where
     if let some sid := resume then
       args := args.push "--session" |>.push sid
     return args.push prompt
+  buildInteractiveArgs _ctx _pluginDirs _subAgent model systemPrompt resume _budget := Id.run do
+    let mut args : Array String := #[]
+    if let some m := model then
+      args := args.push "--model" |>.push m
+    if let some content := systemPrompt then
+      args := args.push "--append-system-prompt" |>.push content
+    if let some sid := resume then
+      args := args.push "--session" |>.push sid
+    return args
   parseOutputLine := piParseOutputLine
   -- The session UUID is captured from the "session" header line emitted to stdout,
   -- so there is nothing left to extract after the run.

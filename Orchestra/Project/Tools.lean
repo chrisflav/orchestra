@@ -532,7 +532,10 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     | none => return content s!"issue {iid.value} not found" (isError := true)
     | some (project, i) =>
       IO.println s!"  [mcp] release_claim: {iid.value} \"{i.title}\" — {reason}"
-      let newStatus := if i.status == .blocked then .blocked else .open
+      let newStatus := match i.status with
+        | .blocked  => .blocked
+        | .inReview => .inReview
+        | _         => .open
       let _ ← release mgr project.id iid newStatus now
       return content s!"released claim on {iid.value} ({reason})"
   | .attachPr iid repo number branch =>
