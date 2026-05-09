@@ -260,6 +260,9 @@ def issueShowHandler (p : Parsed) : IO UInt32 := do
     IO.println s!"Title:        {i.title}"
     IO.println s!"Status:       {issueStatusToString i.status}"
     IO.println s!"Target:       {target}"
+    let depsStr := if i.dependencies.isEmpty then "-"
+                   else String.intercalate ", " (i.dependencies.map (·.value)).toList
+    IO.println s!"Dependencies: {depsStr}"
     IO.println s!"Created:      {i.createdAt}"
     IO.println s!"Updated:      {i.updatedAt}"
     if i.attachedPRs.isEmpty then

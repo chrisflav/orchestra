@@ -44,8 +44,10 @@ inductive ProjectTool where
   | getIssue         (issueId : IssueId)
   | createIssue      (projectId : ProjectId) (title description : String)
                      (parentId : Option IssueId) (target : Option RepoTarget)
+                     (dependencies : Array IssueId := #[])
   | updateIssue      (issueId : IssueId) (title description : Option String)
                      (status : Option IssueStatus) (target : Option RepoTarget)
+                     (dependencies : Option (Array IssueId) := none)
   -- work_issues
   | listOpenIssues   (projectId : ProjectId) (targetRepo : Option Repository)
   | claimIssue       (issueId : IssueId)
@@ -110,26 +112,37 @@ def toolDefs : List (String × String × Json) :=
         , ("description",
             "Create a new issue in a project. To create a sub-issue, set parent_id to " ++
             "the parent issue ID. Per-issue target_repo / target_branch override the " ++
-            "project default.")
+            "project default. Use dependency_ids to list issues that must be completed " ++
+            "before this one is dispatched.")
         , ("inputSchema", obj
             [ ("project_id", strProp "Project ID")
             , ("title", strProp "Issue title")
             , ("description", strProp "Issue description (markdown allowed)")
             , ("parent_id", strProp "Optional parent issue ID")
             , ("target_repo", strProp "Optional target repo (owner/name)")
-            , ("target_branch", strProp "Optional target branch") ]
+            , ("target_branch", strProp "Optional target branch")
+            , ("dependency_ids", Json.mkObj
+                [ ("type", "array")
+                , ("description", "Optional list of issue IDs that must be completed before this issue is dispatched")
+                , ("items", Json.mkObj [("type", "string")]) ]) ]
             ["project_id", "title", "description"]) ])
   , (manageIssuesPerm, "update_issue",
       Json.mkObj
         [ ("name", "update_issue")
-        , ("description", "Update an issue's title, description, status, or target.")
+        , ("description",
+            "Update an issue's title, description, status, target, or dependencies. " ++
+            "Pass dependency_ids to replace the full dependency list; omit to leave it unchanged.")
         , ("inputSchema", obj
             [ ("issue_id", strProp "Issue ID")
             , ("title", strProp "New title")
             , ("description", strProp "New description")
             , ("status", strProp "New status (open|claimed|in_review|completed|abandoned)")
             , ("target_repo", strProp "New target repo (owner/name)")
-            , ("target_branch", strProp "New target branch") ]
+            , ("target_branch", strProp "New target branch")
+            , ("dependency_ids", Json.mkObj
+                [ ("type", "array")
+                , ("description", "Replace the dependency list with these issue IDs (issues that must be completed before this one is dispatched)")
+                , ("items", Json.mkObj [("type", "string")]) ]) ]
             ["issue_id"]) ])
     -- work_issues
   , (workIssuesPerm, "list_open_issues",
@@ -270,7 +283,10 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
       let parent : Option IssueId :=
         args.getObjValAs? String "parent_id" |>.toOption |>.map (fun s => ⟨s⟩)
       let target  ← parseTarget? args
-      return .createIssue ⟨pid⟩ title descr parent target
+      let dependencies : Array IssueId :=
+        (args.getObjValAs? (Array String) "dependency_ids" |>.toOption).getD #[]
+        |>.map (fun s => ⟨s⟩)
+      return .createIssue ⟨pid⟩ title descr parent target dependencies
   | "update_issue" =>
     some <| do
       let iid ← args.getObjValAs? String "issue_id"
@@ -281,7 +297,9 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | none => none
         | some s => issueStatusOfString? s
       let target ← parseTarget? args
-      return .updateIssue ⟨iid⟩ title descr status target
+      let dependencies : Option (Array IssueId) :=
+        args.getObjValAs? (Array String) "dependency_ids" |>.toOption |>.map (·.map (⟨·⟩))
+      return .updateIssue ⟨iid⟩ title descr status target dependencies
   | "list_open_issues" =>
     some <| do
       let pid ← args.getObjValAs? String "project_id"
@@ -436,22 +454,25 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       let prs := i.attachedPRs.map (fun p => s!"  - {p.repo}#{p.number} (branch {p.branch})")
       let children ← childrenOf project.id i.id
       let childLines := children.map (fun c => s!"  - {c.id.value}  [{issueStatusToString c.status}]  {c.title}")
+      let depsStr := if i.dependencies.isEmpty then "-"
+                     else String.intercalate ", " (i.dependencies.map (·.value)).toList
       let header : Array String := #[
-        s!"id:        {i.id.value}",
-        s!"project:   {project.id.value} ({project.name})",
-        s!"parent:    {i.parentId.map (·.value) |>.getD "-"}",
-        s!"title:     {i.title}",
-        s!"status:    {issueStatusToString i.status}",
-        s!"target:    {target}",
-        s!"created:   {i.createdAt}",
-        s!"updated:   {i.updatedAt}",
+        s!"id:           {i.id.value}",
+        s!"project:      {project.id.value} ({project.name})",
+        s!"parent:       {i.parentId.map (·.value) |>.getD "-"}",
+        s!"title:        {i.title}",
+        s!"status:       {issueStatusToString i.status}",
+        s!"target:       {target}",
+        s!"dependencies: {depsStr}",
+        s!"created:      {i.createdAt}",
+        s!"updated:      {i.updatedAt}",
         if i.attachedPRs.isEmpty then "attached_prs: -" else "attached_prs:" ]
       let descrLines := (i.description.splitOn "\n").toArray.map (fun l => s!"  {l}")
       let mut body := header ++ prs
       if !children.isEmpty then body := body ++ #["children:"] ++ childLines
       body := body ++ #["description:"] ++ descrLines
       return content (joinLines body)
-  | .createIssue pid title descr parent target =>
+  | .createIssue pid title descr parent target dependencies =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     let some project ← loadProject pid
       | return content s!"project {pid.value} not found" (isError := true)
@@ -461,21 +482,22 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     let iid ← freshIssueId
     let issue : Issue :=
       { id := iid, projectId := pid, parentId := parent, title, description := descr
-      , target, createdAt := now, updatedAt := now }
+      , target, dependencies, createdAt := now, updatedAt := now }
     saveIssue issue
     return content s!"created issue {iid.value} in project {pid.value}"
-  | .updateIssue iid title descr status target =>
+  | .updateIssue iid title descr status target dependencies =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     match ← findIssue iid with
     | none => return content s!"issue {iid.value} not found" (isError := true)
     | some (_, i) =>
       let updated : Issue :=
         { i with
-          title       := title.getD i.title
-          description := descr.getD i.description
-          status      := status.getD i.status
-          target      := match target with | some t => some t | none => i.target
-          updatedAt   := now }
+          title        := title.getD i.title
+          description  := descr.getD i.description
+          status       := status.getD i.status
+          target       := match target with | some t => some t | none => i.target
+          dependencies := dependencies.getD i.dependencies
+          updatedAt    := now }
       saveIssue updated
       return content s!"updated issue {iid.value}"
   -- ---------------- work_issues ----------------

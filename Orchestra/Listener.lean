@@ -460,9 +460,14 @@ def dispatcherTick (input : DispatcherInput) : Array RoleSpawn := Id.run do
     | .hasOpenIssues =>
       -- Pick the first open issue not already in `spawns` (so we don't try
       -- to spawn two workers for the same issue in one tick).
+      -- Skip issues whose dependencies are not yet all completed.
       let alreadyTargeted : Array String := spawns.filterMap fun s => s.issueId.map (·.value)
+      let completedIds : Array String := input.issues.filterMap fun i =>
+        if i.status == .completed then some i.id.value else none
       let some issue := input.issues.find? (fun i =>
-        i.status == .open && !alreadyTargeted.contains i.id.value)
+        i.status == .open &&
+        !alreadyTargeted.contains i.id.value &&
+        i.dependencies.all (fun dep => completedIds.contains dep.value))
         | continue
       spawns := spawns.push { roleName, issueId := some issue.id }
     | .hasInReviewIssues =>

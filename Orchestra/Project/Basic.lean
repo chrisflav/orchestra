@@ -157,17 +157,19 @@ recovered by scanning the project's issues directory; this avoids
 denormalisation drift across moves and renames. -/
 
 structure Issue where
-  id          : IssueId
-  projectId   : ProjectId
-  parentId    : Option IssueId  := none
-  title       : String
-  description : String
-  status      : IssueStatus     := .open
+  id           : IssueId
+  projectId    : ProjectId
+  parentId     : Option IssueId  := none
+  title        : String
+  description  : String
+  status       : IssueStatus     := .open
   /-- Per-issue override of the project's default target. -/
-  target      : Option RepoTarget := none
-  attachedPRs : Array PRRef     := #[]
-  createdAt   : String
-  updatedAt   : String
+  target       : Option RepoTarget := none
+  attachedPRs  : Array PRRef     := #[]
+  /-- Issues that must be completed before this one can be dispatched. -/
+  dependencies : Array IssueId   := #[]
+  createdAt    : String
+  updatedAt    : String
 deriving Repr, Inhabited
 
 instance : ToJson Issue where
@@ -184,6 +186,7 @@ instance : ToJson Issue where
     let fields := base
     let fields := if let some p := i.parentId then fields ++ [("parent_id", ToJson.toJson p)] else fields
     let fields := if let some t := i.target   then fields ++ [("target",    ToJson.toJson t)] else fields
+    let fields := if !i.dependencies.isEmpty  then fields ++ [("dependencies", Json.arr (i.dependencies.map ToJson.toJson))] else fields
     Json.mkObj fields
 
 instance : FromJson Issue where
@@ -195,11 +198,12 @@ instance : FromJson Issue where
     let status      ← j.getObjValAs? IssueStatus "status"
     let createdAt   ← j.getObjValAs? String "created_at"
     let updatedAt   ← j.getObjValAs? String "updated_at"
-    let parentId    := j.getObjValAs? IssueId "parent_id" |>.toOption
-    let target      := j.getObjValAs? RepoTarget "target"   |>.toOption
-    let attachedPRs := (j.getObjValAs? (Array PRRef) "attached_prs" |>.toOption).getD #[]
+    let parentId     := j.getObjValAs? IssueId "parent_id" |>.toOption
+    let target       := j.getObjValAs? RepoTarget "target"   |>.toOption
+    let attachedPRs  := (j.getObjValAs? (Array PRRef) "attached_prs" |>.toOption).getD #[]
+    let dependencies := (j.getObjValAs? (Array IssueId) "dependencies" |>.toOption).getD #[]
     return { id, projectId, parentId, title, description, status, target, attachedPRs,
-             createdAt, updatedAt }
+             dependencies, createdAt, updatedAt }
 
 /-! ## Filesystem layout
 
