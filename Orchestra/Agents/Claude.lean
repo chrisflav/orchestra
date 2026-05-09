@@ -45,6 +45,22 @@ def claude : AgentDef where
     if let some sid := resume then
       args := args.push "--resume" |>.push sid
     return args.push "-p" |>.push prompt
+  buildInteractiveArgs mcpConfigPath pluginDirs subAgent model systemPrompt resume budget := Id.run do
+    let mut args : Array String := #[
+      "--dangerously-skip-permissions", "--mcp-config", mcpConfigPath,
+      "--max-budget-usd", s!"{budget}"
+    ]
+    for p in pluginDirs do
+      args := args.push "--plugin-dir" |>.push p
+    if let some name := subAgent then
+      args := args.push "--agent" |>.push name
+    if let some m := model then
+      args := args.push "--model" |>.push m
+    if let some content := systemPrompt then
+      args := args.push "--append-system-prompt" |>.push content
+    if let some sid := resume then
+      args := args.push "--resume" |>.push sid
+    return args
   parseOutputLine := StreamFormat.parseEvent
   extractSessionId _ := pure none
   cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()

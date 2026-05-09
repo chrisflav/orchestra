@@ -205,7 +205,7 @@ private def resolveTools (mode : TaskMode) (tools : Option (List String)) :
     per-agent auth configs and returns its env vars via the agent's `envVarsOfAuthSource`.
     Falls back to the legacy flat API key fields when no per-agent auth is configured,
     preserving backward compatibility with existing configs. -/
-private def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
+def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
     (backendName : String) (requestedLabel : Option String)
     : IO (Array (String × Option String)) := do
   match appConfig.agentAuthConfigs.find? (fun c => c.name == backendName) with
@@ -249,7 +249,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (continuesFrom : Option String := none)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
-    (interactive : Bool := true) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
+    (interactive : Bool := true)
+    (interactiveAgent : Bool := false) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
@@ -429,9 +430,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
       (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
       (additionalPaths := appConfig.additionalSandboxPaths)
+      (interactiveAgent := interactiveAgent)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     lastResultSubtype := result.resultSubtype
+    if interactiveAgent then
+      break
     if result.wasCancelled then
       IO.println "  Agent was cancelled."
       wasCancelled := true
@@ -504,10 +508,11 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (continuesFrom : Option String := none)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
-    (interactive : Bool := true) : IO (String × Bool × Option Lean.Json) := do
+    (interactive : Bool := true)
+    (interactiveAgent : Bool := false) : IO (String × Bool × Option Lean.Json) := do
   let ((taskId, usageLimitHit), _, outputJson) ←
     runIOTask appConfig task.ioTask idx debug default
-      continuesFrom series cancelToken interactive
+      continuesFrom series cancelToken interactive interactiveAgent
   return (taskId, usageLimitHit, outputJson)
 
 end Orchestra.TaskRunner

@@ -1171,6 +1171,85 @@ private def queueCmd : Cmd := `[Cli|
     queueRetryCmd
 ]
 
+-- All optional tool permission tokens recognised by --tools.
+private def allOptionalTools : List String :=
+  ["create_pr", "comment", "manage_issues", "work_issues", "review_issues"]
+
+private def interactiveHandler (p : Parsed) : IO UInt32 := do
+  let upstreamStr := p.flag! "upstream" |>.as! String
+  let forkStr     := p.flag! "fork"     |>.as! String
+  let toolsStr    := p.flag? "tools"    |>.map (·.as! String)
+  let backend     := p.flag? "backend"  |>.map (·.as! String)
+  let model       := p.flag? "model"    |>.map (·.as! String)
+  let budget      := p.flag? "budget"   |>.bind (fun v => parseFloat? (v.as! String)) |>.getD 4.0
+  let debug       := p.hasFlag "debug"
+  let configPath  := p.flag? "config"   |>.map (·.as! String)
+  let upstream ← IO.ofExcept (Repository.parse upstreamStr)
+  let fork     ← IO.ofExcept (Repository.parse forkStr)
+  let allowedTools : List String := match toolsStr with
+    | none | some "all" => allOptionalTools
+    | some s => s.splitOn ","
+  let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  -- GitHub authentication
+  let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
+  let installationId ← match appConfig.installationId with
+    | some id => pure id
+    | none    => GitHub.getInstallationId jwt fork.owner
+  let token ← GitHub.createInstallationToken jwt installationId
+  GitHub.setupGhAuth token
+  -- Clone / update repo
+  IO.println s!"Cloning/updating {fork}..."
+  let repoPath ← Repo.ensureCloned fork upstream
+  IO.println s!"  Repo at {repoPath}"
+  -- Start MCP server
+  let backendName := backend.getD "claude"
+  let serverState : Server.State := {
+    upstream, fork
+    allowedTools
+    appId          := appConfig.appId
+    privateKeyPath := appConfig.privateKeyPath
+    installationId
+    pat            := appConfig.pat
+    agentBackend   := backendName
+  }
+  let (port, shutdown) ← Server.start serverState
+  IO.println s!"  MCP server on port {port}"
+  -- Resolve agent backend and auth env vars
+  let agentDef := match backend with
+    | some "pi"       => AgentDef.pi
+    | some "vibe"     => AgentDef.vibe
+    | some "opencode" => AgentDef.opencode
+    | _               => AgentDef.claude
+  let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
+    |>.map (·.extraPorts) |>.getD #[]
+  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName none
+  -- Launch agent interactively (no -p; user gets the TUI directly)
+  IO.println "  Launching agent..."
+  let result ← Sandbox.launchAgent agentDef repoPath "" port token
+    (debug := debug) (pluginDirs := appConfig.pluginDirs)
+    (model := model) (budget := budget)
+    (extraEnv := apiKeyEnv) (extraPorts := extraPorts)
+    (additionalPaths := appConfig.additionalSandboxPaths)
+    (interactiveAgent := true)
+  IO.println s!"  Agent exited with code {result.exitCode}"
+  shutdown
+  return if result.exitCode == 0 then 0 else 1
+
+private def interactiveCmd : Cmd := `[Cli|
+  interactive VIA interactiveHandler; ["0.1.0"]
+  "Drop into the agent's interactive TUI inside a sandboxed environment."
+
+  FLAGS:
+    c, config   : String; "Path to config file (default: ~/.agent/config.json)"
+    d, debug;             "Print the landrun command before executing it"
+    upstream    : String; "Upstream repository in 'owner/repo' format"
+    fork        : String; "Fork repository in 'owner/repo' format"
+    tools       : String; "Comma-separated optional tools to enable, or 'all' (default: all)"
+    backend     : String; "Agent backend: claude (default), vibe, opencode, pi"
+    model       : String; "Model override passed to the agent"
+    budget      : String; "Maximum spend in USD (default: 4.0)"
+]
+
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
   IO.eprintln "Use a subcommand. Try 'orchestra --help'."
   return 1
@@ -1181,6 +1260,7 @@ def orchestraCmd : Cmd := `[Cli|
 
   SUBCOMMANDS:
     runCmd';
+    interactiveCmd;
     mcpServerCmd;
     prepareCmd;
     cleanupCmd;

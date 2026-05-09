@@ -24,6 +24,11 @@ structure AgentDef where
       and the user prompt. -/
   buildArgs : String → Array String → Option String → Option String → Option String → Option String → Float → String
             → Array String
+  /-- Build command-line args for an interactive (TUI) invocation.
+      Same parameters as `buildArgs` minus the prompt; omits headless-only flags
+      like `--print` and `--output-format=stream-json`. -/
+  buildInteractiveArgs : String → Array String → Option String → Option String → Option String → Option String → Float
+                       → Array String
   /-- Parse one line of the agent's stdout stream output.
       Returns `none` for events that should be suppressed. -/
   parseOutputLine : String → Option Event

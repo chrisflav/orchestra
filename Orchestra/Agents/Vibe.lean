@@ -147,6 +147,16 @@ def vibe : AgentDef where
     if let some sid := resume then
       args := args.push "--resume" |>.push sid
     return args
+  buildInteractiveArgs _ctx _pluginDirs subAgent _model systemPrompt resume _budget := Id.run do
+    let mut args : Array String := #[]
+    let agentName := match subAgent with
+      | some n => some n
+      | none   => if systemPrompt.isSome then some "task" else none
+    if let some name := agentName then
+      args := args.push "--agent" |>.push name
+    if let some sid := resume then
+      args := args.push "--resume" |>.push sid
+    return args
   parseOutputLine := vibeParseOutputLine
   extractSessionId := vibeExtractSessionId
   cleanup _ := pure ()
