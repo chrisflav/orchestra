@@ -299,10 +299,7 @@ orchestra mcp <upstream> <fork>       # start the MCP server standalone
 
 The `container/` directory contains a NixOS image definition for incus. It
 installs all required tools (`claude-code`, `elan`, `gh`, `landrun`,
-`mistral-vibe`, and others) and creates an `orchestra` user with SSH access.
-
-Before building, edit `container/nixos.yaml` and replace `"your public key
-here"` with your actual SSH public key.
+`mistral-vibe`, and others) and creates an `orchestra` user.
 
 To build the container image you need distrobuilder and incus:
 
@@ -318,10 +315,15 @@ distrobuilder build-incus nixos.yaml
 Import and start the container:
 
 ```
-incus image import incus.tar.xz rootfs.squashfs  --alias orchestra
+incus image import incus.tar.xz rootfs.squashfs --alias orchestra
 incus launch orchestra my-orchestra --config security.nesting=true
-incus shell my-orchestra
+incus exec my-orchestra bash
 # nixos-rebuild switch
 ```
 
-The last command installs the software in the container.
+The last command installs the software in the container. To login the `orchestra`
+user:
+
+```
+incus exec my-orchestra -- su orchestra
+```
