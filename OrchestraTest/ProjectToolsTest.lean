@@ -172,6 +172,19 @@ def decideApproveCallsHook : Test := do
   TestM.assert wasCalled "enqueueMerger hook should have been invoked"
 
 @[test]
+def attachPrRequiresOwnership : Test := do
+  let denied ← (withTempHome do
+    let project ← setupProject
+    let issue ← addOpenIssue project.id
+    let mgr ← ClaimManager.new
+    let _ ← evalProjectTool (baseEnv [workIssuesPerm] (mgr := some mgr) (taskId := "T1"))
+              (.claimIssue issue.id)
+    let r ← evalProjectTool (baseEnv [workIssuesPerm] (mgr := some mgr) (taskId := "T2"))
+              (.attachPr issue.id { owner := "o", name := "r" } 5 "br")
+    return jsonContains r "held by task T1")
+  TestM.assert denied "non-holder must be rejected from attach_pr"
+
+@[test]
 def parseSplitIssueRejectsEmptyChildren : Test := do
   let args := Json.mkObj
     [ ("parent_id", "p"), ("reason", "too big"), ("children", Json.arr #[]) ]
