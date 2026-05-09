@@ -220,10 +220,8 @@ instance : FromJson QueueEntry where
 
 -- Directories and paths
 
-def queueDir : IO System.FilePath := do
-  match ← IO.getEnv "HOME" with
-  | some h => return System.FilePath.mk h / ".agent" / "queue"
-  | none   => throw (.userError "HOME not set")
+def queueDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "queue"
 
 def pidFile : IO System.FilePath :=
   return (← queueDir) / "daemon.pid"
@@ -353,10 +351,8 @@ def cancelStaleConcertEntries : IO Unit := do
 
 -- Concert run persistence
 
-def concertsDir : IO System.FilePath := do
-  match ← IO.getEnv "HOME" with
-  | some h => return System.FilePath.mk h / ".agent" / "concerts"
-  | none   => throw (.userError "HOME not set")
+def concertsDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "concerts"
 
 def saveConcertRun (run : ConcertRun) : IO Unit := do
   let dir ← concertsDir

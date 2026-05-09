@@ -125,11 +125,6 @@ instance : FromJson Role where
 
 /-! ## Filesystem layout -/
 
-private def homeDir : IO System.FilePath := do
-  match ← IO.getEnv "HOME" with
-  | some h => return System.FilePath.mk h
-  | none   => throw (.userError "HOME not set")
-
 /-- Optional override for the global roles directory (tests redirect this). -/
 initialize globalRolesDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
 
@@ -139,7 +134,7 @@ def setGlobalRolesDirOverride (p : Option System.FilePath) : IO Unit :=
 def globalRolesDir : IO System.FilePath := do
   match ← globalRolesDirOverride.get with
   | some p => return p
-  | none   => return (← homeDir) / ".agent" / "roles"
+  | none   => return (← Dirs.configBase) / "roles"
 
 def projectRolesDir (pid : ProjectId) : IO System.FilePath := do
   return (← projectDir pid) / "roles"

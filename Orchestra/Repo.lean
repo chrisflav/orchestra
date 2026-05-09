@@ -39,10 +39,8 @@ private def runGh' (args : Array String) (cwd : Option System.FilePath := none) 
   let _ ← runGh args cwd
 
 /-- Base directory for all agent work. -/
-def workDir : IO System.FilePath := do
-  match ← IO.getEnv "HOME" with
-  | some h => return System.FilePath.mk h / ".agent" / "repos"
-  | none => throw (.userError "HOME not set")
+def workDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "repos"
 
 /-- Build a plain GitHub HTTPS URL (no credentials). -/
 private def githubUrl (repo : Repository) : String :=

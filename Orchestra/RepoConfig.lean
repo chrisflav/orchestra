@@ -27,12 +27,17 @@ instance : FromJson RepoConfig where
       j.getObjValAs? ValidationConfig "validation" |>.toOption |>.getD {}
     return { validation }
 
-private def agentDir (repoPath : System.FilePath) : System.FilePath :=
-  repoPath / ".agent"
+/-- Return the per-repo config directory, preferring `.orchestra/` and falling back to `.agent/`. -/
+private def orchestraDir (repoPath : System.FilePath) : IO System.FilePath := do
+  let newDir := repoPath / ".orchestra"
+  if ← newDir.pathExists then return newDir
+  let oldDir := repoPath / ".agent"
+  if ← oldDir.pathExists then return oldDir
+  return newDir
 
-/-- Load `.agent/config.json` from the repository. Returns defaults if absent or unparseable. -/
+/-- Load `.orchestra/config.json` (or `.agent/config.json`) from the repository. Returns defaults if absent or unparseable. -/
 def loadRepoConfig (repoPath : System.FilePath) : IO RepoConfig := do
-  let configPath := agentDir repoPath / "config.json"
+  let configPath := (← orchestraDir repoPath) / "config.json"
   if !(← configPath.pathExists) then return {}
   let contents ← IO.FS.readFile configPath
   match Json.parse contents with
@@ -43,11 +48,11 @@ def loadRepoConfig (repoPath : System.FilePath) : IO RepoConfig := do
     | .ok cfg => return cfg
 
 /--
-Run `.agent/<name>` as a bash script with the repository as the working directory.
+Run `.orchestra/<name>` (or `.agent/<name>`) as a bash script with the repository as the working directory.
 Does nothing if the script does not exist. Throws if the script exits non-zero.
 -/
 def runHook (repoPath : System.FilePath) (name : String) : IO Unit := do
-  let hookPath := agentDir repoPath / name
+  let hookPath := (← orchestraDir repoPath) / name
   if !(← hookPath.pathExists) then return
   let child ← IO.Process.spawn {
     cmd  := "bash"
@@ -61,31 +66,31 @@ def runHook (repoPath : System.FilePath) (name : String) : IO Unit := do
     throw (.userError s!"hook {name} failed with exit code {code}")
 
 /--
-Run `.agent/init.sh` once after the repository is first cloned.
-Completion is recorded in `.agent/.initialized`; subsequent calls are no-ops.
-Does nothing if `.agent/` does not exist.
+Run `.orchestra/init.sh` (or `.agent/init.sh`) once after the repository is first cloned.
+Completion is recorded in the same directory as `.initialized`; subsequent calls are no-ops.
+Does nothing if neither `.orchestra/` nor `.agent/` exists in the repo.
 -/
 def runInitIfNeeded (repoPath : System.FilePath) : IO Unit := do
-  let dir := agentDir repoPath
+  let dir ← orchestraDir repoPath
   if !(← dir.pathExists) then return
   let markerPath := dir / ".initialized"
   if ← markerPath.pathExists then return
   runHook repoPath "init.sh"
   IO.FS.writeFile markerPath ""
 
-/-- Returns `true` if `.agent/validation.sh` exists in the repository. -/
-def hasValidationScript (repoPath : System.FilePath) : IO Bool :=
-  (agentDir repoPath / "validation.sh").pathExists
+/-- Returns `true` if `validation.sh` exists in the repo's `.orchestra/` or `.agent/` directory. -/
+def hasValidationScript (repoPath : System.FilePath) : IO Bool := do
+  return (← (← orchestraDir repoPath) / "validation.sh" |>.pathExists)
 
 /--
-Run `.agent/validation.sh`.
+Run `.orchestra/validation.sh` (or `.agent/validation.sh`).
 Returns `(true, "")` if the script passes (exit 0) or does not exist.
 Returns `(false, output)` if the script exits non-zero, where `output` is the
 combined stdout and stderr of the script. Does not throw.
 -/
 def runValidation (repoPath : System.FilePath) : IO (Bool × String) := do
   if !(← hasValidationScript repoPath) then return (true, "")
-  let hookPath := agentDir repoPath / "validation.sh"
+  let hookPath := (← orchestraDir repoPath) / "validation.sh"
   let child ← IO.Process.spawn {
     cmd  := "bash"
     args := #[hookPath.toString]

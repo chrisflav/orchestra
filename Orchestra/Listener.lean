@@ -266,18 +266,16 @@ instance : FromJson ListenerState where
 
 -- Directories
 
-def listenersDir : IO System.FilePath := do
-  match ← IO.getEnv "HOME" with
-  | some h => return System.FilePath.mk h / ".agent" / "listeners"
-  | none   => throw (.userError "HOME not set")
+def listenersConfigDir : IO System.FilePath :=
+  return (← Dirs.configBase) / "listeners"
 
-def listenerStateDir : IO System.FilePath := do
-  return (← listenersDir) / "state"
+def listenerStateDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "listeners" / "state"
 
 -- Config I/O
 
 def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
-  let path := (← listenersDir) / s!"{name}.json"
+  let path := (← listenersConfigDir) / s!"{name}.json"
   if !(← path.pathExists) then return none
   let raw ← IO.FS.readFile path
   match Json.parse raw with
@@ -288,7 +286,8 @@ def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
     | .ok cfg  => return some cfg
 
 
-def loadAllListenerConfigs (dir : System.FilePath) : IO (Array ListenerConfig) := do
+def loadAllListenerConfigs : IO (Array ListenerConfig) := do
+  let dir ← listenersConfigDir
   if !(← dir.pathExists) then return #[]
   let entries ← System.FilePath.readDir dir
   let mut configs : Array ListenerConfig := #[]

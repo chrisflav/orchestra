@@ -414,7 +414,7 @@ def rolesListHandler (p : Parsed) : IO UInt32 := do
     | some pr => pure pr
   let roles ← loadAllRoles project.id
   if roles.isEmpty then
-    IO.println "No roles defined (looked under ~/.agent/projects/<pid>/roles and ~/.agent/roles)."
+    IO.println "No roles defined (looked under <data>/projects/<pid>/roles and <config>/roles)."
     return 0
   IO.println s!"{padRight "ROLE" 18} {padRight "PERMISSIONS" 36} TRIGGER  MAX  PRE-CLAIM"
   IO.println (String.ofList (List.replicate 90 '-'))
@@ -662,7 +662,7 @@ def issueCmd : Cmd := `[Cli|
 
 def spawnCmd : Cmd := `[Cli|
   spawn VIA spawnHandler; ["0.1.0"]
-  "Spawn a task for a role from a role template (~/.agent/roles/<role>.json or per-project)."
+  "Spawn a task for a role from a role template (<config>/roles/<role>.json or per-project)."
 
   FLAGS:
     issue    : String; "Bind the task to this issue (required for hasOpenIssues roles to pre-claim)"

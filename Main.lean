@@ -1,4 +1,5 @@
 import Orchestra
+import Orchestra.Migrate
 import Cli
 import Std.Sync
 
@@ -477,8 +478,7 @@ private def handleSocketRequest
   try conn.close catch _ => pure ()
 
 private def queueStartHandler (p : Parsed) : IO UInt32 := do
-  let configPath   := p.flag? "config"       |>.map (·.as! String)
-  let listenerDir  := p.flag? "listener_dir" |>.map (·.as! String)
+  let configPath   := p.flag? "config" |>.map (·.as! String)
   let debug        := p.hasFlag "debug"
   let background   := p.hasFlag "background"
   -- Background mode: re-exec as a detached daemon and exit
@@ -642,12 +642,9 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         try releaseClaimOnError catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
   -- Load listener configs and spawn one fiber per listener.
-  let lDir ← match listenerDir with
-    | some d => pure (System.FilePath.mk d)
-    | none   => Listener.listenersDir
-  let listenerConfigs ← Listener.loadAllListenerConfigs lDir
+  let listenerConfigs ← Listener.loadAllListenerConfigs
   if !listenerConfigs.isEmpty then
-    IO.println s!"Loaded {listenerConfigs.size} listener(s) from {lDir}"
+    IO.println s!"Loaded {listenerConfigs.size} listener(s)"
   for lcfg in listenerConfigs do
     let _listenerTask ← IO.asTask (prio := .dedicated) do
       -- Fire immediately on first iteration, then respect the configured interval.
@@ -819,14 +816,10 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
     IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork.toString 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
-private def listenerListHandler (p : Parsed) : IO UInt32 := do
-  let listenerDir := p.flag? "listener_dir" |>.map (·.as! String)
-  let lDir ← match listenerDir with
-    | some d => pure (System.FilePath.mk d)
-    | none   => Listener.listenersDir
-  let configs ← Listener.loadAllListenerConfigs lDir
+private def listenerListHandler (_ : Parsed) : IO UInt32 := do
+  let configs ← Listener.loadAllListenerConfigs
   if configs.isEmpty then
-    IO.println s!"No listeners found in {lDir}"
+    IO.println "No listeners configured"
     return (0 : UInt32)
   IO.println s!"{padRight "LISTENER" 24} {padRight "ON" 4} {padRight "INTERVAL" 9} {padRight "LAST CHECKED" 22} PROCESSED"
   IO.println (String.ofList (List.replicate 80 '-'))
@@ -893,7 +886,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
       let seriesLabel := e.series.getD ""
       IO.println s!"{padRight e.id 16} {padRight e.fork.toString 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
   -- Listener status
-  let listenerConfigs ← Listener.loadAllListenerConfigs (← Listener.listenersDir)
+  let listenerConfigs ← Listener.loadAllListenerConfigs
   if !listenerConfigs.isEmpty then
     IO.println ""
     IO.println s!"Listeners: {listenerConfigs.size}"
@@ -938,7 +931,7 @@ private def runCmd' : Cmd := `[Cli|
   "Run coding agent tasks from a task file."
 
   FLAGS:
-    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
     t, task : Nat; "Run only the task at this index (0-based)"
     d, debug; "Print the landrun command before executing it"
     continues : String; "Continue from a previous task by ID (requires --task with multi-task files)"
@@ -955,7 +948,7 @@ private def mcpServerCmd : Cmd := `[Cli|
   "Start the MCP server and print the port it is listening on."
 
   FLAGS:
-    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
     allow_pr; "Allow the create_pr tool (disabled by default)"
 
   ARGS:
@@ -1012,7 +1005,7 @@ private def resumeCmd : Cmd := `[Cli|
   "Resume the latest run in a series with a new prompt."
 
   FLAGS:
-    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
     p, prompt : String; "Prompt for the new agent run"
     d, debug; "Print the landrun command before executing it"
     budget : String; "Maximum spend in USD (default: inherited from previous task, or 4.0)"
@@ -1026,7 +1019,7 @@ private def queueAddCmd : Cmd := `[Cli|
   "Add tasks to the queue from a task file or workflow file, or continue a series with a new prompt."
 
   FLAGS:
-    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
     t, task : Nat; "Enqueue only the task at this index (0-based, task-file mode only)"
     continues : String; "Continue from a previous task by ID (task-file mode only)"
     series : String; "Assign queued task(s) to a named series (task-file mode only)"
@@ -1045,9 +1038,8 @@ private def queueStartCmd : Cmd := `[Cli|
   "Start the queue daemon. Polls for pending tasks and runs them serially."
 
   FLAGS:
-    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
     d, debug; "Print the landrun command before executing it"
-    listener_dir : String; "Directory of listener configs (default: ~/.agent/listeners/)"
     b, background; "Run the daemon in the background, detached from the terminal"
 ]
 
@@ -1124,9 +1116,6 @@ private def listenerSubDefault (_ : Parsed) : IO UInt32 := do
 private def listenerListCmd : Cmd := `[Cli|
   list VIA listenerListHandler; ["0.1.0"]
   "List configured listeners and their state."
-
-  FLAGS:
-    listener_dir : String; "Directory of listener configs (default: ~/.agent/listeners/)"
 ]
 
 private def listenerEnableCmd : Cmd := `[Cli|
@@ -1171,6 +1160,19 @@ private def queueCmd : Cmd := `[Cli|
     queueRetryCmd
 ]
 
+private def migrateHandler (_ : Parsed) : IO UInt32 := do
+  try
+    Migrate.run
+    return 0
+  catch e =>
+    IO.eprintln s!"Migration failed: {e}"
+    return 1
+
+private def migrateCmd : Cmd := `[Cli|
+  migrate VIA migrateHandler; ["0.1.0"]
+  "Migrate configuration and state from ~/.agent/ to XDG directories (~/.config/orchestra/ and ~/.local/share/orchestra/)."
+]
+
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
   IO.eprintln "Use a subcommand. Try 'orchestra --help'."
   return 1
@@ -1194,7 +1196,8 @@ def orchestraCmd : Cmd := `[Cli|
     projectCmd;
     issueCmd;
     spawnCmd;
-    rolesCmd
+    rolesCmd;
+    migrateCmd
 ]
 
 def main (args : List String) : IO UInt32 := do

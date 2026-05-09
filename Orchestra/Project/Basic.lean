@@ -204,22 +204,17 @@ instance : FromJson Issue where
 /-! ## Filesystem layout
 
 ```
-~/.agent/projects/
+~/.local/share/orchestra/projects/
   <project-id>.json              -- Project record
   <project-id>/
     issues/<issue-id>.json       -- Issue record
-    claims/<issue-id>.json       -- Claim lock (separate file: §4 of plan)
+    claims/<issue-id>.json       -- Claim lock
 ```
 -/
 
-private def homeDir : IO System.FilePath := do
-  match ← IO.getEnv "HOME" with
-  | some h => return System.FilePath.mk h
-  | none   => throw (.userError "HOME not set")
-
 /-- Optional override for the projects root directory. Tests set this to a
-    temp directory to avoid touching the user's real `~/.agent/projects`.
-    When `none`, paths are derived from `$HOME` as usual. -/
+    temp directory to avoid touching the user's real projects directory.
+    When `none`, paths are derived from the XDG data base. -/
 initialize projectsDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
 
 def setProjectsDirOverride (p : Option System.FilePath) : IO Unit :=
@@ -228,7 +223,7 @@ def setProjectsDirOverride (p : Option System.FilePath) : IO Unit :=
 def projectsDir : IO System.FilePath := do
   match ← projectsDirOverride.get with
   | some p => return p
-  | none   => return (← homeDir) / ".agent" / "projects"
+  | none   => return (← Dirs.dataBase) / "projects"
 
 def projectDir (pid : ProjectId) : IO System.FilePath := do
   return (← projectsDir) / pid.value

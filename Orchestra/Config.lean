@@ -1,4 +1,5 @@
 import Lean.Data.Json
+import Orchestra.Dirs
 import Orchestra.Project.Id
 
 open Lean (Json FromJson ToJson)
@@ -50,8 +51,8 @@ instance : ToJson TaskMode where
 
 /-- Controls which memory directories are made available to the agent.
     - `none`    – no memory directories
-    - `global`  – global memory only (`~/.agent/memory/`)
-    - `project` – per-project memory only (`~/.agent/memory/<project>/`)
+    - `global`  – global memory only (`<data>/memory/`)
+    - `project` – per-project memory only (`<data>/memory/<project>/`)
     - `both`    – global and per-project memory (default) -/
 inductive MemoryMode where
   | none
@@ -447,31 +448,33 @@ def loadJsonFile (α : Type) [FromJson α] (path : System.FilePath) : IO α := d
     | .ok v => return v
 
 def loadAppConfig (path : Option System.FilePath := none) : IO AppConfig := do
-  let configPath ← expandHome (path.getD "~/.agent/config.json").toString
+  let configPath : System.FilePath ← match path with
+    | some p => expandHome p.toString
+    | none   => do pure ((← Dirs.configBase) / "config.json")
   loadJsonFile AppConfig configPath
 
 def loadTaskFile (path : System.FilePath) : IO TaskFile :=
   loadJsonFile TaskFile path
 
 /--
-Load a system prompt from `~/.agent/prompts/<name>.md`.
+Load a system prompt from the prompts directory (`<config>/prompts/<name>.md`).
 If `name` is `none`, reads `default.md`. Returns `none` if the file does not exist.
 -/
 def loadSystemPrompt (name : Option String := none) : IO (Option String) := do
   let promptName := name.getD "default"
-  let promptPath ← expandHome s!"~/.agent/prompts/{promptName}.md"
+  let promptPath := (← Dirs.configBase) / "prompts" / s!"{promptName}.md"
   if ← promptPath.pathExists then
     return some (← IO.FS.readFile promptPath)
   else
     return none
 
 /--
-Load a prepend prompt from `~/.agent/prompts/<name>.md`.
+Load a prepend prompt from the prompts directory (`<config>/prompts/<name>.md`).
 If `name` is `none`, reads `default-prepend.md`. Returns `none` if the file does not exist.
 -/
 def loadPrependPrompt (name : Option String := none) : IO (Option String) := do
   let promptName := name.getD "default-prepend"
-  let promptPath ← expandHome s!"~/.agent/prompts/{promptName}.md"
+  let promptPath := (← Dirs.configBase) / "prompts" / s!"{promptName}.md"
   if ← promptPath.pathExists then
     return some (← IO.FS.readFile promptPath)
   else

@@ -1,3 +1,5 @@
+import Orchestra.Dirs
+import Orchestra.Migrate
 import Orchestra.AgentDef
 import Orchestra.ConcertManager
 import Orchestra.Agents.Claude

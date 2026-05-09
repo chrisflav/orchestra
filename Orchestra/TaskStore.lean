@@ -124,15 +124,11 @@ instance : FromJson TaskRecord where
 
 -- Directories
 
-def tasksDir : IO System.FilePath := do
-  match ← IO.getEnv "HOME" with
-  | some h => return System.FilePath.mk h / ".agent" / "tasks"
-  | none   => throw (.userError "HOME not set")
+def tasksDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "tasks"
 
-def seriesDir : IO System.FilePath := do
-  match ← IO.getEnv "HOME" with
-  | some h => return System.FilePath.mk h / ".agent" / "series"
-  | none   => throw (.userError "HOME not set")
+def seriesDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "series"
 
 -- ID generation: 16-char lowercase hex from the nanosecond monotonic clock
 

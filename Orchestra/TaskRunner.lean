@@ -157,21 +157,18 @@ private def sanitizeProjectName (upstream : Repository) : String :=
 /-- Return the active memory directories for the given mode and upstream repo.
     Creates the directories if they do not yet exist. -/
 private def resolveMemoryDirs (mode : MemoryMode) (upstream : Repository) : IO (Array String) := do
-  match ← IO.getEnv "HOME" with
-  | none => return #[]
-  | some home =>
-    let memBase := System.FilePath.mk home / ".agent" / "memory"
-    let globalDir  := memBase
-    let projectDir := memBase / sanitizeProjectName upstream
-    let dirs : Array System.FilePath :=
-      match mode with
-      | .none    => #[]
-      | .global  => #[globalDir]
-      | .project => #[projectDir]
-      | .both    => #[globalDir, projectDir]
-    for dir in dirs do
-      IO.FS.createDirAll dir
-    return dirs.map (·.toString)
+  let memBase    := (← Dirs.dataBase) / "memory"
+  let globalDir  := memBase
+  let projectDir := memBase / sanitizeProjectName upstream
+  let dirs : Array System.FilePath :=
+    match mode with
+    | .none    => #[]
+    | .global  => #[globalDir]
+    | .project => #[projectDir]
+    | .both    => #[globalDir, projectDir]
+  for dir in dirs do
+    IO.FS.createDirAll dir
+  return dirs.map (·.toString)
 
 /-- Build a system-prompt addition describing the available memory directories. -/
 private def memorySystemPrompt (memoryDirs : Array String) : Option String :=
@@ -415,13 +412,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
         pure (some ((← TaskStore.tasksDir) / s!"{taskId}{suffix}.debug.jsonl"))
       else pure none
-    -- Structured JSON log: ~/.agent/logs/{fork}/{taskId}.log (always)
     let taskLogFile : Option System.FilePath ← do
-      match ← IO.getEnv "HOME" with
-      | none => pure none
-      | some home =>
-        let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-        pure (some (System.FilePath.mk home / ".agent" / "logs" / ioTask.fork.toString / s!"{taskId}{suffix}.log"))
+      let suffix := if attempt == 0 then "" else s!".retry{attempt}"
+      pure (some ((← Dirs.dataBase) / "logs" / ioTask.fork.toString / s!"{taskId}{suffix}.log"))
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
       (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
       (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
