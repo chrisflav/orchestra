@@ -385,55 +385,9 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       exclude_outdated={excludeOutdated}"
     try
       let response ← GitHub.getPrReviewThreads state.upstream prNumber state.pat
-      let threads :=
-        response.getObjVal? "data"          |>.toOption
-        |>.bind (·.getObjVal? "repository"  |>.toOption)
-        |>.bind (·.getObjVal? "pullRequest" |>.toOption)
-        |>.bind (·.getObjVal? "reviewThreads" |>.toOption)
-        |>.bind (·.getObjVal? "nodes"       |>.toOption)
-        |>.bind (·.getArr?                  |>.toOption)
-        |>.getD #[]
-      let mut lines : Array String := #[]
-      let mut shown := 0
-      let mut filtered := 0
-      for thread in threads do
-        let isResolved := thread.getObjValAs? Bool "isResolved" |>.toOption |>.getD false
-        let isOutdated := thread.getObjValAs? Bool "isOutdated" |>.toOption |>.getD false
-        if unresolvedOnly && isResolved then filtered := filtered + 1; continue
-        if excludeOutdated && isOutdated then filtered := filtered + 1; continue
-        shown := shown + 1
-        let mut tags : Array String := #[]
-        if !isResolved then tags := tags.push "unresolved"
-        if isResolved  then tags := tags.push "resolved"
-        if isOutdated  then tags := tags.push "outdated"
-        let tagStr :=
-          if tags.isEmpty then ""
-          else s!" ({String.join (tags.toList.intersperse ", ")})"
-        lines := lines.push s!"--- Thread {shown}{tagStr}"
-        let comments :=
-          thread.getObjVal? "comments" |>.toOption
-          |>.bind (·.getObjVal? "nodes" |>.toOption)
-          |>.bind (·.getArr?            |>.toOption)
-          |>.getD #[]
-        for comment in comments do
-          let path   := comment.getObjValAs? String "path" |>.toOption |>.getD ""
-          let body   := comment.getObjValAs? String "body" |>.toOption |>.getD ""
-          let author := comment.getObjVal? "author" |>.toOption
-            |>.bind (·.getObjValAs? String "login" |>.toOption)
-            |>.getD "unknown"
-          let lineStr := match comment.getObjValAs? Nat "line" |>.toOption with
-            | some l => s!":{l}"
-            | none   => ""
-          lines := lines.push s!"  @{author} — {path}{lineStr}"
-          for bodyLine in body.splitOn "\n" do
-            lines := lines.push s!"    {bodyLine}"
-        lines := lines.push ""
-      let summary :=
-        if filtered == 0 then s!"({shown} thread(s))"
-        else s!"({shown} thread(s) shown, {filtered} filtered)"
-      lines := lines.push summary
-      log s!"tool get_pr_comments: ok: {shown} threads shown"
-      return toolContent (String.join (lines.toList.intersperse "\n"))
+      let text := GitHub.formatPrReviewThreads response unresolvedOnly excludeOutdated
+      log "tool get_pr_comments: ok"
+      return toolContent text
     catch e =>
       log s!"tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)

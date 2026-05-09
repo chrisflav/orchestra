@@ -1,4 +1,5 @@
 import OrchestraTest.TestM
+import OrchestraTest.GitHubFormatTest
 import OrchestraTest.ListenerConfigTest
 import OrchestraTest.ServerParseTest
 import OrchestraTest.StreamFormatTest
