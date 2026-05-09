@@ -317,11 +317,10 @@ Import and start the container:
 ```
 incus image import incus.tar.xz rootfs.squashfs --alias orchestra
 incus launch orchestra my-orchestra --config security.nesting=true
-incus exec my-orchestra bash
-# nixos-rebuild switch
+incus exec my-orchestra -- nixos-rebuild switch
 ```
 
-The last command installs the software in the container. To login the `orchestra`
+The last command installs the software in the container. To login as the `orchestra`
 user:
 
 ```
