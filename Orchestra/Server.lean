@@ -258,7 +258,7 @@ inductive Request where
 
 -- Parsing
 
-private def parseToolCall (name : String) (args : Json) : ToolCall :=
+def parseToolCall (name : String) (args : Json) : ToolCall :=
   match name with
   | "health" => .health
   | "refresh_token" => .refreshToken
@@ -331,7 +331,7 @@ private def parseToolCall (name : String) (args : Json) : ToolCall :=
 
 /-- Parse a JSON-RPC message into a typed `Request`.
     Returns `none` if the message has no method field. -/
-private def parseRequest (msg : Json) : Option Request :=
+def parseRequest (msg : Json) : Option Request :=
   let id     := msg.getObjVal? "id"     |>.toOption |>.getD .null
   let params := msg.getObjVal? "params" |>.toOption |>.getD (Json.mkObj [])
   match msg.getObjValAs? String "method" |>.toOption with

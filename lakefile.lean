@@ -28,9 +28,5 @@ lean_lib OrchestraTest
 lean_exe orchestra where
   root := `Main
 
-@[default_target]
-lean_exe «orchestra-mcp-test» where
-  root := `McpTest
-
 lean_exe orchestraTest where
   root := `TestDriver
