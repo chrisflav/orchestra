@@ -218,6 +218,22 @@ def splitIssueHappyPath : Test := do
   TestM.assert claimGone            "claim file should be deleted after split"
 
 @[test]
+def releaseClaimAfterAttachPrPreservesInReview : Test := do
+  let status ← (withTempHome do
+    let project ← setupProject
+    let issue ← addOpenIssue project.id
+    let mgr ← ClaimManager.new
+    let env := baseEnv [workIssuesPerm] (mgr := some mgr) (taskId := "T1")
+    let _ ← evalProjectTool env (.claimIssue issue.id)
+    let _ ← evalProjectTool env
+              (.attachPr issue.id { owner := "o", name := "r" } 42 "feature/x")
+    let _ ← evalProjectTool env (.releaseClaim issue.id "done for now")
+    let updated ← loadIssue project.id issue.id
+    return updated.map (·.status))
+  TestM.assertEqual status (some .inReview)
+    (msg := "releasing claim after attach_pr should keep status in_review")
+
+@[test]
 def splitIssueRequiresOwnership : Test := do
   let denied ← (withTempHome do
     let project ← setupProject
