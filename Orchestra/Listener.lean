@@ -739,8 +739,11 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     return #[("", [("output", trimmed)])]
 
   | .projectDispatcher pid caps => do
-    let some _project ← Project.loadProject pid
+    let some project ← Project.loadProject pid
       | IO.eprintln s!"[dispatcher] project {pid.value} not found; skipping"; return #[]
+    if project.isComplete then
+      IO.eprintln s!"[dispatcher] project {pid.value} is complete; skipping"
+      return #[]
     let issues ← Project.loadIssues pid
     let roles  ← Project.loadAllRoles pid
     -- Count active per-role queue entries scoped to this project.

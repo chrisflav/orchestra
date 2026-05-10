@@ -126,6 +126,8 @@ structure Project where
   defaultTarget : Option RepoTarget  := none
   /-- Optional reviewer template (F1). Set to enable auto-review on attach_pr. -/
   reviewer      : Option ReviewerTemplate := none
+  /-- When true, the auto-dispatcher will not spawn any new agents for this project. -/
+  isComplete    : Bool               := false
 deriving Repr, Inhabited
 
 instance : ToJson Project where
@@ -138,6 +140,7 @@ instance : ToJson Project where
     let fields := if let some d := p.description   then fields ++ [("description",    Json.str d)]      else fields
     let fields := if let some t := p.defaultTarget then fields ++ [("default_target", ToJson.toJson t)] else fields
     let fields := if let some r := p.reviewer      then fields ++ [("reviewer",       ToJson.toJson r)] else fields
+    let fields := if p.isComplete                  then fields ++ [("is_complete",    Json.bool true)]  else fields
     Json.mkObj fields
 
 instance : FromJson Project where
@@ -148,7 +151,8 @@ instance : FromJson Project where
     let description   := j.getObjValAs? String "description"      |>.toOption
     let defaultTarget := j.getObjValAs? RepoTarget "default_target" |>.toOption
     let reviewer      := j.getObjValAs? ReviewerTemplate "reviewer" |>.toOption
-    return { id, name, description, createdAt, defaultTarget, reviewer }
+    let isComplete    := (j.getObjValAs? Bool "is_complete" |>.toOption).getD false
+    return { id, name, description, createdAt, defaultTarget, reviewer, isComplete }
 
 /-! ## Issue record
 

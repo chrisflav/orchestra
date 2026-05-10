@@ -48,6 +48,7 @@ inductive ProjectTool where
   | updateIssue      (issueId : IssueId) (title description : Option String)
                      (status : Option IssueStatus) (target : Option RepoTarget)
                      (dependencies : Option (Array IssueId) := none)
+  | completeProject  (projectId : ProjectId) (notes : String)
   -- work_issues
   | listOpenIssues   (projectId : ProjectId) (targetRepo : Option Repository)
   | claimIssue       (issueId : IssueId)
@@ -144,6 +145,17 @@ def toolDefs : List (String × String × Json) :=
                 , ("description", "Replace the dependency list with these issue IDs (issues that must be completed before this one is dispatched)")
                 , ("items", Json.mkObj [("type", "string")]) ]) ]
             ["issue_id"]) ])
+  , (manageIssuesPerm, "complete_project",
+      Json.mkObj
+        [ ("name", "complete_project")
+        , ("description",
+            "Mark a project as complete. Once complete, the auto-dispatcher will no longer " ++
+            "spawn new plan agents or any other role agents for this project. " ++
+            "Use this when all planned work is done and no further issues should be created.")
+        , ("inputSchema", obj
+            [ ("project_id", strProp "Project ID")
+            , ("notes", strProp "Reason or summary for marking the project complete") ]
+            ["project_id", "notes"]) ])
     -- work_issues
   , (workIssuesPerm, "list_open_issues",
       Json.mkObj
@@ -300,6 +312,11 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
       let dependencies : Option (Array IssueId) :=
         args.getObjValAs? (Array String) "dependency_ids" |>.toOption |>.map (·.map (⟨·⟩))
       return .updateIssue ⟨iid⟩ title descr status target dependencies
+  | "complete_project" =>
+    some <| do
+      let pid   ← args.getObjValAs? String "project_id"
+      let notes ← args.getObjValAs? String "notes"
+      return .completeProject ⟨pid⟩ notes
   | "list_open_issues" =>
     some <| do
       let pid ← args.getObjValAs? String "project_id"
@@ -413,8 +430,9 @@ private def issueLine (i : Issue) : String :=
 
 /-- Render a project summary line. -/
 private def projectLine (p : Project) : String :=
-  let target := p.defaultTarget.map renderTarget |>.getD "-"
-  s!"{p.id.value}  {p.name}  default={target}  ({p.createdAt})"
+  let target   := p.defaultTarget.map renderTarget |>.getD "-"
+  let complete := if p.isComplete then "  [complete]" else ""
+  s!"{p.id.value}  {p.name}  default={target}  ({p.createdAt}){complete}"
 
 private def joinLines (xs : Array String) : String :=
   String.join (xs.toList.intersperse "\n")
@@ -505,6 +523,14 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           updatedAt    := now }
       saveIssue updated
       return content s!"updated issue {iid.value}"
+  | .completeProject pid notes =>
+    if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
+    match ← loadProject pid with
+    | none => return content s!"project {pid.value} not found" (isError := true)
+    | some project =>
+      IO.println s!"  [mcp] complete_project: {pid.value} \"{project.name}\" — {notes}"
+      saveProject { project with isComplete := true }
+      return content s!"project {pid.value} marked as complete: {notes}"
   -- ---------------- work_issues ----------------
   | .listOpenIssues pid targetRepo? =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
@@ -696,7 +722,8 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       | some project =>
         let mut lines : Array String := #[
           s!"project_id:   {project.id.value}",
-          s!"project_name: {project.name}"
+          s!"project_name: {project.name}",
+          s!"is_complete:  {project.isComplete}"
         ]
         match env.issueId with
         | none => lines := lines.push "issue:        none"
