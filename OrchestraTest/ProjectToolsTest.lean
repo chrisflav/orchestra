@@ -150,9 +150,8 @@ def decideRejectClearsClaim : Test := do
   TestM.assertEqual status (some .open) (msg := "rejected issue returns to open")
 
 @[test]
-def decideApproveCallsHook : Test := do
-  let (calledRef : IO.Ref Bool) ← IO.mkRef false
-  let (msgOk, wasCalled) ← (withTempHome do
+def decideApproveBlockedWithoutFlag : Test := do
+  let isError ← (withTempHome do
     let project ← setupProject
     let issue ← addOpenIssue project.id
     let mgr ← ClaimManager.new
@@ -161,15 +160,38 @@ def decideApproveCallsHook : Test := do
       , allowedTools := [workIssuesPerm, reviewIssuesPerm]
       , taskId := some "T1"
       , agentBackend := "claude"
-      , enqueueMerger := some (fun _ _ _ => do
-          calledRef.set true; return .ok "merger-task-id") }
+      , canEnqueueMerger := false }
     let _ ← evalProjectTool env (.claimIssue issue.id)
     let _ ← evalProjectTool env
               (.attachPr issue.id { owner := "o", name := "r" } 9 "br")
     let r ← evalProjectTool env (.decideIssue issue.id .approve "lgtm")
-    return (jsonContains r "merger task merger-task-id", ← calledRef.get))
-  TestM.assert msgOk     "decide_issue approve should report enqueued merger"
-  TestM.assert wasCalled "enqueueMerger hook should have been invoked"
+    return jsonContains r "not available")
+  TestM.assert isError "decide_issue approve without canEnqueueMerger should return error"
+
+@[test]
+def decideApproveEnqueuesWhenAllowed : Test := do
+  -- Use a temp data dir so queue entries don't pollute the real data dir.
+  let tmpData : System.FilePath :=
+    System.FilePath.mk "/tmp" / s!"orchestra-enqueue-test-{← IO.monoNanosNow}"
+  IO.FS.createDirAll tmpData
+  Orchestra.Dirs.setDataDirOverride (some tmpData)
+  let msgOk ← try withTempHome do
+    let project ← setupProject
+    let issue ← addOpenIssue project.id
+    let mgr ← ClaimManager.new
+    let env : Env :=
+      { claimManager := some mgr
+      , allowedTools := [workIssuesPerm, reviewIssuesPerm]
+      , taskId := some "T1"
+      , agentBackend := "claude"
+      , canEnqueueMerger := true }
+    let _ ← evalProjectTool env (.claimIssue issue.id)
+    let _ ← evalProjectTool env
+              (.attachPr issue.id { owner := "o", name := "r" } 9 "br")
+    let r ← evalProjectTool env (.decideIssue issue.id .approve "lgtm")
+    return jsonContains r "merger task"
+  finally Orchestra.Dirs.setDataDirOverride none
+  TestM.assert msgOk "decide_issue approve with canEnqueueMerger should report enqueued merger"
 
 @[test]
 def attachPrRequiresOwnership : Test := do

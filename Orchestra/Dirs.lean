@@ -38,8 +38,16 @@ def configBase : IO System.FilePath := do
     return legacy
   return xdgDir
 
+private initialize dataDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
+
+/-- Override the data base directory (for testing). -/
+def setDataDirOverride (p : Option System.FilePath) : IO Unit :=
+  dataDirOverride.set p
+
 /-- Data base: always uses the XDG data dir, no legacy fallback. -/
-def dataBase : IO System.FilePath :=
-  orchestraDataDir
+def dataBase : IO System.FilePath := do
+  match ← dataDirOverride.get with
+  | some p => return p
+  | none   => orchestraDataDir
 
 end Orchestra.Dirs

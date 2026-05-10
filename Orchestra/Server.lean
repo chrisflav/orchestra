@@ -3,15 +3,23 @@ import Std.Internal.UV.TCP
 import Std.Net
 import Orchestra.Config
 import Orchestra.GitHub
+import Orchestra.Monad
 import Orchestra.Project.Tools
+import Orchestra.Monad.SubmitOutput
 
 open Lean (Json)
 open Std.Net
 open Std.Internal.UV.TCP
+open Orchestra (MonadLog MonadGitHubApp MonadGitHub MonadProjectTool MonadSubmitOutput
+  MonadProject MonadClaim MonadTaskStore MonadQueue logError
+  createJWT getInstallationId createInstallationToken setupGhAuth
+  createPullRequest createPullRequestOnRepo getPrReviewThreads createIssueComment
+  replyToPrReviewComment createPrReviewComment createPrReview getPrReviewCommentPrNumber
+  submitOutput)
 
 namespace Orchestra.Server
 
-/-- Mutable state for the server, shared with request handlers. -/
+/-- Immutable configuration for the server, shared with request handlers. -/
 structure State where
   upstream : Repository
   fork : Repository
@@ -29,8 +37,6 @@ structure State where
   outputType : ResultType := .unit
   /-- The task input serialized as JSON. `none` when `inputType = .unit`. -/
   inputJson : Option Json := none
-  /-- Mutable cell where the agent stores its typed output via `submit_task_output`. -/
-  outputRef : Option (IO.Ref (Option Json)) := none
   /-- Issue or PR number this task was launched from. Required for the `comment` tool. -/
   issueNumber : Option Nat := none
   /-- Claim manager handle. Required for `claim_issue` / `release_claim` /
@@ -46,18 +52,93 @@ structure State where
   agentBackend : String := "unknown"
   /-- Series the task belongs to. Recorded with claims. -/
   series : Option String := none
-  /-- Hook that enqueues a merger task, set by the daemon. Plumbed by
-      `Project.Tools.Env` so `decide_issue approve` can request a merge. -/
-  enqueueMerger : Option (Project.ProjectId → Project.IssueId → Project.PRRef →
-                          IO (Except String String)) := none
-  /-- Optional auto-reviewer hook (F1). Plumbed to `Project.Tools.Env.enqueueReviewer`. -/
-  enqueueReviewer : Option (Project.Project → Project.IssueId → Project.PRRef →
-                            Project.ReviewerTemplate → IO (Except String String)) := none
+  /-- Whether `decide_issue approve` is permitted to enqueue a merger task. -/
+  canEnqueueMerger : Bool := false
+  /-- Whether `attach_pr` is permitted to enqueue an auto-reviewer task. -/
+  canEnqueueReviewer : Bool := false
 
-private def log (msg : String) : IO Unit := do
-  let err ← IO.getStderr
-  err.putStrLn s!"[mcp] {msg}"
-  err.flush
+-- Daemon monad
+
+/-- Environment threaded through the daemon's request-handling monad.
+    Holds the output ref used by `MonadSubmitOutput`. -/
+structure DaemonEnv where
+  outputRef : IO.Ref (Option Json)
+
+/-- The concrete monad in which the MCP server handles requests.
+    Wraps `IO` in a reader so `MonadSubmitOutput` can write to the output ref
+    without storing a callback in `State`. -/
+abbrev DaemonM := ReaderT DaemonEnv IO
+
+instance : MonadSubmitOutput DaemonM where
+  submitOutput j := do (← read).outputRef.set (some j)
+
+instance : MonadLog DaemonM where
+  logInfo  msg := liftM (IO.println msg)
+  logError msg := liftM (show IO Unit from do
+    let stderr ← IO.getStderr
+    stderr.putStrLn msg
+    stderr.flush)
+
+instance : MonadGitHubApp DaemonM where
+  createJWT appId keyPath             := liftM (GitHub.createJWT appId keyPath)
+  getInstallationId jwt owner         := liftM (GitHub.getInstallationId jwt owner)
+  createInstallationToken jwt instId  := liftM (GitHub.createInstallationToken jwt instId)
+  setupGhAuth token                   := liftM (GitHub.setupGhAuth token)
+
+instance : MonadGitHub DaemonM where
+  createPullRequest t r ti b h bs          := liftM (GitHub.createPullRequest t r ti b h bs)
+  createPullRequestOnRepo t r ti b h bs    := liftM (GitHub.createPullRequestOnRepo t r ti b h bs)
+  getPrReviewThreads r n t                 := liftM (GitHub.getPrReviewThreads r n t)
+  createIssueComment t r n b               := liftM (GitHub.createIssueComment t r n b)
+  replyToPrReviewComment t r n c b         := liftM (GitHub.replyToPrReviewComment t r n c b)
+  createPrReviewComment t r n p f l b      := liftM (GitHub.createPrReviewComment t r n p f l b)
+  createPrReview t r n b cs               := liftM (GitHub.createPrReview t r n b cs)
+  getPrReviewCommentPrNumber t r n         := liftM (GitHub.getPrReviewCommentPrNumber t r n)
+
+instance : MonadTaskStore DaemonM where
+  saveTask r                  := liftM (TaskStore.saveTask r)
+  loadTask id                 := liftM (TaskStore.loadTask id)
+  loadAllTasks                := liftM TaskStore.loadAllTasks
+  latestInSeries s            := liftM (TaskStore.latestInSeries s)
+  updateSeriesPointer s tid   := liftM (TaskStore.updateSeriesPointer s tid)
+  generateTaskId              := liftM TaskStore.generateId
+  currentIso8601              := liftM TaskStore.currentIso8601
+
+instance : MonadQueue DaemonM where
+  saveEntry e     := liftM (Queue.saveEntry e)
+  loadEntry id    := liftM (Queue.loadEntry id)
+  loadAllEntries  := liftM Queue.loadAllEntries
+  nextPending     := liftM Queue.nextPending
+  writePid pid    := liftM (Queue.writePid pid)
+  readPid         := liftM Queue.readPid
+  deletePid       := liftM Queue.deletePid
+
+instance : MonadProject DaemonM where
+  freshProjectId          := liftM Project.freshProjectId
+  freshIssueId            := liftM Project.freshIssueId
+  saveProject p           := liftM (Project.saveProject p)
+  loadProject pid         := liftM (Project.loadProject pid)
+  loadAllProjects         := liftM Project.loadAllProjects
+  saveIssue i             := liftM (Project.saveIssue i)
+  loadIssue pid iid       := liftM (Project.loadIssue pid iid)
+  loadIssues pid          := liftM (Project.loadIssues pid)
+  findIssue iid           := liftM (Project.findIssue iid)
+  childrenOf pid iid      := liftM (Project.childrenOf pid iid)
+  rootIssues pid          := liftM (Project.rootIssues pid)
+  loadRole pid s          := liftM (Project.loadRole pid s)
+  loadAllRoles pid        := liftM (Project.loadAllRoles pid)
+  roleSearchPaths pid s   := liftM (Project.roleSearchPaths pid s)
+
+instance : MonadClaim DaemonM where
+  loadClaim pid iid                   := liftM (Project.loadClaim pid iid)
+  loadClaims pid                      := liftM (Project.loadClaims pid)
+  tryClaim mgr pid iid tid ag now ser := liftM (Project.tryClaim mgr pid iid tid ag now ser)
+  release mgr pid iid st now          := liftM (Project.release mgr pid iid st now)
+  updateClaimTaskId mgr pid iid tid   := liftM (Project.updateClaimTaskId mgr pid iid tid)
+  forceRelease mgr pid iid            := liftM (Project.forceRelease mgr pid iid)
+
+instance : MonadProjectTool DaemonM where
+  evalProjectTool env call := Project.Tools.evalProjectTool env call
 
 -- JSON-RPC helpers
 
@@ -414,169 +495,170 @@ def parseRequest (msg : Json) : Option Request :=
 
 -- Evaluation
 
-private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
+private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
+    [MonadProjectTool m] [MonadExceptOf IO.Error m] [MonadSubmitOutput m]
+    (state : State) (call : ToolCall) : m Json := do
   match call with
   | .health =>
-    log "tool health"
+    logError "[mcp] tool health"
     return toolContent "ok"
   | .refreshToken =>
-    log "tool refresh_token: creating new installation token"
+    logError "[mcp] tool refresh_token: creating new installation token"
     try
-      let jwt ← GitHub.createJWT state.appId state.privateKeyPath
-      let token ← GitHub.createInstallationToken jwt state.installationId
-      GitHub.setupGhAuth token
-      log "tool refresh_token: ok"
+      let jwt ← createJWT state.appId state.privateKeyPath
+      let token ← createInstallationToken jwt state.installationId
+      setupGhAuth token
+      logError "[mcp] tool refresh_token: ok"
       return toolContent token
     catch e =>
-      log s!"tool refresh_token: error: {e}"
+      logError s!"[mcp] tool refresh_token: error: {e}"
       return toolContent (toString e) (isError := true)
   | .createPr title body head base target =>
     if !state.allowedTools.contains "create_pr" then
-      log "tool create_pr: denied (not in allowed tools)"
+      logError "[mcp] tool create_pr: denied (not in allowed tools)"
       return toolContent "PR creation is not enabled for this task" (isError := true)
     match target with
     | .upstream =>
       if state.pat.isEmpty then
-        log "tool create_pr: error: PAT not configured (target=upstream)"
+        logError "[mcp] tool create_pr: error: PAT not configured (target=upstream)"
         return toolContent
           "github.pat not set in config (required when target=upstream; pass target=\"fork\" to use the App token)"
           (isError := true)
-      log s!"tool create_pr [upstream]: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
+      logError s!"[mcp] tool create_pr [upstream]: {state.fork}:{head} -> \
+        {state.upstream} base={base} title={repr title}"
       try
-        let result ← GitHub.createPullRequest state.pat state.upstream
+        let result ← createPullRequest state.pat state.upstream
           s!"{state.fork.owner}:{head}" base title body
-        log s!"tool create_pr: ok: {result.trimAscii}"
+        logError s!"[mcp] tool create_pr: ok: {result.trimAscii}"
         return toolContent result
       catch e =>
-        log s!"tool create_pr: error: {e}"
+        logError s!"[mcp] tool create_pr: error: {e}"
         return toolContent (toString e) (isError := true)
     | .fork =>
-      log s!"tool create_pr [fork]: {state.fork}:{head} base={base} title={repr title}"
+      logError s!"[mcp] tool create_pr [fork]: {state.fork}:{head} base={base} title={repr title}"
       try
         -- Mint a fresh installation token so the PR is attributed to the
         -- GitHub App, not the PAT owner.
-        let jwt ← GitHub.createJWT state.appId state.privateKeyPath
-        let token ← GitHub.createInstallationToken jwt state.installationId
-        let result ← GitHub.createPullRequestOnRepo token state.fork
+        let jwt ← createJWT state.appId state.privateKeyPath
+        let token ← createInstallationToken jwt state.installationId
+        let result ← createPullRequestOnRepo token state.fork
           head base title body
-        log s!"tool create_pr: ok: {result.trimAscii}"
+        logError s!"[mcp] tool create_pr: ok: {result.trimAscii}"
         return toolContent result
       catch e =>
-        log s!"tool create_pr: error: {e}"
+        logError s!"[mcp] tool create_pr: error: {e}"
         return toolContent (toString e) (isError := true)
   | .getPrComments prNumber unresolvedOnly excludeOutdated =>
-    log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
+    logError s!"[mcp] tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
       exclude_outdated={excludeOutdated}"
     try
-      let response ← GitHub.getPrReviewThreads state.upstream prNumber state.pat
+      let response ← getPrReviewThreads state.upstream prNumber state.pat
       let text := GitHub.formatPrReviewThreads response unresolvedOnly excludeOutdated
-      log "tool get_pr_comments: ok"
+      logError "[mcp] tool get_pr_comments: ok"
       return toolContent text
     catch e =>
-      log s!"tool get_pr_comments: error: {e}"
+      logError s!"[mcp] tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)
   | .comment action =>
     if !state.allowedTools.contains "comment" then
-      log "tool comment: denied (not in allowed tools)"
+      logError "[mcp] tool comment: denied (not in allowed tools)"
       return toolContent "comment tool is not enabled for this task" (isError := true)
     match state.issueNumber with
     | none =>
-      log "tool comment: no issue number configured"
+      logError "[mcp] tool comment: no issue number configured"
       return toolContent "no issue_number configured for this task" (isError := true)
     | some n =>
       match action with
       | .issue body =>
-        log s!"tool comment: posting to {state.upstream}#{n}"
+        logError s!"[mcp] tool comment: posting to {state.upstream}#{n}"
         try
-          let result ← GitHub.createIssueComment state.pat state.upstream n body
-          log "tool comment: ok"
+          let result ← createIssueComment state.pat state.upstream n body
+          logError "[mcp] tool comment: ok"
           return toolContent result
         catch e =>
-          log s!"tool comment: error: {e}"
+          logError s!"[mcp] tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
       | .review body inlineComments =>
-        log s!"tool comment: posting review to {state.upstream}#{n} \
+        logError s!"[mcp] tool comment: posting review to {state.upstream}#{n} \
           ({inlineComments.size} inline comments)"
         try
-          let result ← GitHub.createPrReview state.pat state.upstream n body inlineComments
-          log "tool comment: ok"
+          let result ← createPrReview state.pat state.upstream n body inlineComments
+          logError "[mcp] tool comment: ok"
           return toolContent result
         catch e =>
-          log s!"tool comment: error: {e}"
+          logError s!"[mcp] tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
       | .replyInline body cid =>
-        log s!"tool comment: replying to inline comment {cid} on {state.upstream}#{n}"
+        logError s!"[mcp] tool comment: replying to inline comment {cid} on {state.upstream}#{n}"
         try
-          let cidPr ← GitHub.getPrReviewCommentPrNumber state.pat state.upstream cid
+          let cidPr ← getPrReviewCommentPrNumber state.pat state.upstream cid
           if cidPr ≠ n then
-            log s!"tool comment: comment {cid} belongs to PR #{cidPr}, not #{n}"
+            logError s!"[mcp] tool comment: comment {cid} belongs to PR #{cidPr}, not #{n}"
             return toolContent s!"comment {cid} does not belong to issue #{n}" (isError := true)
-          let result ← GitHub.replyToPrReviewComment state.pat state.upstream n cid body
-          log "tool comment: ok"
+          let result ← replyToPrReviewComment state.pat state.upstream n cid body
+          logError "[mcp] tool comment: ok"
           return toolContent result
         catch e =>
-          log s!"tool comment: error: {e}"
+          logError s!"[mcp] tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
       | .newInline comment =>
-        log s!"tool comment: new inline comment on {state.upstream}#{n} \
+        logError s!"[mcp] tool comment: new inline comment on {state.upstream}#{n} \
           {comment.path}:{comment.line} ({comment.side})"
         try
-          let result ← GitHub.createPrReviewComment state.pat state.upstream n
+          let result ← createPrReviewComment state.pat state.upstream n
             comment.body comment.path comment.line comment.side
-          log "tool comment: ok"
+          logError "[mcp] tool comment: ok"
           return toolContent result
         catch e =>
-          log s!"tool comment: error: {e}"
+          logError s!"[mcp] tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
   | .getTaskInput =>
-    log "tool get_task_input"
+    logError "[mcp] tool get_task_input"
     match state.inputJson with
     | some j => return toolContent j.compress
     | none   => return toolContent "no input available" (isError := true)
   | .submitTaskOutput value =>
-    log s!"tool submit_task_output: {value.compress.take 200}"
-    match state.outputRef with
-    | some ref =>
-      ref.set (some value)
-      return toolContent "output recorded"
-    | none =>
-      return toolContent "output submission not available for this task" (isError := true)
+    logError s!"[mcp] tool submit_task_output: {value.compress.take 200}"
+    submitOutput value
+    return toolContent "output recorded"
   | .project call =>
     let env : Project.Tools.Env :=
-      { claimManager  := state.claimManager
-      , allowedTools  := state.allowedTools
-      , taskId        := state.taskId
-      , agentBackend  := state.agentBackend
-      , series        := state.series
-      , projectId     := state.projectId
-      , issueId       := state.issueId
-      , enqueueMerger   := state.enqueueMerger
-      , enqueueReviewer := state.enqueueReviewer }
-    Project.Tools.evalProjectTool env call
+      { claimManager     := state.claimManager
+      , allowedTools     := state.allowedTools
+      , taskId           := state.taskId
+      , agentBackend     := state.agentBackend
+      , series           := state.series
+      , projectId        := state.projectId
+      , issueId          := state.issueId
+      , canEnqueueMerger   := state.canEnqueueMerger
+      , canEnqueueReviewer := state.canEnqueueReviewer }
+    MonadProjectTool.evalProjectTool env call
   | .unknown name =>
-    log s!"tool {name}: unknown"
+    logError s!"[mcp] tool {name}: unknown"
     return toolContent s!"unknown tool: {name}" (isError := true)
   | .parseError msg =>
-    log s!"tool call error: {msg}"
+    logError s!"[mcp] tool call error: {msg}"
     return toolContent msg (isError := true)
 
 /-- Evaluate a parsed JSON-RPC request. Returns `some` response, or `none` for notifications. -/
-private def evalRequest (state : State) (req : Request) : IO (Option Json) := do
+private def evalRequest [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
+    [MonadProjectTool m] [MonadExceptOf IO.Error m] [MonadSubmitOutput m]
+    (state : State) (req : Request) : m (Option Json) := do
   match req with
   | .initialize id =>
-    log "initialize"
+    logError "[mcp] initialize"
     return some (jsonrpcResult id initializeResult)
   | .initialized =>
-    log "initialized"
+    logError "[mcp] initialized"
     return none
   | .toolsList id =>
-    log "tools/list"
+    logError "[mcp] tools/list"
     return some (jsonrpcResult id (toolsList state))
   | .toolsCall id call =>
     let result ← evalToolCall state call
     return some (jsonrpcResult id result)
   | .unknown id method =>
-    log s!"unknown method: {method}"
+    logError s!"[mcp] unknown method: {method}"
     return some (jsonrpcError id (-32601) s!"method not found: {method}")
 
 -- TCP transport (raw JSON-RPC, newline-delimited)
@@ -593,7 +675,7 @@ Reads newline-delimited JSON messages, dispatches them, and writes responses.
 A line buffer handles the case where a single TCP receive spans multiple messages
 or a message is split across multiple receives.
 -/
-private def handleClient (state : State) (client : Socket) : IO Unit := do
+private def handleClient (state : State) (client : Socket) : DaemonM Unit := do
   let buf ← IO.mkRef ""
   repeat do
     let data? ← awaitTcp (← client.recv? 65536)
@@ -619,7 +701,8 @@ private def handleClient (state : State) (client : Socket) : IO Unit := do
               let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
 
 /-- Start the MCP server. Returns (port, shutdown action). -/
-def start (state : State) : IO (UInt16 × IO Unit) := do
+def start (state : State) (outputRef : IO.Ref (Option Json)) : IO (UInt16 × IO Unit) := do
+  let daemonEnv : DaemonEnv := { outputRef }
   let server ← Socket.new
   let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := 0 }
   server.bind addr
@@ -635,10 +718,10 @@ def start (state : State) : IO (UInt16 × IO Unit) := do
       | .ok client =>
         if !(← running.get) then break
         let _ ← IO.asTask (prio := .dedicated) do
-          log "client connected"
-          try handleClient state client
+          logError "[mcp] client connected"
+          try (handleClient state client).run daemonEnv
           catch _ => pure ()
-          log "client disconnected"
+          logError "[mcp] client disconnected"
   let shutdown : IO Unit := do
     running.set false
     try

@@ -99,31 +99,6 @@ private def runHandler (p : Parsed) : IO UInt32 := do
 
   return (0 : UInt32)
 
-private def mcpServerHandler (p : Parsed) : IO UInt32 := do
-  let upstream ← IO.ofExcept (Repository.parse (p.positionalArg! "upstream" |>.as! String))
-  let fork ← IO.ofExcept (Repository.parse (p.positionalArg! "fork" |>.as! String))
-  let allowPR := p.hasFlag "allow_pr"
-  let configPath := p.flag? "config" |>.map (·.as! String)
-  let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
-  let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let installationId ← match appConfig.installationId with
-    | some id => pure id
-    | none => GitHub.getInstallationId jwt fork.owner
-  let token ← GitHub.createInstallationToken jwt installationId
-  GitHub.setupGhAuth token
-  let serverState : Server.State := {
-    upstream, fork
-    allowedTools := if allowPR then ["create_pr"] else []
-    appId := appConfig.appId
-    privateKeyPath := appConfig.privateKeyPath
-    installationId
-    pat := appConfig.pat
-  }
-  let (port, _shutdown) ← Server.start serverState
-  IO.println s!"MCP server listening on port {port}"
-  repeat do
-    IO.sleep 60000
-  return (0 : UInt32)
 
 private def prepareHandler (p : Parsed) : IO UInt32 := do
   let upstream ← IO.ofExcept (Repository.parse (p.positionalArg! "upstream" |>.as! String))
@@ -943,19 +918,6 @@ private def runCmd' : Cmd := `[Cli|
     "task-file" : String; "Path to the JSON task file"
 ]
 
-private def mcpServerCmd : Cmd := `[Cli|
-  mcp VIA mcpServerHandler; ["0.1.0"]
-  "Start the MCP server and print the port it is listening on."
-
-  FLAGS:
-    c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
-    allow_pr; "Allow the create_pr tool (disabled by default)"
-
-  ARGS:
-    "upstream" : String; "Upstream repository in 'owner/repo' format"
-    "fork" : String; "Fork repository in 'owner/repo' format"
-]
-
 private def prepareCmd : Cmd := `[Cli|
   prepare VIA prepareHandler; ["0.1.0"]
   "Clone the fork and configure the upstream remote."
@@ -1183,54 +1145,23 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let toolsStr    := p.flag? "tools"    |>.map (·.as! String)
   let backend     := p.flag? "backend"  |>.map (·.as! String)
   let model       := p.flag? "model"    |>.map (·.as! String)
-  let budget      := p.flag? "budget"   |>.bind (fun v => parseFloat? (v.as! String)) |>.getD 4.0
+  let budget      := p.flag? "budget"   |>.bind (fun v => parseFloat? (v.as! String))
   let debug       := p.hasFlag "debug"
   let configPath  := p.flag? "config"   |>.map (·.as! String)
   let upstream ← IO.ofExcept (Repository.parse upstreamStr)
   let fork     ← IO.ofExcept (Repository.parse forkStr)
-  let allowedTools : List String := match toolsStr with
-    | none | some "all" => allOptionalTools
-    | some s => s.splitOn ","
+  let tools : Option (List String) := toolsStr.map fun s =>
+    if s == "all" then allOptionalTools else s.splitOn ","
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
-  let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let installationId ← match appConfig.installationId with
-    | some id => pure id
-    | none    => GitHub.getInstallationId jwt fork.owner
-  let token ← GitHub.createInstallationToken jwt installationId
-  GitHub.setupGhAuth token
-  IO.println s!"Cloning/updating {fork}..."
-  let repoPath ← Repo.ensureCloned fork upstream
-  IO.println s!"  Repo at {repoPath}"
-  let backendName := backend.getD "claude"
-  let serverState : Server.State := {
+  let ioTask : IOTask .unit .unit := {
     upstream, fork
-    allowedTools
-    appId          := appConfig.appId
-    privateKeyPath := appConfig.privateKeyPath
-    installationId
-    pat            := appConfig.pat
-    agentBackend   := backendName
+    mode    := .fork
+    prompt  := ""
+    backend, model, budget, tools
   }
-  let (port, shutdown) ← Server.start serverState
-  IO.println s!"  MCP server on port {port}"
-  let agentDef := match backend with
-    | some "pi"       => AgentDef.pi
-    | some "vibe"     => AgentDef.vibe
-    | some "opencode" => AgentDef.opencode
-    | _               => AgentDef.claude
-  let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
-    |>.map (·.extraPorts) |>.getD #[]
-  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName none
-  IO.println "  Launching agent..."
-  let result ← Sandbox.launchAgent agentDef repoPath "" port token
-    (debug := debug) (pluginDirs := appConfig.pluginDirs)
-    (model := model) (budget := budget)
-    (extraEnv := apiKeyEnv) (extraPorts := extraPorts)
-    (additionalPaths := appConfig.additionalSandboxPaths)
+  let (_, _, _) ← TaskRunner.runIOTask appConfig ioTask 0 debug default
     (interactiveAgent := true)
-  IO.println s!"  Agent exited with code {result.exitCode}"
-  shutdown
-  return if result.exitCode == 0 then 0 else 1
+  return 0
 
 private def interactiveCmd : Cmd := `[Cli|
   interactive VIA interactiveHandler; ["0.1.0"]
@@ -1258,7 +1189,6 @@ def orchestraCmd : Cmd := `[Cli|
   SUBCOMMANDS:
     runCmd';
     interactiveCmd;
-    mcpServerCmd;
     prepareCmd;
     cleanupCmd;
     tasksCmd;
