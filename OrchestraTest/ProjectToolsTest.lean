@@ -162,7 +162,7 @@ def decideApproveCallsHook : Test := do
       , taskId := some "T1"
       , agentBackend := "claude"
       , enqueueMerger := some (fun _ _ _ => do
-          calledRef.set true; return .ok "merger-task-id") }
+          calledRef.set true; return "merger-task-id") }
     let _ ← evalProjectTool env (.claimIssue issue.id)
     let _ ← evalProjectTool env
               (.attachPr issue.id { owner := "o", name := "r" } 9 "br")

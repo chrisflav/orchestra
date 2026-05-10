@@ -440,7 +440,8 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         return toolContent
           "github.pat not set in config (required when target=upstream; pass target=\"fork\" to use the App token)"
           (isError := true)
-      logError s!"[mcp] tool create_pr [upstream]: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
+      logError s!"[mcp] tool create_pr [upstream]: {state.fork}:{head} -> \
+        {state.upstream} base={base} title={repr title}"
       try
         let result ← createPullRequest state.pat state.upstream
           s!"{state.fork.owner}:{head}" base title body

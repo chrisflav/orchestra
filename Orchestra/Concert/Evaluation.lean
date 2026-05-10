@@ -3,7 +3,6 @@ import Orchestra.ConcertManager
 import Orchestra.Monad
 import Orchestra.Queue
 import Orchestra.TaskRunner
-import Orchestra.TaskStore
 import Std.Sync
 
 open Lean (Json)
