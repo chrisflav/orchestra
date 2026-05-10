@@ -111,7 +111,7 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
     | none => GitHub.getInstallationId jwt fork.owner
   let token ← GitHub.createInstallationToken jwt installationId
   GitHub.setupGhAuth token
-  let serverState : Server.State := {
+  let serverState : Server.State IO := {
     upstream, fork
     allowedTools := if allowPR then ["create_pr"] else []
     appId := appConfig.appId
@@ -1202,7 +1202,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let repoPath ← Repo.ensureCloned fork upstream
   IO.println s!"  Repo at {repoPath}"
   let backendName := backend.getD "claude"
-  let serverState : Server.State := {
+  let serverState : Server.State IO := {
     upstream, fork
     allowedTools
     appId          := appConfig.appId

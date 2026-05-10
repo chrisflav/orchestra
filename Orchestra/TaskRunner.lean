@@ -340,7 +340,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       Use 'tools' instead (e.g. {repr allowedTools}) and optionally 'read_only: true/false'."
   let inputJson := some (ResultType.valueToJson i input)
   let outputRef ← IO.mkRef (none : Option Lean.Json)
-  let serverState : Server.State := {
+  let serverState : Server.State IO := {
     upstream := ioTask.upstream
     fork := ioTask.fork
     allowedTools
@@ -351,7 +351,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     inputType := i
     outputType := o
     inputJson
-    outputRef := some outputRef
+    submitOutput := some (fun j => outputRef.set (some j))
     issueNumber := ioTask.issueNumber
     claimManager := some globalClaimManager
     taskId := some taskId
