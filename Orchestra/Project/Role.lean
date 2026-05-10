@@ -198,18 +198,20 @@ def loadAllRoles (pid : ProjectId) : IO (Array Role) := do
     for triggers that don't bind to one issue (e.g. planners).
     Supports: {{project_id}}, {{project_name}}, {{instructions}},
     {{issue_id}}, {{issue_title}}, {{target_repo}}, {{target_branch}},
-    {{pr_number}}, {{pr_branch}}, {{pr_repo}}. -/
+    {{pr_number}}, {{pr_branch}}, {{pr_repo}},
+    {{last_review_feedback}} (empty string when no prior rejection exists). -/
 structure RenderVars where
-  projectId    : String
-  projectName  : String
-  instructions : String
-  issueId      : Option String := none
-  issueTitle   : Option String := none
-  targetRepo   : Option String := none
-  targetBranch : Option String := none
-  prNumber     : Option String := none
-  prBranch     : Option String := none
-  prRepo       : Option String := none
+  projectId          : String
+  projectName        : String
+  instructions       : String
+  issueId            : Option String := none
+  issueTitle         : Option String := none
+  targetRepo         : Option String := none
+  targetBranch       : Option String := none
+  prNumber           : Option String := none
+  prBranch           : Option String := none
+  prRepo             : Option String := none
+  lastReviewFeedback : Option String := none
 deriving Repr, Inhabited
 
 /-- Substitute `{{name}}` placeholders. Unknown placeholders are left in place
@@ -223,9 +225,10 @@ def render (tmpl : String) (v : RenderVars) : String :=
     , ("{{issue_title}}",   v.issueTitle.getD "")
     , ("{{target_repo}}",   v.targetRepo.getD "")
     , ("{{target_branch}}", v.targetBranch.getD "")
-    , ("{{pr_number}}",     v.prNumber.getD "")
-    , ("{{pr_branch}}",     v.prBranch.getD "")
-    , ("{{pr_repo}}",       v.prRepo.getD "") ]
+    , ("{{pr_number}}",           v.prNumber.getD "")
+    , ("{{pr_branch}}",           v.prBranch.getD "")
+    , ("{{pr_repo}}",             v.prRepo.getD "")
+    , ("{{last_review_feedback}}", v.lastReviewFeedback.getD "") ]
   subs.foldl (fun acc (k, val) => acc.replace k val) tmpl
 
 /-- Build render vars for a project + optional issue. Pulls the effective
@@ -238,15 +241,17 @@ def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : St
   | some i =>
     let target := effectiveTarget project i
     let pr? := i.attachedPRs.toList.reverse.head?
-    { projectId    := project.id.value
-    , projectName  := project.name
+    let lastFeedback? := i.reviews.toList.reverse.head?.map (·.notes)
+    { projectId          := project.id.value
+    , projectName        := project.name
     , instructions
-    , issueId      := some i.id.value
-    , issueTitle   := some i.title
-    , targetRepo   := target.map (·.repo.toString)
-    , targetBranch := target.map (·.branch)
-    , prNumber     := pr?.map (fun p => toString p.number)
-    , prBranch     := pr?.map (·.branch)
-    , prRepo       := pr?.map (·.repo.toString) }
+    , issueId            := some i.id.value
+    , issueTitle         := some i.title
+    , targetRepo         := target.map (·.repo.toString)
+    , targetBranch       := target.map (·.branch)
+    , prNumber           := pr?.map (fun p => toString p.number)
+    , prBranch           := pr?.map (·.branch)
+    , prRepo             := pr?.map (·.repo.toString)
+    , lastReviewFeedback := lastFeedback? }
 
 end Orchestra.Project
