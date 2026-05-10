@@ -9,7 +9,8 @@ import Orchestra.Project.Tools
 open Lean (Json)
 open Std.Net
 open Std.Internal.UV.TCP
-open Orchestra (logError createJWT getInstallationId createInstallationToken setupGhAuth
+open Orchestra (MonadLog MonadGitHubApp MonadGitHub
+  logError createJWT getInstallationId createInstallationToken setupGhAuth
   createPullRequest createPullRequestOnRepo getPrReviewThreads createIssueComment
   replyToPrReviewComment createPrReviewComment createPrReview getPrReviewCommentPrNumber)
 
@@ -413,7 +414,8 @@ def parseRequest (msg : Json) : Option Request :=
 
 -- Evaluation
 
-private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
+private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
+    [MonadLiftT IO m] (state : State) (call : ToolCall) : m Json := do
   match call with
   | .health =>
     logError "[mcp] tool health"
@@ -537,7 +539,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     logError s!"[mcp] tool submit_task_output: {value.compress.take 200}"
     match state.outputRef with
     | some ref =>
-      ref.set (some value)
+      liftM (ref.set (some value))
       return toolContent "output recorded"
     | none =>
       return toolContent "output submission not available for this task" (isError := true)
@@ -552,7 +554,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       , issueId       := state.issueId
       , enqueueMerger   := state.enqueueMerger
       , enqueueReviewer := state.enqueueReviewer }
-    Project.Tools.evalProjectTool env call
+    liftM (Project.Tools.evalProjectTool env call)
   | .unknown name =>
     logError s!"[mcp] tool {name}: unknown"
     return toolContent s!"unknown tool: {name}" (isError := true)
@@ -561,7 +563,8 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     return toolContent msg (isError := true)
 
 /-- Evaluate a parsed JSON-RPC request. Returns `some` response, or `none` for notifications. -/
-private def evalRequest (state : State) (req : Request) : IO (Option Json) := do
+private def evalRequest [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
+    [MonadLiftT IO m] (state : State) (req : Request) : m (Option Json) := do
   match req with
   | .initialize id =>
     logError "[mcp] initialize"
@@ -593,17 +596,18 @@ Reads newline-delimited JSON messages, dispatches them, and writes responses.
 A line buffer handles the case where a single TCP receive spans multiple messages
 or a message is split across multiple receives.
 -/
-private def handleClient (state : State) (client : Socket) : IO Unit := do
-  let buf ← IO.mkRef ""
+private def handleClient [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
+    [MonadLiftT IO m] (state : State) (client : Socket) : m Unit := do
+  let buf ← liftM (IO.mkRef "")
   repeat do
-    let data? ← awaitTcp (← client.recv? 65536)
+    let data? ← liftM do awaitTcp (← client.recv? 65536)
     match data? with
     | none => return
     | some bytes =>
-      buf.modify (· ++ String.fromUTF8! bytes)
-      let lines := (← buf.get).splitOn "\n"
+      liftM (buf.modify (· ++ String.fromUTF8! bytes))
+      let lines := (← liftM buf.get).splitOn "\n"
       -- All elements except the last are complete lines; the last may be partial.
-      buf.set (lines.getLast?.getD "")
+      liftM (buf.set (lines.getLast?.getD ""))
       for line in lines.dropLast do
         let trimmed := line.trimAscii.toString
         if trimmed.isEmpty then continue
@@ -616,7 +620,7 @@ private def handleClient (state : State) (client : Socket) : IO Unit := do
             match ← evalRequest state req with
             | none => pure ()
             | some response =>
-              let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
+              let _ ← liftM do awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
 
 /-- Start the MCP server. Returns (port, shutdown action). -/
 def start (state : State) : IO (UInt16 × IO Unit) := do
