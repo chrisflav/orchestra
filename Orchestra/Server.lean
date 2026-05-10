@@ -415,7 +415,7 @@ def parseRequest (msg : Json) : Option Request :=
 -- Evaluation
 
 private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
-    [MonadLiftT IO m] (state : State) (call : ToolCall) : m Json := do
+    [MonadLiftT IO m] [MonadExceptOf IO.Error m] (state : State) (call : ToolCall) : m Json := do
   match call with
   | .health =>
     logError "[mcp] tool health"
@@ -564,7 +564,7 @@ private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub 
 
 /-- Evaluate a parsed JSON-RPC request. Returns `some` response, or `none` for notifications. -/
 private def evalRequest [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
-    [MonadLiftT IO m] (state : State) (req : Request) : m (Option Json) := do
+    [MonadLiftT IO m] [MonadExceptOf IO.Error m] (state : State) (req : Request) : m (Option Json) := do
   match req with
   | .initialize id =>
     logError "[mcp] initialize"
@@ -597,7 +597,7 @@ A line buffer handles the case where a single TCP receive spans multiple message
 or a message is split across multiple receives.
 -/
 private def handleClient [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub m]
-    [MonadLiftT IO m] (state : State) (client : Socket) : m Unit := do
+    [MonadLiftT IO m] [MonadExceptOf IO.Error m] (state : State) (client : Socket) : m Unit := do
   let buf ← liftM (IO.mkRef "")
   repeat do
     let data? ← liftM do awaitTcp (← client.recv? 65536)
