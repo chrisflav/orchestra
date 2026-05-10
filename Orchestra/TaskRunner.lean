@@ -396,6 +396,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
+    -- Check if a cancel request arrived during the previous validation run.
+    if let some ct := cancelToken then
+      if (← ct.getCancellationReason) == some .cancel then
+        IO.println "  Cancellation requested, stopping before next attempt."
+        wasCancelled := true
+        break
     RepoConfig.runHook repoPath "before.sh"
     let prompt :=
       if attempt == 0 then baseTaskPrompt
