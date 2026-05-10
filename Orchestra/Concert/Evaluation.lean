@@ -1,11 +1,13 @@
 import Orchestra.Concert.Basic
 import Orchestra.ConcertManager
+import Orchestra.Monad
 import Orchestra.Queue
 import Orchestra.TaskRunner
 import Orchestra.TaskStore
 import Std.Sync
 
 open Lean (Json)
+open Orchestra (generateTaskId currentIso8601 saveEntry readAppConfig)
 
 namespace Orchestra.Concert
 
@@ -53,9 +55,9 @@ mutual
     | .abort   => throw (IO.userError "Concert aborted")
     | .op (.run o t input) k => do
         let spec       := t.toIOTask input
-        let stepKey    ← TaskStore.generateId
+        let stepKey    ← generateTaskId
         let promise    ← ConcertManager.register mgr stepKey
-        let createdAt  ← TaskStore.currentIso8601
+        let createdAt  ← currentIso8601
         let entry : Queue.QueueEntry := {
           id            := stepKey
           createdAt
@@ -81,7 +83,7 @@ mutual
           outputType    := o
           inputJson     := none
         }
-        Queue.saveEntry entry
+        saveEntry entry
         -- Block until the queue worker signals completion (always resolved, safe to use result!)
         let resultJson ← IO.wait promise.result!
         let result :=
@@ -95,7 +97,7 @@ mutual
 end
 
 def evalWithConfig (c : Concert α) : IO α := do
-  let appConfig ← loadAppConfig
+  let appConfig ← readAppConfig none
   eval appConfig false none c
 
 end Orchestra.Concert

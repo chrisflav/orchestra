@@ -1,9 +1,11 @@
 import Lean.Data.Json
+import Orchestra.Monad.Log
+import Orchestra.Monad.TaskStore
 import Orchestra.Project.Basic
 import Orchestra.Project.Claim
-import Orchestra.TaskStore
 
 open Lean (Json FromJson ToJson)
+open Orchestra (logInfo logError currentIso8601)
 
 namespace Orchestra.Project.Tools
 
@@ -375,14 +377,13 @@ structure Env where
   /-- Optional series the task belongs to. Stored alongside the claim. -/
   series : Option String := none
   /-- Hook called by `decideIssue .approve` to enqueue the merger task.
-      Receives (projectId, issueId, prRef). Returning `.ok ()` is success;
-      `.error msg` is surfaced to the agent. -/
-  enqueueMerger : Option (ProjectId → IssueId → PRRef → IO (Except String String)) := none
+      Receives (projectId, issueId, prRef). Throws on failure. -/
+  enqueueMerger : Option (ProjectId → IssueId → PRRef → IO String) := none
   /-- Optional auto-reviewer hook (F1). Called by `attachPr` when the
       project has a `reviewer` template configured. Receives
-      `(project, issueId, prRef, template)`. -/
+      `(project, issueId, prRef, template)`. Throws on failure. -/
   enqueueReviewer : Option
-    (Project → IssueId → PRRef → ReviewerTemplate → IO (Except String String)) := none
+    (Project → IssueId → PRRef → ReviewerTemplate → IO String) := none
   /-- Orchestra project this task belongs to. Used by `project_info`. -/
   projectId : Option ProjectId := none
   /-- Orchestra issue this task is working on. Used by `project_info`. -/
@@ -428,7 +429,7 @@ private def content (text : String) (isError : Bool := false) : Json :=
 /-! ## Evaluator -/
 
 def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
-  let now ← TaskStore.currentIso8601
+  let now ← currentIso8601
   match call with
   -- ---------------- manage_issues ----------------
   | .listProjects =>
@@ -530,11 +531,11 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     match ← findIssue iid with
     | none => return content s!"issue {iid.value} not found" (isError := true)
     | some (project, i) =>
-      IO.println s!"  [mcp] claim_issue: {iid.value} \"{i.title}\""
+      logInfo s!"  [mcp] claim_issue: {iid.value} \"{i.title}\""
       match ← tryClaim mgr project.id iid taskId env.agentBackend now env.series with
       | .acquired _ =>
         let target := (effectiveTarget project i).map renderTarget |>.getD ""
-        IO.println s!"  [mcp] claim_issue: acquired (target={target})"
+        logInfo s!"  [mcp] claim_issue: acquired (target={target})"
         let payload := Json.mkObj
           [ ("ok", true)
           , ("issue_id",     Json.str iid.value)
@@ -542,14 +543,14 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           , ("target",       Json.str target) ]
         return content payload.compress
       | .alreadyClaimed existing =>
-        IO.println s!"  [mcp] claim_issue: already claimed by task {existing.taskId}"
+        logInfo s!"  [mcp] claim_issue: already claimed by task {existing.taskId}"
         let payload := Json.mkObj
           [ ("ok", false)
           , ("error", Json.str "already_claimed")
           , ("held_by_task", Json.str existing.taskId) ]
         return content payload.compress (isError := true)
       | .invalid reason =>
-        IO.println s!"  [mcp] claim_issue: invalid — {reason}"
+        logInfo s!"  [mcp] claim_issue: invalid — {reason}"
         return content s!"invalid claim: {reason}" (isError := true)
   | .releaseClaim iid reason =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
@@ -558,7 +559,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     match ← findIssue iid with
     | none => return content s!"issue {iid.value} not found" (isError := true)
     | some (project, i) =>
-      IO.println s!"  [mcp] release_claim: {iid.value} \"{i.title}\" — {reason}"
+      logInfo s!"  [mcp] release_claim: {iid.value} \"{i.title}\" — {reason}"
       let newStatus := match i.status with
         | .blocked  => .blocked
         | .inReview => .inReview
@@ -581,7 +582,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
             s!"cannot attach PR to {iid.value}: held by task {claim.taskId}, not this task"
             (isError := true)
         else
-          IO.println s!"  [mcp] attach_pr: {iid.value} \"{i.title}\" ← {repo}#{number} (branch {branch})"
+          logInfo s!"  [mcp] attach_pr: {iid.value} \"{i.title}\" ← {repo}#{number} (branch {branch})"
           let pr : PRRef := { repo, number, branch, taskId := env.taskId }
           let updated : Issue :=
             { i with
@@ -592,13 +593,13 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           -- F1: if the project configures an auto-reviewer, enqueue it now.
           let reviewerNote ← match project.reviewer, env.enqueueReviewer with
             | some tmpl, some hook =>
-              match ← hook project iid pr tmpl with
-              | .ok rid    =>
-                IO.println s!"  [mcp] attach_pr: reviewer task {rid} enqueued"
+              try
+                let rid ← hook project iid pr tmpl
+                logInfo s!"  [mcp] attach_pr: reviewer task {rid} enqueued"
                 pure s!"; reviewer task {rid} enqueued"
-              | .error msg =>
-                IO.println s!"  [mcp] attach_pr: reviewer enqueue failed — {msg}"
-                pure s!"; reviewer enqueue failed: {msg}"
+              catch e =>
+                logInfo s!"  [mcp] attach_pr: reviewer enqueue failed — {toString e}"
+                pure s!"; reviewer enqueue failed: {toString e}"
             | _, _ => pure ""
           return content
             s!"attached {repo}#{number} to {iid.value}; issue moved to in_review{reviewerNote}"
@@ -611,7 +612,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     match ← findIssue parentId with
     | none => return content s!"issue {parentId.value} not found" (isError := true)
     | some (project, parent) =>
-      IO.println s!"  [mcp] split_issue: {parentId.value} \"{parent.title}\" → {children.size} sub-issues — {reason}"
+      logInfo s!"  [mcp] split_issue: {parentId.value} \"{parent.title}\" → {children.size} sub-issues — {reason}"
       -- Caller must already hold the claim on this parent. We don't allow
       -- workers to split issues they don't own — that would let a stray
       -- agent rearrange someone else's work.
@@ -635,7 +636,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
               , target := spec.target <|> inheritedTarget
               , createdAt := now, updatedAt := now }
             saveIssue issue
-            IO.println s!"  [mcp] split_issue: created sub-issue {iid.value} \"{spec.title}\""
+            logInfo s!"  [mcp] split_issue: created sub-issue {iid.value} \"{spec.title}\""
             createdIds := createdIds.push iid.value
           -- Move parent to .blocked and clear the claim. We don't reuse
           -- `release` here because it sets status unconditionally; we want
@@ -662,7 +663,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     | none => return content s!"issue {iid.value} not found" (isError := true)
     | some (project, i) =>
       let decisionStr := match decision with | .approve => "approve" | .reject => "reject"
-      IO.println s!"  [mcp] decide_issue: {iid.value} \"{i.title}\" → {decisionStr} — {notes}"
+      logInfo s!"  [mcp] decide_issue: {iid.value} \"{i.title}\" → {decisionStr} — {notes}"
       match decision with
       | .reject =>
         -- Move back to .open and clear any claim. Notes are echoed back; the
@@ -671,7 +672,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           let _ ← release mgr project.id iid .open now
         else
           saveIssue { i with status := .open, updatedAt := now }
-        IO.println s!"  [mcp] decide_issue: {iid.value} moved to open"
+        logInfo s!"  [mcp] decide_issue: {iid.value} moved to open"
         return content s!"rejected {iid.value}: {notes}"
       | .approve =>
         match i.attachedPRs.toList.reverse with
@@ -681,13 +682,14 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           | none =>
             return content "merger enqueue hook not configured" (isError := true)
           | some hook =>
-            match ← hook project.id iid pr with
-            | .error msg => return content s!"failed to enqueue merger: {msg}" (isError := true)
-            | .ok mergerTaskId =>
-              IO.println s!"  [mcp] decide_issue: {iid.value} approved; merger task {mergerTaskId} enqueued"
+            try
+              let mergerTaskId ← hook project.id iid pr
+              logInfo s!"  [mcp] decide_issue: {iid.value} approved; merger task {mergerTaskId} enqueued"
               return content s!"approved {iid.value}; merger task {mergerTaskId} enqueued ({notes})"
+            catch e =>
+              return content s!"failed to enqueue merger: {toString e}" (isError := true)
   | .projectInfo =>
-    IO.println "  [mcp] project_info"
+    logInfo "  [mcp] project_info"
     match env.projectId with
     | none => return content "this task is not attached to a project" (isError := true)
     | some pid =>

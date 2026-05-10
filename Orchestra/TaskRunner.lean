@@ -5,6 +5,7 @@ import Orchestra.Agents.Opencode
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
 import Orchestra.GitHub
+import Orchestra.Monad
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.Sandbox
@@ -25,25 +26,23 @@ initialize globalClaimManager : Project.ClaimManager ← Project.ClaimManager.ne
 
 /-- Enqueue a merger task for `pr` so the queue daemon will merge it later.
     Used by `decide_issue approve` via the `enqueueMerger` hook. Returns the
-    new queue entry's ID on success. -/
-def enqueueMergerImpl (pid : Project.ProjectId) (iid : Project.IssueId)
-    (pr : Project.PRRef) : IO (Except String String) := do
-  try
-    let id ← TaskStore.generateId
-    let createdAt ← TaskStore.currentIso8601
-    let entry : Queue.QueueEntry :=
-      { id, createdAt
-      , upstream := pr.repo, fork := pr.repo
-      , mode := .pr
-      , prompt := s!"merge {pr.repo}#{pr.number}"
-      , backend := some "merger"
-      , projectId := some pid
-      , issueId := some iid
-      , priority := 100 }
-    Queue.saveEntry entry
-    return .ok id
-  catch e =>
-    return .error (toString e)
+    new queue entry's ID. -/
+def enqueueMergerImpl [Monad m] [MonadTaskStore m] [MonadQueue m]
+    (pid : Project.ProjectId) (iid : Project.IssueId)
+    (pr : Project.PRRef) : m String := do
+  let id ← generateTaskId
+  let createdAt ← currentIso8601
+  let entry : Queue.QueueEntry :=
+    { id, createdAt
+    , upstream := pr.repo, fork := pr.repo
+    , mode := .pr
+    , prompt := s!"merge {pr.repo}#{pr.number}"
+    , backend := some "merger"
+    , projectId := some pid
+    , issueId := some iid
+    , priority := 100 }
+  saveEntry entry
+  return id
 
 /-- Render the reviewer prompt template with the PR / issue context. -/
 private def renderReviewerPrompt (tmpl : String) (pr : Project.PRRef) (iid : Project.IssueId)
@@ -55,28 +54,26 @@ private def renderReviewerPrompt (tmpl : String) (pr : Project.PRRef) (iid : Pro
 
 /-- Enqueue a reviewer task for `pr` against `tmpl`. Used by `attach_pr` via
     the `enqueueReviewer` hook when a project has a `reviewer` template. -/
-def enqueueReviewerImpl (project : Project.Project) (iid : Project.IssueId)
-    (pr : Project.PRRef) (tmpl : Project.ReviewerTemplate) : IO (Except String String) := do
-  try
-    let id ← TaskStore.generateId
-    let createdAt ← TaskStore.currentIso8601
-    let entry : Queue.QueueEntry :=
-      { id, createdAt
-      , upstream := pr.repo, fork := pr.repo
-      , mode := .pr
-      , prompt := renderReviewerPrompt tmpl.promptTemplate pr iid
-      , backend := tmpl.backend
-      , projectId := some project.id
-      , issueId := some iid
-      -- The reviewer needs review tools but should also be able to comment / read PRs.
-      , tools := some ["review_issues", "comment", "get_pr_comments"]
-      , readOnly := true
-      , issueNumber := some pr.number
-      , priority := 50 }
-    Queue.saveEntry entry
-    return .ok id
-  catch e =>
-    return .error (toString e)
+def enqueueReviewerImpl [Monad m] [MonadTaskStore m] [MonadQueue m]
+    (project : Project.Project) (iid : Project.IssueId)
+    (pr : Project.PRRef) (tmpl : Project.ReviewerTemplate) : m String := do
+  let id ← generateTaskId
+  let createdAt ← currentIso8601
+  let entry : Queue.QueueEntry :=
+    { id, createdAt
+    , upstream := pr.repo, fork := pr.repo
+    , mode := .pr
+    , prompt := renderReviewerPrompt tmpl.promptTemplate pr iid
+    , backend := tmpl.backend
+    , projectId := some project.id
+    , issueId := some iid
+    -- The reviewer needs review tools but should also be able to comment / read PRs.
+    , tools := some ["review_issues", "comment", "get_pr_comments"]
+    , readOnly := true
+    , issueNumber := some pr.number
+    , priority := 50 }
+  saveEntry entry
+  return id
 
 /-- Run a merger task: checkout the PR branch, run the validation script, then
     shell out to `gh pr merge`. If validation fails the issue is marked
@@ -84,7 +81,7 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Project.IssueId)
     MCP path. Used when `ioTask.backend = some "merger"`. -/
 private def runMerger {i o : ResultType} (ioTask : IOTask i o)
     (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord) : IO Unit := do
-  IO.println "  [merger] merge backend"
+  logInfo "  [merger] merge backend"
   let some pid := ioTask.projectId
     | throw (.userError "merger task missing project_id")
   let some iid := ioTask.issueId
@@ -95,7 +92,7 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
     | throw (.userError s!"merger: issue {iid.value} has no attached PRs")
   let prRef := s!"{pr.repo}#{pr.number}"
   -- Checkout the PR branch in the shared repo clone.
-  IO.println s!"  [merger] gh pr checkout {pr.number}"
+  logInfo s!"  [merger] gh pr checkout {pr.number}"
   let coChild ← IO.Process.spawn
     { cmd := "gh"
       args := #["pr", "checkout", toString pr.number, "--repo", pr.repo.toString]
@@ -106,22 +103,22 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
   let coStderr ← coChild.stderr.readToEnd
   let coExit ← coChild.wait
   if coExit != 0 then
-    IO.eprintln s!"  [merger] pr checkout failed:\n{coStderr}"
+    logError s!"  [merger] pr checkout failed:\n{coStderr}"
     throw (.userError "pr checkout failed")
   -- Run the validation script before merging.
-  IO.println "  [merger] running validation script"
+  logInfo "  [merger] running validation script"
   let (valid, validOutput) ← RepoConfig.runValidation repoPath
   if !validOutput.isEmpty then
-    IO.println s!"  [merger] validation output:\n{validOutput}"
+    logInfo s!"  [merger] validation output:\n{validOutput}"
   if !valid then
-    IO.eprintln s!"  [merger] validation failed for {prRef}, rejecting"
-    let now ← TaskStore.currentIso8601
+    logError s!"  [merger] validation failed for {prRef}, rejecting"
+    let now ← currentIso8601
     Project.saveIssue { issue with status := .rejected, updatedAt := now }
     let _ ← Project.forceRelease globalClaimManager pid iid
-    TaskStore.saveTask { initialRecord with status := .failed }
+    saveTask { initialRecord with status := .failed }
     throw (.userError s!"validation failed for {prRef}")
   -- Validation passed: merge the PR.
-  IO.println s!"  [merger] gh pr merge {prRef}"
+  logInfo s!"  [merger] gh pr merge {prRef}"
   let mergeChild ← IO.Process.spawn
     { cmd := "gh"
       args := #["pr", "merge", toString pr.number, "--repo", pr.repo.toString, "--squash", "--delete-branch"]
@@ -130,16 +127,16 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
   let mergeOut ← mergeChild.stdout.readToEnd
   let mergeErr ← mergeChild.stderr.readToEnd
   let mergeExit ← mergeChild.wait
-  let now ← TaskStore.currentIso8601
+  let now ← currentIso8601
   if mergeExit != 0 then
-    IO.eprintln s!"  [merger] gh pr merge failed (exit {mergeExit}):\n{mergeErr}"
+    logError s!"  [merger] gh pr merge failed (exit {mergeExit}):\n{mergeErr}"
     -- Leave the issue in .inReview so the reviewer can rerun the merger or re-decide.
-    TaskStore.saveTask { initialRecord with status := .failed }
+    saveTask { initialRecord with status := .failed }
     throw (.userError s!"gh pr merge {prRef} failed")
-  IO.println s!"  [merger] merged {prRef}\n{mergeOut}"
+  logInfo s!"  [merger] merged {prRef}\n{mergeOut}"
   Project.saveIssue { issue with status := .completed, updatedAt := now }
   let _ ← Project.forceRelease globalClaimManager pid iid
-  TaskStore.saveTask { initialRecord with status := .completed }
+  saveTask { initialRecord with status := .completed }
   -- If this issue has a parent that is blocked, check whether all siblings
   -- are now completed and unblock the parent if so.
   if let some parentId := issue.parentId then
@@ -147,9 +144,9 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
       if parent.status == .blocked then
         let siblings ← Project.childrenOf pid parentId
         if siblings.all (·.status == .completed) then
-          let now2 ← TaskStore.currentIso8601
+          let now2 ← currentIso8601
           Project.saveIssue { parent with status := .open, updatedAt := now2 }
-          IO.println s!"  [merger] all children of {parentId.value} completed; unblocked → open"
+          logInfo s!"  [merger] all children of {parentId.value} completed; unblocked → open"
 
 private def sanitizeProjectName (upstream : Repository) : String :=
   s!"{upstream.owner}-{upstream.name}"
@@ -229,7 +226,7 @@ def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
     -- Validate label uniqueness (warn on duplicates)
     let dupeCount := agentAuth.authSources.filter (fun s => s.label == label) |>.size
     if dupeCount > 1 then
-      IO.eprintln s!"  Warning: duplicate auth source label '{label}' for backend '{backendName}'"
+      logError s!"  Warning: duplicate auth source label '{label}' for backend '{backendName}'"
     -- Find the source with the matching label
     match agentAuth.authSources.find? (fun s => s.label == label) with
     | none => throw (.userError
@@ -248,15 +245,15 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (cancelToken : Option Std.CancellationToken := none)
     (interactive : Bool := true)
     (interactiveAgent : Bool := false) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
-  IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
+  logInfo s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
   -- one ID at enqueue time and the task gets a second ID here at run time,
   -- requiring the pre-claim retag in `updateClaimTaskId`. The fix is to
   -- pre-assign the task ID on the queue entry and pass it in instead of
   -- generating a new one, making `entry.taskId : Option String` redundant.
-  let taskId ← TaskStore.generateId
-  let createdAt ← TaskStore.currentIso8601
+  let taskId ← generateTaskId
+  let createdAt ← currentIso8601
   let initialRecord : TaskStore.TaskRecord := {
     id := taskId, createdAt
     upstream := ioTask.upstream, fork := ioTask.fork, mode := ioTask.mode
@@ -268,7 +265,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     issueId   := ioTask.issueId
     role      := ioTask.role
   }
-  TaskStore.saveTask initialRecord
+  saveTask initialRecord
   -- If this task was pre-claimed (daemon wrote the claim with the queue-entry
   -- ID before we ran), retag the claim with the real generated taskId so that
   -- ownership checks in attach_pr / split_issue pass.
@@ -278,58 +275,58 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let initialResume : Option String ← match continuesFrom with
     | none => pure none
     | some prevId =>
-      match ← TaskStore.loadTask prevId with
+      match ← loadTask prevId with
       | none =>
-        IO.eprintln s!"  Warning: task '{prevId}' not found, ignoring --continues"
+        logError s!"  Warning: task '{prevId}' not found, ignoring --continues"
         pure none
       | some prev => pure prev.sessionId
   -- Diagnostic block: surface the context the agent is starting with so the
   -- daemon log shows project/issue/series/resume info without having to grep
   -- the per-task .log file. Kept compact: prompt is dumped verbatim, but the
   -- prepend-prompt is shown by name only (its body is loaded later).
-  IO.println s!"  Task ID: {taskId}"
+  logInfo s!"  Task ID: {taskId}"
   match ioTask.projectId with
   | none     => pure ()
   | some pid =>
     match ← Project.loadProject pid with
-    | some pr => IO.println s!"  Project: {pid.value} ({pr.name})"
-    | none    => IO.println s!"  Project: {pid.value} (not found)"
+    | some pr => logInfo s!"  Project: {pid.value} ({pr.name})"
+    | none    => logInfo s!"  Project: {pid.value} (not found)"
   match ioTask.issueId, ioTask.projectId with
   | some iid, some pid =>
     match ← Project.loadIssue pid iid with
-    | some i => IO.println s!"  Issue:   {iid.value} ({i.title})"
-    | none   => IO.println s!"  Issue:   {iid.value} (not found)"
-  | some iid, none => IO.println s!"  Issue:   {iid.value}"
+    | some i => logInfo s!"  Issue:   {iid.value} ({i.title})"
+    | none   => logInfo s!"  Issue:   {iid.value} (not found)"
+  | some iid, none => logInfo s!"  Issue:   {iid.value}"
   | none,     _    => pure ()
   match continuesFrom, initialResume with
   | some prevId, some sid =>
-      IO.println s!"  Resuming task {prevId} (session {sid})"
+      logInfo s!"  Resuming task {prevId} (session {sid})"
   | some prevId, none =>
-      IO.println s!"  Resuming task {prevId} (no session id recorded)"
+      logInfo s!"  Resuming task {prevId} (no session id recorded)"
   | none,        _    => pure ()
   match series with
-  | some s => IO.println s!"  Series:  {s}"
+  | some s => logInfo s!"  Series:  {s}"
   | none   => pure ()
   match ioTask.prependPrompt with
-  | some name => IO.println s!"  Prepend prompt: {name}"
+  | some name => logInfo s!"  Prepend prompt: {name}"
   | none      => pure ()
-  IO.println "  Prompt:"
+  logInfo "  Prompt:"
   for line in ioTask.prompt.splitOn "\n" do
-    IO.println s!"    {line}"
+    logInfo s!"    {line}"
   -- 1. Create GitHub App token
-  IO.println "  Creating GitHub App token..."
-  let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
+  logInfo "  Creating GitHub App token..."
+  let jwt ← createJWT appConfig.appId appConfig.privateKeyPath
   let forkOwner := ioTask.fork.owner
   let installationId ← match appConfig.installationId with
     | some id => pure id
-    | none => GitHub.getInstallationId jwt forkOwner
-  let token ← GitHub.createInstallationToken jwt installationId
-  GitHub.setupGhAuth token
-  IO.println "  Token ready"
+    | none => getInstallationId jwt forkOwner
+  let token ← createInstallationToken jwt installationId
+  setupGhAuth token
+  logInfo "  Token ready"
   -- 2. Clone / update repo
-  IO.println s!"Cloning/updating {ioTask.fork}..."
+  logInfo s!"Cloning/updating {ioTask.fork}..."
   let repoPath ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive
-  IO.println s!"  Repo at {repoPath}"
+  logInfo s!"  Repo at {repoPath}"
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
   -- clone setup with all other backends but skips the MCP server and agent.
   if ioTask.backend == some "merger" then
@@ -339,7 +336,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
   let (allowedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
   if usingModeFallback then
-    IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
+    logError s!"  Deprecation warning: the 'mode' field is deprecated. \
       Use 'tools' instead (e.g. {repr allowedTools}) and optionally 'read_only: true/false'."
   let inputJson := some (ResultType.valueToJson i input)
   let outputRef ← IO.mkRef (none : Option Lean.Json)
@@ -366,12 +363,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     enqueueReviewer := some enqueueReviewerImpl
   }
   let (port, shutdown) ← Server.start serverState
-  IO.println s!"  MCP server on port {port}"
+  logInfo s!"  MCP server on port {port}"
   -- 4. Run init hook and load per-repository config
   RepoConfig.runInitIfNeeded repoPath
   let repoConfig ← RepoConfig.loadRepoConfig repoPath
   -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
-  let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
+  let baseSystemPrompt ← readSystemPrompt ioTask.systemPrompt
   -- 5a. Resolve memory directories and amend system prompt
   let memoryDirs ← resolveMemoryDirs ioTask.memory ioTask.upstream
   let systemPrompt :=
@@ -381,7 +378,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     | none,    some mp => some mp
     | some sp, some mp => some (sp ++ "\n\n" ++ mp)
   -- 5b. Load prepend prompt and apply to task prompt
-  let prependPrompt ← loadPrependPrompt ioTask.prependPrompt
+  let prependPrompt ← readPrependPrompt ioTask.prependPrompt
   let baseTaskPrompt :=
     match prependPrompt with
     | none    => ioTask.prompt
@@ -398,7 +395,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       if attempt == 0 then baseTaskPrompt
       else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
     let resume := if attempt == 0 then initialResume else sessionId
-    IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
+    logInfo s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
     let agentDef := match ioTask.backend with
       | some "pi"       => AgentDef.pi
       | some "vibe"     => AgentDef.vibe
@@ -424,34 +421,34 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
       (additionalPaths := appConfig.additionalSandboxPaths)
       (interactiveAgent := interactiveAgent)
-    IO.println s!"  Agent exited with code {result.exitCode}"
+    logInfo s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     lastResultSubtype := result.resultSubtype
     if interactiveAgent then
       break
     if result.wasCancelled then
-      IO.println "  Agent was cancelled."
+      logInfo "  Agent was cancelled."
       wasCancelled := true
       break
     if result.usageLimitHit then
-      IO.println "  Agent hit usage limit."
+      logInfo "  Agent hit usage limit."
       usageLimitHit := true
       break
     if !(← RepoConfig.hasValidationScript repoPath) then
-      IO.println "  No validation script found, skipping validation."
+      logInfo "  No validation script found, skipping validation."
       break
-    IO.println "  Running validation script..."
+    logInfo "  Running validation script..."
     let (valid, validationOutput) ← RepoConfig.runValidation repoPath
     lastValidationOutput := validationOutput
     if !validationOutput.isEmpty then
-      IO.println s!"  Validation output:\n{validationOutput}"
+      logInfo s!"  Validation output:\n{validationOutput}"
     if valid then
-      IO.println "  Validation passed."
+      logInfo "  Validation passed."
       break
     if attempt + 1 < maxAttempts then
-      IO.println s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
+      logInfo s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
     else
-      IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
+      logError s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
   -- 6. Run after hook and shut down MCP server
   RepoConfig.runHook repoPath "after.sh"
   shutdown
@@ -463,7 +460,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | some .errorMaxBudgetUsd => .unfinished
       | some (.error _)         => .failed
       | _                       => if usageLimitHit then .unfinished else .completed
-  TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
+  saveTask { initialRecord with sessionId, status := finalStatus }
   -- Release the orchestra-issue claim on terminal status. If the worker
   -- already moved the issue to .inReview via attach_pr, leave that status
   -- alone and only delete the lock file (forceRelease). Otherwise hand the
@@ -472,7 +469,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   | some _pid, some iid =>
     match ← Project.findIssue iid with
     | some (project, issue) =>
-      let now ← TaskStore.currentIso8601
+      let now ← currentIso8601
       let succeeded := finalStatus matches .completed
       if succeeded && issue.status == .inReview then
         let _ ← Project.forceRelease globalClaimManager project.id iid
@@ -481,8 +478,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     | none => pure ()
   | _, _ => pure ()
   if let some seriesName := series then
-    TaskStore.updateSeriesPointer seriesName taskId
-  IO.println s!"=== Task {idx} done ===\n"
+    updateSeriesPointer seriesName taskId
+  logInfo s!"=== Task {idx} done ===\n"
   let outputJson ← outputRef.get
   let typedOutput : Option o.Type ← do
     match outputJson with
@@ -491,7 +488,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       match ResultType.valueFromJson o j with
       | .ok v    => pure (some v)
       | .error e =>
-        IO.eprintln s!"  Warning: failed to parse task output: {e}"
+        logError s!"  Warning: failed to parse task output: {e}"
         pure none
   return ((taskId, usageLimitHit), typedOutput, outputJson)
 
