@@ -12,8 +12,7 @@ open Std.Internal.UV.TCP
 open Orchestra (MonadLog MonadGitHubApp MonadGitHub MonadProjectTool
   logError createJWT getInstallationId createInstallationToken setupGhAuth
   createPullRequest createPullRequestOnRepo getPrReviewThreads createIssueComment
-  replyToPrReviewComment createPrReviewComment createPrReview getPrReviewCommentPrNumber
-  evalProjectTool)
+  replyToPrReviewComment createPrReviewComment createPrReview getPrReviewCommentPrNumber)
 
 namespace Orchestra.Server
 
@@ -561,7 +560,7 @@ private def evalToolCall [Monad m] [MonadLog m] [MonadGitHubApp m] [MonadGitHub 
       , issueId       := state.issueId
       , enqueueMerger   := state.enqueueMerger
       , enqueueReviewer := state.enqueueReviewer }
-    evalProjectTool env call
+    MonadProjectTool.evalProjectTool env call
   | .unknown name =>
     logError s!"[mcp] tool {name}: unknown"
     return toolContent s!"unknown tool: {name}" (isError := true)
