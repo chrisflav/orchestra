@@ -834,6 +834,8 @@ private def listenerListHandler (_ : Parsed) : IO UInt32 := do
 
 private def listenerEnableHandler (p : Parsed) : IO UInt32 := do
   let name := p.positionalArg! "name" |>.as! String
+  let some _ ← Listener.loadListenerConfig name
+    | IO.eprintln s!"Listener '{name}' not found"; return 1
   let state ← Listener.loadListenerState name
   Listener.saveListenerState name { state with enabled := true }
   IO.println s!"Listener '{name}': enabled (takes effect on next tick)"
@@ -841,6 +843,8 @@ private def listenerEnableHandler (p : Parsed) : IO UInt32 := do
 
 private def listenerDisableHandler (p : Parsed) : IO UInt32 := do
   let name := p.positionalArg! "name" |>.as! String
+  let some _ ← Listener.loadListenerConfig name
+    | IO.eprintln s!"Listener '{name}' not found"; return 1
   let state ← Listener.loadListenerState name
   Listener.saveListenerState name { state with enabled := false }
   IO.println s!"Listener '{name}': disabled (takes effect on next tick)"
