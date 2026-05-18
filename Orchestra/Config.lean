@@ -447,11 +447,46 @@ def loadJsonFile (α : Type) [FromJson α] (path : System.FilePath) : IO α := d
     | .error e => throw (.userError s!"{path}: {e}")
     | .ok v => return v
 
+/-- Load `secrets.json` from the config base directory.
+    Returns a list of `(key, value)` pairs for use in template substitution.
+    If the file does not exist the empty list is returned silently. -/
+def loadSecrets : IO (List (String × String)) := do
+  let path := (← Dirs.configBase) / "secrets.json"
+  if !(← path.pathExists) then return []
+  let contents ← IO.FS.readFile path
+  match Json.parse contents with
+  | .error e => throw (.userError s!"{path}: JSON parse error: {e}")
+  | .ok j =>
+    match j with
+    | .obj kvs =>
+      let pairs ← kvs.toList.mapM fun (k, v) => do
+        match v with
+        | .str s => return (k, s)
+        | _ => throw (.userError s!"{path}: secret '{k}' must be a string")
+      return pairs
+    | _ => throw (.userError s!"{path}: expected a JSON object")
+
+/-- Replace every `{{key}}` occurrence in `text` with the corresponding secret value. -/
+def applySecrets (secrets : List (String × String)) (text : String) : String :=
+  secrets.foldl (fun acc (k, v) => acc.replace ("{{" ++ k ++ "}}") v) text
+
+/-- Like `loadJsonFile` but substitutes `{{key}}` patterns from `secrets` before parsing. -/
+def loadJsonFileWithSecrets (α : Type) [FromJson α] (path : System.FilePath)
+    (secrets : List (String × String)) : IO α := do
+  let contents := applySecrets secrets (← IO.FS.readFile path)
+  match Json.parse contents with
+  | .error e => throw (.userError s!"{path}: JSON parse error: {e}")
+  | .ok j =>
+    match FromJson.fromJson? j with
+    | .error e => throw (.userError s!"{path}: {e}")
+    | .ok v => return v
+
 def loadAppConfig (path : Option System.FilePath := none) : IO AppConfig := do
   let configPath : System.FilePath ← match path with
     | some p => expandHome p.toString
     | none   => do pure ((← Dirs.configBase) / "config.json")
-  loadJsonFile AppConfig configPath
+  let secrets ← loadSecrets
+  loadJsonFileWithSecrets AppConfig configPath secrets
 
 def loadTaskFile (path : System.FilePath) : IO TaskFile :=
   loadJsonFile TaskFile path

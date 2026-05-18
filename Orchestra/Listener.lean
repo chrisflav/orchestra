@@ -277,7 +277,8 @@ def listenerStateDir : IO System.FilePath :=
 def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
   let path := (← listenersConfigDir) / s!"{name}.json"
   if !(← path.pathExists) then return none
-  let raw ← IO.FS.readFile path
+  let secrets ← loadSecrets
+  let raw := applySecrets secrets (← IO.FS.readFile path)
   match Json.parse raw with
   | .error _ => return none
   | .ok j    =>
@@ -289,13 +290,14 @@ def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
 def loadAllListenerConfigs : IO (Array ListenerConfig) := do
   let dir ← listenersConfigDir
   if !(← dir.pathExists) then return #[]
+  let secrets ← loadSecrets
   let entries ← System.FilePath.readDir dir
   let mut configs : Array ListenerConfig := #[]
   for entry in entries do
     let name := entry.fileName
     if !name.endsWith ".json" then continue
     -- skip the state subdirectory entry (it has no .json extension anyway)
-    let raw ← IO.FS.readFile entry.path
+    let raw := applySecrets secrets (← IO.FS.readFile entry.path)
     match Json.parse raw with
     | .error e => IO.eprintln s!"Warning: failed to parse listener config {name}: {e}"
     | .ok j    =>
