@@ -359,6 +359,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     claimManager := some globalClaimManager
     taskId := some taskId
     agentBackend := ioTask.backend.getD "claude"
+    model := ioTask.model
+    prBanner := appConfig.prBanner
     series
     projectId := ioTask.projectId
     issueId   := ioTask.issueId
