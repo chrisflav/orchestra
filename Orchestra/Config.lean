@@ -1,6 +1,7 @@
 import Lean.Data.Json
 import Orchestra.Dirs
 import Orchestra.Project.Id
+import Orchestra.YamlConfig
 
 open Lean (Json FromJson ToJson)
 
@@ -481,12 +482,36 @@ def loadJsonFileWithSecrets (α : Type) [FromJson α] (path : System.FilePath)
     | .error e => throw (.userError s!"{path}: {e}")
     | .ok v => return v
 
+/-- Like `loadJsonFileWithSecrets` but parses YAML instead of JSON. -/
+def loadYamlFileWithSecrets (α : Type) [FromJson α] (path : System.FilePath)
+    (secrets : List (String × String)) : IO α := do
+  let contents := applySecrets secrets (← IO.FS.readFile path)
+  match YamlConfig.parseYamlToJson contents with
+  | .error e => throw (.userError s!"{path}: {e}")
+  | .ok j =>
+    match FromJson.fromJson? j with
+    | .error e => throw (.userError s!"{path}: {e}")
+    | .ok v => return v
+
+private def isYamlPath (p : System.FilePath) : Bool :=
+  let s := p.toString
+  s.endsWith ".yaml" || s.endsWith ".yml"
+
 def loadAppConfig (path : Option System.FilePath := none) : IO AppConfig := do
   let configPath : System.FilePath ← match path with
     | some p => expandHome p.toString
-    | none   => do pure ((← Dirs.configBase) / "config.json")
+    | none   => do
+        let base ← Dirs.configBase
+        let jsonPath := base / "config.json"
+        let yamlPath := base / "config.yaml"
+        if ← jsonPath.pathExists then pure jsonPath
+        else if ← yamlPath.pathExists then pure yamlPath
+        else pure jsonPath
   let secrets ← loadSecrets
-  loadJsonFileWithSecrets AppConfig configPath secrets
+  if isYamlPath configPath then
+    loadYamlFileWithSecrets AppConfig configPath secrets
+  else
+    loadJsonFileWithSecrets AppConfig configPath secrets
 
 def loadTaskFile (path : System.FilePath) : IO TaskFile :=
   loadJsonFile TaskFile path

@@ -1,4 +1,5 @@
 import Lean.Data.Json
+import Orchestra.YamlConfig
 
 open Lean (Json FromJson)
 
@@ -35,12 +36,24 @@ private def orchestraDir (repoPath : System.FilePath) : IO System.FilePath := do
   if ← oldDir.pathExists then return oldDir
   return newDir
 
-/-- Load `.orchestra/config.json` (or `.agent/config.json`) from the repository. Returns defaults if absent or unparseable. -/
+/-- Load `.orchestra/config.json` or `.orchestra/config.yaml` (or `.agent/` equivalents)
+    from the repository. Returns defaults if absent or unparseable.
+    YAML takes precedence over JSON when both are present. -/
 def loadRepoConfig (repoPath : System.FilePath) : IO RepoConfig := do
-  let configPath := (← orchestraDir repoPath) / "config.json"
-  if !(← configPath.pathExists) then return {}
+  let dir ← orchestraDir repoPath
+  let yamlPath := dir / "config.yaml"
+  let jsonPath := dir / "config.json"
+  let (configPath, isYaml) ←
+    if ← yamlPath.pathExists then pure (yamlPath, true)
+    else if ← jsonPath.pathExists then pure (jsonPath, false)
+    else return {}
   let contents ← IO.FS.readFile configPath
-  match Json.parse contents with
+  let parsed : Except String Json :=
+    if isYaml then Orchestra.YamlConfig.parseYamlToJson contents
+    else match Json.parse contents with
+      | .ok j    => .ok j
+      | .error e => .error e
+  match parsed with
   | .error _ => return {}
   | .ok j =>
     match FromJson.fromJson? j with

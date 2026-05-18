@@ -1,5 +1,6 @@
 import Orchestra.Dirs
 import Orchestra.Migrate
+import Orchestra.YamlConfig
 import Orchestra.AgentDef
 import Orchestra.ConcertManager
 import Orchestra.Agents.Claude

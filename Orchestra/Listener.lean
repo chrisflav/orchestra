@@ -3,6 +3,7 @@ import Orchestra.Config
 import Orchestra.TaskStore
 import Orchestra.Queue
 import Orchestra.Project
+import Orchestra.YamlConfig
 
 open Lean (Json FromJson ToJson)
 
@@ -157,7 +158,12 @@ structure ActionConfig where
   /-- Path to a workflow YAML file. When set, a concert is started instead of a
       single task. Template variables are applied to the workflow's upstream/fork
       before conversion. -/
-  workflowPath   : Option String := none
+  workflowPath    : Option String := none
+  /-- Inline workflow definition as a JSON string (produced by inlining a `workflow:`
+      block in a `.yaml` listener config). When set and `workflowPath` is absent,
+      a concert is started from this definition.
+      The JSON string is valid YAML, so it is passed directly to `WorkflowProgram.parseYaml`. -/
+  workflowContent : Option String := none
   /-- Issue/PR number to associate with the task. May be a template string
       (e.g. `"{{pr_number}}"`) or a literal (e.g. `"69"`). When absent the
       `issue_number` template variable provided by the event source is used. -/
@@ -183,8 +189,9 @@ instance : ToJson ActionConfig where
     let fields := if let some t := a.tools        then fields ++ [("tools",         ToJson.toJson t)] else fields
     let fields := if a.readOnly                   then fields ++ [("read_only",      Json.bool true)]  else fields
     let fields := if a.priority != 10             then fields ++ [("priority",        Json.num a.priority)] else fields
-    let fields := if let some p := a.workflowPath then fields ++ [("workflow_path",  Json.str p)]          else fields
-    let fields := if let some n := a.issueNumber  then fields ++ [("issue_number",   Json.str n)]          else fields
+    let fields := if let some p := a.workflowPath    then fields ++ [("workflow_path",    Json.str p)] else fields
+    let fields := if let some c := a.workflowContent then fields ++ [("workflow_content", Json.str c)] else fields
+    let fields := if let some n := a.issueNumber     then fields ++ [("issue_number",     Json.str n)] else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -212,10 +219,11 @@ instance : FromJson ActionConfig where
     let tools := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority     := j.getObjValAs? Nat    "priority"      |>.toOption |>.getD 10
-    let workflowPath := j.getObjValAs? String "workflow_path" |>.toOption
-    let issueNumber  := j.getObjValAs? String "issue_number"  |>.toOption
+    let workflowPath    := j.getObjValAs? String "workflow_path"    |>.toOption
+    let workflowContent := j.getObjValAs? String "workflow_content" |>.toOption
+    let issueNumber     := j.getObjValAs? String "issue_number"     |>.toOption
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, tools, readOnly, priority, workflowPath, issueNumber }
+             budget, memory, authSource, tools, readOnly, priority, workflowPath, workflowContent, issueNumber }
 
 -- Listener config
 
@@ -274,12 +282,52 @@ def listenerStateDir : IO System.FilePath :=
 
 -- Config I/O
 
+/-- When a YAML listener config contains an inline `workflow:` mapping under `action`,
+    convert it to a `workflow_content` string (JSON representation) so that the existing
+    `FromJson ActionConfig` instance can deserialize it via `workflowContent`. -/
+private def transformInlineWorkflow (j : Json) : Json :=
+  let actionOpt := j.getObjVal? "action" |>.toOption
+  match actionOpt with
+  | none => j
+  | some actionJson =>
+    match actionJson.getObjVal? "workflow" |>.toOption with
+    | none => j
+    | some workflowJson =>
+      -- Serialize the inline workflow node as a compact JSON string.
+      -- JSON is valid YAML so WorkflowProgram.parseYaml can consume it directly.
+      let wfContent := Lean.Json.compress workflowJson
+      -- Rebuild action without "workflow", adding "workflow_content"
+      let newAction := match actionJson with
+        | .obj kvs =>
+          let filtered := kvs.toList.filter (·.1 != "workflow")
+          Lean.Json.mkObj (filtered ++ [("workflow_content", Lean.Json.str wfContent)])
+        | other => other
+      -- Rebuild top-level object with updated action
+      match j with
+      | .obj kvs =>
+        let filtered := kvs.toList.filter (·.1 != "action")
+        Lean.Json.mkObj (filtered ++ [("action", newAction)])
+      | other => other
+
+private def parseListenerJson (raw : String) (isYaml : Bool) : Except String Json :=
+  if isYaml then
+    YamlConfig.parseYamlToJson raw |>.map transformInlineWorkflow
+  else
+    match Json.parse raw with
+    | .ok j    => .ok j
+    | .error e => .error e
+
 def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
-  let path := (← listenersConfigDir) / s!"{name}.json"
+  let dir ← listenersConfigDir
+  let jsonPath := dir / s!"{name}.json"
+  let yamlPath := dir / s!"{name}.yaml"
+  let (path, isYaml) ←
+    if ← yamlPath.pathExists then pure (yamlPath, true)
+    else pure (jsonPath, false)
   if !(← path.pathExists) then return none
   let secrets ← loadSecrets
   let raw := applySecrets secrets (← IO.FS.readFile path)
-  match Json.parse raw with
+  match parseListenerJson raw isYaml with
   | .error _ => return none
   | .ok j    =>
     match FromJson.fromJson? j with
@@ -295,10 +343,10 @@ def loadAllListenerConfigs : IO (Array ListenerConfig) := do
   let mut configs : Array ListenerConfig := #[]
   for entry in entries do
     let name := entry.fileName
-    if !name.endsWith ".json" then continue
-    -- skip the state subdirectory entry (it has no .json extension anyway)
+    let isYaml := name.endsWith ".yaml" || name.endsWith ".yml"
+    if !name.endsWith ".json" && !isYaml then continue
     let raw := applySecrets secrets (← IO.FS.readFile entry.path)
-    match Json.parse raw with
+    match parseListenerJson raw isYaml with
     | .error e => IO.eprintln s!"Warning: failed to parse listener config {name}: {e}"
     | .ok j    =>
       match FromJson.fromJson? j (α := ListenerConfig) with

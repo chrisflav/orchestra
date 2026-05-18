@@ -704,49 +704,57 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                   IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} → {entry.id}"
               continue
             | _ => pure ()
+            -- Helper: resolve upstream/fork strings from action config + template vars.
+            let resolveUpstream (action : Listener.ActionConfig) :=
+              let r := Listener.renderTemplate action.upstream vars
+              if r.isEmpty then vars.find? (·.1 == "upstream") |>.map (·.2) |>.getD ""
+              else r
+            let resolveFork (action : Listener.ActionConfig) :=
+              let r := Listener.renderTemplate action.fork vars
+              if r.isEmpty then vars.find? (·.1 == "fork") |>.map (·.2) |>.getD ""
+              else r
+            -- Helper: start a concert from a parsed YAML string.
+            let startConcert (yaml : String) (sourceName : String) : IO Unit := do
+              match Workflow.WorkflowProgram.parseYaml yaml with
+              | .error e =>
+                IO.eprintln s!"  Listener '{liveCfg.name}': workflow parse error: {e}"
+              | .ok prog =>
+                let upstream := Repository.parse (resolveUpstream liveCfg.action) |>.toOption
+                let fork     := Repository.parse (resolveFork liveCfg.action)     |>.toOption
+                let prog := { prog with upstream, fork }
+                let jsonVars := vars.map fun (k, v) => (k, Lean.Json.str v)
+                let concert := Workflow.WorkflowProgram.toConcert prog jsonVars
+                IO.println s!"  Listener '{lcfg.name}': starting concert from {sourceName}"
+                let concertId ← TaskStore.generateId
+                let concertRun : Queue.ConcertRun := {
+                  id           := concertId
+                  startedAt    := ← TaskStore.currentIso8601
+                  name         := if prog.name.isEmpty then none else some prog.name
+                  workflowFile := if sourceName.startsWith "/" || sourceName.contains '/'
+                                  then some sourceName else none
+                }
+                Queue.saveConcertRun concertRun
+                let _concertTask ← IO.asTask (prio := .dedicated) do
+                  try
+                    Concert.evalQueued concertMgr appConfig debug none (some concertId) concert
+                    let t ← TaskStore.currentIso8601
+                    Queue.saveConcertRun { concertRun with status := .done, finishedAt := some t }
+                  catch e =>
+                    IO.eprintln s!"  Concert {concertId} failed: {e}"
+                    let t ← TaskStore.currentIso8601
+                    Queue.saveConcertRun { concertRun with status := .failed, finishedAt := some t }
+                pure ()
             if let some wfPath := liveCfg.action.workflowPath then
-              -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
+              -- Concert mode: load from file, apply template vars, start a concert fiber.
               let resolvedPath := Listener.renderTemplate wfPath vars
               try
                 let yaml ← IO.FS.readFile resolvedPath
-                match Workflow.WorkflowProgram.parseYaml yaml with
-                | .error e =>
-                  IO.eprintln s!"  Listener '{liveCfg.name}': workflow parse error: {e}"
-                | .ok prog =>
-                  let upstreamStr :=
-                    let r := Listener.renderTemplate liveCfg.action.upstream vars
-                    if r.isEmpty then vars.find? (·.1 == "upstream") |>.map (·.2) |>.getD ""
-                    else r
-                  let forkStr :=
-                    let r := Listener.renderTemplate liveCfg.action.fork vars
-                    if r.isEmpty then vars.find? (·.1 == "fork") |>.map (·.2) |>.getD ""
-                    else r
-                  let upstream := Repository.parse upstreamStr |>.toOption
-                  let fork     := Repository.parse forkStr     |>.toOption
-                  let prog := { prog with upstream, fork }
-                  let jsonVars := vars.map fun (k, v) => (k, Lean.Json.str v)
-                  let concert := Workflow.WorkflowProgram.toConcert prog jsonVars
-                  IO.println s!"  Listener '{lcfg.name}': starting concert from {resolvedPath}"
-                  let concertId ← TaskStore.generateId
-                  let concertRun : Queue.ConcertRun := {
-                    id           := concertId
-                    startedAt    := ← TaskStore.currentIso8601
-                    name         := if prog.name.isEmpty then none else some prog.name
-                    workflowFile := some resolvedPath
-                  }
-                  Queue.saveConcertRun concertRun
-                  let _concertTask ← IO.asTask (prio := .dedicated) do
-                    try
-                      Concert.evalQueued concertMgr appConfig debug none (some concertId) concert
-                      let t ← TaskStore.currentIso8601
-                      Queue.saveConcertRun { concertRun with status := .done, finishedAt := some t }
-                    catch e =>
-                      IO.eprintln s!"  Concert {concertId} failed: {e}"
-                      let t ← TaskStore.currentIso8601
-                      Queue.saveConcertRun { concertRun with status := .failed, finishedAt := some t }
-                  pure ()
+                startConcert yaml resolvedPath
               catch e =>
                 IO.eprintln s!"  Listener '{liveCfg.name}': failed to load workflow: {e}"
+            else if let some wfContent := liveCfg.action.workflowContent then
+              -- Concert mode: inline workflow definition from YAML listener config.
+              startConcert wfContent "(inline)"
             else
               -- Single-task mode: enqueue a QueueEntry as before.
               let qentry ← Listener.buildQueueEntry liveCfg.action vars
