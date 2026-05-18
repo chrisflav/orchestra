@@ -281,6 +281,19 @@ def nextPending : IO (Option QueueEntry) := do
   let maxPriEntries := pending.filter (·.priority == maxPri)
   return (maxPriEntries.back? |>.filter (·.priority == maxPri))
 
+/-- Like `nextPending` but skips repos where the running count equals or exceeds `perRepoLimit`.
+    `activePerRepo` maps fork key (owner/name) → number of currently running tasks on that repo. -/
+def nextPendingWithRepoLimits (activePerRepo : Std.HashMap String Nat) (perRepoLimit : Nat)
+    : IO (Option QueueEntry) := do
+  let all ← loadAllEntries
+  let pending := all.filter (fun e =>
+    e.status == .pending &&
+    activePerRepo.getD e.fork.toString 0 < perRepoLimit)
+  if pending.isEmpty then return none
+  let maxPri := pending.foldl (·.max ·.priority) 0
+  let maxPriEntries := pending.filter (·.priority == maxPri)
+  return maxPriEntries.back?
+
 -- PID file management
 
 def writePid (pid : UInt32) : IO Unit := do

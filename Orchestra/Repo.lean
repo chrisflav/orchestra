@@ -116,7 +116,65 @@ def ensureCloned (fork upstream : Repository) (interactive : Bool := true) : IO 
   runGh' #["auth", "setup-git"] none
   return repoPath
 
-/-- Remove all cloned repositories. -/
+/-- Path for the main clone of a fork repository. -/
+def clonePath (fork : Repository) : IO System.FilePath := do
+  return (← workDir) / fork.owner / fork.name
+
+/-- Path for a git worktree tied to a specific queue entry. -/
+def worktreePath (fork : Repository) (entryId : String) : IO System.FilePath := do
+  return (← workDir) / fork.owner / s!"{fork.name}-wt-{entryId}"
+
+/-- Create a git worktree for a parallel agent task on the same repository.
+    Ensures the main clone exists and is up to date first, then adds a detached
+    worktree that shares the same git objects. Returns the worktree path. -/
+def ensureWorktree (fork upstream : Repository) (entryId : String) : IO System.FilePath := do
+  let mainPath ← ensureCloned fork upstream (interactive := false)
+  let wtPath ← worktreePath fork entryId
+  if ← wtPath.pathExists then
+    return wtPath
+  IO.println s!"  Creating worktree at {wtPath}..."
+  runGit' #["worktree", "add", "--detach", wtPath.toString] mainPath
+  return wtPath
+
+/-- Remove a git worktree after the task using it finishes. -/
+def removeWorktree (mainPath : System.FilePath) (wtPath : System.FilePath) : IO Unit := do
+  try
+    runGit' #["worktree", "remove", "--force", wtPath.toString] mainPath
+    IO.println s!"  Removed worktree {wtPath}"
+  catch e =>
+    IO.eprintln s!"  Warning: failed to remove worktree {wtPath}: {e}"
+    try IO.FS.removeDirAll wtPath catch _ => pure ()
+
+/-- Return true if `path` is a main git clone (`.git/` is a directory, not a file). -/
+private def isMainClone (path : System.FilePath) : IO Bool :=
+  (path / ".git" / "config").pathExists
+
+/-- List all main clones under the work directory, together with any git worktrees
+    each clone has registered. Returns an array of (mainClonePath, worktreePaths). -/
+def listClones : IO (Array (System.FilePath × Array System.FilePath)) := do
+  let base ← workDir
+  if !(← base.pathExists) then return #[]
+  let mut result : Array (System.FilePath × Array System.FilePath) := #[]
+  for ownerEntry in ← base.readDir do
+    let ownerPath := ownerEntry.path
+    if !(← ownerPath.pathExists) then continue
+    for repoEntry in ← ownerPath.readDir do
+      let repoPath := repoEntry.path
+      if !(← isMainClone repoPath) then continue
+      let worktrees ← try
+        let out ← runGit #["worktree", "list", "--porcelain"] repoPath
+        let paths := out.splitOn "\n" |>.filterMap fun l =>
+          if l.startsWith "worktree " then
+            let p := (l.drop "worktree ".length).toString
+            if p != repoPath.toString then some (System.FilePath.mk p)
+            else none
+          else none
+        pure paths.toArray
+      catch _ => pure #[]
+      result := result.push (repoPath, worktrees)
+  return result
+
+/-- Remove all cloned repositories and worktrees. -/
 def cleanup : IO Unit := do
   let base ← workDir
   if ← base.pathExists then

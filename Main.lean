@@ -136,6 +136,17 @@ private def cleanupHandler (_ : Parsed) : IO UInt32 := do
   Repo.cleanup
   return (0 : UInt32)
 
+private def cleanupListHandler (_ : Parsed) : IO UInt32 := do
+  let clones ← Repo.listClones
+  if clones.isEmpty then
+    IO.println "No repository clones found."
+    return (0 : UInt32)
+  for (mainPath, worktrees) in clones do
+    IO.println s!"  {mainPath}"
+    for wt in worktrees do
+      IO.println s!"    worktree: {wt}"
+  return (0 : UInt32)
+
 private def tasksHandler (p : Parsed) : IO UInt32 := do
   let limit := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
   let records := (← TaskStore.loadAllTasks).toList.take limit
@@ -478,9 +489,11 @@ private def handleSocketRequest
   try conn.close catch _ => pure ()
 
 private def queueStartHandler (p : Parsed) : IO UInt32 := do
-  let configPath   := p.flag? "config" |>.map (·.as! String)
-  let debug        := p.hasFlag "debug"
-  let background   := p.hasFlag "background"
+  let configPath          := p.flag? "config" |>.map (·.as! String)
+  let debug               := p.hasFlag "debug"
+  let background          := p.hasFlag "background"
+  let parallelLimit       := max 1 (p.flag? "parallel"          |>.map (·.as! Nat) |>.getD 1)
+  let parallelLimitPerRepo := max 1 (p.flag? "parallel-per-repo" |>.map (·.as! Nat) |>.getD 1)
   -- Background mode: re-exec as a detached daemon and exit
   if background then
     if ← Queue.daemonRunning then
@@ -539,6 +552,10 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   let nextTokenId ← IO.mkRef (0 : Nat)
   -- Mutex serialising the "find next pending + mark running" claim operation.
   let claimMutex ← Std.BaseMutex.new
+  -- Tracks number of currently running tasks per repo (fork key) and total.
+  -- Both are protected by claimMutex.
+  let activePerRepo ← IO.mkRef ({} : Std.HashMap String Nat)
+  let totalActive   ← IO.mkRef (0 : Nat)
   -- Concert manager: handles suspended concert fibers waiting for task results.
   let concertMgr ← ConcertManager.new
   -- Socket server: receives control requests (add_task, add_concert, cancel, shutdown).
@@ -556,16 +573,55 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     catch _ => pure ()
   -- Helper: atomically claim the next pending entry, marking it as running.
   -- Serialised by claimMutex so that multiple workers cannot claim the same entry.
-  let claimNextEntry : IO (Option Queue.QueueEntry) := do
+  -- Returns (entry, needsWorktree): needsWorktree is true when the repo is already
+  -- in use by another parallel task and this task should run in a git worktree.
+  let claimNextEntry : IO (Option (Queue.QueueEntry × Bool)) := do
     claimMutex.lock
-    let entry ← Queue.nextPending
-    if let some e := entry then
-      Queue.saveEntry { e with status := .running }
+    let total ← totalActive.get
+    let result ←
+      if total >= parallelLimit then
+        pure none
+      else do
+        let repoMap ← activePerRepo.get
+        let entry ← Queue.nextPendingWithRepoLimits repoMap parallelLimitPerRepo
+        match entry with
+        | none => pure none
+        | some e =>
+          Queue.saveEntry { e with status := .running }
+          let repoCount := repoMap.getD e.fork.toString 0
+          activePerRepo.modify (fun m => m.insert e.fork.toString (repoCount + 1))
+          totalActive.modify (· + 1)
+          pure (some (e, decide (0 < repoCount)))
     claimMutex.unlock
-    return entry
+    return result
+  -- Helper: release parallel-tracking state for a completed entry.
+  let releaseEntry (entry : Queue.QueueEntry) : IO Unit := do
+    claimMutex.lock
+    let n := (← activePerRepo.get).getD entry.fork.toString 0
+    activePerRepo.modify (fun m => m.insert entry.fork.toString (if n > 0 then n - 1 else 0))
+    totalActive.modify (fun t => if t > 0 then t - 1 else 0)
+    claimMutex.unlock
   -- Helper: run one queue entry to completion and update its status.
   -- Also signals the ConcertManager if the entry belongs to a concert.
-  let runEntry (entry : Queue.QueueEntry) : IO Unit := do
+  -- needsWorktree: when true, create an isolated git worktree for this task
+  -- instead of using the shared main clone, to allow parallel work on the same repo.
+  let runEntry (entry : Queue.QueueEntry) (needsWorktree : Bool) : IO Unit := do
+    -- Create a worktree for parallel tasks on the same repo.
+    let wtPath : Option System.FilePath ←
+      if !needsWorktree then pure none
+      else
+        try some <$> Repo.ensureWorktree entry.fork entry.upstream entry.id
+        catch e =>
+          IO.eprintln s!"  Failed to create worktree for {entry.id}: {e}"
+          try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+          releaseEntry entry
+          return
+    -- Cleanup action: remove worktree and release parallel-tracking slot.
+    let doCleanup : IO Unit := do
+      if let some wt := wtPath then
+        let mainPath := (← Repo.workDir) / entry.fork.owner / entry.fork.name
+        try Repo.removeWorktree mainPath wt catch _ => pure ()
+      releaseEntry entry
     let taskToken ← Std.CancellationToken.new
     let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
     activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
@@ -610,6 +666,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
         (cancelToken := some taskToken) (interactive := false)
+        (repoPathOverride := wtPath)
       removeToken
       -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
       -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.
@@ -629,6 +686,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         Queue.saveEntry { entry with status := .done, taskId := some taskId, outputJson }
         if let some key := entry.concertStepKey then
           ConcertManager.signal concertMgr key outputJson
+      doCleanup
     catch e =>
       removeToken
       let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
@@ -641,6 +699,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
         try releaseClaimOnError catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+      doCleanup
   -- Load listener configs and spawn one fiber per listener.
   let listenerConfigs ← Listener.loadAllListenerConfigs
   if !listenerConfigs.isEmpty then
@@ -764,13 +823,20 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           Listener.saveListenerState lcfg.name newState
         catch e =>
           IO.eprintln s!"  Listener '{lcfg.name}' poll error: {e}"
-  -- Queue worker loop: claim and run entries one at a time.
-  -- To support parallel execution in the future, spawn multiple copies of this loop.
-  try
+  -- Queue worker loop: claim and run one entry at a time.
+  -- Spawning parallelLimit copies of this loop enables parallel execution.
+  let workerLoop : IO Unit := do
     while !(← shutdownToken.isCancelled) do
       match ← claimNextEntry with
-      | none       => IO.sleep 1000
-      | some entry => runEntry entry
+      | none              => IO.sleep 1000
+      | some (entry, wt)  => runEntry entry wt
+  -- Spawn additional workers beyond the first (which runs on the main thread below).
+  for _ in List.range (parallelLimit - 1) do
+    let _workerTask ← IO.asTask (prio := .dedicated) workerLoop
+  if parallelLimit > 1 then
+    IO.println s!"Queue daemon running with parallelLimit={parallelLimit}, parallelLimitPerRepo={parallelLimitPerRepo}"
+  try
+    workerLoop
   finally
     match ← socketServerRef.get with
     | some s => try s.close catch _ => pure ()
@@ -969,9 +1035,17 @@ private def prepareCmd : Cmd := `[Cli|
     "fork" : String; "Fork repository in 'owner/repo' format"
 ]
 
+private def cleanupListCmd : Cmd := `[Cli|
+  list VIA cleanupListHandler; ["0.1.0"]
+  "List all repository clones and their git worktrees."
+]
+
 private def cleanupCmd : Cmd := `[Cli|
   cleanup VIA cleanupHandler; ["0.1.0"]
-  "Remove all cloned repositories."
+  "Manage cloned repositories. Without a subcommand, removes all clones and worktrees."
+
+  SUBCOMMANDS:
+    cleanupListCmd
 ]
 
 private def tasksCmd : Cmd := `[Cli|
@@ -1039,12 +1113,14 @@ private def queueAddCmd : Cmd := `[Cli|
 
 private def queueStartCmd : Cmd := `[Cli|
   start VIA queueStartHandler; ["0.1.0"]
-  "Start the queue daemon. Polls for pending tasks and runs them serially."
+  "Start the queue daemon. Polls for pending tasks and runs them in parallel up to the configured limit."
 
   FLAGS:
     c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
     d, debug; "Print the landrun command before executing it"
     b, background; "Run the daemon in the background, detached from the terminal"
+    parallel : Nat; "Maximum number of tasks to run in parallel (default: 1)"
+    "parallel-per-repo" : Nat; "Maximum parallel tasks per repository; additional copies use git worktrees (default: 1)"
 ]
 
 private def queueStatusCmd : Cmd := `[Cli|
