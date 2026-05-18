@@ -247,7 +247,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
     (interactive : Bool := true)
-    (interactiveAgent : Bool := false) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
+    (interactiveAgent : Bool := false)
+    -- When set, skip cloning and use this path (a git worktree) directly.
+    (repoPathOverride : Option System.FilePath := none) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
@@ -326,10 +328,16 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let token ← GitHub.createInstallationToken jwt installationId
   GitHub.setupGhAuth token
   IO.println "  Token ready"
-  -- 2. Clone / update repo
-  IO.println s!"Cloning/updating {ioTask.fork}..."
-  let repoPath ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive
-  IO.println s!"  Repo at {repoPath}"
+  -- 2. Clone / update repo (or use the provided worktree path directly)
+  let repoPath ← match repoPathOverride with
+    | some p =>
+      IO.println s!"  Using worktree at {p}"
+      pure p
+    | none   =>
+      IO.println s!"Cloning/updating {ioTask.fork}..."
+      let p ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive
+      IO.println s!"  Repo at {p}"
+      pure p
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
   -- clone setup with all other backends but skips the MCP server and agent.
   if ioTask.backend == some "merger" then
@@ -502,10 +510,11 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
     (interactive : Bool := true)
-    (interactiveAgent : Bool := false) : IO (String × Bool × Option Lean.Json) := do
+    (interactiveAgent : Bool := false)
+    (repoPathOverride : Option System.FilePath := none) : IO (String × Bool × Option Lean.Json) := do
   let ((taskId, usageLimitHit), _, outputJson) ←
     runIOTask appConfig task.ioTask idx debug default
-      continuesFrom series cancelToken interactive interactiveAgent
+      continuesFrom series cancelToken interactive interactiveAgent repoPathOverride
   return (taskId, usageLimitHit, outputJson)
 
 end Orchestra.TaskRunner
