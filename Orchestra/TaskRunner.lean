@@ -364,6 +364,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     issueId   := ioTask.issueId
     enqueueMerger   := some enqueueMergerImpl
     enqueueReviewer := some enqueueReviewerImpl
+    prLabels  := ioTask.prLabels
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"

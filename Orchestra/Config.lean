@@ -245,6 +245,9 @@ structure IOTask (i o : ResultType) where
       by the project-dispatcher to count active per-role tasks unambiguously,
       avoiding fragile `tools` list comparisons. -/
   role : Option String := none
+  /-- Labels to automatically apply to every pull request created by `create_pr` during this task.
+      Labels that do not exist on the target repository are created automatically. -/
+  prLabels : List String := []
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -344,9 +347,10 @@ instance : FromJson Task where
     let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
     let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
     let role        := j.getObjValAs? String    "role"       |>.toOption
+    let prLabels    := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
     return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, authSource, tools, readOnly, series, priority,
-                                issueNumber, projectId, issueId, role } }
+                                issueNumber, projectId, issueId, role, prLabels } }
 
 /-- Filesystem paths to expose inside the landrun sandbox. -/
 structure SandboxPaths where

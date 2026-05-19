@@ -101,32 +101,48 @@ def createInstallationToken (jwt : String) (installationId : Nat) : IO String :=
 def setupGhAuth (token : String) : IO Unit := do
   runCmd' "sh" #["-c", s!"echo '{token}' | gh auth login --with-token"]
 
+/-- Ensure the given labels exist on a repository.
+    Labels that are missing are created with a default colour; existing ones are not modified. -/
+def ensureLabels (token : String) (repo : Repository) (labels : List String) : IO Unit := do
+  let env := if token.isEmpty then #[] else #[("GH_TOKEN", some token)]
+  for label in labels do
+    try
+      let _ ← runCmd "gh" #["label", "create", label, "--repo", repo.toString, "--color", "0075ca"]
+        (env := env)
+    catch _ => pure ()
+
 /-- Create a pull request on the upstream repo using a PAT. -/
 def createPullRequest (pat : String) (upstream : Repository)
-    (head base title body : String) : IO String := do
-  runCmd "gh" #[
+    (head base title body : String) (labels : List String := []) : IO String := do
+  unless labels.isEmpty do
+    ensureLabels pat upstream labels
+  let labelArgs : Array String := (labels.flatMap fun l => ["--label", l]).toArray
+  runCmd "gh" (#[
     "pr", "create",
     "--repo", upstream.toString,
     "--head", head,
     "--base", base,
     "--title", title,
     "--body", body
-  ] (env := #[("GH_TOKEN", some pat)])
+  ] ++ labelArgs) (env := #[("GH_TOKEN", some pat)])
 
 /-- Create a pull request entirely within a single repository (no cross-repo
     `owner:branch` head prefix), authenticated by `token` — typically a fresh
     GitHub App installation token. Used when the agent wants to open a PR on
     its fork rather than the upstream. -/
 def createPullRequestOnRepo (token : String) (repo : Repository)
-    (head base title body : String) : IO String := do
-  runCmd "gh" #[
+    (head base title body : String) (labels : List String := []) : IO String := do
+  unless labels.isEmpty do
+    ensureLabels token repo labels
+  let labelArgs : Array String := (labels.flatMap fun l => ["--label", l]).toArray
+  runCmd "gh" (#[
     "pr", "create",
     "--repo", repo.toString,
     "--head", head,
     "--base", base,
     "--title", title,
     "--body", body
-  ] (env := #[("GH_TOKEN", some token)])
+  ] ++ labelArgs) (env := #[("GH_TOKEN", some token)])
 
 /--
 Fetch review threads for a pull request via the GitHub GraphQL API.
