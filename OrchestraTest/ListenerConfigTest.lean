@@ -181,3 +181,56 @@ def agentAuthConfigExtraPortsDefault : Test := do
   | .error e => TestM.fail s!"AgentAuthConfig no extra_ports: {e}"
   | .ok cfg =>
     TestM.assertEqual cfg.extraPorts (#[] : Array Nat) (msg := "extraPorts default empty")
+
+@[test]
+def githubLabelCountBasic : Test := do
+  let json := r#"
+    {"type": "github-label-count",
+     "repos": [{"upstream": "org/repo", "fork": "my-org/fork"}],
+     "labels": ["needs-review"],
+     "max": 5}
+  "#
+  match Json.parse json >>= FromJson.fromJson? (α := SourceConfig) with
+  | .error e => TestM.fail s!"github-label-count parse: {e}"
+  | .ok (.githubLabelCount repos labels max kind) =>
+    TestM.assertEqual repos.length 1 (msg := "repos length")
+    TestM.assertEqual labels ["needs-review"] (msg := "labels")
+    TestM.assertEqual max 5 (msg := "max")
+    TestM.assertEqual kind "issues" (msg := "kind default")
+    match repos with
+    | [r] =>
+      TestM.assertEqual r.upstream.toString "org/repo" (msg := "upstream")
+      TestM.assertEqual r.fork.toString "my-org/fork" (msg := "fork")
+    | _ => TestM.fail "repos not a singleton"
+  | .ok _ => TestM.fail "unexpected SourceConfig variant"
+
+@[test]
+def githubLabelCountKindPulls : Test := do
+  let json := r#"
+    {"type": "github-label-count",
+     "repos": [{"upstream": "org/repo", "fork": "my-org/fork"}],
+     "labels": ["ready-for-review"],
+     "max": 3,
+     "kind": "pulls"}
+  "#
+  match Json.parse json >>= FromJson.fromJson? (α := SourceConfig) with
+  | .error e => TestM.fail s!"github-label-count pulls parse: {e}"
+  | .ok (.githubLabelCount _repos _labels max kind) =>
+    TestM.assertEqual max 3 (msg := "max")
+    TestM.assertEqual kind "pulls" (msg := "kind")
+  | .ok _ => TestM.fail "unexpected SourceConfig variant"
+
+@[test]
+def githubLabelCountRoundTrip : Test := do
+  let sc : SourceConfig := .githubLabelCount
+    [{ upstream := { owner := "org", name := "repo" }
+       fork := { owner := "my-org", name := "repo" } }]
+    ["bug", "help-wanted"] 10 "all"
+  match FromJson.fromJson? (ToJson.toJson sc) (α := SourceConfig) with
+  | .error e => TestM.fail s!"github-label-count round-trip: {e}"
+  | .ok (.githubLabelCount repos labels max kind) =>
+    TestM.assertEqual repos.length 1 (msg := "repos length")
+    TestM.assertEqual labels ["bug", "help-wanted"] (msg := "labels")
+    TestM.assertEqual max 10 (msg := "max")
+    TestM.assertEqual kind "all" (msg := "kind")
+  | .ok _ => TestM.fail "wrong variant"

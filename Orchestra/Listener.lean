@@ -50,6 +50,13 @@ inductive SourceConfig where
       Each tick the dispatcher counts active per-role queue entries and emits
       a synthetic event per role that is below its cap and whose trigger holds. -/
   | projectDispatcher (projectId : Project.ProjectId) (caps : List (String × Nat))
+  /-- Fires whenever the number of open issues or pull requests with the given
+      labels on a repository is strictly below `max`.  Emits one event per repo
+      per tick while the condition holds (no state deduplication — use a high
+      `interval_seconds` to avoid flooding the queue).
+      `kind` controls what is counted: `"issues"` (default), `"pulls"`, or `"all"`.
+      Template variables: `count`, `max`, `needed` (= max − count), `upstream`, `fork`. -/
+  | githubLabelCount  (repos : List RepoEntry) (labels : List String) (max : Nat) (kind : String)
 
 instance : ToJson SourceConfig where
   toJson
@@ -79,6 +86,12 @@ instance : ToJson SourceConfig where
                     ("project_id", Json.str pid.value),
                     ("caps", Json.mkObj
                        (caps.map (fun (n, c) => (n, Json.num c))))]
+    | .githubLabelCount repos labels max kind =>
+        Json.mkObj [("type", "github-label-count"),
+                    ("repos", ToJson.toJson repos),
+                    ("labels", ToJson.toJson labels),
+                    ("max", Json.num max),
+                    ("kind", kind)]
 
 /-- Parse a `repos` list from JSON.  If `"repos"` is absent, fall back to the singular
     `"fork"` string (treated as both `upstream` and `fork`). -/
@@ -123,6 +136,12 @@ instance : FromJson SourceConfig where
         let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
           v.getNat?.toOption.map (k, ·)
         return .projectDispatcher ⟨pid⟩ caps
+    | "github-label-count" =>
+        let repos  ← parseRepos j
+        let labels  := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
+        let max    ← j.getObjValAs? Nat "max"
+        let kind    := j.getObjValAs? String "kind" |>.toOption |>.getD "issues"
+        return .githubLabelCount repos labels max kind
     | _ => .error s!"unknown source type: {ty}"
 
 -- Action template
@@ -762,5 +781,34 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
         | some iid => baseVars ++ [("issue_id", iid.value)]
         | none     => baseVars
       ("", vars)
+
+  | .githubLabelCount repos labels max kind => do
+    let mut allEvents : Array (String × List (String × String)) := #[]
+    for entry in repos do
+      let labelParam := if labels.isEmpty then "" else "&labels=" ++ ",".intercalate labels
+      let endpoint := s!"/repos/{entry.upstream}/issues?state=open&per_page=100{labelParam}"
+      let jsonOpt ← runGhApi endpoint ghToken
+      let items ← match jsonOpt with
+        | none   => pure (#[] : Array Json)
+        | some j => match j.getArr? with
+          | .ok a  => pure a
+          | .error _ => pure #[]
+      -- Count items matching the configured kind.
+      let shouldCount (item : Json) : Bool :=
+        let isPr := (item.getObjVal? "pull_request").isOk
+        match kind with
+        | "issues" => !isPr
+        | "pulls"  => isPr
+        | _        => true  -- "all" or unrecognised
+      let count := (items.filter shouldCount).size
+      if count < max then
+        let needed := max - count
+        let vars := [("count", toString count), ("max", toString max),
+                     ("needed", toString needed),
+                     ("upstream", entry.upstream.toString), ("fork", entry.fork.toString),
+                     ("upstream_escaped", entry.upstream.toString.replace "/" "_"),
+                     ("fork_escaped",     entry.fork.toString.replace "/" "_")]
+        allEvents := allEvents.push ("", vars)
+    return allEvents
 
 end Orchestra.Listener
