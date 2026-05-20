@@ -57,7 +57,6 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let continuesFrom := p.flag? "continues" |>.map (·.as! String)
   let series        := p.flag? "series"    |>.map (·.as! String)
   let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
-  let authSourceFlag := p.flag? "auth_source" |>.map (·.as! String)
   let initVars      := p.flag? "vars"      |>.map (fun v => parseVarsJson (v.as! String)) |>.getD []
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   if isWorkflowFile taskFile then
@@ -89,17 +88,11 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   for i in [:tasks.size] do
     try
       -- CLI flags override the task file values
-      let task := match budgetFlag, authSourceFlag with
-        | none,   none     => tasks[i]!
-        | some b, none     =>
+      let task := match budgetFlag with
+        | none   => tasks[i]!
+        | some b =>
           let t := tasks[i]!
           { t with ioTask := { t.ioTask with budget := some b } }
-        | none,   some as  =>
-          let t := tasks[i]!
-          { t with ioTask := { t.ioTask with authSource := some as } }
-        | some b, some as  =>
-          let t := tasks[i]!
-          { t with ioTask := { t.ioTask with budget := some b, authSource := some as } }
       let _ ← TaskRunner.runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
@@ -948,7 +941,6 @@ private def runCmd' : Cmd := `[Cli|
     continues : String; "Continue from a previous task by ID (requires --task with multi-task files)"
     series : String; "Assign this run to a named task series"
     budget : String; "Maximum spend in USD, overrides task file (default: 4.0)"
-    auth_source : String; "Authentication source label to use for this run (overrides task file)"
     vars : String; "Initial workflow variable bindings as a JSON object, e.g. '{\"key\":\"value\"}' (workflow files only)"
 
   ARGS:
@@ -1198,6 +1190,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let budget      := p.flag? "budget"   |>.bind (fun v => parseFloat? (v.as! String)) |>.getD 4.0
   let debug       := p.hasFlag "debug"
   let configPath  := p.flag? "config"   |>.map (·.as! String)
+  let authSource  := p.flag? "auth_source" |>.map (·.as! String)
   let upstream ← IO.ofExcept (Repository.parse upstreamStr)
   let fork     ← IO.ofExcept (Repository.parse forkStr)
   let allowedTools : List String := match toolsStr with
@@ -1232,7 +1225,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     | _               => AgentDef.claude
   let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
     |>.map (·.extraPorts) |>.getD #[]
-  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName none
+  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName authSource
   IO.println "  Launching agent..."
   let result ← Sandbox.launchAgent agentDef repoPath "" port token
     (debug := debug) (pluginDirs := appConfig.pluginDirs)
@@ -1257,6 +1250,7 @@ private def interactiveCmd : Cmd := `[Cli|
     backend     : String; "Agent backend: claude (default), vibe, opencode, pi"
     model       : String; "Model override passed to the agent"
     budget      : String; "Maximum spend in USD (default: 4.0)"
+    auth_source : String; "Authentication source label to use (overrides default_auth_source)"
 ]
 
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
