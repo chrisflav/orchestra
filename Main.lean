@@ -57,6 +57,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let continuesFrom := p.flag? "continues" |>.map (·.as! String)
   let series        := p.flag? "series"    |>.map (·.as! String)
   let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
+  let authSourceFlag := p.flag? "auth_source" |>.map (·.as! String)
   let initVars      := p.flag? "vars"      |>.map (fun v => parseVarsJson (v.as! String)) |>.getD []
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   if isWorkflowFile taskFile then
@@ -87,12 +88,18 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let series ← inheritSeries continuesFrom series
   for i in [:tasks.size] do
     try
-      -- CLI --budget overrides the task file budget
-      let task := match budgetFlag with
-        | none   => tasks[i]!
-        | some b =>
+      -- CLI flags override the task file values
+      let task := match budgetFlag, authSourceFlag with
+        | none,   none     => tasks[i]!
+        | some b, none     =>
           let t := tasks[i]!
           { t with ioTask := { t.ioTask with budget := some b } }
+        | none,   some as  =>
+          let t := tasks[i]!
+          { t with ioTask := { t.ioTask with authSource := some as } }
+        | some b, some as  =>
+          let t := tasks[i]!
+          { t with ioTask := { t.ioTask with budget := some b, authSource := some as } }
       let _ ← TaskRunner.runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
@@ -941,6 +948,7 @@ private def runCmd' : Cmd := `[Cli|
     continues : String; "Continue from a previous task by ID (requires --task with multi-task files)"
     series : String; "Assign this run to a named task series"
     budget : String; "Maximum spend in USD, overrides task file (default: 4.0)"
+    auth_source : String; "Authentication source label to use for this run (overrides task file)"
     vars : String; "Initial workflow variable bindings as a JSON object, e.g. '{\"key\":\"value\"}' (workflow files only)"
 
   ARGS:
