@@ -22,6 +22,10 @@ automatically when using the provided container image):
 - `claude` (Claude Code CLI) and/or `vibe` (mistral-vibe) installed and
   authenticated
 - `gh` (GitHub CLI) for repository operations
+- [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) — **Optional**
+  MCP OAuth support for the **Pi agent** specifically (not needed for Claude Code
+  or vibe agents). Tested with the MCP tools defined in this project. Install in
+  the container with `pi install npm:pi-mcp-adapter`.
 
 In addition, the private key from the GitHub App must be included as a file in the container.
 
