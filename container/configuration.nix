@@ -42,7 +42,6 @@ in
     unstable.opencode
     unstable.claude-code
     unstable.mistral-vibe
-    nodejs_latest
     pi-coding-agent-wrapped
   ];
 
