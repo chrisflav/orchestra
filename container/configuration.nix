@@ -7,9 +7,20 @@
 
 let
   unstable = import
-    (builtins.fetchTarball https://github.com/nixos/nixpkgs/tarball/31ca9ee01d22aafd34495977ab009e2984afa99d)
+    (builtins.fetchTarball https://github.com/nixos/nixpkgs/tarball/071434384885966c13bb5a4fd4e6d16788c8247f)
     # reuse the current configuration
     { config = config.nixpkgs.config; };
+
+  pi-coding-agent-wrapped = pkgs.symlinkJoin {
+    name = "pi-coding-agent";
+    buildInputs = [ pkgs.makeWrapper ];
+    paths = [ unstable.pi-coding-agent ];
+    postBuild = ''
+      wrapProgram $out/bin/pi \
+        --run 'export NPM_CONFIG_PREFIX="$HOME/.pi/npm/"' \
+        --prefix PATH : ${lib.makeBinPath [ pkgs.nodejs_latest ]}
+    '';
+  };
 in
 {
   nixpkgs.config.allowUnfree = true;
@@ -31,6 +42,8 @@ in
     unstable.opencode
     unstable.claude-code
     unstable.mistral-vibe
+    nodejs_latest
+    pi-coding-agent-wrapped
   ];
 
   users.users.orchestra = {
