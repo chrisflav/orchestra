@@ -53,6 +53,9 @@ structure State where
   /-- Optional auto-reviewer hook (F1). Plumbed to `Project.Tools.Env.enqueueReviewer`. -/
   enqueueReviewer : Option (Project.Project → Project.IssueId → Project.PRRef →
                             Project.ReviewerTemplate → IO (Except String String)) := none
+  /-- Labels to apply automatically to every PR created via `create_pr`.
+      Missing labels are created on the target repository before the PR is opened. -/
+  prLabels : List String := []
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -444,7 +447,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       log s!"tool create_pr [upstream]: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
       try
         let result ← GitHub.createPullRequest state.pat state.upstream
-          s!"{state.fork.owner}:{head}" base title body
+          s!"{state.fork.owner}:{head}" base title body state.prLabels
         log s!"tool create_pr: ok: {result.trimAscii}"
         return toolContent result
       catch e =>
@@ -458,7 +461,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         let jwt ← GitHub.createJWT state.appId state.privateKeyPath
         let token ← GitHub.createInstallationToken jwt state.installationId
         let result ← GitHub.createPullRequestOnRepo token state.fork
-          head base title body
+          head base title body state.prLabels
         log s!"tool create_pr: ok: {result.trimAscii}"
         return toolContent result
       catch e =>

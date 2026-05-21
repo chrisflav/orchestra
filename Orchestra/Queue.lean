@@ -139,6 +139,8 @@ structure QueueEntry where
   /-- Optional role name (mirrors `IOTask.role`). Used by the dispatcher to
       count per-role active tasks unambiguously. -/
   role : Option String := none
+  /-- Labels to apply automatically to every PR created via `create_pr`. -/
+  prLabels : List String := []
 
 instance : ToJson QueueEntry where
   toJson e :=
@@ -176,6 +178,7 @@ instance : ToJson QueueEntry where
     let fields := if let some p := e.projectId then fields ++ [("project_id", ToJson.toJson p)] else fields
     let fields := if let some i := e.issueId   then fields ++ [("issue_id",   ToJson.toJson i)] else fields
     let fields := if let some r := e.role      then fields ++ [("role",       Json.str r)]      else fields
+    let fields := if !e.prLabels.isEmpty       then fields ++ [("pr_labels",  ToJson.toJson e.prLabels)] else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -212,11 +215,12 @@ instance : FromJson QueueEntry where
     let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
     let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
     let role        := j.getObjValAs? String    "role"       |>.toOption
+    let prLabels    := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
-             issueNumber, projectId, issueId, role }
+             issueNumber, projectId, issueId, role, prLabels }
 
 -- Directories and paths
 

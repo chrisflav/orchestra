@@ -87,7 +87,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let series ← inheritSeries continuesFrom series
   for i in [:tasks.size] do
     try
-      -- CLI --budget overrides the task file budget
+      -- CLI flags override the task file values
       let task := match budgetFlag with
         | none   => tasks[i]!
         | some b =>
@@ -593,6 +593,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         projectId        := entry.projectId
         issueId          := entry.issueId
         role             := entry.role
+        prLabels         := entry.prLabels
       }
     }
     let cfg ← match entry.configPath with
@@ -1190,6 +1191,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let budget      := p.flag? "budget"   |>.bind (fun v => parseFloat? (v.as! String)) |>.getD 4.0
   let debug       := p.hasFlag "debug"
   let configPath  := p.flag? "config"   |>.map (·.as! String)
+  let authSource  := p.flag? "auth_source" |>.map (·.as! String)
   let upstream ← IO.ofExcept (Repository.parse upstreamStr)
   let fork     ← IO.ofExcept (Repository.parse forkStr)
   let allowedTools : List String := match toolsStr with
@@ -1224,7 +1226,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     | _               => AgentDef.claude
   let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
     |>.map (·.extraPorts) |>.getD #[]
-  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName none
+  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName authSource
   IO.println "  Launching agent..."
   let result ← Sandbox.launchAgent agentDef repoPath "" port token
     (debug := debug) (pluginDirs := appConfig.pluginDirs)
@@ -1249,6 +1251,7 @@ private def interactiveCmd : Cmd := `[Cli|
     backend     : String; "Agent backend: claude (default), vibe, opencode, pi"
     model       : String; "Model override passed to the agent"
     budget      : String; "Maximum spend in USD (default: 4.0)"
+    auth_source : String; "Authentication source label to use (overrides default_auth_source)"
 ]
 
 private def defaultHandler (_ : Parsed) : IO UInt32 := do

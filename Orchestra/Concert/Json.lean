@@ -28,6 +28,7 @@ instance {i o : ResultType} : ToJson (IOTask i o) where
     , ("tools",         ToJson.toJson t.tools)
     , ("read_only",     .bool t.readOnly)
     , ("series",        ToJson.toJson t.series)
+    , ("pr_labels",     ToJson.toJson t.prLabels)
     , ("input_type",    ToJson.toJson i)
     , ("output_type",   ToJson.toJson o)
     ]
@@ -48,8 +49,9 @@ instance {i o : ResultType} : FromJson (IOTask i o) where
     let tools        := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly     := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let series       := j.getObjValAs? String "series" |>.toOption
+    let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
     return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model,
-             budget, memory, authSource, tools, readOnly, series }
+             budget, memory, authSource, tools, readOnly, series, prLabels }
 
 /-- Serialize a `Concert α` to JSON.
     For `run` nodes, the task spec is computed from the current input and the continuation is

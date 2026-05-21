@@ -181,6 +181,8 @@ structure ActionConfig where
       (e.g. `"{{pr_number}}"`) or a literal (e.g. `"69"`). When absent the
       `issue_number` template variable provided by the event source is used. -/
   issueNumber    : Option String := none
+  /-- Labels to apply automatically to every PR created via `create_pr` during this task. -/
+  prLabels       : List String   := []
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -204,6 +206,7 @@ instance : ToJson ActionConfig where
     let fields := if a.priority != 10             then fields ++ [("priority",        Json.num a.priority)] else fields
     let fields := if let some p := a.workflowPath then fields ++ [("workflow_path",  Json.str p)]          else fields
     let fields := if let some n := a.issueNumber  then fields ++ [("issue_number",   Json.str n)]          else fields
+    let fields := if !a.prLabels.isEmpty          then fields ++ [("pr_labels",      ToJson.toJson a.prLabels)] else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -233,8 +236,10 @@ instance : FromJson ActionConfig where
     let priority     := j.getObjValAs? Nat    "priority"      |>.toOption |>.getD 10
     let workflowPath := j.getObjValAs? String "workflow_path" |>.toOption
     let issueNumber  := j.getObjValAs? String "issue_number"  |>.toOption
+    let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, tools, readOnly, priority, workflowPath, issueNumber }
+             budget, memory, authSource, tools, readOnly, priority, workflowPath, issueNumber,
+             prLabels }
 
 -- Listener config
 
@@ -393,6 +398,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     readOnly     := action.readOnly
     priority     := action.priority
     issueNumber
+    prLabels     := action.prLabels
   }
 
 -- GitHub helpers
