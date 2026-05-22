@@ -662,6 +662,11 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           let events ← Listener.pollSource liveCfg.source state appConfig.pat
             appConfig.authorizedUsers
           for (_, vars) in (events : Array (String × List (String × String))) do
+            -- github-label-count: skip if a task from this listener is already active.
+            if let .githubLabelCount .. := liveCfg.source then
+              if ← Queue.hasActiveEntryForListener lcfg.name then
+                IO.println s!"  Listener '{lcfg.name}': skipping (active entry already in queue)"
+                continue
             -- Project-dispatcher source: synthetic events carry only `role_name`
             -- and (optionally) `issue_id`. Build the queue entry directly from
             -- the named role template, pre-claiming through the in-process
@@ -750,7 +755,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                 IO.eprintln s!"  Listener '{liveCfg.name}': failed to load workflow: {e}"
             else
               -- Single-task mode: enqueue a QueueEntry as before.
-              let qentry ← Listener.buildQueueEntry liveCfg.action vars
+              let qentry ← Listener.buildQueueEntry liveCfg.action vars (some lcfg.name)
               Queue.saveEntry qentry
               IO.println s!"  Listener '{liveCfg.name}': queued entry {qentry.id}"
           let newIds := events.filterMap (fun ev =>

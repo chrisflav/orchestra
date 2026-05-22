@@ -141,6 +141,8 @@ structure QueueEntry where
   role : Option String := none
   /-- Labels to apply automatically to every PR created via `create_pr`. -/
   prLabels : List String := []
+  /-- Name of the listener that created this entry, if any. -/
+  listenerName : Option String := none
 
 instance : ToJson QueueEntry where
   toJson e :=
@@ -177,8 +179,9 @@ instance : ToJson QueueEntry where
     let fields := if let some n := e.issueNumber then fields ++ [("issue_number", Json.num n)] else fields
     let fields := if let some p := e.projectId then fields ++ [("project_id", ToJson.toJson p)] else fields
     let fields := if let some i := e.issueId   then fields ++ [("issue_id",   ToJson.toJson i)] else fields
-    let fields := if let some r := e.role      then fields ++ [("role",       Json.str r)]      else fields
-    let fields := if !e.prLabels.isEmpty       then fields ++ [("pr_labels",  ToJson.toJson e.prLabels)] else fields
+    let fields := if let some r := e.role         then fields ++ [("role",          Json.str r)]      else fields
+    let fields := if !e.prLabels.isEmpty          then fields ++ [("pr_labels",     ToJson.toJson e.prLabels)] else fields
+    let fields := if let some s := e.listenerName then fields ++ [("listener_name", Json.str s)]      else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -214,13 +217,14 @@ instance : FromJson QueueEntry where
     let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
     let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
     let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
-    let role        := j.getObjValAs? String    "role"       |>.toOption
-    let prLabels    := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
+    let role         := j.getObjValAs? String    "role"          |>.toOption
+    let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
+    let listenerName := j.getObjValAs? String "listener_name"    |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
-             issueNumber, projectId, issueId, role, prLabels }
+             issueNumber, projectId, issueId, role, prLabels, listenerName }
 
 -- Directories and paths
 
@@ -284,6 +288,12 @@ def nextPending : IO (Option QueueEntry) := do
   -- Among entries with max priority, pick the oldest (last in newest-first array)
   let maxPriEntries := pending.filter (·.priority == maxPri)
   return (maxPriEntries.back? |>.filter (·.priority == maxPri))
+
+/-- Return true if any entry created by `name` is currently pending or running. -/
+def hasActiveEntryForListener (name : String) : IO Bool := do
+  let entries ← loadAllEntries
+  return entries.any fun e =>
+    (e.status == .pending || e.status == .running) && e.listenerName == some name
 
 -- PID file management
 

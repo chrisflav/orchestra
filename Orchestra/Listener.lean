@@ -51,9 +51,9 @@ inductive SourceConfig where
       a synthetic event per role that is below its cap and whose trigger holds. -/
   | projectDispatcher (projectId : Project.ProjectId) (caps : List (String × Nat))
   /-- Fires whenever the number of open issues or pull requests with the given
-      labels on a repository is strictly below `max`.  Emits one event per repo
-      per tick while the condition holds (no state deduplication — use a high
-      `interval_seconds` to avoid flooding the queue).
+      labels on a repository is strictly below `max`.  Emits at most one task per
+      tick; the tick is skipped while a task from this listener is already pending
+      or running.
       `kind` controls what is counted: `"issues"` (default), `"pulls"`, or `"all"`.
       Template variables: `count`, `max`, `needed` (= max − count), `upstream`, `fork`. -/
   | githubLabelCount  (repos : List RepoEntry) (labels : List String) (max : Nat) (kind : String)
@@ -356,7 +356,8 @@ def renderTemplate (template : String) (vars : List (String × String)) : String
 
 -- Queue entry builder
 
-def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : IO Queue.QueueEntry := do
+def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
+    (listenerName : Option String := none) : IO Queue.QueueEntry := do
   let id        ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
   let prompt    := renderTemplate action.promptTemplate vars
@@ -399,6 +400,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     priority     := action.priority
     issueNumber
     prLabels     := action.prLabels
+    listenerName
   }
 
 -- GitHub helpers
