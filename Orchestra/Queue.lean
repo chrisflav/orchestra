@@ -141,6 +141,10 @@ structure QueueEntry where
   role : Option String := none
   /-- Labels to apply automatically to every PR created via `create_pr`. -/
   prLabels : List String := []
+  /-- Labels to add to the issue or PR when using the `triage` backend. -/
+  triageAddLabels : List String := []
+  /-- Labels to remove from the issue or PR when using the `triage` backend. -/
+  triageRemoveLabels : List String := []
   /-- Name of the listener that created this entry, if any. -/
   listenerName : Option String := none
 
@@ -180,7 +184,9 @@ instance : ToJson QueueEntry where
     let fields := if let some p := e.projectId then fields ++ [("project_id", ToJson.toJson p)] else fields
     let fields := if let some i := e.issueId   then fields ++ [("issue_id",   ToJson.toJson i)] else fields
     let fields := if let some r := e.role         then fields ++ [("role",          Json.str r)]      else fields
-    let fields := if !e.prLabels.isEmpty          then fields ++ [("pr_labels",     ToJson.toJson e.prLabels)] else fields
+    let fields := if !e.prLabels.isEmpty          then fields ++ [("pr_labels",            ToJson.toJson e.prLabels)]         else fields
+    let fields := if !e.triageAddLabels.isEmpty   then fields ++ [("triage_add_labels",    ToJson.toJson e.triageAddLabels)]   else fields
+    let fields := if !e.triageRemoveLabels.isEmpty then fields ++ [("triage_remove_labels", ToJson.toJson e.triageRemoveLabels)] else fields
     let fields := if let some s := e.listenerName then fields ++ [("listener_name", Json.str s)]      else fields
     Json.mkObj fields
 
@@ -218,13 +224,16 @@ instance : FromJson QueueEntry where
     let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
     let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
     let role         := j.getObjValAs? String    "role"          |>.toOption
-    let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
+    let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
+    let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
+    let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
     let listenerName := j.getObjValAs? String "listener_name"    |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
-             issueNumber, projectId, issueId, role, prLabels, listenerName }
+             issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
+             listenerName }
 
 -- Directories and paths
 

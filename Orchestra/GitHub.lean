@@ -170,6 +170,25 @@ def getPrReviewThreads (upstream : Repository) (prNumber : Nat) (pat : String) :
   | .error e => throw (.userError s!"failed to parse GraphQL response: {e}")
   | .ok j => return j
 
+/-- Add labels to a GitHub issue or pull request. -/
+def addIssueLabels (repo : Repository) (issueNumber : Nat) (labels : List String) : IO Unit := do
+  unless labels.isEmpty do
+    let payload := Json.mkObj [("labels", Json.arr (labels.map Json.str |>.toArray))]
+    let _ ← runCmd "gh" #[
+      "api", "--method", "POST",
+      s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels",
+      "--input", "-"
+    ] (input := payload.compress)
+
+/-- Remove a label from a GitHub issue or pull request. Succeeds even if the label is not present. -/
+def removeIssueLabel (repo : Repository) (issueNumber : Nat) (label : String) : IO Unit :=
+  try
+    let _ ← runCmd "gh" #[
+      "api", "--method", "DELETE",
+      s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels/{label}"
+    ]
+  catch _ => pure ()
+
 /-- Post a comment on an issue or pull request. -/
 def createIssueComment (pat : String) (upstream : Repository) (issueNumber : Nat) (body : String) : IO String := do
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
