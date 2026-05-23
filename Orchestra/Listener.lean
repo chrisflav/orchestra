@@ -914,7 +914,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
         allEvents := allEvents.push (eventId, vars)
     -- Prune processedIds to only currently-visible items so that a label removal
     -- followed by re-application causes the listener to fire again.
-    let prunedProcessed := state.processedIds.filter (fun id => currentIds.contains id)
+    let prunedProcessed := state.processedIds.filter currentIds.contains
     return (allEvents, some (prunedProcessed ++ allEvents.map (·.1)))
 
 end Orchestra.Listener
