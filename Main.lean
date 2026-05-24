@@ -661,7 +661,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           let liveCfg := (← Listener.loadListenerConfig lcfg.name).getD lcfg
           let state  ← Listener.loadListenerState lcfg.name
           if !state.enabled then pure () else
-          let events ← Listener.pollSource liveCfg.source state appConfig.pat
+          let (events, processedIdsReplacement) ← Listener.pollSource liveCfg.source state appConfig.pat
             appConfig.authorizedUsers
           for (_, vars) in (events : Array (String × List (String × String))) do
             -- github-label-count: skip if a task from this listener is already active.
@@ -716,7 +716,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
               -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
               let resolvedPath := Listener.renderTemplate wfPath vars
               try
-                let yaml ← IO.FS.readFile resolvedPath
+                let rawYaml ← IO.FS.readFile resolvedPath
+                let yaml := Listener.renderTemplate rawYaml vars
                 match Workflow.WorkflowProgram.parseYaml yaml with
                 | .error e =>
                   IO.eprintln s!"  Listener '{liveCfg.name}': workflow parse error: {e}"
@@ -766,7 +767,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           let currentEnabled := (← Listener.loadListenerState lcfg.name).enabled
           let newState : Listener.ListenerState := {
             lastChecked  := ← TaskStore.currentIso8601
-            processedIds := state.processedIds ++ newIds
+            processedIds := processedIdsReplacement.getD (state.processedIds ++ newIds)
             enabled      := currentEnabled
           }
           Listener.saveListenerState lcfg.name newState
