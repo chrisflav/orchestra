@@ -248,6 +248,10 @@ structure IOTask (i o : ResultType) where
   /-- Labels to automatically apply to every pull request created by `create_pr` during this task.
       Labels that do not exist on the target repository are created automatically. -/
   prLabels : List String := []
+  /-- Labels to add to the issue or PR when using the `triage` backend. -/
+  triageAddLabels : List String := []
+  /-- Labels to remove from the issue or PR when using the `triage` backend. -/
+  triageRemoveLabels : List String := []
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -347,10 +351,13 @@ instance : FromJson Task where
     let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
     let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
     let role        := j.getObjValAs? String    "role"       |>.toOption
-    let prLabels    := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
+    let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
+    let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
+    let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
     return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, authSource, tools, readOnly, series, priority,
-                                issueNumber, projectId, issueId, role, prLabels } }
+                                issueNumber, projectId, issueId, role, prLabels,
+                                triageAddLabels, triageRemoveLabels } }
 
 /-- Filesystem paths to expose inside the landrun sandbox. -/
 structure SandboxPaths where

@@ -151,6 +151,28 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
           Project.saveIssue { parent with status := .open, updatedAt := now2 }
           IO.println s!"  [merger] all children of {parentId.value} completed; unblocked → open"
 
+/-- Run a triage task: add and/or remove labels on a GitHub issue or pull request.
+    Skips the entire agent / sandbox / MCP path.
+    Used when `ioTask.backend = some "triage"`. -/
+private def runTriage {i o : ResultType} (pat : String) (ioTask : IOTask i o)
+    (initialRecord : TaskStore.TaskRecord) : IO Unit := do
+  IO.println "  [triage] label backend"
+  let some issueNumber := ioTask.issueNumber
+    | throw (.userError "triage task missing issue_number")
+  let addLabels    := ioTask.triageAddLabels
+  let removeLabels := ioTask.triageRemoveLabels
+  if !addLabels.isEmpty then
+    IO.println s!"  [triage] adding labels {addLabels} to {ioTask.upstream}#{issueNumber}"
+    GitHub.addIssueLabels pat ioTask.upstream issueNumber addLabels
+  for label in removeLabels do
+    IO.println s!"  [triage] removing label '{label}' from {ioTask.upstream}#{issueNumber}"
+    try
+      GitHub.removeIssueLabel pat ioTask.upstream issueNumber label
+    catch e =>
+      IO.eprintln s!"  [triage] failed to remove label '{label}': {e}"
+  TaskStore.saveTask { initialRecord with status := .completed }
+  IO.println s!"  [triage] done"
+
 private def sanitizeProjectName (upstream : Repository) : String :=
   s!"{upstream.owner}-{upstream.name}"
 
@@ -334,6 +356,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- clone setup with all other backends but skips the MCP server and agent.
   if ioTask.backend == some "merger" then
     runMerger ioTask repoPath initialRecord
+    return ((taskId, false), none, none)
+  -- Triage: add/remove labels on an issue or PR. Shares auth setup but skips
+  -- the repo clone, MCP server, and agent.
+  if ioTask.backend == some "triage" then
+    runTriage appConfig.pat ioTask initialRecord
     return ((taskId, false), none, none)
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat

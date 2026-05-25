@@ -75,6 +75,9 @@ mutual
           tools         := spec.tools
           readOnly      := spec.readOnly
           priority      := spec.priority
+          issueNumber   := spec.issueNumber
+          triageAddLabels    := spec.triageAddLabels
+          triageRemoveLabels := spec.triageRemoveLabels
           concertStepKey := some stepKey
           concertId
           inputType     := ResultType.unit
