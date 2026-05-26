@@ -116,25 +116,31 @@ def ensureCloned (fork upstream : Repository)
     let remotes₃ ← runGit #["remote"] repoPath
     if !(remotes₃.splitOn "\n" |>.any (· == "upstream")) then
       runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
-  -- Configure git credential store with PAT (if provided) so that fetches
-  -- against private upstream repos don't prompt for username/password.
-  unless pat.isEmpty do
-    let credFile := repoPath / ".git" / "credentials"
-    let child ← IO.Process.spawn {
-      cmd := "sh", args := #["-c",
-        s!"(echo 'https://x-access-token:{pat}@github.com'; cat '{credFile}') | sort -u > '{credFile}.tmp' && mv '{credFile}.tmp' '{credFile}'"
-      ]
-      stdout := .piped, stderr := .piped
-    }
-    let _ ← child.stdout.readToEnd
-    let _ ← child.stderr.readToEnd
-    let _ ← child.wait
-    runGit' #["config", "credential.helper", s!"store --file={credFile}"] repoPath
-  -- Ensure gh credentials are wired into git for authenticated operations
+  -- Ensure gh credentials are wired into git for authenticated operations.
+  -- This configures git to use gh's credential helper, which provides
+  -- authentication via the GitHub App token already configured by
+  -- GitHub.setupGhAuth.  No PAT is written to disk.
   runGh' #["auth", "setup-git"] none
-  -- Fetch upstream to keep remote tracking branches up to date
+  -- Fetch upstream to keep remote tracking branches up to date.
+  -- Pass PAT via GH_TOKEN env var (if provided) so that fetches against
+  -- private upstream repos don't prompt for username/password.  The token
+  -- is scoped to this single command and never written to disk.
   IO.println "  Fetching upstream..."
-  runGit' #["fetch", "upstream"] repoPath
+  if pat.isEmpty then
+    runGit' #["fetch", "upstream"] repoPath
+  else
+    let child ← IO.Process.spawn {
+      cmd := "git"
+      args := #["fetch", "upstream"]
+      cwd := repoPath
+      env := #[("GH_TOKEN", some pat)]
+      stdout := .piped
+      stderr := .piped
+    }
+    let stderr ← child.stderr.readToEnd
+    let code ← child.wait
+    if code != 0 then
+      throw (.userError s!"git fetch upstream failed (exit {code}):\n{stderr}")
   return repoPath
 
 /-- Remove all cloned repositories. -/
