@@ -103,6 +103,12 @@ def ensureCloned (fork upstream : Repository) (interactive : Bool := true) : IO 
         if originUrl != expectedOriginUrl then
           IO.println s!"  Fixing origin URL: {originUrl} → {expectedOriginUrl}"
           runGit' #["remote", "set-url", "origin", expectedOriginUrl] repoPath
+        -- Make sure upstream points at the upstream HTTPS URL (no embedded/expired tokens)
+        let upstreamUrl ← runGit #["remote", "get-url", "upstream"] repoPath
+        let expectedUpstreamUrl := githubUrl upstream
+        if upstreamUrl != expectedUpstreamUrl then
+          IO.println s!"  Fixing upstream URL: {upstreamUrl} → {expectedUpstreamUrl}"
+          runGit' #["remote", "set-url", "upstream", expectedUpstreamUrl] repoPath
   else
     IO.FS.createDirAll repoPath
     runGh' #["repo", "clone", fork.toString, repoPath.toString]
