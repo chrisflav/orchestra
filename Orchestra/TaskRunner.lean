@@ -328,7 +328,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   IO.println "  Token ready"
   -- 2. Clone / update repo
   IO.println s!"Cloning/updating {ioTask.fork}..."
-  let repoPath ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive
+  let repoPath ← Repo.ensureCloned ioTask.fork ioTask.upstream appConfig.pat interactive
   IO.println s!"  Repo at {repoPath}"
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
   -- clone setup with all other backends but skips the MCP server and agent.

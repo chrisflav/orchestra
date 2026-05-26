@@ -54,7 +54,8 @@ an error is thrown instead.
 Cloning is performed via `gh repo clone`, which uses the GitHub App authentication
 already configured by `GitHub.setupGhAuth`.
 -/
-def ensureCloned (fork upstream : Repository) (interactive : Bool := true) : IO System.FilePath := do
+def ensureCloned (fork upstream : Repository)
+    (pat : String := "") (interactive : Bool := true) : IO System.FilePath := do
   let base ← workDir
   let repoPath := base / fork.owner / fork.name
   if ← repoPath.pathExists then
@@ -115,6 +116,20 @@ def ensureCloned (fork upstream : Repository) (interactive : Bool := true) : IO 
     let remotes₃ ← runGit #["remote"] repoPath
     if !(remotes₃.splitOn "\n" |>.any (· == "upstream")) then
       runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
+  -- Configure git credential store with PAT (if provided) so that fetches
+  -- against private upstream repos don't prompt for username/password.
+  unless pat.isEmpty do
+    let credFile := repoPath / ".git" / "credentials"
+    let child ← IO.Process.spawn {
+      cmd := "sh", args := #["-c",
+        s!"(echo 'https://x-access-token:{pat}@github.com'; cat '{credFile}') | sort -u > '{credFile}.tmp' && mv '{credFile}.tmp' '{credFile}'"
+      ]
+      stdout := .piped, stderr := .piped
+    }
+    let _ ← child.stdout.readToEnd
+    let _ ← child.stderr.readToEnd
+    let _ ← child.wait
+    runGit' #["config", "credential.helper", s!"store --file={credFile}"] repoPath
   -- Ensure gh credentials are wired into git for authenticated operations
   runGh' #["auth", "setup-git"] none
   -- Fetch upstream to keep remote tracking branches up to date
