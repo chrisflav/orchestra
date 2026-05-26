@@ -54,6 +54,12 @@ structure TaskSpec where
   systemPrompt  : Option String   := none
   prependPrompt : Option String   := none
   backend       : Option String   := none
+  /-- Issue or PR number to act on (required for the `triage` backend). -/
+  issueNumber   : Option Nat      := none
+  /-- Labels to add to the issue or PR when using the `triage` backend. -/
+  triageAddLabels    : List String := []
+  /-- Labels to remove from the issue or PR when using the `triage` backend. -/
+  triageRemoveLabels : List String := []
   deriving Repr
 
 /-- Specifies that a step iterates over a list. -/
@@ -163,6 +169,9 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       agent := spec.agent, model := spec.model, readOnly := spec.readOnly
       systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt
       backend := spec.backend
+      issueNumber := spec.issueNumber
+      triageAddLabels := spec.triageAddLabels
+      triageRemoveLabels := spec.triageRemoveLabels
     }
     StateT.lift (run ioTask ())
   else
@@ -174,6 +183,9 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       agent := spec.agent, model := spec.model, readOnly := spec.readOnly
       systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt
       backend := spec.backend
+      issueNumber := spec.issueNumber
+      triageAddLabels := spec.triageAddLabels
+      triageRemoveLabels := spec.triageRemoveLabels
     }
     let j ← StateT.lift (run ioTask ())
     modify fun (env', ctrl) =>
