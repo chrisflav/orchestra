@@ -55,7 +55,7 @@ Cloning is performed via `gh repo clone`, which uses the GitHub App authenticati
 already configured by `GitHub.setupGhAuth`.
 -/
 def ensureCloned (fork upstream : Repository)
-    (pat : String := "") (interactive : Bool := true) : IO System.FilePath := do
+    (interactive : Bool := true) : IO System.FilePath := do
   let base ← workDir
   let repoPath := base / fork.owner / fork.name
   if ← repoPath.pathExists then
@@ -122,25 +122,10 @@ def ensureCloned (fork upstream : Repository)
   -- GitHub.setupGhAuth.  No PAT is written to disk.
   runGh' #["auth", "setup-git"] none
   -- Fetch upstream to keep remote tracking branches up to date.
-  -- Pass PAT via GH_TOKEN env var (if provided) so that fetches against
-  -- private upstream repos don't prompt for username/password.  The token
-  -- is scoped to this single command and never written to disk.
+  -- git uses gh's credential helper (configured above) for authentication,
+  -- so no PAT is needed — the GitHub App installation token is sufficient.
   IO.println "  Fetching upstream..."
-  if pat.isEmpty then
-    runGit' #["fetch", "upstream"] repoPath
-  else
-    let child ← IO.Process.spawn {
-      cmd := "git"
-      args := #["fetch", "upstream"]
-      cwd := repoPath
-      env := #[("GH_TOKEN", some pat)]
-      stdout := .piped
-      stderr := .piped
-    }
-    let stderr ← child.stderr.readToEnd
-    let code ← child.wait
-    if code != 0 then
-      throw (.userError s!"git fetch upstream failed (exit {code}):\n{stderr}")
+  runGit' #["fetch", "upstream"] repoPath
   return repoPath
 
 /-- Remove all cloned repositories. -/

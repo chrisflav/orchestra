@@ -128,9 +128,7 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
 private def prepareHandler (p : Parsed) : IO UInt32 := do
   let upstream ← IO.ofExcept (Repository.parse (p.positionalArg! "upstream" |>.as! String))
   let fork ← IO.ofExcept (Repository.parse (p.positionalArg! "fork" |>.as! String))
-  let configPath := p.flag? "config" |>.map (·.as! String)
-  let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
-  let repoPath ← Repo.ensureCloned fork upstream appConfig.pat
+  let repoPath ← Repo.ensureCloned fork upstream
   IO.println repoPath.toString
   return (0 : UInt32)
 
@@ -1215,7 +1213,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let token ← GitHub.createInstallationToken jwt installationId
   GitHub.setupGhAuth token
   IO.println s!"Cloning/updating {fork}..."
-  let repoPath ← Repo.ensureCloned fork upstream appConfig.pat
+  let repoPath ← Repo.ensureCloned fork upstream
   IO.println s!"  Repo at {repoPath}"
   let backendName := backend.getD "claude"
   let serverState : Server.State := {
