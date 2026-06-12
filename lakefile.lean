@@ -6,7 +6,8 @@ package orchestra where
   testDriver := "orchestraTest"
 
 require Cli from git "https://github.com/leanprover/lean4-cli.git" @ "main"
-require Yaml from git "https://github.com/chrisflav/lean-yaml" @ "master"
+require Yaml from git "https://github.com/chrisflav/lean-yaml" @ "528ff42a1c4caa793dd8de6922c6d6bf2862ca16"
+require verso from git "https://github.com/leanprover/verso" @ "170af40e495d97361a59fcf8e8295a4f26116aea"
 
 /-- Compile the Unix domain socket C shim into a static library. -/
 extern_lib udsFFI pkg := do

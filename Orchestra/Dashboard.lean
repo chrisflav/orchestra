@@ -6,10 +6,12 @@ import Orchestra.Dirs
 import Orchestra.Queue
 import Orchestra.TaskStore
 import Orchestra.Listener
+import Verso.Output.Html
 
 open Lean (Json ToJson)
 open Std.Net
 open Std.Internal.UV.TCP
+open Verso.Output (Html)
 
 /-!
 # Orchestra Web Dashboard
@@ -17,9 +19,7 @@ open Std.Internal.UV.TCP
 A minimal HTTP/1.1 server that serves a password-protected web dashboard showing
 the live state of the queue, configured listeners, and task history with log output.
 
-The HTML is generated directly from Lean string templates. Future work: migrate the
-static parts of the site to a verso-based generator
-(https://github.com/leanprover/verso) for richer markup and cross-linking.
+HTML is generated using the verso `Html` DSL (`Verso.Output.Html`).
 -/
 
 namespace Orchestra.Dashboard
@@ -59,20 +59,12 @@ private def httpResponse (resp : HttpResponse) : String :=
   let hdrs := resp.headers.map (fun (k, v) => s!"{k}: {v}\r\n") |>.toList
   statusLine ++ String.join hdrs ++ contentLen ++ "Connection: close\r\n\r\n" ++ resp.body
 
-private def htmlResp (body : String) (status : Nat := 200) : HttpResponse :=
-  { status, headers := #[("Content-Type", "text/html; charset=utf-8")], body }
+private def htmlResp (html : Html) (status : Nat := 200) : HttpResponse :=
+  { status
+    headers := #[("Content-Type", "text/html; charset=utf-8")]
+    body    := Html.doctype ++ Html.asString html }
 
-private def notFound (msg : String) : HttpResponse :=
-  htmlResp ("<html><body><h1>Not Found</h1><p>" ++ msg ++ "</p></body></html>") 404
-
-private def unauthorizedResp : HttpResponse := {
-  status  := 401
-  headers := #[("Content-Type", "text/html; charset=utf-8"),
-               ("WWW-Authenticate", "Basic realm=\"Orchestra Dashboard\"")]
-  body    := "<html><body><h1>401 Unauthorized</h1></body></html>"
-}
-
--- Base64 decode
+-- Base64 decode (uses <<< / >>> operators; keep outside the verso DSL open)
 
 private def b64Val (c : Char) : Option UInt8 :=
   let n := c.toNat
@@ -116,29 +108,36 @@ private def checkBasicAuth (hdrs : Array (String × String)) (password : String)
         | _ :: rest => String.intercalate ":" rest == password
         | _ => false
 
--- HTML helpers
+-- Pre-escape `&` in user-supplied strings before handing them to verso text nodes.
+-- `Html.asString` for `Html.text true` escapes `<` and `>` but not `&`; we handle
+-- `&` here so that the combined output is fully HTML-safe.
+private def esc (s : String) : String := s.replace "&" "&amp;"
 
-private def esc (s : String) : String :=
-  s.foldl (fun acc c => acc ++ match c with
-    | '&'  => "&amp;" | '<' => "&lt;" | '>' => "&gt;"
-    | '"'  => "&quot;" | '\'' => "&#39;"
-    | c    => String.ofList [c]) ""
+-- HTML generation
+-- Open the verso Html DSL in a section so that the <<< / >>> attribute syntax
+-- does not shadow the bit-shift operators used in decodeBase64 above.
 
-private def badge (s : String) : String :=
+section
+open Verso.Output.Html
+
+private def notFound (msg : String) : HttpResponse :=
+  htmlResp ({{ <html><body><h1>"Not Found"</h1><p> s!"{esc msg}" </p></body></html> }}) 404
+
+private def unauthorizedResp : HttpResponse :=
+  let base := htmlResp {{ <html><body><h1>"401 Unauthorized"</h1></body></html> }} 401
+  { base with headers := base.headers.push ("WWW-Authenticate", "Basic realm=\"Orchestra Dashboard\"") }
+
+private def badge (s : String) : Html :=
   let cls := match s with
-    | "running"              => "r"
-    | "pending"              => "p"
-    | "done" | "completed"  => "d"
-    | "failed"               => "f"
-    | "cancelled"            => "c"
-    | _                      => "o"
-  s!"<span class=\"b b{cls}\">{esc s}</span>"
+    | "running"             => "r"
+    | "pending"             => "p"
+    | "done" | "completed" => "d"
+    | "failed"              => "f"
+    | "cancelled"           => "c"
+    | _                     => "o"
+  {{ <span class=s!"b b{cls}"> s!"{s}" </span> }}
 
-private def shell (title content : String) : String :=
-  "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
-  "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
-  s!"<title>{esc title} — Orchestra</title>" ++
-  "<style>" ++
+private def dashCss : String :=
   ":root{--bg:#0f1117;--sf:#1a1d24;--bd:#2a2d35;--tx:#e2e4e9;--mu:#8b8fa8;--ac:#5b8def}" ++
   "*{box-sizing:border-box;margin:0;padding:0}" ++
   "body{font-family:ui-monospace,monospace;background:var(--bg);color:var(--tx);font-size:14px;line-height:1.6}" ++
@@ -164,17 +163,30 @@ private def shell (title content : String) : String :=
   ".note{font-size:11px;color:var(--mu);margin-top:8px}" ++
   ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:24px}" ++
   ".st{background:var(--sf);border:1px solid var(--bd);border-radius:6px;padding:16px}" ++
-  ".sv{font-size:26px;font-weight:700}.sl{font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}" ++
-  "</style></head><body>" ++
-  "<header><span class=\"logo\">Orchestra</span><nav>" ++
-  "<a href=\"/\">Overview</a><a href=\"/queue\">Queue</a>" ++
-  "<a href=\"/listeners\">Listeners</a><a href=\"/tasks\">Tasks</a>" ++
-  "</nav></header>" ++
-  s!"<main>{content}</main>" ++
-  "<script>setTimeout(()=>location.reload(),15000)</script>" ++
-  "</body></html>"
+  ".sv{font-size:26px;font-weight:700}.sl{font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}"
 
--- Page generators
+private def shell (title : String) (content : Html) : Html :=
+  {{ <html lang="en">
+    <head>
+      <meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width,initial-scale=1"/>
+      <title> s!"{esc title} — Orchestra" </title>
+      <style> {{ Html.text false dashCss }} </style>
+    </head>
+    <body>
+      <header>
+        <span class="logo"> "Orchestra" </span>
+        <nav>
+          <a href="/"> "Overview" </a>
+          <a href="/queue"> "Queue" </a>
+          <a href="/listeners"> "Listeners" </a>
+          <a href="/tasks"> "Tasks" </a>
+        </nav>
+      </header>
+      <main> {{ content }} </main>
+      <script> {{ Html.text false "setTimeout(()=>location.reload(),15000)" }} </script>
+    </body>
+  </html> }}
 
 private def qStText : Queue.QueueStatus → String
   | .pending    => "pending"   | .running    => "running"
@@ -186,10 +198,13 @@ private def tStText : TaskStore.TaskStatus → String
   | .failed     => "failed"    | .unfinished => "unfinished"
   | .cancelled  => "cancelled"
 
-private def statBox (val : Nat) (lbl : String) : String :=
-  s!"<div class=\"st\"><div class=\"sv\">{val}</div><div class=\"sl\">{lbl}</div></div>"
+private def statBox (val : Nat) (lbl : String) : Html :=
+  {{ <div class="st">
+    <div class="sv"> s!"{val}" </div>
+    <div class="sl"> s!"{lbl}" </div>
+  </div> }}
 
-private def overviewPage : IO String := do
+private def overviewPage : IO Html := do
   let entries  ← Queue.loadAllEntries
   let tasks    ← TaskStore.loadAllTasks
   let lsCfgs   ← Listener.loadAllListenerConfigs
@@ -198,121 +213,207 @@ private def overviewPage : IO String := do
   let pending := entries.filter (·.status == .pending)
   let failed  := entries.filter (·.status == .failed)
   let rConcerts := concerts.filter (·.status == .running)
-  let stats :=
-    "<div class=\"stats\">" ++
-    statBox running.size "Running" ++ statBox pending.size "Pending" ++
-    statBox failed.size  "Failed"  ++ statBox rConcerts.size "Concerts" ++
-    statBox lsCfgs.size  "Listeners" ++ statBox tasks.size "Total Tasks" ++
-    "</div>"
+  let stats : Html :=
+    {{ <div class="stats">
+      {{ statBox running.size "Running" }}
+      {{ statBox pending.size "Pending" }}
+      {{ statBox failed.size "Failed" }}
+      {{ statBox rConcerts.size "Concerts" }}
+      {{ statBox lsCfgs.size "Listeners" }}
+      {{ statBox tasks.size "Total Tasks" }}
+    </div> }}
   let active := running ++ pending
-  let activeRows :=
+  let activeRows : Html :=
     if active.isEmpty then
-      "<tr><td colspan=\"6\" class=\"empty\">No active tasks</td></tr>"
+      {{ <tr><td colspan="6" class="empty"> "No active tasks" </td></tr> }}
     else
-      String.join (active.toList.map fun e =>
-        "<tr><td class=\"m\"><a href=\"/tasks/" ++ e.id ++ "\">" ++ esc e.id ++ "</a></td>" ++
-        "<td>" ++ badge (qStText e.status) ++ "</td>" ++
-        "<td class=\"m trunc\">" ++ esc e.fork.toString ++ "</td>" ++
-        "<td class=\"m\">" ++ esc e.createdAt ++ "</td>" ++
-        "<td>" ++ toString e.priority ++ "</td>" ++
-        "<td class=\"m trunc\">" ++ esc (e.concertId.getD "") ++ "</td></tr>")
-  let qTable :=
-    "<div class=\"card\"><table><thead><tr>" ++
-    "<th>ID</th><th>Status</th><th>Fork</th><th>Created</th><th>Pri</th><th>Concert</th>" ++
-    "</tr></thead><tbody>" ++ activeRows ++ "</tbody></table></div>"
+      Html.fromList (active.toList.map fun e =>
+        {{ <tr>
+          <td class="m"> <a href=s!"/tasks/{e.id}"> s!"{esc e.id}" </a> </td>
+          <td> {{ badge (qStText e.status) }} </td>
+          <td class="m trunc"> s!"{esc e.fork.toString}" </td>
+          <td class="m"> s!"{e.createdAt}" </td>
+          <td> s!"{e.priority}" </td>
+          <td class="m trunc"> s!"{esc (e.concertId.getD "")}" </td>
+        </tr> }})
+  let qTable : Html :=
+    {{ <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th> "ID" </th> <th> "Status" </th> <th> "Fork" </th>
+            <th> "Created" </th> <th> "Pri" </th> <th> "Concert" </th>
+          </tr>
+        </thead>
+        <tbody> {{ activeRows }} </tbody>
+      </table>
+    </div> }}
   let recentTasks := tasks.toList.take 10
-  let recentRows :=
+  let recentRows : Html :=
     if recentTasks.isEmpty then
-      "<tr><td colspan=\"5\" class=\"empty\">No tasks yet</td></tr>"
+      {{ <tr><td colspan="5" class="empty"> "No tasks yet" </td></tr> }}
     else
-      String.join (recentTasks.map fun r =>
-        let snip := (r.prompt.take 60).toString
-        "<tr><td class=\"m\"><a href=\"/tasks/" ++ r.id ++ "\">" ++ esc r.id ++ "</a></td>" ++
-        "<td>" ++ badge (tStText r.status) ++ "</td>" ++
-        "<td class=\"m trunc\">" ++ esc r.fork.toString ++ "</td>" ++
-        "<td class=\"m\">" ++ esc r.createdAt ++ "</td>" ++
-        "<td class=\"trunc\">" ++ esc snip ++ "</td></tr>")
-  let tTable :=
-    "<div class=\"card\"><table><thead><tr>" ++
-    "<th>ID</th><th>Status</th><th>Fork</th><th>Created</th><th>Prompt</th>" ++
-    "</tr></thead><tbody>" ++ recentRows ++ "</tbody></table></div>"
-  return shell "Overview"
-    (stats ++ "<h2>Active Queue</h2>" ++ qTable ++
-     "<h2>Recent Tasks</h2>" ++ tTable ++
-     "<p class=\"note\">Refreshes every 15 s</p>")
+      Html.fromList (recentTasks.map fun r =>
+        let snip : String := (r.prompt.take 60).toString
+        {{ <tr>
+          <td class="m"> <a href=s!"/tasks/{r.id}"> s!"{esc r.id}" </a> </td>
+          <td> {{ badge (tStText r.status) }} </td>
+          <td class="m trunc"> s!"{esc r.fork.toString}" </td>
+          <td class="m"> s!"{r.createdAt}" </td>
+          <td class="trunc"> s!"{esc snip}" </td>
+        </tr> }})
+  let tTable : Html :=
+    {{ <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th> "ID" </th> <th> "Status" </th> <th> "Fork" </th>
+            <th> "Created" </th> <th> "Prompt" </th>
+          </tr>
+        </thead>
+        <tbody> {{ recentRows }} </tbody>
+      </table>
+    </div> }}
+  return shell "Overview" {{
+    {{ stats }}
+    <h2> "Active Queue" </h2>
+    {{ qTable }}
+    <h2> "Recent Tasks" </h2>
+    {{ tTable }}
+    <p class="note"> "Refreshes every 15 s" </p>
+  }}
 
-private def queuePage : IO String := do
+private def queuePage : IO Html := do
   let entries  ← Queue.loadAllEntries
   let concerts ← Queue.loadAllConcertRuns
-  let cRows :=
-    if concerts.isEmpty then "<tr><td colspan=\"5\" class=\"empty\">No concerts</td></tr>"
-    else String.join (concerts.toList.map fun r =>
-      let st := match r.status with
-        | .running => "running" | .done => "done" | .failed => "failed" | .cancelled => "cancelled"
-      "<tr><td class=\"m\">" ++ esc r.id ++ "</td>" ++
-      "<td>" ++ badge st ++ "</td>" ++
-      "<td class=\"m\">" ++ esc r.startedAt ++ "</td>" ++
-      "<td class=\"m\">" ++ esc (r.finishedAt.getD "") ++ "</td>" ++
-      "<td class=\"m trunc\">" ++ esc (r.name.getD (r.workflowFile.getD "")) ++ "</td></tr>")
-  let cTable :=
-    "<div class=\"card\"><table><thead><tr>" ++
-    "<th>Concert ID</th><th>Status</th><th>Started</th><th>Finished</th><th>Name / File</th>" ++
-    "</tr></thead><tbody>" ++ cRows ++ "</tbody></table></div>"
-  let eRows :=
-    if entries.isEmpty then "<tr><td colspan=\"7\" class=\"empty\">No entries</td></tr>"
-    else String.join (entries.toList.map fun e =>
-      "<tr><td class=\"m\"><a href=\"/tasks/" ++ e.id ++ "\">" ++ esc e.id ++ "</a></td>" ++
-      "<td>" ++ badge (qStText e.status) ++ "</td>" ++
-      "<td class=\"m trunc\">" ++ esc e.fork.toString ++ "</td>" ++
-      "<td class=\"m\">" ++ esc e.createdAt ++ "</td>" ++
-      "<td>" ++ toString e.priority ++ "</td>" ++
-      "<td class=\"m\">" ++ esc (e.series.getD "") ++ "</td>" ++
-      "<td class=\"m\">" ++ esc (e.concertId.getD "") ++ "</td></tr>")
-  let eTable :=
-    "<div class=\"card\"><table><thead><tr>" ++
-    "<th>ID</th><th>Status</th><th>Fork</th><th>Created</th><th>Pri</th><th>Series</th><th>Concert</th>" ++
-    "</tr></thead><tbody>" ++ eRows ++ "</tbody></table></div>"
-  return shell "Queue"
-    ("<h1>Queue</h1><h2>Concerts</h2>" ++ cTable ++ "<h2>Entries</h2>" ++ eTable)
+  let cRows : Html :=
+    if concerts.isEmpty then
+      {{ <tr><td colspan="5" class="empty"> "No concerts" </td></tr> }}
+    else
+      Html.fromList (concerts.toList.map fun r =>
+        let st := match r.status with
+          | .running => "running" | .done => "done"
+          | .failed  => "failed"  | .cancelled => "cancelled"
+        {{ <tr>
+          <td class="m"> s!"{esc r.id}" </td>
+          <td> {{ badge st }} </td>
+          <td class="m"> s!"{r.startedAt}" </td>
+          <td class="m"> s!"{esc (r.finishedAt.getD "")}" </td>
+          <td class="m trunc"> s!"{esc (r.name.getD (r.workflowFile.getD ""))}" </td>
+        </tr> }})
+  let cTable : Html :=
+    {{ <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th> "Concert ID" </th> <th> "Status" </th>
+            <th> "Started" </th> <th> "Finished" </th> <th> "Name / File" </th>
+          </tr>
+        </thead>
+        <tbody> {{ cRows }} </tbody>
+      </table>
+    </div> }}
+  let eRows : Html :=
+    if entries.isEmpty then
+      {{ <tr><td colspan="7" class="empty"> "No entries" </td></tr> }}
+    else
+      Html.fromList (entries.toList.map fun e =>
+        {{ <tr>
+          <td class="m"> <a href=s!"/tasks/{e.id}"> s!"{esc e.id}" </a> </td>
+          <td> {{ badge (qStText e.status) }} </td>
+          <td class="m trunc"> s!"{esc e.fork.toString}" </td>
+          <td class="m"> s!"{e.createdAt}" </td>
+          <td> s!"{e.priority}" </td>
+          <td class="m"> s!"{esc (e.series.getD "")}" </td>
+          <td class="m"> s!"{esc (e.concertId.getD "")}" </td>
+        </tr> }})
+  let eTable : Html :=
+    {{ <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th> "ID" </th> <th> "Status" </th> <th> "Fork" </th>
+            <th> "Created" </th> <th> "Pri" </th> <th> "Series" </th> <th> "Concert" </th>
+          </tr>
+        </thead>
+        <tbody> {{ eRows }} </tbody>
+      </table>
+    </div> }}
+  return shell "Queue" {{
+    <h1> "Queue" </h1>
+    <h2> "Concerts" </h2>
+    {{ cTable }}
+    <h2> "Entries" </h2>
+    {{ eTable }}
+  }}
 
-private def listenersPage : IO String := do
+private def listenersPage : IO Html := do
   let cfgs ← Listener.loadAllListenerConfigs
-  let rows ← cfgs.toList.mapM fun c => do
+  let rows : List Html ← cfgs.toList.mapM fun c => do
     let st ← Listener.loadListenerState c.name
     let last := if st.lastChecked.isEmpty then "never" else st.lastChecked
-    let eb := if st.enabled then "<span class=\"b bd\">enabled</span>"
-              else "<span class=\"b bc\">disabled</span>"
-    return "<tr><td>" ++ esc c.name ++ "</td><td>" ++ eb ++ "</td>" ++
-           "<td class=\"m\">" ++ toString c.intervalSeconds ++ "s</td>" ++
-           "<td class=\"m\">" ++ esc last ++ "</td>" ++
-           "<td>" ++ toString st.processedIds.size ++ "</td></tr>"
-  let body :=
-    if rows.isEmpty then "<tr><td colspan=\"5\" class=\"empty\">No listeners</td></tr>"
-    else String.join rows
-  return shell "Listeners"
-    ("<h1>Listeners</h1><div class=\"card\"><table><thead><tr>" ++
-     "<th>Name</th><th>Status</th><th>Interval</th><th>Last Checked</th><th>Events</th>" ++
-     "</tr></thead><tbody>" ++ body ++ "</tbody></table></div>")
+    let eb : Html :=
+      if st.enabled then {{ <span class="b bd"> "enabled" </span> }}
+      else {{ <span class="b bc"> "disabled" </span> }}
+    return {{ <tr>
+      <td> s!"{esc c.name}" </td>
+      <td> {{ eb }} </td>
+      <td class="m"> s!"{c.intervalSeconds}s" </td>
+      <td class="m"> s!"{last}" </td>
+      <td> s!"{st.processedIds.size}" </td>
+    </tr> }}
+  let tableBody : Html :=
+    if rows.isEmpty then
+      {{ <tr><td colspan="5" class="empty"> "No listeners" </td></tr> }}
+    else Html.fromList rows
+  return shell "Listeners" {{
+    <h1> "Listeners" </h1>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th> "Name" </th> <th> "Status" </th> <th> "Interval" </th>
+            <th> "Last Checked" </th> <th> "Events" </th>
+          </tr>
+        </thead>
+        <tbody> {{ tableBody }} </tbody>
+      </table>
+    </div>
+  }}
 
-private def tasksPage : IO String := do
+private def tasksPage : IO Html := do
   let tasks ← TaskStore.loadAllTasks
   let shown := tasks.toList.take 50
-  let rows :=
-    if shown.isEmpty then "<tr><td colspan=\"6\" class=\"empty\">No tasks yet</td></tr>"
-    else String.join (shown.map fun r =>
-      let snip := (r.prompt.take 80).toString
-      "<tr><td class=\"m\"><a href=\"/tasks/" ++ r.id ++ "\">" ++ esc r.id ++ "</a></td>" ++
-      "<td>" ++ badge (tStText r.status) ++ "</td>" ++
-      "<td class=\"m trunc\">" ++ esc r.fork.toString ++ "</td>" ++
-      "<td class=\"m\">" ++ esc r.createdAt ++ "</td>" ++
-      "<td class=\"m\">" ++ esc (r.series.getD "") ++ "</td>" ++
-      "<td class=\"trunc\">" ++ esc snip ++ "</td></tr>")
-  return shell "Tasks"
-    ("<h1>Tasks</h1><div class=\"card\"><table><thead><tr>" ++
-     "<th>ID</th><th>Status</th><th>Fork</th><th>Created</th><th>Series</th><th>Prompt</th>" ++
-     "</tr></thead><tbody>" ++ rows ++ "</tbody></table></div>")
+  let rows : Html :=
+    if shown.isEmpty then
+      {{ <tr><td colspan="6" class="empty"> "No tasks yet" </td></tr> }}
+    else
+      Html.fromList (shown.map fun r =>
+        let snip : String := (r.prompt.take 80).toString
+        {{ <tr>
+          <td class="m"> <a href=s!"/tasks/{r.id}"> s!"{esc r.id}" </a> </td>
+          <td> {{ badge (tStText r.status) }} </td>
+          <td class="m trunc"> s!"{esc r.fork.toString}" </td>
+          <td class="m"> s!"{r.createdAt}" </td>
+          <td class="m"> s!"{esc (r.series.getD "")}" </td>
+          <td class="trunc"> s!"{esc snip}" </td>
+        </tr> }})
+  return shell "Tasks" {{
+    <h1> "Tasks" </h1>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th> "ID" </th> <th> "Status" </th> <th> "Fork" </th>
+            <th> "Created" </th> <th> "Series" </th> <th> "Prompt" </th>
+          </tr>
+        </thead>
+        <tbody> {{ rows }} </tbody>
+      </table>
+    </div>
+  }}
 
-private def taskDetailPage (id : String) : IO (Option String) := do
+private def taskDetailPage (id : String) : IO (Option Html) := do
   let record  ← TaskStore.loadTask id
   let entries ← Queue.loadAllEntries
   let qEntry  := entries.find? (·.id == id)
@@ -328,22 +429,28 @@ private def taskDetailPage (id : String) : IO (Option String) := do
   | some (fork, st, createdAt, prompt) =>
     let logPath := (← Dirs.dataBase) / "logs" / fork.toString / s!"{id}.log"
     let logContent ← if ← logPath.pathExists then IO.FS.readFile logPath else pure ""
-    let logSec :=
-      if logContent.isEmpty then "<p class=\"empty\" style=\"padding:16px\">No log file.</p>"
-      else "<pre class=\"pre\">" ++ esc logContent ++ "</pre>"
-    let details :=
-      "<table>" ++
-      "<tr><th>ID</th><td class=\"m\">" ++ esc id ++ "</td></tr>" ++
-      "<tr><th>Status</th><td>" ++ badge st ++ "</td></tr>" ++
-      "<tr><th>Fork</th><td class=\"m\">" ++ esc fork.toString ++ "</td></tr>" ++
-      "<tr><th>Created</th><td class=\"m\">" ++ esc createdAt ++ "</td></tr>" ++
-      "</table>"
-    let content :=
-      "<h1>Task <span class=\"m\">" ++ esc id ++ "</span></h1>" ++
-      "<div class=\"card\">" ++ details ++ "</div>" ++
-      "<h2>Prompt</h2><div class=\"card\"><pre class=\"pre\">" ++ esc prompt ++ "</pre></div>" ++
-      "<h2>Log</h2><div class=\"card\">" ++ logSec ++ "</div>"
+    let logSec : Html :=
+      if logContent.isEmpty then
+        {{ <p class="empty" style="padding:16px"> "No log file." </p> }}
+      else
+        {{ <pre class="pre"> s!"{esc logContent}" </pre> }}
+    let details : Html :=
+      {{ <table>
+        <tr><th> "ID" </th>      <td class="m"> s!"{esc id}" </td></tr>
+        <tr><th> "Status" </th>  <td> {{ badge st }} </td></tr>
+        <tr><th> "Fork" </th>    <td class="m"> s!"{esc fork.toString}" </td></tr>
+        <tr><th> "Created" </th> <td class="m"> s!"{createdAt}" </td></tr>
+      </table> }}
+    let content : Html :=
+      {{ <h1> "Task " <span class="m"> s!"{esc id}" </span> </h1>
+        <div class="card"> {{ details }} </div>
+        <h2> "Prompt" </h2>
+        <div class="card"> <pre class="pre"> s!"{esc prompt}" </pre> </div>
+        <h2> "Log" </h2>
+        <div class="card"> {{ logSec }} </div> }}
     return some (shell s!"Task {id}" content)
+
+end -- HTML generation section
 
 -- HTTP request parsing
 
@@ -381,7 +488,6 @@ private def dispatch (req : HttpRequest) (pw : String) : IO HttpResponse := do
   if !checkBasicAuth req.headers pw then return unauthorizedResp
   if req.method != "GET" then return { status := 400, headers := #[], body := "Bad Request" }
   let path := pathOnly req.path
-  -- Exact route matches
   if path == "/" then return htmlResp (← overviewPage)
   if path == "/queue" then return htmlResp (← queuePage)
   if path == "/listeners" then return htmlResp (← listenersPage)
@@ -390,14 +496,13 @@ private def dispatch (req : HttpRequest) (pw : String) : IO HttpResponse := do
     | some id =>
       match ← taskDetailPage id with
       | some html => return htmlResp html
-      | none => return notFound s!"Task not found: {esc id}"
+      | none => return notFound s!"Task not found: {id}"
     | none => return htmlResp (← tasksPage)
-  -- Prefix routes: /tasks/<id>
   if path.startsWith "/tasks/" then
     let id := (path.drop 7).toString
     match ← taskDetailPage id with
     | some html => return htmlResp html
-    | none => return notFound s!"Task not found: {esc id}"
+    | none => return notFound s!"Task not found: {id}"
   return notFound "Page not found."
 
 -- TCP client handler
@@ -413,7 +518,6 @@ private def serveClient (client : Socket) (pw : String) : IO Unit := do
     | some bytes =>
       buf.modify (· ++ String.fromUTF8! bytes)
       let cur ← buf.get
-      -- Stop reading once we have the full headers
       if (cur.splitOn "\r\n\r\n").length > 1 then i := 16
   let raw ← buf.get
   let resp ← match parseRequest raw with
