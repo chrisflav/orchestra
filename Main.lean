@@ -1186,6 +1186,28 @@ private def migrateCmd : Cmd := `[Cli|
   "Migrate configuration and state from ~/.agent/ to XDG directories (~/.config/orchestra/ and ~/.local/share/orchestra/)."
 ]
 
+private def dashboardHandler (p : Parsed) : IO UInt32 := do
+  let port     := p.flag? "port"     |>.map (·.as! Nat) |>.getD 8080
+  let password := p.flag? "password" |>.map (·.as! String) |>.getD ""
+  if password.isEmpty then
+    IO.eprintln "Error: --password is required to protect the dashboard"
+    return 1
+  let (boundPort, _shutdown) ← Dashboard.start password port.toUInt16
+  IO.println s!"Orchestra dashboard listening on http://localhost:{boundPort}"
+  IO.println s!"Username: any  Password: (as provided)"
+  repeat do
+    IO.sleep 60000
+  return 0
+
+private def dashboardCmd : Cmd := `[Cli|
+  dashboard VIA dashboardHandler; ["0.1.0"]
+  "Start the web dashboard server (password-protected)."
+
+  FLAGS:
+    p, port     : Nat;    "Port to listen on (default: 8080)"
+    w, password : String; "Password for HTTP Basic Auth (required)"
+]
+
 -- All optional tool permission tokens recognised by --tools.
 private def allOptionalTools : List String :=
   ["create_pr", "comment", "manage_issues", "work_issues", "review_issues"]
@@ -1287,7 +1309,8 @@ def orchestraCmd : Cmd := `[Cli|
     issueCmd;
     spawnCmd;
     rolesCmd;
-    migrateCmd
+    migrateCmd;
+    dashboardCmd
 ]
 
 def main (args : List String) : IO UInt32 := do
