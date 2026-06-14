@@ -44,6 +44,10 @@ structure State where
   issueId : Option Project.IssueId := none
   /-- Backend label of the running agent (e.g. "claude"). Recorded with claims. -/
   agentBackend : String := "unknown"
+  /-- Model override for the running agent (e.g. "claude-opus-4-7"). -/
+  model : Option String := none
+  /-- Optional banner template appended to PR bodies (from AppConfig.prBanner). -/
+  prBanner : Option String := none
   /-- Series the task belongs to. Recorded with claims. -/
   series : Option String := none
   /-- Hook that enqueues a merger task, set by the daemon. Plumbed by
@@ -61,6 +65,42 @@ private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
   err.putStrLn s!"[mcp] {msg}"
   err.flush
+
+/-- Patterns that identify generic "Generated with Claude Code" banner lines to strip. -/
+private def genericBannerPatterns : List String := [
+  "claude.ai/claude-code",
+  "Generated with [Claude Code]",
+  "Generated with Claude Code",
+  "Co-Authored-By: Claude"
+]
+
+/-- Return true if `line` contains `needle` as a substring. -/
+private def lineContains (line needle : String) : Bool :=
+  match line.splitOn needle with
+  | _ :: _ :: _ => true
+  | _ => false
+
+/-- Return true if `line` contains any of the generic banner patterns. -/
+private def isGenericBannerLine (line : String) : Bool :=
+  genericBannerPatterns.any (lineContains line ·)
+
+/-- Strip generic Claude Code banner lines from `body` and optionally append a custom banner.
+    Template placeholders `{backend}` and `{model}` in `bannerTemplate` are substituted. -/
+private def applyPrBanner (body : String) (bannerTemplate : Option String)
+    (backend : String) (model : Option String) : String :=
+  -- Strip generic banner lines (and surrounding blank lines they leave behind).
+  let lines := body.splitOn "\n"
+  let stripped := lines.filter (fun l => !isGenericBannerLine l)
+  -- Drop trailing blank lines.
+  let trimmed := stripped.reverse.dropWhile (fun l => l.all Char.isWhitespace) |>.reverse
+  let cleanBody := String.intercalate "\n" trimmed
+  match bannerTemplate with
+  | none => cleanBody
+  | some tmpl =>
+    let modelStr := model.getD backend
+    let banner := tmpl.replace "{backend}" backend |>.replace "{model}" modelStr
+    if cleanBody.isEmpty then banner
+    else cleanBody ++ "\n\n" ++ banner
 
 -- JSON-RPC helpers
 
@@ -437,6 +477,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     if !state.allowedTools.contains "create_pr" then
       log "tool create_pr: denied (not in allowed tools)"
       return toolContent "PR creation is not enabled for this task" (isError := true)
+    let body := applyPrBanner body state.prBanner state.agentBackend state.model
     match target with
     | .upstream =>
       if state.pat.isEmpty then
