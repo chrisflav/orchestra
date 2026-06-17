@@ -312,6 +312,28 @@ def formatPrReviewThreads (response : Json) (unresolvedOnly excludeOutdated : Bo
     lines := lines.push summary
     return String.join (lines.toList.intersperse "\n")
 
+/-- Add labels to an issue or pull request. -/
+def addLabels (token : String) (repo : Repository) (number : Nat) (labels : List String) : IO String := do
+  let env := if token.isEmpty then #[] else #[("GH_TOKEN", some token)]
+  let labelsJson := Json.arr (labels.map Json.str).toArray
+  let payload := Json.mkObj [("labels", labelsJson)]
+  runCmd "gh" #[
+    "api", "--method", "POST",
+    s!"/repos/{repo.owner}/{repo.name}/issues/{number}/labels",
+    "--input", "-"
+  ] (input := payload.compress) (env := env)
+
+/-- Remove a single label from an issue or pull request.
+    No-ops silently if the label is not present. -/
+def removeLabel (token : String) (repo : Repository) (number : Nat) (label : String) : IO Unit := do
+  let env := if token.isEmpty then #[] else #[("GH_TOKEN", some token)]
+  try
+    let _ ← runCmd "gh" #[
+      "api", "--method", "DELETE",
+      s!"/repos/{repo.owner}/{repo.name}/issues/{number}/labels/{label}"
+    ] (env := env)
+  catch _ => pure ()
+
 /-- Return the pull-request number that a review comment belongs to. -/
 def getPrReviewCommentPrNumber (pat : String) (upstream : Repository) (commentId : Nat) : IO Nat := do
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]

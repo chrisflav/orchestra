@@ -153,6 +153,42 @@ private def optionalToolDefs : List (String × Json) := [
       ("required", .arr #["head"])
     ])
   ]),
+  ("triage", Json.mkObj [
+    ("name", "triage"),
+    ("description",
+      "Add or remove labels on an issue or pull request.\n\n" ++
+      "Operates on the upstream repository by default (target=\"upstream\", authenticated by PAT). " ++
+      "Set target=\"fork\" to operate on the fork repository instead (authenticated by a freshly-minted " ++
+      "GitHub App installation token, no PAT required).\n\n" ++
+      "At least one of `add` or `remove` must be non-empty."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("number", Json.mkObj [
+          ("type", "integer"),
+          ("description", "Issue or pull request number.")
+        ]),
+        ("add", Json.mkObj [
+          ("type", "array"),
+          ("items", Json.mkObj [("type", "string")]),
+          ("description", "Labels to add.")
+        ]),
+        ("remove", Json.mkObj [
+          ("type", "array"),
+          ("items", Json.mkObj [("type", "string")]),
+          ("description", "Labels to remove.")
+        ]),
+        ("target", Json.mkObj [
+          ("type", "string"),
+          ("enum", Json.arr #["upstream", "fork"]),
+          ("description",
+            "Repository to operate on. \"upstream\" (default) uses PAT; " ++
+            "\"fork\" uses the GitHub App installation token.")
+        ])
+      ]),
+      ("required", .arr #["number"])
+    ])
+  ]),
   ("comment", Json.mkObj [
     ("name", "comment"),
     ("description",
@@ -296,6 +332,7 @@ inductive ToolCall where
              (target : PrTarget)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
   | comment (action : CommentAction)
+  | triage (number : Nat) (add : List String) (remove : List String) (target : PrTarget)
   | getTaskInput
   | submitTaskOutput (value : Json)
   /-- A project / issue tool from `Orchestra.Project.Tools`. -/
@@ -387,6 +424,32 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
             .parseError "'reply_to_comment_id' and 'path'/'line' are mutually exclusive"
           | none, some _, none   => .parseError "'path' requires 'line'"
           | none, none, some _   => .parseError "'line' requires 'path'"
+  | "triage" =>
+    match args.getObjVal? "number" |>.toOption with
+    | none => .parseError "missing required argument: number"
+    | some numJson =>
+      match numJson.getInt? |>.toOption with
+      | none => .parseError "number must be an integer"
+      | some numInt =>
+        if numInt <= 0 then .parseError "number must be a positive integer"
+        else
+          let parseLabels (key : String) : List String :=
+            match args.getObjVal? key |>.toOption with
+            | none => []
+            | some arr =>
+              match arr.getArr? |>.toOption with
+              | none => []
+              | some items => (items.filterMap fun j => j.getStr? |>.toOption).toList
+          let add    := parseLabels "add"
+          let remove := parseLabels "remove"
+          if add.isEmpty && remove.isEmpty then
+            .parseError "at least one of 'add' or 'remove' must be non-empty"
+          else
+            let targetStr := args.getObjValAs? String "target" |>.toOption |>.getD "upstream"
+            match targetStr with
+            | "upstream" => .triage numInt.toNat add remove .upstream
+            | "fork"     => .triage numInt.toNat add remove .fork
+            | _ => .parseError s!"invalid 'target' (expected \"upstream\" or \"fork\", got {repr targetStr})"
   | "get_task_input" => .getTaskInput
   | "submit_task_output" =>
     match args.getObjVal? "value" with
@@ -531,6 +594,42 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
+  | .triage number add remove target =>
+    if !state.allowedTools.contains "triage" then
+      log "tool triage: denied (not in allowed tools)"
+      return toolContent "triage tool is not enabled for this task" (isError := true)
+    let withToken (token : String) (repo : Repository) : IO Json := do
+      let mut msgs : Array String := #[]
+      unless add.isEmpty do
+        log s!"tool triage: adding {add} to {repo}#{number}"
+        try
+          let _ ← GitHub.addLabels token repo number add
+          msgs := msgs.push s!"added labels: {", ".intercalate add}"
+        catch e =>
+          log s!"tool triage: error adding labels: {e}"
+          return toolContent (toString e) (isError := true)
+      for lbl in remove do
+        log s!"tool triage: removing {lbl} from {repo}#{number}"
+        GitHub.removeLabel token repo number lbl
+        msgs := msgs.push s!"removed label: {lbl}"
+      log "tool triage: ok"
+      return toolContent (String.join (msgs.toList.intersperse "\n"))
+    match target with
+    | .upstream =>
+      if state.pat.isEmpty then
+        log "tool triage: error: PAT not configured (target=upstream)"
+        return toolContent
+          "github.pat not set in config (required when target=upstream; pass target=\"fork\" to use the App token)"
+          (isError := true)
+      withToken state.pat state.upstream
+    | .fork =>
+      try
+        let jwt ← GitHub.createJWT state.appId state.privateKeyPath
+        let token ← GitHub.createInstallationToken jwt state.installationId
+        withToken token state.fork
+      catch e =>
+        log s!"tool triage: error minting token: {e}"
+        return toolContent (toString e) (isError := true)
   | .getTaskInput =>
     log "tool get_task_input"
     match state.inputJson with
