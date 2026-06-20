@@ -1,6 +1,7 @@
 import Orchestra.Config
 import Orchestra.AgentDef
 import Orchestra.Agents.Claude
+import Orchestra.Agents.Gemini
 import Orchestra.Agents.Opencode
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
@@ -173,6 +174,26 @@ private def runTriage {i o : ResultType} (pat : String) (ioTask : IOTask i o)
   TaskStore.saveTask { initialRecord with status := .completed }
   IO.println s!"  [triage] done"
 
+/-- Run a Gemini query task: resolve the API key from auth sources, call the Gemini
+    generateContent API with the task prompt, and record the text response as the task output.
+    Skips the entire sandbox / MCP server / repo-clone path. -/
+private def runGeminiQuery {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
+    (initialRecord : TaskStore.TaskRecord) : IO (Option Lean.Json) := do
+  IO.println "  [gemini] external LLM query backend"
+  let apiKey ← Gemini.resolveApiKey appConfig ioTask.authSource
+  let model := ioTask.model.getD Gemini.defaultModel
+  IO.println s!"  [gemini] model: {model}"
+  let systemPrompt ← loadSystemPrompt ioTask.systemPrompt
+  let response ← try
+    Gemini.queryGemini apiKey model ioTask.prompt systemPrompt
+  catch e =>
+    IO.eprintln s!"  [gemini] API query failed: {e}"
+    TaskStore.saveTask { initialRecord with status := .failed }
+    throw e
+  TaskStore.saveTask { initialRecord with status := .completed }
+  IO.println "  [gemini] done"
+  return some (.str response)
+
 private def sanitizeProjectName (upstream : Repository) : String :=
   s!"{upstream.owner}-{upstream.name}"
 
@@ -338,6 +359,17 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   IO.println "  Prompt:"
   for line in ioTask.prompt.splitOn "\n" do
     IO.println s!"    {line}"
+  -- Gemini: query the Gemini API directly. Skips GitHub auth, repo clone, sandbox, and MCP server.
+  if ioTask.backend == some "gemini" then
+    let outputJson ← runGeminiQuery appConfig ioTask initialRecord
+    let typedOutput : Option o.Type ← match outputJson with
+      | none   => pure none
+      | some j => match ResultType.valueFromJson o j with
+        | .ok v    => pure (some v)
+        | .error e =>
+          IO.eprintln s!"  [gemini] Warning: failed to deserialize output: {e}"
+          pure none
+    return ((taskId, false), typedOutput, outputJson)
   -- 1. Create GitHub App token
   IO.println "  Creating GitHub App token..."
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
