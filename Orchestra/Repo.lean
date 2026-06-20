@@ -54,7 +54,8 @@ an error is thrown instead.
 Cloning is performed via `gh repo clone`, which uses the GitHub App authentication
 already configured by `GitHub.setupGhAuth`.
 -/
-def ensureCloned (fork upstream : Repository) (interactive : Bool := true) : IO System.FilePath := do
+def ensureCloned (fork upstream : Repository)
+    (interactive : Bool := true) : IO System.FilePath := do
   let base ← workDir
   let repoPath := base / fork.owner / fork.name
   if ← repoPath.pathExists then
@@ -103,15 +104,26 @@ def ensureCloned (fork upstream : Repository) (interactive : Bool := true) : IO 
         if originUrl != expectedOriginUrl then
           IO.println s!"  Fixing origin URL: {originUrl} → {expectedOriginUrl}"
           runGit' #["remote", "set-url", "origin", expectedOriginUrl] repoPath
+        -- Make sure upstream points at the upstream HTTPS URL (no embedded/expired tokens)
+        let upstreamUrl ← runGit #["remote", "get-url", "upstream"] repoPath
+        let expectedUpstreamUrl := githubUrl upstream
+        if upstreamUrl != expectedUpstreamUrl then
+          IO.println s!"  Fixing upstream URL: {upstreamUrl} → {expectedUpstreamUrl}"
+          runGit' #["remote", "set-url", "upstream", expectedUpstreamUrl] repoPath
   else
     IO.FS.createDirAll repoPath
     runGh' #["repo", "clone", fork.toString, repoPath.toString]
     let remotes₃ ← runGit #["remote"] repoPath
     if !(remotes₃.splitOn "\n" |>.any (· == "upstream")) then
       runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
-  -- Ensure gh credentials are wired into git for authenticated operations
+  -- Ensure gh credentials are wired into git for authenticated operations.
+  -- This configures git to use gh's credential helper, which provides
+  -- authentication via the GitHub App token already configured by
+  -- GitHub.setupGhAuth.  No PAT is written to disk.
   runGh' #["auth", "setup-git"] none
-  -- Fetch upstream to keep remote tracking branches up to date
+  -- Fetch upstream to keep remote tracking branches up to date.
+  -- git uses gh's credential helper (configured above) for authentication,
+  -- so no PAT is needed — the GitHub App installation token is sufficient.
   IO.println "  Fetching upstream..."
   runGit' #["fetch", "upstream"] repoPath
   return repoPath
