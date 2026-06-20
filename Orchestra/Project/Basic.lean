@@ -56,6 +56,36 @@ instance : FromJson PRRef where
     let taskId := j.getObjValAs? String "task_id" |>.toOption
     return { repo, number, branch, taskId }
 
+/-! ## Review records
+
+A `IssueReview` is appended to an issue each time a reviewer rejects it.
+Only non-approving decisions are stored; approvals immediately enqueue a
+merger task and leave the issue in `.inReview` until it is merged or fails
+validation. -/
+
+structure IssueReview where
+  /-- Backend label or task ID of the reviewer agent (e.g. "claude"). -/
+  reviewer  : String
+  /-- Free-text notes explaining why the PR was rejected. -/
+  notes     : String
+  /-- ISO 8601 timestamp of the decision. -/
+  decidedAt : String
+deriving Repr, Inhabited
+
+instance : ToJson IssueReview where
+  toJson r :=
+    Json.mkObj
+      [ ("reviewer",   Json.str r.reviewer)
+      , ("notes",      Json.str r.notes)
+      , ("decided_at", Json.str r.decidedAt) ]
+
+instance : FromJson IssueReview where
+  fromJson? j := do
+    let reviewer  ← j.getObjValAs? String "reviewer"
+    let notes     ← j.getObjValAs? String "notes"
+    let decidedAt ← j.getObjValAs? String "decided_at"
+    return { reviewer, notes, decidedAt }
+
 /-! ## Issue lifecycle -/
 
 inductive IssueStatus where
@@ -168,6 +198,8 @@ structure Issue where
   attachedPRs  : Array PRRef     := #[]
   /-- Issues that must be completed before this one can be dispatched. -/
   dependencies : Array IssueId   := #[]
+  /-- Non-approving review decisions, oldest first. -/
+  reviews      : Array IssueReview := #[]
   createdAt    : String
   updatedAt    : String
 deriving Repr, Inhabited
@@ -187,6 +219,7 @@ instance : ToJson Issue where
     let fields := if let some p := i.parentId then fields ++ [("parent_id", ToJson.toJson p)] else fields
     let fields := if let some t := i.target   then fields ++ [("target",    ToJson.toJson t)] else fields
     let fields := if !i.dependencies.isEmpty  then fields ++ [("dependencies", Json.arr (i.dependencies.map ToJson.toJson))] else fields
+    let fields := if !i.reviews.isEmpty       then fields ++ [("reviews",      Json.arr (i.reviews.map ToJson.toJson))]       else fields
     Json.mkObj fields
 
 instance : FromJson Issue where
@@ -202,8 +235,9 @@ instance : FromJson Issue where
     let target       := j.getObjValAs? RepoTarget "target"   |>.toOption
     let attachedPRs  := (j.getObjValAs? (Array PRRef) "attached_prs" |>.toOption).getD #[]
     let dependencies := (j.getObjValAs? (Array IssueId) "dependencies" |>.toOption).getD #[]
+    let reviews      := (j.getObjValAs? (Array IssueReview) "reviews" |>.toOption).getD #[]
     return { id, projectId, parentId, title, description, status, target, attachedPRs,
-             dependencies, createdAt, updatedAt }
+             dependencies, reviews, createdAt, updatedAt }
 
 /-! ## Filesystem layout
 

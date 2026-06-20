@@ -468,8 +468,11 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         s!"updated:      {i.updatedAt}",
         if i.attachedPRs.isEmpty then "attached_prs: -" else "attached_prs:" ]
       let descrLines := (i.description.splitOn "\n").toArray.map (fun l => s!"  {l}")
+      let reviewLines := i.reviews.map (fun r =>
+        s!"  - [{r.decidedAt}] {r.reviewer}: {r.notes}")
       let mut body := header ++ prs
       if !children.isEmpty then body := body ++ #["children:"] ++ childLines
+      if !i.reviews.isEmpty then body := body ++ #["reviews:"] ++ reviewLines
       body := body ++ #["description:"] ++ descrLines
       return content (joinLines body)
   | .createIssue pid title descr parent target dependencies =>
@@ -665,12 +668,15 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       IO.println s!"  [mcp] decide_issue: {iid.value} \"{i.title}\" → {decisionStr} — {notes}"
       match decision with
       | .reject =>
-        -- Move back to .open and clear any claim. Notes are echoed back; the
-        -- comment tool is the right place to post them on the PR if desired.
+        -- Record the rejection review, then move back to .open and clear the claim.
+        -- We save the issue with the appended review first; release reloads it from
+        -- disk and only overwrites status + updatedAt, preserving the reviews array.
+        let review : IssueReview := { reviewer := env.agentBackend, notes, decidedAt := now }
+        saveIssue { i with reviews := i.reviews.push review }
         if let some mgr := env.claimManager then
           let _ ← release mgr project.id iid .open now
         else
-          saveIssue { i with status := .open, updatedAt := now }
+          saveIssue { i with reviews := i.reviews.push review, status := .open, updatedAt := now }
         IO.println s!"  [mcp] decide_issue: {iid.value} moved to open"
         return content s!"rejected {iid.value}: {notes}"
       | .approve =>
