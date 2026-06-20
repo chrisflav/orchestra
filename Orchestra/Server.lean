@@ -164,7 +164,9 @@ private def optionalToolDefs : List (String × Json) := [
         "to attach inline comments to the review (COMMENT event, no approval/rejection).\n" ++
       "• Reply to an existing inline PR review comment: provide `body` and `reply_to_comment_id`.\n" ++
       "• New inline PR review comment on a specific file and line: provide `body`, `path`, and `line`.\n\n" ++
-      "`review`, `reply_to_comment_id`, and `path`/`line` are mutually exclusive."),
+      "`review`, `reply_to_comment_id`, and `path`/`line` are mutually exclusive.\n\n" ++
+      "Use `target=\"fork\"` when the PR lives in the fork repository rather than upstream " ++
+      "(authenticated by a freshly-minted GitHub App installation token, no PAT required)."),
     ("inputSchema", Json.mkObj [
       ("type", "object"),
       ("properties", Json.mkObj [
@@ -219,6 +221,13 @@ private def optionalToolDefs : List (String × Json) := [
             "Which side of the diff to comment on when creating a new inline review comment " ++
             "(default: RIGHT)."),
           ("enum", .arr #["LEFT", "RIGHT"])
+        ]),
+        ("target", Json.mkObj [
+          ("type", "string"),
+          ("enum", Json.arr #["upstream", "fork"]),
+          ("description",
+            "Which repository hosts the PR. \"upstream\" (default) posts to state.upstream via PAT; " ++
+            "\"fork\" posts to state.fork via the GitHub App installation token.")
         ])
       ]),
       ("required", .arr #["body"])
@@ -295,7 +304,7 @@ inductive ToolCall where
   | createPr (title : String) (body : String) (head : String) (base : String)
              (target : PrTarget)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
-  | comment (action : CommentAction)
+  | comment (action : CommentAction) (target : PrTarget)
   | getTaskInput
   | submitTaskOutput (value : Json)
   /-- A project / issue tool from `Orchestra.Project.Tools`. -/
@@ -357,6 +366,15 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
         let path      := args.getObjValAs? String "path"             |>.toOption
         let line      := args.getObjValAs? Nat "line"                |>.toOption
         let side      := args.getObjValAs? String "side"             |>.toOption |>.getD "RIGHT"
+        let targetStr := args.getObjValAs? String "target"           |>.toOption |>.getD "upstream"
+        let target? : Option PrTarget := match targetStr with
+          | "upstream" => some .upstream
+          | "fork"     => some .fork
+          | _          => none
+        match target? with
+        | none =>
+          .parseError s!"invalid 'target' (expected \"upstream\" or \"fork\", got {repr targetStr})"
+        | some target =>
         if review then
           match replyToId, path, line with
           | none, none, none =>
@@ -375,14 +393,14 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
                       let s := item.getObjValAs? String "side" |>.toOption |>.getD "RIGHT"
                       some { path := p, line := l, body := b, side := s }
                     | _, _, _ => none
-            .comment (.review body inlineComments)
+            .comment (.review body inlineComments) target
           | _, _, _          =>
             .parseError "'review' is mutually exclusive with 'reply_to_comment_id' and 'path'/'line'"
         else
           match replyToId, path, line with
-          | some cid, none, none => .comment (.replyInline body cid)
-          | none, some p, some l => .comment (.newInline { path := p, line := l, body, side })
-          | none, none, none     => .comment (.issue body)
+          | some cid, none, none => .comment (.replyInline body cid) target
+          | none, some p, some l => .comment (.newInline { path := p, line := l, body, side }) target
+          | none, none, none     => .comment (.issue body) target
           | some _, _, _         =>
             .parseError "'reply_to_comment_id' and 'path'/'line' are mutually exclusive"
           | none, some _, none   => .parseError "'path' requires 'line'"
@@ -478,7 +496,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     catch e =>
       log s!"tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)
-  | .comment action =>
+  | .comment action target =>
     if !state.allowedTools.contains "comment" then
       log "tool comment: denied (not in allowed tools)"
       return toolContent "comment tool is not enabled for this task" (isError := true)
@@ -487,50 +505,47 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       log "tool comment: no issue number configured"
       return toolContent "no issue_number configured for this task" (isError := true)
     | some n =>
-      match action with
-      | .issue body =>
-        log s!"tool comment: posting to {state.upstream}#{n}"
-        try
-          let result ← GitHub.createIssueComment state.pat state.upstream n body
+      -- Resolve which repo to target and which token to use.
+      let (repo, tokenIO) : Repository × IO String :=
+        match target with
+        | .upstream => (state.upstream, pure state.pat)
+        | .fork =>
+          (state.fork, do
+            let jwt ← GitHub.createJWT state.appId state.privateKeyPath
+            GitHub.createInstallationToken jwt state.installationId)
+      try
+        let token ← tokenIO
+        match action with
+        | .issue body =>
+          log s!"tool comment: posting to {repo}#{n}"
+          let result ← GitHub.createIssueComment token repo n body
           log "tool comment: ok"
           return toolContent result
-        catch e =>
-          log s!"tool comment: error: {e}"
-          return toolContent (toString e) (isError := true)
-      | .review body inlineComments =>
-        log s!"tool comment: posting review to {state.upstream}#{n} \
-          ({inlineComments.size} inline comments)"
-        try
-          let result ← GitHub.createPrReview state.pat state.upstream n body inlineComments
+        | .review body inlineComments =>
+          log s!"tool comment: posting review to {repo}#{n} \
+            ({inlineComments.size} inline comments)"
+          let result ← GitHub.createPrReview token repo n body inlineComments
           log "tool comment: ok"
           return toolContent result
-        catch e =>
-          log s!"tool comment: error: {e}"
-          return toolContent (toString e) (isError := true)
-      | .replyInline body cid =>
-        log s!"tool comment: replying to inline comment {cid} on {state.upstream}#{n}"
-        try
-          let cidPr ← GitHub.getPrReviewCommentPrNumber state.pat state.upstream cid
+        | .replyInline body cid =>
+          log s!"tool comment: replying to inline comment {cid} on {repo}#{n}"
+          let cidPr ← GitHub.getPrReviewCommentPrNumber token repo cid
           if cidPr ≠ n then
             log s!"tool comment: comment {cid} belongs to PR #{cidPr}, not #{n}"
             return toolContent s!"comment {cid} does not belong to issue #{n}" (isError := true)
-          let result ← GitHub.replyToPrReviewComment state.pat state.upstream n cid body
+          let result ← GitHub.replyToPrReviewComment token repo n cid body
           log "tool comment: ok"
           return toolContent result
-        catch e =>
-          log s!"tool comment: error: {e}"
-          return toolContent (toString e) (isError := true)
-      | .newInline comment =>
-        log s!"tool comment: new inline comment on {state.upstream}#{n} \
-          {comment.path}:{comment.line} ({comment.side})"
-        try
-          let result ← GitHub.createPrReviewComment state.pat state.upstream n
+        | .newInline comment =>
+          log s!"tool comment: new inline comment on {repo}#{n} \
+            {comment.path}:{comment.line} ({comment.side})"
+          let result ← GitHub.createPrReviewComment token repo n
             comment.body comment.path comment.line comment.side
           log "tool comment: ok"
           return toolContent result
-        catch e =>
-          log s!"tool comment: error: {e}"
-          return toolContent (toString e) (isError := true)
+      catch e =>
+        log s!"tool comment: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .getTaskInput =>
     log "tool get_task_input"
     match state.inputJson with
