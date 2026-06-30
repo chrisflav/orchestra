@@ -334,27 +334,53 @@
 
   // ---- boot + live updates ---------------------------------------------
 
-  // Snapshot the scroll position of every scrollable region (the task-detail
-  // log, prompt and per-event `<pre>` blocks) so a full innerHTML replace
-  // doesn't reset where the user is reading. If they were pinned to the
-  // bottom of the log, keep them pinned so new events follow.
+  // Snapshot every scrollable region inside the page (the task-detail log,
+  // prompt and per-event `<pre>` blocks) **and** the document scroll, so a
+  // full innerHTML replace doesn't reset where the user is reading. If they
+  // were pinned to the bottom of the log, keep them pinned so new events
+  // follow.
+  //
+  // Indexing is done by `(className, ordinal-within-class)`, which is
+  // resilient to extra inner `<pre>` elements appearing between renders
+  // (a new tool result event would otherwise shift positional indices).
+  const SCROLL_SELECTOR = ".log, .lbody pre, .pre";
+
   function snapshotScrolls(root) {
-    const out = [];
-    root.querySelectorAll(".log, .lbody pre, .pre").forEach((el) => {
-      const atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 4;
-      out.push({ cls: el.className, top: el.scrollTop, atBottom });
+    const out = new Map();
+    const counts = new Map();
+    root.querySelectorAll(SCROLL_SELECTOR).forEach((el) => {
+      const key = el.className || "_pre";
+      const n = counts.get(key) || 0;
+      counts.set(key, n + 1);
+      if (el.scrollTop > 0 || el.scrollHeight > el.clientHeight) {
+        const atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 4;
+        out.set(`${key}:${n}`, { top: el.scrollTop, atBottom });
+      }
     });
-    return out;
+    return { winY: window.scrollY, els: out };
   }
 
   function restoreScrolls(root, snap) {
-    const els = root.querySelectorAll(".log, .lbody pre, .pre");
-    els.forEach((el, i) => {
-      const s = snap[i];
-      if (!s || s.cls !== el.className) return;
+    // Force layout so scrollHeight is computed on the freshly-inserted nodes
+    // before we try to set scrollTop. Without this some browsers clamp
+    // scrollTop to 0 because layout hasn't decided that overflow exists yet.
+    void root.offsetHeight;
+    const counts = new Map();
+    root.querySelectorAll(SCROLL_SELECTOR).forEach((el) => {
+      const key = el.className || "_pre";
+      const n = counts.get(key) || 0;
+      counts.set(key, n + 1);
+      const s = snap.els.get(`${key}:${n}`);
+      if (!s) return;
       el.scrollTop = s.atBottom ? el.scrollHeight : s.top;
     });
+    // Restore document scroll. Replacing innerHTML on <main> briefly
+    // collapses its layout, and the browser can scroll the viewport back
+    // toward the top while it rebuilds.
+    if (snap.winY > 0) window.scrollTo(0, snap.winY);
   }
+
+  const lastSig = new WeakMap();
 
   function render(target, page, data) {
     const fn = pages[page];
@@ -362,6 +388,14 @@
       target.innerHTML = `<p class="empty">Unknown page: ${E(page)}</p>`;
       return;
     }
+    // Skip if the payload hasn't changed since the last render: avoids
+    // re-laying out the page (and thrashing scroll positions) when SSE
+    // delivers identical data on consecutive ticks.
+    let sig;
+    try { sig = JSON.stringify(data); } catch (_) { sig = null; }
+    if (sig != null && lastSig.get(target) === sig) return;
+    if (sig != null) lastSig.set(target, sig);
+
     const snap = snapshotScrolls(target);
     target.innerHTML = fn(data);
     restoreScrolls(target, snap);
