@@ -165,7 +165,18 @@ private def dashCss : String :=
   ".st{background:var(--sf);border:1px solid var(--bd);border-radius:6px;padding:16px}" ++
   ".sv{font-size:26px;font-weight:700}.sl{font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}"
 
-private def shell (title : String) (content : Html) : Html :=
+-- JS that subscribes to an SSE endpoint and replaces the inner HTML of `<main>`
+-- with the received fragment. The browser reuses the page's cached Basic Auth
+-- credentials for the EventSource request to the same origin.
+private def sseScript (endpoint : String) : String :=
+  "var es=new EventSource('" ++ endpoint ++ "');" ++
+  "es.onmessage=function(e){document.querySelector('main').innerHTML=e.data;};" ++
+  "window.addEventListener('beforeunload',function(){es.close();});"
+
+private def shell (title : String) (sseEndpoint : Option String) (content : Html) : Html :=
+  let script := match sseEndpoint with
+    | none => ""
+    | some p => sseScript p
   {{ <html lang="en">
     <head>
       <meta charset="utf-8"/>
@@ -184,7 +195,7 @@ private def shell (title : String) (content : Html) : Html :=
         </nav>
       </header>
       <main> {{ content }} </main>
-      <script> {{ Html.text false "setTimeout(()=>location.reload(),15000)" }} </script>
+      <script> {{ Html.text false script }} </script>
     </body>
   </html> }}
 
@@ -204,7 +215,7 @@ private def statBox (val : Nat) (lbl : String) : Html :=
     <div class="sl"> s!"{lbl}" </div>
   </div> }}
 
-private def overviewPage : IO Html := do
+private def overviewContent : IO Html := do
   let entries  ← Queue.loadAllEntries
   let tasks    ← TaskStore.loadAllTasks
   let lsCfgs   ← Listener.loadAllListenerConfigs
@@ -274,16 +285,18 @@ private def overviewPage : IO Html := do
         <tbody> {{ recentRows }} </tbody>
       </table>
     </div> }}
-  return shell "Overview" {{
+  return {{
     {{ stats }}
     <h2> "Active Queue" </h2>
     {{ qTable }}
     <h2> "Recent Tasks" </h2>
     {{ tTable }}
-    <p class="note"> "Refreshes every 15 s" </p>
   }}
 
-private def queuePage : IO Html := do
+private def overviewPage : IO Html := do
+  return shell "Overview" (some "/sse/overview") (← overviewContent)
+
+private def queueContent : IO Html := do
   let entries  ← Queue.loadAllEntries
   let concerts ← Queue.loadAllConcertRuns
   let cRows : Html :=
@@ -339,7 +352,7 @@ private def queuePage : IO Html := do
         <tbody> {{ eRows }} </tbody>
       </table>
     </div> }}
-  return shell "Queue" {{
+  return {{
     <h1> "Queue" </h1>
     <h2> "Concerts" </h2>
     {{ cTable }}
@@ -347,7 +360,10 @@ private def queuePage : IO Html := do
     {{ eTable }}
   }}
 
-private def listenersPage : IO Html := do
+private def queuePage : IO Html := do
+  return shell "Queue" (some "/sse/queue") (← queueContent)
+
+private def listenersContent : IO Html := do
   let cfgs ← Listener.loadAllListenerConfigs
   let rows : List Html ← cfgs.toList.mapM fun c => do
     let st ← Listener.loadListenerState c.name
@@ -366,7 +382,7 @@ private def listenersPage : IO Html := do
     if rows.isEmpty then
       {{ <tr><td colspan="5" class="empty"> "No listeners" </td></tr> }}
     else Html.fromList rows
-  return shell "Listeners" {{
+  return {{
     <h1> "Listeners" </h1>
     <div class="card">
       <table>
@@ -381,7 +397,10 @@ private def listenersPage : IO Html := do
     </div>
   }}
 
-private def tasksPage : IO Html := do
+private def listenersPage : IO Html := do
+  return shell "Listeners" (some "/sse/listeners") (← listenersContent)
+
+private def tasksContent : IO Html := do
   let tasks ← TaskStore.loadAllTasks
   let shown := tasks.toList.take 50
   let rows : Html :=
@@ -398,7 +417,7 @@ private def tasksPage : IO Html := do
           <td class="m"> s!"{esc (r.series.getD "")}" </td>
           <td class="trunc"> s!"{esc snip}" </td>
         </tr> }})
-  return shell "Tasks" {{
+  return {{
     <h1> "Tasks" </h1>
     <div class="card">
       <table>
@@ -413,7 +432,10 @@ private def tasksPage : IO Html := do
     </div>
   }}
 
-private def taskDetailPage (id : String) : IO (Option Html) := do
+private def tasksPage : IO Html := do
+  return shell "Tasks" (some "/sse/tasks") (← tasksContent)
+
+private def taskDetailContent (id : String) : IO (Option Html) := do
   let record  ← TaskStore.loadTask id
   let entries ← Queue.loadAllEntries
   let qEntry  := entries.find? (·.id == id)
@@ -448,9 +470,38 @@ private def taskDetailPage (id : String) : IO (Option Html) := do
         <div class="card"> <pre class="pre"> s!"{esc prompt}" </pre> </div>
         <h2> "Log" </h2>
         <div class="card"> {{ logSec }} </div> }}
-    return some (shell s!"Task {id}" content)
+    return some content
+
+private def taskDetailPage (id : String) : IO (Option Html) := do
+  match ← taskDetailContent id with
+  | none => return none
+  | some content => return some (shell s!"Task {id}" (some s!"/sse/tasks/{id}") content)
+
+/-- Render the current dynamic fragment for an SSE endpoint kind.
+    Returns `none` if the kind is unknown or the referenced resource is missing.
+    The fragment is the same verso `Html` value that the corresponding page
+    wraps in `shell` — rendered to a string via `Html.asString`. -/
+private def renderFragment (kind : String) : IO (Option String) := do
+  let toStr (h : Html) : String := Html.asString h (breakLines := false)
+  if kind == "overview"  then return some (toStr (← overviewContent))
+  if kind == "queue"     then return some (toStr (← queueContent))
+  if kind == "listeners" then return some (toStr (← listenersContent))
+  if kind == "tasks"     then return some (toStr (← tasksContent))
+  if kind.startsWith "tasks/" then
+    let id := (kind.drop "tasks/".length).toString
+    match ← taskDetailContent id with
+    | none   => return none
+    | some h => return some (toStr h)
+  return none
 
 end -- HTML generation section
+
+/-- Encode a payload as a single SSE `message` event. Each `\n` in the payload
+    becomes a separate `data:` line per the SSE spec; the browser rejoins them
+    with `\n` in `event.data`. The frame is terminated by a blank line. -/
+private def sseFrame (payload : String) : String :=
+  let lines := payload.splitOn "\n"
+  (lines.map (fun l => "data: " ++ l) |> String.intercalate "\n") ++ "\n\n"
 
 -- HTTP request parsing
 
@@ -505,6 +556,37 @@ private def dispatch (req : HttpRequest) (pw : String) : IO HttpResponse := do
     | none => return notFound s!"Task not found: {id}"
   return notFound "Page not found."
 
+-- SSE streaming handler
+
+private def sseHeader : String :=
+  "HTTP/1.1 200 OK\r\n" ++
+  "Content-Type: text/event-stream\r\n" ++
+  "Cache-Control: no-cache\r\n" ++
+  "Connection: keep-alive\r\n" ++
+  "X-Accel-Buffering: no\r\n\r\n"
+
+/-- Refresh interval for SSE pushes, in milliseconds. -/
+private def sseIntervalMs : UInt32 := 2000
+
+private partial def sseLoop (client : Socket) (kind : String) : IO Unit := do
+  let payloadOpt ← try renderFragment kind catch _ => pure none
+  match payloadOpt with
+  | none => return -- unknown kind or vanished resource; close stream
+  | some payload =>
+    let ok ← try
+      let _ ← awaitTcp (← client.send #[(sseFrame payload).toUTF8])
+      pure true
+    catch _ => pure false
+    if !ok then return
+    IO.sleep sseIntervalMs
+    sseLoop client kind
+
+private def serveSse (client : Socket) (kind : String) : IO Unit := do
+  try
+    let _ ← awaitTcp (← client.send #[sseHeader.toUTF8])
+    sseLoop client kind
+  catch _ => pure ()
+
 -- TCP client handler
 
 private def serveClient (client : Socket) (pw : String) : IO Unit := do
@@ -520,10 +602,20 @@ private def serveClient (client : Socket) (pw : String) : IO Unit := do
       let cur ← buf.get
       if (cur.splitOn "\r\n\r\n").length > 1 then i := 16
   let raw ← buf.get
-  let resp ← match parseRequest raw with
-    | none => pure { status := 400, headers := #[], body := "Bad Request" }
-    | some req => dispatch req pw
-  let _ ← awaitTcp (← client.send #[httpResponse resp |>.toUTF8])
+  match parseRequest raw with
+  | none =>
+    let resp : HttpResponse := { status := 400, headers := #[], body := "Bad Request" }
+    let _ ← awaitTcp (← client.send #[httpResponse resp |>.toUTF8])
+  | some req =>
+    let path := pathOnly req.path
+    if path.startsWith "/sse/" then
+      if !checkBasicAuth req.headers pw then
+        let _ ← awaitTcp (← client.send #[httpResponse unauthorizedResp |>.toUTF8])
+      else
+        serveSse client (path.drop "/sse/".length).toString
+    else
+      let resp ← dispatch req pw
+      let _ ← awaitTcp (← client.send #[httpResponse resp |>.toUTF8])
 
 /-- Start the dashboard HTTP server on the given port (0 = auto-assign).
     Returns `(boundPort, shutdown)`. -/
