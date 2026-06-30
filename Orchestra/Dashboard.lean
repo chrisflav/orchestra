@@ -7,11 +7,15 @@ import Orchestra.Queue
 import Orchestra.TaskStore
 import Orchestra.Listener
 import Verso.Output.Html
+import Verso.Doc.Html
+import Verso.Doc.Name
+import Orchestra.Dashboard.About
 
 open Lean (Json ToJson)
 open Std.Net
 open Std.Internal.UV.TCP
 open Verso.Output (Html)
+open Verso.Doc (Genre Part)
 
 /-!
 # Orchestra Web Dashboard
@@ -140,387 +144,26 @@ private def unauthorizedResp : HttpResponse :=
   let base := htmlResp {{ <html><body><h1>"401 Unauthorized"</h1></body></html> }} 401
   { base with headers := base.headers.push ("WWW-Authenticate", "Basic realm=\"Orchestra Dashboard\"") }
 
-/-- Light theme stylesheet. Inlined into every shell. -/
-private def dashCss : String :=
-  ":root{--bg:#f7f8fa;--sf:#ffffff;--bd:#e4e7ec;--tx:#1f2937;--mu:#6b7280;--ac:#2563eb;--code:#f3f4f6}" ++
-  "*{box-sizing:border-box;margin:0;padding:0}" ++
-  "body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--tx);font-size:14px;line-height:1.55}" ++
-  "code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}" ++
-  "a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}" ++
-  "header{background:var(--sf);border-bottom:1px solid var(--bd);padding:12px 24px;display:flex;align-items:center;gap:24px}" ++
-  "header .logo{font-weight:700;font-size:16px;color:var(--tx)}" ++
-  "nav{display:flex;gap:16px}nav a{color:var(--mu);font-size:13px;padding:4px 0}" ++
-  "nav a:hover{color:var(--tx)}nav a.active{color:var(--tx);border-bottom:2px solid var(--ac)}" ++
-  "main{padding:24px;max-width:1200px;margin:0 auto}" ++
-  "h1{font-size:20px;font-weight:600;margin-bottom:16px}" ++
-  "h2{font-size:12px;font-weight:600;margin:24px 0 10px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em}" ++
-  ".card{background:var(--sf);border:1px solid var(--bd);border-radius:8px;overflow:hidden;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.03)}" ++
-  "table{width:100%;border-collapse:collapse}" ++
-  "th{text-align:left;padding:10px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mu);border-bottom:1px solid var(--bd);font-weight:600;background:#fafbfc}" ++
-  "td{padding:10px 12px;border-bottom:1px solid var(--bd);vertical-align:top}tr:last-child td{border-bottom:none}" ++
-  "tr:hover td{background:#fafbfc}" ++
-  ".b{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.03em}" ++
-  ".br{background:#dcfce7;color:#15803d}.bp{background:#fef3c7;color:#a16207}" ++
-  ".bd{background:#dcfce7;color:#166534}.bf{background:#fee2e2;color:#b91c1c}" ++
-  ".bc{background:#e5e7eb;color:#4b5563}.bo{background:#dbeafe;color:#1d4ed8}" ++
-  ".m{font-size:12px;color:var(--mu)}.mono{font-family:ui-monospace,monospace;font-size:12px}" ++
-  ".trunc{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" ++
-  ".pre{background:var(--code);padding:16px;font-size:12px;font-family:ui-monospace,monospace;color:var(--tx);" ++
-       "white-space:pre-wrap;word-break:break-word;max-height:600px;overflow-y:auto}" ++
-  ".empty{padding:32px;text-align:center;color:var(--mu)}" ++
-  ".loading{padding:48px;text-align:center;color:var(--mu);font-size:13px}" ++
-  ".note{font-size:11px;color:var(--mu);margin-top:8px}" ++
-  ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}" ++
-  ".st{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.03)}" ++
-  ".sv{font-size:26px;font-weight:700;color:var(--tx)}" ++
-  ".sl{font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}" ++
-  ".log{background:var(--sf);padding:0;font-size:13px;max-height:760px;overflow-y:auto}" ++
-  ".le{display:grid;grid-template-columns:90px 1fr;gap:12px;padding:10px 14px;border-bottom:1px solid var(--bd);align-items:start}" ++
-  ".le:last-child{border-bottom:none}" ++
-  ".lk{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;padding:3px 8px;border-radius:4px;text-align:center;width:fit-content}" ++
-  ".lk-init{background:#dbeafe;color:#1d4ed8}.lk-system{background:#e5e7eb;color:#374151}" ++
-  ".lk-think{background:#ede9fe;color:#6d28d9}.lk-tool{background:#fef3c7;color:#92400e}" ++
-  ".lk-text{background:#dcfce7;color:#166534}.lk-out{background:#f3f4f6;color:#374151}" ++
-  ".lk-result{background:#dcfce7;color:#166534}.lk-err{background:#fee2e2;color:#b91c1c}" ++
-  ".lk-unk{background:#e5e7eb;color:#6b7280}" ++
-  ".lbody{min-width:0;font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.5;color:var(--tx);word-break:break-word}" ++
-  ".lbody pre{background:var(--code);padding:8px 10px;border-radius:4px;white-space:pre-wrap;word-break:break-word;font-size:12px;margin-top:4px;max-height:300px;overflow-y:auto}" ++
-  ".lbody .meta{color:var(--mu);font-size:11px;margin-top:2px}" ++
-  ".lbody .toolname{font-weight:600;color:#92400e}" ++
-  ".lbody .thinking{font-style:italic;color:#6d28d9}" ++
-  ".lbody .err{color:#b91c1c;font-weight:600}" ++
-  ".kv{font-size:11px;color:var(--mu);margin-bottom:4px;text-transform:uppercase;letter-spacing:.05em}"
+/-- Light theme stylesheet, served inline by the layout. -/
+private def dashCss : String := include_str "Dashboard/dashboard.css"
 
-/-- Frontend JS bundle. Renders all dynamic content. Boots from the `data-page`
-    / `data-api` / `data-sse` attributes on `<main>`: fetches the initial JSON
-    state, paints it, then subscribes to the SSE stream for live updates.
-    All HTML strings are built with single-quoted attributes so the Lean
-    string literal stays free of internal `"` characters. -/
-private def dashJs : String :=
-"(function(){
-'use strict';
+/-- Frontend JS bundle, served inline by the layout. Boots from the
+    `data-page` / `data-api` / `data-sse` attributes on `<main>`: fetches the
+    initial JSON state, paints it, then subscribes to the SSE stream for
+    live updates. -/
+private def dashJs : String := include_str "Dashboard/dashboard.js"
 
-function E(s){
-  return String(s==null?'':s)
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;');
-}
+private def loadingPlaceholder : Html := {{ <div class="loading"> "Loading…" </div> }}
 
-function trunc(s,n){
-  s = String(s||'');
-  return s.length<=n ? s : s.slice(0,n)+'…';
-}
-
-var BADGE_CLS = {running:'br',pending:'bp',done:'bd',completed:'bd',failed:'bf',cancelled:'bc',unfinished:'bc'};
-function badge(s){
-  var cls = BADGE_CLS[s] || 'bo';
-  return `<span class='b ${cls}'>${E(s)}</span>`;
-}
-
-function table(headers, rows, emptyMsg){
-  var c = headers.length;
-  var body = rows.length===0
-    ? `<tr><td colspan='${c}' class='empty'>${E(emptyMsg)}</td></tr>`
-    : rows.join('');
-  var ths = headers.map(function(h){return `<th>${E(h)}</th>`;}).join('');
-  return `<div class='card'><table><thead><tr>${ths}</tr></thead><tbody>${body}</tbody></table></div>`;
-}
-
-function kvTable(rows){
-  var trs = rows.map(function(r){
-    var k=r[0], v=r[1], cls=r[2]||'m';
-    return `<tr><th>${E(k)}</th><td class='${cls}'>${v}</td></tr>`;
-  }).join('');
-  return `<div class='card'><table>${trs}</table></div>`;
-}
-
-function statBox(value,label){
-  return `<div class='st'><div class='sv'>${E(value)}</div><div class='sl'>${E(label)}</div></div>`;
-}
-
-function link(href,label,cls){
-  return `<a href='${E(href)}' class='${cls||''}'>${E(label)}</a>`;
-}
-
-// -------- Log rendering --------
-
-function logKind(label,cls,body){
-  return `<div class='le'><span class='lk ${cls}'>${E(label)}</span><div class='lbody'>${body}</div></div>`;
-}
-
-function renderToolInput(input){
-  input = input || {};
-  var cmd = input.command || '';
-  var fp = input.file_path || input.filePath || '';
-  var pat = input.pattern || '';
-  var desc = input.description || '';
-  if (cmd){
-    return (desc ? `<div class='meta'>${E(desc)}</div>` : '') + `<pre>$ ${E(cmd)}</pre>`;
-  }
-  if (fp)  return `<div class='meta'>${E(fp)}</div>`;
-  if (pat) return `<div class='meta'>pattern: ${E(pat)}</div>`;
-  if (desc) return `<div class='meta'>${E(desc)}</div>`;
-  return `<pre>${E(trunc(JSON.stringify(input),280))}</pre>`;
-}
-
-function renderLogEvent(j){
-  switch (j.type){
-    case 'init':
-      return logKind('init','lk-init',
-        `model: ${E(j.model)}<div class='meta'>session ${E(trunc(j.session_id||'',12))}</div>`);
-    case 'system':
-      return logKind('system','lk-system', E(j.subtype||''));
-    case 'assistant': {
-      var it = j.item || {};
-      if (it.type==='thinking')
-        return logKind('thinking','lk-think', `<div class='thinking'>${E(it.text)}</div>`);
-      if (it.type==='tool_use')
-        return logKind('tool','lk-tool',
-          `<span class='toolname'>${E(it.name)}</span>${renderToolInput(it.input||{})}`);
-      if (it.type==='text')
-        return logKind('text','lk-text', E(it.text));
-      return logKind(it.type||'unknown','lk-unk', E(trunc(JSON.stringify(it),240)));
-    }
-    case 'tool_result': {
-      var so = j.stdout||'';
-      var se = j.stderr||'';
-      var body = (so ? `<pre>${E(so)}</pre>` : '') +
-                 (se ? `<div class='meta err'>stderr</div><pre>${E(se)}</pre>` : '');
-      return logKind('output','lk-out', body);
-    }
-    case 'result': {
-      var sub = j.subtype||'';
-      var cls = (typeof sub==='string' && sub.indexOf('error')===0) ? 'lk-err' : 'lk-result';
-      var parts = [];
-      if (j.num_turns!=null) parts.push(`${j.num_turns} turns`);
-      if (j.duration_ms!=null) parts.push(`${Math.floor(j.duration_ms/1000)}s`);
-      if (j.total_cost_usd!=null) parts.push(`$${j.total_cost_usd}`);
-      var meta = parts.join(' · ');
-      var body = (j.result ? `<pre>${E(j.result)}</pre>` : '') +
-                 (meta ? `<div class='meta'>${E(meta)}</div>` : '');
-      return logKind(sub, cls, body);
-    }
-    case 'unknown':
-      return logKind('unknown','lk-unk', E(j.event_type||''));
-    default:
-      return logKind(j.type||'unknown','lk-unk', E(trunc(JSON.stringify(j),240)));
-  }
-}
-
-function renderLog(events){
-  if (!events || events.length===0)
-    return `<p class='empty' style='padding:16px'>No log file.</p>`;
-  return `<div class='log'>${events.map(renderLogEvent).join('')}</div>`;
-}
-
-// -------- Page renderers --------
-
-var pages = {};
-
-pages.overview = function(d){
-  var c = d.counts;
-  var labels = [['running','Running'],['pending','Pending'],['failed','Failed'],
-                ['concerts','Concerts'],['listeners','Listeners'],['totalTasks','Total Tasks']];
-  var stats = `<div class='stats'>${
-    labels.map(function(p){return statBox(c[p[0]], p[1]);}).join('')
-  }</div>`;
-  var qRows = d.activeQueue.map(function(e){
-    return `<tr><td class='mono'>${link('/tasks/'+e.id, e.id)}</td>
-      <td>${badge(e.status)}</td>
-      <td class='m trunc'>${E(e.fork)}</td>
-      <td class='m'>${E(e.createdAt)}</td>
-      <td>${E(e.priority)}</td>
-      <td class='m trunc'>${E(e.concertId||'')}</td></tr>`;
-  });
-  var qTable = table(['ID','Status','Fork','Created','Pri','Concert'], qRows, 'No active tasks');
-  var tRows = d.recentTasks.map(function(r){
-    return `<tr><td class='mono'>${link('/tasks/'+r.id, r.id)}</td>
-      <td>${badge(r.status)}</td>
-      <td class='m trunc'>${E(r.fork)}</td>
-      <td class='m'>${E(r.createdAt)}</td>
-      <td class='trunc'>${E(trunc(r.prompt,60))}</td></tr>`;
-  });
-  var tTable = table(['ID','Status','Fork','Created','Prompt'], tRows, 'No tasks yet');
-  return `<h1>Overview</h1>${stats}<h2>Active Queue</h2>${qTable}<h2>Recent Tasks</h2>${tTable}`;
-};
-
-pages.queue = function(d){
-  var cRows = d.concerts.map(function(r){
-    return `<tr><td class='mono'>${link('/concerts/'+r.id, r.id)}</td>
-      <td>${badge(r.status)}</td>
-      <td class='m'>${E(r.startedAt)}</td>
-      <td class='m'>${E(r.finishedAt||'')}</td>
-      <td class='m trunc'>${E(r.name||r.workflowFile||'')}</td></tr>`;
-  });
-  var cTable = table(['Concert ID','Status','Started','Finished','Name / File'], cRows, 'No concerts');
-  var eRows = d.entries.map(function(e){
-    return `<tr><td class='mono'>${link('/tasks/'+e.id, e.id)}</td>
-      <td>${badge(e.status)}</td>
-      <td class='m trunc'>${E(e.fork)}</td>
-      <td class='m'>${E(e.createdAt)}</td>
-      <td>${E(e.priority)}</td>
-      <td class='m'>${E(e.series||'')}</td>
-      <td class='m'>${E(e.concertId||'')}</td></tr>`;
-  });
-  var eTable = table(['ID','Status','Fork','Created','Pri','Series','Concert'], eRows, 'No entries');
-  return `<h1>Queue</h1><h2>Concerts</h2>${cTable}<h2>Entries</h2>${eTable}`;
-};
-
-pages.concerts = function(d){
-  var rows = d.concerts.map(function(r){
-    return `<tr><td class='mono'>${link('/concerts/'+r.id, r.id)}</td>
-      <td>${badge(r.status)}</td>
-      <td class='m'>${E(r.name||'')}</td>
-      <td class='m trunc'>${E(r.workflowFile||'')}</td>
-      <td class='m'>${E(r.startedAt)}</td>
-      <td class='m'>${E(r.finishedAt||'')}</td></tr>`;
-  });
-  var t = table(['ID','Status','Name','Workflow','Started','Finished'], rows, 'No concerts');
-  return `<h1>Concerts</h1>${t}`;
-};
-
-pages['concert-detail'] = function(d){
-  if (!d || d.error) return `<h1>Concert not found</h1>`;
-  var r = d.concert;
-  var details = kvTable([
-    ['ID', E(r.id), 'mono'],
-    ['Status', badge(r.status), ''],
-    ['Name', E(r.name||'—'), ''],
-    ['Workflow', E(r.workflowFile||'—'), 'mono'],
-    ['Started', E(r.startedAt), 'm'],
-    ['Finished', E(r.finishedAt||'—'), 'm']
-  ]);
-  var stepRows = d.steps.map(function(s){
-    return `<tr><td class='mono'>${link('/tasks/'+s.id, s.id)}</td>
-      <td>${badge(s.status)}</td>
-      <td class='m trunc'>${E(s.fork)}</td>
-      <td class='m'>${E(s.createdAt)}</td>
-      <td class='m trunc'>${E(s.concertStepKey||'')}</td></tr>`;
-  });
-  var steps = table(['Task','Status','Fork','Created','Step Key'], stepRows, 'No steps');
-  return `<h1>Concert <span class='m mono'>${E(r.id)}</span></h1>${details}<h2>Steps</h2>${steps}`;
-};
-
-pages.listeners = function(d){
-  var rows = d.listeners.map(function(l){
-    var statusBadge = `<span class='b ${l.enabled?'bd':'bc'}'>${l.enabled?'enabled':'disabled'}</span>`;
-    return `<tr><td>${link('/listeners/'+l.name, l.name)}</td>
-      <td>${statusBadge}</td>
-      <td class='m'>${E(l.sourceType)}</td>
-      <td class='m'>${E(l.intervalSeconds)}s</td>
-      <td class='m'>${E(l.lastChecked||'never')}</td>
-      <td>${E(l.eventCount)}</td></tr>`;
-  });
-  var t = table(['Name','Status','Source','Interval','Last Checked','Events'], rows, 'No listeners');
-  return `<h1>Listeners</h1>${t}`;
-};
-
-pages['listener-detail'] = function(d){
-  if (!d || d.error) return `<h1>Listener not found</h1>`;
-  var statusBadge = `<span class='b ${d.enabled?'bd':'bc'}'>${d.enabled?'enabled':'disabled'}</span>`;
-  var cfgRows = [
-    ['Name', E(d.name), ''],
-    ['Status', statusBadge, ''],
-    ['Interval', `${E(d.intervalSeconds)}s`, 'm'],
-    ['Last Checked', E(d.lastChecked||'never'), 'm'],
-    ['Events Seen', E(d.eventCount), ''],
-    ['Source Type', E(d.sourceType), 'mono'],
-    ['Source', E(d.sourceDetail), 'm']
-  ];
-  (d.sourceExtras||[]).forEach(function(p){ cfgRows.push([E(p[0]), E(p[1]), 'm']); });
-  var cfg = kvTable(cfgRows);
-  var act = kvTable([
-    ['Mode', E(d.action.mode), 'mono'],
-    ['Upstream', E(d.action.upstream||''), 'm'],
-    ['Fork', E(d.action.fork||''), 'm'],
-    ['Series', E(d.action.series||'—'), 'm'],
-    ['Backend', E(d.action.backend||'—'), 'm'],
-    ['Model', E(d.action.model||'—'), 'm'],
-    ['Workflow', E(d.action.workflowPath||'—'), 'mono'],
-    ['Priority', E(d.action.priority), '']
-  ]);
-  var tmpl = `<div style='padding:12px'><div class='kv'>PROMPT TEMPLATE</div><pre class='pre'>${E(d.action.promptTemplate)}</pre></div>`;
-  var evRows = (d.recentEvents||[]).map(function(ev){return `<tr><td class='mono'>${E(ev)}</td></tr>`;});
-  var evTable = `<div class='card'><table><tbody>${
-    evRows.length===0 ? `<tr><td class='empty'>No events processed yet</td></tr>` : evRows.join('')
-  }</tbody></table></div>`;
-  return `<h1>Listener <span class='m'>${E(d.name)}</span></h1>
-    <h2>Configuration</h2>${cfg}
-    <h2>Action</h2><div class='card'>${act}${tmpl}</div>
-    <h2>Processed Event IDs (${E(d.eventCount)})</h2>${evTable}`;
-};
-
-pages.tasks = function(d){
-  var rows = d.tasks.map(function(r){
-    return `<tr><td class='mono'>${link('/tasks/'+r.id, r.id)}</td>
-      <td>${badge(r.status)}</td>
-      <td class='m trunc'>${E(r.fork)}</td>
-      <td class='m'>${E(r.createdAt)}</td>
-      <td class='m'>${E(r.series||'')}</td>
-      <td class='trunc'>${E(trunc(r.prompt,80))}</td></tr>`;
-  });
-  var t = table(['ID','Status','Fork','Created','Series','Prompt'], rows, 'No tasks yet');
-  return `<h1>Tasks</h1>${t}`;
-};
-
-pages['task-detail'] = function(d){
-  if (!d || d.error) return `<h1>Task not found</h1>`;
-  var details = kvTable([
-    ['ID', E(d.id), 'mono'],
-    ['Status', badge(d.status), ''],
-    ['Fork', E(d.fork), 'm'],
-    ['Created', E(d.createdAt), 'm']
-  ]);
-  var prompt = `<div class='card'><pre class='pre'>${E(d.prompt)}</pre></div>`;
-  var logHtml = renderLog(d.log);
-  return `<h1>Task <span class='m'>${E(d.id)}</span></h1>${details}
-    <h2>Prompt</h2>${prompt}
-    <h2>Log</h2><div class='card'>${logHtml}</div>`;
-};
-
-// -------- Boot + live updates --------
-
-function render(target, page, data){
-  var fn = pages[page];
-  if (!fn) { target.innerHTML = `<p class='empty'>Unknown page: ${E(page)}</p>`; return; }
-  target.innerHTML = fn(data);
-}
-
-function fetchAndRender(target, page, url){
-  return fetch(url, { credentials: 'same-origin' })
-    .then(function(r){ return r.ok ? r.json() : { error: 'fetch failed (' + r.status + ')' }; })
-    .then(function(data){ render(target, page, data); })
-    .catch(function(e){ target.innerHTML = `<p class='empty'>Error: ${E(e.message)}</p>`; });
-}
-
-function subscribeSse(target, page, url){
-  var es = new EventSource(url);
-  es.onmessage = function(ev){
-    try { render(target, page, JSON.parse(ev.data)); } catch (_) {}
-  };
-  window.addEventListener('beforeunload', function(){ es.close(); });
-}
-
-document.addEventListener('DOMContentLoaded', function(){
-  var main = document.querySelector('main[data-page]');
-  if (!main) return;
-  var page = main.dataset.page;
-  var api  = main.dataset.api;
-  var sse  = main.dataset.sse;
-  if (!api) return;
-  fetchAndRender(main, page, api).then(function(){
-    if (sse) subscribeSse(main, page, sse);
-  });
-});
-
-})();"
-
-/-- The single layout `Template` shared by every page. Each page is a thin
-    call to `layout` that passes its identifier (used by the JS bundle to pick
-    a renderer) plus optional API / SSE endpoints. -/
+/-- The single layout shared by every page. Dynamic pages pass a `pageId`,
+    API URL and SSE URL — the embedded JS bundle reads them from the `<main>`
+    `data-*` attributes and renders the page on the client. Static pages
+    (e.g. the Verso-rendered About prose) pass `api = none` / `sse = none`
+    and a server-side-rendered `content`; the JS bundle bails out because
+    `data-api` is empty. -/
 private def layout (title : String) (pageId : String) (api : Option String)
-    (sse : Option String) (activeNav : String) : Html :=
+    (sse : Option String) (activeNav : String)
+    (content : Html := loadingPlaceholder) : Html :=
   let apiAttr := api.getD ""
   let sseAttr := sse.getD ""
   let navItem (href label idTag : String) : Html :=
@@ -544,10 +187,11 @@ private def layout (title : String) (pageId : String) (api : Option String)
           {{ navItem "/concerts"  "Concerts"  "concerts"  }}
           {{ navItem "/listeners" "Listeners" "listeners" }}
           {{ navItem "/tasks"     "Tasks"     "tasks"     }}
+          {{ navItem "/about"     "About"     "about"     }}
         </nav>
       </header>
       <main data-page=s!"{pageId}" data-api=s!"{apiAttr}" data-sse=s!"{sseAttr}">
-        <div class="loading"> "Loading…" </div>
+        {{ content }}
       </main>
       <script> {{ Html.text false dashJs }} </script>
     </body>
@@ -581,6 +225,27 @@ private def tasksShell : Html :=
 private def taskDetailShell (id : String) : Html :=
   layout s!"Task {id}" "task-detail"
     (some s!"/api/tasks/{id}") (some s!"/sse/tasks/{id}") "tasks"
+
+-- About: prose authored as a Verso document (`Orchestra/Dashboard/About.lean`)
+-- and rendered to `Html` at request time using `Verso.Doc.Html.Part.toHtml`.
+
+private def renderVersoPart (p : Part Genre.none) : Html :=
+  let ctx : Verso.Doc.Html.HtmlT.Context Genre.none :=
+    { options         := {}
+      traverseContext := ()
+      traverseState   := ()
+      definitionIds   := {}
+      linkTargets     := {}
+      codeOptions     := {} }
+  let act : Verso.Doc.Html.HtmlT Genre.none Id Html :=
+    Verso.Doc.Html.ToHtml.toHtml p
+  ((act ctx).run {}).fst
+
+private def aboutContent : Html :=
+  {{ <div class="prose"> {{ renderVersoPart (%doc Orchestra.Dashboard.About) }} </div> }}
+
+private def aboutShell : Html :=
+  layout "About" "about" none none "about" (content := aboutContent)
 
 end -- section (HTML shell generation)
 
@@ -881,6 +546,7 @@ private def dispatch (req : HttpRequest) (pw : String) : IO HttpResponse := do
     | some j => return jsonResp j
     | none   => return jsonResp (Json.mkObj [("error", "not found")]) 404
   -- Static shells (JS fetches the matching /api/... after load)
+  if path == "/about"     then return htmlResp aboutShell
   if path == "/"          then return htmlResp overviewShell
   if path == "/queue"     then return htmlResp queueShell
   if path == "/concerts"  then return htmlResp concertsShell
