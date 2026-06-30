@@ -20,8 +20,17 @@ extern_lib udsFFI pkg := do
   buildFileAfterDep libFile oJob fun oFile => do
     compileStaticLib libFile #[oFile]
 
+/-- Front-end CSS/JS shipped with the dashboard. Declared as an input
+    directory so `lake build` rebuilds `Orchestra.Dashboard` whenever a
+    file inside it changes (the `include_str` calls in `Orchestra/Dashboard.lean`
+    are otherwise invisible to Lake's dependency tracker). -/
+input_dir dashboardAssets where
+  text := true
+  path := "Orchestra/Dashboard"
+
 @[default_target]
-lean_lib Orchestra
+lean_lib Orchestra where
+  needs := #[dashboardAssets]
 
 lean_lib OrchestraTest
 
