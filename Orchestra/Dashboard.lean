@@ -138,32 +138,53 @@ private def badge (s : String) : Html :=
   {{ <span class=s!"b b{cls}"> s!"{s}" </span> }}
 
 private def dashCss : String :=
-  ":root{--bg:#0f1117;--sf:#1a1d24;--bd:#2a2d35;--tx:#e2e4e9;--mu:#8b8fa8;--ac:#5b8def}" ++
+  ":root{--bg:#f7f8fa;--sf:#ffffff;--bd:#e4e7ec;--tx:#1f2937;--mu:#6b7280;--ac:#2563eb;--code:#f3f4f6}" ++
   "*{box-sizing:border-box;margin:0;padding:0}" ++
-  "body{font-family:ui-monospace,monospace;background:var(--bg);color:var(--tx);font-size:14px;line-height:1.6}" ++
+  "body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--tx);font-size:14px;line-height:1.55}" ++
+  "code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}" ++
   "a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}" ++
   "header{background:var(--sf);border-bottom:1px solid var(--bd);padding:12px 24px;display:flex;align-items:center;gap:24px}" ++
-  "header .logo{font-weight:700;font-size:16px}" ++
+  "header .logo{font-weight:700;font-size:16px;color:var(--tx)}" ++
   "nav{display:flex;gap:16px}nav a{color:var(--mu);font-size:13px}nav a:hover{color:var(--tx)}" ++
   "main{padding:24px;max-width:1200px;margin:0 auto}" ++
-  "h1{font-size:18px;font-weight:600;margin-bottom:16px}" ++
+  "h1{font-size:20px;font-weight:600;margin-bottom:16px}" ++
   "h2{font-size:12px;font-weight:600;margin:24px 0 10px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em}" ++
-  ".card{background:var(--sf);border:1px solid var(--bd);border-radius:6px;overflow:hidden;margin-bottom:16px}" ++
+  ".card{background:var(--sf);border:1px solid var(--bd);border-radius:8px;overflow:hidden;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.03)}" ++
   "table{width:100%;border-collapse:collapse}" ++
-  "th{text-align:left;padding:8px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mu);border-bottom:1px solid var(--bd);font-weight:500}" ++
-  "td{padding:8px 12px;border-bottom:1px solid var(--bd);vertical-align:top}tr:last-child td{border-bottom:none}" ++
-  "tr:hover td{background:rgba(255,255,255,.02)}" ++
+  "th{text-align:left;padding:10px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mu);border-bottom:1px solid var(--bd);font-weight:600;background:#fafbfc}" ++
+  "td{padding:10px 12px;border-bottom:1px solid var(--bd);vertical-align:top}tr:last-child td{border-bottom:none}" ++
+  "tr:hover td{background:#fafbfc}" ++
   ".b{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.03em}" ++
-  ".br{background:rgba(58,154,92,.2);color:#6dcf96}.bp{background:rgba(232,168,56,.2);color:#f0c060}" ++
-  ".bd{background:rgba(58,154,92,.15);color:#5abf80}.bf{background:rgba(232,80,80,.2);color:#f07070}" ++
-  ".bc{background:rgba(139,143,168,.2);color:var(--mu)}.bo{background:rgba(91,141,239,.2);color:#7baaff}" ++
-  ".m{font-size:12px;color:var(--mu)}.trunc{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" ++
-  ".pre{background:#0a0c10;padding:16px;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:600px;overflow-y:auto}" ++
+  ".br{background:#dcfce7;color:#15803d}.bp{background:#fef3c7;color:#a16207}" ++
+  ".bd{background:#dcfce7;color:#166534}.bf{background:#fee2e2;color:#b91c1c}" ++
+  ".bc{background:#e5e7eb;color:#4b5563}.bo{background:#dbeafe;color:#1d4ed8}" ++
+  ".m{font-size:12px;color:var(--mu)}.mono{font-family:ui-monospace,monospace;font-size:12px}" ++
+  ".trunc{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" ++
+  ".pre{background:var(--code);padding:16px;font-size:12px;font-family:ui-monospace,monospace;color:var(--tx);" ++
+       "white-space:pre-wrap;word-break:break-word;max-height:600px;overflow-y:auto;border-radius:0}" ++
   ".empty{padding:32px;text-align:center;color:var(--mu)}" ++
   ".note{font-size:11px;color:var(--mu);margin-top:8px}" ++
-  ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:24px}" ++
-  ".st{background:var(--sf);border:1px solid var(--bd);border-radius:6px;padding:16px}" ++
-  ".sv{font-size:26px;font-weight:700}.sl{font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}"
+  ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}" ++
+  ".st{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.03)}" ++
+  ".sv{font-size:26px;font-weight:700;color:var(--tx)}" ++
+  ".sl{font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}" ++
+  -- Log renderer
+  ".log{background:var(--sf);padding:0;font-size:13px;max-height:760px;overflow-y:auto}" ++
+  ".le{display:grid;grid-template-columns:90px 1fr;gap:12px;padding:10px 14px;border-bottom:1px solid var(--bd);align-items:start}" ++
+  ".le:last-child{border-bottom:none}" ++
+  ".lk{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;padding:3px 8px;border-radius:4px;text-align:center;width:fit-content}" ++
+  ".lk-init{background:#dbeafe;color:#1d4ed8}.lk-system{background:#e5e7eb;color:#374151}" ++
+  ".lk-think{background:#ede9fe;color:#6d28d9}.lk-tool{background:#fef3c7;color:#92400e}" ++
+  ".lk-text{background:#dcfce7;color:#166534}.lk-out{background:#f3f4f6;color:#374151}" ++
+  ".lk-result{background:#dcfce7;color:#166534}.lk-err{background:#fee2e2;color:#b91c1c}" ++
+  ".lk-unk{background:#e5e7eb;color:#6b7280}" ++
+  ".lbody{min-width:0;font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.5;color:var(--tx);word-break:break-word}" ++
+  ".lbody pre{background:var(--code);padding:8px 10px;border-radius:4px;white-space:pre-wrap;word-break:break-word;font-size:12px;margin-top:4px;max-height:300px;overflow-y:auto}" ++
+  ".lbody .meta{color:var(--mu);font-size:11px;margin-top:2px}" ++
+  ".lbody .toolname{font-weight:600;color:#92400e}" ++
+  ".lbody .thinking{font-style:italic;color:#6d28d9}" ++
+  ".lbody .err{color:#b91c1c;font-weight:600}" ++
+  ".lraw{padding:8px 14px;font-family:ui-monospace,monospace;font-size:11px;color:var(--mu);border-bottom:1px solid var(--bd)}"
 
 -- JS that subscribes to an SSE endpoint and replaces the inner HTML of `<main>`
 -- with the received fragment. The browser reuses the page's cached Basic Auth
@@ -190,6 +211,7 @@ private def shell (title : String) (sseEndpoint : Option String) (content : Html
         <nav>
           <a href="/"> "Overview" </a>
           <a href="/queue"> "Queue" </a>
+          <a href="/concerts"> "Concerts" </a>
           <a href="/listeners"> "Listeners" </a>
           <a href="/tasks"> "Tasks" </a>
         </nav>
@@ -208,6 +230,10 @@ private def tStText : TaskStore.TaskStatus → String
   | .running    => "running"   | .completed  => "completed"
   | .failed     => "failed"    | .unfinished => "unfinished"
   | .cancelled  => "cancelled"
+
+private def cStText : Queue.ConcertStatus → String
+  | .running   => "running"  | .done      => "done"
+  | .failed    => "failed"   | .cancelled => "cancelled"
 
 private def statBox (val : Nat) (lbl : String) : Html :=
   {{ <div class="st">
@@ -304,12 +330,9 @@ private def queueContent : IO Html := do
       {{ <tr><td colspan="5" class="empty"> "No concerts" </td></tr> }}
     else
       Html.fromList (concerts.toList.map fun r =>
-        let st := match r.status with
-          | .running => "running" | .done => "done"
-          | .failed  => "failed"  | .cancelled => "cancelled"
         {{ <tr>
-          <td class="m"> s!"{esc r.id}" </td>
-          <td> {{ badge st }} </td>
+          <td class="mono"> <a href=s!"/concerts/{r.id}"> s!"{esc r.id}" </a> </td>
+          <td> {{ badge (cStText r.status) }} </td>
           <td class="m"> s!"{r.startedAt}" </td>
           <td class="m"> s!"{esc (r.finishedAt.getD "")}" </td>
           <td class="m trunc"> s!"{esc (r.name.getD (r.workflowFile.getD ""))}" </td>
@@ -363,6 +386,122 @@ private def queueContent : IO Html := do
 private def queuePage : IO Html := do
   return shell "Queue" (some "/sse/queue") (← queueContent)
 
+-- Concerts
+
+private def concertsContent : IO Html := do
+  let concerts ← Queue.loadAllConcertRuns
+  let rows : Html :=
+    if concerts.isEmpty then
+      {{ <tr><td colspan="6" class="empty"> "No concerts" </td></tr> }}
+    else
+      Html.fromList (concerts.toList.map fun r =>
+        {{ <tr>
+          <td class="mono"> <a href=s!"/concerts/{r.id}"> s!"{esc r.id}" </a> </td>
+          <td> {{ badge (cStText r.status) }} </td>
+          <td class="m"> s!"{esc (r.name.getD "")}" </td>
+          <td class="m trunc"> s!"{esc (r.workflowFile.getD "")}" </td>
+          <td class="m"> s!"{r.startedAt}" </td>
+          <td class="m"> s!"{esc (r.finishedAt.getD "")}" </td>
+        </tr> }})
+  return {{
+    <h1> "Concerts" </h1>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th> "ID" </th> <th> "Status" </th> <th> "Name" </th>
+            <th> "Workflow" </th> <th> "Started" </th> <th> "Finished" </th>
+          </tr>
+        </thead>
+        <tbody> {{ rows }} </tbody>
+      </table>
+    </div>
+  }}
+
+private def concertsPage : IO Html := do
+  return shell "Concerts" (some "/sse/concerts") (← concertsContent)
+
+private def concertDetailContent (id : String) : IO (Option Html) := do
+  match ← Queue.loadConcertRun id with
+  | none => return none
+  | some r =>
+    let entries ← Queue.loadAllEntries
+    let steps := entries.filter (fun e => e.concertId == some id)
+    let stepRows : Html :=
+      if steps.isEmpty then
+        {{ <tr><td colspan="5" class="empty"> "No steps" </td></tr> }}
+      else
+        Html.fromList (steps.toList.map fun e =>
+          {{ <tr>
+            <td class="mono"> <a href=s!"/tasks/{e.id}"> s!"{esc e.id}" </a> </td>
+            <td> {{ badge (qStText e.status) }} </td>
+            <td class="m trunc"> s!"{esc e.fork.toString}" </td>
+            <td class="m"> s!"{e.createdAt}" </td>
+            <td class="m trunc"> s!"{esc (e.concertStepKey.getD "")}" </td>
+          </tr> }})
+    let details : Html :=
+      {{ <table>
+        <tr><th> "ID" </th>       <td class="mono"> s!"{esc r.id}" </td></tr>
+        <tr><th> "Status" </th>   <td> {{ badge (cStText r.status) }} </td></tr>
+        <tr><th> "Name" </th>     <td> s!"{esc (r.name.getD "—")}" </td></tr>
+        <tr><th> "Workflow" </th> <td class="mono"> s!"{esc (r.workflowFile.getD "—")}" </td></tr>
+        <tr><th> "Started" </th>  <td class="m"> s!"{r.startedAt}" </td></tr>
+        <tr><th> "Finished" </th> <td class="m"> s!"{esc (r.finishedAt.getD "—")}" </td></tr>
+      </table> }}
+    return some {{
+      <h1> "Concert " <span class="m mono"> s!"{esc id}" </span> </h1>
+      <div class="card"> {{ details }} </div>
+      <h2> "Steps" </h2>
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th> "Task" </th> <th> "Status" </th> <th> "Fork" </th>
+              <th> "Created" </th> <th> "Step Key" </th>
+            </tr>
+          </thead>
+          <tbody> {{ stepRows }} </tbody>
+        </table>
+      </div>
+    }}
+
+private def concertDetailPage (id : String) : IO (Option Html) := do
+  match ← concertDetailContent id with
+  | none => return none
+  | some content => return some (shell s!"Concert {id}" (some s!"/sse/concerts/{id}") content)
+
+-- Listener detail
+
+private def sourceSummary : Listener.SourceConfig → (String × String)
+  | .githubIssues repos labels _ _    =>
+      let r := String.intercalate ", " (repos.map (·.upstream.toString))
+      ("github-issues", s!"{r}" ++ (if labels.isEmpty then "" else s!" [labels: {String.intercalate "," labels}]"))
+  | .githubPrReviews repos labels _ _ =>
+      let r := String.intercalate ", " (repos.map (·.upstream.toString))
+      ("github-pr-reviews", s!"{r}" ++ (if labels.isEmpty then "" else s!" [labels: {String.intercalate "," labels}]"))
+  | .githubComments repos labels _ _  =>
+      let r := String.intercalate ", " (repos.map (·.upstream.toString))
+      ("github-comments", s!"{r}" ++ (if labels.isEmpty then "" else s!" [labels: {String.intercalate "," labels}]"))
+  | .shell cmd args                   => ("shell", s!"{cmd} {String.intercalate " " args}")
+  | .projectDispatcher pid caps       =>
+      let cs := String.intercalate ", " (caps.map (fun (n,c) => s!"{n}={c}"))
+      ("project-dispatcher", s!"project={pid.value} caps=[{cs}]")
+  | .githubLabelCount repos labels max kind =>
+      let r := String.intercalate ", " (repos.map (·.upstream.toString))
+      ("github-label-count", s!"{r} kind={kind} max={max} labels=[{String.intercalate "," labels}]")
+  | .githubLabels repos labels kind _ =>
+      let r := String.intercalate ", " (repos.map (·.upstream.toString))
+      ("github-labels", s!"{r} kind={kind} labels=[{String.intercalate "," labels}]")
+
+private def sourceExtras : Listener.SourceConfig → List (String × String)
+  | .githubIssues _ _ trig authU
+  | .githubPrReviews _ _ trig authU
+  | .githubComments _ _ trig authU =>
+      [("trigger", trig), ("authorized users", String.intercalate ", " authU)]
+  | .githubLabels _ _ _ authU =>
+      [("authorized users", String.intercalate ", " authU)]
+  | _ => []
+
 private def listenersContent : IO Html := do
   let cfgs ← Listener.loadAllListenerConfigs
   let rows : List Html ← cfgs.toList.mapM fun c => do
@@ -371,16 +510,18 @@ private def listenersContent : IO Html := do
     let eb : Html :=
       if st.enabled then {{ <span class="b bd"> "enabled" </span> }}
       else {{ <span class="b bc"> "disabled" </span> }}
+    let (srcType, _) := sourceSummary c.source
     return {{ <tr>
-      <td> s!"{esc c.name}" </td>
+      <td> <a href=s!"/listeners/{c.name}"> s!"{esc c.name}" </a> </td>
       <td> {{ eb }} </td>
+      <td class="m"> s!"{esc srcType}" </td>
       <td class="m"> s!"{c.intervalSeconds}s" </td>
       <td class="m"> s!"{last}" </td>
       <td> s!"{st.processedIds.size}" </td>
     </tr> }}
   let tableBody : Html :=
     if rows.isEmpty then
-      {{ <tr><td colspan="5" class="empty"> "No listeners" </td></tr> }}
+      {{ <tr><td colspan="6" class="empty"> "No listeners" </td></tr> }}
     else Html.fromList rows
   return {{
     <h1> "Listeners" </h1>
@@ -388,8 +529,8 @@ private def listenersContent : IO Html := do
       <table>
         <thead>
           <tr>
-            <th> "Name" </th> <th> "Status" </th> <th> "Interval" </th>
-            <th> "Last Checked" </th> <th> "Events" </th>
+            <th> "Name" </th> <th> "Status" </th> <th> "Source" </th>
+            <th> "Interval" </th> <th> "Last Checked" </th> <th> "Events" </th>
           </tr>
         </thead>
         <tbody> {{ tableBody }} </tbody>
@@ -399,6 +540,73 @@ private def listenersContent : IO Html := do
 
 private def listenersPage : IO Html := do
   return shell "Listeners" (some "/sse/listeners") (← listenersContent)
+
+private def listenerDetailContent (name : String) : IO (Option Html) := do
+  match ← Listener.loadListenerConfig name with
+  | none => return none
+  | some c =>
+    let st ← Listener.loadListenerState c.name
+    let last := if st.lastChecked.isEmpty then "never" else st.lastChecked
+    let (srcType, srcDetail) := sourceSummary c.source
+    let extras := sourceExtras c.source
+    let extraRows : Html := Html.fromList (extras.filterMap fun (k, v) =>
+      if v.isEmpty then none
+      else some {{ <tr><th> s!"{esc k}" </th><td class="m"> s!"{esc v}" </td></tr> }})
+    let eb : Html :=
+      if st.enabled then {{ <span class="b bd"> "enabled" </span> }}
+      else {{ <span class="b bc"> "disabled" </span> }}
+    let cfg : Html :=
+      {{ <table>
+        <tr><th> "Name" </th>     <td> s!"{esc c.name}" </td></tr>
+        <tr><th> "Status" </th>   <td> {{ eb }} </td></tr>
+        <tr><th> "Interval" </th> <td class="m"> s!"{c.intervalSeconds}s" </td></tr>
+        <tr><th> "Last Checked" </th> <td class="m"> s!"{last}" </td></tr>
+        <tr><th> "Events Seen" </th>  <td> s!"{st.processedIds.size}" </td></tr>
+        <tr><th> "Source Type" </th>  <td class="mono"> s!"{esc srcType}" </td></tr>
+        <tr><th> "Source" </th>       <td class="m"> s!"{esc srcDetail}" </td></tr>
+        {{ extraRows }}
+      </table> }}
+    let act : Html :=
+      {{ <table>
+        <tr><th> "Mode" </th>     <td class="mono"> s!"{esc (Lean.ToJson.toJson c.action.mode).compress}" </td></tr>
+        <tr><th> "Upstream" </th> <td class="m"> s!"{esc c.action.upstream}" </td></tr>
+        <tr><th> "Fork" </th>     <td class="m"> s!"{esc c.action.fork}" </td></tr>
+        <tr><th> "Series" </th>   <td class="m"> s!"{esc (c.action.series.getD "—")}" </td></tr>
+        <tr><th> "Backend" </th>  <td class="m"> s!"{esc (c.action.backend.getD "—")}" </td></tr>
+        <tr><th> "Model" </th>    <td class="m"> s!"{esc (c.action.model.getD "—")}" </td></tr>
+        <tr><th> "Workflow" </th> <td class="mono"> s!"{esc (c.action.workflowPath.getD "—")}" </td></tr>
+        <tr><th> "Priority" </th> <td> s!"{c.action.priority}" </td></tr>
+      </table> }}
+    let recent := st.processedIds.toList.reverse.take 50
+    let evRows : Html :=
+      if recent.isEmpty then
+        {{ <tr><td class="empty"> "No events processed yet" </td></tr> }}
+      else
+        Html.fromList (recent.map fun ev =>
+          {{ <tr><td class="mono"> s!"{esc ev}" </td></tr> }})
+    return some {{
+      <h1> "Listener " <span class="m"> s!"{esc name}" </span> </h1>
+      <h2> "Configuration" </h2>
+      <div class="card"> {{ cfg }} </div>
+      <h2> "Action" </h2>
+      <div class="card">
+        {{ act }}
+        <div style="padding:12px">
+          <div class="meta" style="font-size:11px;color:var(--mu);margin-bottom:4px"> "PROMPT TEMPLATE" </div>
+          <pre class="pre"> s!"{esc c.action.promptTemplate}" </pre>
+        </div>
+      </div>
+      <h2> s!"Processed Event IDs ({st.processedIds.size})" </h2>
+      <div class="card">
+        <table><tbody> {{ evRows }} </tbody></table>
+      </div>
+    }}
+
+private def listenerDetailPage (name : String) : IO (Option Html) := do
+  match ← listenerDetailContent name with
+  | none => return none
+  | some content =>
+    return some (shell s!"Listener {name}" (some s!"/sse/listeners/{name}") content)
 
 private def tasksContent : IO Html := do
   let tasks ← TaskStore.loadAllTasks
@@ -435,6 +643,146 @@ private def tasksContent : IO Html := do
 private def tasksPage : IO Html := do
   return shell "Tasks" (some "/sse/tasks") (← tasksContent)
 
+-- Log rendering: parse each JSONL line produced by `Sandbox.launchAgent` and
+-- render it as a structured row instead of dumping raw JSON. Lines that fail
+-- to parse fall back to a small monospaced raw row.
+
+private def jStr? (j : Json) (k : String) : Option String :=
+  match j.getObjValAs? String k with | .ok s => some s | _ => none
+
+private def jStrD (j : Json) (k : String) (d := "") : String :=
+  (jStr? j k).getD d
+
+private def jNat? (j : Json) (k : String) : Option Nat :=
+  j.getObjValAs? Nat k |>.toOption
+
+private def truncStr (s : String) (n : Nat) : String :=
+  if s.length ≤ n then s
+  else String.ofList (s.toList.take n) ++ "…"
+
+private def renderToolInput (input : Json) : Html :=
+  let cmd := jStrD input "command"
+  let fp  := jStrD input "file_path"
+  let pat := jStrD input "pattern"
+  let desc := jStrD input "description"
+  if !cmd.isEmpty then
+    {{ <div>
+      {{ if desc.isEmpty then ({{ "" }} : Html)
+         else {{ <div class="meta"> s!"{esc desc}" </div> }} }}
+      <pre> s!"$ {esc cmd}" </pre>
+    </div> }}
+  else if !fp.isEmpty then
+    {{ <div class="meta"> s!"{esc fp}" </div> }}
+  else if !pat.isEmpty then
+    {{ <div class="meta"> s!"pattern: {esc pat}" </div> }}
+  else if !desc.isEmpty then
+    {{ <div class="meta"> s!"{esc desc}" </div> }}
+  else
+    let raw := truncStr (Json.compress input) 280
+    {{ <pre> s!"{esc raw}" </pre> }}
+
+private def renderLogEvent (j : Json) : Html :=
+  match jStrD j "type" with
+  | "init" =>
+    let sid   := jStrD j "session_id"
+    let model := jStrD j "model"
+    let sidShort := truncStr sid 12
+    {{ <div class="le">
+      <span class="lk lk-init"> "init" </span>
+      <div class="lbody"> s!"model: {esc model}"
+        <div class="meta"> s!"session {esc sidShort}" </div>
+      </div>
+    </div> }}
+  | "system" =>
+    {{ <div class="le">
+      <span class="lk lk-system"> "system" </span>
+      <div class="lbody"> s!"{esc (jStrD j "subtype")}" </div>
+    </div> }}
+  | "assistant" =>
+    let item := (j.getObjVal? "item").toOption.getD (Json.mkObj [])
+    match jStrD item "type" with
+    | "thinking" =>
+      {{ <div class="le">
+        <span class="lk lk-think"> "thinking" </span>
+        <div class="lbody thinking"> s!"{esc (jStrD item "text")}" </div>
+      </div> }}
+    | "tool_use" =>
+      let name := jStrD item "name"
+      let input := (item.getObjVal? "input").toOption.getD (Json.mkObj [])
+      {{ <div class="le">
+        <span class="lk lk-tool"> "tool" </span>
+        <div class="lbody">
+          <span class="toolname"> s!"{esc name}" </span>
+          {{ renderToolInput input }}
+        </div>
+      </div> }}
+    | "text" =>
+      {{ <div class="le">
+        <span class="lk lk-text"> "text" </span>
+        <div class="lbody"> s!"{esc (jStrD item "text")}" </div>
+      </div> }}
+    | other =>
+      {{ <div class="le">
+        <span class="lk lk-unk"> s!"{esc other}" </span>
+        <div class="lbody"> s!"{esc (truncStr (Json.compress item) 240)}" </div>
+      </div> }}
+  | "tool_result" =>
+    let stdout := jStrD j "stdout"
+    let stderr := jStrD j "stderr"
+    {{ <div class="le">
+      <span class="lk lk-out"> "output" </span>
+      <div class="lbody">
+        {{ if stdout.isEmpty then ({{ "" }} : Html)
+           else {{ <pre> s!"{esc stdout}" </pre> }} }}
+        {{ if stderr.isEmpty then ({{ "" }} : Html)
+           else {{ <div>
+             <div class="meta err"> "stderr" </div>
+             <pre> s!"{esc stderr}" </pre>
+           </div> }} }}
+      </div>
+    </div> }}
+  | "result" =>
+    let sub := jStrD j "subtype"
+    let res := jStrD j "result"
+    let isErr := sub.startsWith "error"
+    let kindCls := if isErr then "lk lk-err" else "lk lk-result"
+    let turns := match jNat? j "num_turns"   with | some n => s!"{n} turns" | none => ""
+    let dur   := match jNat? j "duration_ms" with | some n => s!"{n / 1000}s" | none => ""
+    let cost := match j.getObjVal? "total_cost_usd" |>.toOption with
+      | some v => s!"${v.compress}"
+      | none   => ""
+    let metaStr := [turns, dur, cost].filter (! ·.isEmpty) |> String.intercalate " · "
+    {{ <div class="le">
+      <span class=s!"{kindCls}"> s!"{esc sub}" </span>
+      <div class="lbody">
+        {{ if res.isEmpty then ({{ "" }} : Html)
+           else {{ <pre> s!"{esc res}" </pre> }} }}
+        {{ if metaStr.isEmpty then ({{ "" }} : Html)
+           else {{ <div class="meta"> s!"{esc metaStr}" </div> }} }}
+      </div>
+    </div> }}
+  | "unknown" =>
+    {{ <div class="le">
+      <span class="lk lk-unk"> "unknown" </span>
+      <div class="lbody"> s!"{esc (jStrD j "event_type")}" </div>
+    </div> }}
+  | other =>
+    {{ <div class="le">
+      <span class="lk lk-unk"> s!"{esc other}" </span>
+      <div class="lbody"> s!"{esc (truncStr (Json.compress j) 240)}" </div>
+    </div> }}
+
+private def renderLog (content : String) : Html :=
+  let lines := content.splitOn "\n" |>.filter (! ·.trimAscii.isEmpty)
+  if lines.isEmpty then
+    {{ <p class="empty" style="padding:16px"> "No log file." </p> }}
+  else
+    let rows : List Html := lines.map fun line =>
+      match Json.parse line with
+      | .ok j    => renderLogEvent j
+      | .error _ => {{ <div class="lraw"> s!"{esc (truncStr line 400)}" </div> }}
+    {{ <div class="log"> {{ Html.fromList rows }} </div> }}
+
 private def taskDetailContent (id : String) : IO (Option Html) := do
   let record  ← TaskStore.loadTask id
   let entries ← Queue.loadAllEntries
@@ -451,11 +799,7 @@ private def taskDetailContent (id : String) : IO (Option Html) := do
   | some (fork, st, createdAt, prompt) =>
     let logPath := (← Dirs.dataBase) / "logs" / fork.toString / s!"{id}.log"
     let logContent ← if ← logPath.pathExists then IO.FS.readFile logPath else pure ""
-    let logSec : Html :=
-      if logContent.isEmpty then
-        {{ <p class="empty" style="padding:16px"> "No log file." </p> }}
-      else
-        {{ <pre class="pre"> s!"{esc logContent}" </pre> }}
+    let logSec : Html := renderLog logContent
     let details : Html :=
       {{ <table>
         <tr><th> "ID" </th>      <td class="m"> s!"{esc id}" </td></tr>
@@ -486,7 +830,18 @@ private def renderFragment (kind : String) : IO (Option String) := do
   if kind == "overview"  then return some (toStr (← overviewContent))
   if kind == "queue"     then return some (toStr (← queueContent))
   if kind == "listeners" then return some (toStr (← listenersContent))
+  if kind == "concerts"  then return some (toStr (← concertsContent))
   if kind == "tasks"     then return some (toStr (← tasksContent))
+  if kind.startsWith "concerts/" then
+    let id := (kind.drop "concerts/".length).toString
+    match ← concertDetailContent id with
+    | none   => return none
+    | some h => return some (toStr h)
+  if kind.startsWith "listeners/" then
+    let name := (kind.drop "listeners/".length).toString
+    match ← listenerDetailContent name with
+    | none   => return none
+    | some h => return some (toStr h)
   if kind.startsWith "tasks/" then
     let id := (kind.drop "tasks/".length).toString
     match ← taskDetailContent id with
@@ -541,7 +896,18 @@ private def dispatch (req : HttpRequest) (pw : String) : IO HttpResponse := do
   let path := pathOnly req.path
   if path == "/" then return htmlResp (← overviewPage)
   if path == "/queue" then return htmlResp (← queuePage)
+  if path == "/concerts" then return htmlResp (← concertsPage)
+  if path.startsWith "/concerts/" then
+    let id := (path.drop "/concerts/".length).toString
+    match ← concertDetailPage id with
+    | some html => return htmlResp html
+    | none => return notFound s!"Concert not found: {id}"
   if path == "/listeners" then return htmlResp (← listenersPage)
+  if path.startsWith "/listeners/" then
+    let name := (path.drop "/listeners/".length).toString
+    match ← listenerDetailPage name with
+    | some html => return htmlResp html
+    | none => return notFound s!"Listener not found: {name}"
   if path == "/tasks" then
     match queryParam req.path "id" with
     | some id =>
