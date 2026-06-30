@@ -16,10 +16,21 @@ open Verso.Output (Html)
 /-!
 # Orchestra Web Dashboard
 
-A minimal HTTP/1.1 server that serves a password-protected web dashboard showing
-the live state of the queue, configured listeners, and task history with log output.
+A minimal HTTP/1.1 server that serves a password-protected web dashboard.
 
-HTML is generated using the verso `Html` DSL (`Verso.Output.Html`).
+The Lean server is responsible for:
+  * Generating the *static* per-page HTML shell using the verso `Html` DSL
+    (`Verso.Output.Html`). The shell carries the chrome (header, nav, CSS) and
+    a single `<main>` element annotated with `data-page` / `data-api` /
+    `data-sse` attributes.
+  * Exposing JSON endpoints under `/api/...` that return view models for each
+    page.
+  * Pushing the same JSON view models to the browser over Server-Sent Events
+    under `/sse/...` so the dashboard stays live.
+
+All rendering of dynamic content (tables, badges, log rows) happens in the
+embedded JavaScript bundle below. Adding a page = a Verso shell function +
+a Lean `IO Json` builder + a JS renderer keyed on `data-page`.
 -/
 
 namespace Orchestra.Dashboard
@@ -63,6 +74,11 @@ private def htmlResp (html : Html) (status : Nat := 200) : HttpResponse :=
   { status
     headers := #[("Content-Type", "text/html; charset=utf-8")]
     body    := Html.doctype ++ Html.asString html }
+
+private def jsonResp (j : Json) (status : Nat := 200) : HttpResponse :=
+  { status
+    headers := #[("Content-Type", "application/json; charset=utf-8")]
+    body    := Json.compress j }
 
 -- Base64 decode (uses <<< / >>> operators; keep outside the verso DSL open)
 
@@ -108,14 +124,11 @@ private def checkBasicAuth (hdrs : Array (String × String)) (password : String)
         | _ :: rest => String.intercalate ":" rest == password
         | _ => false
 
--- Pre-escape `&` in user-supplied strings before handing them to verso text nodes.
--- `Html.asString` for `Html.text true` escapes `<` and `>` but not `&`; we handle
--- `&` here so that the combined output is fully HTML-safe.
 private def esc (s : String) : String := s.replace "&" "&amp;"
 
--- HTML generation
--- Open the verso Html DSL in a section so that the <<< / >>> attribute syntax
--- does not shadow the bit-shift operators used in decodeBase64 above.
+-- HTML shell generation
+-- Open the verso `Html` DSL in a section so the `<<<` / `>>>` attribute syntax
+-- does not shadow the bit-shift operators used in `decodeBase64` above.
 
 section
 open Verso.Output.Html
@@ -127,16 +140,7 @@ private def unauthorizedResp : HttpResponse :=
   let base := htmlResp {{ <html><body><h1>"401 Unauthorized"</h1></body></html> }} 401
   { base with headers := base.headers.push ("WWW-Authenticate", "Basic realm=\"Orchestra Dashboard\"") }
 
-private def badge (s : String) : Html :=
-  let cls := match s with
-    | "running"             => "r"
-    | "pending"             => "p"
-    | "done" | "completed" => "d"
-    | "failed"              => "f"
-    | "cancelled"           => "c"
-    | _                     => "o"
-  {{ <span class=s!"b b{cls}"> s!"{s}" </span> }}
-
+/-- Light theme stylesheet. Inlined into every shell. -/
 private def dashCss : String :=
   ":root{--bg:#f7f8fa;--sf:#ffffff;--bd:#e4e7ec;--tx:#1f2937;--mu:#6b7280;--ac:#2563eb;--code:#f3f4f6}" ++
   "*{box-sizing:border-box;margin:0;padding:0}" ++
@@ -145,7 +149,8 @@ private def dashCss : String :=
   "a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline}" ++
   "header{background:var(--sf);border-bottom:1px solid var(--bd);padding:12px 24px;display:flex;align-items:center;gap:24px}" ++
   "header .logo{font-weight:700;font-size:16px;color:var(--tx)}" ++
-  "nav{display:flex;gap:16px}nav a{color:var(--mu);font-size:13px}nav a:hover{color:var(--tx)}" ++
+  "nav{display:flex;gap:16px}nav a{color:var(--mu);font-size:13px;padding:4px 0}" ++
+  "nav a:hover{color:var(--tx)}nav a.active{color:var(--tx);border-bottom:2px solid var(--ac)}" ++
   "main{padding:24px;max-width:1200px;margin:0 auto}" ++
   "h1{font-size:20px;font-weight:600;margin-bottom:16px}" ++
   "h2{font-size:12px;font-weight:600;margin:24px 0 10px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em}" ++
@@ -161,14 +166,14 @@ private def dashCss : String :=
   ".m{font-size:12px;color:var(--mu)}.mono{font-family:ui-monospace,monospace;font-size:12px}" ++
   ".trunc{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" ++
   ".pre{background:var(--code);padding:16px;font-size:12px;font-family:ui-monospace,monospace;color:var(--tx);" ++
-       "white-space:pre-wrap;word-break:break-word;max-height:600px;overflow-y:auto;border-radius:0}" ++
+       "white-space:pre-wrap;word-break:break-word;max-height:600px;overflow-y:auto}" ++
   ".empty{padding:32px;text-align:center;color:var(--mu)}" ++
+  ".loading{padding:48px;text-align:center;color:var(--mu);font-size:13px}" ++
   ".note{font-size:11px;color:var(--mu);margin-top:8px}" ++
   ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}" ++
   ".st{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.03)}" ++
   ".sv{font-size:26px;font-weight:700;color:var(--tx)}" ++
   ".sl{font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}" ++
-  -- Log renderer
   ".log{background:var(--sf);padding:0;font-size:13px;max-height:760px;overflow-y:auto}" ++
   ".le{display:grid;grid-template-columns:90px 1fr;gap:12px;padding:10px 14px;border-bottom:1px solid var(--bd);align-items:start}" ++
   ".le:last-child{border-bottom:none}" ++
@@ -184,20 +189,345 @@ private def dashCss : String :=
   ".lbody .toolname{font-weight:600;color:#92400e}" ++
   ".lbody .thinking{font-style:italic;color:#6d28d9}" ++
   ".lbody .err{color:#b91c1c;font-weight:600}" ++
-  ".lraw{padding:8px 14px;font-family:ui-monospace,monospace;font-size:11px;color:var(--mu);border-bottom:1px solid var(--bd)}"
+  ".kv{font-size:11px;color:var(--mu);margin-bottom:4px;text-transform:uppercase;letter-spacing:.05em}"
 
--- JS that subscribes to an SSE endpoint and replaces the inner HTML of `<main>`
--- with the received fragment. The browser reuses the page's cached Basic Auth
--- credentials for the EventSource request to the same origin.
-private def sseScript (endpoint : String) : String :=
-  "var es=new EventSource('" ++ endpoint ++ "');" ++
-  "es.onmessage=function(e){document.querySelector('main').innerHTML=e.data;};" ++
-  "window.addEventListener('beforeunload',function(){es.close();});"
+/-- Frontend JS bundle. Renders all dynamic content. Boots from the `data-page`
+    / `data-api` / `data-sse` attributes on `<main>`: fetches the initial JSON
+    state, paints it, then subscribes to the SSE stream for live updates.
+    All HTML strings are built with single-quoted attributes so the Lean
+    string literal stays free of internal `"` characters. -/
+private def dashJs : String :=
+"(function(){
+'use strict';
 
-private def shell (title : String) (sseEndpoint : Option String) (content : Html) : Html :=
-  let script := match sseEndpoint with
-    | none => ""
-    | some p => sseScript p
+function E(s){
+  return String(s==null?'':s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
+}
+
+function trunc(s,n){
+  s = String(s||'');
+  return s.length<=n ? s : s.slice(0,n)+'…';
+}
+
+var BADGE_CLS = {running:'br',pending:'bp',done:'bd',completed:'bd',failed:'bf',cancelled:'bc',unfinished:'bc'};
+function badge(s){
+  var cls = BADGE_CLS[s] || 'bo';
+  return `<span class='b ${cls}'>${E(s)}</span>`;
+}
+
+function table(headers, rows, emptyMsg){
+  var c = headers.length;
+  var body = rows.length===0
+    ? `<tr><td colspan='${c}' class='empty'>${E(emptyMsg)}</td></tr>`
+    : rows.join('');
+  var ths = headers.map(function(h){return `<th>${E(h)}</th>`;}).join('');
+  return `<div class='card'><table><thead><tr>${ths}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function kvTable(rows){
+  var trs = rows.map(function(r){
+    var k=r[0], v=r[1], cls=r[2]||'m';
+    return `<tr><th>${E(k)}</th><td class='${cls}'>${v}</td></tr>`;
+  }).join('');
+  return `<div class='card'><table>${trs}</table></div>`;
+}
+
+function statBox(value,label){
+  return `<div class='st'><div class='sv'>${E(value)}</div><div class='sl'>${E(label)}</div></div>`;
+}
+
+function link(href,label,cls){
+  return `<a href='${E(href)}' class='${cls||''}'>${E(label)}</a>`;
+}
+
+// -------- Log rendering --------
+
+function logKind(label,cls,body){
+  return `<div class='le'><span class='lk ${cls}'>${E(label)}</span><div class='lbody'>${body}</div></div>`;
+}
+
+function renderToolInput(input){
+  input = input || {};
+  var cmd = input.command || '';
+  var fp = input.file_path || input.filePath || '';
+  var pat = input.pattern || '';
+  var desc = input.description || '';
+  if (cmd){
+    return (desc ? `<div class='meta'>${E(desc)}</div>` : '') + `<pre>$ ${E(cmd)}</pre>`;
+  }
+  if (fp)  return `<div class='meta'>${E(fp)}</div>`;
+  if (pat) return `<div class='meta'>pattern: ${E(pat)}</div>`;
+  if (desc) return `<div class='meta'>${E(desc)}</div>`;
+  return `<pre>${E(trunc(JSON.stringify(input),280))}</pre>`;
+}
+
+function renderLogEvent(j){
+  switch (j.type){
+    case 'init':
+      return logKind('init','lk-init',
+        `model: ${E(j.model)}<div class='meta'>session ${E(trunc(j.session_id||'',12))}</div>`);
+    case 'system':
+      return logKind('system','lk-system', E(j.subtype||''));
+    case 'assistant': {
+      var it = j.item || {};
+      if (it.type==='thinking')
+        return logKind('thinking','lk-think', `<div class='thinking'>${E(it.text)}</div>`);
+      if (it.type==='tool_use')
+        return logKind('tool','lk-tool',
+          `<span class='toolname'>${E(it.name)}</span>${renderToolInput(it.input||{})}`);
+      if (it.type==='text')
+        return logKind('text','lk-text', E(it.text));
+      return logKind(it.type||'unknown','lk-unk', E(trunc(JSON.stringify(it),240)));
+    }
+    case 'tool_result': {
+      var so = j.stdout||'';
+      var se = j.stderr||'';
+      var body = (so ? `<pre>${E(so)}</pre>` : '') +
+                 (se ? `<div class='meta err'>stderr</div><pre>${E(se)}</pre>` : '');
+      return logKind('output','lk-out', body);
+    }
+    case 'result': {
+      var sub = j.subtype||'';
+      var cls = (typeof sub==='string' && sub.indexOf('error')===0) ? 'lk-err' : 'lk-result';
+      var parts = [];
+      if (j.num_turns!=null) parts.push(`${j.num_turns} turns`);
+      if (j.duration_ms!=null) parts.push(`${Math.floor(j.duration_ms/1000)}s`);
+      if (j.total_cost_usd!=null) parts.push(`$${j.total_cost_usd}`);
+      var meta = parts.join(' · ');
+      var body = (j.result ? `<pre>${E(j.result)}</pre>` : '') +
+                 (meta ? `<div class='meta'>${E(meta)}</div>` : '');
+      return logKind(sub, cls, body);
+    }
+    case 'unknown':
+      return logKind('unknown','lk-unk', E(j.event_type||''));
+    default:
+      return logKind(j.type||'unknown','lk-unk', E(trunc(JSON.stringify(j),240)));
+  }
+}
+
+function renderLog(events){
+  if (!events || events.length===0)
+    return `<p class='empty' style='padding:16px'>No log file.</p>`;
+  return `<div class='log'>${events.map(renderLogEvent).join('')}</div>`;
+}
+
+// -------- Page renderers --------
+
+var pages = {};
+
+pages.overview = function(d){
+  var c = d.counts;
+  var labels = [['running','Running'],['pending','Pending'],['failed','Failed'],
+                ['concerts','Concerts'],['listeners','Listeners'],['totalTasks','Total Tasks']];
+  var stats = `<div class='stats'>${
+    labels.map(function(p){return statBox(c[p[0]], p[1]);}).join('')
+  }</div>`;
+  var qRows = d.activeQueue.map(function(e){
+    return `<tr><td class='mono'>${link('/tasks/'+e.id, e.id)}</td>
+      <td>${badge(e.status)}</td>
+      <td class='m trunc'>${E(e.fork)}</td>
+      <td class='m'>${E(e.createdAt)}</td>
+      <td>${E(e.priority)}</td>
+      <td class='m trunc'>${E(e.concertId||'')}</td></tr>`;
+  });
+  var qTable = table(['ID','Status','Fork','Created','Pri','Concert'], qRows, 'No active tasks');
+  var tRows = d.recentTasks.map(function(r){
+    return `<tr><td class='mono'>${link('/tasks/'+r.id, r.id)}</td>
+      <td>${badge(r.status)}</td>
+      <td class='m trunc'>${E(r.fork)}</td>
+      <td class='m'>${E(r.createdAt)}</td>
+      <td class='trunc'>${E(trunc(r.prompt,60))}</td></tr>`;
+  });
+  var tTable = table(['ID','Status','Fork','Created','Prompt'], tRows, 'No tasks yet');
+  return `<h1>Overview</h1>${stats}<h2>Active Queue</h2>${qTable}<h2>Recent Tasks</h2>${tTable}`;
+};
+
+pages.queue = function(d){
+  var cRows = d.concerts.map(function(r){
+    return `<tr><td class='mono'>${link('/concerts/'+r.id, r.id)}</td>
+      <td>${badge(r.status)}</td>
+      <td class='m'>${E(r.startedAt)}</td>
+      <td class='m'>${E(r.finishedAt||'')}</td>
+      <td class='m trunc'>${E(r.name||r.workflowFile||'')}</td></tr>`;
+  });
+  var cTable = table(['Concert ID','Status','Started','Finished','Name / File'], cRows, 'No concerts');
+  var eRows = d.entries.map(function(e){
+    return `<tr><td class='mono'>${link('/tasks/'+e.id, e.id)}</td>
+      <td>${badge(e.status)}</td>
+      <td class='m trunc'>${E(e.fork)}</td>
+      <td class='m'>${E(e.createdAt)}</td>
+      <td>${E(e.priority)}</td>
+      <td class='m'>${E(e.series||'')}</td>
+      <td class='m'>${E(e.concertId||'')}</td></tr>`;
+  });
+  var eTable = table(['ID','Status','Fork','Created','Pri','Series','Concert'], eRows, 'No entries');
+  return `<h1>Queue</h1><h2>Concerts</h2>${cTable}<h2>Entries</h2>${eTable}`;
+};
+
+pages.concerts = function(d){
+  var rows = d.concerts.map(function(r){
+    return `<tr><td class='mono'>${link('/concerts/'+r.id, r.id)}</td>
+      <td>${badge(r.status)}</td>
+      <td class='m'>${E(r.name||'')}</td>
+      <td class='m trunc'>${E(r.workflowFile||'')}</td>
+      <td class='m'>${E(r.startedAt)}</td>
+      <td class='m'>${E(r.finishedAt||'')}</td></tr>`;
+  });
+  var t = table(['ID','Status','Name','Workflow','Started','Finished'], rows, 'No concerts');
+  return `<h1>Concerts</h1>${t}`;
+};
+
+pages['concert-detail'] = function(d){
+  if (!d || d.error) return `<h1>Concert not found</h1>`;
+  var r = d.concert;
+  var details = kvTable([
+    ['ID', E(r.id), 'mono'],
+    ['Status', badge(r.status), ''],
+    ['Name', E(r.name||'—'), ''],
+    ['Workflow', E(r.workflowFile||'—'), 'mono'],
+    ['Started', E(r.startedAt), 'm'],
+    ['Finished', E(r.finishedAt||'—'), 'm']
+  ]);
+  var stepRows = d.steps.map(function(s){
+    return `<tr><td class='mono'>${link('/tasks/'+s.id, s.id)}</td>
+      <td>${badge(s.status)}</td>
+      <td class='m trunc'>${E(s.fork)}</td>
+      <td class='m'>${E(s.createdAt)}</td>
+      <td class='m trunc'>${E(s.concertStepKey||'')}</td></tr>`;
+  });
+  var steps = table(['Task','Status','Fork','Created','Step Key'], stepRows, 'No steps');
+  return `<h1>Concert <span class='m mono'>${E(r.id)}</span></h1>${details}<h2>Steps</h2>${steps}`;
+};
+
+pages.listeners = function(d){
+  var rows = d.listeners.map(function(l){
+    var statusBadge = `<span class='b ${l.enabled?'bd':'bc'}'>${l.enabled?'enabled':'disabled'}</span>`;
+    return `<tr><td>${link('/listeners/'+l.name, l.name)}</td>
+      <td>${statusBadge}</td>
+      <td class='m'>${E(l.sourceType)}</td>
+      <td class='m'>${E(l.intervalSeconds)}s</td>
+      <td class='m'>${E(l.lastChecked||'never')}</td>
+      <td>${E(l.eventCount)}</td></tr>`;
+  });
+  var t = table(['Name','Status','Source','Interval','Last Checked','Events'], rows, 'No listeners');
+  return `<h1>Listeners</h1>${t}`;
+};
+
+pages['listener-detail'] = function(d){
+  if (!d || d.error) return `<h1>Listener not found</h1>`;
+  var statusBadge = `<span class='b ${d.enabled?'bd':'bc'}'>${d.enabled?'enabled':'disabled'}</span>`;
+  var cfgRows = [
+    ['Name', E(d.name), ''],
+    ['Status', statusBadge, ''],
+    ['Interval', `${E(d.intervalSeconds)}s`, 'm'],
+    ['Last Checked', E(d.lastChecked||'never'), 'm'],
+    ['Events Seen', E(d.eventCount), ''],
+    ['Source Type', E(d.sourceType), 'mono'],
+    ['Source', E(d.sourceDetail), 'm']
+  ];
+  (d.sourceExtras||[]).forEach(function(p){ cfgRows.push([E(p[0]), E(p[1]), 'm']); });
+  var cfg = kvTable(cfgRows);
+  var act = kvTable([
+    ['Mode', E(d.action.mode), 'mono'],
+    ['Upstream', E(d.action.upstream||''), 'm'],
+    ['Fork', E(d.action.fork||''), 'm'],
+    ['Series', E(d.action.series||'—'), 'm'],
+    ['Backend', E(d.action.backend||'—'), 'm'],
+    ['Model', E(d.action.model||'—'), 'm'],
+    ['Workflow', E(d.action.workflowPath||'—'), 'mono'],
+    ['Priority', E(d.action.priority), '']
+  ]);
+  var tmpl = `<div style='padding:12px'><div class='kv'>PROMPT TEMPLATE</div><pre class='pre'>${E(d.action.promptTemplate)}</pre></div>`;
+  var evRows = (d.recentEvents||[]).map(function(ev){return `<tr><td class='mono'>${E(ev)}</td></tr>`;});
+  var evTable = `<div class='card'><table><tbody>${
+    evRows.length===0 ? `<tr><td class='empty'>No events processed yet</td></tr>` : evRows.join('')
+  }</tbody></table></div>`;
+  return `<h1>Listener <span class='m'>${E(d.name)}</span></h1>
+    <h2>Configuration</h2>${cfg}
+    <h2>Action</h2><div class='card'>${act}${tmpl}</div>
+    <h2>Processed Event IDs (${E(d.eventCount)})</h2>${evTable}`;
+};
+
+pages.tasks = function(d){
+  var rows = d.tasks.map(function(r){
+    return `<tr><td class='mono'>${link('/tasks/'+r.id, r.id)}</td>
+      <td>${badge(r.status)}</td>
+      <td class='m trunc'>${E(r.fork)}</td>
+      <td class='m'>${E(r.createdAt)}</td>
+      <td class='m'>${E(r.series||'')}</td>
+      <td class='trunc'>${E(trunc(r.prompt,80))}</td></tr>`;
+  });
+  var t = table(['ID','Status','Fork','Created','Series','Prompt'], rows, 'No tasks yet');
+  return `<h1>Tasks</h1>${t}`;
+};
+
+pages['task-detail'] = function(d){
+  if (!d || d.error) return `<h1>Task not found</h1>`;
+  var details = kvTable([
+    ['ID', E(d.id), 'mono'],
+    ['Status', badge(d.status), ''],
+    ['Fork', E(d.fork), 'm'],
+    ['Created', E(d.createdAt), 'm']
+  ]);
+  var prompt = `<div class='card'><pre class='pre'>${E(d.prompt)}</pre></div>`;
+  var logHtml = renderLog(d.log);
+  return `<h1>Task <span class='m'>${E(d.id)}</span></h1>${details}
+    <h2>Prompt</h2>${prompt}
+    <h2>Log</h2><div class='card'>${logHtml}</div>`;
+};
+
+// -------- Boot + live updates --------
+
+function render(target, page, data){
+  var fn = pages[page];
+  if (!fn) { target.innerHTML = `<p class='empty'>Unknown page: ${E(page)}</p>`; return; }
+  target.innerHTML = fn(data);
+}
+
+function fetchAndRender(target, page, url){
+  return fetch(url, { credentials: 'same-origin' })
+    .then(function(r){ return r.ok ? r.json() : { error: 'fetch failed (' + r.status + ')' }; })
+    .then(function(data){ render(target, page, data); })
+    .catch(function(e){ target.innerHTML = `<p class='empty'>Error: ${E(e.message)}</p>`; });
+}
+
+function subscribeSse(target, page, url){
+  var es = new EventSource(url);
+  es.onmessage = function(ev){
+    try { render(target, page, JSON.parse(ev.data)); } catch (_) {}
+  };
+  window.addEventListener('beforeunload', function(){ es.close(); });
+}
+
+document.addEventListener('DOMContentLoaded', function(){
+  var main = document.querySelector('main[data-page]');
+  if (!main) return;
+  var page = main.dataset.page;
+  var api  = main.dataset.api;
+  var sse  = main.dataset.sse;
+  if (!api) return;
+  fetchAndRender(main, page, api).then(function(){
+    if (sse) subscribeSse(main, page, sse);
+  });
+});
+
+})();"
+
+/-- The single layout `Template` shared by every page. Each page is a thin
+    call to `layout` that passes its identifier (used by the JS bundle to pick
+    a renderer) plus optional API / SSE endpoints. -/
+private def layout (title : String) (pageId : String) (api : Option String)
+    (sse : Option String) (activeNav : String) : Html :=
+  let apiAttr := api.getD ""
+  let sseAttr := sse.getD ""
+  let navItem (href label idTag : String) : Html :=
+    if idTag == activeNav then
+      {{ <a href=s!"{href}" class="active"> s!"{esc label}" </a> }}
+    else
+      {{ <a href=s!"{href}"> s!"{esc label}" </a> }}
   {{ <html lang="en">
     <head>
       <meta charset="utf-8"/>
@@ -209,17 +539,53 @@ private def shell (title : String) (sseEndpoint : Option String) (content : Html
       <header>
         <span class="logo"> "Orchestra" </span>
         <nav>
-          <a href="/"> "Overview" </a>
-          <a href="/queue"> "Queue" </a>
-          <a href="/concerts"> "Concerts" </a>
-          <a href="/listeners"> "Listeners" </a>
-          <a href="/tasks"> "Tasks" </a>
+          {{ navItem "/"          "Overview"  "overview"  }}
+          {{ navItem "/queue"     "Queue"     "queue"     }}
+          {{ navItem "/concerts"  "Concerts"  "concerts"  }}
+          {{ navItem "/listeners" "Listeners" "listeners" }}
+          {{ navItem "/tasks"     "Tasks"     "tasks"     }}
         </nav>
       </header>
-      <main> {{ content }} </main>
-      <script> {{ Html.text false script }} </script>
+      <main data-page=s!"{pageId}" data-api=s!"{apiAttr}" data-sse=s!"{sseAttr}">
+        <div class="loading"> "Loading…" </div>
+      </main>
+      <script> {{ Html.text false dashJs }} </script>
     </body>
   </html> }}
+
+-- Per-page Verso shells. Each is a single `layout` call.
+
+private def overviewShell : Html :=
+  layout "Overview" "overview" (some "/api/overview") (some "/sse/overview") "overview"
+
+private def queueShell : Html :=
+  layout "Queue" "queue" (some "/api/queue") (some "/sse/queue") "queue"
+
+private def concertsShell : Html :=
+  layout "Concerts" "concerts" (some "/api/concerts") (some "/sse/concerts") "concerts"
+
+private def concertDetailShell (id : String) : Html :=
+  layout s!"Concert {id}" "concert-detail"
+    (some s!"/api/concerts/{id}") (some s!"/sse/concerts/{id}") "concerts"
+
+private def listenersShell : Html :=
+  layout "Listeners" "listeners" (some "/api/listeners") (some "/sse/listeners") "listeners"
+
+private def listenerDetailShell (name : String) : Html :=
+  layout s!"Listener {name}" "listener-detail"
+    (some s!"/api/listeners/{name}") (some s!"/sse/listeners/{name}") "listeners"
+
+private def tasksShell : Html :=
+  layout "Tasks" "tasks" (some "/api/tasks") (some "/sse/tasks") "tasks"
+
+private def taskDetailShell (id : String) : Html :=
+  layout s!"Task {id}" "task-detail"
+    (some s!"/api/tasks/{id}") (some s!"/sse/tasks/{id}") "tasks"
+
+end -- section (HTML shell generation)
+
+-- View-model builders: each `/api/...` endpoint produces a `Json` value
+-- tailored for the corresponding page renderer in `dashJs`.
 
 private def qStText : Queue.QueueStatus → String
   | .pending    => "pending"   | .running    => "running"
@@ -235,13 +601,40 @@ private def cStText : Queue.ConcertStatus → String
   | .running   => "running"  | .done      => "done"
   | .failed    => "failed"   | .cancelled => "cancelled"
 
-private def statBox (val : Nat) (lbl : String) : Html :=
-  {{ <div class="st">
-    <div class="sv"> s!"{val}" </div>
-    <div class="sl"> s!"{lbl}" </div>
-  </div> }}
+private def queueEntryJson (e : Queue.QueueEntry) : Json :=
+  Json.mkObj [
+    ("id",            e.id),
+    ("status",        qStText e.status),
+    ("fork",          e.fork.toString),
+    ("createdAt",     e.createdAt),
+    ("priority",      ToJson.toJson e.priority),
+    ("series",        e.series.getD ""),
+    ("concertId",     e.concertId.getD ""),
+    ("concertStepKey", e.concertStepKey.getD ""),
+    ("prompt",        e.prompt)
+  ]
 
-private def overviewContent : IO Html := do
+private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
+  Json.mkObj [
+    ("id",        r.id),
+    ("status",    tStText r.status),
+    ("fork",      r.fork.toString),
+    ("createdAt", r.createdAt),
+    ("series",    r.series.getD ""),
+    ("prompt",    r.prompt)
+  ]
+
+private def concertRunJson (r : Queue.ConcertRun) : Json :=
+  Json.mkObj [
+    ("id",           r.id),
+    ("status",       cStText r.status),
+    ("name",         r.name.getD ""),
+    ("workflowFile", r.workflowFile.getD ""),
+    ("startedAt",    r.startedAt),
+    ("finishedAt",   r.finishedAt.getD "")
+  ]
+
+private def overviewApi : IO Json := do
   let entries  ← Queue.loadAllEntries
   let tasks    ← TaskStore.loadAllTasks
   let lsCfgs   ← Listener.loadAllListenerConfigs
@@ -250,238 +643,59 @@ private def overviewContent : IO Html := do
   let pending := entries.filter (·.status == .pending)
   let failed  := entries.filter (·.status == .failed)
   let rConcerts := concerts.filter (·.status == .running)
-  let stats : Html :=
-    {{ <div class="stats">
-      {{ statBox running.size "Running" }}
-      {{ statBox pending.size "Pending" }}
-      {{ statBox failed.size "Failed" }}
-      {{ statBox rConcerts.size "Concerts" }}
-      {{ statBox lsCfgs.size "Listeners" }}
-      {{ statBox tasks.size "Total Tasks" }}
-    </div> }}
   let active := running ++ pending
-  let activeRows : Html :=
-    if active.isEmpty then
-      {{ <tr><td colspan="6" class="empty"> "No active tasks" </td></tr> }}
-    else
-      Html.fromList (active.toList.map fun e =>
-        {{ <tr>
-          <td class="m"> <a href=s!"/tasks/{e.id}"> s!"{esc e.id}" </a> </td>
-          <td> {{ badge (qStText e.status) }} </td>
-          <td class="m trunc"> s!"{esc e.fork.toString}" </td>
-          <td class="m"> s!"{e.createdAt}" </td>
-          <td> s!"{e.priority}" </td>
-          <td class="m trunc"> s!"{esc (e.concertId.getD "")}" </td>
-        </tr> }})
-  let qTable : Html :=
-    {{ <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th> "ID" </th> <th> "Status" </th> <th> "Fork" </th>
-            <th> "Created" </th> <th> "Pri" </th> <th> "Concert" </th>
-          </tr>
-        </thead>
-        <tbody> {{ activeRows }} </tbody>
-      </table>
-    </div> }}
-  let recentTasks := tasks.toList.take 10
-  let recentRows : Html :=
-    if recentTasks.isEmpty then
-      {{ <tr><td colspan="5" class="empty"> "No tasks yet" </td></tr> }}
-    else
-      Html.fromList (recentTasks.map fun r =>
-        let snip : String := (r.prompt.take 60).toString
-        {{ <tr>
-          <td class="m"> <a href=s!"/tasks/{r.id}"> s!"{esc r.id}" </a> </td>
-          <td> {{ badge (tStText r.status) }} </td>
-          <td class="m trunc"> s!"{esc r.fork.toString}" </td>
-          <td class="m"> s!"{r.createdAt}" </td>
-          <td class="trunc"> s!"{esc snip}" </td>
-        </tr> }})
-  let tTable : Html :=
-    {{ <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th> "ID" </th> <th> "Status" </th> <th> "Fork" </th>
-            <th> "Created" </th> <th> "Prompt" </th>
-          </tr>
-        </thead>
-        <tbody> {{ recentRows }} </tbody>
-      </table>
-    </div> }}
-  return {{
-    {{ stats }}
-    <h2> "Active Queue" </h2>
-    {{ qTable }}
-    <h2> "Recent Tasks" </h2>
-    {{ tTable }}
-  }}
+  let recent := tasks.toList.take 10
+  return Json.mkObj [
+    ("counts", Json.mkObj [
+      ("running",    ToJson.toJson running.size),
+      ("pending",    ToJson.toJson pending.size),
+      ("failed",     ToJson.toJson failed.size),
+      ("concerts",   ToJson.toJson rConcerts.size),
+      ("listeners",  ToJson.toJson lsCfgs.size),
+      ("totalTasks", ToJson.toJson tasks.size)
+    ]),
+    ("activeQueue", Json.arr (active.map queueEntryJson)),
+    ("recentTasks", Json.arr (recent.map taskRecJson).toArray)
+  ]
 
-private def overviewPage : IO Html := do
-  return shell "Overview" (some "/sse/overview") (← overviewContent)
-
-private def queueContent : IO Html := do
+private def queueApi : IO Json := do
   let entries  ← Queue.loadAllEntries
   let concerts ← Queue.loadAllConcertRuns
-  let cRows : Html :=
-    if concerts.isEmpty then
-      {{ <tr><td colspan="5" class="empty"> "No concerts" </td></tr> }}
-    else
-      Html.fromList (concerts.toList.map fun r =>
-        {{ <tr>
-          <td class="mono"> <a href=s!"/concerts/{r.id}"> s!"{esc r.id}" </a> </td>
-          <td> {{ badge (cStText r.status) }} </td>
-          <td class="m"> s!"{r.startedAt}" </td>
-          <td class="m"> s!"{esc (r.finishedAt.getD "")}" </td>
-          <td class="m trunc"> s!"{esc (r.name.getD (r.workflowFile.getD ""))}" </td>
-        </tr> }})
-  let cTable : Html :=
-    {{ <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th> "Concert ID" </th> <th> "Status" </th>
-            <th> "Started" </th> <th> "Finished" </th> <th> "Name / File" </th>
-          </tr>
-        </thead>
-        <tbody> {{ cRows }} </tbody>
-      </table>
-    </div> }}
-  let eRows : Html :=
-    if entries.isEmpty then
-      {{ <tr><td colspan="7" class="empty"> "No entries" </td></tr> }}
-    else
-      Html.fromList (entries.toList.map fun e =>
-        {{ <tr>
-          <td class="m"> <a href=s!"/tasks/{e.id}"> s!"{esc e.id}" </a> </td>
-          <td> {{ badge (qStText e.status) }} </td>
-          <td class="m trunc"> s!"{esc e.fork.toString}" </td>
-          <td class="m"> s!"{e.createdAt}" </td>
-          <td> s!"{e.priority}" </td>
-          <td class="m"> s!"{esc (e.series.getD "")}" </td>
-          <td class="m"> s!"{esc (e.concertId.getD "")}" </td>
-        </tr> }})
-  let eTable : Html :=
-    {{ <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th> "ID" </th> <th> "Status" </th> <th> "Fork" </th>
-            <th> "Created" </th> <th> "Pri" </th> <th> "Series" </th> <th> "Concert" </th>
-          </tr>
-        </thead>
-        <tbody> {{ eRows }} </tbody>
-      </table>
-    </div> }}
-  return {{
-    <h1> "Queue" </h1>
-    <h2> "Concerts" </h2>
-    {{ cTable }}
-    <h2> "Entries" </h2>
-    {{ eTable }}
-  }}
+  return Json.mkObj [
+    ("concerts", Json.arr (concerts.map concertRunJson)),
+    ("entries",  Json.arr (entries.map queueEntryJson))
+  ]
 
-private def queuePage : IO Html := do
-  return shell "Queue" (some "/sse/queue") (← queueContent)
-
--- Concerts
-
-private def concertsContent : IO Html := do
+private def concertsApi : IO Json := do
   let concerts ← Queue.loadAllConcertRuns
-  let rows : Html :=
-    if concerts.isEmpty then
-      {{ <tr><td colspan="6" class="empty"> "No concerts" </td></tr> }}
-    else
-      Html.fromList (concerts.toList.map fun r =>
-        {{ <tr>
-          <td class="mono"> <a href=s!"/concerts/{r.id}"> s!"{esc r.id}" </a> </td>
-          <td> {{ badge (cStText r.status) }} </td>
-          <td class="m"> s!"{esc (r.name.getD "")}" </td>
-          <td class="m trunc"> s!"{esc (r.workflowFile.getD "")}" </td>
-          <td class="m"> s!"{r.startedAt}" </td>
-          <td class="m"> s!"{esc (r.finishedAt.getD "")}" </td>
-        </tr> }})
-  return {{
-    <h1> "Concerts" </h1>
-    <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th> "ID" </th> <th> "Status" </th> <th> "Name" </th>
-            <th> "Workflow" </th> <th> "Started" </th> <th> "Finished" </th>
-          </tr>
-        </thead>
-        <tbody> {{ rows }} </tbody>
-      </table>
-    </div>
-  }}
+  return Json.mkObj [
+    ("concerts", Json.arr (concerts.map concertRunJson))
+  ]
 
-private def concertsPage : IO Html := do
-  return shell "Concerts" (some "/sse/concerts") (← concertsContent)
-
-private def concertDetailContent (id : String) : IO (Option Html) := do
+private def concertDetailApi (id : String) : IO (Option Json) := do
   match ← Queue.loadConcertRun id with
   | none => return none
   | some r =>
     let entries ← Queue.loadAllEntries
     let steps := entries.filter (fun e => e.concertId == some id)
-    let stepRows : Html :=
-      if steps.isEmpty then
-        {{ <tr><td colspan="5" class="empty"> "No steps" </td></tr> }}
-      else
-        Html.fromList (steps.toList.map fun e =>
-          {{ <tr>
-            <td class="mono"> <a href=s!"/tasks/{e.id}"> s!"{esc e.id}" </a> </td>
-            <td> {{ badge (qStText e.status) }} </td>
-            <td class="m trunc"> s!"{esc e.fork.toString}" </td>
-            <td class="m"> s!"{e.createdAt}" </td>
-            <td class="m trunc"> s!"{esc (e.concertStepKey.getD "")}" </td>
-          </tr> }})
-    let details : Html :=
-      {{ <table>
-        <tr><th> "ID" </th>       <td class="mono"> s!"{esc r.id}" </td></tr>
-        <tr><th> "Status" </th>   <td> {{ badge (cStText r.status) }} </td></tr>
-        <tr><th> "Name" </th>     <td> s!"{esc (r.name.getD "—")}" </td></tr>
-        <tr><th> "Workflow" </th> <td class="mono"> s!"{esc (r.workflowFile.getD "—")}" </td></tr>
-        <tr><th> "Started" </th>  <td class="m"> s!"{r.startedAt}" </td></tr>
-        <tr><th> "Finished" </th> <td class="m"> s!"{esc (r.finishedAt.getD "—")}" </td></tr>
-      </table> }}
-    return some {{
-      <h1> "Concert " <span class="m mono"> s!"{esc id}" </span> </h1>
-      <div class="card"> {{ details }} </div>
-      <h2> "Steps" </h2>
-      <div class="card">
-        <table>
-          <thead>
-            <tr>
-              <th> "Task" </th> <th> "Status" </th> <th> "Fork" </th>
-              <th> "Created" </th> <th> "Step Key" </th>
-            </tr>
-          </thead>
-          <tbody> {{ stepRows }} </tbody>
-        </table>
-      </div>
-    }}
-
-private def concertDetailPage (id : String) : IO (Option Html) := do
-  match ← concertDetailContent id with
-  | none => return none
-  | some content => return some (shell s!"Concert {id}" (some s!"/sse/concerts/{id}") content)
-
--- Listener detail
+    return some (Json.mkObj [
+      ("concert", concertRunJson r),
+      ("steps",   Json.arr (steps.map queueEntryJson))
+    ])
 
 private def sourceSummary : Listener.SourceConfig → (String × String)
   | .githubIssues repos labels _ _    =>
       let r := String.intercalate ", " (repos.map (·.upstream.toString))
-      ("github-issues", s!"{r}" ++ (if labels.isEmpty then "" else s!" [labels: {String.intercalate "," labels}]"))
+      ("github-issues",
+        r ++ (if labels.isEmpty then "" else s!" [labels: {String.intercalate "," labels}]"))
   | .githubPrReviews repos labels _ _ =>
       let r := String.intercalate ", " (repos.map (·.upstream.toString))
-      ("github-pr-reviews", s!"{r}" ++ (if labels.isEmpty then "" else s!" [labels: {String.intercalate "," labels}]"))
+      ("github-pr-reviews",
+        r ++ (if labels.isEmpty then "" else s!" [labels: {String.intercalate "," labels}]"))
   | .githubComments repos labels _ _  =>
       let r := String.intercalate ", " (repos.map (·.upstream.toString))
-      ("github-comments", s!"{r}" ++ (if labels.isEmpty then "" else s!" [labels: {String.intercalate "," labels}]"))
+      ("github-comments",
+        r ++ (if labels.isEmpty then "" else s!" [labels: {String.intercalate "," labels}]"))
   | .shell cmd args                   => ("shell", s!"{cmd} {String.intercalate " " args}")
   | .projectDispatcher pid caps       =>
       let cs := String.intercalate ", " (caps.map (fun (n,c) => s!"{n}={c}"))
@@ -502,358 +716,120 @@ private def sourceExtras : Listener.SourceConfig → List (String × String)
       [("authorized users", String.intercalate ", " authU)]
   | _ => []
 
-private def listenersContent : IO Html := do
+private def listenerSummaryJson (c : Listener.ListenerConfig) (st : Listener.ListenerState) : Json :=
+  let (srcType, _) := sourceSummary c.source
+  Json.mkObj [
+    ("name",            c.name),
+    ("enabled",         Json.bool st.enabled),
+    ("sourceType",      srcType),
+    ("intervalSeconds", ToJson.toJson c.intervalSeconds),
+    ("lastChecked",     st.lastChecked),
+    ("eventCount",      ToJson.toJson st.processedIds.size)
+  ]
+
+private def listenersApi : IO Json := do
   let cfgs ← Listener.loadAllListenerConfigs
-  let rows : List Html ← cfgs.toList.mapM fun c => do
+  let rows : Array Json ← cfgs.mapM fun c => do
     let st ← Listener.loadListenerState c.name
-    let last := if st.lastChecked.isEmpty then "never" else st.lastChecked
-    let eb : Html :=
-      if st.enabled then {{ <span class="b bd"> "enabled" </span> }}
-      else {{ <span class="b bc"> "disabled" </span> }}
-    let (srcType, _) := sourceSummary c.source
-    return {{ <tr>
-      <td> <a href=s!"/listeners/{c.name}"> s!"{esc c.name}" </a> </td>
-      <td> {{ eb }} </td>
-      <td class="m"> s!"{esc srcType}" </td>
-      <td class="m"> s!"{c.intervalSeconds}s" </td>
-      <td class="m"> s!"{last}" </td>
-      <td> s!"{st.processedIds.size}" </td>
-    </tr> }}
-  let tableBody : Html :=
-    if rows.isEmpty then
-      {{ <tr><td colspan="6" class="empty"> "No listeners" </td></tr> }}
-    else Html.fromList rows
-  return {{
-    <h1> "Listeners" </h1>
-    <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th> "Name" </th> <th> "Status" </th> <th> "Source" </th>
-            <th> "Interval" </th> <th> "Last Checked" </th> <th> "Events" </th>
-          </tr>
-        </thead>
-        <tbody> {{ tableBody }} </tbody>
-      </table>
-    </div>
-  }}
+    return listenerSummaryJson c st
+  return Json.mkObj [("listeners", Json.arr rows)]
 
-private def listenersPage : IO Html := do
-  return shell "Listeners" (some "/sse/listeners") (← listenersContent)
+private def actionJson (a : Listener.ActionConfig) : Json :=
+  Json.mkObj [
+    ("mode",           ToJson.toJson a.mode),
+    ("upstream",       a.upstream),
+    ("fork",           a.fork),
+    ("series",         a.series.getD ""),
+    ("backend",        a.backend.getD ""),
+    ("model",          a.model.getD ""),
+    ("workflowPath",   a.workflowPath.getD ""),
+    ("priority",       ToJson.toJson a.priority),
+    ("promptTemplate", a.promptTemplate)
+  ]
 
-private def listenerDetailContent (name : String) : IO (Option Html) := do
+private def listenerDetailApi (name : String) : IO (Option Json) := do
   match ← Listener.loadListenerConfig name with
   | none => return none
   | some c =>
     let st ← Listener.loadListenerState c.name
-    let last := if st.lastChecked.isEmpty then "never" else st.lastChecked
     let (srcType, srcDetail) := sourceSummary c.source
     let extras := sourceExtras c.source
-    let extraRows : Html := Html.fromList (extras.filterMap fun (k, v) =>
-      if v.isEmpty then none
-      else some {{ <tr><th> s!"{esc k}" </th><td class="m"> s!"{esc v}" </td></tr> }})
-    let eb : Html :=
-      if st.enabled then {{ <span class="b bd"> "enabled" </span> }}
-      else {{ <span class="b bc"> "disabled" </span> }}
-    let cfg : Html :=
-      {{ <table>
-        <tr><th> "Name" </th>     <td> s!"{esc c.name}" </td></tr>
-        <tr><th> "Status" </th>   <td> {{ eb }} </td></tr>
-        <tr><th> "Interval" </th> <td class="m"> s!"{c.intervalSeconds}s" </td></tr>
-        <tr><th> "Last Checked" </th> <td class="m"> s!"{last}" </td></tr>
-        <tr><th> "Events Seen" </th>  <td> s!"{st.processedIds.size}" </td></tr>
-        <tr><th> "Source Type" </th>  <td class="mono"> s!"{esc srcType}" </td></tr>
-        <tr><th> "Source" </th>       <td class="m"> s!"{esc srcDetail}" </td></tr>
-        {{ extraRows }}
-      </table> }}
-    let act : Html :=
-      {{ <table>
-        <tr><th> "Mode" </th>     <td class="mono"> s!"{esc (Lean.ToJson.toJson c.action.mode).compress}" </td></tr>
-        <tr><th> "Upstream" </th> <td class="m"> s!"{esc c.action.upstream}" </td></tr>
-        <tr><th> "Fork" </th>     <td class="m"> s!"{esc c.action.fork}" </td></tr>
-        <tr><th> "Series" </th>   <td class="m"> s!"{esc (c.action.series.getD "—")}" </td></tr>
-        <tr><th> "Backend" </th>  <td class="m"> s!"{esc (c.action.backend.getD "—")}" </td></tr>
-        <tr><th> "Model" </th>    <td class="m"> s!"{esc (c.action.model.getD "—")}" </td></tr>
-        <tr><th> "Workflow" </th> <td class="mono"> s!"{esc (c.action.workflowPath.getD "—")}" </td></tr>
-        <tr><th> "Priority" </th> <td> s!"{c.action.priority}" </td></tr>
-      </table> }}
+    let extrasJson : Array Json := (extras.filter (fun (_, v) => ! v.isEmpty)).map
+      (fun (k, v) => (Json.arr #[Json.str k, Json.str v])) |>.toArray
     let recent := st.processedIds.toList.reverse.take 50
-    let evRows : Html :=
-      if recent.isEmpty then
-        {{ <tr><td class="empty"> "No events processed yet" </td></tr> }}
-      else
-        Html.fromList (recent.map fun ev =>
-          {{ <tr><td class="mono"> s!"{esc ev}" </td></tr> }})
-    return some {{
-      <h1> "Listener " <span class="m"> s!"{esc name}" </span> </h1>
-      <h2> "Configuration" </h2>
-      <div class="card"> {{ cfg }} </div>
-      <h2> "Action" </h2>
-      <div class="card">
-        {{ act }}
-        <div style="padding:12px">
-          <div class="meta" style="font-size:11px;color:var(--mu);margin-bottom:4px"> "PROMPT TEMPLATE" </div>
-          <pre class="pre"> s!"{esc c.action.promptTemplate}" </pre>
-        </div>
-      </div>
-      <h2> s!"Processed Event IDs ({st.processedIds.size})" </h2>
-      <div class="card">
-        <table><tbody> {{ evRows }} </tbody></table>
-      </div>
-    }}
+    return some (Json.mkObj [
+      ("name",            c.name),
+      ("enabled",         Json.bool st.enabled),
+      ("intervalSeconds", ToJson.toJson c.intervalSeconds),
+      ("lastChecked",     st.lastChecked),
+      ("eventCount",      ToJson.toJson st.processedIds.size),
+      ("sourceType",      srcType),
+      ("sourceDetail",    srcDetail),
+      ("sourceExtras",    Json.arr extrasJson),
+      ("action",          actionJson c.action),
+      ("recentEvents",    Json.arr (recent.map Json.str).toArray)
+    ])
 
-private def listenerDetailPage (name : String) : IO (Option Html) := do
-  match ← listenerDetailContent name with
-  | none => return none
-  | some content =>
-    return some (shell s!"Listener {name}" (some s!"/sse/listeners/{name}") content)
-
-private def tasksContent : IO Html := do
+private def tasksApi : IO Json := do
   let tasks ← TaskStore.loadAllTasks
-  let shown := tasks.toList.take 50
-  let rows : Html :=
-    if shown.isEmpty then
-      {{ <tr><td colspan="6" class="empty"> "No tasks yet" </td></tr> }}
-    else
-      Html.fromList (shown.map fun r =>
-        let snip : String := (r.prompt.take 80).toString
-        {{ <tr>
-          <td class="m"> <a href=s!"/tasks/{r.id}"> s!"{esc r.id}" </a> </td>
-          <td> {{ badge (tStText r.status) }} </td>
-          <td class="m trunc"> s!"{esc r.fork.toString}" </td>
-          <td class="m"> s!"{r.createdAt}" </td>
-          <td class="m"> s!"{esc (r.series.getD "")}" </td>
-          <td class="trunc"> s!"{esc snip}" </td>
-        </tr> }})
-  return {{
-    <h1> "Tasks" </h1>
-    <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th> "ID" </th> <th> "Status" </th> <th> "Fork" </th>
-            <th> "Created" </th> <th> "Series" </th> <th> "Prompt" </th>
-          </tr>
-        </thead>
-        <tbody> {{ rows }} </tbody>
-      </table>
-    </div>
-  }}
+  return Json.mkObj [
+    ("tasks", Json.arr ((tasks.toList.take 50).map taskRecJson).toArray)
+  ]
 
-private def tasksPage : IO Html := do
-  return shell "Tasks" (some "/sse/tasks") (← tasksContent)
+/-- Parse the per-task structured JSONL log into an array of `Json` events.
+    Returns an empty array if the file is missing. -/
+private def loadTaskLog (fork : Repository) (id : String) : IO (Array Json) := do
+  let path := (← Dirs.dataBase) / "logs" / fork.toString / s!"{id}.log"
+  if !(← path.pathExists) then return #[]
+  let raw ← IO.FS.readFile path
+  let mut out : Array Json := #[]
+  for line in raw.splitOn "\n" do
+    if line.trimAscii.isEmpty then continue
+    match Json.parse line with
+    | .ok j    => out := out.push j
+    | .error _ => out := out.push (Json.mkObj [("type", "unknown"), ("event_type", "parse_error")])
+  return out
 
--- Log rendering: parse each JSONL line produced by `Sandbox.launchAgent` and
--- render it as a structured row instead of dumping raw JSON. Lines that fail
--- to parse fall back to a small monospaced raw row.
-
-private def jStr? (j : Json) (k : String) : Option String :=
-  match j.getObjValAs? String k with | .ok s => some s | _ => none
-
-private def jStrD (j : Json) (k : String) (d := "") : String :=
-  (jStr? j k).getD d
-
-private def jNat? (j : Json) (k : String) : Option Nat :=
-  j.getObjValAs? Nat k |>.toOption
-
-private def truncStr (s : String) (n : Nat) : String :=
-  if s.length ≤ n then s
-  else String.ofList (s.toList.take n) ++ "…"
-
-private def renderToolInput (input : Json) : Html :=
-  let cmd := jStrD input "command"
-  let fp  := jStrD input "file_path"
-  let pat := jStrD input "pattern"
-  let desc := jStrD input "description"
-  if !cmd.isEmpty then
-    {{ <div>
-      {{ if desc.isEmpty then ({{ "" }} : Html)
-         else {{ <div class="meta"> s!"{esc desc}" </div> }} }}
-      <pre> s!"$ {esc cmd}" </pre>
-    </div> }}
-  else if !fp.isEmpty then
-    {{ <div class="meta"> s!"{esc fp}" </div> }}
-  else if !pat.isEmpty then
-    {{ <div class="meta"> s!"pattern: {esc pat}" </div> }}
-  else if !desc.isEmpty then
-    {{ <div class="meta"> s!"{esc desc}" </div> }}
-  else
-    let raw := truncStr (Json.compress input) 280
-    {{ <pre> s!"{esc raw}" </pre> }}
-
-private def renderLogEvent (j : Json) : Html :=
-  match jStrD j "type" with
-  | "init" =>
-    let sid   := jStrD j "session_id"
-    let model := jStrD j "model"
-    let sidShort := truncStr sid 12
-    {{ <div class="le">
-      <span class="lk lk-init"> "init" </span>
-      <div class="lbody"> s!"model: {esc model}"
-        <div class="meta"> s!"session {esc sidShort}" </div>
-      </div>
-    </div> }}
-  | "system" =>
-    {{ <div class="le">
-      <span class="lk lk-system"> "system" </span>
-      <div class="lbody"> s!"{esc (jStrD j "subtype")}" </div>
-    </div> }}
-  | "assistant" =>
-    let item := (j.getObjVal? "item").toOption.getD (Json.mkObj [])
-    match jStrD item "type" with
-    | "thinking" =>
-      {{ <div class="le">
-        <span class="lk lk-think"> "thinking" </span>
-        <div class="lbody thinking"> s!"{esc (jStrD item "text")}" </div>
-      </div> }}
-    | "tool_use" =>
-      let name := jStrD item "name"
-      let input := (item.getObjVal? "input").toOption.getD (Json.mkObj [])
-      {{ <div class="le">
-        <span class="lk lk-tool"> "tool" </span>
-        <div class="lbody">
-          <span class="toolname"> s!"{esc name}" </span>
-          {{ renderToolInput input }}
-        </div>
-      </div> }}
-    | "text" =>
-      {{ <div class="le">
-        <span class="lk lk-text"> "text" </span>
-        <div class="lbody"> s!"{esc (jStrD item "text")}" </div>
-      </div> }}
-    | other =>
-      {{ <div class="le">
-        <span class="lk lk-unk"> s!"{esc other}" </span>
-        <div class="lbody"> s!"{esc (truncStr (Json.compress item) 240)}" </div>
-      </div> }}
-  | "tool_result" =>
-    let stdout := jStrD j "stdout"
-    let stderr := jStrD j "stderr"
-    {{ <div class="le">
-      <span class="lk lk-out"> "output" </span>
-      <div class="lbody">
-        {{ if stdout.isEmpty then ({{ "" }} : Html)
-           else {{ <pre> s!"{esc stdout}" </pre> }} }}
-        {{ if stderr.isEmpty then ({{ "" }} : Html)
-           else {{ <div>
-             <div class="meta err"> "stderr" </div>
-             <pre> s!"{esc stderr}" </pre>
-           </div> }} }}
-      </div>
-    </div> }}
-  | "result" =>
-    let sub := jStrD j "subtype"
-    let res := jStrD j "result"
-    let isErr := sub.startsWith "error"
-    let kindCls := if isErr then "lk lk-err" else "lk lk-result"
-    let turns := match jNat? j "num_turns"   with | some n => s!"{n} turns" | none => ""
-    let dur   := match jNat? j "duration_ms" with | some n => s!"{n / 1000}s" | none => ""
-    let cost := match j.getObjVal? "total_cost_usd" |>.toOption with
-      | some v => s!"${v.compress}"
-      | none   => ""
-    let metaStr := [turns, dur, cost].filter (! ·.isEmpty) |> String.intercalate " · "
-    {{ <div class="le">
-      <span class=s!"{kindCls}"> s!"{esc sub}" </span>
-      <div class="lbody">
-        {{ if res.isEmpty then ({{ "" }} : Html)
-           else {{ <pre> s!"{esc res}" </pre> }} }}
-        {{ if metaStr.isEmpty then ({{ "" }} : Html)
-           else {{ <div class="meta"> s!"{esc metaStr}" </div> }} }}
-      </div>
-    </div> }}
-  | "unknown" =>
-    {{ <div class="le">
-      <span class="lk lk-unk"> "unknown" </span>
-      <div class="lbody"> s!"{esc (jStrD j "event_type")}" </div>
-    </div> }}
-  | other =>
-    {{ <div class="le">
-      <span class="lk lk-unk"> s!"{esc other}" </span>
-      <div class="lbody"> s!"{esc (truncStr (Json.compress j) 240)}" </div>
-    </div> }}
-
-private def renderLog (content : String) : Html :=
-  let lines := content.splitOn "\n" |>.filter (! ·.trimAscii.isEmpty)
-  if lines.isEmpty then
-    {{ <p class="empty" style="padding:16px"> "No log file." </p> }}
-  else
-    let rows : List Html := lines.map fun line =>
-      match Json.parse line with
-      | .ok j    => renderLogEvent j
-      | .error _ => {{ <div class="lraw"> s!"{esc (truncStr line 400)}" </div> }}
-    {{ <div class="log"> {{ Html.fromList rows }} </div> }}
-
-private def taskDetailContent (id : String) : IO (Option Html) := do
+private def taskDetailApi (id : String) : IO (Option Json) := do
   let record  ← TaskStore.loadTask id
   let entries ← Queue.loadAllEntries
   let qEntry  := entries.find? (·.id == id)
   let infoOpt : Option (Repository × String × String × String) :=
     match record with
     | some r => some (r.fork, tStText r.status, r.createdAt, r.prompt)
-    | none   =>
+    | none =>
       match qEntry with
       | some q => some (q.fork, qStText q.status, q.createdAt, q.prompt)
       | none   => none
   match infoOpt with
   | none => return none
   | some (fork, st, createdAt, prompt) =>
-    let logPath := (← Dirs.dataBase) / "logs" / fork.toString / s!"{id}.log"
-    let logContent ← if ← logPath.pathExists then IO.FS.readFile logPath else pure ""
-    let logSec : Html := renderLog logContent
-    let details : Html :=
-      {{ <table>
-        <tr><th> "ID" </th>      <td class="m"> s!"{esc id}" </td></tr>
-        <tr><th> "Status" </th>  <td> {{ badge st }} </td></tr>
-        <tr><th> "Fork" </th>    <td class="m"> s!"{esc fork.toString}" </td></tr>
-        <tr><th> "Created" </th> <td class="m"> s!"{createdAt}" </td></tr>
-      </table> }}
-    let content : Html :=
-      {{ <h1> "Task " <span class="m"> s!"{esc id}" </span> </h1>
-        <div class="card"> {{ details }} </div>
-        <h2> "Prompt" </h2>
-        <div class="card"> <pre class="pre"> s!"{esc prompt}" </pre> </div>
-        <h2> "Log" </h2>
-        <div class="card"> {{ logSec }} </div> }}
-    return some content
+    let log ← loadTaskLog fork id
+    return some (Json.mkObj [
+      ("id",        id),
+      ("status",    st),
+      ("fork",      fork.toString),
+      ("createdAt", createdAt),
+      ("prompt",    prompt),
+      ("log",       Json.arr log)
+    ])
 
-private def taskDetailPage (id : String) : IO (Option Html) := do
-  match ← taskDetailContent id with
-  | none => return none
-  | some content => return some (shell s!"Task {id}" (some s!"/sse/tasks/{id}") content)
-
-/-- Render the current dynamic fragment for an SSE endpoint kind.
-    Returns `none` if the kind is unknown or the referenced resource is missing.
-    The fragment is the same verso `Html` value that the corresponding page
-    wraps in `shell` — rendered to a string via `Html.asString`. -/
-private def renderFragment (kind : String) : IO (Option String) := do
-  let toStr (h : Html) : String := Html.asString h (breakLines := false)
-  if kind == "overview"  then return some (toStr (← overviewContent))
-  if kind == "queue"     then return some (toStr (← queueContent))
-  if kind == "listeners" then return some (toStr (← listenersContent))
-  if kind == "concerts"  then return some (toStr (← concertsContent))
-  if kind == "tasks"     then return some (toStr (← tasksContent))
+/-- Dispatch a `/api/...` or `/sse/...` kind string to the matching builder. -/
+private def renderApi (kind : String) : IO (Option Json) := do
+  if kind == "overview"  then return some (← overviewApi)
+  if kind == "queue"     then return some (← queueApi)
+  if kind == "concerts"  then return some (← concertsApi)
+  if kind == "listeners" then return some (← listenersApi)
+  if kind == "tasks"     then return some (← tasksApi)
   if kind.startsWith "concerts/" then
-    let id := (kind.drop "concerts/".length).toString
-    match ← concertDetailContent id with
-    | none   => return none
-    | some h => return some (toStr h)
+    return ← concertDetailApi (kind.drop "concerts/".length).toString
   if kind.startsWith "listeners/" then
-    let name := (kind.drop "listeners/".length).toString
-    match ← listenerDetailContent name with
-    | none   => return none
-    | some h => return some (toStr h)
+    return ← listenerDetailApi (kind.drop "listeners/".length).toString
   if kind.startsWith "tasks/" then
-    let id := (kind.drop "tasks/".length).toString
-    match ← taskDetailContent id with
-    | none   => return none
-    | some h => return some (toStr h)
+    return ← taskDetailApi (kind.drop "tasks/".length).toString
   return none
 
-end -- HTML generation section
-
-/-- Encode a payload as a single SSE `message` event. Each `\n` in the payload
-    becomes a separate `data:` line per the SSE spec; the browser rejoins them
-    with `\n` in `event.data`. The frame is terminated by a blank line. -/
+/-- Encode a payload as a single SSE `message` event. -/
 private def sseFrame (payload : String) : String :=
   let lines := payload.splitOn "\n"
   (lines.map (fun l => "data: " ++ l) |> String.intercalate "\n") ++ "\n\n"
@@ -888,38 +864,40 @@ private def pathOnly (path : String) : String :=
   | p :: _ => p
   | _ => path
 
--- Route dispatch
+-- Route dispatch.
+-- `/`, `/queue`, ... return static Verso-rendered shells.
+-- `/api/...` return JSON view models.
+-- `/sse/...` is handled by `serveClient` before reaching this function.
 
 private def dispatch (req : HttpRequest) (pw : String) : IO HttpResponse := do
   if !checkBasicAuth req.headers pw then return unauthorizedResp
   if req.method != "GET" then return { status := 400, headers := #[], body := "Bad Request" }
   let path := pathOnly req.path
-  if path == "/" then return htmlResp (← overviewPage)
-  if path == "/queue" then return htmlResp (← queuePage)
-  if path == "/concerts" then return htmlResp (← concertsPage)
+  -- JSON API
+  if path.startsWith "/api/" then
+    let raw := (path.drop "/api/".length).toString
+    let kind := if raw.endsWith ".json" then (raw.take (raw.length - 5)).toString else raw
+    match ← renderApi kind with
+    | some j => return jsonResp j
+    | none   => return jsonResp (Json.mkObj [("error", "not found")]) 404
+  -- Static shells (JS fetches the matching /api/... after load)
+  if path == "/"          then return htmlResp overviewShell
+  if path == "/queue"     then return htmlResp queueShell
+  if path == "/concerts"  then return htmlResp concertsShell
   if path.startsWith "/concerts/" then
     let id := (path.drop "/concerts/".length).toString
-    match ← concertDetailPage id with
-    | some html => return htmlResp html
-    | none => return notFound s!"Concert not found: {id}"
-  if path == "/listeners" then return htmlResp (← listenersPage)
+    return htmlResp (concertDetailShell id)
+  if path == "/listeners" then return htmlResp listenersShell
   if path.startsWith "/listeners/" then
     let name := (path.drop "/listeners/".length).toString
-    match ← listenerDetailPage name with
-    | some html => return htmlResp html
-    | none => return notFound s!"Listener not found: {name}"
+    return htmlResp (listenerDetailShell name)
   if path == "/tasks" then
     match queryParam req.path "id" with
-    | some id =>
-      match ← taskDetailPage id with
-      | some html => return htmlResp html
-      | none => return notFound s!"Task not found: {id}"
-    | none => return htmlResp (← tasksPage)
+    | some id => return htmlResp (taskDetailShell id)
+    | none    => return htmlResp tasksShell
   if path.startsWith "/tasks/" then
-    let id := (path.drop 7).toString
-    match ← taskDetailPage id with
-    | some html => return htmlResp html
-    | none => return notFound s!"Task not found: {id}"
+    let id := (path.drop "/tasks/".length).toString
+    return htmlResp (taskDetailShell id)
   return notFound "Page not found."
 
 -- SSE streaming handler
@@ -935,12 +913,12 @@ private def sseHeader : String :=
 private def sseIntervalMs : UInt32 := 2000
 
 private partial def sseLoop (client : Socket) (kind : String) : IO Unit := do
-  let payloadOpt ← try renderFragment kind catch _ => pure none
-  match payloadOpt with
+  let jsonOpt ← try renderApi kind catch _ => pure none
+  match jsonOpt with
   | none => return -- unknown kind or vanished resource; close stream
-  | some payload =>
+  | some j =>
     let ok ← try
-      let _ ← awaitTcp (← client.send #[(sseFrame payload).toUTF8])
+      let _ ← awaitTcp (← client.send #[(sseFrame (Json.compress j)).toUTF8])
       pure true
     catch _ => pure false
     if !ok then return
