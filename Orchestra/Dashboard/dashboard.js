@@ -334,13 +334,37 @@
 
   // ---- boot + live updates ---------------------------------------------
 
+  // Snapshot the scroll position of every scrollable region (the task-detail
+  // log, prompt and per-event `<pre>` blocks) so a full innerHTML replace
+  // doesn't reset where the user is reading. If they were pinned to the
+  // bottom of the log, keep them pinned so new events follow.
+  function snapshotScrolls(root) {
+    const out = [];
+    root.querySelectorAll(".log, .lbody pre, .pre").forEach((el) => {
+      const atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 4;
+      out.push({ cls: el.className, top: el.scrollTop, atBottom });
+    });
+    return out;
+  }
+
+  function restoreScrolls(root, snap) {
+    const els = root.querySelectorAll(".log, .lbody pre, .pre");
+    els.forEach((el, i) => {
+      const s = snap[i];
+      if (!s || s.cls !== el.className) return;
+      el.scrollTop = s.atBottom ? el.scrollHeight : s.top;
+    });
+  }
+
   function render(target, page, data) {
     const fn = pages[page];
     if (!fn) {
       target.innerHTML = `<p class="empty">Unknown page: ${E(page)}</p>`;
       return;
     }
+    const snap = snapshotScrolls(target);
     target.innerHTML = fn(data);
+    restoreScrolls(target, snap);
   }
 
   function fetchAndRender(target, page, url) {
