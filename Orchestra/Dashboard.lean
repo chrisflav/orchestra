@@ -6,35 +6,31 @@ import Orchestra.Dirs
 import Orchestra.Queue
 import Orchestra.TaskStore
 import Orchestra.Listener
-import Verso.Output.Html
-import Verso.Doc.Html
-import Verso.Doc.Name
-import Orchestra.Dashboard.About
+import Orchestra.Dashboard.Site
 
 open Lean (Json ToJson)
 open Std.Net
 open Std.Internal.UV.TCP
-open Verso.Output (Html)
-open Verso.Doc (Genre Part)
 
 /-!
 # Orchestra Web Dashboard
 
 The dashboard is split into two independently-run pieces:
 
-  * **`generate`** writes a fully static website (HTML/CSS/JS) into a target
-    directory. The HTML page shells are authored with the verso `Html` DSL
-    (`Verso.Output.Html`); each `<main>` carries `data-*` attributes telling the
-    JS bundle which JSON endpoint to fetch and stream from. The generated files
-    can be served by any plain HTTP server — orchestra ships no front-end server.
+  * **`generate`** (in `Orchestra/Dashboard/Site.lean`) writes a fully static
+    website (HTML/CSS/JS) into a target directory. The pages are authored as
+    Verso `#doc (Page)` documents and emitted with Verso's Blog pipeline
+    (`blogMain`), like `leanprover/verso-website`. The generated files can be
+    served by any plain HTTP server — orchestra ships no front-end server.
 
-  * **`serve`** runs a minimal HTTP/1.1 server (bound to `127.0.0.1`) exposing
-    only the JSON API under `/api/...` and Server-Sent Event streams under
-    `/sse/...`, with permissive CORS so the separately-served static site can
-    fetch cross-origin. It serves no HTML.
+  * **`serve`** (this module) runs a minimal HTTP/1.1 server (bound to
+    `127.0.0.1`) exposing only the JSON API under `/api/...` and Server-Sent
+    Event streams under `/sse/...`, with permissive CORS so the separately-served
+    static site can fetch cross-origin. It serves no HTML.
 
-Adding a page = a verso shell (in `generate`) + a Lean `IO Json` builder + a JS
-renderer keyed on `data-page` (in `Dashboard/dashboard.js`).
+Adding a page = a verso `#doc (Page)` shell (in `Dashboard/Pages/`) wired into
+`versoSite` + a Lean `IO Json` builder (here) + a JS renderer keyed on
+`data-page` (in `Dashboard/dashboard.js`).
 -/
 
 namespace Orchestra.Dashboard
@@ -84,122 +80,9 @@ private def jsonResp (j : Json) (status : Nat := 200) : HttpResponse :=
     headers := #[("Content-Type", "application/json; charset=utf-8")] ++ corsHeaders
     body    := Json.compress j }
 
--- Pre-escape `&` in user-supplied strings before handing them to verso text
--- nodes. `Html.asString` escapes `<`/`>` but not `&`.
-private def esc (s : String) : String := s.replace "&" "&amp;"
-
--- Static HTML shell generation.
--- Open the verso `Html` DSL in a section.
-
-section
-open Verso.Output.Html
-
-private def loadingPlaceholder : Html := {{ <div class="loading"> "Loading…" </div> }}
-
-/-- The single layout shared by every generated page.
-
-    `apiBase` is the base URL of the JSON API backend (`dashboard serve`), baked
-    into every page. `endpoint` is the API/SSE kind the page's JS should fetch
-    (`"overview"`, `"queue"`, …); detail pages pass a prefix like `"tasks/"`
-    together with `param` (`"id"`/`"name"`), whose value the JS reads from the
-    page's query string and appends. Static pages (About) pass `endpoint = none`
-    and a server-side-rendered `content`. -/
-private def layout (apiBase title pageId : String) (endpoint param : Option String)
-    (activeNav : String) (content : Html := loadingPlaceholder) : Html :=
-  let epAttr    := endpoint.getD ""
-  let paramAttr := param.getD ""
-  let navItem (href label idTag : String) : Html :=
-    if idTag == activeNav then
-      {{ <a href=s!"{href}" class="active"> s!"{esc label}" </a> }}
-    else
-      {{ <a href=s!"{href}"> s!"{esc label}" </a> }}
-  {{ <html lang="en">
-    <head>
-      <meta charset="utf-8"/>
-      <meta name="viewport" content="width=device-width,initial-scale=1"/>
-      <title> s!"{esc title} — Orchestra" </title>
-      <link rel="stylesheet" href="dashboard.css"/>
-    </head>
-    <body>
-      <header>
-        <span class="logo"> "Orchestra" </span>
-        <nav>
-          {{ navItem "index.html"     "Overview"  "overview"  }}
-          {{ navItem "queue.html"     "Queue"     "queue"     }}
-          {{ navItem "concerts.html"  "Concerts"  "concerts"  }}
-          {{ navItem "listeners.html" "Listeners" "listeners" }}
-          {{ navItem "tasks.html"     "Tasks"     "tasks"     }}
-          {{ navItem "about.html"     "About"     "about"     }}
-        </nav>
-      </header>
-      <main data-page=s!"{pageId}" data-api-base=s!"{apiBase}"
-            data-endpoint=s!"{epAttr}" data-param=s!"{paramAttr}">
-        {{ content }}
-      </main>
-      <script src="dashboard.js"> "" </script>
-    </body>
-  </html> }}
-
--- Per-page verso shells. Each is a single `layout` call parameterised by the
--- JSON API base URL. List pages fetch `/api/<kind>`; detail pages append the
--- query-string value for `param` to the `<kind>/` prefix.
-
-private def overviewShell      (apiBase : String) : Html := layout apiBase "Overview"  "overview"        (some "overview")   none        "overview"
-private def queueShell         (apiBase : String) : Html := layout apiBase "Queue"     "queue"           (some "queue")      none        "queue"
-private def concertsShell      (apiBase : String) : Html := layout apiBase "Concerts"  "concerts"        (some "concerts")   none        "concerts"
-private def listenersShell     (apiBase : String) : Html := layout apiBase "Listeners" "listeners"       (some "listeners")  none        "listeners"
-private def tasksShell         (apiBase : String) : Html := layout apiBase "Tasks"     "tasks"           (some "tasks")      none        "tasks"
-private def taskDetailShell    (apiBase : String) : Html := layout apiBase "Task"      "task-detail"     (some "tasks/")     (some "id")   "tasks"
-private def concertDetailShell (apiBase : String) : Html := layout apiBase "Concert"   "concert-detail"  (some "concerts/")  (some "id")   "concerts"
-private def listenerDetailShell (apiBase : String) : Html := layout apiBase "Listener" "listener-detail" (some "listeners/") (some "name") "listeners"
-
--- About: prose authored as a verso document (`Orchestra/Dashboard/About.lean`)
--- and rendered to `Html` at generation time.
-
-private def renderVersoPart (p : Part Genre.none) : Html :=
-  let ctx : Verso.Doc.Html.HtmlT.Context Genre.none :=
-    { options         := {}
-      traverseContext := ()
-      traverseState   := ()
-      definitionIds   := {}
-      linkTargets     := {}
-      codeOptions     := {} }
-  let act : Verso.Doc.Html.HtmlT Genre.none Id Html :=
-    Verso.Doc.Html.ToHtml.toHtml p
-  ((act ctx).run {}).fst
-
-private def aboutContent : Html :=
-  {{ <div class="prose"> {{ renderVersoPart (%doc Orchestra.Dashboard.About) }} </div> }}
-
-private def aboutShell (apiBase : String) : Html :=
-  layout apiBase "About" "about" none none "about" (content := aboutContent)
-
-/-- Light theme stylesheet, written out by `generate`. -/
-private def dashCss : String := include_str "Dashboard/dashboard.css"
-
-/-- Front-end JS bundle, written out by `generate`. -/
-private def dashJs : String := include_str "Dashboard/dashboard.js"
-
-end -- section (HTML shell generation)
-
-/-- Generate the complete static dashboard site into `targetDir`. The generated
-    front-end fetches (and streams over SSE) from the JSON API at `apiBase` —
-    the base URL of a running `orchestra dashboard serve`. -/
-def generate (targetDir : System.FilePath) (apiBase : String) : IO Unit := do
-  IO.FS.createDirAll targetDir
-  let writeHtml (name : String) (h : Html) : IO Unit :=
-    IO.FS.writeFile (targetDir / name) (Html.doctype ++ Html.asString h)
-  writeHtml "index.html"     (overviewShell apiBase)
-  writeHtml "queue.html"     (queueShell apiBase)
-  writeHtml "concerts.html"  (concertsShell apiBase)
-  writeHtml "listeners.html" (listenersShell apiBase)
-  writeHtml "tasks.html"     (tasksShell apiBase)
-  writeHtml "task.html"      (taskDetailShell apiBase)
-  writeHtml "concert.html"   (concertDetailShell apiBase)
-  writeHtml "listener.html"  (listenerDetailShell apiBase)
-  writeHtml "about.html"     (aboutShell apiBase)
-  IO.FS.writeFile (targetDir / "dashboard.css") dashCss
-  IO.FS.writeFile (targetDir / "dashboard.js") dashJs
+-- The static-site generator (`generate`, the theme, the page shells) lives in
+-- `Orchestra/Dashboard/Site.lean`; this module contributes only the JSON API and
+-- SSE server below.
 
 -- View-model builders: each `/api/...` endpoint produces a `Json` value
 -- tailored for the corresponding page renderer in `dashboard.js`.

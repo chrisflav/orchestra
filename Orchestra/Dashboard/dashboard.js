@@ -1,8 +1,10 @@
 // Orchestra dashboard front-end.
 // Renders every dynamic page from JSON fetched from the corresponding /api/...
 // endpoint, then keeps it live by replacing the inner HTML on each SSE message.
-// The page kind, API URL and SSE URL are read from data-* attributes on <main>
-// emitted by the Verso shell.
+// The page kind and endpoint are read from data-* attributes on the shell
+// element (a wrapper div emitted by the Verso page). The JSON API base URL is
+// read from window.ORCHESTRA_API_BASE, injected into each page's <head> by the
+// Verso theme at generation time.
 
 (function () {
   "use strict";
@@ -150,7 +152,7 @@
     }</div>`;
     const qRows = d.activeQueue.map((e) => `
       <tr>
-        <td class="mono">${link("task.html?id=" +e.id, e.id)}</td>
+        <td class="mono">${link("task/?id=" +e.id, e.id)}</td>
         <td>${badge(e.status)}</td>
         <td class="m trunc">${E(e.fork)}</td>
         <td class="m">${E(e.createdAt)}</td>
@@ -162,7 +164,7 @@
       qRows, "No active tasks");
     const tRows = d.recentTasks.map((r) => `
       <tr>
-        <td class="mono">${link("task.html?id=" +r.id, r.id)}</td>
+        <td class="mono">${link("task/?id=" +r.id, r.id)}</td>
         <td>${badge(r.status)}</td>
         <td class="m trunc">${E(r.fork)}</td>
         <td class="m">${E(r.createdAt)}</td>
@@ -177,7 +179,7 @@
   pages.queue = (d) => {
     const cRows = d.concerts.map((r) => `
       <tr>
-        <td class="mono">${link("concert.html?id=" +r.id, r.id)}</td>
+        <td class="mono">${link("concert/?id=" +r.id, r.id)}</td>
         <td>${badge(r.status)}</td>
         <td class="m">${E(r.startedAt)}</td>
         <td class="m">${E(r.finishedAt || "")}</td>
@@ -188,7 +190,7 @@
       cRows, "No concerts");
     const eRows = d.entries.map((e) => `
       <tr>
-        <td class="mono">${link("task.html?id=" +e.id, e.id)}</td>
+        <td class="mono">${link("task/?id=" +e.id, e.id)}</td>
         <td>${badge(e.status)}</td>
         <td class="m trunc">${E(e.fork)}</td>
         <td class="m">${E(e.createdAt)}</td>
@@ -205,7 +207,7 @@
   pages.concerts = (d) => {
     const rows = d.concerts.map((r) => `
       <tr>
-        <td class="mono">${link("concert.html?id=" +r.id, r.id)}</td>
+        <td class="mono">${link("concert/?id=" +r.id, r.id)}</td>
         <td>${badge(r.status)}</td>
         <td class="m">${E(r.name || "")}</td>
         <td class="m trunc">${E(r.workflowFile || "")}</td>
@@ -231,7 +233,7 @@
     ]);
     const stepRows = d.steps.map((s) => `
       <tr>
-        <td class="mono">${link("task.html?id=" +s.id, s.id)}</td>
+        <td class="mono">${link("task/?id=" +s.id, s.id)}</td>
         <td>${badge(s.status)}</td>
         <td class="m trunc">${E(s.fork)}</td>
         <td class="m">${E(s.createdAt)}</td>
@@ -248,7 +250,7 @@
       const sb = `<span class="b ${l.enabled ? "bd" : "bc"}">${l.enabled ? "enabled" : "disabled"}</span>`;
       return `
         <tr>
-          <td>${link("listener.html?name=" +l.name, l.name)}</td>
+          <td>${link("listener/?name=" +l.name, l.name)}</td>
           <td>${sb}</td>
           <td class="m">${E(l.sourceType)}</td>
           <td class="m">${E(l.intervalSeconds)}s</td>
@@ -303,7 +305,7 @@
   pages.tasks = (d) => {
     const rows = d.tasks.map((r) => `
       <tr>
-        <td class="mono">${link("task.html?id=" +r.id, r.id)}</td>
+        <td class="mono">${link("task/?id=" +r.id, r.id)}</td>
         <td>${badge(r.status)}</td>
         <td class="m trunc">${E(r.fork)}</td>
         <td class="m">${E(r.createdAt)}</td>
@@ -418,18 +420,19 @@
     window.addEventListener("beforeunload", () => es.close());
   }
 
-  // Build the absolute API/SSE URLs for this page from the static shell's
-  // data-* attributes:
-  //   data-api-base   base URL of the JSON API backend (from `dashboard serve`)
+  // Build the absolute API/SSE URLs for this page. The JSON API base comes from
+  // window.ORCHESTRA_API_BASE (injected by the Verso theme). The rest come from
+  // the shell wrapper's data-* attributes:
+  //   data-page       renderer key, e.g. "overview" or "task-detail"
   //   data-endpoint   endpoint kind, e.g. "overview" or "tasks/" for details
   //   data-param      query-string key ("id"/"name") whose value is appended
-  //                   to data-endpoint for detail pages (task.html?id=…)
+  //                   to data-endpoint for detail pages (task/?id=…)
   // Pages without a data-endpoint (e.g. the static About page) are left alone.
   document.addEventListener("DOMContentLoaded", () => {
-    const main = document.querySelector("main[data-page]");
+    const main = document.querySelector("[data-page]");
     if (!main) return;
     const page = main.dataset.page;
-    const base = (main.dataset.apiBase || "").replace(/\/+$/, "");
+    const base = String(window.ORCHESTRA_API_BASE || "").replace(/\/+$/, "");
     let endpoint = main.dataset.endpoint || "";
     const param = main.dataset.param || "";
     if (!endpoint) return; // static page, nothing to fetch

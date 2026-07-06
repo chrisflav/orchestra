@@ -1,0 +1,124 @@
+import VersoBlog
+import Lean.Data.Json
+import Orchestra.Dashboard.Pages.Overview
+import Orchestra.Dashboard.Pages.Queue
+import Orchestra.Dashboard.Pages.Concerts
+import Orchestra.Dashboard.Pages.Listeners
+import Orchestra.Dashboard.Pages.Tasks
+import Orchestra.Dashboard.Pages.TaskDetail
+import Orchestra.Dashboard.Pages.ConcertDetail
+import Orchestra.Dashboard.Pages.ListenerDetail
+import Orchestra.Dashboard.Pages.About
+
+/-!
+# Static dashboard site
+
+The dashboard's static pages are authored as Verso `#doc (Page)` documents
+(`Orchestra/Dashboard/Pages/*.lean`), assembled into a `Site` tree and emitted
+with Verso's Blog pipeline (`blogMain`) — the same approach as
+[`leanprover/verso-website`](https://github.com/leanprover/verso-website).
+
+The shared page chrome (header/nav, `<main>`, asset links) lives in the theme's
+`primaryTemplate`. The runtime `--api-url` value is threaded through by making the
+theme a function of `apiBase`, whose closure bakes `window.ORCHESTRA_API_BASE`
+into every page's `<head>`; `dashboard.js` reads it to build the `/api/…` and
+`/sse/…` URLs.
+
+Static assets (`dashboard.css`/`dashboard.js`) are embedded in the binary with
+`include_str` and written out after `blogMain`, so the installed `orchestra`
+executable is self-contained (Verso's `static … ← path` would instead copy from
+disk at run time, which is unavailable for an installed binary).
+-/
+
+namespace Orchestra.Dashboard
+
+open Verso Genre Blog Site Syntax
+
+open Output Html in
+/-- A single navigation link; `active` is the currently-selected nav group. -/
+private def navItem (active href label key : String) : Html :=
+  if key == active then
+    {{ <a href=s!"{href}" class="active"> s!"{label}" </a> }}
+  else
+    {{ <a href=s!"{href}"> s!"{label}" </a> }}
+
+open Output Html Template Theme in
+/-- The single layout shared by every generated page. `apiBase` is the base URL of
+    the JSON API backend (`dashboard serve`), baked into every page. -/
+def theme (apiBase : String) : Theme := { Theme.default with
+  primaryTemplate := do
+    -- Relative path back to the site root, so root-level assets resolve from
+    -- nested page directories (e.g. `queue/index.html`). Mirrors `builtinHeader`.
+    let path ← currentPath
+    let siteRoot := String.join (path.toList.map (fun _ => "../")) ++ "./"
+    -- The active nav group; detail pages highlight their parent list.
+    let active :=
+      match path[0]? with
+      | none            => "overview"
+      | some "task"     => "tasks"
+      | some "concert"  => "concerts"
+      | some "listener" => "listeners"
+      | some s          => s
+    let pageTitle ← param (α := String) "title"
+    let apiBaseJs := s!"window.ORCHESTRA_API_BASE = {(Lean.Json.str apiBase).compress};"
+    return {{
+      <html lang="en">
+        <head>
+          <meta charset="utf-8"/>
+          <meta name="viewport" content="width=device-width,initial-scale=1"/>
+          <base href=s!"{siteRoot}"/>
+          <title> s!"{pageTitle} — Orchestra" </title>
+          <link rel="stylesheet" href="dashboard.css"/>
+          <script> {{ Html.text false apiBaseJs }} </script>
+        </head>
+        <body>
+          <header>
+            <span class="logo"> "Orchestra" </span>
+            <nav>
+              {{ navItem active "."          "Overview"  "overview"  }}
+              {{ navItem active "queue/"     "Queue"     "queue"     }}
+              {{ navItem active "concerts/"  "Concerts"  "concerts"  }}
+              {{ navItem active "listeners/" "Listeners" "listeners" }}
+              {{ navItem active "tasks/"     "Tasks"     "tasks"     }}
+              {{ navItem active "about/"     "About"     "about"     }}
+            </nav>
+          </header>
+          <main>
+            {{ ← param "content" }}
+          </main>
+          <script src="dashboard.js"> "" </script>
+        </body>
+      </html>
+    }}
+  -- Emit the page content directly, without the default `<article><h1>` wrapper.
+  pageTemplate := do return (← param "content") }
+
+/-- The site's URL structure. The Overview document is the root (`index.html`);
+    every other page is a named subdirectory (`queue/index.html`, …). -/
+def versoSite : Site :=
+  site Orchestra.Dashboard.Pages.Overview /
+    "queue"     Orchestra.Dashboard.Pages.Queue
+    "concerts"  Orchestra.Dashboard.Pages.Concerts
+    "listeners" Orchestra.Dashboard.Pages.Listeners
+    "tasks"     Orchestra.Dashboard.Pages.Tasks
+    "task"      Orchestra.Dashboard.Pages.TaskDetail
+    "concert"   Orchestra.Dashboard.Pages.ConcertDetail
+    "listener"  Orchestra.Dashboard.Pages.ListenerDetail
+    "about"     Orchestra.Dashboard.Pages.About
+
+/-- Light theme stylesheet, written out by `generate`. -/
+def dashCss : String := include_str "dashboard.css"
+
+/-- Front-end JS bundle, written out by `generate`. -/
+def dashJs : String := include_str "dashboard.js"
+
+/-- Generate the complete static dashboard site into `targetDir`. The generated
+    front-end fetches (and streams over SSE) from the JSON API at `apiBase` — the
+    base URL of a running `orchestra dashboard serve`. -/
+def generate (targetDir : System.FilePath) (apiBase : String) : IO Unit := do
+  IO.FS.createDirAll targetDir
+  let _ ← blogMain (theme apiBase) versoSite (options := ["--output", targetDir.toString])
+  IO.FS.writeFile (targetDir / "dashboard.css") dashCss
+  IO.FS.writeFile (targetDir / "dashboard.js") dashJs
+
+end Orchestra.Dashboard
