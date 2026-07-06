@@ -150,7 +150,7 @@
     }</div>`;
     const qRows = d.activeQueue.map((e) => `
       <tr>
-        <td class="mono">${link("/tasks/" + e.id, e.id)}</td>
+        <td class="mono">${link("task.html?id=" +e.id, e.id)}</td>
         <td>${badge(e.status)}</td>
         <td class="m trunc">${E(e.fork)}</td>
         <td class="m">${E(e.createdAt)}</td>
@@ -162,7 +162,7 @@
       qRows, "No active tasks");
     const tRows = d.recentTasks.map((r) => `
       <tr>
-        <td class="mono">${link("/tasks/" + r.id, r.id)}</td>
+        <td class="mono">${link("task.html?id=" +r.id, r.id)}</td>
         <td>${badge(r.status)}</td>
         <td class="m trunc">${E(r.fork)}</td>
         <td class="m">${E(r.createdAt)}</td>
@@ -177,7 +177,7 @@
   pages.queue = (d) => {
     const cRows = d.concerts.map((r) => `
       <tr>
-        <td class="mono">${link("/concerts/" + r.id, r.id)}</td>
+        <td class="mono">${link("concert.html?id=" +r.id, r.id)}</td>
         <td>${badge(r.status)}</td>
         <td class="m">${E(r.startedAt)}</td>
         <td class="m">${E(r.finishedAt || "")}</td>
@@ -188,7 +188,7 @@
       cRows, "No concerts");
     const eRows = d.entries.map((e) => `
       <tr>
-        <td class="mono">${link("/tasks/" + e.id, e.id)}</td>
+        <td class="mono">${link("task.html?id=" +e.id, e.id)}</td>
         <td>${badge(e.status)}</td>
         <td class="m trunc">${E(e.fork)}</td>
         <td class="m">${E(e.createdAt)}</td>
@@ -205,7 +205,7 @@
   pages.concerts = (d) => {
     const rows = d.concerts.map((r) => `
       <tr>
-        <td class="mono">${link("/concerts/" + r.id, r.id)}</td>
+        <td class="mono">${link("concert.html?id=" +r.id, r.id)}</td>
         <td>${badge(r.status)}</td>
         <td class="m">${E(r.name || "")}</td>
         <td class="m trunc">${E(r.workflowFile || "")}</td>
@@ -231,7 +231,7 @@
     ]);
     const stepRows = d.steps.map((s) => `
       <tr>
-        <td class="mono">${link("/tasks/" + s.id, s.id)}</td>
+        <td class="mono">${link("task.html?id=" +s.id, s.id)}</td>
         <td>${badge(s.status)}</td>
         <td class="m trunc">${E(s.fork)}</td>
         <td class="m">${E(s.createdAt)}</td>
@@ -248,7 +248,7 @@
       const sb = `<span class="b ${l.enabled ? "bd" : "bc"}">${l.enabled ? "enabled" : "disabled"}</span>`;
       return `
         <tr>
-          <td>${link("/listeners/" + l.name, l.name)}</td>
+          <td>${link("listener.html?name=" +l.name, l.name)}</td>
           <td>${sb}</td>
           <td class="m">${E(l.sourceType)}</td>
           <td class="m">${E(l.intervalSeconds)}s</td>
@@ -303,7 +303,7 @@
   pages.tasks = (d) => {
     const rows = d.tasks.map((r) => `
       <tr>
-        <td class="mono">${link("/tasks/" + r.id, r.id)}</td>
+        <td class="mono">${link("task.html?id=" +r.id, r.id)}</td>
         <td>${badge(r.status)}</td>
         <td class="m trunc">${E(r.fork)}</td>
         <td class="m">${E(r.createdAt)}</td>
@@ -418,15 +418,31 @@
     window.addEventListener("beforeunload", () => es.close());
   }
 
+  // Build the absolute API/SSE URLs for this page from the static shell's
+  // data-* attributes:
+  //   data-api-base   base URL of the JSON API backend (from `dashboard serve`)
+  //   data-endpoint   endpoint kind, e.g. "overview" or "tasks/" for details
+  //   data-param      query-string key ("id"/"name") whose value is appended
+  //                   to data-endpoint for detail pages (task.html?id=…)
+  // Pages without a data-endpoint (e.g. the static About page) are left alone.
   document.addEventListener("DOMContentLoaded", () => {
     const main = document.querySelector("main[data-page]");
     if (!main) return;
     const page = main.dataset.page;
-    const api  = main.dataset.api;
-    const sse  = main.dataset.sse;
-    if (!api) return;
-    fetchAndRender(main, page, api).then(() => {
-      if (sse) subscribeSse(main, page, sse);
-    });
+    const base = (main.dataset.apiBase || "").replace(/\/+$/, "");
+    let endpoint = main.dataset.endpoint || "";
+    const param = main.dataset.param || "";
+    if (!endpoint) return; // static page, nothing to fetch
+    if (param) {
+      const v = new URLSearchParams(location.search).get(param);
+      if (!v) {
+        main.innerHTML = `<p class="empty">Missing ?${E(param)}= parameter.</p>`;
+        return;
+      }
+      endpoint += encodeURIComponent(v);
+    }
+    const api = base + "/api/" + endpoint;
+    const sse = base + "/sse/" + endpoint;
+    fetchAndRender(main, page, api).then(() => subscribeSse(main, page, sse));
   });
 })();

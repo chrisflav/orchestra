@@ -33,7 +33,9 @@ up as its own queue entry with a back-reference to the parent run.
 
 # Live updates
 
-This dashboard renders the static page chrome on the server using Verso and
-then fetches the page data as JSON from `/api/...` endpoints. The same JSON is
-streamed over Server-Sent Events at `/sse/...` every two seconds so the page
-stays current without a full reload.
+This dashboard is a fully static website — its page chrome is generated ahead of
+time with Verso (`orchestra dashboard generate`) and can be served by any HTTP
+server. Each page fetches its data as JSON from the `/api/...` endpoints of the
+backend started with `orchestra dashboard serve`. The same JSON is streamed over
+Server-Sent Events at `/sse/...` every two seconds so the page stays current
+without a full reload.

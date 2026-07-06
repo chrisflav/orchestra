@@ -1186,26 +1186,57 @@ private def migrateCmd : Cmd := `[Cli|
   "Migrate configuration and state from ~/.agent/ to XDG directories (~/.config/orchestra/ and ~/.local/share/orchestra/)."
 ]
 
-private def dashboardHandler (p : Parsed) : IO UInt32 := do
-  let port     := p.flag? "port"     |>.map (·.as! Nat) |>.getD 8080
-  let password := p.flag? "password" |>.map (·.as! String) |>.getD ""
-  if password.isEmpty then
-    IO.eprintln "Error: --password is required to protect the dashboard"
-    return 1
-  let (boundPort, _shutdown) ← Dashboard.start password port.toUInt16
-  IO.println s!"Orchestra dashboard listening on http://localhost:{boundPort}"
-  IO.println s!"Username: any  Password: (as provided)"
+private def dashboardGenerateHandler (p : Parsed) : IO UInt32 := do
+  let dir     := p.positionalArg! "dir" |>.as! String
+  let apiBase := p.flag? "api-url" |>.map (·.as! String) |>.getD "http://localhost:8080"
+  Dashboard.generate dir apiBase
+  IO.println s!"Generated static dashboard site in '{dir}' (API base: {apiBase})."
+  IO.println "Serve it with any static HTTP server, e.g.:"
+  IO.println s!"  python3 -m http.server -d {dir} 8000"
+  IO.println "Then start the JSON API backend with: orchestra dashboard serve"
+  return 0
+
+private def dashboardGenerateCmd : Cmd := `[Cli|
+  generate VIA dashboardGenerateHandler; ["0.1.0"]
+  "Generate the static dashboard site (HTML/CSS/JS) into a target directory."
+
+  FLAGS:
+    a, "api-url" : String; "Base URL of the JSON API the site talks to (default: http://localhost:8080)"
+
+  ARGS:
+    dir : String; "Target directory for the generated site"
+]
+
+private def dashboardServeHandler (p : Parsed) : IO UInt32 := do
+  let port := p.flag? "port" |>.map (·.as! Nat) |>.getD 8080
+  let (boundPort, _shutdown) ← Dashboard.serve port.toUInt16
+  IO.println s!"Orchestra dashboard JSON API + SSE listening on http://127.0.0.1:{boundPort}"
+  IO.println "Serve the generated static site separately (e.g. python3 -m http.server)."
   repeat do
     IO.sleep 60000
   return 0
 
-private def dashboardCmd : Cmd := `[Cli|
-  dashboard VIA dashboardHandler; ["0.1.0"]
-  "Start the web dashboard server (password-protected)."
+private def dashboardServeCmd : Cmd := `[Cli|
+  serve VIA dashboardServeHandler; ["0.1.0"]
+  "Start the dashboard JSON API + SSE backend (bound to 127.0.0.1)."
 
   FLAGS:
-    p, port     : Nat;    "Port to listen on (default: 8080)"
-    w, password : String; "Password for HTTP Basic Auth (required)"
+    p, port : Nat; "Port to listen on (default: 8080)"
+]
+
+private def dashboardDefaultHandler (_ : Parsed) : IO UInt32 := do
+  IO.println "Usage: orchestra dashboard <generate|serve>"
+  IO.println "  generate <dir>   Generate the static dashboard site into <dir>."
+  IO.println "  serve            Start the JSON API + SSE backend the site talks to."
+  return 0
+
+private def dashboardCmd : Cmd := `[Cli|
+  dashboard VIA dashboardDefaultHandler; ["0.1.0"]
+  "Generate the static web dashboard and run its JSON API backend."
+
+  SUBCOMMANDS:
+    dashboardGenerateCmd;
+    dashboardServeCmd
 ]
 
 -- All optional tool permission tokens recognised by --tools.

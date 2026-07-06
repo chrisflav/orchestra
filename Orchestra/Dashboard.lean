@@ -20,21 +20,21 @@ open Verso.Doc (Genre Part)
 /-!
 # Orchestra Web Dashboard
 
-A minimal HTTP/1.1 server that serves a password-protected web dashboard.
+The dashboard is split into two independently-run pieces:
 
-The Lean server is responsible for:
-  * Generating the *static* per-page HTML shell using the verso `Html` DSL
-    (`Verso.Output.Html`). The shell carries the chrome (header, nav, CSS) and
-    a single `<main>` element annotated with `data-page` / `data-api` /
-    `data-sse` attributes.
-  * Exposing JSON endpoints under `/api/...` that return view models for each
-    page.
-  * Pushing the same JSON view models to the browser over Server-Sent Events
-    under `/sse/...` so the dashboard stays live.
+  * **`generate`** writes a fully static website (HTML/CSS/JS) into a target
+    directory. The HTML page shells are authored with the verso `Html` DSL
+    (`Verso.Output.Html`); each `<main>` carries `data-*` attributes telling the
+    JS bundle which JSON endpoint to fetch and stream from. The generated files
+    can be served by any plain HTTP server — orchestra ships no front-end server.
 
-All rendering of dynamic content (tables, badges, log rows) happens in the
-embedded JavaScript bundle below. Adding a page = a Verso shell function +
-a Lean `IO Json` builder + a JS renderer keyed on `data-page`.
+  * **`serve`** runs a minimal HTTP/1.1 server (bound to `127.0.0.1`) exposing
+    only the JSON API under `/api/...` and Server-Sent Event streams under
+    `/sse/...`, with permissive CORS so the separately-served static site can
+    fetch cross-origin. It serves no HTML.
+
+Adding a page = a verso shell (in `generate`) + a Lean `IO Json` builder + a JS
+renderer keyed on `data-page` (in `Dashboard/dashboard.js`).
 -/
 
 namespace Orchestra.Dashboard
@@ -61,12 +61,17 @@ private structure HttpResponse where
   body    : String
 
 private def statusText : Nat → String
-  | 200 => "OK"
-  | 301 => "Moved Permanently"
-  | 400 => "Bad Request"
-  | 401 => "Unauthorized"
-  | 404 => "Not Found"
+  | 200 => "OK"           | 204 => "No Content"
+  | 400 => "Bad Request"  | 404 => "Not Found"
+  | 405 => "Method Not Allowed"
   | n   => s!"Status {n}"
+
+/-- Permissive CORS headers so a separately-served static front-end can call the
+    API/SSE endpoints from another origin. -/
+private def corsHeaders : Array (String × String) :=
+  #[("Access-Control-Allow-Origin", "*"),
+    ("Access-Control-Allow-Methods", "GET, OPTIONS"),
+    ("Access-Control-Allow-Headers", "Content-Type")]
 
 private def httpResponse (resp : HttpResponse) : String :=
   let statusLine := s!"HTTP/1.1 {resp.status} {statusText resp.status}\r\n"
@@ -74,98 +79,35 @@ private def httpResponse (resp : HttpResponse) : String :=
   let hdrs := resp.headers.map (fun (k, v) => s!"{k}: {v}\r\n") |>.toList
   statusLine ++ String.join hdrs ++ contentLen ++ "Connection: close\r\n\r\n" ++ resp.body
 
-private def htmlResp (html : Html) (status : Nat := 200) : HttpResponse :=
-  { status
-    headers := #[("Content-Type", "text/html; charset=utf-8")]
-    body    := Html.doctype ++ Html.asString html }
-
 private def jsonResp (j : Json) (status : Nat := 200) : HttpResponse :=
   { status
-    headers := #[("Content-Type", "application/json; charset=utf-8")]
+    headers := #[("Content-Type", "application/json; charset=utf-8")] ++ corsHeaders
     body    := Json.compress j }
 
--- Base64 decode (uses <<< / >>> operators; keep outside the verso DSL open)
-
-private def b64Val (c : Char) : Option UInt8 :=
-  let n := c.toNat
-  if 'A'.toNat ≤ n && n ≤ 'Z'.toNat then some (n - 'A'.toNat).toUInt8
-  else if 'a'.toNat ≤ n && n ≤ 'z'.toNat then some (n - 'a'.toNat + 26).toUInt8
-  else if '0'.toNat ≤ n && n ≤ '9'.toNat then some (n - '0'.toNat + 52).toUInt8
-  else if c == '+' then some 62
-  else if c == '/' then some 63
-  else none
-
-private partial def decodeBase64 (s : String) : Option String := do
-  let chars := s.toList.filter (· != '=')
-  let rec go : List Char → List UInt8 → Option (List UInt8)
-    | [], acc => some acc
-    | [a], acc => do
-        let va ← b64Val a
-        some (acc ++ [va <<< 2])
-    | [a, b], acc => do
-        let va ← b64Val a; let vb ← b64Val b
-        some (acc ++ [(va <<< 2) ||| (vb >>> 4)])
-    | [a, b, c], acc => do
-        let va ← b64Val a; let vb ← b64Val b; let vc ← b64Val c
-        some (acc ++ [(va <<< 2) ||| (vb >>> 4), (vb <<< 4) ||| (vc >>> 2)])
-    | a :: b :: c :: d :: rest, acc => do
-        let va ← b64Val a; let vb ← b64Val b; let vc ← b64Val c; let vd ← b64Val d
-        go rest (acc ++ [(va <<< 2) ||| (vb >>> 4),
-                         (vb <<< 4) ||| (vc >>> 2),
-                         (vc <<< 6) ||| vd])
-  let bytes ← go chars []
-  some (String.fromUTF8! ⟨bytes.toArray⟩)
-
-private def checkBasicAuth (hdrs : Array (String × String)) (password : String) : Bool :=
-  match hdrs.find? (fun (k, _) => k.toLower == "authorization") with
-  | none => false
-  | some (_, v) =>
-    if !v.startsWith "Basic " then false
-    else match decodeBase64 ((v.drop 6).toString) with
-      | none => false
-      | some decoded =>
-        match decoded.splitOn ":" with
-        | _ :: rest => String.intercalate ":" rest == password
-        | _ => false
-
+-- Pre-escape `&` in user-supplied strings before handing them to verso text
+-- nodes. `Html.asString` escapes `<`/`>` but not `&`.
 private def esc (s : String) : String := s.replace "&" "&amp;"
 
--- HTML shell generation
--- Open the verso `Html` DSL in a section so the `<<<` / `>>>` attribute syntax
--- does not shadow the bit-shift operators used in `decodeBase64` above.
+-- Static HTML shell generation.
+-- Open the verso `Html` DSL in a section.
 
 section
 open Verso.Output.Html
 
-private def notFound (msg : String) : HttpResponse :=
-  htmlResp ({{ <html><body><h1>"Not Found"</h1><p> s!"{esc msg}" </p></body></html> }}) 404
-
-private def unauthorizedResp : HttpResponse :=
-  let base := htmlResp {{ <html><body><h1>"401 Unauthorized"</h1></body></html> }} 401
-  { base with headers := base.headers.push ("WWW-Authenticate", "Basic realm=\"Orchestra Dashboard\"") }
-
-/-- Light theme stylesheet, served inline by the layout. -/
-private def dashCss : String := include_str "Dashboard/dashboard.css"
-
-/-- Frontend JS bundle, served inline by the layout. Boots from the
-    `data-page` / `data-api` / `data-sse` attributes on `<main>`: fetches the
-    initial JSON state, paints it, then subscribes to the SSE stream for
-    live updates. -/
-private def dashJs : String := include_str "Dashboard/dashboard.js"
-
 private def loadingPlaceholder : Html := {{ <div class="loading"> "Loading…" </div> }}
 
-/-- The single layout shared by every page. Dynamic pages pass a `pageId`,
-    API URL and SSE URL — the embedded JS bundle reads them from the `<main>`
-    `data-*` attributes and renders the page on the client. Static pages
-    (e.g. the Verso-rendered About prose) pass `api = none` / `sse = none`
-    and a server-side-rendered `content`; the JS bundle bails out because
-    `data-api` is empty. -/
-private def layout (title : String) (pageId : String) (api : Option String)
-    (sse : Option String) (activeNav : String)
-    (content : Html := loadingPlaceholder) : Html :=
-  let apiAttr := api.getD ""
-  let sseAttr := sse.getD ""
+/-- The single layout shared by every generated page.
+
+    `apiBase` is the base URL of the JSON API backend (`dashboard serve`), baked
+    into every page. `endpoint` is the API/SSE kind the page's JS should fetch
+    (`"overview"`, `"queue"`, …); detail pages pass a prefix like `"tasks/"`
+    together with `param` (`"id"`/`"name"`), whose value the JS reads from the
+    page's query string and appends. Static pages (About) pass `endpoint = none`
+    and a server-side-rendered `content`. -/
+private def layout (apiBase title pageId : String) (endpoint param : Option String)
+    (activeNav : String) (content : Html := loadingPlaceholder) : Html :=
+  let epAttr    := endpoint.getD ""
+  let paramAttr := param.getD ""
   let navItem (href label idTag : String) : Html :=
     if idTag == activeNav then
       {{ <a href=s!"{href}" class="active"> s!"{esc label}" </a> }}
@@ -176,58 +118,43 @@ private def layout (title : String) (pageId : String) (api : Option String)
       <meta charset="utf-8"/>
       <meta name="viewport" content="width=device-width,initial-scale=1"/>
       <title> s!"{esc title} — Orchestra" </title>
-      <style> {{ Html.text false dashCss }} </style>
+      <link rel="stylesheet" href="dashboard.css"/>
     </head>
     <body>
       <header>
         <span class="logo"> "Orchestra" </span>
         <nav>
-          {{ navItem "/"          "Overview"  "overview"  }}
-          {{ navItem "/queue"     "Queue"     "queue"     }}
-          {{ navItem "/concerts"  "Concerts"  "concerts"  }}
-          {{ navItem "/listeners" "Listeners" "listeners" }}
-          {{ navItem "/tasks"     "Tasks"     "tasks"     }}
-          {{ navItem "/about"     "About"     "about"     }}
+          {{ navItem "index.html"     "Overview"  "overview"  }}
+          {{ navItem "queue.html"     "Queue"     "queue"     }}
+          {{ navItem "concerts.html"  "Concerts"  "concerts"  }}
+          {{ navItem "listeners.html" "Listeners" "listeners" }}
+          {{ navItem "tasks.html"     "Tasks"     "tasks"     }}
+          {{ navItem "about.html"     "About"     "about"     }}
         </nav>
       </header>
-      <main data-page=s!"{pageId}" data-api=s!"{apiAttr}" data-sse=s!"{sseAttr}">
+      <main data-page=s!"{pageId}" data-api-base=s!"{apiBase}"
+            data-endpoint=s!"{epAttr}" data-param=s!"{paramAttr}">
         {{ content }}
       </main>
-      <script> {{ Html.text false dashJs }} </script>
+      <script src="dashboard.js"> "" </script>
     </body>
   </html> }}
 
--- Per-page Verso shells. Each is a single `layout` call.
+-- Per-page verso shells. Each is a single `layout` call parameterised by the
+-- JSON API base URL. List pages fetch `/api/<kind>`; detail pages append the
+-- query-string value for `param` to the `<kind>/` prefix.
 
-private def overviewShell : Html :=
-  layout "Overview" "overview" (some "/api/overview") (some "/sse/overview") "overview"
+private def overviewShell      (apiBase : String) : Html := layout apiBase "Overview"  "overview"        (some "overview")   none        "overview"
+private def queueShell         (apiBase : String) : Html := layout apiBase "Queue"     "queue"           (some "queue")      none        "queue"
+private def concertsShell      (apiBase : String) : Html := layout apiBase "Concerts"  "concerts"        (some "concerts")   none        "concerts"
+private def listenersShell     (apiBase : String) : Html := layout apiBase "Listeners" "listeners"       (some "listeners")  none        "listeners"
+private def tasksShell         (apiBase : String) : Html := layout apiBase "Tasks"     "tasks"           (some "tasks")      none        "tasks"
+private def taskDetailShell    (apiBase : String) : Html := layout apiBase "Task"      "task-detail"     (some "tasks/")     (some "id")   "tasks"
+private def concertDetailShell (apiBase : String) : Html := layout apiBase "Concert"   "concert-detail"  (some "concerts/")  (some "id")   "concerts"
+private def listenerDetailShell (apiBase : String) : Html := layout apiBase "Listener" "listener-detail" (some "listeners/") (some "name") "listeners"
 
-private def queueShell : Html :=
-  layout "Queue" "queue" (some "/api/queue") (some "/sse/queue") "queue"
-
-private def concertsShell : Html :=
-  layout "Concerts" "concerts" (some "/api/concerts") (some "/sse/concerts") "concerts"
-
-private def concertDetailShell (id : String) : Html :=
-  layout s!"Concert {id}" "concert-detail"
-    (some s!"/api/concerts/{id}") (some s!"/sse/concerts/{id}") "concerts"
-
-private def listenersShell : Html :=
-  layout "Listeners" "listeners" (some "/api/listeners") (some "/sse/listeners") "listeners"
-
-private def listenerDetailShell (name : String) : Html :=
-  layout s!"Listener {name}" "listener-detail"
-    (some s!"/api/listeners/{name}") (some s!"/sse/listeners/{name}") "listeners"
-
-private def tasksShell : Html :=
-  layout "Tasks" "tasks" (some "/api/tasks") (some "/sse/tasks") "tasks"
-
-private def taskDetailShell (id : String) : Html :=
-  layout s!"Task {id}" "task-detail"
-    (some s!"/api/tasks/{id}") (some s!"/sse/tasks/{id}") "tasks"
-
--- About: prose authored as a Verso document (`Orchestra/Dashboard/About.lean`)
--- and rendered to `Html` at request time using `Verso.Doc.Html.Part.toHtml`.
+-- About: prose authored as a verso document (`Orchestra/Dashboard/About.lean`)
+-- and rendered to `Html` at generation time.
 
 private def renderVersoPart (p : Part Genre.none) : Html :=
   let ctx : Verso.Doc.Html.HtmlT.Context Genre.none :=
@@ -244,13 +171,38 @@ private def renderVersoPart (p : Part Genre.none) : Html :=
 private def aboutContent : Html :=
   {{ <div class="prose"> {{ renderVersoPart (%doc Orchestra.Dashboard.About) }} </div> }}
 
-private def aboutShell : Html :=
-  layout "About" "about" none none "about" (content := aboutContent)
+private def aboutShell (apiBase : String) : Html :=
+  layout apiBase "About" "about" none none "about" (content := aboutContent)
+
+/-- Light theme stylesheet, written out by `generate`. -/
+private def dashCss : String := include_str "Dashboard/dashboard.css"
+
+/-- Front-end JS bundle, written out by `generate`. -/
+private def dashJs : String := include_str "Dashboard/dashboard.js"
 
 end -- section (HTML shell generation)
 
+/-- Generate the complete static dashboard site into `targetDir`. The generated
+    front-end fetches (and streams over SSE) from the JSON API at `apiBase` —
+    the base URL of a running `orchestra dashboard serve`. -/
+def generate (targetDir : System.FilePath) (apiBase : String) : IO Unit := do
+  IO.FS.createDirAll targetDir
+  let writeHtml (name : String) (h : Html) : IO Unit :=
+    IO.FS.writeFile (targetDir / name) (Html.doctype ++ Html.asString h)
+  writeHtml "index.html"     (overviewShell apiBase)
+  writeHtml "queue.html"     (queueShell apiBase)
+  writeHtml "concerts.html"  (concertsShell apiBase)
+  writeHtml "listeners.html" (listenersShell apiBase)
+  writeHtml "tasks.html"     (tasksShell apiBase)
+  writeHtml "task.html"      (taskDetailShell apiBase)
+  writeHtml "concert.html"   (concertDetailShell apiBase)
+  writeHtml "listener.html"  (listenerDetailShell apiBase)
+  writeHtml "about.html"     (aboutShell apiBase)
+  IO.FS.writeFile (targetDir / "dashboard.css") dashCss
+  IO.FS.writeFile (targetDir / "dashboard.js") dashJs
+
 -- View-model builders: each `/api/...` endpoint produces a `Json` value
--- tailored for the corresponding page renderer in `dashJs`.
+-- tailored for the corresponding page renderer in `dashboard.js`.
 
 private def qStText : Queue.QueueStatus → String
   | .pending    => "pending"   | .running    => "running"
@@ -518,53 +470,32 @@ private def parseRequest (raw : String) : Option HttpRequest :=
       some { method, path, headers, body }
     | _ => none
 
-private def queryParam (path key : String) : Option String :=
-  match path.splitOn "?" with
-  | [_, q] => q.splitOn "&" |>.findSome? fun p =>
-      if p.startsWith (key ++ "=") then some ((p.drop (key.length + 1)).toString) else none
-  | _ => none
-
 private def pathOnly (path : String) : String :=
   match path.splitOn "?" with
   | p :: _ => p
   | _ => path
 
--- Route dispatch.
--- `/`, `/queue`, ... return static Verso-rendered shells.
--- `/api/...` return JSON view models.
--- `/sse/...` is handled by `serveClient` before reaching this function.
-
-private def dispatch (req : HttpRequest) (pw : String) : IO HttpResponse := do
-  if !checkBasicAuth req.headers pw then return unauthorizedResp
-  if req.method != "GET" then return { status := 400, headers := #[], body := "Bad Request" }
-  let path := pathOnly req.path
-  -- JSON API
+/-- Extract the API/SSE kind from a `/api/<kind>` (or `.json`-suffixed) path. -/
+private def apiKind (path : String) : Option String :=
   if path.startsWith "/api/" then
     let raw := (path.drop "/api/".length).toString
-    let kind := if raw.endsWith ".json" then (raw.take (raw.length - 5)).toString else raw
+    some (if raw.endsWith ".json" then (raw.take (raw.length - 5)).toString else raw)
+  else none
+
+-- Route dispatch. Only `/api/...` (JSON) is handled here; `/sse/...` is handled
+-- by `serveClient` before reaching this function. No HTML is served.
+
+private def dispatch (req : HttpRequest) : IO HttpResponse := do
+  if req.method == "OPTIONS" then
+    return { status := 204, headers := corsHeaders, body := "" }
+  if req.method != "GET" then
+    return jsonResp (Json.mkObj [("error", "method not allowed")]) 405
+  match apiKind (pathOnly req.path) with
+  | some kind =>
     match ← renderApi kind with
     | some j => return jsonResp j
     | none   => return jsonResp (Json.mkObj [("error", "not found")]) 404
-  -- Static shells (JS fetches the matching /api/... after load)
-  if path == "/about"     then return htmlResp aboutShell
-  if path == "/"          then return htmlResp overviewShell
-  if path == "/queue"     then return htmlResp queueShell
-  if path == "/concerts"  then return htmlResp concertsShell
-  if path.startsWith "/concerts/" then
-    let id := (path.drop "/concerts/".length).toString
-    return htmlResp (concertDetailShell id)
-  if path == "/listeners" then return htmlResp listenersShell
-  if path.startsWith "/listeners/" then
-    let name := (path.drop "/listeners/".length).toString
-    return htmlResp (listenerDetailShell name)
-  if path == "/tasks" then
-    match queryParam req.path "id" with
-    | some id => return htmlResp (taskDetailShell id)
-    | none    => return htmlResp tasksShell
-  if path.startsWith "/tasks/" then
-    let id := (path.drop "/tasks/".length).toString
-    return htmlResp (taskDetailShell id)
-  return notFound "Page not found."
+  | none => return jsonResp (Json.mkObj [("error", "not found")]) 404
 
 -- SSE streaming handler
 
@@ -573,6 +504,7 @@ private def sseHeader : String :=
   "Content-Type: text/event-stream\r\n" ++
   "Cache-Control: no-cache\r\n" ++
   "Connection: keep-alive\r\n" ++
+  "Access-Control-Allow-Origin: *\r\n" ++
   "X-Accel-Buffering: no\r\n\r\n"
 
 /-- Refresh interval for SSE pushes, in milliseconds. -/
@@ -599,7 +531,7 @@ private def serveSse (client : Socket) (kind : String) : IO Unit := do
 
 -- TCP client handler
 
-private def serveClient (client : Socket) (pw : String) : IO Unit := do
+private def serveClient (client : Socket) : IO Unit := do
   let buf ← IO.mkRef ""
   let mut i := 0
   while i < 16 do
@@ -614,24 +546,20 @@ private def serveClient (client : Socket) (pw : String) : IO Unit := do
   let raw ← buf.get
   match parseRequest raw with
   | none =>
-    let resp : HttpResponse := { status := 400, headers := #[], body := "Bad Request" }
-    let _ ← awaitTcp (← client.send #[httpResponse resp |>.toUTF8])
+    let _ ← awaitTcp (← client.send #[httpResponse (jsonResp (Json.mkObj [("error", "bad request")]) 400) |>.toUTF8])
   | some req =>
     let path := pathOnly req.path
-    if path.startsWith "/sse/" then
-      if !checkBasicAuth req.headers pw then
-        let _ ← awaitTcp (← client.send #[httpResponse unauthorizedResp |>.toUTF8])
-      else
-        serveSse client (path.drop "/sse/".length).toString
+    if path.startsWith "/sse/" && req.method == "GET" then
+      serveSse client (path.drop "/sse/".length).toString
     else
-      let resp ← dispatch req pw
+      let resp ← dispatch req
       let _ ← awaitTcp (← client.send #[httpResponse resp |>.toUTF8])
 
-/-- Start the dashboard HTTP server on the given port (0 = auto-assign).
-    Returns `(boundPort, shutdown)`. -/
-def start (password : String) (port : UInt16 := 0) : IO (UInt16 × IO Unit) := do
+/-- Start the dashboard JSON API + SSE backend, bound to `127.0.0.1` on the given
+    port (`0` = auto-assign). Returns `(boundPort, shutdown)`. -/
+def serve (port : UInt16 := 8080) : IO (UInt16 × IO Unit) := do
   let server ← Socket.new
-  let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 0 0 0 0, port }
+  let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port }
   server.bind addr
   server.listen 32
   let boundPort := match ← server.getSockName with
@@ -644,7 +572,7 @@ def start (password : String) (port : UInt16 := 0) : IO (UInt16 × IO Unit) := d
       | .ok client =>
         if !(← running.get) then break
         let _ ← IO.asTask (prio := .dedicated) do
-          try serveClient client password
+          try serveClient client
           catch _ => pure ()
   let shutdown : IO Unit := do
     running.set false
