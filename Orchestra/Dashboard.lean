@@ -55,7 +55,7 @@ private def hexDigits : Array Char := "0123456789abcdef".toList.toArray
 
 private def toHex (b : UInt8) : String :=
   let n := b.toNat
-  String.mk [hexDigits[n >>> 4]!, hexDigits[n &&& 0xf]!]
+  String.ofList [hexDigits[n >>> 4]!, hexDigits[n &&& 0xf]!]
 
 /-- Generate a fresh random token (60 hex chars / 30 bytes of entropy) sourced
     from `/dev/urandom`. -/
