@@ -223,3 +223,39 @@ tr:hover td { background: #fafbfc; }
   text-transform: uppercase;
   letter-spacing: .05em;
 }
+
+/* Dependency graph */
+.graph {
+  background: var(--sf);
+  border: 1px solid var(--bd);
+  border-radius: 8px;
+  padding: 8px;
+  overflow: auto;
+  max-height: 640px;
+}
+.graph svg { display: block; }
+.gnode { cursor: default; }
+.gid {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  fill: var(--tx);
+}
+.gtitle {
+  font-size: 11px;
+  fill: var(--mu);
+}
+.glegend {
+  display: flex;
+  gap: 18px;
+  font-size: 11px;
+  color: var(--mu);
+  margin-bottom: 8px;
+}
+.glegend span { display: inline-flex; align-items: center; gap: 6px; }
+.glegend .lseg { display: inline-block; width: 18px; height: 2px; border-radius: 2px; }
+.glegend .lseg.dash {
+  background: none !important;
+  border-top: 2px dashed #c084fc;
+  height: 0;
+}

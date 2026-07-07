@@ -27,8 +27,10 @@
   const BADGE_CLS = {
     running: "br", pending: "bp",
     done: "bd", completed: "bd",
-    failed: "bf",
-    cancelled: "bc", unfinished: "bc",
+    failed: "bf", rejected: "bf",
+    cancelled: "bc", unfinished: "bc", abandoned: "bc", blocked: "bc",
+    // issue statuses
+    open: "bo", claimed: "bp", in_review: "br",
   };
   function badge(s) {
     const cls = BADGE_CLS[s] || "bo";
@@ -332,6 +334,192 @@
       <h1>Task <span class="m">${E(d.id)}</span></h1>${details}
       <h2>Prompt</h2>${prompt}
       <h2>Log</h2><div class="card">${logHtml}</div>`;
+  };
+
+  pages.projects = (d) => {
+    const rows = (d.projects || []).map((p) => {
+      const c = p.counts || {};
+      const active = (c.open || 0) + (c.claimed || 0) + (c.inReview || 0);
+      return `
+        <tr>
+          <td>${link("project/?id=" +p.id, p.name || p.id)}</td>
+          <td class="m mono trunc">${E(p.id)}</td>
+          <td>${E(p.issueCount)}</td>
+          <td>${active}</td>
+          <td>${E(c.blocked || 0)}</td>
+          <td>${E(c.completed || 0)}</td>
+          <td class="m trunc">${E(p.defaultTarget || "—")}</td>
+        </tr>`;
+    });
+    const t = table(
+      ["Project", "ID", "Issues", "Active", "Blocked", "Completed", "Default Target"],
+      rows, "No projects");
+    return `<h1>Projects</h1>${t}`;
+  };
+
+  // ---- dependency graph -------------------------------------------------
+
+  // Fill colour per issue status (keeps the graph readable at a glance).
+  const NODE_FILL = {
+    open: "#dbeafe", claimed: "#fef3c7", in_review: "#dcfce7",
+    blocked: "#e5e7eb", completed: "#dcfce7",
+    abandoned: "#e5e7eb", rejected: "#fee2e2",
+  };
+  const NODE_STROKE = {
+    open: "#1d4ed8", claimed: "#a16207", in_review: "#15803d",
+    blocked: "#4b5563", completed: "#166534",
+    abandoned: "#9ca3af", rejected: "#b91c1c",
+  };
+
+  // Assign each node a layer = longest dependency chain reaching it, so that a
+  // node always sits to the right of everything it depends on. Cycles (which
+  // the model permits but the dispatcher never queues) are broken by ignoring
+  // back-edges left over after a topological pass.
+  function layerNodes(ids, edges) {
+    const adj = new Map(), indeg = new Map();
+    ids.forEach((id) => { adj.set(id, []); indeg.set(id, 0); });
+    edges.forEach((e) => {
+      if (adj.has(e.from) && indeg.has(e.to)) {
+        adj.get(e.from).push(e.to);
+        indeg.set(e.to, indeg.get(e.to) + 1);
+      }
+    });
+    const deg = new Map(indeg);
+    const queue = ids.filter((id) => deg.get(id) === 0);
+    const order = [];
+    while (queue.length) {
+      const u = queue.shift();
+      order.push(u);
+      adj.get(u).forEach((v) => { deg.set(v, deg.get(v) - 1); if (deg.get(v) === 0) queue.push(v); });
+    }
+    ids.forEach((id) => { if (!order.includes(id)) order.push(id); }); // leftover cycle nodes
+    const layer = new Map(ids.map((id) => [id, 0]));
+    order.forEach((u) => adj.get(u).forEach((v) => {
+      if (layer.get(v) < layer.get(u) + 1) layer.set(v, layer.get(u) + 1);
+    }));
+    return layer;
+  }
+
+  function depGraph(issues) {
+    if (!issues || issues.length === 0) {
+      return `<div class="card"><p class="empty">No issues in this project.</p></div>`;
+    }
+    const byId = new Map(issues.map((i) => [i.id, i]));
+    // Dependency edges (solid): dep -> issue, i.e. dep must finish first.
+    // Parent edges (dashed): parent -> child decomposition.
+    const edges = [];
+    issues.forEach((i) => {
+      (i.dependencies || []).forEach((dep) => {
+        if (byId.has(dep)) edges.push({ from: dep, to: i.id, kind: "dep" });
+      });
+      if (i.parentId && byId.has(i.parentId)) {
+        edges.push({ from: i.parentId, to: i.id, kind: "parent" });
+      }
+    });
+
+    const ids = issues.map((i) => i.id);
+    const layer = layerNodes(ids, edges);
+    // Bucket nodes by layer, preserving input order within a layer.
+    const cols = new Map();
+    ids.forEach((id) => {
+      const l = layer.get(id);
+      if (!cols.has(l)) cols.set(l, []);
+      cols.get(l).push(id);
+    });
+
+    const COLW = 210, ROWH = 78, NW = 168, NH = 52, PAD = 20;
+    const pos = new Map();
+    let maxRow = 0;
+    cols.forEach((col, l) => {
+      col.forEach((id, r) => {
+        pos.set(id, { x: PAD + l * COLW, y: PAD + r * ROWH });
+        if (r > maxRow) maxRow = r;
+      });
+    });
+    const maxLayer = Math.max(0, ...Array.from(cols.keys()));
+    const width = PAD * 2 + maxLayer * COLW + NW;
+    const height = PAD * 2 + maxRow * ROWH + NH;
+
+    // Edges first so nodes paint on top.
+    const edgeSvg = edges.map((e) => {
+      const a = pos.get(e.from), b = pos.get(e.to);
+      if (!a || !b) return "";
+      const x1 = a.x + NW, y1 = a.y + NH / 2;
+      const x2 = b.x, y2 = b.y + NH / 2;
+      const mx = (x1 + x2) / 2;
+      const dashed = e.kind === "parent";
+      return `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"
+        fill="none" stroke="${dashed ? "#c084fc" : "#94a3b8"}" stroke-width="1.5"
+        ${dashed ? 'stroke-dasharray="4 3"' : ""} marker-end="url(#arrow)"/>`;
+    }).join("");
+
+    const nodeSvg = ids.map((id) => {
+      const i = byId.get(id), p = pos.get(id);
+      const fill = NODE_FILL[i.status] || "#f3f4f6";
+      const stroke = NODE_STROKE[i.status] || "#9ca3af";
+      const short = E(String(id).slice(0, 7));
+      const title = E(trunc(i.title || "", 26));
+      const claim = i.claimedBy ? ` · ${E(i.claimedBy)}` : "";
+      return `<g class="gnode">
+        <title>${E(i.title || "")} — ${E(i.status)}${i.claimedBy ? " (claimed by " + E(i.claimedBy) + ")" : ""}</title>
+        <rect x="${p.x}" y="${p.y}" width="${NW}" height="${NH}" rx="8"
+          fill="${fill}" stroke="${stroke}" stroke-width="1.5"/>
+        <text x="${p.x + 10}" y="${p.y + 20}" class="gid">${short}${claim}</text>
+        <text x="${p.x + 10}" y="${p.y + 38}" class="gtitle">${title}</text>
+      </g>`;
+    }).join("");
+
+    const legend = `<div class="glegend">
+      <span><i class="lseg" style="background:#94a3b8"></i>depends on</span>
+      <span><i class="lseg dash" style="background:#c084fc"></i>parent → child</span>
+    </div>`;
+
+    return `${legend}<div class="graph">
+      <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"
+           xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4"
+                  orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M0,0 L8,4 L0,8 z" fill="#94a3b8"/>
+          </marker>
+        </defs>
+        ${edgeSvg}${nodeSvg}
+      </svg></div>`;
+  }
+
+  pages["project-detail"] = (d) => {
+    if (!d || d.error) return `<h1>Project not found</h1>`;
+    const p = d.project, c = p.counts || {};
+    const meta = kvTable([
+      ["ID",             E(p.id), "mono"],
+      ["Name",           E(p.name || "—"), ""],
+      ["Description",    E(p.description || "—"), ""],
+      ["Created",        E(p.createdAt), "m"],
+      ["Default Target", E(p.defaultTarget || "—"), "m"],
+      ["Issues",         E(p.issueCount), ""],
+    ]);
+    const stats = `<div class="stats">${[
+      ["open", "Open"], ["claimed", "Claimed"], ["inReview", "In Review"],
+      ["blocked", "Blocked"], ["completed", "Completed"], ["rejected", "Rejected"],
+    ].map(([k, l]) => statBox(c[k] || 0, l)).join("")}</div>`;
+    const rows = (d.issues || []).map((i) => `
+      <tr>
+        <td class="mono">${E(String(i.id).slice(0, 8))}</td>
+        <td>${badge(i.status)}</td>
+        <td class="trunc">${E(i.title)}</td>
+        <td class="m mono trunc">${E(i.parentId || "")}</td>
+        <td class="m">${(i.dependencies || []).length}</td>
+        <td class="m">${E(i.claimedBy || "")}</td>
+        <td class="m">${E(i.prCount)}</td>
+      </tr>`);
+    const t = table(
+      ["Issue", "Status", "Title", "Parent", "Deps", "Claimed By", "PRs"],
+      rows, "No issues");
+    return `
+      <h1>Project <span class="m">${E(p.name || p.id)}</span></h1>${meta}
+      ${stats}
+      <h2>Dependency Graph</h2>${depGraph(d.issues)}
+      <h2>Issues</h2>${t}`;
   };
 
   // ---- boot + live updates ---------------------------------------------

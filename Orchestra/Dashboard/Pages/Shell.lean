@@ -34,5 +34,7 @@ def tasksShell           : Html := shell "tasks"           "tasks"       ""
 def taskDetailShell      : Html := shell "task-detail"     "tasks/"      "id"
 def concertDetailShell   : Html := shell "concert-detail"  "concerts/"   "id"
 def listenerDetailShell  : Html := shell "listener-detail" "listeners/"  "name"
+def projectsShell        : Html := shell "projects"        "projects"    ""
+def projectDetailShell   : Html := shell "project-detail"  "projects/"   "id"
 
 end Orchestra.Dashboard.Pages.Shell

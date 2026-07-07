@@ -6,11 +6,15 @@ import Orchestra.Dirs
 import Orchestra.Queue
 import Orchestra.TaskStore
 import Orchestra.Listener
+import Orchestra.Project.Basic
+import Orchestra.Project.Claim
 import Orchestra.Dashboard.Site
 
 open Lean (Json ToJson)
 open Std.Net
 open Std.Internal.UV.TCP
+open Orchestra.Project (Project Issue IssueStatus ProjectId Claim
+  loadAllProjects loadProject loadIssues loadClaims)
 
 /-!
 # Orchestra Web Dashboard
@@ -330,6 +334,74 @@ private def tasksApi : IO Json := do
     ("tasks", Json.arr ((tasks.toList.take 50).map taskRecJson).toArray)
   ]
 
+-- Projects & issues
+
+private def issueStText : IssueStatus → String
+  | .open      => "open"      | .claimed   => "claimed"
+  | .inReview  => "in_review" | .blocked   => "blocked"
+  | .completed => "completed" | .abandoned => "abandoned"
+  | .rejected  => "rejected"
+
+/-- Per-status issue counts plus the total, for a project's issue set. -/
+private def issueCountsJson (issues : Array Issue) : Json :=
+  let n := fun (s : IssueStatus) => (issues.filter (·.status == s)).size
+  Json.mkObj [
+    ("open",      ToJson.toJson (n .open)),
+    ("claimed",   ToJson.toJson (n .claimed)),
+    ("inReview",  ToJson.toJson (n .inReview)),
+    ("blocked",   ToJson.toJson (n .blocked)),
+    ("completed", ToJson.toJson (n .completed)),
+    ("abandoned", ToJson.toJson (n .abandoned)),
+    ("rejected",  ToJson.toJson (n .rejected))
+  ]
+
+private def projectSummaryJson (p : Project) (issues : Array Issue) : Json :=
+  Json.mkObj [
+    ("id",            ToJson.toJson p.id),
+    ("name",          p.name),
+    ("description",   p.description.getD ""),
+    ("createdAt",     p.createdAt),
+    ("defaultTarget", match p.defaultTarget with
+      | some t => Json.str s!"{t.repo}@{t.branch}" | none => Json.str ""),
+    ("issueCount",    ToJson.toJson issues.size),
+    ("counts",        issueCountsJson issues)
+  ]
+
+/-- A single issue as a dependency-graph node: identity, status, its parent and
+    dependency edges (both by issue id), and who (if anyone) currently holds it. -/
+private def issueNodeJson (i : Issue) (claim : Option Claim) : Json :=
+  Json.mkObj [
+    ("id",           ToJson.toJson i.id),
+    ("title",        i.title),
+    ("status",       issueStText i.status),
+    ("parentId",     match i.parentId with | some p => ToJson.toJson p | none => Json.str ""),
+    ("dependencies", Json.arr (i.dependencies.map ToJson.toJson)),
+    ("prCount",      ToJson.toJson i.attachedPRs.size),
+    ("claimedBy",    match claim with | some c => Json.str c.agent | none => Json.str ""),
+    ("updatedAt",    i.updatedAt)
+  ]
+
+private def projectsApi : IO Json := do
+  let projects ← loadAllProjects
+  let rows ← projects.mapM fun p => do
+    return projectSummaryJson p (← loadIssues p.id)
+  return Json.mkObj [("projects", Json.arr rows)]
+
+private def projectDetailApi (id : String) : IO (Option Json) := do
+  let pid : ProjectId := ⟨id⟩
+  match ← loadProject pid with
+  | none => return none
+  | some p =>
+    let issues ← loadIssues pid
+    let claims ← loadClaims pid
+    let nodes := issues.map fun i =>
+      let claim := (claims.find? (fun (iid, _) => iid == i.id)).map (·.2)
+      issueNodeJson i claim
+    return some (Json.mkObj [
+      ("project", projectSummaryJson p issues),
+      ("issues",  Json.arr nodes)
+    ])
+
 /-- Parse the per-task structured JSONL log into an array of `Json` events.
     Returns an empty array if the file is missing. -/
 private def loadTaskLog (fork : Repository) (id : String) : IO (Array Json) := do
@@ -375,6 +447,9 @@ private def renderApi (kind : String) : IO (Option Json) := do
   if kind == "concerts"  then return some (← concertsApi)
   if kind == "listeners" then return some (← listenersApi)
   if kind == "tasks"     then return some (← tasksApi)
+  if kind == "projects"  then return some (← projectsApi)
+  if kind.startsWith "projects/" then
+    return ← projectDetailApi (kind.drop "projects/".length).toString
   if kind.startsWith "concerts/" then
     return ← concertDetailApi (kind.drop "concerts/".length).toString
   if kind.startsWith "listeners/" then

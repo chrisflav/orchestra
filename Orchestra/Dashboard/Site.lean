@@ -8,6 +8,8 @@ import Orchestra.Dashboard.Pages.Tasks
 import Orchestra.Dashboard.Pages.TaskDetail
 import Orchestra.Dashboard.Pages.ConcertDetail
 import Orchestra.Dashboard.Pages.ListenerDetail
+import Orchestra.Dashboard.Pages.Projects
+import Orchestra.Dashboard.Pages.ProjectDetail
 import Orchestra.Dashboard.Pages.About
 
 /-!
@@ -58,6 +60,7 @@ def theme (apiBase : String) : Theme := { Theme.default with
       | none            => "overview"
       | some "task"     => "tasks"
       | some "concert"  => "concerts"
+      | some "project"  => "projects"
       | some "listener" => "listeners"
       | some s          => s
     let pageTitle ← param (α := String) "title"
@@ -79,6 +82,7 @@ def theme (apiBase : String) : Theme := { Theme.default with
               {{ navItem active "."          "Overview"  "overview"  }}
               {{ navItem active "queue/"     "Queue"     "queue"     }}
               {{ navItem active "concerts/"  "Concerts"  "concerts"  }}
+              {{ navItem active "projects/"  "Projects"  "projects"  }}
               {{ navItem active "listeners/" "Listeners" "listeners" }}
               {{ navItem active "tasks/"     "Tasks"     "tasks"     }}
               {{ navItem active "about/"     "About"     "about"     }}
@@ -101,6 +105,8 @@ def versoSite : Site :=
     "queue"     Orchestra.Dashboard.Pages.Queue
     "concerts"  Orchestra.Dashboard.Pages.Concerts
     "listeners" Orchestra.Dashboard.Pages.Listeners
+    "projects"  Orchestra.Dashboard.Pages.Projects
+    "project"   Orchestra.Dashboard.Pages.ProjectDetail
     "tasks"     Orchestra.Dashboard.Pages.Tasks
     "task"      Orchestra.Dashboard.Pages.TaskDetail
     "concert"   Orchestra.Dashboard.Pages.ConcertDetail
