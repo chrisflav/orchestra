@@ -35,6 +35,60 @@ Adding a page = a verso `#doc (Page)` shell (in `Dashboard/Pages/`) wired into
 
 namespace Orchestra.Dashboard
 
+-- API authentication
+--
+-- The server binds to `127.0.0.1` but replies with a wildcard `Access-Control-
+-- Allow-Origin`, so any web page the user visits could otherwise `fetch` the
+-- API cross-origin. A shared bearer token gates every `/api/...` and `/sse/...`
+-- request. `generate` bakes the same token into the static site (see
+-- `Dashboard/Site.lean`) and `dashboard.js` presents it on each request.
+
+/-- The env var that overrides the persisted dashboard API token. -/
+def tokenEnvVar : String := "ORCHESTRA_DASHBOARD_TOKEN"
+
+/-- Where an auto-generated token is persisted so that `generate` and `serve`
+    (typically separate invocations) agree on the same secret. -/
+private def tokenFile : IO System.FilePath := do
+  return (← Dirs.dataBase) / "dashboard.token"
+
+private def hexDigits : Array Char := "0123456789abcdef".toList.toArray
+
+private def toHex (b : UInt8) : String :=
+  let n := b.toNat
+  String.mk [hexDigits[n >>> 4]!, hexDigits[n &&& 0xf]!]
+
+/-- Generate a fresh random token (60 hex chars / 30 bytes of entropy) sourced
+    from `/dev/urandom`. -/
+private def genToken : IO String := do
+  let bytes ← IO.FS.withFile "/dev/urandom" .read fun h => h.read 30
+  return String.join (bytes.toList.map toHex)
+
+/-- Resolve the dashboard API token, in priority order:
+    1. an explicit `flagToken` (e.g. `--token`),
+    2. the `ORCHESTRA_DASHBOARD_TOKEN` env var,
+    3. a token previously persisted under the data dir,
+    4. otherwise a freshly generated token (persisted for reuse).
+
+    Shared by `generate` (which bakes the token into the site) and `serve`
+    (which enforces it), so both agree without the user wiring anything up. -/
+def resolveToken (flagToken : Option String := none) : IO String := do
+  if let some t := flagToken then
+    if !t.trimAscii.isEmpty then return t.trimAscii.toString
+  if let some t ← IO.getEnv tokenEnvVar then
+    if !t.trimAscii.isEmpty then return t.trimAscii.toString
+  let path ← tokenFile
+  if ← path.pathExists then
+    let t := (← IO.FS.readFile path).trimAscii.toString
+    if !t.isEmpty then return t
+  let t ← genToken
+  IO.FS.createDirAll (← Dirs.dataBase)
+  IO.FS.writeFile path (t ++ "\n")
+  -- Best-effort: restrict the token file to the owner.
+  try
+    let _ ← IO.Process.run { cmd := "chmod", args := #["600", path.toString] }
+  catch _ => pure ()
+  return t
+
 -- TCP helper (mirrors the one in Orchestra.Server)
 
 private def awaitTcp (p : IO.Promise (Except IO.Error α)) : IO α := do
@@ -59,7 +113,7 @@ private structure HttpResponse where
 private def statusText : Nat → String
   | 200 => "OK"           | 204 => "No Content"
   | 400 => "Bad Request"  | 404 => "Not Found"
-  | 405 => "Method Not Allowed"
+  | 401 => "Unauthorized" | 405 => "Method Not Allowed"
   | n   => s!"Status {n}"
 
 /-- Permissive CORS headers so a separately-served static front-end can call the
@@ -67,7 +121,7 @@ private def statusText : Nat → String
 private def corsHeaders : Array (String × String) :=
   #[("Access-Control-Allow-Origin", "*"),
     ("Access-Control-Allow-Methods", "GET, OPTIONS"),
-    ("Access-Control-Allow-Headers", "Content-Type")]
+    ("Access-Control-Allow-Headers", "Content-Type, Authorization")]
 
 private def httpResponse (resp : HttpResponse) : String :=
   let statusLine := s!"HTTP/1.1 {resp.status} {statusText resp.status}\r\n"
@@ -365,14 +419,51 @@ private def apiKind (path : String) : Option String :=
     some (if raw.endsWith ".json" then (raw.take (raw.length - 5)).toString else raw)
   else none
 
+-- Authentication: every request must present the shared token, either as an
+-- `Authorization: Bearer <token>` header (used by `fetch`) or a `?token=<token>`
+-- query parameter (needed for SSE, since `EventSource` cannot set headers).
+
+/-- Look up a request header case-insensitively. -/
+private def headerValue (req : HttpRequest) (name : String) : Option String :=
+  (req.headers.find? (fun (k, _) => k.toLower == name.toLower)).map (·.2)
+
+/-- The bearer token from an `Authorization: Bearer <token>` header, if present. -/
+private def bearerToken (req : HttpRequest) : Option String :=
+  match headerValue req "authorization" with
+  | some v =>
+    if v.startsWith "Bearer " then some (v.drop "Bearer ".length).trimAscii.toString else none
+  | none   => none
+
+/-- The value of a `?key=…` (or `&key=…`) query parameter in a raw path. Tokens
+    are hex, so no percent-decoding is required. -/
+private def queryParam (path : String) (key : String) : Option String :=
+  match path.splitOn "?" with
+  | _ :: q :: _ =>
+    (q.splitOn "&").findSome? fun kv =>
+      match kv.splitOn "=" with
+      | k :: v :: _ => if k == key then some v else none
+      | _           => none
+  | _ => none
+
+/-- Whether the request carries the expected token (header or query param). -/
+private def authorized (token : String) (req : HttpRequest) : Bool :=
+  let supplied := (bearerToken req).orElse (fun _ => queryParam req.path "token")
+  supplied == some token
+
+private def unauthorizedResp : HttpResponse :=
+  jsonResp (Json.mkObj [("error", "unauthorized")]) 401
+
 -- Route dispatch. Only `/api/...` (JSON) is handled here; `/sse/...` is handled
 -- by `serveClient` before reaching this function. No HTML is served.
 
-private def dispatch (req : HttpRequest) : IO HttpResponse := do
+private def dispatch (token : String) (req : HttpRequest) : IO HttpResponse := do
   if req.method == "OPTIONS" then
+    -- CORS preflight carries no credentials; never require auth for it.
     return { status := 204, headers := corsHeaders, body := "" }
   if req.method != "GET" then
     return jsonResp (Json.mkObj [("error", "method not allowed")]) 405
+  unless authorized token req do
+    return unauthorizedResp
   match apiKind (pathOnly req.path) with
   | some kind =>
     match ← renderApi kind with
@@ -414,7 +505,7 @@ private def serveSse (client : Socket) (kind : String) : IO Unit := do
 
 -- TCP client handler
 
-private def serveClient (client : Socket) : IO Unit := do
+private def serveClient (token : String) (client : Socket) : IO Unit := do
   let buf ← IO.mkRef ""
   let mut i := 0
   while i < 16 do
@@ -433,14 +524,18 @@ private def serveClient (client : Socket) : IO Unit := do
   | some req =>
     let path := pathOnly req.path
     if path.startsWith "/sse/" && req.method == "GET" then
-      serveSse client (path.drop "/sse/".length).toString
+      if authorized token req then
+        serveSse client (path.drop "/sse/".length).toString
+      else
+        let _ ← awaitTcp (← client.send #[httpResponse unauthorizedResp |>.toUTF8])
     else
-      let resp ← dispatch req
+      let resp ← dispatch token req
       let _ ← awaitTcp (← client.send #[httpResponse resp |>.toUTF8])
 
 /-- Start the dashboard JSON API + SSE backend, bound to `127.0.0.1` on the given
-    port (`0` = auto-assign). Returns `(boundPort, shutdown)`. -/
-def serve (port : UInt16 := 8080) : IO (UInt16 × IO Unit) := do
+    port (`0` = auto-assign). Every request must present `token` (see
+    `resolveToken`). Returns `(boundPort, shutdown)`. -/
+def serve (token : String) (port : UInt16 := 8080) : IO (UInt16 × IO Unit) := do
   let server ← Socket.new
   let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port }
   server.bind addr
@@ -455,7 +550,7 @@ def serve (port : UInt16 := 8080) : IO (UInt16 × IO Unit) := do
       | .ok client =>
         if !(← running.get) then break
         let _ ← IO.asTask (prio := .dedicated) do
-          try serveClient client
+          try serveClient token client
           catch _ => pure ()
   let shutdown : IO Unit := do
     running.set false

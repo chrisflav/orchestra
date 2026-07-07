@@ -44,7 +44,8 @@ private def navItem (active href label key : String) : Html :=
 
 open Output Html Template Theme in
 /-- The single layout shared by every generated page. `apiBase` is the base URL of
-    the JSON API backend (`dashboard serve`), baked into every page. -/
+    the JSON API backend (`dashboard serve`), baked into every page. The API token
+    is *not* baked in — the front-end prompts the user for it at runtime. -/
 def theme (apiBase : String) : Theme := { Theme.default with
   primaryTemplate := do
     -- Relative path back to the site root, so root-level assets resolve from

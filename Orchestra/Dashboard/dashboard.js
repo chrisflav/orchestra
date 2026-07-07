@@ -403,9 +403,50 @@
     restoreScrolls(target, snap);
   }
 
+  // API token. The backend requires it on every request, but it is NOT baked
+  // into these static pages: the user supplies it at runtime, and it is kept in
+  // localStorage for subsequent visits. It is sent as a bearer header on fetch
+  // requests and — since EventSource cannot set custom headers — as a ?token=
+  // query param on SSE streams.
+  const TOKEN_KEY = "orchestraApiToken";
+  const getToken = () => window.localStorage.getItem(TOKEN_KEY) || "";
+  const setToken = (t) =>
+    t ? window.localStorage.setItem(TOKEN_KEY, t)
+      : window.localStorage.removeItem(TOKEN_KEY);
+
+  // Prompt the user for the token; returns the new token, or "" if cancelled.
+  function promptToken(message) {
+    const t = window.prompt(
+      message || "Enter the Orchestra dashboard API token:", getToken());
+    if (t === null) return "";
+    setToken(t.trim());
+    return getToken();
+  }
+
+  function withToken(url) {
+    const t = getToken();
+    if (!t) return url;
+    return url + (url.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(t);
+  }
+
   function fetchAndRender(target, page, url) {
-    return fetch(url, { credentials: "same-origin" })
-      .then((r) => r.ok ? r.json() : { error: `fetch failed (${r.status})` })
+    function attempt(reprompted) {
+      const t = getToken();
+      const opts = { credentials: "same-origin" };
+      if (t) opts.headers = { Authorization: "Bearer " + t };
+      return fetch(url, opts).then((r) => {
+        if (r.status === 401 && !reprompted) {
+          setToken("");
+          const msg = t
+            ? "The API token was rejected. Enter the Orchestra dashboard API token:"
+            : "Authentication required. Enter the Orchestra dashboard API token:";
+          if (promptToken(msg)) return attempt(true);
+          return { error: "unauthorized — a valid API token is required" };
+        }
+        return r.ok ? r.json() : { error: `fetch failed (${r.status})` };
+      });
+    }
+    return attempt(false)
       .then((data) => render(target, page, data))
       .catch((e) => {
         target.innerHTML = `<p class="empty">Error: ${E(e.message)}</p>`;
@@ -413,7 +454,8 @@
   }
 
   function subscribeSse(target, page, url) {
-    const es = new EventSource(url);
+    if (!getToken()) return; // no token yet; fetch path prompts for it
+    const es = new EventSource(withToken(url));
     es.onmessage = (ev) => {
       try { render(target, page, JSON.parse(ev.data)); } catch (_) { /* ignore */ }
     };

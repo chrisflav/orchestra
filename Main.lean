@@ -1191,6 +1191,7 @@ private def dashboardGenerateHandler (p : Parsed) : IO UInt32 := do
   let apiBase := p.flag? "api-url" |>.map (·.as! String) |>.getD "http://localhost:8080"
   Dashboard.generate dir apiBase
   IO.println s!"Generated static dashboard site in '{dir}' (API base: {apiBase})."
+  IO.println "The dashboard will prompt for the API token in the browser on first load."
   IO.println "Serve it with any static HTTP server, e.g.:"
   IO.println s!"  python3 -m http.server -d {dir} 8000"
   IO.println "Then start the JSON API backend with: orchestra dashboard serve"
@@ -1209,8 +1210,12 @@ private def dashboardGenerateCmd : Cmd := `[Cli|
 
 private def dashboardServeHandler (p : Parsed) : IO UInt32 := do
   let port := p.flag? "port" |>.map (·.as! Nat) |>.getD 8080
-  let (boundPort, _shutdown) ← Dashboard.serve port.toUInt16
+  let token ← Dashboard.resolveToken (p.flag? "token" |>.map (·.as! String))
+  let (boundPort, _shutdown) ← Dashboard.serve token port.toUInt16
   IO.println s!"Orchestra dashboard JSON API + SSE listening on http://127.0.0.1:{boundPort}"
+  IO.println s!"API token: {token}"
+  IO.println "Requests must present it as 'Authorization: Bearer <token>' or '?token=<token>'."
+  IO.println "Enter this token in the dashboard when it prompts you on first load."
   IO.println "Serve the generated static site separately (e.g. python3 -m http.server)."
   repeat do
     IO.sleep 60000
@@ -1222,6 +1227,7 @@ private def dashboardServeCmd : Cmd := `[Cli|
 
   FLAGS:
     p, port : Nat; "Port to listen on (default: 8080)"
+    t, token : String; "API token to require (default: $ORCHESTRA_DASHBOARD_TOKEN or a generated, persisted token)"
 ]
 
 private def dashboardDefaultHandler (_ : Parsed) : IO UInt32 := do
