@@ -255,13 +255,6 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
 
 -- Queue helpers
 
-/-- Read the current process PID from /proc/self/stat (Linux-specific). -/
-private def getOwnPid : IO UInt32 := do
-  let stat ← IO.FS.readFile (System.FilePath.mk "/proc/self/stat")
-  match stat.splitOn " " with
-  | pid :: _ => return (pid.toNat?.getD 0).toUInt32
-  | _        => return 0
-
 /-- Send a JSON request to the daemon socket and return the parsed response.
     Throws if the daemon returns an "error" field. -/
 private def daemonRequest (req : Lean.Json) : IO Lean.Json := do
@@ -524,7 +517,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   if ← Queue.daemonRunning then
     IO.eprintln "Queue daemon is already running."
     return 1
-  let pid ← getOwnPid
+  let pid ← Queue.ownPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
   -- Startup cleanup

@@ -319,12 +319,36 @@ def readPid : IO (Option UInt32) := do
 def deletePid : IO Unit :=
   try IO.FS.removeFile (← pidFile) catch _ => pure ()
 
-/-- Return true if a daemon process with the stored PID is still alive. -/
+/-- This process's own PID. -/
+def ownPid : IO UInt32 := do
+  let stat ← IO.FS.readFile (System.FilePath.mk "/proc/self/stat")
+  match stat.splitOn " " with
+  | pid :: _ => return (pid.toNat?.getD 0).toUInt32
+  | _        => return 0
+
+/-- Return true if a daemon process with the stored PID is still alive.
+
+    "The PID is in `/proc`" is not sufficient on its own, for two reasons:
+
+    * **It can be us.** The PID file outlives the process that wrote it, and in a container the
+      daemon is PID 1 — so after a restart the next container's PID 1 is the very process running
+      this check, which would otherwise conclude a daemon is already running and refuse to start,
+      on every restart, forever.
+    * **PIDs are recycled.** A daemon that died without cleaning up leaves a PID that some
+      unrelated process may later take, wedging `queue start` until the file is deleted by hand.
+
+    An unreadable `comm` (hardened `/proc`, different user) is treated as "running": refusing to
+    start is recoverable, whereas two daemons racing on the same queue directory is not. -/
 def daemonRunning : IO Bool := do
   match ← readPid with
   | none => return false
   | some pid =>
-    return ← (System.FilePath.mk s!"/proc/{pid}").pathExists
+    if pid == (← ownPid) then return false
+    if !(← (System.FilePath.mk s!"/proc/{pid}").pathExists) then return false
+    let comm ← try some <$> IO.FS.readFile s!"/proc/{pid}/comm" catch _ => pure none
+    match comm with
+    | none => return true
+    | some c => return c.trimAscii.toString == "orchestra"
 
 -- Cascade cancellation
 
