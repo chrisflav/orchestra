@@ -60,6 +60,12 @@ Tool permission groups (set via the task config's `tools` list):
 - `work_issues` — worker agents: list open issues, claim, attach PR, release, split into sub-issues.
 - `review_issues` — reviewer agents: list in-review, approve / reject.
 
+Reviews are recorded on the taxis issue's comment thread: `decide_issue` posts its `notes` there
+automatically, and `comment_issue` / `list_issue_comments` cover the rest. Reading is available to
+all three groups and writing to `work_issues`/`review_issues`, so a rejected issue carries its
+reasoning forward to whoever picks it up next. These are taxis comments, distinct from the
+`comment` tool, which posts to the GitHub issue or PR a task was launched from.
+
 ## Configuring taxis
 
 Add a `taxis` section to `config.json` (`$XDG_CONFIG_HOME/orchestra/config.json`, falling back to

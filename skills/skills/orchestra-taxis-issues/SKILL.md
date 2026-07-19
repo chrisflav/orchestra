@@ -103,6 +103,25 @@ So you can create children under your root or anything beneath it, and update an
 range. You cannot retitle another project's issues. Reads are not restricted: `list_issues` and
 `get_issue` see the whole tracker, which is fine for context.
 
+## Comments — where review feedback lives
+
+Every taxis issue has a comment thread. It is the record of *why* something was decided, and the
+only thing the next agent to pick the issue up will see.
+
+```
+list_issue_comments(issue_id: 57)          read the thread
+comment_issue(issue_id: 57, body: "...")   add to it
+```
+
+**Read the thread before reworking an issue that came back to open.** A rejection is recorded
+there; without it you will not know what was wrong and are likely to resubmit the same work.
+
+`get_issue` also includes the thread, so if you are already fetching detail you have it.
+
+These are comments on the **taxis** issue. Do not confuse them with `comment`, which posts to the
+GitHub issue or pull request the task was launched from — a different system, see the
+`orchestra-pull-requests` skill.
+
 ## Reviewing
 
 ```
@@ -113,6 +132,11 @@ decide_issue(issue_id: 57, decision: "approve" | "reject", notes: "...")
 Approving enqueues a merger task for the latest attached PR. Rejecting returns the issue to open.
 Judge the PR against what its issue asked for, which `get_issue` will show you.
 
+`decide_issue` records your `notes` as a comment on the issue automatically, so a rejection always
+leaves a trace the next worker can read. Put the actual reasoning in `notes` — "rejected" on its
+own tells them nothing. Use `comment_issue` for anything beyond the verdict, such as replying to a
+worker's question or leaving guidance without deciding yet.
+
 ## Which tools you have
 
 Tools are gated per task by permission group:
@@ -120,6 +144,9 @@ Tools are gated per task by permission group:
 - `manage_issues` — `list_projects`, `list_issues`, `get_issue`, `create_issue`, `update_issue`
 - `work_issues` — `list_open_issues`, `claim_issue`, `release_claim`, `attach_pr`, `split_issue`
 - `review_issues` — `list_issues_in_review`, `decide_issue`
+
+`list_issue_comments` comes with any of the three, and `comment_issue` with `work_issues` or
+`review_issues` — the thread is shared ground between whoever reviews and whoever reworks.
 
 A refusal saying the task is not authorized for a group is deliberate, not a bug. Report what you
 needed; do not look for another route to it.

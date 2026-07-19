@@ -254,3 +254,29 @@ def splitIssueRequiresOwnership : Test := do
   TestM.assert (jsonContains r "held by task T1") "non-holder must be rejected"
 
 end OrchestraTest.ProjectTools
+
+/-- `list_issue_comments` is offered under three permission groups and `comment_issue` under two,
+    so a task holding more than one would be handed the same tool twice without the dedupe in
+    `Server.toolsList` — a malformed tools/list the agent sees, not a server-side error. -/
+@[test]
+def commentToolsAreListedOncePerGroupSet : Test := do
+  let names := toolDefs.map (fun (_, name, _) => name)
+  TestM.assert ((names.filter (· == "list_issue_comments")).length > 1)
+    "list_issue_comments is deliberately registered under several groups"
+  let forWorker := toolDefs.filterMap fun (perm, name, _) =>
+    if perm == workIssuesPerm || perm == reviewIssuesPerm then some name else none
+  let deduped := forWorker.foldl (fun acc n => if acc.contains n then acc else acc ++ [n]) []
+  TestM.assert (forWorker.length > deduped.length)
+    "a worker+reviewer task sees duplicates before dedupe, which is what Server.toolsList removes"
+
+@[test]
+def commentToolsParse : Test := do
+  match tryParseToolCall "comment_issue"
+      (Json.mkObj [("issue_id", Json.num 57), ("body", Json.str "looks good")]) with
+  | some (.ok (.commentIssue iid body)) =>
+    TestM.assertEqual iid.toString "57"
+    TestM.assertEqual body "looks good"
+  | _ => TestM.fail "comment_issue should parse"
+  match tryParseToolCall "list_issue_comments" (Json.mkObj [("issue_id", Json.num 57)]) with
+  | some (.ok (.listIssueComments iid)) => TestM.assertEqual iid.toString "57"
+  | _ => TestM.fail "list_issue_comments should parse"

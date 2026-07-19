@@ -257,8 +257,14 @@ Call this tool exactly once when the task is complete."),
 private def toolsList (state : State) : Json :=
   let optional := optionalToolDefs.filterMap fun entry =>
     if state.allowedTools.contains entry.1 then some entry.2 else none
-  let project := Project.Tools.toolDefs.filterMap fun (perm, _name, def_) =>
-    if state.allowedTools.contains perm then some def_ else none
+  -- Deduped by name: a tool may be listed under more than one permission group (an issue's
+  -- comment thread is readable by workers and reviewers alike), and a task holding two of them
+  -- would otherwise be offered the same tool twice.
+  let project := (Project.Tools.toolDefs.filterMap fun (perm, name, def_) =>
+      if state.allowedTools.contains perm then some (name, def_) else none)
+    |>.foldl (fun acc (name, def_) =>
+        if acc.any (·.1 == name) then acc else acc ++ [(name, def_)]) []
+    |>.map (·.2)
   let io := ioToolDefs state.inputType state.outputType
   let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
   Json.mkObj [("tools",

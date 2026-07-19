@@ -636,6 +636,32 @@ def issuesWithLabel (labelName : String) :
         ok := ok.push (issue, at'.target)
   return some (ok, gaps)
 
+/-! ## Comments
+
+Taxis issues carry a comment thread. It is where a reviewer's verdict and reasoning live, and
+where the next agent to pick the issue up reads why it came back — so both writing and reading
+are exposed to agents, not just to humans in the taxis UI. -/
+
+/-- Post a comment on an issue. -/
+def addComment (iid : Taxis.IssueId) (body : String) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let _ ← unwrap (← Orchestra.Taxis.createComment cfg iid body)
+
+/-- An issue's comments, oldest first as taxis returns them. -/
+def loadComments (iid : Taxis.IssueId) : IO (Array Orchestra.Taxis.Comment) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  unwrap (← Orchestra.Taxis.listComments cfg iid)
+
+/-- One comment as a line of agent-facing text: author, time, then the body indented. -/
+def renderComment (c : Orchestra.Taxis.Comment) : IO String := do
+  let when ← Orchestra.Taxis.epochToIso8601 c.createdAt
+  let who := c.authorName.getD "(unknown)"
+  let verdict := match c.review with
+    | some v => s!" [review: {repr v}]"
+    | none => ""
+  let body := String.intercalate "\n" ((c.body.splitOn "\n").map (s!"    " ++ ·))
+  return s!"  {who} at {when}{verdict}\n{body}"
+
 /-! ## Write scoping
 
 An agent working an issue may only create and update issues within its own project subtree. The

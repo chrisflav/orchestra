@@ -56,6 +56,11 @@ inductive ProjectTool where
   /-- Worker-driven decomposition: replace the held parent issue with a set of
       sub-issues and release the claim on the parent. -/
   | splitIssue       (parentId : Taxis.IssueId) (children : Array NewSubissueSpec) (reason : String)
+  /-- Read an issue's comment thread. Available to worker and reviewer roles alike: a reviewer
+      writes the verdict there, and the next worker to pick the issue up reads why. -/
+  | listIssueComments  (issueId : Taxis.IssueId)
+  /-- Add a comment to an issue's thread. -/
+  | commentIssue       (issueId : Taxis.IssueId) (body : String)
   -- review_issues
   | listIssuesInReview (projectId : Taxis.IssueId)
   | decideIssue        (issueId : Taxis.IssueId) (decision : ReviewDecision) (notes : String)
@@ -83,6 +88,26 @@ private def obj (props : List (String × Json)) (required : List String) : Json 
 /-- All optional tools provided by this module, paired with the permission
     label that gates them. The server filters by label against
     `state.allowedTools`. -/
+private def commentsToolDef : Json :=
+  Json.mkObj
+    [ ("name", "list_issue_comments")
+    , ("description",
+        "Read the comment thread on a taxis issue. This is where a reviewer records why an " ++
+        "issue was approved or rejected — read it before reworking an issue that came back.")
+    , ("inputSchema", obj [ ("issue_id", intProp "Issue ID") ] ["issue_id"]) ]
+
+private def commentIssueToolDef : Json :=
+  Json.mkObj
+    [ ("name", "comment_issue")
+    , ("description",
+        "Add a comment to a taxis issue's thread. Reviewers: record your review here. " ++
+        "This is the taxis issue tracker, not GitHub — use `comment` for the GitHub issue or " ++
+        "pull request the task was launched from.")
+    , ("inputSchema", obj
+        [ ("issue_id", intProp "Issue ID")
+        , ("body", strProp "Comment text (markdown allowed)") ]
+        ["issue_id", "body"]) ]
+
 def toolDefs : List (String × String × Json) :=
   [ -- manage_issues
     (manageIssuesPerm, "list_projects",
@@ -205,6 +230,11 @@ def toolDefs : List (String × String × Json) :=
             , ("number", intProp "PR number")
             , ("branch", strProp "PR head branch") ]
             ["issue_id", "repo", "number", "branch"]) ])
+  , (workIssuesPerm, "list_issue_comments", commentsToolDef)
+  , (reviewIssuesPerm, "list_issue_comments", commentsToolDef)
+  , (manageIssuesPerm, "list_issue_comments", commentsToolDef)
+  , (workIssuesPerm, "comment_issue", commentIssueToolDef)
+  , (reviewIssuesPerm, "comment_issue", commentIssueToolDef)
     -- review_issues
   , (reviewIssuesPerm, "list_issues_in_review",
       Json.mkObj
@@ -336,6 +366,15 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
           let target ← parseTarget? item
           (Except.ok { title, description := descr, target } : Except String NewSubissueSpec)
         return .splitIssue parentId children reason
+  | "list_issue_comments" =>
+    some <| do
+      let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
+      return .listIssueComments iid
+  | "comment_issue" =>
+    some <| do
+      let iid  ← args.getObjValAs? Taxis.IssueId "issue_id"
+      let body ← args.getObjValAs? String "body"
+      return .commentIssue iid body
   | "list_issues_in_review" =>
     some <| do
       let pid ← args.getObjValAs? Taxis.IssueId "project_id"
@@ -491,6 +530,10 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       let mut body := header ++ prs
       if !children.isEmpty then body := body ++ #["children:"] ++ childLines
       body := body ++ #["description:"] ++ descrLines
+      let comments ← loadComments iid
+      if !comments.isEmpty then
+        let rendered ← comments.mapM renderComment
+        body := body ++ #["comments:"] ++ rendered
       return content (joinLines body)
   | .createIssue pid title descr parent target dependencies =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
@@ -665,6 +708,21 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
             , ("reason",     Json.str reason)
             , ("created",    Json.arr (createdIds.map ToJson.toJson)) ]
           return content payload.compress
+  | .listIssueComments iid =>
+    -- Offered under every group that lists it, so accept any of them here rather than a single
+    -- permission: the reviewer writes the thread and the worker has to be able to read it.
+    if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
+      return content (deny reviewIssuesPerm) (isError := true)
+    let comments ← loadComments iid
+    if comments.isEmpty then return content s!"No comments on issue {iid.toString}."
+    let rendered ← comments.mapM renderComment
+    return content (joinLines rendered)
+  | .commentIssue iid body =>
+    if !(has env workIssuesPerm || has env reviewIssuesPerm) then
+      return content (deny reviewIssuesPerm) (isError := true)
+    addComment iid body
+    IO.println s!"  [mcp] comment_issue: {iid.toString}"
+    return content s!"commented on issue {iid.toString}"
   -- ---------------- review_issues ----------------
   | .listIssuesInReview pid =>
     if !has env reviewIssuesPerm then return content (deny reviewIssuesPerm) (isError := true)
@@ -682,6 +740,11 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       IO.println s!"  [mcp] decide_issue: {iid.toString} \"{i.title}\" → {decisionStr} — {notes}"
       match decision with
       | .reject =>
+        -- The verdict belongs on the issue, not just in the tool response: the next worker to
+        -- pick this up needs to know why it came back, and the response is seen only by this
+        -- reviewer. Failing to record it must not fail the decision itself.
+        try addComment iid s!"**Rejected.**\n\n{notes}"
+        catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
         -- Move back to .open and clear any claim. Notes are echoed back; the
         -- comment tool is the right place to post them on the PR if desired.
         if let some mgr := env.claimManager then
@@ -701,6 +764,8 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
             match ← hook project.id iid pr with
             | .error msg => return content s!"failed to enqueue merger: {msg}" (isError := true)
             | .ok mergerTaskId =>
+              try addComment iid s!"**Approved.**\n\n{notes}"
+              catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
               IO.println s!"  [mcp] decide_issue: {iid.toString} approved; merger task {mergerTaskId} enqueued"
               return content s!"approved {iid.toString}; merger task {mergerTaskId} enqueued ({notes})"
   | .projectInfo =>
