@@ -207,3 +207,29 @@ def dispatcherEmitsAtMostOnePerRolePerTick : Test := do
   TestM.assertEqual count 1 (msg := "≤1 spawn per role per tick (gradual ramp)")
 
 end OrchestraTest.ProjectRole
+
+/-- The comment thread reaches an agent only through the prompt for worker roles: reading it needs
+    a tool call the agent has to know to make, and a rejection lives nowhere else now that there
+    is no rejected status. -/
+@[test]
+def renderSubstitutesIssueComments : Test := do
+  let v : RenderVars :=
+    { projectId := "9", projectName := "P", instructions := ""
+    , issueId := some "57", issueTitle := some "t"
+    , issueComments := some "  reviewer at 2026-01-01 [review: requestChanges]\n    fix the proof" }
+  let out := render "thread:\n{{issue_comments}}" v
+  TestM.assert ((out.splitOn "fix the proof").length > 1) "comment body substituted"
+  -- Absent thread renders empty rather than leaving the placeholder visible.
+  let noComments : RenderVars := { projectId := "1", projectName := "P", instructions := "" }
+  TestM.assertEqual (render "[{{issue_comments}}]" noComments) "[]"
+    (msg := "no thread renders empty")
+
+@[test]
+def shippedWorkerTemplatesCarryTheThread : Test := do
+  for name in ["implementor", "reviewer"] do
+    let raw ← IO.FS.readFile s!"examples/projects/roles/{name}.json"
+    match Json.parse raw >>= FromJson.fromJson? (α := Role) with
+    | .error e => TestM.fail s!"{name}.json: {e}"
+    | .ok role =>
+      TestM.assert ((role.promptTemplate.splitOn "{{issue_comments}}").length > 1)
+        s!"the shipped {name} template must carry the issue comment thread"

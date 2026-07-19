@@ -84,7 +84,8 @@ structure Role where
   budget         : Option Float  := none
   /-- Prompt body — supports {{project_id}}, {{project_name}}, {{instructions}},
       and (when an issue is bound) {{issue_id}}, {{issue_title}}, {{issue_description}},
-      {{target_repo}}, {{target_branch}}, {{pr_number}}, {{pr_branch}}, {{pr_repo}}.
+      {{issue_comments}}, {{target_repo}}, {{target_branch}}, {{pr_number}}, {{pr_branch}},
+      {{pr_repo}}.
       Unrecognised placeholders pass through.
 
       Worker templates should include {{issue_description}}: it is the only way the issue body
@@ -220,6 +221,10 @@ structure RenderVars where
   /-- The issue's body. Nothing else puts it in front of the agent: `get_issue` is the only tool
       that renders it and that is gated on `manage_issues`, which worker roles do not have. -/
   issueDescription : Option String := none
+  /-- The issue's comment thread. Carries a reviewer's reasoning to whoever picks the issue up
+      next, which matters most for a rejection: there is no rejected status, so the
+      request-changes review is the only record of what was wrong. -/
+  issueComments : Option String := none
   targetRepo   : Option String := none
   targetBranch : Option String := none
   prNumber     : Option String := none
@@ -237,6 +242,7 @@ def render (tmpl : String) (v : RenderVars) : String :=
     , ("{{issue_id}}",      v.issueId.getD "")
     , ("{{issue_title}}",   v.issueTitle.getD "")
     , ("{{issue_description}}", v.issueDescription.getD "")
+    , ("{{issue_comments}}", v.issueComments.getD "")
     , ("{{target_repo}}",   v.targetRepo.getD "")
     , ("{{target_branch}}", v.targetBranch.getD "")
     , ("{{pr_number}}",     v.prNumber.getD "")
@@ -252,7 +258,7 @@ def render (tmpl : String) (v : RenderVars) : String :=
     comes from taxis artifacts, and without threading it through here `{{target_repo}}` and
     `{{target_branch}}` would render empty in the very prompts that need them. -/
 def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : String)
-    (targetOverride : Option RepoTarget := none)
+    (targetOverride : Option RepoTarget := none) (comments : Option String := none)
     : RenderVars :=
   match issue? with
   | none => { projectId := project.id.toString, projectName := project.name, instructions }
@@ -265,6 +271,7 @@ def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : St
     , issueId      := some i.id.toString
     , issueTitle   := some i.title
     , issueDescription := some i.description
+    , issueComments := comments
     , targetRepo   := target.map (·.repo.toString)
     , targetBranch := target.map (·.branch)
     , prNumber     := pr?.map (fun p => toString p.number)

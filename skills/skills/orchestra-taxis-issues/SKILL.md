@@ -119,7 +119,9 @@ status — a rejection *is* the request-changes review on the thread, and it is 
 what was wrong. The merger records validation failures the same way. Without reading it you will
 not know what to fix and are likely to resubmit the same work.
 
-`get_issue` also includes the thread, so if you are already fetching detail you have it.
+`get_issue` also includes the thread, so if you are already fetching detail you have it. Role
+prompts can carry it directly too, via `{{issue_comments}}` — if your prompt already shows the
+discussion, you do not need to fetch it again.
 
 These are comments on the **taxis** issue. Do not confuse them with `comment`, which posts to the
 GitHub issue or pull request the task was launched from — a different system, see the

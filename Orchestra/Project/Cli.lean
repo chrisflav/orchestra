@@ -372,7 +372,10 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let some target' := target
     | IO.eprintln "Cannot spawn: no effective target (project has no default and issue has no override)"
       return 1
-  let vars := renderVarsFor project mIssue extraInstructions
+  let comments ← match mIssue with
+    | some i => renderCommentThread i.id
+    | none   => pure none
+  let vars := renderVarsFor project mIssue extraInstructions (comments := comments)
   let prompt := render role.promptTemplate vars
   let entry : Queue.QueueEntry :=
     { id := entryId, createdAt

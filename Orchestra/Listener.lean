@@ -614,7 +614,12 @@ def buildRoleEntry (project : Project.Project) (role : Project.Role)
   let some target' := target | return none
   let id ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
-  let vars   := Project.renderVarsFor project issue? instructions targetOverride
+  -- One extra fetch per dispatch (not per tick) so the thread lands in the prompt: a worker
+  -- picking up a rejected issue would otherwise have to know to ask for it.
+  let comments ← match issue? with
+    | some i => Project.renderCommentThread i.id
+    | none   => pure none
+  let vars   := Project.renderVarsFor project issue? instructions targetOverride comments
   let prompt := Project.render role.promptTemplate vars
   return some
     { id, createdAt

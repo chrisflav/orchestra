@@ -128,6 +128,16 @@ $XDG_DATA_HOME/orchestra/projects/<project-id>/roles/<name>.json     -- per-proj
 (`~/.config/orchestra`/`~/.local/share/orchestra` if the `XDG_*` variables aren't set; see
 `Orchestra.Dirs`.)
 
+Prompt templates support `{{project_id}}`, `{{project_name}}`, `{{instructions}}`, and — when the
+role is dispatched onto an issue — `{{issue_id}}`, `{{issue_title}}`, `{{issue_description}}`,
+`{{issue_comments}}`, `{{target_repo}}`, `{{target_branch}}`, `{{pr_number}}`, `{{pr_branch}}`,
+`{{pr_repo}}`. Unrecognised placeholders pass through; an absent value renders empty.
+
+`{{issue_description}}` and `{{issue_comments}}` are the two worth putting in every worker
+template. They are the only way an agent sees what an issue asks for and what a reviewer said
+about it — `get_issue` and `list_issue_comments` render both, but a worker has to know to call
+them, and a rejection lives nowhere else now that there is no rejected status.
+
 Examples in `roles/`: `implementor.json`, `reviewer.json`, `planner.json`.
 Each ships with `dispatch.max: 0` so auto-spawn is opt-in — set caps in a
 dispatcher listener config (see `examples/listeners/auto-dispatcher.json`)

@@ -682,6 +682,15 @@ def renderComment (c : Orchestra.Taxis.Comment) : IO String := do
   let body := String.intercalate "\n" ((c.body.splitOn "\n").map (s!"    " ++ ·))
   return s!"  {who} at {when}{verdict}\n{body}"
 
+/-- An issue's whole comment thread rendered for a prompt, or `none` when there is nothing to
+    show. Lets a role template carry the discussion — a rejection's reasoning above all — without
+    the agent having to know to call `list_issue_comments` first. -/
+def renderCommentThread (iid : Taxis.IssueId) : IO (Option String) := do
+  let comments ← loadComments iid
+  if comments.isEmpty then return none
+  let rendered ← comments.mapM renderComment
+  return some (String.intercalate "\n" rendered.toList)
+
 /-! ## Write scoping
 
 An agent working an issue may only create and update issues within its own project subtree. The
