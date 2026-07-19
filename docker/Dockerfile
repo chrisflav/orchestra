@@ -75,6 +75,27 @@ ENV PATH="${ELAN_HOME}/bin:${PATH}"
 RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf \
       | sh -s -- -y --no-modify-path --default-toolchain none
 
+# Pre-create every $HOME path the agent sandbox grants access to.
+#
+# Landlock rules can only attach to paths that already exist, so Sandbox.lean drops any that
+# don't (`if ← p.pathExists`) rather than letting landrun hard-error. In a fresh container none
+# of these exist, so their rules are silently dropped — and since $HOME itself is never granted,
+# the agent cannot create them either: it reports that it can't write ~/.claude, then hangs.
+#
+# Keep this list in sync with `sandboxPaths` in Orchestra/Agents/Claude.lean (`homeRox` +
+# `homeRw`); `.elan` is already created by the elan installer above.
+#
+# `.claude.json` is seeded with an empty object rather than touched: it is Claude Code's config
+# file, and a zero-length file is not valid JSON.
+RUN mkdir -p /home/orchestra/.claude \
+             /home/orchestra/.cache \
+             /home/orchestra/.local \
+             /home/orchestra/.config/claude \
+             /home/orchestra/.config/gh \
+             /home/orchestra/.config/git \
+    && echo '{}' > /home/orchestra/.claude.json \
+    && touch /home/orchestra/.gitconfig
+
 # Back to root *only* so the entrypoint can take ownership of the bind-mounted /config and /data
 # (Docker creates missing bind-mount sources as root) before re-execing itself as `orchestra` via
 # setpriv. Nothing beyond those two chowns ever runs as root.
