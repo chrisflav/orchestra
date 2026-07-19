@@ -105,8 +105,9 @@ def vibe : AgentDef where
     rox     := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
     ro      := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw      := ["/dev/null"]
-    homeRox := [".elan", ".cache", ".local"]
+    homeRox := [".local"]
     homeRw  := [".gitconfig", ".config/gh", ".config/git"]
+    homeRwx := [".elan", ".cache"]
   }
   setupMcp port model systemPrompt := do
     let ts ← IO.monoNanosNow

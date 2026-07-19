@@ -86,10 +86,26 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   for p in ← expandHomePaths paths.homeRox do
     if ← p.pathExists then
       args := args.push "--rox" |>.push p.toString
-  -- Home-relative paths read-write (agent config/state)
+  -- Home-relative paths read-write (agent config/state).
+  --
+  -- A missing path here is not benign, unlike the system paths above. Landlock can only attach a
+  -- rule to a path that exists, so a missing one is dropped — and since $HOME itself is never
+  -- granted, the agent cannot create it either. It typically reports that it cannot write its
+  -- config directory and then hangs, with nothing in the log to explain why. Warn instead: the
+  -- fix is to create the path in whatever image or machine image is being used.
   for p in ← expandHomePaths paths.homeRw do
     if ← p.pathExists then
       args := args.push "--rw" |>.push p.toString
+    else
+      IO.eprintln s!"  [sandbox] warning: {p} does not exist, so the agent gets no write access \
+        to it and cannot create it — the agent may hang on startup. Create it and retry."
+  -- Home-relative paths needing write *and* execute (toolchain managers — see `SandboxPaths`).
+  for p in ← expandHomePaths paths.homeRwx do
+    if ← p.pathExists then
+      args := args.push "--rwx" |>.push p.toString
+    else
+      IO.eprintln s!"  [sandbox] warning: {p} does not exist, so the agent gets no write access \
+        to it and cannot create it — the agent may hang on startup. Create it and retry."
   -- Additional paths from global app config
   for p in additionalPaths.rox do
     if ← System.FilePath.pathExists p then
@@ -106,6 +122,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   for p in ← expandHomePaths additionalPaths.homeRw do
     if ← p.pathExists then
       args := args.push "--rw" |>.push p.toString
+  for p in ← expandHomePaths additionalPaths.homeRwx do
+    if ← p.pathExists then
+      args := args.push "--rwx" |>.push p.toString
   for p in additionalPaths.extraPorts do
     args := args.push "--connect-tcp" |>.push (toString p)
     args := args.push "--bind-tcp" |>.push (toString p)

@@ -1,12 +1,16 @@
 {
   "name": "implementor",
-  "permissions": ["work_issues", "create_pr", "comment"],
+  "permissions": [
+    "work_issues",
+    "create_pr",
+    "comment"
+  ],
   "backend": "claude",
   "model": "sonnet",
   "system_prompt": "worker-agent",
   "read_only": false,
   "priority": 30,
-  "prompt_template": "You are an implementor working on the orchestra project {{project_name}} (id: {{project_id}}).\n\nYou hold the claim on issue {{issue_id}} ({{issue_title}}). Open a PR against {{target_repo}} on branch {{target_branch}}.\n\n{{instructions}}",
+  "prompt_template": "You are an implementor working on the orchestra project {{project_name}} (id: {{project_id}}).\n\nYou hold the claim on issue {{issue_id}}: {{issue_title}}\n\n--- issue description ---\n{{issue_description}}\n--- end issue description ---\n\n--- discussion so far (may be empty) ---\n{{issue_comments}}\n--- end discussion ---\n\nIf the discussion contains a request-changes review, this issue came back for rework: address exactly what it asks for. Otherwise work on what the description asks for. Open a PR against {{target_repo}} on branch {{target_branch}} and attach it to the issue.\n\n{{instructions}}",
   "dispatch": {
     "trigger": "has_open_issues",
     "max": 0,

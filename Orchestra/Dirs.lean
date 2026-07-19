@@ -38,6 +38,14 @@ def configBase : IO System.FilePath := do
     return legacy
   return xdgDir
 
+/-- Skills shipped with orchestra and loaded into every agent by default: `<config>/skills`.
+
+    A Claude plugin directory (`.claude-plugin/plugin.json` plus `skills/`), passed to the agent
+    as a `--plugin-dir` alongside anything in `plugin_dirs`. The repository's `skills/` directory
+    is the source; see the README for installing it. Absent is fine — nothing is loaded. -/
+def skillsDir : IO System.FilePath := do
+  return (← configBase) / "skills"
+
 /-- Data base: always uses the XDG data dir, no legacy fallback. -/
 def dataBase : IO System.FilePath :=
   orchestraDataDir

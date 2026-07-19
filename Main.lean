@@ -255,13 +255,6 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
 
 -- Queue helpers
 
-/-- Read the current process PID from /proc/self/stat (Linux-specific). -/
-private def getOwnPid : IO UInt32 := do
-  let stat ← IO.FS.readFile (System.FilePath.mk "/proc/self/stat")
-  match stat.splitOn " " with
-  | pid :: _ => return (pid.toNat?.getD 0).toUInt32
-  | _        => return 0
-
 /-- Send a JSON request to the daemon socket and return the parsed response.
     Throws if the daemon returns an "error" field. -/
 private def daemonRequest (req : Lean.Json) : IO Lean.Json := do
@@ -524,7 +517,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   if ← Queue.daemonRunning then
     IO.eprintln "Queue daemon is already running."
     return 1
-  let pid ← getOwnPid
+  let pid ← Queue.ownPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
   -- Startup cleanup
@@ -676,7 +669,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
             match liveCfg.source with
             | .projectDispatcher pid _ =>
               let roleName := vars.find? (·.1 == "role_name") |>.map (·.2) |>.getD ""
-              let issueId := vars.find? (·.1 == "issue_id") |>.map (fun p => (⟨p.2⟩ : Project.IssueId))
+              let issueId := vars.find? (·.1 == "issue_id") |>.bind (fun p => Taxis.IssueId.parse? p.2)
               let some project ← Project.loadProject pid | continue
               let some role ← Project.loadRole pid roleName | continue
               let issue? : Option Project.Issue ← match issueId with
@@ -701,7 +694,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                     | .acquired _ => pure true
                     | .alreadyClaimed e =>
                       IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: \
-                        issue {i.id.value} already claimed by {e.taskId}"
+                        issue {i.id.toString} already claimed by {e.taskId}"
                       pure false
                     | .invalid r =>
                       IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: {r}"
@@ -710,6 +703,65 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                 if claimed then
                   Queue.saveEntry entry
                   IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} → {entry.id}"
+              continue
+            | .labelDispatcher label _ =>
+              -- Same shape as the branch above, but the project and target come from the event
+              -- rather than the listener config: this source spans projects, and each issue's
+              -- target was resolved from its taxis artifacts at poll time
+              -- (Project.artifactTarget) rather than inherited from a project default.
+              let getVar (k : String) := vars.find? (·.1 == k) |>.map (·.2)
+              let roleName := getVar "role_name" |>.getD ""
+              let some issueId := getVar "issue_id" |>.bind Taxis.IssueId.parse?
+                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event without a \
+                    usable issue_id; skipping"
+                  continue
+              let some projectId := getVar "project_id" |>.bind Taxis.IssueId.parse?
+                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event without a \
+                    usable project_id; skipping"
+                  continue
+              let target? : Option Project.RepoTarget :=
+                match getVar "target_repo", getVar "target_branch" with
+                | some r, some b => (Repository.parse r).toOption.map ({ repo := ·, branch := b })
+                | _, _ => none
+              let some target := target?
+                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event for issue \
+                    {issueId.toString} carried no usable target; skipping"
+                  continue
+              let some project ← Project.loadProject projectId | continue
+              -- Global roles only: these issues can span projects, so no single project's
+              -- roles/ directory takes precedence (see Project.loadGlobalRoles).
+              let some role := (← Project.loadGlobalRoles).find? (·.name == roleName)
+                | IO.eprintln s!"  Listener '{lcfg.name}': no global role '{roleName}'; skipping"
+                  continue
+              let some issue ← Project.loadIssue projectId issueId | continue
+              let entryOpt ← Listener.buildRoleEntry project role (some issue)
+                (targetOverride := some target)
+              match entryOpt with
+              | none =>
+                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName} for issue \
+                  {issueId.toString}: no effective target"
+              | some entry =>
+                let needsClaim := match role.dispatch with
+                  | some d => d.preClaim
+                  | none   => false
+                let claimed ← if needsClaim then
+                    let now ← TaskStore.currentIso8601
+                    let agent := role.backend.getD "claude"
+                    match ← Project.tryClaim TaskRunner.globalClaimManager projectId issue.id
+                                             entry.id agent now none with
+                    | .acquired _ => pure true
+                    | .alreadyClaimed e =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: issue \
+                        {issue.id.toString} already claimed by {e.taskId}"
+                      pure false
+                    | .invalid r =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: {r}"
+                      pure false
+                  else pure true
+                if claimed then
+                  Queue.saveEntry entry
+                  IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} for issue \
+                    {issue.id.toString} ({label}) → {entry.id}"
               continue
             | _ => pure ()
             if let some wfPath := liveCfg.action.workflowPath then
@@ -1290,6 +1342,29 @@ def orchestraCmd : Cmd := `[Cli|
     migrateCmd
 ]
 
+/-- Wrap a stream so that every write is flushed immediately.
+
+    Lean block-buffers its output streams when they are not a TTY. A long-running process writing
+    to a pipe therefore produces *nothing* until it exits or fills the buffer — so the queue
+    daemon, which is meant to run for days, shows no output at all under `docker compose logs`,
+    systemd's journal, `tee`, or anything else that isn't a terminal. Short-lived commands hide
+    the problem by flushing on exit.
+
+    Only applied when the stream is not already a TTY: an interactive terminal is line-buffered
+    by default and does not need a flush per write. -/
+private def autoFlushing (s : IO.FS.Stream) : IO.FS.Stream :=
+  { s with
+    write  := fun bs  => do s.write bs;  s.flush
+    putStr := fun str => do s.putStr str; s.flush }
+
+private def unbufferIfPiped : IO Unit := do
+  let out ← IO.getStdout
+  unless ← out.isTty do discard <| IO.setStdout (autoFlushing out)
+  let err ← IO.getStderr
+  unless ← err.isTty do discard <| IO.setStderr (autoFlushing err)
+
 def main (args : List String) : IO UInt32 := do
+  unbufferIfPiped
   gRawArgs.set args
+  Project.ensureTaxisConfigured
   orchestraCmd.validate args

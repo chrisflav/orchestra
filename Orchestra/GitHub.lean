@@ -97,9 +97,40 @@ def createInstallationToken (jwt : String) (installationId : Nat) : IO String :=
       | throw (.userError "token response missing 'token' field")
     return token
 
-/-- Configure `gh` CLI to use the given token. -/
+/-- Configure `gh` CLI to use the given token.
+
+    Rejects an empty token rather than passing it on: `gh auth login --with-token` given no token
+    does not fail, it falls back to an interactive device-code prompt and blocks forever — which
+    in the daemon is an unattended hang with nothing in the log to explain it.
+
+    The token goes over stdin rather than being interpolated into `sh -c "echo ... | gh ..."`, so
+    there is no shell to quote it for, and a failure is reported as `gh failed` rather than the
+    considerably less helpful `sh failed`. -/
 def setupGhAuth (token : String) : IO Unit := do
-  runCmd' "sh" #["-c", s!"echo '{token}' | gh auth login --with-token"]
+  if token.isEmpty then
+    throw (.userError
+      "refusing to run `gh auth login` with an empty token (it would block on an interactive \
+       prompt). Check github_app.app_id and github_app.private_key_path in config.json.")
+  runCmd' "gh" #["auth", "login", "--with-token"] (input := token)
+
+/-- Whether a pull request has been merged.
+
+    Used by the dispatcher to decide whether an issue still needs review: an attached PR that is
+    already merged does not. Returns `false` when the state cannot be determined — an unreachable
+    GitHub or a deleted PR then queues a reviewer that finds nothing to do, which is recoverable,
+    where returning `true` would silently drop review of real work. -/
+def isPrMerged (token : String) (repo : Repository) (number : Nat) : IO Bool := do
+  let env := if token.isEmpty then #[] else #[("GH_TOKEN", some token)]
+  try
+    -- `state`, not `merged`: gh has no `merged` field, and asking for one makes the whole call
+    -- fail. `state` is OPEN / CLOSED / MERGED, so it also distinguishes a PR closed without
+    -- merging — which still counts as unmerged here, since the issue's work did not land.
+    let out ← runCmd "gh"
+      #["pr", "view", toString number, "--repo", repo.toString, "--json", "state", "-q", ".state"]
+      (env := env)
+    return out.trimAscii.toString == "MERGED"
+  catch _ =>
+    return false
 
 /-- Ensure the given labels exist on a repository.
     Labels that are missing are created with a default colour; existing ones are not modified. -/

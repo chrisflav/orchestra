@@ -7,11 +7,18 @@ through a built-in MCP server.
 
 ## prerequisites
 
-It is recommended to run all of orchestra inside a virtual machine or container. The
-[container section](#container) describes a ready-made NixOS incus image that
-provides the full environment.
+It is recommended to run all of orchestra inside a virtual machine or container. Two ready-made
+environments provide the full set of tools: a NixOS incus image (see the
+[container section](#container)) and a Docker image running the queue daemon (see the
+[docker section](#docker)).
 
 Before starting you will need to create a GitHub App with a private key, installed on the organization owning the fork. Download the private key.
+
+You will also want a personal access token with repo scope. The two are not alternatives: every
+task mints an installation token from the App and gives it to `gh` for cloning and pushing, so
+without the App no task runs at all, while the PAT covers what an installation token cannot —
+pull requests against the *upstream* repository, issue comments, PR reviews, and the triage
+backend.
 
 Inside the container (or VM), the following must be available (all installed
 automatically when using the provided container image):
@@ -184,6 +191,39 @@ adding them to the `tools` list in the task configuration.
   The `comment` tool requires the task to carry an `issue_number` (set automatically by the
   listener when triggered from an issue or pull request).
 
+Three more tool groups — `manage_issues`, `work_issues`, `review_issues` — are available when a
+task carries them in its `tools` list, backing orchestra's project/issue/claim workflow (a taxis
+issue tracker instance, not local files — see [`examples/projects/README.md`](examples/projects/README.md)
+for the full concept mapping, the `taxis` config section, and a CLI/tool cheat sheet).
+
+## skills
+
+`skills/` is a Claude plugin directory loaded into every agent by default. It carries two skills:
+
+- **`orchestra-pull-requests`** — opening PRs, commenting, reading review feedback.
+- **`orchestra-taxis-issues`** — claiming, splitting, attaching PRs, and managing tracker issues.
+
+Both exist mainly to state one rule the agent cannot infer: **`gh` must never be used for pull
+requests or issues.** Everything goes through the MCP tools, which select the right credential
+(PAT vs GitHub App token), record what the task did, and enforce the per-task permission groups.
+`gh` is authenticated for git transport only. Plain `git` is fine.
+
+They also draw the distinction between **taxis** issues (the tracker; what agents claim and work)
+and **GitHub** issues (the thread a task was launched from). The ids look alike and nothing stops
+you passing one where the other belongs.
+
+Install by copying into the config directory, from where orchestra picks it up automatically:
+
+```
+cp -r skills $XDG_CONFIG_HOME/orchestra/skills      # or ~/.config/orchestra/skills
+```
+
+The Docker image bundles them and seeds `/config/orchestra/skills` on first start, so nothing is
+needed there. Local edits survive restarts; delete the directory to get the shipped copy back.
+
+Anything in `plugin_dirs` in `config.json` is loaded as well — the skills directory is prepended,
+not a replacement.
+
 ## running tasks
 
 ```
@@ -337,7 +377,11 @@ Example — respond to issue comments containing a trigger word:
 
 Fields:
 
-- `source.type` — `"github-issues"`, `"github-comments"`, `"github-pr-reviews"`, or `"shell"`
+- `source.type` — one of `"github-issues"`, `"github-comments"`, `"github-pr-reviews"`,
+  `"github-labels"`, `"github-label-count"`, `"shell"`, or the two auto-dispatchers
+  `"project-dispatcher"` and `"label-dispatcher"` (documented in
+  [`examples/projects/README.md`](examples/projects/README.md) — the first works on one project,
+  the second on every issue carrying a given label, wherever it lives)
 - `source.repos` — list of `{"upstream": "...", "fork": "..."}` pairs
 - `source.trigger` — only events whose body contains this string are processed
 - `source.authorized_users` — list of GitHub logins that may trigger the listener; empty means allow everyone
@@ -406,3 +450,30 @@ user:
 ```
 incus exec my-orchestra -- su orchestra
 ```
+
+## docker
+
+`docker/` packages the queue daemon and the same dependency set as an image, for hosts without
+incus. See [`docker/README.md`](docker/README.md) for the details.
+
+```
+cd docker
+cp .env.example .env      # fill in at least ORCHESTRA_TAXIS_URL and a token
+docker compose up --build
+```
+
+The container runs `orchestra queue start`; override the command for one-off subcommands against
+the same volumes:
+
+```
+docker compose run --rm orchestra project list
+```
+
+Config and state live in gitignored host directories — `docker/config/`, `docker/data/` and
+`docker/secrets/` — created on first `up`, so `config/orchestra/config.json` can be edited
+directly and a GitHub App key just gets dropped in `secrets/`.
+
+It expects an existing taxis instance rather than starting one — `ORCHESTRA_TAXIS_URL` must be
+reachable from inside the container, so not `localhost`. Agents are sandboxed with landrun
+(Landlock), which works under Docker's default seccomp profile; the entrypoint probes it at
+start-up and `docker/README.md` covers what to check if that warning appears.

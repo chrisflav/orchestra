@@ -5,7 +5,6 @@ import Init.Data.String.Basic
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra.TaskStore
-open Orchestra.Project (ProjectId IssueId)
 
 -- Types
 
@@ -62,9 +61,9 @@ structure TaskRecord where
   /-- Priority used for queue ordering. Defaults to 10. -/
   priority      : Nat           := 10
   /-- Orchestra project this task belongs to (optional). -/
-  projectId     : Option ProjectId := none
+  projectId     : Option Taxis.IssueId := none
   /-- Orchestra issue this task is/was working on (optional). -/
-  issueId       : Option IssueId   := none
+  issueId       : Option Taxis.IssueId   := none
   /-- Optional role name. -/
   role          : Option String    := none
 deriving Repr
@@ -115,8 +114,8 @@ instance : FromJson TaskRecord where
     let prependPrompt   := j.getObjValAs? String "prepend_prompt"  |>.toOption
     let budget        := j.getObjValAs? Float  "budget"         |>.toOption
     let priority      := j.getObjValAs? Nat   "priority"      |>.toOption |>.getD 10
-    let projectId     := j.getObjValAs? ProjectId "project_id" |>.toOption
-    let issueId       := j.getObjValAs? IssueId   "issue_id"   |>.toOption
+    let projectId     := j.getObjValAs? Taxis.IssueId "project_id" |>.toOption
+    let issueId       := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
     let role          := j.getObjValAs? String    "role"       |>.toOption
     return { id, createdAt, upstream, fork, mode, prompt, status, sessionId,
              continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority,

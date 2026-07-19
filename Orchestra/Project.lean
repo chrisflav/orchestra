@@ -1,4 +1,3 @@
-import Orchestra.Project.Id
 import Orchestra.Project.Basic
 import Orchestra.Project.Claim
 import Orchestra.Project.Role

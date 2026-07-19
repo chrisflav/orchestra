@@ -35,6 +35,10 @@ in
     jq
     openssl
     gcc
+    # `nc` is the MCP transport, not a debugging tool: every agent backend points its MCP client
+    # at the built-in server with `nc 127.0.0.1 <port>` (see setupMcp in Orchestra/Agents/).
+    # Without it the agent sees the "agent" MCP server stuck connecting and gets no tools.
+    netcat-openbsd
     # Lean version manager
     elan
     landrun

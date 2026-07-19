@@ -24,7 +24,11 @@ def workIssuesPerm   : String := "work_issues"
 def reviewIssuesPerm : String := "review_issues"
 
 inductive ReviewDecision where
+  /-- The pull request should land. Enqueues the merger; the issue stays open, because merging a
+      PR is not the same as finishing the issue — see `complete`. -/
   | approve
+  /-- The issue's work is done. Marks it completed without merging anything. -/
+  | complete
   | reject
 deriving Repr, Inhabited
 
@@ -39,26 +43,31 @@ deriving Repr, Inhabited
 inductive ProjectTool where
   -- manage_issues
   | listProjects
-  | listIssues       (projectId : ProjectId) (statusFilter : Option IssueStatus)
-                     (parentId : Option IssueId)
-  | getIssue         (issueId : IssueId)
-  | createIssue      (projectId : ProjectId) (title description : String)
-                     (parentId : Option IssueId) (target : Option RepoTarget)
-                     (dependencies : Array IssueId := #[])
-  | updateIssue      (issueId : IssueId) (title description : Option String)
+  | listIssues       (projectId : Taxis.IssueId) (statusFilter : Option IssueStatus)
+                     (parentId : Option Taxis.IssueId)
+  | getIssue         (issueId : Taxis.IssueId)
+  | createIssue      (projectId : Taxis.IssueId) (title description : String)
+                     (parentId : Option Taxis.IssueId) (target : Option RepoTarget)
+                     (dependencies : Array Taxis.IssueId := #[])
+  | updateIssue      (issueId : Taxis.IssueId) (title description : Option String)
                      (status : Option IssueStatus) (target : Option RepoTarget)
-                     (dependencies : Option (Array IssueId) := none)
+                     (dependencies : Option (Array Taxis.IssueId) := none)
   -- work_issues
-  | listOpenIssues   (projectId : ProjectId) (targetRepo : Option Repository)
-  | claimIssue       (issueId : IssueId)
-  | releaseClaim     (issueId : IssueId) (reason : String)
-  | attachPr         (issueId : IssueId) (repo : Repository) (number : Nat) (branch : String)
+  | listOpenIssues   (projectId : Taxis.IssueId) (targetRepo : Option Repository)
+  | claimIssue       (issueId : Taxis.IssueId)
+  | releaseClaim     (issueId : Taxis.IssueId) (reason : String)
+  | attachPr         (issueId : Taxis.IssueId) (repo : Repository) (number : Nat) (branch : String)
   /-- Worker-driven decomposition: replace the held parent issue with a set of
-      sub-issues, move the parent to `.blocked`, and release the claim. -/
-  | splitIssue       (parentId : IssueId) (children : Array NewSubissueSpec) (reason : String)
+      sub-issues and release the claim on the parent. -/
+  | splitIssue       (parentId : Taxis.IssueId) (children : Array NewSubissueSpec) (reason : String)
+  /-- Read an issue's comment thread. Available to worker and reviewer roles alike: a reviewer
+      writes the verdict there, and the next worker to pick the issue up reads why. -/
+  | listIssueComments  (issueId : Taxis.IssueId)
+  /-- Add a comment to an issue's thread. -/
+  | commentIssue       (issueId : Taxis.IssueId) (body : String)
   -- review_issues
-  | listIssuesInReview (projectId : ProjectId)
-  | decideIssue        (issueId : IssueId) (decision : ReviewDecision) (notes : String)
+  | listIssuesInReview (projectId : Taxis.IssueId)
+  | decideIssue        (issueId : Taxis.IssueId) (decision : ReviewDecision) (notes : String)
   -- always-available (when attached to a project)
   | projectInfo
 deriving Repr, Inhabited
@@ -83,6 +92,26 @@ private def obj (props : List (String × Json)) (required : List String) : Json 
 /-- All optional tools provided by this module, paired with the permission
     label that gates them. The server filters by label against
     `state.allowedTools`. -/
+private def commentsToolDef : Json :=
+  Json.mkObj
+    [ ("name", "list_issue_comments")
+    , ("description",
+        "Read the comment thread on a taxis issue. This is where a reviewer records why an " ++
+        "issue was approved or rejected — read it before reworking an issue that came back.")
+    , ("inputSchema", obj [ ("issue_id", intProp "Issue ID") ] ["issue_id"]) ]
+
+private def commentIssueToolDef : Json :=
+  Json.mkObj
+    [ ("name", "comment_issue")
+    , ("description",
+        "Add a comment to a taxis issue's thread. Reviewers: record your review here. " ++
+        "This is the taxis issue tracker, not GitHub — use `comment` for the GitHub issue or " ++
+        "pull request the task was launched from.")
+    , ("inputSchema", obj
+        [ ("issue_id", intProp "Issue ID")
+        , ("body", strProp "Comment text (markdown allowed)") ]
+        ["issue_id", "body"]) ]
+
 def toolDefs : List (String × String × Json) :=
   [ -- manage_issues
     (manageIssuesPerm, "list_projects",
@@ -95,16 +124,16 @@ def toolDefs : List (String × String × Json) :=
         [ ("name", "list_issues")
         , ("description", "List issues within a project. Optional status / parent_id filters.")
         , ("inputSchema", obj
-            [ ("project_id", strProp "Project ID")
-            , ("status", strProp "Optional status filter (open|claimed|in_review|completed|abandoned)")
-            , ("parent_id", strProp "Optional parent issue ID; only direct children are returned") ]
+            [ ("project_id", intProp "Project ID")
+            , ("status", strProp "Optional status filter (open|claimed|completed|abandoned)")
+            , ("parent_id", intProp "Optional parent issue ID; only direct children are returned") ]
             ["project_id"]) ])
   , (manageIssuesPerm, "get_issue",
       Json.mkObj
         [ ("name", "get_issue")
         , ("description", "Get full issue detail (children + attached PRs).")
         , ("inputSchema", obj
-            [ ("issue_id", strProp "Issue ID") ]
+            [ ("issue_id", intProp "Issue ID") ]
             ["issue_id"]) ])
   , (manageIssuesPerm, "create_issue",
       Json.mkObj
@@ -115,16 +144,16 @@ def toolDefs : List (String × String × Json) :=
             "project default. Use dependency_ids to list issues that must be completed " ++
             "before this one is dispatched.")
         , ("inputSchema", obj
-            [ ("project_id", strProp "Project ID")
+            [ ("project_id", intProp "Project ID")
             , ("title", strProp "Issue title")
             , ("description", strProp "Issue description (markdown allowed)")
-            , ("parent_id", strProp "Optional parent issue ID")
+            , ("parent_id", intProp "Optional parent issue ID")
             , ("target_repo", strProp "Optional target repo (owner/name)")
             , ("target_branch", strProp "Optional target branch")
             , ("dependency_ids", Json.mkObj
                 [ ("type", "array")
                 , ("description", "Optional list of issue IDs that must be completed before this issue is dispatched")
-                , ("items", Json.mkObj [("type", "string")]) ]) ]
+                , ("items", Json.mkObj [("type", "integer")]) ]) ]
             ["project_id", "title", "description"]) ])
   , (manageIssuesPerm, "update_issue",
       Json.mkObj
@@ -133,16 +162,16 @@ def toolDefs : List (String × String × Json) :=
             "Update an issue's title, description, status, target, or dependencies. " ++
             "Pass dependency_ids to replace the full dependency list; omit to leave it unchanged.")
         , ("inputSchema", obj
-            [ ("issue_id", strProp "Issue ID")
+            [ ("issue_id", intProp "Issue ID")
             , ("title", strProp "New title")
             , ("description", strProp "New description")
-            , ("status", strProp "New status (open|claimed|in_review|completed|abandoned)")
+            , ("status", strProp "New status (open|claimed|completed|abandoned)")
             , ("target_repo", strProp "New target repo (owner/name)")
             , ("target_branch", strProp "New target branch")
             , ("dependency_ids", Json.mkObj
                 [ ("type", "array")
                 , ("description", "Replace the dependency list with these issue IDs (issues that must be completed before this one is dispatched)")
-                , ("items", Json.mkObj [("type", "string")]) ]) ]
+                , ("items", Json.mkObj [("type", "integer")]) ]) ]
             ["issue_id"]) ])
     -- work_issues
   , (workIssuesPerm, "list_open_issues",
@@ -150,7 +179,7 @@ def toolDefs : List (String × String × Json) :=
         [ ("name", "list_open_issues")
         , ("description", "List open (unclaimed) issues a worker can pick up.")
         , ("inputSchema", obj
-            [ ("project_id", strProp "Project ID")
+            [ ("project_id", intProp "Project ID")
             , ("target_repo", strProp "Optional: only issues whose effective target repo matches (owner/name)") ]
             ["project_id"]) ])
   , (workIssuesPerm, "claim_issue",
@@ -160,14 +189,14 @@ def toolDefs : List (String × String × Json) :=
             "Claim an open issue for this task. Returns the effective target repo and " ++
             "branch on success. Fails with 'already_claimed' if another task holds it.")
         , ("inputSchema", obj
-            [ ("issue_id", strProp "Issue ID") ]
+            [ ("issue_id", intProp "Issue ID") ]
             ["issue_id"]) ])
   , (workIssuesPerm, "release_claim",
       Json.mkObj
         [ ("name", "release_claim")
         , ("description", "Release a claim, returning the issue to the open pool.")
         , ("inputSchema", obj
-            [ ("issue_id", strProp "Issue ID")
+            [ ("issue_id", intProp "Issue ID")
             , ("reason", strProp "Free-text reason recorded in the response") ]
             ["issue_id", "reason"]) ])
   , (workIssuesPerm, "split_issue",
@@ -175,11 +204,11 @@ def toolDefs : List (String × String × Json) :=
         [ ("name", "split_issue")
         , ("description",
             "Decompose the issue this task currently holds into one or more sub-issues. " ++
-            "The parent moves to `blocked`, the claim is released, and the children become " ++
+            "The parent moves to `a container (it now has open children), the claim is released, and the children become " ++
             "open and pickable. Caller MUST hold the claim on `parent_id`. Each child " ++
             "inherits the parent's effective target unless target_repo + target_branch are set.")
         , ("inputSchema", obj
-            [ ("parent_id", strProp "ID of the issue this task currently holds")
+            [ ("parent_id", intProp "ID of the issue this task currently holds")
             , ("reason",    strProp "Why the issue needed to be split (recorded in the response)")
             , ("children",  Json.mkObj
                 [ ("type", "array")
@@ -197,31 +226,40 @@ def toolDefs : List (String × String × Json) :=
       Json.mkObj
         [ ("name", "attach_pr")
         , ("description",
-            "Attach a pull request to an issue and move it to in_review. " ++
+            "Attach a pull request to an issue. This is what puts it in front of a reviewer: " ++
+            "one is queued for any open issue with an unmerged PR attached. " ++
             "Call after create_pr returns the PR number.")
         , ("inputSchema", obj
-            [ ("issue_id", strProp "Issue ID")
+            [ ("issue_id", intProp "Issue ID")
             , ("repo", strProp "PR target repo (owner/name)")
             , ("number", intProp "PR number")
             , ("branch", strProp "PR head branch") ]
             ["issue_id", "repo", "number", "branch"]) ])
+  , (workIssuesPerm, "list_issue_comments", commentsToolDef)
+  , (reviewIssuesPerm, "list_issue_comments", commentsToolDef)
+  , (manageIssuesPerm, "list_issue_comments", commentsToolDef)
+  , (workIssuesPerm, "comment_issue", commentIssueToolDef)
+  , (reviewIssuesPerm, "comment_issue", commentIssueToolDef)
     -- review_issues
   , (reviewIssuesPerm, "list_issues_in_review",
       Json.mkObj
         [ ("name", "list_issues_in_review")
-        , ("description", "List issues currently in_review (i.e. with attached PRs awaiting decision).")
+        , ("description", "List issues awaiting review: open, with at least one attached pull request.")
         , ("inputSchema", obj
-            [ ("project_id", strProp "Project ID") ]
+            [ ("project_id", intProp "Project ID") ]
             ["project_id"]) ])
   , (reviewIssuesPerm, "decide_issue",
       Json.mkObj
         [ ("name", "decide_issue")
         , ("description",
-            "Approve or reject the issue under review. Approve enqueues a merger task " ++
-            "for the latest attached PR; reject returns the issue to open.")
+            "Decide on an issue under review. `approve` enqueues a merger for the latest " ++
+            "attached PR — the PR lands but the issue stays open, since one PR is not " ++
+            "necessarily the whole issue. `complete` marks the issue finished without merging " ++
+            "anything. `reject` returns it to open. All three record your notes as a review " ++
+            "comment on the issue.")
         , ("inputSchema", obj
-            [ ("issue_id", strProp "Issue ID")
-            , ("decision", strProp "approve | reject")
+            [ ("issue_id", intProp "Issue ID")
+            , ("decision", strProp "approve | complete | reject")
             , ("notes",    strProp "Reviewer notes") ]
             ["issue_id", "decision", "notes"]) ])
   ]
@@ -241,11 +279,8 @@ def projectInfoToolDef : Json :=
 private def issueStatusOfString? : String → Option IssueStatus
   | "open"      => some .open
   | "claimed"   => some .claimed
-  | "in_review" => some .inReview
-  | "blocked"   => some .blocked
   | "completed" => some .completed
   | "abandoned" => some .abandoned
-  | "rejected"  => some .rejected
   | _           => none
 
 private def parseTarget? (args : Json) : Except String (Option RepoTarget) := do
@@ -260,36 +295,35 @@ private def parseTarget? (args : Json) : Except String (Option RepoTarget) := do
     Except.error "target_repo and target_branch must be provided together"
 
 /-- Parse a `tools/call` for a project tool. Returns `none` if the tool name
-    is not one of ours (the server should fall through to its other tools). -/
+    is not one of ours (the server should fall through to its other tools).
+    `project_id`/`issue_id`/`parent_id`/`dependency_ids` are JSON integers (taxis's own id
+    convention), decoded via `Taxis.IssueId`/`Taxis.IssueId`'s `FromJson` — not strings. -/
 def tryParseToolCall (name : String) (args : Json) : Option (Except String ProjectTool) :=
   match name with
   | "list_projects" => some (.ok .listProjects)
   | "list_issues" =>
     some <| do
-      let pid ← args.getObjValAs? String "project_id"
+      let pid ← args.getObjValAs? Taxis.IssueId "project_id"
       let statusFilter := (args.getObjValAs? String "status" |>.toOption).bind issueStatusOfString?
-      let parentId : Option IssueId :=
-        args.getObjValAs? String "parent_id" |>.toOption |>.map (fun s => ⟨s⟩)
-      return .listIssues ⟨pid⟩ statusFilter parentId
+      let parentId := args.getObjValAs? Taxis.IssueId "parent_id" |>.toOption
+      return .listIssues pid statusFilter parentId
   | "get_issue" =>
     some <| do
-      let iid ← args.getObjValAs? String "issue_id"
-      return .getIssue ⟨iid⟩
+      let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
+      return .getIssue iid
   | "create_issue" =>
     some <| do
-      let pid     ← args.getObjValAs? String "project_id"
+      let pid     ← args.getObjValAs? Taxis.IssueId "project_id"
       let title   ← args.getObjValAs? String "title"
       let descr   ← args.getObjValAs? String "description"
-      let parent : Option IssueId :=
-        args.getObjValAs? String "parent_id" |>.toOption |>.map (fun s => ⟨s⟩)
+      let parent := args.getObjValAs? Taxis.IssueId "parent_id" |>.toOption
       let target  ← parseTarget? args
-      let dependencies : Array IssueId :=
-        (args.getObjValAs? (Array String) "dependency_ids" |>.toOption).getD #[]
-        |>.map (fun s => ⟨s⟩)
-      return .createIssue ⟨pid⟩ title descr parent target dependencies
+      let dependencies : Array Taxis.IssueId :=
+        (args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" |>.toOption).getD #[]
+      return .createIssue pid title descr parent target dependencies
   | "update_issue" =>
     some <| do
-      let iid ← args.getObjValAs? String "issue_id"
+      let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
       let title  := args.getObjValAs? String "title"       |>.toOption
       let descr  := args.getObjValAs? String "description" |>.toOption
       let status :=
@@ -297,37 +331,36 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | none => none
         | some s => issueStatusOfString? s
       let target ← parseTarget? args
-      let dependencies : Option (Array IssueId) :=
-        args.getObjValAs? (Array String) "dependency_ids" |>.toOption |>.map (·.map (⟨·⟩))
-      return .updateIssue ⟨iid⟩ title descr status target dependencies
+      let dependencies := args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" |>.toOption
+      return .updateIssue iid title descr status target dependencies
   | "list_open_issues" =>
     some <| do
-      let pid ← args.getObjValAs? String "project_id"
+      let pid ← args.getObjValAs? Taxis.IssueId "project_id"
       let mRepo := args.getObjValAs? String "target_repo" |>.toOption
       let target? : Option Repository ← match mRepo with
         | none => Except.ok none
         | some s => (Repository.parse s).map some
-      return .listOpenIssues ⟨pid⟩ target?
+      return .listOpenIssues pid target?
   | "claim_issue" =>
     some <| do
-      let iid ← args.getObjValAs? String "issue_id"
-      return .claimIssue ⟨iid⟩
+      let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
+      return .claimIssue iid
   | "release_claim" =>
     some <| do
-      let iid    ← args.getObjValAs? String "issue_id"
+      let iid    ← args.getObjValAs? Taxis.IssueId "issue_id"
       let reason ← args.getObjValAs? String "reason"
-      return .releaseClaim ⟨iid⟩ reason
+      return .releaseClaim iid reason
   | "attach_pr" =>
     some <| do
-      let iid    ← args.getObjValAs? String "issue_id"
+      let iid    ← args.getObjValAs? Taxis.IssueId "issue_id"
       let repoS  ← args.getObjValAs? String "repo"
       let number ← args.getObjValAs? Nat "number"
       let branch ← args.getObjValAs? String "branch"
       let repo   ← Repository.parse repoS
-      return .attachPr ⟨iid⟩ repo number branch
+      return .attachPr iid repo number branch
   | "split_issue" =>
     some <| do
-      let parentS ← args.getObjValAs? String "parent_id"
+      let parentId ← args.getObjValAs? Taxis.IssueId "parent_id"
       let reason  ← args.getObjValAs? String "reason"
       let arr     ← args.getObjValAs? (Array Json) "children"
       if arr.isEmpty then
@@ -338,21 +371,31 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
           let descr ← item.getObjValAs? String "description"
           let target ← parseTarget? item
           (Except.ok { title, description := descr, target } : Except String NewSubissueSpec)
-        return .splitIssue ⟨parentS⟩ children reason
+        return .splitIssue parentId children reason
+  | "list_issue_comments" =>
+    some <| do
+      let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
+      return .listIssueComments iid
+  | "comment_issue" =>
+    some <| do
+      let iid  ← args.getObjValAs? Taxis.IssueId "issue_id"
+      let body ← args.getObjValAs? String "body"
+      return .commentIssue iid body
   | "list_issues_in_review" =>
     some <| do
-      let pid ← args.getObjValAs? String "project_id"
-      return .listIssuesInReview ⟨pid⟩
+      let pid ← args.getObjValAs? Taxis.IssueId "project_id"
+      return .listIssuesInReview pid
   | "decide_issue" =>
     some <| do
-      let iid      ← args.getObjValAs? String "issue_id"
+      let iid      ← args.getObjValAs? Taxis.IssueId "issue_id"
       let decStr   ← args.getObjValAs? String "decision"
       let notes    ← args.getObjValAs? String "notes"
       let decision ← match decStr with
         | "approve" => Except.ok ReviewDecision.approve
         | "reject"  => Except.ok ReviewDecision.reject
-        | s         => Except.error s!"decision must be 'approve' or 'reject', got {repr s}"
-      return .decideIssue ⟨iid⟩ decision notes
+        | "complete" => Except.ok ReviewDecision.complete
+        | s => Except.error s!"decision must be 'approve', 'complete' or 'reject', got {repr s}"
+      return .decideIssue iid decision notes
   | "project_info" => some (.ok .projectInfo)
   | _ => none
 
@@ -377,19 +420,43 @@ structure Env where
   /-- Hook called by `decideIssue .approve` to enqueue the merger task.
       Receives (projectId, issueId, prRef). Returning `.ok ()` is success;
       `.error msg` is surfaced to the agent. -/
-  enqueueMerger : Option (ProjectId → IssueId → PRRef → IO (Except String String)) := none
+  enqueueMerger : Option (Taxis.IssueId → Taxis.IssueId → PRRef → IO (Except String String)) := none
   /-- Optional auto-reviewer hook (F1). Called by `attachPr` when the
       project has a `reviewer` template configured. Receives
       `(project, issueId, prRef, template)`. -/
   enqueueReviewer : Option
-    (Project → IssueId → PRRef → ReviewerTemplate → IO (Except String String)) := none
+    (Project → Taxis.IssueId → PRRef → ReviewerTemplate → IO (Except String String)) := none
   /-- Orchestra project this task belongs to. Used by `project_info`. -/
-  projectId : Option ProjectId := none
+  projectId : Option Taxis.IssueId := none
   /-- Orchestra issue this task is working on. Used by `project_info`. -/
-  issueId : Option IssueId := none
+  issueId : Option Taxis.IssueId := none
 
 private def deny (perm : String) : String :=
   s!"this task is not authorized for the {perm} tool group"
+
+/-- The issue bounding what this task may create or update: the root of its own project subtree
+    (`Project.projectRootOf`). Anchored on the task's issue when it has one, otherwise on its
+    project — a role dispatched without an issue (a planner, say) is still confined to its
+    project. `none` means the task is attached to neither and cannot be scoped at all. -/
+private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
+  match env.issueId, env.projectId with
+  | some iid, _ => return some (← projectRootOf iid)
+  | none, some pid => return some (← projectRootOf pid)
+  | none, none => return none
+
+/-- Reject a write that would land outside the task's subtree. Returns an error string to
+    surface, or `none` when the write is allowed. Reads are not scoped — see
+    `Project.Basic`'s "Write scoping". -/
+private def refuseOutsideScope (env : Env) (target : Taxis.IssueId) (what : String) :
+    IO (Option String) := do
+  match ← writeScopeRoot env with
+  | none =>
+    return some s!"cannot {what}: this task is attached to no project or issue, so there is no \
+      subtree to scope the change to"
+  | some root =>
+    if ← isWithinSubtree root target then return none
+    return some s!"cannot {what}: issue {target.toString} is outside this task's project \
+      subtree (root {root.toString}); manage_issues may only modify issues at or below it"
 
 private def has (env : Env) (perm : String) : Bool :=
   env.allowedTools.contains perm
@@ -400,21 +467,18 @@ private def renderTarget : RepoTarget → String
 private def issueStatusToString : IssueStatus → String
   | .open      => "open"
   | .claimed   => "claimed"
-  | .inReview  => "in_review"
-  | .blocked   => "blocked"
   | .completed => "completed"
   | .abandoned => "abandoned"
-  | .rejected  => "rejected"
 
 /-- Render an issue summary line (used in list responses). -/
 private def issueLine (i : Issue) : String :=
-  let parent := i.parentId.map (·.value) |>.getD "-"
-  s!"{i.id.value}  [{issueStatusToString i.status}]  parent={parent}  {i.title}"
+  let parent := i.parentId.map (·.toString) |>.getD "-"
+  s!"{i.id.toString}  [{issueStatusToString i.status}]  parent={parent}  {i.title}"
 
 /-- Render a project summary line. -/
 private def projectLine (p : Project) : String :=
   let target := p.defaultTarget.map renderTarget |>.getD "-"
-  s!"{p.id.value}  {p.name}  default={target}  ({p.createdAt})"
+  s!"{p.id.toString}  {p.name}  default={target}  ({p.createdAt})"
 
 private def joinLines (xs : Array String) : String :=
   String.join (xs.toList.intersperse "\n")
@@ -439,7 +503,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
   | .listIssues pid statusFilter parentId =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     let some _ ← loadProject pid
-      | return content s!"project {pid.value} not found" (isError := true)
+      | return content s!"project {pid.toString} not found" (isError := true)
     let mut issues ← loadIssues pid
     if let some s := statusFilter then issues := issues.filter (·.status == s)
     if let some p := parentId then issues := issues.filter (·.parentId == some p)
@@ -448,18 +512,18 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
   | .getIssue iid =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     match ← findIssue iid with
-    | none => return content s!"issue {iid.value} not found" (isError := true)
+    | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (project, i) =>
       let target := (effectiveTarget project i).map renderTarget |>.getD "-"
       let prs := i.attachedPRs.map (fun p => s!"  - {p.repo}#{p.number} (branch {p.branch})")
       let children ← childrenOf project.id i.id
-      let childLines := children.map (fun c => s!"  - {c.id.value}  [{issueStatusToString c.status}]  {c.title}")
+      let childLines := children.map (fun c => s!"  - {c.id.toString}  [{issueStatusToString c.status}]  {c.title}")
       let depsStr := if i.dependencies.isEmpty then "-"
-                     else String.intercalate ", " (i.dependencies.map (·.value)).toList
+                     else String.intercalate ", " (i.dependencies.map (·.toString)).toList
       let header : Array String := #[
-        s!"id:           {i.id.value}",
-        s!"project:      {project.id.value} ({project.name})",
-        s!"parent:       {i.parentId.map (·.value) |>.getD "-"}",
+        s!"id:           {i.id.toString}",
+        s!"project:      {project.id.toString} ({project.name})",
+        s!"parent:       {i.parentId.map (·.toString) |>.getD "-"}",
         s!"title:        {i.title}",
         s!"status:       {issueStatusToString i.status}",
         s!"target:       {target}",
@@ -471,29 +535,36 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       let mut body := header ++ prs
       if !children.isEmpty then body := body ++ #["children:"] ++ childLines
       body := body ++ #["description:"] ++ descrLines
+      let comments ← loadComments iid
+      if !comments.isEmpty then
+        let rendered ← comments.mapM renderComment
+        body := body ++ #["comments:"] ++ rendered
       return content (joinLines body)
   | .createIssue pid title descr parent target dependencies =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     let some project ← loadProject pid
-      | return content s!"project {pid.value} not found" (isError := true)
+      | return content s!"project {pid.toString} not found" (isError := true)
     if target.isNone && project.defaultTarget.isNone then
       return content
         "project has no default target; pass target_repo and target_branch" (isError := true)
+    -- A new issue is placed under `parent` when given, otherwise directly under the project;
+    -- either way that anchor is what has to sit inside this task's subtree.
+    if let some msg ← refuseOutsideScope env (parent.getD pid) "create an issue there" then
+      return content msg (isError := true)
+    -- The parent needs no status change: having an open child is what makes it a container,
+    -- and the dispatcher reads that off the tree (`Project.dispatchCandidates`).
     if let some parentId := parent then
-      match ← findIssue parentId with
-      | none => return content s!"parent issue {parentId.value} not found" (isError := true)
-      | some (_, parentIssue) =>
-        saveIssue { parentIssue with status := .blocked, updatedAt := now }
-    let iid ← freshIssueId
-    let issue : Issue :=
-      { id := iid, projectId := pid, parentId := parent, title, description := descr
-      , target, dependencies, createdAt := now, updatedAt := now }
-    saveIssue issue
-    return content s!"created issue {iid.value} in project {pid.value}"
+      if (← findIssue parentId).isNone then
+        return content s!"parent issue {parentId.toString} not found" (isError := true)
+    let issue ← createIssue pid title descr (parentId := parent) (target := target)
+      (dependencies := dependencies)
+    return content s!"created issue {issue.id.toString} in project {pid.toString}"
   | .updateIssue iid title descr status target dependencies =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
+    if let some msg ← refuseOutsideScope env iid "update that issue" then
+      return content msg (isError := true)
     match ← findIssue iid with
-    | none => return content s!"issue {iid.value} not found" (isError := true)
+    | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (_, i) =>
       let updated : Issue :=
         { i with
@@ -504,12 +575,12 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           dependencies := dependencies.getD i.dependencies
           updatedAt    := now }
       saveIssue updated
-      return content s!"updated issue {iid.value}"
+      return content s!"updated issue {iid.toString}"
   -- ---------------- work_issues ----------------
   | .listOpenIssues pid targetRepo? =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
     let some project ← loadProject pid
-      | return content s!"project {pid.value} not found" (isError := true)
+      | return content s!"project {pid.toString} not found" (isError := true)
     let issues ← loadIssues pid
     let openIssues := issues.filter (·.status == .open)
     let filtered := match targetRepo? with
@@ -528,17 +599,17 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     let some taskId := env.taskId
       | return content "no task id in context (cannot record claim)" (isError := true)
     match ← findIssue iid with
-    | none => return content s!"issue {iid.value} not found" (isError := true)
+    | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (project, i) =>
-      IO.println s!"  [mcp] claim_issue: {iid.value} \"{i.title}\""
+      IO.println s!"  [mcp] claim_issue: {iid.toString} \"{i.title}\""
       match ← tryClaim mgr project.id iid taskId env.agentBackend now env.series with
       | .acquired _ =>
         let target := (effectiveTarget project i).map renderTarget |>.getD ""
         IO.println s!"  [mcp] claim_issue: acquired (target={target})"
         let payload := Json.mkObj
           [ ("ok", true)
-          , ("issue_id",     Json.str iid.value)
-          , ("project_id",   Json.str project.id.value)
+          , ("issue_id",     ToJson.toJson iid)
+          , ("project_id",   ToJson.toJson project.id)
           , ("target",       Json.str target) ]
         return content payload.compress
       | .alreadyClaimed existing =>
@@ -556,39 +627,42 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     let some mgr := env.claimManager
       | return content "claim manager not available in this context" (isError := true)
     match ← findIssue iid with
-    | none => return content s!"issue {iid.value} not found" (isError := true)
+    | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (project, i) =>
-      IO.println s!"  [mcp] release_claim: {iid.value} \"{i.title}\" — {reason}"
-      let newStatus := match i.status with
-        | .blocked  => .blocked
-        | .inReview => .inReview
-        | _         => .open
+      IO.println s!"  [mcp] release_claim: {iid.toString} \"{i.title}\" — {reason}"
+      -- Nothing to preserve: whether the issue is under review is derived from its attached PRs,
+      -- not from a status, so releasing simply returns it to the open pool.
+      let newStatus : IssueStatus := .open
       let _ ← release mgr project.id iid newStatus now
-      return content s!"released claim on {iid.value} ({reason})"
+      return content s!"released claim on {iid.toString} ({reason})"
   | .attachPr iid repo number branch =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
     let some taskId := env.taskId
       | return content "no task id in context (cannot verify claim ownership)" (isError := true)
     match ← findIssue iid with
-    | none => return content s!"issue {iid.value} not found" (isError := true)
+    | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (project, i) =>
-      match ← loadClaim project.id iid with
+      match ← loadClaim iid with
       | none =>
-        return content s!"cannot attach PR to {iid.value}: issue is not claimed" (isError := true)
+        return content s!"cannot attach PR to {iid.toString}: issue is not claimed" (isError := true)
       | some claim =>
         if claim.taskId != taskId then
           return content
-            s!"cannot attach PR to {iid.value}: held by task {claim.taskId}, not this task"
+            s!"cannot attach PR to {iid.toString}: held by task {claim.taskId}, not this task"
             (isError := true)
         else
-          IO.println s!"  [mcp] attach_pr: {iid.value} \"{i.title}\" ← {repo}#{number} (branch {branch})"
+          IO.println s!"  [mcp] attach_pr: {iid.toString} \"{i.title}\" ← {repo}#{number} (branch {branch})"
           let pr : PRRef := { repo, number, branch, taskId := env.taskId }
-          let updated : Issue :=
-            { i with
-              attachedPRs := i.attachedPRs.push pr
-              status      := .inReview
-              updatedAt   := now }
-          saveIssue updated
+          -- Attach first: if this fails the issue stays claimed rather than looking review-ready
+          -- with no PR to review.
+          try
+            attachPR iid pr
+          catch e =>
+            return content s!"failed to attach {repo}#{number} to {iid.toString}: {e}"
+              (isError := true)
+          -- No status change: an issue is under review because it has an unmerged PR attached,
+          -- which is now true by virtue of the attach itself.
+          saveIssue { i with updatedAt := now }
           -- F1: if the project configures an auto-reviewer, enqueue it now.
           let reviewerNote ← match project.reviewer, env.enqueueReviewer with
             | some tmpl, some hook =>
@@ -601,7 +675,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
                 pure s!"; reviewer enqueue failed: {msg}"
             | _, _ => pure ""
           return content
-            s!"attached {repo}#{number} to {iid.value}; issue moved to in_review{reviewerNote}"
+            s!"attached {repo}#{number} to {iid.toString}; it is now awaiting review{reviewerNote}"
   | .splitIssue parentId children reason =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
     let some mgr := env.claimManager
@@ -609,70 +683,99 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     let some taskId := env.taskId
       | return content "no task id in context (cannot verify claim ownership)" (isError := true)
     match ← findIssue parentId with
-    | none => return content s!"issue {parentId.value} not found" (isError := true)
+    | none => return content s!"issue {parentId.toString} not found" (isError := true)
     | some (project, parent) =>
-      IO.println s!"  [mcp] split_issue: {parentId.value} \"{parent.title}\" → {children.size} sub-issues — {reason}"
+      IO.println s!"  [mcp] split_issue: {parentId.toString} \"{parent.title}\" → {children.size} sub-issues — {reason}"
       -- Caller must already hold the claim on this parent. We don't allow
       -- workers to split issues they don't own — that would let a stray
       -- agent rearrange someone else's work.
-      match ← loadClaim project.id parentId with
+      match ← loadClaim parentId with
       | none =>
-        return content s!"cannot split {parentId.value}: not currently claimed" (isError := true)
+        return content s!"cannot split {parentId.toString}: not currently claimed" (isError := true)
       | some claim =>
         if claim.taskId != taskId then
           return content
-            s!"cannot split {parentId.value}: held by task {claim.taskId}, not this task"
+            s!"cannot split {parentId.toString}: held by task {claim.taskId}, not this task"
             (isError := true)
         else
           let inheritedTarget := effectiveTarget project parent
-          let mut createdIds : Array String := #[]
+          let mut createdIds : Array Taxis.IssueId := #[]
           for spec in children do
-            let iid ← freshIssueId
-            let issue : Issue :=
-              { id := iid, projectId := project.id
-              , parentId := some parentId
-              , title := spec.title, description := spec.description
-              , target := spec.target <|> inheritedTarget
-              , createdAt := now, updatedAt := now }
-            saveIssue issue
-            IO.println s!"  [mcp] split_issue: created sub-issue {iid.value} \"{spec.title}\""
-            createdIds := createdIds.push iid.value
-          -- Move parent to .blocked and clear the claim. We don't reuse
-          -- `release` here because it sets status unconditionally; we want
-          -- `.blocked` specifically.
-          saveIssue { parent with status := .blocked, updatedAt := now }
-          let _ ← forceRelease mgr project.id parentId
+            let issue ← createIssue project.id spec.title spec.description
+              (parentId := some parentId) (target := spec.target <|> inheritedTarget)
+            IO.println s!"  [mcp] split_issue: created sub-issue {issue.id.toString} \"{spec.title}\""
+            createdIds := createdIds.push issue.id
+          -- Clear the claim without touching status: the new children are open, which is what
+          -- makes the parent a container as far as the dispatcher is concerned. `forceRelease`
+          -- rather than `release` because the latter sets a status unconditionally.
+          let _ ← forceRelease mgr parentId
           let payload := Json.mkObj
             [ ("ok",         true)
-            , ("parent_id",  Json.str parentId.value)
+            , ("parent_id",  ToJson.toJson parentId)
             , ("reason",     Json.str reason)
-            , ("created",    Json.arr (createdIds.map Json.str)) ]
+            , ("created",    Json.arr (createdIds.map ToJson.toJson)) ]
           return content payload.compress
+  | .listIssueComments iid =>
+    -- Offered under every group that lists it, so accept any of them here rather than a single
+    -- permission: the reviewer writes the thread and the worker has to be able to read it.
+    if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
+      return content (deny reviewIssuesPerm) (isError := true)
+    let comments ← loadComments iid
+    if comments.isEmpty then return content s!"No comments on issue {iid.toString}."
+    let rendered ← comments.mapM renderComment
+    return content (joinLines rendered)
+  | .commentIssue iid body =>
+    if !(has env workIssuesPerm || has env reviewIssuesPerm) then
+      return content (deny reviewIssuesPerm) (isError := true)
+    addComment iid body
+    IO.println s!"  [mcp] comment_issue: {iid.toString}"
+    return content s!"commented on issue {iid.toString}"
   -- ---------------- review_issues ----------------
   | .listIssuesInReview pid =>
     if !has env reviewIssuesPerm then return content (deny reviewIssuesPerm) (isError := true)
     let some _ ← loadProject pid
-      | return content s!"project {pid.value} not found" (isError := true)
-    let issues := (← loadIssues pid).filter (·.status == .inReview)
+      | return content s!"project {pid.toString} not found" (isError := true)
+    -- Derived, not a status: open issues carrying at least one attached PR. `loadIssues` leaves
+    -- attachedPRs empty for speed, so each open issue is re-fetched; and merge state is not
+    -- consulted here, so a PR merged by hand still shows until the issue is completed.
+    let mut issues : Array Issue := #[]
+    for i in (← loadIssues pid).filter (·.status == .open) do
+      if let some full ← loadIssue pid i.id then
+        if !full.attachedPRs.isEmpty then issues := issues.push full
     if issues.isEmpty then return content "No issues awaiting review."
     return content (joinLines (issues.map issueLine))
   | .decideIssue iid decision notes =>
     if !has env reviewIssuesPerm then return content (deny reviewIssuesPerm) (isError := true)
     match ← findIssue iid with
-    | none => return content s!"issue {iid.value} not found" (isError := true)
+    | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (project, i) =>
-      let decisionStr := match decision with | .approve => "approve" | .reject => "reject"
-      IO.println s!"  [mcp] decide_issue: {iid.value} \"{i.title}\" → {decisionStr} — {notes}"
+      let decisionStr := match decision with
+        | .approve => "approve" | .complete => "complete" | .reject => "reject"
+      IO.println s!"  [mcp] decide_issue: {iid.toString} \"{i.title}\" → {decisionStr} — {notes}"
       match decision with
       | .reject =>
+        -- The verdict belongs on the issue, not just in the tool response: the next worker to
+        -- pick this up needs to know why it came back, and the response is seen only by this
+        -- reviewer. Failing to record it must not fail the decision itself.
+        try addComment iid notes (review := some .requestChanges)
+        catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
         -- Move back to .open and clear any claim. Notes are echoed back; the
         -- comment tool is the right place to post them on the PR if desired.
         if let some mgr := env.claimManager then
           let _ ← release mgr project.id iid .open now
         else
           saveIssue { i with status := .open, updatedAt := now }
-        IO.println s!"  [mcp] decide_issue: {iid.value} moved to open"
-        return content s!"rejected {iid.value}: {notes}"
+        IO.println s!"  [mcp] decide_issue: {iid.toString} moved to open"
+        return content s!"rejected {iid.toString}: {notes}"
+      | .complete =>
+        try addComment iid notes (review := some .approve)
+        catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
+        if let some mgr := env.claimManager then
+          let _ ← release mgr project.id iid .completed now
+        else
+          saveIssue { i with status := .completed, updatedAt := now }
+        IO.println s!"  [mcp] decide_issue: {iid.toString} completed"
+        return content s!"completed {iid.toString}: {notes}"
       | .approve =>
         match i.attachedPRs.toList.reverse with
         | [] => return content "no attached PRs to merge" (isError := true)
@@ -684,30 +787,34 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
             match ← hook project.id iid pr with
             | .error msg => return content s!"failed to enqueue merger: {msg}" (isError := true)
             | .ok mergerTaskId =>
-              IO.println s!"  [mcp] decide_issue: {iid.value} approved; merger task {mergerTaskId} enqueued"
-              return content s!"approved {iid.value}; merger task {mergerTaskId} enqueued ({notes})"
+              try addComment iid notes (review := some .approve)
+              catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
+              IO.println s!"  [mcp] decide_issue: {iid.toString} approved; merger task {mergerTaskId} enqueued"
+              return content
+                s!"approved {iid.toString}; merger task {mergerTaskId} enqueued. The issue stays \
+                   open — use decide_issue with 'complete' when the work is finished. ({notes})"
   | .projectInfo =>
     IO.println "  [mcp] project_info"
     match env.projectId with
     | none => return content "this task is not attached to a project" (isError := true)
     | some pid =>
       match ← loadProject pid with
-      | none => return content s!"project {pid.value} not found" (isError := true)
+      | none => return content s!"project {pid.toString} not found" (isError := true)
       | some project =>
         let mut lines : Array String := #[
-          s!"project_id:   {project.id.value}",
+          s!"project_id:   {project.id.toString}",
           s!"project_name: {project.name}"
         ]
         match env.issueId with
         | none => lines := lines.push "issue:        none"
         | some iid =>
           match ← findIssue iid with
-          | none => lines := lines.push s!"issue_id:     {iid.value} (not found)"
+          | none => lines := lines.push s!"issue_id:     {iid.toString} (not found)"
           | some (_, issue) =>
-            lines := lines.push s!"issue_id:     {issue.id.value}"
+            lines := lines.push s!"issue_id:     {issue.id.toString}"
             lines := lines.push s!"issue_title:  {issue.title}"
             lines := lines.push s!"issue_status: {issueStatusToString issue.status}"
-            if let some claim ← loadClaim project.id iid then
+            if let some claim ← loadClaim iid then
               if some claim.taskId == env.taskId then
                 lines := lines.push s!"claim:        held by this task (since {claim.claimedAt})"
               else

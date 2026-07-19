@@ -1,12 +1,11 @@
 {
-  "name": "demo-dispatcher",
+  "name": "demo-label-dispatcher",
   "source": {
-    "type": "project-dispatcher",
-    "project_id": 42,
+    "type": "label-dispatcher",
+    "label": "agent-ready",
     "caps": {
       "implementor": 2,
-      "reviewer":    1,
-      "planner":     1
+      "reviewer":    1
     }
   },
   "action": {

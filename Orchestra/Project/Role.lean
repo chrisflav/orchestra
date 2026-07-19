@@ -83,8 +83,13 @@ structure Role where
   priority       : Nat           := 10
   budget         : Option Float  := none
   /-- Prompt body — supports {{project_id}}, {{project_name}}, {{instructions}},
-      and (when an issue is bound) {{issue_id}}, {{issue_title}},
-      {{target_repo}}, {{target_branch}}. Unrecognised placeholders pass through. -/
+      and (when an issue is bound) {{issue_id}}, {{issue_title}}, {{issue_description}},
+      {{issue_comments}}, {{target_repo}}, {{target_branch}}, {{pr_number}}, {{pr_branch}},
+      {{pr_repo}}.
+      Unrecognised placeholders pass through.
+
+      Worker templates should include {{issue_description}}: it is the only way the issue body
+      reaches an agent, since the tool that renders it (`get_issue`) needs `manage_issues`. -/
   promptTemplate : String
   /-- Optional auto-dispatch policy. `none` = manual-spawn only. -/
   dispatch       : Option DispatchPolicy := none
@@ -136,7 +141,7 @@ def globalRolesDir : IO System.FilePath := do
   | some p => return p
   | none   => return (← Dirs.configBase) / "roles"
 
-def projectRolesDir (pid : ProjectId) : IO System.FilePath := do
+def projectRolesDir (pid : Taxis.IssueId) : IO System.FilePath := do
   return (← projectDir pid) / "roles"
 
 private def roleFileName (name : String) : String := s!"{name}.json"
@@ -153,13 +158,13 @@ private def loadRoleFromFile (path : System.FilePath) : IO (Option Role) := do
 
 /-- Resolve a role by name. Project-scoped file wins over the global one;
     returns `none` only if neither file exists or both fail to parse. -/
-def loadRole (pid : ProjectId) (name : String) : IO (Option Role) := do
+def loadRole (pid : Taxis.IssueId) (name : String) : IO (Option Role) := do
   let projectPath := (← projectRolesDir pid) / roleFileName name
   if let some r ← loadRoleFromFile projectPath then return some r
   loadRoleFromFile ((← globalRolesDir) / roleFileName name)
 
 /-- Convenience for diagnostics: report the two paths that would be searched. -/
-def roleSearchPaths (pid : ProjectId) (name : String) :
+def roleSearchPaths (pid : Taxis.IssueId) (name : String) :
     IO (System.FilePath × System.FilePath) := do
   return ((← projectRolesDir pid) / roleFileName name,
           (← globalRolesDir)      / roleFileName name)
@@ -168,9 +173,22 @@ private def stripJsonExt (s : String) : Option String :=
   let ext := ".json"
   if s.endsWith ext then some (s.dropEnd ext.length).toString else none
 
+/-- Roles from the global directory only. Used by the project-independent dispatcher
+    (`Listener.SourceConfig.labelDispatcher`), whose issues can span projects — there is no single
+    project whose `roles/` directory would take precedence, so only globals apply there. -/
+def loadGlobalRoles : IO (Array Role) := do
+  let mut byName : Std.HashMap String Role := {}
+  let gdir ← globalRolesDir
+  if ← gdir.pathExists then
+    for entry in ← System.FilePath.readDir gdir do
+      if let some _ := stripJsonExt entry.fileName then
+        if let some r ← loadRoleFromFile entry.path then
+          byName := byName.insert r.name r
+  return byName.toArray.map (·.2)
+
 /-- All roles available for a project: project-scoped roles first, then any
     global roles whose names aren't already shadowed by a project file. -/
-def loadAllRoles (pid : ProjectId) : IO (Array Role) := do
+def loadAllRoles (pid : Taxis.IssueId) : IO (Array Role) := do
   let mut byName : Std.HashMap String Role := {}
   let pdir ← projectRolesDir pid
   if ← pdir.pathExists then
@@ -200,6 +218,13 @@ structure RenderVars where
   instructions : String
   issueId      : Option String := none
   issueTitle   : Option String := none
+  /-- The issue's body. Nothing else puts it in front of the agent: `get_issue` is the only tool
+      that renders it and that is gated on `manage_issues`, which worker roles do not have. -/
+  issueDescription : Option String := none
+  /-- The issue's comment thread. Carries a reviewer's reasoning to whoever picks the issue up
+      next, which matters most for a rejection: there is no rejected status, so the
+      request-changes review is the only record of what was wrong. -/
+  issueComments : Option String := none
   targetRepo   : Option String := none
   targetBranch : Option String := none
   prNumber     : Option String := none
@@ -216,6 +241,8 @@ def render (tmpl : String) (v : RenderVars) : String :=
     , ("{{instructions}}",  v.instructions)
     , ("{{issue_id}}",      v.issueId.getD "")
     , ("{{issue_title}}",   v.issueTitle.getD "")
+    , ("{{issue_description}}", v.issueDescription.getD "")
+    , ("{{issue_comments}}", v.issueComments.getD "")
     , ("{{target_repo}}",   v.targetRepo.getD "")
     , ("{{target_branch}}", v.targetBranch.getD "")
     , ("{{pr_number}}",     v.prNumber.getD "")
@@ -225,19 +252,26 @@ def render (tmpl : String) (v : RenderVars) : String :=
 
 /-- Build render vars for a project + optional issue. Pulls the effective
     target from `effectiveTarget` so per-issue overrides are honoured.
-    If the issue has attached PRs, the most recent one populates the pr_* vars. -/
+    If the issue has attached PRs, the most recent one populates the pr_* vars.
+
+    `targetOverride` mirrors `Listener.buildRoleEntry`'s: for label-dispatched issues the target
+    comes from taxis artifacts, and without threading it through here `{{target_repo}}` and
+    `{{target_branch}}` would render empty in the very prompts that need them. -/
 def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : String)
+    (targetOverride : Option RepoTarget := none) (comments : Option String := none)
     : RenderVars :=
   match issue? with
-  | none => { projectId := project.id.value, projectName := project.name, instructions }
+  | none => { projectId := project.id.toString, projectName := project.name, instructions }
   | some i =>
-    let target := effectiveTarget project i
+    let target := targetOverride <|> effectiveTarget project i
     let pr? := i.attachedPRs.toList.reverse.head?
-    { projectId    := project.id.value
+    { projectId    := project.id.toString
     , projectName  := project.name
     , instructions
-    , issueId      := some i.id.value
+    , issueId      := some i.id.toString
     , issueTitle   := some i.title
+    , issueDescription := some i.description
+    , issueComments := comments
     , targetRepo   := target.map (·.repo.toString)
     , targetBranch := target.map (·.branch)
     , prNumber     := pr?.map (fun p => toString p.number)
