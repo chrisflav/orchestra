@@ -136,7 +136,7 @@ Auto-dispatch listener:
 {
   "source": {
     "type": "project-dispatcher",
-    "project_id": "<pid>",
+    "project_id": 42,
     "caps": { "implementor": 2, "reviewer": 1, "planner": 1 }
   },
   "interval_seconds": 30

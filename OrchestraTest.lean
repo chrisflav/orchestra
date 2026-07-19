@@ -7,5 +7,6 @@ import OrchestraTest.WorkflowParserTest
 import OrchestraTest.ProjectClaimTest
 import OrchestraTest.ProjectFieldsTest
 import OrchestraTest.ProjectMetaTest
+import OrchestraTest.ExamplesTest
 import OrchestraTest.ProjectToolsTest
 import OrchestraTest.ProjectRoleTest
