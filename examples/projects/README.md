@@ -144,3 +144,52 @@ Auto-dispatch listener:
 ```
 
 Each tick the dispatcher counts queue entries `(status ∈ {pending, running}) ∧ projectId == this ∧ role == X`, and if `count < cap` and the role's trigger holds, enqueues exactly one new entry per role.
+
+### Project-independent dispatch
+
+`label-dispatcher` does the same thing without being tied to one project: it works on **every**
+taxis issue carrying a given label, wherever in the tracker it lives.
+
+```json
+{
+  "source": {
+    "type": "label-dispatcher",
+    "label": "agent-ready",
+    "caps": { "implementor": 2, "reviewer": 1 }
+  },
+  "interval_seconds": 30
+}
+```
+
+Because these issues have no orchestra project behind them, there is no `defaultTarget` to
+inherit. The target is read off taxis artifacts instead, walking from the issue up its parent
+chain and taking the **nearest** ancestor carrying each:
+
+| What | Artifact | Field |
+| --- | --- | --- |
+| Repository | `repository` | `url`, parsed for `owner/repo` |
+| Branch | `github-branch` | `branch` |
+
+So a project-level issue can carry the `repository` artifact once and every issue beneath it
+inherits it, while a single sub-issue can pin its own branch by carrying its own `github-branch`.
+
+Both are required. An issue carrying the label but missing either is **skipped with a warning**
+naming which half is missing — dispatching an agent at a guessed repository is worse than not
+dispatching:
+
+```
+[dispatcher] issue 57 is labelled 'agent-ready' but has no repository artifact
+  on it or any ancestor; skipping
+```
+
+Two further differences from `project-dispatcher`:
+
+- **Only global roles apply** (`<config>/roles/`). The issues can span projects, so no single
+  project's `roles/` directory takes precedence.
+- **Caps are scoped to the labelled set** — they bound concurrent work on labelled issues rather
+  than colliding with per-project dispatchers using the same role names.
+
+The ancestor carrying the `repository` artifact stands in for the project: it fills the queue
+entry's `project_id` and supplies `{{project_name}}` when the role prompt is rendered. Issues
+carrying the `t-project` label are skipped even if labelled, since they are containers rather
+than units of work.

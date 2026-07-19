@@ -343,7 +343,11 @@ Example — respond to issue comments containing a trigger word:
 
 Fields:
 
-- `source.type` — `"github-issues"`, `"github-comments"`, `"github-pr-reviews"`, or `"shell"`
+- `source.type` — one of `"github-issues"`, `"github-comments"`, `"github-pr-reviews"`,
+  `"github-labels"`, `"github-label-count"`, `"shell"`, or the two auto-dispatchers
+  `"project-dispatcher"` and `"label-dispatcher"` (documented in
+  [`examples/projects/README.md`](examples/projects/README.md) — the first works on one project,
+  the second on every issue carrying a given label, wherever it lives)
 - `source.repos` — list of `{"upstream": "...", "fork": "..."}` pairs
 - `source.trigger` — only events whose body contains this string are processed
 - `source.authorized_users` — list of GitHub logins that may trigger the listener; empty means allow everyone

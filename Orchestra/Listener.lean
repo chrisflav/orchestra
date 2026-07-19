@@ -50,6 +50,15 @@ inductive SourceConfig where
       Each tick the dispatcher counts active per-role queue entries and emits
       a synthetic event per role that is below its cap and whose trigger holds. -/
   | projectDispatcher (projectId : Taxis.IssueId) (caps : List (String × Nat))
+  /-- Auto-dispatch across *every* project: work on any taxis issue carrying `label`, wherever it
+      lives in the tracker. Same role templates and `caps` semantics as `projectDispatcher`; the
+      difference is only where the issue set and the target come from.
+
+      With no project behind these issues there is no `defaultTarget` to inherit, so each issue's
+      repository and branch are read off `repository` / `github-branch` artifacts on it or an
+      ancestor (`Project.artifactTarget`). An issue missing either is reported and skipped —
+      dispatching an agent at a guessed repository is worse than not dispatching. -/
+  | labelDispatcher   (label : String) (caps : List (String × Nat))
   /-- Fires whenever the number of open issues or pull requests with the given
       labels on a repository is strictly below `max`.  Emits at most one task per
       tick; the tick is skipped while a task from this listener is already pending
@@ -95,6 +104,11 @@ instance : ToJson SourceConfig where
     | .projectDispatcher pid caps =>
         Json.mkObj [("type", "project-dispatcher"),
                     ("project_id", ToJson.toJson pid),
+                    ("caps", Json.mkObj
+                       (caps.map (fun (n, c) => (n, Json.num c))))]
+    | .labelDispatcher label caps =>
+        Json.mkObj [("type", "label-dispatcher"),
+                    ("label", Json.str label),
                     ("caps", Json.mkObj
                        (caps.map (fun (n, c) => (n, Json.num c))))]
     | .githubLabelCount repos labels max kind =>
@@ -153,6 +167,13 @@ instance : FromJson SourceConfig where
         let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
           v.getNat?.toOption.map (k, ·)
         return .projectDispatcher pid caps
+    | "label-dispatcher" =>
+        let label ← j.getObjValAs? String "label"
+        let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
+        let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
+        let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
+          v.getNat?.toOption.map (k, ·)
+        return .labelDispatcher label caps
     | "github-label-count" =>
         let repos  ← parseRepos j
         let labels  := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
@@ -533,16 +554,22 @@ def dispatcherTick (input : DispatcherInput) : Array RoleSpawn := Id.run do
 
 /-- Build a queue entry for a role spawn. Returns `none` if the role refers
     to a missing target (multi-org project where neither the role's bound
-    issue nor the project default sets one). -/
+    issue nor the project default sets one).
+
+    `targetOverride` is used by the project-independent dispatcher, whose target comes from taxis
+    artifacts rather than from the project or the issue's own override — see
+    `Project.artifactTarget`. It wins over both; `none` keeps the ordinary resolution. -/
 def buildRoleEntry (project : Project.Project) (role : Project.Role)
-    (issue? : Option Project.Issue) (instructions : String := "") :
+    (issue? : Option Project.Issue) (instructions : String := "")
+    (targetOverride : Option Project.RepoTarget := none) :
     IO (Option Queue.QueueEntry) := do
-  let target := issue?.bind (Project.effectiveTarget project ·)
+  let target := targetOverride
+            <|> issue?.bind (Project.effectiveTarget project ·)
             <|> project.defaultTarget
   let some target' := target | return none
   let id ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
-  let vars   := Project.renderVarsFor project issue? instructions
+  let vars   := Project.renderVarsFor project issue? instructions targetOverride
   let prompt := Project.render role.promptTemplate vars
   return some
     { id, createdAt
@@ -816,6 +843,50 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
         | some iid => baseVars ++ [("issue_id", iid.toString)]
         | none     => baseVars
       ("", vars), none)
+
+  | .labelDispatcher label caps => do
+    let some (candidates, gaps) ← Project.issuesWithLabel label
+      | IO.eprintln s!"[dispatcher] label '{label}' does not exist on the taxis instance; \
+          skipping"; return (#[], none)
+    -- Report unroutable issues every tick rather than once: the fix is to attach an artifact in
+    -- taxis, and a line that scrolled past on daemon start is not going to prompt that.
+    for (iid, gap) in gaps do
+      match gap with
+      | .noRepository =>
+        IO.eprintln s!"[dispatcher] issue {iid.toString} is labelled '{label}' but has no \
+          repository artifact on it or any ancestor; skipping"
+      | .noBranch repo =>
+        IO.eprintln s!"[dispatcher] issue {iid.toString} is labelled '{label}' and resolves to \
+          {repo} but has no github-branch artifact on it or any ancestor; skipping"
+    let issues := candidates.map (·.1)
+    let roles ← Project.loadGlobalRoles
+    -- Cap counting is scoped to the labelled set, so the caps bound concurrent work *on labelled
+    -- issues* rather than colliding with per-project dispatchers running the same role names.
+    let labelled : Array Taxis.IssueId := issues.map (·.id)
+    let allEntries ← Queue.loadAllEntries
+    let mut active : Std.HashMap String Nat := {}
+    for e in allEntries do
+      let isActive := e.status == .pending || e.status == .running
+      if !isActive then continue
+      let some eIid := e.issueId | continue
+      if !labelled.contains eIid then continue
+      if let some r := e.role then
+        active := active.insert r ((active.getD r 0) + 1)
+    let spawns := dispatcherTick { activeByRole := active, issues, caps, roles }
+    return (spawns.filterMap fun s =>
+      -- Every spawn from this source is issue-bound: the target lives on the issue's artifacts,
+      -- so a role that didn't bind to one has nowhere to run.
+      match s.issueId with
+      | none => none
+      | some iid =>
+        match candidates.find? (fun (i, _) => i.id == iid) with
+        | none => none
+        | some (issue, target) =>
+          some ("", [ ("role_name",     s.roleName)
+                    , ("issue_id",      iid.toString)
+                    , ("project_id",    issue.projectId.toString)
+                    , ("target_repo",   target.repo.toString)
+                    , ("target_branch", target.branch) ]), none)
 
   | .githubLabelCount repos labels max kind => do
     let mut allEvents : Array (String × List (String × String)) := #[]

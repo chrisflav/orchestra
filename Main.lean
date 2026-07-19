@@ -711,6 +711,65 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                   Queue.saveEntry entry
                   IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} → {entry.id}"
               continue
+            | .labelDispatcher label _ =>
+              -- Same shape as the branch above, but the project and target come from the event
+              -- rather than the listener config: this source spans projects, and each issue's
+              -- target was resolved from its taxis artifacts at poll time
+              -- (Project.artifactTarget) rather than inherited from a project default.
+              let getVar (k : String) := vars.find? (·.1 == k) |>.map (·.2)
+              let roleName := getVar "role_name" |>.getD ""
+              let some issueId := getVar "issue_id" |>.bind Taxis.IssueId.parse?
+                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event without a \
+                    usable issue_id; skipping"
+                  continue
+              let some projectId := getVar "project_id" |>.bind Taxis.IssueId.parse?
+                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event without a \
+                    usable project_id; skipping"
+                  continue
+              let target? : Option Project.RepoTarget :=
+                match getVar "target_repo", getVar "target_branch" with
+                | some r, some b => (Repository.parse r).toOption.map ({ repo := ·, branch := b })
+                | _, _ => none
+              let some target := target?
+                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event for issue \
+                    {issueId.toString} carried no usable target; skipping"
+                  continue
+              let some project ← Project.loadProject projectId | continue
+              -- Global roles only: these issues can span projects, so no single project's
+              -- roles/ directory takes precedence (see Project.loadGlobalRoles).
+              let some role := (← Project.loadGlobalRoles).find? (·.name == roleName)
+                | IO.eprintln s!"  Listener '{lcfg.name}': no global role '{roleName}'; skipping"
+                  continue
+              let some issue ← Project.loadIssue projectId issueId | continue
+              let entryOpt ← Listener.buildRoleEntry project role (some issue)
+                (targetOverride := some target)
+              match entryOpt with
+              | none =>
+                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName} for issue \
+                  {issueId.toString}: no effective target"
+              | some entry =>
+                let needsClaim := match role.dispatch with
+                  | some d => d.preClaim
+                  | none   => false
+                let claimed ← if needsClaim then
+                    let now ← TaskStore.currentIso8601
+                    let agent := role.backend.getD "claude"
+                    match ← Project.tryClaim TaskRunner.globalClaimManager projectId issue.id
+                                             entry.id agent now none with
+                    | .acquired _ => pure true
+                    | .alreadyClaimed e =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: issue \
+                        {issue.id.toString} already claimed by {e.taskId}"
+                      pure false
+                    | .invalid r =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: {r}"
+                      pure false
+                  else pure true
+                if claimed then
+                  Queue.saveEntry entry
+                  IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} for issue \
+                    {issue.id.toString} ({label}) → {entry.id}"
+              continue
             | _ => pure ()
             if let some wfPath := liveCfg.action.workflowPath then
               -- Concert mode: parse the YAML, apply template vars, start a concert fiber.

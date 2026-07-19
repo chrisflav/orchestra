@@ -168,6 +168,19 @@ private def stripJsonExt (s : String) : Option String :=
   let ext := ".json"
   if s.endsWith ext then some (s.dropEnd ext.length).toString else none
 
+/-- Roles from the global directory only. Used by the project-independent dispatcher
+    (`Listener.SourceConfig.labelDispatcher`), whose issues can span projects — there is no single
+    project whose `roles/` directory would take precedence, so only globals apply there. -/
+def loadGlobalRoles : IO (Array Role) := do
+  let mut byName : Std.HashMap String Role := {}
+  let gdir ← globalRolesDir
+  if ← gdir.pathExists then
+    for entry in ← System.FilePath.readDir gdir do
+      if let some _ := stripJsonExt entry.fileName then
+        if let some r ← loadRoleFromFile entry.path then
+          byName := byName.insert r.name r
+  return byName.toArray.map (·.2)
+
 /-- All roles available for a project: project-scoped roles first, then any
     global roles whose names aren't already shadowed by a project file. -/
 def loadAllRoles (pid : Taxis.IssueId) : IO (Array Role) := do
@@ -225,13 +238,18 @@ def render (tmpl : String) (v : RenderVars) : String :=
 
 /-- Build render vars for a project + optional issue. Pulls the effective
     target from `effectiveTarget` so per-issue overrides are honoured.
-    If the issue has attached PRs, the most recent one populates the pr_* vars. -/
+    If the issue has attached PRs, the most recent one populates the pr_* vars.
+
+    `targetOverride` mirrors `Listener.buildRoleEntry`'s: for label-dispatched issues the target
+    comes from taxis artifacts, and without threading it through here `{{target_repo}}` and
+    `{{target_branch}}` would render empty in the very prompts that need them. -/
 def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : String)
+    (targetOverride : Option RepoTarget := none)
     : RenderVars :=
   match issue? with
   | none => { projectId := project.id.toString, projectName := project.name, instructions }
   | some i =>
-    let target := effectiveTarget project i
+    let target := targetOverride <|> effectiveTarget project i
     let pr? := i.attachedPRs.toList.reverse.head?
     { projectId    := project.id.toString
     , projectName  := project.name

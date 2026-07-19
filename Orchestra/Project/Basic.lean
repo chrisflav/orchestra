@@ -496,6 +496,111 @@ def findIssue (iid : Taxis.IssueId) : IO (Option (Project × Issue)) := do
     | none => return none
     | some project => return some (project, ← toIssue ids project.id detail.issue detail.attachedArtifacts)
 
+/-! ## Artifact-derived targets
+
+The project-independent dispatcher (`Listener.SourceConfig.labelDispatcher`) works on issues
+picked out by a label, with no orchestra `Project` behind them and so no `defaultTarget` to
+inherit. Their target is read off taxis artifacts instead, walking up the parent chain:
+
+* the repository comes from a `repository` artifact (`{ url, name? }`, see
+  `Taxis.Plugins.Standard`), whose URL is parsed for the `owner/repo` pair;
+* the branch comes from a `github-branch` artifact (`{ owner, repo, branch }`, see
+  `Taxis.Plugins.Github`).
+
+Each is taken from the *nearest* ancestor carrying it, starting at the issue itself, so a
+sub-issue can pin its own branch while inheriting the repository from the project above it. Both
+are required — a labelled issue missing either is skipped rather than guessed at, since
+dispatching an agent at the wrong repository or branch is worse than not dispatching. -/
+
+/-- The `owner/repo` in a repository artifact's `url`, e.g.
+    `https://github.com/leanprover/lean4` (with or without a trailing `.git` or slash). -/
+def repositoryOfArtifactUrl (url : String) : Option Repository :=
+  let trimmed := (url.splitOn "://").getLast!
+  let parts := (trimmed.splitOn "/").filter (!·.isEmpty)
+  match parts with
+  | _host :: owner :: repo :: _ =>
+    let repo := if repo.endsWith ".git" then (repo.dropEnd 4).toString else repo
+    if owner.isEmpty || repo.isEmpty then none else some { owner, name := repo }
+  | _ => none
+
+/-- Why `artifactTarget` could not produce a target — carried so the caller can say which half
+    is missing rather than emitting one vague "no target" line. -/
+inductive TargetGap where
+  | noRepository
+  | noBranch (repo : Repository)
+deriving Repr, BEq
+
+/-- An artifact-derived target, plus the ancestor the `repository` artifact was found on. That
+    ancestor stands in for the "project" a label-dispatched issue belongs to: it is what fills
+    `QueueEntry.projectId` and supplies `{{project_name}}` when rendering the role prompt. -/
+structure ArtifactTarget where
+  target      : RepoTarget
+  /-- Issue carrying the `repository` artifact — may be the dispatched issue itself. -/
+  repoOwner   : Taxis.IssueId
+deriving Repr
+
+/-- Resolve an issue's `RepoTarget` from `repository` + `github-branch` artifacts on it or any
+    ancestor (nearest wins). See this section's docs. -/
+def artifactTarget (iid : Taxis.IssueId) : IO (Except TargetGap ArtifactTarget) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let rec walk (id : Taxis.IssueId) (repo? : Option (Repository × Taxis.IssueId))
+      (branch? : Option String) :
+      Nat → IO (Option (Repository × Taxis.IssueId) × Option String)
+    | 0 => pure (repo?, branch?)
+    | fuel + 1 => do
+      match ← Orchestra.Taxis.getIssueDetail cfg id with
+      | .error _ => pure (repo?, branch?)
+      | .ok detail =>
+        let arts := detail.attachedArtifacts
+        let repo? := repo? <|> (arts.findSome? fun a =>
+          if a.kind == "repository" then
+            ((a.payload.getObjValAs? String "url").toOption.bind repositoryOfArtifactUrl).map (·, id)
+          else none)
+        let branch? := branch? <|> (arts.findSome? fun a =>
+          if a.kind == "github-branch" then (a.payload.getObjValAs? String "branch").toOption
+          else none)
+        if repo?.isSome && branch?.isSome then pure (repo?, branch?)
+        else match detail.issue.parent with
+          | none => pure (repo?, branch?)
+          | some p => walk p repo? branch? fuel
+  match ← walk iid none none maxAncestorDepth with
+  | (none, _) => return .error .noRepository
+  | (some (repo, _), none) => return .error (.noBranch repo)
+  | (some (repo, owner), some branch) =>
+    return .ok { target := { repo, branch }, repoOwner := owner }
+
+/-- Every issue carrying `labelName`, regardless of project — the issue set the
+    project-independent dispatcher works from. `none` means no such label exists on the tracker
+    (distinct from "the label exists and nothing carries it", which is `some #[]`); the label is
+    looked up rather than created, since a dispatcher configured against a typo'd label should
+    report that, not silently conjure it.
+
+    `projectId` on each returned issue is the ancestor carrying the `repository` artifact, so
+    issues from different projects can appear side by side; issues whose target can't be resolved
+    are omitted along with the reason, for the caller to report. -/
+def issuesWithLabel (labelName : String) :
+    IO (Option (Array (Issue × RepoTarget) × Array (Taxis.IssueId × TargetGap))) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  let labels ← unwrap (← Orchestra.Taxis.listLabels cfg)
+  let some label := labels.find? (·.name == labelName) | return none
+  let raws ← unwrap (← Orchestra.Taxis.listIssues cfg (label := some label.id))
+  let mut ok : Array (Issue × RepoTarget) := #[]
+  let mut gaps : Array (Taxis.IssueId × TargetGap) := #[]
+  for raw in raws do
+    -- Skip the project markers themselves: a `t-project` issue carrying the trigger label is a
+    -- container, not a unit of work.
+    if raw.labels.contains ids.project then continue
+    match ← artifactTarget raw.id with
+    | .error gap => gaps := gaps.push (raw.id, gap)
+    | .ok at' =>
+      -- Re-fetched (rather than reusing `raw`) to pick up attached PRs and the artifact-derived
+      -- project id. One extra GET per labelled issue; taxis has no batch issue-detail endpoint,
+      -- the same limitation `loadIssues` already documents.
+      if let some issue ← loadIssue at'.repoOwner raw.id then
+        ok := ok.push (issue, at'.target)
+  return some (ok, gaps)
+
 /-! ## Hierarchy traversal (B1: parentId-only) -/
 
 /-- Direct children of `parent` within `pid`. -/

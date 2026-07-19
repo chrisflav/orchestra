@@ -8,5 +8,6 @@ import OrchestraTest.ProjectClaimTest
 import OrchestraTest.ProjectFieldsTest
 import OrchestraTest.ProjectMetaTest
 import OrchestraTest.ExamplesTest
+import OrchestraTest.LabelDispatcherTest
 import OrchestraTest.ProjectToolsTest
 import OrchestraTest.ProjectRoleTest
