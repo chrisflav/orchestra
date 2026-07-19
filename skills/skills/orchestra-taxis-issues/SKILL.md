@@ -91,8 +91,10 @@ Ids are **integers**, taxis's own convention — `42`, not `"42"`.
 Put the actual task in the `description`. It is what a worker agent is shown; a title alone leaves
 it guessing.
 
-`dependency_ids` on an issue lists issues that must be completed before it is dispatched. Use it
-for real ordering constraints rather than encoding them in prose.
+`dependency_ids` lists issues that must be finished before this one is dispatched. A dependency
+blocks only while it is still **open** — completing or abandoning it unblocks the dependent, so
+abandoning work does not strand everything downstream. Use this for real ordering constraints
+rather than encoding them in prose.
 
 ### Writes are confined to your project subtree
 

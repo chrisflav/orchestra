@@ -206,7 +206,6 @@ def dispatcherEmitsAtMostOnePerRolePerTick : Test := do
     { activeByRole := {}, issues, caps := [("implementor", 10)], roles := #[role] }).size
   TestM.assertEqual count 1 (msg := "≤1 spawn per role per tick (gradual ramp)")
 
-end OrchestraTest.ProjectRole
 
 /-- The comment thread reaches an agent only through the prompt for worker roles: reading it needs
     a tool call the agent has to know to make, and a rejection lives nowhere else now that there
@@ -233,3 +232,49 @@ def shippedWorkerTemplatesCarryTheThread : Test := do
     | .ok role =>
       TestM.assert ((role.promptTemplate.splitOn "{{issue_comments}}").length > 1)
         s!"the shipped {name} template must carry the issue comment thread"
+
+/-! ## Dependency gating
+
+    `openIds` carries which issues are still open; a dependency blocks exactly while it is in
+    there. Deriving that from `issues` instead would be wrong, because that set is open-only —
+    every completed dependency would look unsatisfied and nothing with a dependency would ever
+    dispatch. -/
+
+private def depRole : Role :=
+  { name := "implementor", permissions := ["work_issues"]
+  , promptTemplate := "x"
+  , dispatch := some { trigger := .hasOpenIssues, max := 1 } }
+
+private def firstSpawnId (issues : Array Issue) (openIds : Array Taxis.IssueId) : Option String :=
+  (dispatcherTick { activeByRole := {}, issues, openIds
+                  , caps := [("implementor", 1)], roles := #[depRole] })[0]?
+    |>.bind (·.issueId) |>.map (·.toString)
+
+@[test]
+def openDependencyBlocksDispatch : Test := do
+  let project := fixtureProject
+  let blocked := fixtureIssue 102 project .open (dependencies := #[⟨101⟩])
+  TestM.assertEqual (firstSpawnId #[blocked] #[⟨101⟩]) none
+    (msg := "dependency still open, so not dispatched")
+
+@[test]
+def satisfiedDependencyAllowsDispatch : Test := do
+  let project := fixtureProject
+  let ready := fixtureIssue 102 project .open (dependencies := #[⟨101⟩])
+  -- 101 absent from openIds: completed or abandoned, either way it no longer blocks.
+  TestM.assertEqual (firstSpawnId #[ready] #[]) (some "102")
+    (msg := "dependency no longer open, so dispatched")
+
+/-- The regression this guards: with the dependency set derived from the (open-only) candidate
+    list, a completed dependency was indistinguishable from a missing one and every issue with a
+    dependency was blocked forever. -/
+@[test]
+def dependenciesDoNotBlockPermanently : Test := do
+  let project := fixtureProject
+  let a := fixtureIssue 101 project .open
+  let b := fixtureIssue 102 project .open (dependencies := #[⟨101⟩])
+  -- While 101 is open only 101 is dispatchable; once it closes, 102 becomes so.
+  TestM.assertEqual (firstSpawnId #[a, b] #[⟨101⟩]) (some "101") (msg := "the unblocked one first")
+  TestM.assertEqual (firstSpawnId #[b] #[]) (some "102") (msg := "and 102 once 101 is done")
+
+end OrchestraTest.ProjectRole

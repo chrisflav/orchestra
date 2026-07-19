@@ -626,6 +626,9 @@ structure LabelDispatchSets where
   reviewable : Array (Issue × RepoTarget)
   /-- Issues in scope whose target could not be resolved, with the reason. -/
   gaps       : Array (Taxis.IssueId × TargetGap)
+  /-- Every issue in the tracker that is still open, in scope or not. Dependencies may point
+      anywhere, so answering "is this dependency still open" needs the whole picture. -/
+  openIds    : Array Taxis.IssueId
 
 def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
   let cfg ← Orchestra.Taxis.getConfig
@@ -651,7 +654,8 @@ def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
       if let some issue ← loadIssue at'.repoOwner raw.id then
         if workIds.contains raw.id.val then work := work.push (issue, at'.target)
         if !issue.attachedPRs.isEmpty then reviewable := reviewable.push (issue, at'.target)
-  return some { work, reviewable, gaps }
+  let openIds := (all.filter (fun i => i.state == .open)).map (·.id)
+  return some { work, reviewable, gaps, openIds }
 
 /-! ## Comments
 

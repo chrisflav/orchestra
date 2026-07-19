@@ -17,7 +17,7 @@ error.
 | Project | A taxis issue carrying the `t-project` label. `Project.name`/`.description` are the issue's `title`/`description`. |
 | Issue | A taxis issue whose `parent` is the project's issue (root issues) or another orchestra issue (sub-issues created by `split_issue`). |
 | Issue status (`open`/`claimed`/`completed`/`abandoned`) | taxis `state` (`open`/`closed`/`completed`) plus the single `o-claimed` label; `open` without it is `open`, `closed` is `abandoned`. Three conditions have no status of their own and are read from the data: **decomposed** (has open children), **awaiting review** (open with an unmerged pull request attached), and **rejected** (latest review comment asks for changes). |
-| Dependencies | taxis's native issue-dependency graph — no separate plumbing. |
+| Dependencies | taxis's native issue-dependency graph — no separate plumbing. A dependency holds its dependent back only while it is still open; completed *or* abandoned releases it. |
 | Claim (which task currently holds an issue) | A `session`-kind artifact on the issue (`{task_id, agent, series?, claimed_at}`) — "claimed" means the issue has one. |
 | Attached PR | A `github-pr`-kind artifact on the issue. |
 | `RepoTarget` override / reviewer template | Not a native taxis field — encoded as a JSON blob in a trailing ` ```orchestra-meta ` fenced block appended to the issue's description, stripped before a human sees it. |

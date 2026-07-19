@@ -514,6 +514,14 @@ structure DispatcherInput where
       still have a pull request of its own that needs reviewing, and merge state is resolved by
       the caller since it costs a GitHub call. -/
   reviewable   : Array Project.Issue := #[]
+  /-- Ids of issues that are still open — neither completed nor abandoned. A dependency blocks
+      its dependent exactly while it appears here.
+
+      Kept separate from `issues` because that set is open-only: deriving "which dependencies are
+      done" from it would find nothing done, and every issue with a dependency would be blocked
+      forever. Ids absent from this set do not block, so a dependency the caller cannot see (one
+      in a project it did not fetch) is treated as satisfied rather than blocking indefinitely. -/
+  openIds      : Array Taxis.IssueId := #[]
   /-- Caps from the listener config: role name → maximum concurrent. -/
   caps         : List (String × Nat)
   /-- Roles available for this project (project files override globals).
@@ -540,16 +548,16 @@ def dispatcherTick (input : DispatcherInput) : Array RoleSpawn := Id.run do
     let some dispatch := role.dispatch | continue
     match dispatch.trigger with
     | .hasOpenIssues =>
-      -- Pick the first open issue not already in `spawns` (so we don't try
-      -- to spawn two workers for the same issue in one tick).
-      -- Skip issues whose dependencies are not yet all completed.
+      -- Pick the first open issue not already in `spawns` (so we don't try to spawn two workers
+      -- for the same issue in one tick), skipping any whose dependencies are still open. A
+      -- dependency that is completed *or abandoned* no longer blocks: abandoning work is a
+      -- decision that it will not happen, and treating it as forever-unsatisfied would strand
+      -- everything downstream.
       let alreadyTargeted : Array String := spawns.filterMap fun s => s.issueId.map (·.toString)
-      let completedIds : Array String := input.issues.filterMap fun i =>
-        if i.status == .completed then some i.id.toString else none
       let some issue := input.issues.find? (fun i =>
         i.status == .open &&
         !alreadyTargeted.contains i.id.toString &&
-        i.dependencies.all (fun dep => completedIds.contains dep.toString))
+        i.dependencies.all (fun dep => !input.openIds.contains dep))
         | continue
       spawns := spawns.push { roleName, issueId := some issue.id }
     | .hasInReviewIssues =>
@@ -884,8 +892,9 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       if e.projectId != some pid then continue
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
+    let openIds := (issues.filter (fun i => i.status != .completed && i.status != .abandoned)).map (·.id)
     let reviewable ← awaitingReview ghToken (← withAttachedPRs pid issues)
-    let spawns := dispatcherTick { activeByRole := active, issues, reviewable, caps, roles }
+    let spawns := dispatcherTick { activeByRole := active, issues, reviewable, openIds, caps, roles }
     -- Emit synthetic events. eventId is empty so the listener-state dedup
     -- doesn't accumulate (each tick is fresh; the cap is the dedup mechanism).
     return (spawns.map fun s =>
