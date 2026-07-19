@@ -58,7 +58,6 @@ private def parseTargetFlags? (p : Parsed) : Except String (Option RepoTarget) :
 private def issueStatusOfString? : String → Option IssueStatus
   | "open"      => some .open
   | "claimed"   => some .claimed
-  | "in_review" => some .inReview
   | "completed" => some .completed
   | "abandoned" => some .abandoned
   | "rejected"  => some .rejected
@@ -67,7 +66,6 @@ private def issueStatusOfString? : String → Option IssueStatus
 private def issueStatusToString : IssueStatus → String
   | .open      => "open"
   | .claimed   => "claimed"
-  | .inReview  => "in_review"
   | .completed => "completed"
   | .abandoned => "abandoned"
   | .rejected  => "rejected"
@@ -617,7 +615,7 @@ private def issueListCmd : Cmd := `[Cli|
   "List issues in a project."
 
   FLAGS:
-    status : String; "Filter by status: open|claimed|in_review|completed|abandoned"
+    status : String; "Filter by status: open|claimed|completed|abandoned|rejected"
 
   ARGS:
     "project-id" : String; "Project ID"

@@ -16,13 +16,13 @@ error.
 | --- | --- |
 | Project | A taxis issue carrying the `t-project` label. `Project.name`/`.description` are the issue's `title`/`description`. |
 | Issue | A taxis issue whose `parent` is the project's issue (root issues) or another orchestra issue (sub-issues created by `split_issue`). |
-| Issue status (`open`/`claimed`/`in_review`/`completed`/`abandoned`/`rejected`) | taxis `state` (`open`/`closed`/`completed`) plus at most one status label (`o-claimed`, `o-in-review`, `o-rejected`); `open` state with none of those labels is `open`, `closed` is `abandoned`. A decomposed parent has no status of its own — it is recognised by having open children. |
+| Issue status (`open`/`claimed`/`completed`/`abandoned`/`rejected`) | taxis `state` (`open`/`closed`/`completed`) plus at most one status label (`o-claimed`, `o-rejected`); `open` state with neither label is `open`, `closed` is `abandoned`. Two conditions have no status of their own and are read from the data instead: a decomposed parent is one with open children, and an issue awaiting review is an open one carrying an unmerged pull request. |
 | Dependencies | taxis's native issue-dependency graph — no separate plumbing. |
 | Claim (which task currently holds an issue) | A `session`-kind artifact on the issue (`{task_id, agent, series?, claimed_at}`) — "claimed" means the issue has one. |
 | Attached PR | A `github-pr`-kind artifact on the issue. |
 | `RepoTarget` override / reviewer template | Not a native taxis field — encoded as a JSON blob in a trailing ` ```orchestra-meta ` fenced block appended to the issue's description, stripped before a human sees it. |
 
-`o-claimed`/`o-in-review`/`o-rejected`/`t-project` are created automatically (if
+`o-claimed`/`o-rejected`/`t-project` are created automatically (if
 missing) the first time they're needed, so nothing needs to be pre-provisioned on the taxis side
 beyond the instance itself and an actor with permission to manage labels (an admin — see
 "Configuring taxis").
@@ -58,7 +58,12 @@ Tool permission groups (set via the task config's `tools` list):
 
 - `manage_issues` — plan agents: list / create / update issues + sub-issues.
 - `work_issues` — worker agents: list open issues, claim, attach PR, release, split into sub-issues.
-- `review_issues` — reviewer agents: list in-review, approve / reject.
+- `review_issues` — reviewer agents: list issues awaiting review, approve / complete / reject.
+
+A reviewer is queued for **any open issue with an unmerged pull request attached**, including one
+with children — a container can have a PR of its own. Merge state comes from GitHub, so an issue
+whose PR was merged by hand stops being queued too. `approve` lands the PR and leaves the issue
+open; `complete` is the separate decision that the issue's work is done.
 
 Reviews are recorded on the taxis issue's comment thread: `decide_issue` posts its `notes` there
 automatically as a native review comment carrying the approve / request-changes verdict, and `comment_issue` / `list_issue_comments` cover the rest. Reading is available to
@@ -87,7 +92,7 @@ value in `secrets.json` (`$XDG_CONFIG_HOME/orchestra/secrets.json`) rather than 
 The token must be an API token (`POST /api/me/tokens` while authenticated in the taxis UI, or
 `GET|POST /actors/:id/tokens` as an admin to mint one for a bot actor — see taxis's own README) —
 not a session-login token. Its actor needs **admin** rights on the taxis instance: creating the
-`t-project`/`o-claimed`/`o-in-review`/`o-rejected` labels on first use requires it.
+`t-project`/`o-claimed`/`o-rejected` labels on first use requires it.
 
 Without a `taxis` section, `orchestra project`/`orchestra issue`/`manage_issues`/`work_issues`/
 `review_issues` all fail with a clear "taxis is not configured" error; every other orchestra

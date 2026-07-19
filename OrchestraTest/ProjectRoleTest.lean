@@ -135,19 +135,22 @@ def dispatcherSpawnsWorkerWhenOpenIssueAndCapAllows : Test := do
 @[test]
 def dispatcherBindsReviewerToInReviewIssue : Test := do
   let project := fixtureProject
-  let issues := #[fixtureIssue 101 project .open, fixtureIssue 102 project .inReview]
+  let issues := #[fixtureIssue 101 project .open]
+  -- Awaiting review is no longer a status: the caller resolves it (open issue, unmerged PR
+  -- attached) and hands the result in as `reviewable`.
+  let reviewable := #[fixtureIssue 102 project .open]
   let role : Role :=
     { name := "reviewer", permissions := ["review_issues"]
     , promptTemplate := "review"
     , dispatch := some { trigger := .hasInReviewIssues, max := 1, preClaim := false } }
   let result := dispatcherTick
-    { activeByRole := {}, issues, caps := [("reviewer", 1)], roles := #[role] }
+    { activeByRole := {}, issues, reviewable, caps := [("reviewer", 1)], roles := #[role] }
   TestM.assertEqual result.size 1 (msg := "exactly one reviewer spawn")
   match result[0]? with
   | some s =>
     TestM.assert s.issueId.isSome "reviewer spawn must bind to an issue"
     TestM.assertEqual (s.issueId.map (·.toString)) (some "102")
-      (msg := "bound to the in-review issue, not the open one")
+      (msg := "bound to the reviewable issue, not the one a worker would take")
   | none => TestM.fail "expected one spawn"
 
 /-- No in-review issue means no reviewer, bound or otherwise. -/
@@ -160,8 +163,8 @@ def dispatcherSkipsReviewerWithoutInReviewIssues : Test := do
     , dispatch := some { trigger := .hasInReviewIssues, max := 1 } }
   let result := dispatcherTick
     { activeByRole := {}, issues := #[fixtureIssue 101 project .open]
-    , caps := [("reviewer", 1)], roles := #[role] }
-  TestM.assert result.isEmpty "nothing in review, so no reviewer"
+    , reviewable := #[], caps := [("reviewer", 1)], roles := #[role] }
+  TestM.assert result.isEmpty "nothing awaiting review, so no reviewer"
 
 @[test]
 def dispatcherRespectsCap : Test := do

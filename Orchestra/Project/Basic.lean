@@ -73,7 +73,6 @@ def prRefArtifactPayload (pr : PRRef) : Json :=
 inductive IssueStatus where
   | open
   | claimed
-  | inReview
   | completed
   | abandoned
   /-- PR failed the merger's validation check; not picked up again automatically. -/
@@ -84,7 +83,6 @@ instance : ToJson IssueStatus where
   toJson
     | .open      => "open"
     | .claimed   => "claimed"
-    | .inReview  => "in_review"
     | .completed => "completed"
     | .abandoned => "abandoned"
     | .rejected  => "rejected"
@@ -93,7 +91,6 @@ instance : FromJson IssueStatus where
   fromJson?
     | .str "open"      => .ok .open
     | .str "claimed"   => .ok .claimed
-    | .str "in_review" => .ok .inReview
     | .str "completed" => .ok .completed
     | .str "abandoned" => .ok .abandoned
     | .str "rejected"  => .ok .rejected
@@ -170,8 +167,12 @@ A project id and an issue id are therefore both plain `Taxis.IssueId` — there 
 metadata blob appended to the taxis issue's `description`, behind a machine-readable marker
 (a trailing fenced ` ```orchestra-meta ` block), parsed back out on load and stripped before a
 human ever sees the description. `IssueStatus` has no native field either: it's `state` (open /
-closed / completed) plus at most one dedicated status label (`o-claimed`, `o-in-review`,
-`o-rejected` — `open`/`completed`/`abandoned` need no label, see `statusOf`/`labelsFor`).
+closed / completed) plus at most one dedicated status label (`o-claimed`, `o-rejected` —
+`open`/`completed`/`abandoned` need no label, see `statusOf`/`labelsFor`).
+
+There is likewise no "in review" status. An issue is under review when it is open and carries an
+attached pull request that has not been merged — read from the tree and from GitHub rather than
+from a label that something has to remember to set and clear.
 
 There is deliberately no "blocked" status. A parent that has been decomposed is recognised by
 still having open children (`dispatchCandidates`), which needs no label to maintain and cannot
@@ -214,7 +215,6 @@ def decodeMeta (raw : String) : String × Json :=
 
 private structure StatusLabelIds where
   claimed  : Orchestra.Taxis.LabelId
-  inReview : Orchestra.Taxis.LabelId
   rejected : Orchestra.Taxis.LabelId
   project  : Orchestra.Taxis.LabelId
 
@@ -234,7 +234,6 @@ private def statusLabelIds : IO StatusLabelIds := do
       | .error e => throw (.userError s!"taxis: failed to ensure label '{name}': {e}")
     let ids : StatusLabelIds :=
       { claimed  := ← ensure "o-claimed"
-        inReview := ← ensure "o-in-review"
         rejected := ← ensure "o-rejected"
         project  := ← ensure "t-project" }
     statusLabelIdsRef.set (some ids)
@@ -248,7 +247,6 @@ private def statusOf (ids : StatusLabelIds) (state : Orchestra.Taxis.IssueState)
   | .closed => .abandoned
   | .open =>
     if labels.contains ids.claimed then .claimed
-    else if labels.contains ids.inReview then .inReview
     else if labels.contains ids.rejected then .rejected
     else .open
 
@@ -262,11 +260,10 @@ private def stateOf : IssueStatus → Orchestra.Taxis.IssueState
     any) — always exactly zero or one of the three is present afterward. -/
 private def labelsFor (ids : StatusLabelIds) (current : Array Orchestra.Taxis.LabelId) (status : IssueStatus) :
     Array Orchestra.Taxis.LabelId :=
-  let statusIds := #[ids.claimed, ids.inReview, ids.rejected]
+  let statusIds := #[ids.claimed, ids.rejected]
   let cleared := current.filter (fun l => !statusIds.contains l)
   match status with
   | .claimed  => cleared.push ids.claimed
-  | .inReview => cleared.push ids.inReview
   | .rejected => cleared.push ids.rejected
   | .open | .completed | .abandoned => cleared
 
@@ -580,15 +577,10 @@ def artifactTarget (iid : Taxis.IssueId) : IO (Except TargetGap ArtifactTarget) 
       with the actual tree.
 
     Pure, and the entire selection policy — everything else in `issuesWithLabel` is fetching. -/
-def dispatchCandidates (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Taxis.LabelId) :
+def inScopeOpenIssues (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Taxis.LabelId) :
     Array Orchestra.Taxis.Issue :=
   let byId : Std.HashMap Int64 Orchestra.Taxis.Issue :=
     Std.HashMap.ofList (all.toList.map fun i => (i.id.val, i))
-  let hasOpenChildren : Std.HashMap Int64 Unit :=
-    Std.HashMap.ofList (all.toList.filterMap fun i =>
-      match i.state with
-      | .open => i.parent.map (·.val, ())
-      | _ => none)
   let rec inScope (i : Orchestra.Taxis.Issue) : Nat → Bool
     | 0 => false
     | fuel + 1 =>
@@ -598,11 +590,22 @@ def dispatchCandidates (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Ta
         | some p => match byId.get? p.val with
           | some parent => inScope parent fuel
           | none => false
-  -- Only open issues are candidates. Without this a completed issue stays "in scope" forever —
-  -- it still inherits the label and has no open children — so every tick would re-resolve its
-  -- target and, if it has no artifacts, warn about it again.
-  all.filter fun i =>
-    i.state == .open && inScope i all.size && !hasOpenChildren.contains i.id.val
+  -- Only open issues. Without this a completed issue stays "in scope" forever — it still
+  -- inherits the label — so every tick would re-resolve its target and, if it has no artifacts,
+  -- warn about it again.
+  all.filter fun i => i.state == .open && inScope i all.size
+
+/-- `inScopeOpenIssues` minus containers: the set a *worker* may be dispatched onto. Reviewers use
+    `inScopeOpenIssues` directly, since an issue with children can still have a pull request of
+    its own awaiting review. -/
+def dispatchCandidates (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Taxis.LabelId) :
+    Array Orchestra.Taxis.Issue :=
+  let hasOpenChildren : Std.HashMap Int64 Unit :=
+    Std.HashMap.ofList (all.toList.filterMap fun i =>
+      match i.state with
+      | .open => i.parent.map (·.val, ())
+      | _ => none)
+  (inScopeOpenIssues all label).filter fun i => !hasOpenChildren.contains i.id.val
 
 /-- Every issue carrying `labelName`, regardless of project — the issue set the
     project-independent dispatcher works from. `none` means no such label exists on the tracker
@@ -614,8 +617,17 @@ def dispatchCandidates (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Ta
     issues from different projects can appear side by side; issues whose target can't be resolved
     are omitted along with the reason, for the caller to report — every exclusion is reported,
     since an issue that silently never dispatches gives you nothing to debug. -/
-def issuesWithLabel (labelName : String) :
-    IO (Option (Array (Issue × RepoTarget) × Array (Taxis.IssueId × TargetGap))) := do
+structure LabelDispatchSets where
+  /-- Leaves: what a worker role may be dispatched onto. -/
+  work       : Array (Issue × RepoTarget)
+  /-- Open in-scope issues carrying at least one attached pull request, *including* containers —
+      an issue with children can still have a PR of its own that needs reviewing. Whether those
+      PRs are actually still unmerged is the caller's to check, since it costs a GitHub call. -/
+  reviewable : Array (Issue × RepoTarget)
+  /-- Issues in scope whose target could not be resolved, with the reason. -/
+  gaps       : Array (Taxis.IssueId × TargetGap)
+
+def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
   let cfg ← Orchestra.Taxis.getConfig
   let labels ← unwrap (← Orchestra.Taxis.listLabels cfg)
   let some label := labels.find? (·.name == labelName) | return none
@@ -623,9 +635,13 @@ def issuesWithLabel (labelName : String) :
   -- deciding whether an issue is in scope needs its ancestors, and deciding whether it is a leaf
   -- needs everyone else's parent pointers. One list call plus in-memory work.
   let all ← unwrap (← Orchestra.Taxis.listIssues cfg)
-  let mut ok : Array (Issue × RepoTarget) := #[]
+  let workIds := (dispatchCandidates all label.id).map (·.id.val)
+  let mut work : Array (Issue × RepoTarget) := #[]
+  let mut reviewable : Array (Issue × RepoTarget) := #[]
   let mut gaps : Array (Taxis.IssueId × TargetGap) := #[]
-  for raw in dispatchCandidates all label.id do
+  -- Walk the wider set once: workers are the leaf subset of it, and reviewables are those with a
+  -- PR attached, so both come out of the same fetches.
+  for raw in inScopeOpenIssues all label.id do
     match ← artifactTarget raw.id with
     | .error gap => gaps := gaps.push (raw.id, gap)
     | .ok at' =>
@@ -633,8 +649,9 @@ def issuesWithLabel (labelName : String) :
       -- project id. One extra GET per candidate; taxis has no batch issue-detail endpoint, the
       -- same limitation `loadIssues` already documents.
       if let some issue ← loadIssue at'.repoOwner raw.id then
-        ok := ok.push (issue, at'.target)
-  return some (ok, gaps)
+        if workIds.contains raw.id.val then work := work.push (issue, at'.target)
+        if !issue.attachedPRs.isEmpty then reviewable := reviewable.push (issue, at'.target)
+  return some { work, reviewable, gaps }
 
 /-! ## Comments
 

@@ -58,8 +58,9 @@ Once the PR is open (via `create_pr` — see the `orchestra-pull-requests` skill
 attach_pr(issue_id: 57, repo: "owner/name", number: 123, branch: "my-branch")
 ```
 
-This is what moves the issue into review and, if the project configures one, enqueues a reviewer.
-Opening a PR without attaching it leaves the issue looking unstarted.
+Attaching is what puts the issue in front of a reviewer: the dispatcher queues one for any open
+issue carrying a pull request that is not yet merged. Opening a PR without attaching it leaves the
+issue looking unstarted and nobody will review it.
 
 You must hold the claim on the issue to attach to it.
 
@@ -126,10 +127,20 @@ GitHub issue or pull request the task was launched from — a different system, 
 
 ```
 list_issues_in_review(project_id: 42)
-decide_issue(issue_id: 57, decision: "approve" | "reject", notes: "...")
+decide_issue(issue_id: 57, decision: "approve" | "complete" | "reject", notes: "...")
 ```
 
-Approving enqueues a merger task for the latest attached PR. Rejecting returns the issue to open.
+| Decision | Effect |
+| --- | --- |
+| `approve` | Enqueues the merger for the latest attached PR. The PR lands; **the issue stays open.** |
+| `complete` | Marks the issue finished. Merges nothing. |
+| `reject` | Returns the issue to open. |
+
+Approving is a verdict on the *pull request*, not on the issue: one PR is rarely the whole issue,
+and an issue may collect several. So approve when the code should land, and `complete` separately
+once the issue's actual goal is met — which may be after several approved PRs, or immediately
+after one.
+
 Judge the PR against what its issue asked for, which `get_issue` will show you.
 
 `decide_issue` records your `notes` as a **review comment** on the issue automatically, carrying

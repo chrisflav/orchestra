@@ -3,6 +3,7 @@ import Orchestra.Config
 import Orchestra.TaskStore
 import Orchestra.Queue
 import Orchestra.Project
+import Orchestra.GitHub
 
 open Lean (Json FromJson ToJson)
 
@@ -506,8 +507,13 @@ structure DispatcherInput where
   /-- Currently active queue entries (status pending|running) for this project,
       grouped by role name. Only roles that appear in `caps` need to be counted. -/
   activeByRole : Std.HashMap String Nat := {}
-  /-- Issues for the project. Used to evaluate role triggers. -/
+  /-- Issues a worker may be dispatched onto. -/
   issues       : Array Project.Issue
+  /-- Issues awaiting review: open, with an unmerged pull request attached. Kept separate from
+      `issues` because the two sets differ — a container with children is not work, but it can
+      still have a pull request of its own that needs reviewing, and merge state is resolved by
+      the caller since it costs a GitHub call. -/
+  reviewable   : Array Project.Issue := #[]
   /-- Caps from the listener config: role name → maximum concurrent. -/
   caps         : List (String × Nat)
   /-- Roles available for this project (project files override globals).
@@ -547,22 +553,49 @@ def dispatcherTick (input : DispatcherInput) : Array RoleSpawn := Id.run do
         | continue
       spawns := spawns.push { roleName, issueId := some issue.id }
     | .hasInReviewIssues =>
-      -- Bind the issue, like `hasOpenIssues` does. A reviewer used to spawn unbound, which left
-      -- the label-dispatcher unable to place it: that source takes an entry's repository and
-      -- branch from the issue's own artifacts, so a spawn with no issue had no target and was
-      -- dropped — reviewers were never dispatched there at all. Binding is safe for the claim
-      -- protocol because reviewer roles set `pre_claim: false`; nothing claims the issue.
+      -- Bound to the issue being reviewed, like `hasOpenIssues` binds the one being worked. Safe
+      -- for the claim protocol because reviewer roles set `pre_claim: false`; nothing claims it.
+      -- Drawn from `reviewable` rather than `issues`, so a container with a pull request of its
+      -- own still gets reviewed even though no worker would be dispatched onto it.
       let alreadyTargeted : Array String := spawns.filterMap fun s => s.issueId.map (·.toString)
-      let some issue := input.issues.find? (fun i =>
-        i.status == .inReview && !alreadyTargeted.contains i.id.toString)
+      let some issue := input.reviewable.find? (fun i =>
+        !alreadyTargeted.contains i.id.toString)
         | continue
       spawns := spawns.push { roleName, issueId := some issue.id }
     | .idle =>
-      let hasOpen     := input.issues.any (·.status == .open)
-      let hasInReview := input.issues.any (·.status == .inReview)
-      if !hasOpen && !hasInReview then
+      let hasOpen := input.issues.any (·.status == .open)
+      if !hasOpen && input.reviewable.isEmpty then
         spawns := spawns.push { roleName }
   return spawns
+
+/-- Of `issues` (whose `attachedPRs` must already be populated), those still awaiting review:
+    open, and carrying at least one pull request that is not merged.
+
+    The merge check is a GitHub call per pull request per tick, which is why it lives here rather
+    than in the pure selection. `isPrMerged` answers `false` when it cannot tell, so an
+    unreachable GitHub queues a reviewer that finds nothing to do rather than silently dropping
+    review of real work. -/
+def awaitingReview (ghToken : String) (issues : Array Project.Issue) :
+    IO (Array Project.Issue) := do
+  let mut out : Array Project.Issue := #[]
+  for i in issues do
+    if i.status != .open || i.attachedPRs.isEmpty then continue
+    let mut anyUnmerged := false
+    for pr in i.attachedPRs do
+      unless anyUnmerged do
+        unless ← GitHub.isPrMerged ghToken pr.repo pr.number do anyUnmerged := true
+    if anyUnmerged then out := out.push i
+  return out
+
+/-- Re-fetch `issues` with their attached pull requests. `Project.loadIssues` leaves `attachedPRs`
+    empty for speed, so the review path has to ask for detail; only open issues are worth it. -/
+def withAttachedPRs (pid : Taxis.IssueId) (issues : Array Project.Issue) :
+    IO (Array Project.Issue) := do
+  let mut out : Array Project.Issue := #[]
+  for i in issues do
+    if i.status != .open then continue
+    if let some full ← Project.loadIssue pid i.id then out := out.push full
+  return out
 
 /-- Build a queue entry for a role spawn. Returns `none` if the role refers
     to a missing target (multi-org project where neither the role's bound
@@ -846,7 +879,8 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       if e.projectId != some pid then continue
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
-    let spawns := dispatcherTick { activeByRole := active, issues, caps, roles }
+    let reviewable ← awaitingReview ghToken (← withAttachedPRs pid issues)
+    let spawns := dispatcherTick { activeByRole := active, issues, reviewable, caps, roles }
     -- Emit synthetic events. eventId is empty so the listener-state dedup
     -- doesn't accumulate (each tick is fresh; the cap is the dedup mechanism).
     return (spawns.map fun s =>
@@ -857,9 +891,10 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       ("", vars), none)
 
   | .labelDispatcher label caps => do
-    let some (candidates, gaps) ← Project.issuesWithLabel label
+    let some sets ← Project.issuesWithLabel label
       | IO.eprintln s!"[dispatcher] label '{label}' does not exist on the taxis instance; \
           skipping"; return (#[], none)
+    let gaps := sets.gaps
     -- Report unroutable issues every tick rather than once: the fix is to attach an artifact in
     -- taxis, and a line that scrolled past on daemon start is not going to prompt that.
     for (iid, gap) in gaps do
@@ -870,11 +905,15 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       | .noBranch repo =>
         IO.eprintln s!"[dispatcher] issue {iid.toString} is in scope for '{label}' and \
           resolves to {repo} but has no github-branch artifact on it or any ancestor; skipping"
-    let issues := candidates.map (·.1)
+    let issues := sets.work.map (·.1)
+    -- An attached PR that is already merged needs no review. Checked here rather than in the
+    -- selection because it is a GitHub call per PR; `isPrMerged` answers false when it cannot
+    -- tell, which queues a reviewer that finds nothing rather than dropping review of real work.
+    let reviewable ← awaitingReview ghToken (sets.reviewable.map (·.1))
     let roles ← Project.loadGlobalRoles
     -- Cap counting is scoped to the labelled set, so the caps bound concurrent work *on labelled
     -- issues* rather than colliding with per-project dispatchers running the same role names.
-    let labelled : Array Taxis.IssueId := issues.map (·.id)
+    let labelled : Array Taxis.IssueId := issues.map (·.id) ++ reviewable.map (·.id)
     let allEntries ← Queue.loadAllEntries
     let mut active : Std.HashMap String Nat := {}
     for e in allEntries do
@@ -898,7 +937,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       match s.issueId with
       | none => none
       | some iid =>
-        match candidates.find? (fun (i, _) => i.id == iid) with
+        match (sets.work ++ sets.reviewable).find? (fun (i, _) => i.id == iid) with
         | none => none
         | some (issue, target) =>
           some ("", [ ("role_name",     s.roleName)

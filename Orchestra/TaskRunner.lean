@@ -137,7 +137,10 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
     TaskStore.saveTask { initialRecord with status := .failed }
     throw (.userError s!"gh pr merge {prRef} failed")
   IO.println s!"  [merger] merged {prRef}\n{mergeOut}"
-  Project.saveIssue { issue with status := .completed, updatedAt := now }
+  -- Merging a pull request does not finish the issue. An issue can carry several PRs, and
+  -- approving one says "this should land", not "the work is done" — completing is a separate
+  -- decision a reviewer makes with `decide_issue complete`. The issue stays open, and since its
+  -- PR is now merged the dispatcher stops queueing reviewers for it.
   let _ ← Project.forceRelease globalClaimManager iid
   TaskStore.saveTask { initialRecord with status := .completed }
 
@@ -492,17 +495,16 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | some (.error _)         => .failed
       | _                       => if usageLimitHit then .unfinished else .completed
   TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
-  -- Release the orchestra-issue claim on terminal status. If the worker
-  -- already moved the issue to .inReview via attach_pr, leave that status
-  -- alone and only delete the lock file (forceRelease). Otherwise hand the
-  -- issue back to the open pool so another worker can pick it up.
+  -- Release the orchestra-issue claim on terminal status. A worker that succeeded and attached a
+  -- PR leaves the issue awaiting review, so only drop the lock (forceRelease) and leave its
+  -- status alone; anything else hands the issue back to the open pool for another worker.
   match ioTask.projectId, ioTask.issueId with
   | some _pid, some iid =>
     match ← Project.findIssue iid with
     | some (project, issue) =>
       let now ← TaskStore.currentIso8601
       let succeeded := finalStatus matches .completed
-      if succeeded && issue.status == .inReview then
+      if succeeded && !issue.attachedPRs.isEmpty then
         let _ ← Project.forceRelease globalClaimManager iid
       else
         let _ ← Project.release globalClaimManager project.id iid .open now

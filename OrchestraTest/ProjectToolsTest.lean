@@ -46,11 +46,11 @@ private def jsonContains (j : Json) (needle : String) : Bool :=
 
 @[test]
 def parseListIssuesWithStatus : Test := do
-  let args := Json.mkObj [("project_id", Json.num 7), ("status", "in_review")]
+  let args := Json.mkObj [("project_id", Json.num 7), ("status", "claimed")]
   match tryParseToolCall "list_issues" args with
   | some (.ok (.listIssues pid sf _)) =>
     TestM.assertEqual pid.val (7 : Int64) (msg := "project id")
-    TestM.assert (sf == some .inReview) "status filter parsed"
+    TestM.assert (sf == some .claimed) "status filter parsed"
   | other => TestM.fail s!"unexpected parse: {repr other}"
 
 @[test]
@@ -137,8 +137,10 @@ def attachPrMovesToInReview : Test := do
             (.attachPr issue.id { owner := "o", name := "r" } 42 "feature/x")
   let updated ← loadIssue project.id issue.id
   cleanup project #[issue]
-  TestM.assert (jsonContains r "moved to in_review") "attach_pr should mention in_review transition"
-  TestM.assertEqual (updated.map (·.status)) (some .inReview) (msg := "issue status flips to in_review")
+  TestM.assert (jsonContains r "awaiting review") "attach_pr should say the issue awaits review"
+  -- No status flip any more: an issue awaits review because it has an unmerged PR attached.
+  TestM.assertEqual (updated.map (·.status)) (some .open) (msg := "status is unchanged")
+  TestM.assertEqual (updated.map (·.attachedPRs.size)) (some 1) (msg := "the PR is attached")
 
 @[test]
 def decideRejectClearsClaim : Test := do
@@ -234,8 +236,8 @@ def releaseClaimAfterAttachPrPreservesInReview : Test := do
   let _ ← evalProjectTool env (.releaseClaim issue.id "done for now")
   let updated ← loadIssue project.id issue.id
   cleanup project #[issue]
-  TestM.assertEqual (updated.map (·.status)) (some .inReview)
-    (msg := "releasing claim after attach_pr should keep status in_review")
+  TestM.assertEqual (updated.map (·.status)) (some .open)
+    (msg := "releasing a claim returns the issue to open; its attached PR is what marks it for review")
 
 @[test]
 def splitIssueRequiresOwnership : Test := do

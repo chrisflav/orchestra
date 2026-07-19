@@ -24,7 +24,11 @@ def workIssuesPerm   : String := "work_issues"
 def reviewIssuesPerm : String := "review_issues"
 
 inductive ReviewDecision where
+  /-- The pull request should land. Enqueues the merger; the issue stays open, because merging a
+      PR is not the same as finishing the issue — see `complete`. -/
   | approve
+  /-- The issue's work is done. Marks it completed without merging anything. -/
+  | complete
   | reject
 deriving Repr, Inhabited
 
@@ -121,7 +125,7 @@ def toolDefs : List (String × String × Json) :=
         , ("description", "List issues within a project. Optional status / parent_id filters.")
         , ("inputSchema", obj
             [ ("project_id", intProp "Project ID")
-            , ("status", strProp "Optional status filter (open|claimed|in_review|completed|abandoned|rejected)")
+            , ("status", strProp "Optional status filter (open|claimed|completed|abandoned|rejected)")
             , ("parent_id", intProp "Optional parent issue ID; only direct children are returned") ]
             ["project_id"]) ])
   , (manageIssuesPerm, "get_issue",
@@ -161,7 +165,7 @@ def toolDefs : List (String × String × Json) :=
             [ ("issue_id", intProp "Issue ID")
             , ("title", strProp "New title")
             , ("description", strProp "New description")
-            , ("status", strProp "New status (open|claimed|in_review|completed|abandoned|rejected)")
+            , ("status", strProp "New status (open|claimed|completed|abandoned|rejected)")
             , ("target_repo", strProp "New target repo (owner/name)")
             , ("target_branch", strProp "New target branch")
             , ("dependency_ids", Json.mkObj
@@ -222,7 +226,8 @@ def toolDefs : List (String × String × Json) :=
       Json.mkObj
         [ ("name", "attach_pr")
         , ("description",
-            "Attach a pull request to an issue and move it to in_review. " ++
+            "Attach a pull request to an issue. This is what puts it in front of a reviewer: " ++
+            "one is queued for any open issue with an unmerged PR attached. " ++
             "Call after create_pr returns the PR number.")
         , ("inputSchema", obj
             [ ("issue_id", intProp "Issue ID")
@@ -239,7 +244,7 @@ def toolDefs : List (String × String × Json) :=
   , (reviewIssuesPerm, "list_issues_in_review",
       Json.mkObj
         [ ("name", "list_issues_in_review")
-        , ("description", "List issues currently in_review (i.e. with attached PRs awaiting decision).")
+        , ("description", "List issues awaiting review: open, with at least one attached pull request.")
         , ("inputSchema", obj
             [ ("project_id", intProp "Project ID") ]
             ["project_id"]) ])
@@ -247,11 +252,14 @@ def toolDefs : List (String × String × Json) :=
       Json.mkObj
         [ ("name", "decide_issue")
         , ("description",
-            "Approve or reject the issue under review. Approve enqueues a merger task " ++
-            "for the latest attached PR; reject returns the issue to open.")
+            "Decide on an issue under review. `approve` enqueues a merger for the latest " ++
+            "attached PR — the PR lands but the issue stays open, since one PR is not " ++
+            "necessarily the whole issue. `complete` marks the issue finished without merging " ++
+            "anything. `reject` returns it to open. All three record your notes as a review " ++
+            "comment on the issue.")
         , ("inputSchema", obj
             [ ("issue_id", intProp "Issue ID")
-            , ("decision", strProp "approve | reject")
+            , ("decision", strProp "approve | complete | reject")
             , ("notes",    strProp "Reviewer notes") ]
             ["issue_id", "decision", "notes"]) ])
   ]
@@ -271,7 +279,6 @@ def projectInfoToolDef : Json :=
 private def issueStatusOfString? : String → Option IssueStatus
   | "open"      => some .open
   | "claimed"   => some .claimed
-  | "in_review" => some .inReview
   | "completed" => some .completed
   | "abandoned" => some .abandoned
   | "rejected"  => some .rejected
@@ -387,7 +394,8 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
       let decision ← match decStr with
         | "approve" => Except.ok ReviewDecision.approve
         | "reject"  => Except.ok ReviewDecision.reject
-        | s         => Except.error s!"decision must be 'approve' or 'reject', got {repr s}"
+        | "complete" => Except.ok ReviewDecision.complete
+        | s => Except.error s!"decision must be 'approve', 'complete' or 'reject', got {repr s}"
       return .decideIssue iid decision notes
   | "project_info" => some (.ok .projectInfo)
   | _ => none
@@ -460,7 +468,6 @@ private def renderTarget : RepoTarget → String
 private def issueStatusToString : IssueStatus → String
   | .open      => "open"
   | .claimed   => "claimed"
-  | .inReview  => "in_review"
   | .completed => "completed"
   | .abandoned => "abandoned"
   | .rejected  => "rejected"
@@ -625,9 +632,9 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (project, i) =>
       IO.println s!"  [mcp] release_claim: {iid.toString} \"{i.title}\" — {reason}"
-      let newStatus := match i.status with
-        | .inReview => .inReview
-        | _         => .open
+      -- Nothing to preserve: whether the issue is under review is derived from its attached PRs,
+      -- not from a status, so releasing simply returns it to the open pool.
+      let newStatus : IssueStatus := .open
       let _ ← release mgr project.id iid newStatus now
       return content s!"released claim on {iid.toString} ({reason})"
   | .attachPr iid repo number branch =>
@@ -648,14 +655,16 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         else
           IO.println s!"  [mcp] attach_pr: {iid.toString} \"{i.title}\" ← {repo}#{number} (branch {branch})"
           let pr : PRRef := { repo, number, branch, taskId := env.taskId }
-          -- Attach first: if this fails the issue stays claimed rather than moving to in_review
+          -- Attach first: if this fails the issue stays claimed rather than looking review-ready
           -- with no PR to review.
           try
             attachPR iid pr
           catch e =>
             return content s!"failed to attach {repo}#{number} to {iid.toString}: {e}"
               (isError := true)
-          saveIssue { i with status := .inReview, updatedAt := now }
+          -- No status change: an issue is under review because it has an unmerged PR attached,
+          -- which is now true by virtue of the attach itself.
+          saveIssue { i with updatedAt := now }
           -- F1: if the project configures an auto-reviewer, enqueue it now.
           let reviewerNote ← match project.reviewer, env.enqueueReviewer with
             | some tmpl, some hook =>
@@ -668,7 +677,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
                 pure s!"; reviewer enqueue failed: {msg}"
             | _, _ => pure ""
           return content
-            s!"attached {repo}#{number} to {iid.toString}; issue moved to in_review{reviewerNote}"
+            s!"attached {repo}#{number} to {iid.toString}; it is now awaiting review{reviewerNote}"
   | .splitIssue parentId children reason =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
     let some mgr := env.claimManager
@@ -728,7 +737,13 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     if !has env reviewIssuesPerm then return content (deny reviewIssuesPerm) (isError := true)
     let some _ ← loadProject pid
       | return content s!"project {pid.toString} not found" (isError := true)
-    let issues := (← loadIssues pid).filter (·.status == .inReview)
+    -- Derived, not a status: open issues carrying at least one attached PR. `loadIssues` leaves
+    -- attachedPRs empty for speed, so each open issue is re-fetched; and merge state is not
+    -- consulted here, so a PR merged by hand still shows until the issue is completed.
+    let mut issues : Array Issue := #[]
+    for i in (← loadIssues pid).filter (·.status == .open) do
+      if let some full ← loadIssue pid i.id then
+        if !full.attachedPRs.isEmpty then issues := issues.push full
     if issues.isEmpty then return content "No issues awaiting review."
     return content (joinLines (issues.map issueLine))
   | .decideIssue iid decision notes =>
@@ -736,7 +751,8 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     match ← findIssue iid with
     | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (project, i) =>
-      let decisionStr := match decision with | .approve => "approve" | .reject => "reject"
+      let decisionStr := match decision with
+        | .approve => "approve" | .complete => "complete" | .reject => "reject"
       IO.println s!"  [mcp] decide_issue: {iid.toString} \"{i.title}\" → {decisionStr} — {notes}"
       match decision with
       | .reject =>
@@ -753,6 +769,15 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           saveIssue { i with status := .open, updatedAt := now }
         IO.println s!"  [mcp] decide_issue: {iid.toString} moved to open"
         return content s!"rejected {iid.toString}: {notes}"
+      | .complete =>
+        try addComment iid notes (review := some .approve)
+        catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
+        if let some mgr := env.claimManager then
+          let _ ← release mgr project.id iid .completed now
+        else
+          saveIssue { i with status := .completed, updatedAt := now }
+        IO.println s!"  [mcp] decide_issue: {iid.toString} completed"
+        return content s!"completed {iid.toString}: {notes}"
       | .approve =>
         match i.attachedPRs.toList.reverse with
         | [] => return content "no attached PRs to merge" (isError := true)
@@ -767,7 +792,9 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
               try addComment iid notes (review := some .approve)
               catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
               IO.println s!"  [mcp] decide_issue: {iid.toString} approved; merger task {mergerTaskId} enqueued"
-              return content s!"approved {iid.toString}; merger task {mergerTaskId} enqueued ({notes})"
+              return content
+                s!"approved {iid.toString}; merger task {mergerTaskId} enqueued. The issue stays \
+                   open — use decide_issue with 'complete' when the work is finished. ({notes})"
   | .projectInfo =>
     IO.println "  [mcp] project_info"
     match env.projectId with

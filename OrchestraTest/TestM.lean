@@ -86,8 +86,8 @@ an API token for it (`POST /me/tokens` while authenticated as that actor), then:
 ORCHESTRA_TEST_TAXIS_URL=http://localhost:8080 ORCHESTRA_TEST_TAXIS_TOKEN=<token> lake test
 ```
 
-The token's actor must be a taxis admin — creating the `t-project`/`o-claimed`/`o-in-review`/
-`o-rejected` labels on first use requires it (see `Project.ensureTaxisConfigured`'s
+The token's actor must be a taxis admin — creating the `t-project`/`o-claimed`/`o-rejected`
+labels on first use requires it (see `Project.ensureTaxisConfigured`'s
 non-test counterpart, wired into `Main.main` the same way). -/
 
 /-- Configure `Orchestra.Taxis` from `ORCHESTRA_TEST_TAXIS_URL`/`ORCHESTRA_TEST_TAXIS_TOKEN` if

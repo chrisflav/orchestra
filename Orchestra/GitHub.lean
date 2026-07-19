@@ -113,6 +113,22 @@ def setupGhAuth (token : String) : IO Unit := do
        prompt). Check github_app.app_id and github_app.private_key_path in config.json.")
   runCmd' "gh" #["auth", "login", "--with-token"] (input := token)
 
+/-- Whether a pull request has been merged.
+
+    Used by the dispatcher to decide whether an issue still needs review: an attached PR that is
+    already merged does not. Returns `false` when the state cannot be determined — an unreachable
+    GitHub or a deleted PR then queues a reviewer that finds nothing to do, which is recoverable,
+    where returning `true` would silently drop review of real work. -/
+def isPrMerged (token : String) (repo : Repository) (number : Nat) : IO Bool := do
+  let env := if token.isEmpty then #[] else #[("GH_TOKEN", some token)]
+  try
+    let out ← runCmd "gh"
+      #["pr", "view", toString number, "--repo", repo.toString, "--json", "merged", "-q", ".merged"]
+      (env := env)
+    return out.trimAscii.toString == "true"
+  catch _ =>
+    return false
+
 /-- Ensure the given labels exist on a repository.
     Labels that are missing are created with a default colour; existing ones are not modified. -/
 def ensureLabels (token : String) (repo : Repository) (labels : List String) : IO Unit := do
