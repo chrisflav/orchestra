@@ -111,9 +111,9 @@ def pi : AgentDef where
     rox        := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
     ro         := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw         := ["/dev/null"]
-    homeRox    := [".cache", ".local"]
+    homeRox    := [".local"]
     homeRw     := [".pi", ".gitconfig", ".config/gh", ".config/git"]
-    homeRwx    := [".elan"]
+    homeRwx    := [".elan", ".cache"]
     extraPorts := [8080]   -- llama.cpp
   }
   -- Configure MCP connectivity via pi-mcp-adapter.  Writes ~/.pi/agent/mcp.json

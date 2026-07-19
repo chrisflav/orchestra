@@ -13,12 +13,15 @@ def claude : AgentDef where
     rox     := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
     ro      := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw      := ["/dev/null"]
-    homeRox := [".cache", ".local"]
+    homeRox := [".local"]
     homeRw  := [".claude", ".claude.json", ".gitconfig",
                 ".config/claude", ".config/gh", ".config/git"]
-    -- elan installs toolchains into ~/.elan and then runs them from there, so it needs
-    -- write and execute, not the read+execute the other home paths get.
-    homeRwx := [".elan"]
+    -- Both need write *and* execute, not the read+execute the other home paths get:
+    --   .elan  — installs toolchains and then runs them from there.
+    --   .cache — build caches are written, not just read. `lake exe cache get` populates it, and
+    --            read-only was only ever useful on a machine something else had warmed; a fresh
+    --            container starts empty, so nothing could cache anything at all.
+    homeRwx := [".elan", ".cache"]
   }
   setupMcp port _ _ := do
     let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
