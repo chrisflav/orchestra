@@ -5,7 +5,6 @@ import Orchestra.TaskStore
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra.Queue
-open Orchestra.Project (ProjectId IssueId)
 
 -- Types
 
@@ -133,12 +132,20 @@ structure QueueEntry where
   issueNumber : Option Nat := none
   /-- Orchestra project this entry belongs to (optional).
       Distinct from `issueNumber` (a GitHub issue number). -/
-  projectId : Option ProjectId := none
+  projectId : Option Taxis.IssueId := none
   /-- Orchestra issue this entry is working on (optional). -/
-  issueId : Option IssueId := none
+  issueId : Option Taxis.IssueId := none
   /-- Optional role name (mirrors `IOTask.role`). Used by the dispatcher to
       count per-role active tasks unambiguously. -/
   role : Option String := none
+  /-- Labels to apply automatically to every PR created via `create_pr`. -/
+  prLabels : List String := []
+  /-- Labels to add to the issue or PR when using the `triage` backend. -/
+  triageAddLabels : List String := []
+  /-- Labels to remove from the issue or PR when using the `triage` backend. -/
+  triageRemoveLabels : List String := []
+  /-- Name of the listener that created this entry, if any. -/
+  listenerName : Option String := none
 
 instance : ToJson QueueEntry where
   toJson e :=
@@ -175,7 +182,11 @@ instance : ToJson QueueEntry where
     let fields := if let some n := e.issueNumber then fields ++ [("issue_number", Json.num n)] else fields
     let fields := if let some p := e.projectId then fields ++ [("project_id", ToJson.toJson p)] else fields
     let fields := if let some i := e.issueId   then fields ++ [("issue_id",   ToJson.toJson i)] else fields
-    let fields := if let some r := e.role      then fields ++ [("role",       Json.str r)]      else fields
+    let fields := if let some r := e.role         then fields ++ [("role",          Json.str r)]      else fields
+    let fields := if !e.prLabels.isEmpty          then fields ++ [("pr_labels",            ToJson.toJson e.prLabels)]         else fields
+    let fields := if !e.triageAddLabels.isEmpty   then fields ++ [("triage_add_labels",    ToJson.toJson e.triageAddLabels)]   else fields
+    let fields := if !e.triageRemoveLabels.isEmpty then fields ++ [("triage_remove_labels", ToJson.toJson e.triageRemoveLabels)] else fields
+    let fields := if let some s := e.listenerName then fields ++ [("listener_name", Json.str s)]      else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -209,14 +220,19 @@ instance : FromJson QueueEntry where
     let inputJson        := j.getObjVal?   "input_json"          |>.toOption
     let outputJson       := j.getObjVal?   "output_json"         |>.toOption
     let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
-    let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
-    let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
-    let role        := j.getObjValAs? String    "role"       |>.toOption
+    let projectId   := j.getObjValAs? Taxis.IssueId "project_id" |>.toOption
+    let issueId     := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
+    let role         := j.getObjValAs? String    "role"          |>.toOption
+    let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
+    let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
+    let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
+    let listenerName := j.getObjValAs? String "listener_name"    |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
-             issueNumber, projectId, issueId, role }
+             issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
+             listenerName }
 
 -- Directories and paths
 
@@ -268,21 +284,11 @@ def loadAllEntries : IO (Array QueueEntry) := do
         result := result.push e
   return result.qsort (fun a b => a.id > b.id)
 
-/-- Return the next pending entry to run.
+/-- Return the next pending entry to run, skipping repositories that already have
+    `perRepoLimit` tasks running. `activePerRepo` maps a fork key (owner/name) to the
+    number of currently running tasks on that repository.
     Entries are ordered by priority (higher first), with older entries breaking ties.
-    Returns none if no pending entries exist. -/
-def nextPending : IO (Option QueueEntry) := do
-  let all ← loadAllEntries
-  let pending := all.filter (fun e => e.status == .pending)
-  if pending.isEmpty then return none
-  -- Find the maximum priority
-  let maxPri := pending.foldl (·.max ·.priority) 0
-  -- Among entries with max priority, pick the oldest (last in newest-first array)
-  let maxPriEntries := pending.filter (·.priority == maxPri)
-  return (maxPriEntries.back? |>.filter (·.priority == maxPri))
-
-/-- Like `nextPending` but skips repos where the running count equals or exceeds `perRepoLimit`.
-    `activePerRepo` maps fork key (owner/name) → number of currently running tasks on that repo. -/
+    Returns none if no eligible pending entries exist. -/
 def nextPendingWithRepoLimits (activePerRepo : Std.HashMap String Nat) (perRepoLimit : Nat)
     : IO (Option QueueEntry) := do
   let all ← loadAllEntries
@@ -290,9 +296,21 @@ def nextPendingWithRepoLimits (activePerRepo : Std.HashMap String Nat) (perRepoL
     e.status == .pending &&
     activePerRepo.getD e.fork.toString 0 < perRepoLimit)
   if pending.isEmpty then return none
+  -- Find the maximum priority
   let maxPri := pending.foldl (·.max ·.priority) 0
+  -- Among entries with max priority, pick the oldest (last in newest-first array)
   let maxPriEntries := pending.filter (·.priority == maxPri)
   return maxPriEntries.back?
+
+/-- Return the next pending entry to run, ignoring any per-repository limits. -/
+def nextPending : IO (Option QueueEntry) :=
+  nextPendingWithRepoLimits {} 1
+
+/-- Return true if any entry created by `name` is currently pending or running. -/
+def hasActiveEntryForListener (name : String) : IO Bool := do
+  let entries ← loadAllEntries
+  return entries.any fun e =>
+    (e.status == .pending || e.status == .running) && e.listenerName == some name
 
 -- PID file management
 
@@ -310,12 +328,36 @@ def readPid : IO (Option UInt32) := do
 def deletePid : IO Unit :=
   try IO.FS.removeFile (← pidFile) catch _ => pure ()
 
-/-- Return true if a daemon process with the stored PID is still alive. -/
+/-- This process's own PID. -/
+def ownPid : IO UInt32 := do
+  let stat ← IO.FS.readFile (System.FilePath.mk "/proc/self/stat")
+  match stat.splitOn " " with
+  | pid :: _ => return (pid.toNat?.getD 0).toUInt32
+  | _        => return 0
+
+/-- Return true if a daemon process with the stored PID is still alive.
+
+    "The PID is in `/proc`" is not sufficient on its own, for two reasons:
+
+    * **It can be us.** The PID file outlives the process that wrote it, and in a container the
+      daemon is PID 1 — so after a restart the next container's PID 1 is the very process running
+      this check, which would otherwise conclude a daemon is already running and refuse to start,
+      on every restart, forever.
+    * **PIDs are recycled.** A daemon that died without cleaning up leaves a PID that some
+      unrelated process may later take, wedging `queue start` until the file is deleted by hand.
+
+    An unreadable `comm` (hardened `/proc`, different user) is treated as "running": refusing to
+    start is recoverable, whereas two daemons racing on the same queue directory is not. -/
 def daemonRunning : IO Bool := do
   match ← readPid with
   | none => return false
   | some pid =>
-    return ← (System.FilePath.mk s!"/proc/{pid}").pathExists
+    if pid == (← ownPid) then return false
+    if !(← (System.FilePath.mk s!"/proc/{pid}").pathExists) then return false
+    let comm ← try some <$> IO.FS.readFile s!"/proc/{pid}/comm" catch _ => pure none
+    match comm with
+    | none => return true
+    | some c => return c.trimAscii.toString == "orchestra"
 
 -- Cascade cancellation
 

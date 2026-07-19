@@ -1,0 +1,20 @@
+{
+  "name": "github-labels",
+  "source": {
+    "type": "github-labels",
+    "repos": [
+      {"upstream": "upstream-org/upstream-repo", "fork": "your-org/upstream-repo"}
+    ],
+    "labels": ["needs-work", "help-wanted"],
+    "kind": "all",
+    "authorized_users": []
+  },
+  "action": {
+    "upstream": "{{upstream}}",
+    "fork": "{{fork}}",
+    "mode": "pr",
+    "prompt_template": "A GitHub {{is_pr}} has been labelled for automated handling.\n\nItem #{{issue_number}}: {{title}}\nURL: {{url}}\nMatched labels: {{matched_labels}}\n\n{{body}}\n\nPlease investigate and implement the requested changes. Open a pull request with your changes.",
+    "series": "item-{{issue_number}}"
+  },
+  "interval_seconds": 300
+}

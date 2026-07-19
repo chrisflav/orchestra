@@ -1,0 +1,13 @@
+# The docker build context is the repository root (docker/docker-compose.yaml sets
+# `build.context: ..`), so without this the whole .lake build tree and the prebuilt Incus images
+# get uploaded to the daemon on every build. The Dockerfile only COPYs sources; everything the
+# build actually needs is listed there.
+.lake
+.git
+container/*.squashfs
+container/*.tar.xz
+docker/.env
+docker/config
+docker/data
+docker/secrets
+.agent

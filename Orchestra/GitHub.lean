@@ -97,36 +97,83 @@ def createInstallationToken (jwt : String) (installationId : Nat) : IO String :=
       | throw (.userError "token response missing 'token' field")
     return token
 
-/-- Configure `gh` CLI to use the given token. -/
+/-- Configure `gh` CLI to use the given token.
+
+    Rejects an empty token rather than passing it on: `gh auth login --with-token` given no token
+    does not fail, it falls back to an interactive device-code prompt and blocks forever — which
+    in the daemon is an unattended hang with nothing in the log to explain it.
+
+    The token goes over stdin rather than being interpolated into `sh -c "echo ... | gh ..."`, so
+    there is no shell to quote it for, and a failure is reported as `gh failed` rather than the
+    considerably less helpful `sh failed`. -/
 def setupGhAuth (token : String) : IO Unit := do
-  runCmd' "sh" #["-c", s!"echo '{token}' | gh auth login --with-token"]
+  if token.isEmpty then
+    throw (.userError
+      "refusing to run `gh auth login` with an empty token (it would block on an interactive \
+       prompt). Check github_app.app_id and github_app.private_key_path in config.json.")
+  runCmd' "gh" #["auth", "login", "--with-token"] (input := token)
+
+/-- Whether a pull request has been merged.
+
+    Used by the dispatcher to decide whether an issue still needs review: an attached PR that is
+    already merged does not. Returns `false` when the state cannot be determined — an unreachable
+    GitHub or a deleted PR then queues a reviewer that finds nothing to do, which is recoverable,
+    where returning `true` would silently drop review of real work. -/
+def isPrMerged (token : String) (repo : Repository) (number : Nat) : IO Bool := do
+  let env := if token.isEmpty then #[] else #[("GH_TOKEN", some token)]
+  try
+    -- `state`, not `merged`: gh has no `merged` field, and asking for one makes the whole call
+    -- fail. `state` is OPEN / CLOSED / MERGED, so it also distinguishes a PR closed without
+    -- merging — which still counts as unmerged here, since the issue's work did not land.
+    let out ← runCmd "gh"
+      #["pr", "view", toString number, "--repo", repo.toString, "--json", "state", "-q", ".state"]
+      (env := env)
+    return out.trimAscii.toString == "MERGED"
+  catch _ =>
+    return false
+
+/-- Ensure the given labels exist on a repository.
+    Labels that are missing are created with a default colour; existing ones are not modified. -/
+def ensureLabels (token : String) (repo : Repository) (labels : List String) : IO Unit := do
+  let env := if token.isEmpty then #[] else #[("GH_TOKEN", some token)]
+  for label in labels do
+    try
+      let _ ← runCmd "gh" #["label", "create", label, "--repo", repo.toString, "--color", "0075ca"]
+        (env := env)
+    catch _ => pure ()
 
 /-- Create a pull request on the upstream repo using a PAT. -/
 def createPullRequest (pat : String) (upstream : Repository)
-    (head base title body : String) : IO String := do
-  runCmd "gh" #[
+    (head base title body : String) (labels : List String := []) : IO String := do
+  unless labels.isEmpty do
+    ensureLabels pat upstream labels
+  let labelArgs : Array String := (labels.flatMap fun l => ["--label", l]).toArray
+  runCmd "gh" (#[
     "pr", "create",
     "--repo", upstream.toString,
     "--head", head,
     "--base", base,
     "--title", title,
     "--body", body
-  ] (env := #[("GH_TOKEN", some pat)])
+  ] ++ labelArgs) (env := #[("GH_TOKEN", some pat)])
 
 /-- Create a pull request entirely within a single repository (no cross-repo
     `owner:branch` head prefix), authenticated by `token` — typically a fresh
     GitHub App installation token. Used when the agent wants to open a PR on
     its fork rather than the upstream. -/
 def createPullRequestOnRepo (token : String) (repo : Repository)
-    (head base title body : String) : IO String := do
-  runCmd "gh" #[
+    (head base title body : String) (labels : List String := []) : IO String := do
+  unless labels.isEmpty do
+    ensureLabels token repo labels
+  let labelArgs : Array String := (labels.flatMap fun l => ["--label", l]).toArray
+  runCmd "gh" (#[
     "pr", "create",
     "--repo", repo.toString,
     "--head", head,
     "--base", base,
     "--title", title,
     "--body", body
-  ] (env := #[("GH_TOKEN", some token)])
+  ] ++ labelArgs) (env := #[("GH_TOKEN", some token)])
 
 /--
 Fetch review threads for a pull request via the GitHub GraphQL API.
@@ -153,6 +200,25 @@ def getPrReviewThreads (upstream : Repository) (prNumber : Nat) (pat : String) :
   match Json.parse result with
   | .error e => throw (.userError s!"failed to parse GraphQL response: {e}")
   | .ok j => return j
+
+/-- Add labels to a GitHub issue or pull request. -/
+def addIssueLabels (pat : String) (repo : Repository) (issueNumber : Nat) (labels : List String) : IO Unit := do
+  unless labels.isEmpty do
+    let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+    let payload := Json.mkObj [("labels", Json.arr (labels.map Json.str |>.toArray))]
+    let _ ← runCmd "gh" #[
+      "api", "--method", "POST",
+      s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels",
+      "--input", "-"
+    ] (input := payload.compress) (env := env)
+
+/-- Remove a label from a GitHub issue or pull request. -/
+def removeIssueLabel (pat : String) (repo : Repository) (issueNumber : Nat) (label : String) : IO Unit := do
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let _ ← runCmd "gh" #[
+    "api", "--method", "DELETE",
+    s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels/{label}"
+  ] (env := env)
 
 /-- Post a comment on an issue or pull request. -/
 def createIssueComment (pat : String) (upstream : Repository) (issueNumber : Nat) (body : String) : IO String := do

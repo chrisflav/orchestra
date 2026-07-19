@@ -1,0 +1,6 @@
+{
+  "name": "orchestra",
+  "version": "0.1.0",
+  "description": "How to open pull requests and work taxis issues from inside an orchestra task, using orchestra's MCP tools rather than the gh CLI.",
+  "author": { "name": "orchestra" }
+}

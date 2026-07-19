@@ -111,36 +111,49 @@ def pi : AgentDef where
     rox        := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
     ro         := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw         := ["/dev/null"]
-    homeRox    := [".elan", ".cache", ".local"]
+    homeRox    := [".local"]
     homeRw     := [".pi", ".gitconfig", ".config/gh", ".config/git"]
-    extraPorts := [11434]  -- Ollama
+    homeRwx    := [".elan", ".cache"]
+    extraPorts := [8080]   -- llama.cpp
   }
-  -- Pi does not have native MCP support.  Return an empty context and inject
-  -- PI_SKIP_VERSION_CHECK so the sandbox startup is quiet.
-  -- Also log pi's config files so the configured API base URL is visible.
-  setupMcp _port _model _systemPrompt := do
-    let err ← IO.getStderr
-    -- Try to read pi's config directory for API endpoint info
-    if let some home ← IO.getEnv "HOME" then do
-      let piDir := System.FilePath.mk home / ".pi"
-      if ← piDir.pathExists then
-        let entries ← try System.FilePath.readDir piDir catch _ => pure #[]
+  -- Configure MCP connectivity via pi-mcp-adapter.  Writes ~/.pi/agent/mcp.json
+  -- with a stdio MCP server pointing at the Orchestra MCP server on the given port.
+  -- Saves any existing mcp.json so cleanup can restore it.
+  setupMcp port _model _systemPrompt := do
+    let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
+      ("orchestra", Json.mkObj [
+        ("transport", .str "stdio"),
+        ("command", .str "nc"),
+        ("args", .arr #[.str "127.0.0.1", .str (toString port)])
+      ])
+    ])]
+    match ← IO.getEnv "HOME" with
+    | none => return ("", #[("PI_SKIP_VERSION_CHECK", some "1")])
+    | some home => do
+      let piAgentDir := System.FilePath.mk home / ".pi" / "agent"
+      let mcpJsonPath := piAgentDir / "mcp.json"
+      -- Save any existing mcp.json
+      let backup : Option String ← if ← mcpJsonPath.pathExists then
+        some <$> IO.FS.readFile mcpJsonPath
+      else
+        pure none
+      -- Write the new MCP config (pi-mcp-adapter picks it up via auto-discovery)
+      IO.FS.createDirAll piAgentDir
+      IO.FS.writeFile mcpJsonPath mcpConfig.compress
+      -- Log pi config files for debugging
+      let err ← IO.getStderr
+      if ← piAgentDir.pathExists then
+        let entries ← try System.FilePath.readDir piAgentDir catch _ => pure #[]
         let jsonFiles := entries.filter (fun e => e.fileName.endsWith ".json")
-        if jsonFiles.isEmpty then
-          err.putStrLn s!"[pi] config dir {piDir} exists but contains no .json files"
         for entry in jsonFiles do
-          let path := piDir / entry.fileName
+          let path := piAgentDir / entry.fileName
           let contents ← try IO.FS.readFile path catch _ => pure "(unreadable)"
           err.putStrLn s!"[pi] config {path}: {contents.trimAscii}"
-      else
-        err.putStrLn s!"[pi] config dir {piDir} does not exist"
-    else
-      err.putStrLn "[pi] WARNING: HOME not set, cannot read pi config"
-    err.flush
-    return ("", #[("PI_SKIP_VERSION_CHECK", some "1")])
+      err.flush
+      return (backup.getD "", #[("PI_SKIP_VERSION_CHECK", some "1")])
   buildArgs _ctx _pluginDirs _subAgent model systemPrompt resume _budget prompt := Id.run do
     -- --print makes pi non-interactive (process prompt and exit);
-    -- without it pi starts in interactive mode and exits immediately when stdin is /dev/null.
+    -- --mode json outputs all session events as JSON lines to stdout.
     let mut args : Array String := #["--print", "--mode", "json"]
     if let some m := model then
       args := args.push "--model" |>.push m
@@ -162,7 +175,18 @@ def pi : AgentDef where
   -- The session UUID is captured from the "session" header line emitted to stdout,
   -- so there is nothing left to extract after the run.
   extractSessionId _ := pure none
-  cleanup _ := pure ()
+  -- Restore the previous mcp.json (or remove it if it did not exist before).
+  cleanup backup := do
+    match ← IO.getEnv "HOME" with
+    | none => pure ()
+    | some home => do
+      let mcpJsonPath := System.FilePath.mk home / ".pi" / "agent" / "mcp.json"
+      if backup.isEmpty then
+        -- We wrote it, so remove it
+        try IO.FS.removeFile mcpJsonPath catch _ => pure ()
+      else
+        -- Restore the previous config
+        IO.FS.writeFile mcpJsonPath backup
   isUsageLimitError := stdUsageLimitError
   -- Map an API key auth source to ANTHROPIC_API_KEY (pi's most common provider).
   -- Users relying on other providers should set the appropriate env var directly.

@@ -7,9 +7,20 @@
 
 let
   unstable = import
-    (builtins.fetchTarball https://github.com/nixos/nixpkgs/tarball/31ca9ee01d22aafd34495977ab009e2984afa99d)
+    (builtins.fetchTarball https://github.com/nixos/nixpkgs/tarball/071434384885966c13bb5a4fd4e6d16788c8247f)
     # reuse the current configuration
     { config = config.nixpkgs.config; };
+
+  pi-coding-agent-wrapped = pkgs.symlinkJoin {
+    name = "pi-coding-agent";
+    buildInputs = [ pkgs.makeWrapper ];
+    paths = [ unstable.pi-coding-agent ];
+    postBuild = ''
+      wrapProgram $out/bin/pi \
+        --run 'export NPM_CONFIG_PREFIX="$HOME/.pi/npm/"' \
+        --prefix PATH : ${lib.makeBinPath [ pkgs.nodejs_latest ]}
+    '';
+  };
 in
 {
   nixpkgs.config.allowUnfree = true;
@@ -24,6 +35,10 @@ in
     jq
     openssl
     gcc
+    # `nc` is the MCP transport, not a debugging tool: every agent backend points its MCP client
+    # at the built-in server with `nc 127.0.0.1 <port>` (see setupMcp in Orchestra/Agents/).
+    # Without it the agent sees the "agent" MCP server stuck connecting and gets no tools.
+    netcat-openbsd
     # Lean version manager
     elan
     landrun
@@ -31,6 +46,7 @@ in
     unstable.opencode
     unstable.claude-code
     unstable.mistral-vibe
+    pi-coding-agent-wrapped
   ];
 
   users.users.orchestra = {

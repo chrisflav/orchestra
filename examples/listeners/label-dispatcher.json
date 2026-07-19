@@ -1,0 +1,16 @@
+{
+  "name": "demo-label-dispatcher",
+  "source": {
+    "type": "label-dispatcher",
+    "label": "agent-ready",
+    "caps": {
+      "implementor": 2,
+      "reviewer":    1
+    }
+  },
+  "action": {
+    "mode": "pr",
+    "prompt_template": ""
+  },
+  "interval_seconds": 30
+}

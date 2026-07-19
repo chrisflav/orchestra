@@ -101,6 +101,18 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
   let systemPrompt  := (mappingLookup pairs "system-prompt").bind  (nodeAsString · |>.toOption)
   let prependPrompt := (mappingLookup pairs "prepend-prompt").bind (nodeAsString · |>.toOption)
   let backend       := (mappingLookup pairs "backend").bind        (nodeAsString · |>.toOption)
+  let issueNumber   := (mappingLookup pairs "issue-number").bind   (nodeAsString · |>.toOption)
+                       |>.bind (·.toNat?)
+  let triageAddLabels ← match mappingLookup pairs "triage-add" with
+    | none      => pure []
+    | some node => do
+        let items ← nodeAsSeq node
+        items.toList.mapM (nodeAsString ·)
+  let triageRemoveLabels ← match mappingLookup pairs "triage-remove" with
+    | none      => pure []
+    | some node => do
+        let items ← nodeAsSeq node
+        items.toList.mapM (nodeAsString ·)
   let input ← match mappingLookup pairs "input" with
     | none      => pure []
     | some iNode => do
@@ -115,7 +127,7 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
           let name ← nodeAsString k
           parseOutputSpec name v
   return { agent, model, prompt, readOnly, input, output, context, upstream, fork,
-           systemPrompt, prependPrompt, backend }
+           systemPrompt, prependPrompt, backend, issueNumber, triageAddLabels, triageRemoveLabels }
 
 private def parseWriteAction (node : Node) : Except String StepAction := do
   let s ← nodeAsString node
