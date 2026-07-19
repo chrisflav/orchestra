@@ -96,6 +96,17 @@ RUN mkdir -p /home/orchestra/.claude \
     && echo '{}' > /home/orchestra/.claude.json \
     && touch /home/orchestra/.gitconfig
 
+# Drop the shell dotfiles useradd copied from /etc/skel. $HOME is not granted to the sandbox and
+# these are not in any rule, so every interactive shell the agent starts fails to source them and
+# prints "/home/orchestra/.bashrc: Permission denied". Harmless to the shell, but it lands in the
+# output of every command the agent runs, which is noise it then tries to act on.
+#
+# Deleting rather than granting read: nothing in Debian's default .bashrc (prompt, aliases,
+# colours) matters to an agent, PATH and HOME are passed into the sandbox explicitly, and a
+# rule would hand the agent read access to a file people habitually put secrets in. Humans who
+# exec into the container still get the system-wide /etc/bash.bashrc, since /etc is granted.
+RUN rm -f /home/orchestra/.bashrc /home/orchestra/.bash_logout /home/orchestra/.profile
+
 # Back to root *only* so the entrypoint can take ownership of the bind-mounted /config and /data
 # (Docker creates missing bind-mount sources as root) before re-execing itself as `orchestra` via
 # setpriv. Nothing beyond those two chowns ever runs as root.
