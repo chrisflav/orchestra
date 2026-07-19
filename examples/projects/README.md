@@ -218,10 +218,12 @@ Two rules decide what gets dispatched:
 - **The label is inherited.** An issue is in scope if it *or any transitive ancestor* carries the
   trigger label, so labelling a project once opts its whole subtree in rather than needing the
   label repeated on every issue.
-- **Only issues with no open children are dispatched.** An issue with children still open has
-  been decomposed — the children are the work. Dispatching it too would put an agent on the whole
-  while others work the parts. Completed and abandoned children do not count, so a parent becomes
-  workable again once its last open child closes.
+- **Only workable issues are dispatched.** An issue can be worked on when it is open, has no
+  open children, and has no open dependencies. Children still open mean it has been decomposed —
+  the children are the work. Open dependencies mean it is waiting on something else. Both
+  conditions count *open* only: a completed or abandoned child or dependency releases it, since
+  abandoning is the decision that the work will not happen and stranding everything downstream
+  would be worse.
 
 Together these give the usual flow: label the project, a planner decomposes it, implementors pick
 up the leaves. A labelled issue with no children yet is itself a leaf, so it dispatches until it

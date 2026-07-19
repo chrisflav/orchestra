@@ -595,17 +595,55 @@ def inScopeOpenIssues (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Tax
   -- warn about it again.
   all.filter fun i => i.state == .open && inScope i all.size
 
-/-- `inScopeOpenIssues` minus containers: the set a *worker* may be dispatched onto. Reviewers use
-    `inScopeOpenIssues` directly, since an issue with children can still have a pull request of
-    its own awaiting review. -/
+/-! ### When an issue can be worked on
+
+One rule, applied wherever a worker might be dispatched: an issue is workable when it is open, has
+**no open children**, and has **no open dependencies**. Anything else is waiting on something.
+
+Both conditions are about *open*-ness specifically. A completed or abandoned child does not make
+its parent a container any more, and a completed or abandoned dependency does not hold its
+dependent back — abandoning is the decision that the work will not happen, so treating it as
+forever-unsatisfied would strand everything downstream.
+
+Both are decided where the full picture is available, never from a set that has already been
+narrowed to open issues: derived from such a set, "done" and "absent" are indistinguishable and
+everything with a dependency blocks forever. The two functions below are the same rule over the
+two shapes the callers hold. -/
+
+/-- The workable subset of `all`, over raw taxis issues — used by the label-dispatcher, which
+    lists the whole tracker and so knows the state of every child and dependency. -/
 def dispatchCandidates (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Taxis.LabelId) :
     Array Orchestra.Taxis.Issue :=
+  let openIds : Std.HashMap Int64 Unit :=
+    Std.HashMap.ofList (all.toList.filterMap fun i =>
+      match i.state with | .open => some (i.id.val, ()) | _ => none)
   let hasOpenChildren : Std.HashMap Int64 Unit :=
     Std.HashMap.ofList (all.toList.filterMap fun i =>
       match i.state with
       | .open => i.parent.map (·.val, ())
       | _ => none)
-  (inScopeOpenIssues all label).filter fun i => !hasOpenChildren.contains i.id.val
+  (inScopeOpenIssues all label).filter fun i =>
+    !hasOpenChildren.contains i.id.val &&
+    i.dependencies.all (fun d => !openIds.contains d.val)
+
+/-- The workable subset of `all`, over orchestra issues — used by the project-dispatcher, which
+    holds every issue in its project.
+
+    A dependency pointing outside the project is not visible here and so does not block. Blocking
+    on an id whose state cannot be seen would strand the dependent permanently, which is the worse
+    failure. -/
+def workableIssues (all : Array Issue) : Array Issue :=
+  let stillOpen (i : Issue) := i.status != .completed && i.status != .abandoned
+  let openIds : Std.HashMap Int64 Unit :=
+    Std.HashMap.ofList (all.toList.filterMap fun i =>
+      if stillOpen i then some (i.id.val, ()) else none)
+  let hasOpenChildren : Std.HashMap Int64 Unit :=
+    Std.HashMap.ofList (all.toList.filterMap fun i =>
+      if stillOpen i then i.parentId.map (·.val, ()) else none)
+  all.filter fun i =>
+    i.status == .open &&
+    !hasOpenChildren.contains i.id.val &&
+    i.dependencies.all (fun d => !openIds.contains d.val)
 
 /-- Every issue carrying `labelName`, regardless of project — the issue set the
     project-independent dispatcher works from. `none` means no such label exists on the tracker
@@ -626,9 +664,6 @@ structure LabelDispatchSets where
   reviewable : Array (Issue × RepoTarget)
   /-- Issues in scope whose target could not be resolved, with the reason. -/
   gaps       : Array (Taxis.IssueId × TargetGap)
-  /-- Every issue in the tracker that is still open, in scope or not. Dependencies may point
-      anywhere, so answering "is this dependency still open" needs the whole picture. -/
-  openIds    : Array Taxis.IssueId
 
 def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
   let cfg ← Orchestra.Taxis.getConfig
@@ -654,8 +689,7 @@ def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
       if let some issue ← loadIssue at'.repoOwner raw.id then
         if workIds.contains raw.id.val then work := work.push (issue, at'.target)
         if !issue.attachedPRs.isEmpty then reviewable := reviewable.push (issue, at'.target)
-  let openIds := (all.filter (fun i => i.state == .open)).map (·.id)
-  return some { work, reviewable, gaps, openIds }
+  return some { work, reviewable, gaps }
 
 /-! ## Comments
 

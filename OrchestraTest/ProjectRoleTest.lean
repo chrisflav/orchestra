@@ -233,48 +233,61 @@ def shippedWorkerTemplatesCarryTheThread : Test := do
       TestM.assert ((role.promptTemplate.splitOn "{{issue_comments}}").length > 1)
         s!"the shipped {name} template must carry the issue comment thread"
 
-/-! ## Dependency gating
+/-! ## When an issue can be worked on
 
-    `openIds` carries which issues are still open; a dependency blocks exactly while it is in
-    there. Deriving that from `issues` instead would be wrong, because that set is open-only —
-    every completed dependency would look unsatisfied and nothing with a dependency would ever
-    dispatch. -/
+    `workableIssues` is the whole rule for the project-dispatcher: open, no open children, no open
+    dependencies. It is applied over every issue in the project, because deciding it from a set
+    already narrowed to open issues cannot tell "done" from "absent" — which is exactly how issues
+    with dependencies came to be blocked forever. -/
 
-private def depRole : Role :=
-  { name := "implementor", permissions := ["work_issues"]
-  , promptTemplate := "x"
-  , dispatch := some { trigger := .hasOpenIssues, max := 1 } }
-
-private def firstSpawnId (issues : Array Issue) (openIds : Array Taxis.IssueId) : Option String :=
-  (dispatcherTick { activeByRole := {}, issues, openIds
-                  , caps := [("implementor", 1)], roles := #[depRole] })[0]?
-    |>.bind (·.issueId) |>.map (·.toString)
+private def workableIds (issues : Array Issue) : List String :=
+  ((workableIssues issues).map (·.id.toString)).toList
 
 @[test]
-def openDependencyBlocksDispatch : Test := do
-  let project := fixtureProject
-  let blocked := fixtureIssue 102 project .open (dependencies := #[⟨101⟩])
-  TestM.assertEqual (firstSpawnId #[blocked] #[⟨101⟩]) none
-    (msg := "dependency still open, so not dispatched")
+def openDependencyBlocksWork : Test := do
+  let p := fixtureProject
+  let issues := #[fixtureIssue 101 p .open, fixtureIssue 102 p .open (dependencies := #[⟨101⟩])]
+  TestM.assertEqual (workableIds issues) ["101"]
+    (msg := "102 waits on an open 101")
 
 @[test]
-def satisfiedDependencyAllowsDispatch : Test := do
-  let project := fixtureProject
-  let ready := fixtureIssue 102 project .open (dependencies := #[⟨101⟩])
-  -- 101 absent from openIds: completed or abandoned, either way it no longer blocks.
-  TestM.assertEqual (firstSpawnId #[ready] #[]) (some "102")
-    (msg := "dependency no longer open, so dispatched")
+def closedDependencyReleasesWork : Test := do
+  let p := fixtureProject
+  let done := #[fixtureIssue 101 p .completed, fixtureIssue 102 p .open (dependencies := #[⟨101⟩])]
+  TestM.assertEqual (workableIds done) ["102"] (msg := "a completed dependency releases")
+  -- Abandoning is a decision the work will not happen, so it must not strand what follows.
+  let dropped := #[fixtureIssue 101 p .abandoned, fixtureIssue 102 p .open (dependencies := #[⟨101⟩])]
+  TestM.assertEqual (workableIds dropped) ["102"] (msg := "an abandoned dependency releases")
 
-/-- The regression this guards: with the dependency set derived from the (open-only) candidate
-    list, a completed dependency was indistinguishable from a missing one and every issue with a
-    dependency was blocked forever. -/
 @[test]
-def dependenciesDoNotBlockPermanently : Test := do
-  let project := fixtureProject
-  let a := fixtureIssue 101 project .open
-  let b := fixtureIssue 102 project .open (dependencies := #[⟨101⟩])
-  -- While 101 is open only 101 is dispatchable; once it closes, 102 becomes so.
-  TestM.assertEqual (firstSpawnId #[a, b] #[⟨101⟩]) (some "101") (msg := "the unblocked one first")
-  TestM.assertEqual (firstSpawnId #[b] #[]) (some "102") (msg := "and 102 once 101 is done")
+def openChildBlocksWork : Test := do
+  let p := fixtureProject
+  let parent := fixtureIssue 101 p .open
+  let child  := { fixtureIssue 102 p .open with parentId := some ⟨101⟩ }
+  TestM.assertEqual (workableIds #[parent, child]) ["102"]
+    (msg := "the parent is a container while its child is open")
+  let doneChild := { fixtureIssue 102 p .completed with parentId := some ⟨101⟩ }
+  TestM.assertEqual (workableIds #[parent, doneChild]) ["101"]
+    (msg := "and becomes workable once the child closes")
+
+/-- Both conditions at once, which is the rule as stated: workable means no open children *and*
+    no open dependencies. -/
+@[test]
+def bothConditionsMustHold : Test := do
+  let p := fixtureProject
+  let blocker := fixtureIssue 100 p .open
+  let parent  := fixtureIssue 101 p .open (dependencies := #[⟨100⟩])
+  let child   := { fixtureIssue 102 p .open with parentId := some ⟨101⟩ }
+  -- 101 has both an open child and an open dependency; only the leaf 102 and the leaf 100 qualify.
+  TestM.assertEqual (workableIds #[blocker, parent, child]) ["100", "102"]
+    (msg := "only issues clear on both counts")
+
+/-- A dependency the caller cannot see does not block. Blocking on an unknown id would strand the
+    dependent permanently, which is the worse failure. -/
+@[test]
+def invisibleDependencyDoesNotBlock : Test := do
+  let p := fixtureProject
+  TestM.assertEqual (workableIds #[fixtureIssue 102 p .open (dependencies := #[⟨999⟩])]) ["102"]
+    (msg := "an id outside the set is treated as satisfied")
 
 end OrchestraTest.ProjectRole

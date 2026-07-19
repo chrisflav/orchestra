@@ -8,15 +8,17 @@ open Orchestra.Project
 namespace OrchestraTest.DispatchCandidates
 
 /-! Selection policy for the project-independent dispatcher: the trigger label is inherited by
-    descendants, and only leaves are dispatched. `dispatchCandidates` is pure, so unlike the rest
-    of the label-dispatch path this runs without a taxis instance. -/
+    descendants, and an issue is workable when it is open with no open children and no open
+    dependencies. `dispatchCandidates` is pure, so unlike the rest of the label-dispatch path this
+    runs without a taxis instance. -/
 
 private def trigger : Taxis.LabelId := ⟨3⟩
 private def tProject : Taxis.LabelId := ⟨2⟩
 
 private def mk (id : Int64) (parent : Option Int64 := none)
-    (labels : Array Taxis.LabelId := #[]) (state : Taxis.IssueState := .open) : Taxis.Issue :=
-  { id := ⟨id⟩, title := s!"issue {id}", parent := parent.map (⟨·⟩), labels, state
+    (labels : Array Taxis.LabelId := #[]) (state : Taxis.IssueState := .open)
+    (dependencies : Array Taxis.IssueId := #[]) : Taxis.Issue :=
+  { id := ⟨id⟩, title := s!"issue {id}", parent := parent.map (⟨·⟩), labels, state, dependencies
     createdAt := ⟨0⟩, updatedAt := ⟨0⟩ }
 
 private def ids (issues : Array Taxis.Issue) : List Int64 :=
@@ -94,5 +96,21 @@ def realTrackerShape : Test := do
 def cyclesTerminate : Test := do
   let all := #[mk 1 (parent := some 2), mk 2 (parent := some 1)]
   TestM.assert (dispatchCandidates all trigger).isEmpty "a cycle with no label selects nothing"
+
+/-- The label-dispatcher applies the same rule as the project one, over the raw tracker listing:
+    open dependencies block, closed ones do not. It lists every issue, so unlike the project case
+    a dependency in another project is still visible and still counts. -/
+@[test]
+def openDependencyBlocksCandidacy : Test := do
+  let blocked := #[mk 9 (labels := #[trigger]),
+                   mk 20 (parent := some 9) (dependencies := #[⟨21⟩]),
+                   mk 21 (parent := some 9)]
+  TestM.assertEqual (ids (dispatchCandidates blocked trigger)) [21]
+    (msg := "20 waits on an open 21")
+  let released := #[mk 9 (labels := #[trigger]),
+                    mk 20 (parent := some 9) (dependencies := #[⟨21⟩]),
+                    mk 21 (parent := some 9) (state := .completed)]
+  TestM.assertEqual (ids (dispatchCandidates released trigger)) [20]
+    (msg := "and runs once 21 is completed")
 
 end OrchestraTest.DispatchCandidates
