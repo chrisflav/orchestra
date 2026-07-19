@@ -577,20 +577,21 @@ def artifactTarget (iid : Taxis.IssueId) : IO (Except TargetGap ArtifactTarget) 
 
     `projectId` on each returned issue is the ancestor carrying the `repository` artifact, so
     issues from different projects can appear side by side; issues whose target can't be resolved
-    are omitted along with the reason, for the caller to report. -/
+    are omitted along with the reason, for the caller to report — every exclusion is reported,
+    since an issue that silently never dispatches gives you nothing to debug. -/
 def issuesWithLabel (labelName : String) :
     IO (Option (Array (Issue × RepoTarget) × Array (Taxis.IssueId × TargetGap))) := do
   let cfg ← Orchestra.Taxis.getConfig
-  let ids ← statusLabelIds
   let labels ← unwrap (← Orchestra.Taxis.listLabels cfg)
   let some label := labels.find? (·.name == labelName) | return none
   let raws ← unwrap (← Orchestra.Taxis.listIssues cfg (label := some label.id))
   let mut ok : Array (Issue × RepoTarget) := #[]
   let mut gaps : Array (Taxis.IssueId × TargetGap) := #[]
+  -- Deliberately no filtering by `t-project`: carrying that label does not make an issue a
+  -- container. Real trackers apply it broadly, including to leaves that are perfectly good units
+  -- of work and carry their own repository/branch artifacts. The trigger label is the only thing
+  -- that selects work here — if you don't want an issue dispatched, don't label it.
   for raw in raws do
-    -- Skip the project markers themselves: a `t-project` issue carrying the trigger label is a
-    -- container, not a unit of work.
-    if raw.labels.contains ids.project then continue
     match ← artifactTarget raw.id with
     | .error gap => gaps := gaps.push (raw.id, gap)
     | .ok at' =>

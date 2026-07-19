@@ -190,6 +190,10 @@ Two further differences from `project-dispatcher`:
   than colliding with per-project dispatchers using the same role names.
 
 The ancestor carrying the `repository` artifact stands in for the project: it fills the queue
-entry's `project_id` and supplies `{{project_name}}` when the role prompt is rendered. Issues
-carrying the `t-project` label are skipped even if labelled, since they are containers rather
-than units of work.
+entry's `project_id` and supplies `{{project_name}}` when the role prompt is rendered.
+
+The trigger label is the **only** thing that selects work — carrying `t-project` does not exempt
+an issue. Trackers apply that label broadly, including to leaves that are perfectly good units of
+work with their own repository and branch artifacts, so treating it as "this is a container"
+silently swallowed exactly the issues people meant to dispatch. If you don't want an issue picked
+up, don't put the trigger label on it.
