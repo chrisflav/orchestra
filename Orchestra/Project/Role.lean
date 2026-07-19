@@ -136,7 +136,7 @@ def globalRolesDir : IO System.FilePath := do
   | some p => return p
   | none   => return (← Dirs.configBase) / "roles"
 
-def projectRolesDir (pid : ProjectId) : IO System.FilePath := do
+def projectRolesDir (pid : Taxis.IssueId) : IO System.FilePath := do
   return (← projectDir pid) / "roles"
 
 private def roleFileName (name : String) : String := s!"{name}.json"
@@ -153,13 +153,13 @@ private def loadRoleFromFile (path : System.FilePath) : IO (Option Role) := do
 
 /-- Resolve a role by name. Project-scoped file wins over the global one;
     returns `none` only if neither file exists or both fail to parse. -/
-def loadRole (pid : ProjectId) (name : String) : IO (Option Role) := do
+def loadRole (pid : Taxis.IssueId) (name : String) : IO (Option Role) := do
   let projectPath := (← projectRolesDir pid) / roleFileName name
   if let some r ← loadRoleFromFile projectPath then return some r
   loadRoleFromFile ((← globalRolesDir) / roleFileName name)
 
 /-- Convenience for diagnostics: report the two paths that would be searched. -/
-def roleSearchPaths (pid : ProjectId) (name : String) :
+def roleSearchPaths (pid : Taxis.IssueId) (name : String) :
     IO (System.FilePath × System.FilePath) := do
   return ((← projectRolesDir pid) / roleFileName name,
           (← globalRolesDir)      / roleFileName name)
@@ -170,7 +170,7 @@ private def stripJsonExt (s : String) : Option String :=
 
 /-- All roles available for a project: project-scoped roles first, then any
     global roles whose names aren't already shadowed by a project file. -/
-def loadAllRoles (pid : ProjectId) : IO (Array Role) := do
+def loadAllRoles (pid : Taxis.IssueId) : IO (Array Role) := do
   let mut byName : Std.HashMap String Role := {}
   let pdir ← projectRolesDir pid
   if ← pdir.pathExists then
@@ -229,14 +229,14 @@ def render (tmpl : String) (v : RenderVars) : String :=
 def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : String)
     : RenderVars :=
   match issue? with
-  | none => { projectId := project.id.value, projectName := project.name, instructions }
+  | none => { projectId := project.id.toString, projectName := project.name, instructions }
   | some i =>
     let target := effectiveTarget project i
     let pr? := i.attachedPRs.toList.reverse.head?
-    { projectId    := project.id.value
+    { projectId    := project.id.toString
     , projectName  := project.name
     , instructions
-    , issueId      := some i.id.value
+    , issueId      := some i.id.toString
     , issueTitle   := some i.title
     , targetRepo   := target.map (·.repo.toString)
     , targetBranch := target.map (·.branch)

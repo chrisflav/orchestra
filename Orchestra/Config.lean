@@ -1,11 +1,10 @@
 import Lean.Data.Json
 import Orchestra.Dirs
-import Orchestra.Project.Id
+import Orchestra.Taxis
 
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra
-open Orchestra.Project (ProjectId IssueId)
 
 /-- A GitHub repository identified by its owner and name. -/
 structure Repository where
@@ -237,10 +236,10 @@ structure IOTask (i o : ResultType) where
   issueNumber : Option Nat := none
   /-- Orchestra project this task belongs to (optional).
       Distinct from `issueNumber`, which is a GitHub issue number. -/
-  projectId : Option ProjectId := none
+  projectId : Option Taxis.IssueId := none
   /-- Orchestra issue this task is working on (optional).
       Set by `claim_issue`; release on terminal status flips it back to `.open`. -/
-  issueId : Option IssueId := none
+  issueId : Option Taxis.IssueId := none
   /-- Optional role name this task was spawned for (e.g. "implementor"). Used
       by the project-dispatcher to count active per-role tasks unambiguously,
       avoiding fragile `tools` list comparisons. -/
@@ -348,8 +347,8 @@ instance : FromJson Task where
     let series      := j.getObjValAs? String "series"          |>.toOption
     let priority    := j.getObjValAs? Nat "priority"           |>.toOption |>.getD 10
     let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
-    let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
-    let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
+    let projectId   := j.getObjValAs? Taxis.IssueId "project_id" |>.toOption
+    let issueId     := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
     let role        := j.getObjValAs? String    "role"       |>.toOption
     let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
@@ -409,6 +408,10 @@ structure AppConfig where
       Merged on top of the agent-backend's built-in paths.
       Useful for granting rw access to directories like `.cache`. -/
   additionalSandboxPaths : SandboxPaths := {}
+  /-- taxis instance backing the project/issue/claim subsystem (`Orchestra.Project`). `none`
+      disables it — any project/issue/claim operation then fails with a clear "not configured"
+      error rather than falling back to the old file-based storage. -/
+  taxis : Option Taxis.Config := none
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -429,9 +432,10 @@ instance : FromJson AppConfig where
     let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
     let agentAuthConfigs := j.getObjValAs? (Array AgentAuthConfig) "agents" |>.toOption |>.getD #[]
     let additionalSandboxPaths := j.getObjValAs? SandboxPaths "additional_sandbox_paths" |>.toOption |>.getD {}
+    let taxis := j.getObjValAs? Taxis.Config "taxis" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs, additionalSandboxPaths }
+             agentAuthConfigs, additionalSandboxPaths, taxis }
 
 structure TaskFile where
   tasks : Array Task

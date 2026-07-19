@@ -1,7 +1,7 @@
 import Lean.Data.Json
 import Orchestra.Config
 import Orchestra.TaskStore
-import Orchestra.Project.Id
+import Orchestra.Taxis
 
 open Lean (Json FromJson ToJson)
 
@@ -16,7 +16,7 @@ they inherit the project's `defaultTarget`. -/
 structure RepoTarget where
   repo   : Repository
   branch : String
-deriving Repr, Inhabited
+deriving Repr, Inhabited, BEq
 
 instance : ToJson RepoTarget where
   toJson t := Json.mkObj [("repo", ToJson.toJson t.repo), ("branch", Json.str t.branch)]
@@ -37,7 +37,7 @@ structure PRRef where
   number : Nat
   branch : String
   taskId : Option String := none
-deriving Repr, Inhabited
+deriving Repr, Inhabited, BEq
 
 instance : ToJson PRRef where
   toJson p :=
@@ -55,6 +55,18 @@ instance : FromJson PRRef where
     let branch ← j.getObjValAs? String "branch"
     let taskId := j.getObjValAs? String "task_id" |>.toOption
     return { repo, number, branch, taskId }
+
+/-- `PRRef` as a taxis `github-pr` artifact payload — that handler's `validate` requires a `url`
+    field (see `Taxis.Plugins.Github`), which `PRRef.toJson` alone doesn't produce; this adds it
+    while keeping `repo`/`number`/`branch`/`task_id` too, so `FromJson PRRef` still round-trips it
+    unchanged on read. -/
+def prRefArtifactPayload (pr : PRRef) : Json :=
+  let base : List (String × Json) :=
+    [ ("url", Json.str s!"https://github.com/{pr.repo}/pull/{pr.number}")
+    , ("repo", ToJson.toJson pr.repo)
+    , ("number", Json.num pr.number)
+    , ("branch", Json.str pr.branch) ]
+  Json.mkObj (base ++ (pr.taskId.map fun t => [("task_id", Json.str t)] : Option _).getD [])
 
 /-! ## Issue lifecycle -/
 
@@ -117,7 +129,7 @@ instance : FromJson ReviewerTemplate where
     return { backend, promptTemplate }
 
 structure Project where
-  id            : ProjectId
+  id            : Taxis.IssueId
   name          : String
   description   : Option String      := none
   createdAt     : String
@@ -128,227 +140,371 @@ structure Project where
   reviewer      : Option ReviewerTemplate := none
 deriving Repr, Inhabited
 
-instance : ToJson Project where
-  toJson p :=
-    let base : List (String × Json) :=
-      [ ("id",         ToJson.toJson p.id)
-      , ("name",       Json.str p.name)
-      , ("created_at", Json.str p.createdAt) ]
-    let fields := base
-    let fields := if let some d := p.description   then fields ++ [("description",    Json.str d)]      else fields
-    let fields := if let some t := p.defaultTarget then fields ++ [("default_target", ToJson.toJson t)] else fields
-    let fields := if let some r := p.reviewer      then fields ++ [("reviewer",       ToJson.toJson r)] else fields
-    Json.mkObj fields
-
-instance : FromJson Project where
-  fromJson? j := do
-    let id            ← j.getObjValAs? ProjectId "id"
-    let name          ← j.getObjValAs? String "name"
-    let createdAt     ← j.getObjValAs? String "created_at"
-    let description   := j.getObjValAs? String "description"      |>.toOption
-    let defaultTarget := j.getObjValAs? RepoTarget "default_target" |>.toOption
-    let reviewer      := j.getObjValAs? ReviewerTemplate "reviewer" |>.toOption
-    return { id, name, description, createdAt, defaultTarget, reviewer }
-
 /-! ## Issue record
 
-`parentId` is the only hierarchy pointer (decision B1). The child set is
-recovered by scanning the project's issues directory; this avoids
-denormalisation drift across moves and renames. -/
+`parentId` is the only hierarchy pointer (decision B1); backed 1:1 by taxis's own single-parent
+`Issue.parent`. The child set is recovered by scanning the project's issues, same as before this
+migration (taxis has no server-side "children of X" filter). -/
 
 structure Issue where
-  id           : IssueId
-  projectId    : ProjectId
-  parentId     : Option IssueId  := none
+  id           : Taxis.IssueId
+  projectId    : Taxis.IssueId
+  parentId     : Option Taxis.IssueId  := none
   title        : String
   description  : String
   status       : IssueStatus     := .open
   /-- Per-issue override of the project's default target. -/
   target       : Option RepoTarget := none
   attachedPRs  : Array PRRef     := #[]
-  /-- Issues that must be completed before this one can be dispatched. -/
-  dependencies : Array IssueId   := #[]
+  /-- Issues that must be completed before this one can be dispatched. Native taxis dependency
+      graph — no separate plumbing needed. -/
+  dependencies : Array Taxis.IssueId   := #[]
   createdAt    : String
   updatedAt    : String
 deriving Repr, Inhabited
 
-instance : ToJson Issue where
-  toJson i :=
-    let base : List (String × Json) :=
-      [ ("id",          ToJson.toJson i.id)
-      , ("project_id",  ToJson.toJson i.projectId)
-      , ("title",       Json.str i.title)
-      , ("description", Json.str i.description)
-      , ("status",      ToJson.toJson i.status)
-      , ("attached_prs", Json.arr (i.attachedPRs.map ToJson.toJson))
-      , ("created_at",  Json.str i.createdAt)
-      , ("updated_at",  Json.str i.updatedAt) ]
-    let fields := base
-    let fields := if let some p := i.parentId then fields ++ [("parent_id", ToJson.toJson p)] else fields
-    let fields := if let some t := i.target   then fields ++ [("target",    ToJson.toJson t)] else fields
-    let fields := if !i.dependencies.isEmpty  then fields ++ [("dependencies", Json.arr (i.dependencies.map ToJson.toJson))] else fields
-    Json.mkObj fields
+/-! ## taxis backing
 
-instance : FromJson Issue where
-  fromJson? j := do
-    let id          ← j.getObjValAs? IssueId "id"
-    let projectId   ← j.getObjValAs? ProjectId "project_id"
-    let title       ← j.getObjValAs? String "title"
-    let description ← j.getObjValAs? String "description"
-    let status      ← j.getObjValAs? IssueStatus "status"
-    let createdAt   ← j.getObjValAs? String "created_at"
-    let updatedAt   ← j.getObjValAs? String "updated_at"
-    let parentId     := j.getObjValAs? IssueId "parent_id" |>.toOption
-    let target       := j.getObjValAs? RepoTarget "target"   |>.toOption
-    let attachedPRs  := (j.getObjValAs? (Array PRRef) "attached_prs" |>.toOption).getD #[]
-    let dependencies := (j.getObjValAs? (Array IssueId) "dependencies" |>.toOption).getD #[]
-    return { id, projectId, parentId, title, description, status, target, attachedPRs,
-             dependencies, createdAt, updatedAt }
+Every `Project`/`Issue` is a taxis issue: a project is one carrying the `t-project` label; an
+Orchestra issue belonging to project `pid` is a taxis issue whose native `parent` is `pid` (for a
+root issue) or another Orchestra issue's id (for a sub-issue, e.g. one produced by `split_issue`).
+A project id and an issue id are therefore both plain `Taxis.IssueId` — there is no separate
+"project" concept on the wire, only issues, some of which carry the `t-project` label.
 
-/-! ## Filesystem layout
+`RepoTarget`/`PRRef`/`ReviewerTemplate` have no native taxis field: they're encoded as a JSON
+metadata blob appended to the taxis issue's `description`, behind a machine-readable marker
+(a trailing fenced ` ```orchestra-meta ` block), parsed back out on load and stripped before a
+human ever sees the description. `IssueStatus` has no native field either: it's `state` (open /
+closed / completed) plus at most one dedicated status label (`o-claimed`, `o-in-review`,
+`o-blocked`, `o-rejected` — `open`/`completed`/`abandoned` need no label, see `statusOf`/
+`labelsFor`). -/
 
-```
-~/.local/share/orchestra/projects/
-  <project-id>.json              -- Project record
-  <project-id>/
-    issues/<issue-id>.json       -- Issue record
-    claims/<issue-id>.json       -- Claim lock
-```
--/
+private def metaFence := "\n```orchestra-meta\n"
+private def metaFenceEnd := "\n```"
 
-/-- Optional override for the projects root directory. Tests set this to a
-    temp directory to avoid touching the user's real projects directory.
-    When `none`, paths are derived from the XDG data base. -/
-initialize projectsDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
+/-! `encodeMeta`/`decodeMeta` are the wire format for everything taxis has no native field for,
+so they're not `private`: `OrchestraTest.ProjectMeta` round-trips them directly, which is the
+one part of this module testable without a live taxis instance. -/
 
-def setProjectsDirOverride (p : Option System.FilePath) : IO Unit :=
-  projectsDirOverride.set p
+/-- Append `metaFields` (if non-empty) to `human` as a trailing fenced metadata block. -/
+def encodeMeta (human : String) (metaFields : List (String × Json)) : String :=
+  if metaFields.isEmpty then human
+  else human ++ metaFence ++ (Json.mkObj metaFields).compress ++ metaFenceEnd
 
-def projectsDir : IO System.FilePath := do
-  match ← projectsDirOverride.get with
-  | some p => return p
-  | none   => return (← Dirs.dataBase) / "projects"
+/-- Split a taxis issue description into (human-readable text, metadata) by finding the trailing
+    `metaFence` marker, if any. Splits on the *last* fence, not the first: `encodeMeta` always
+    appends its block at the end, and a human description may legitimately contain the marker
+    (an issue *about* this format, say) without that truncating everything after it.
 
-def projectDir (pid : ProjectId) : IO System.FilePath := do
-  return (← projectsDir) / pid.value
+    Tolerates a missing/malformed block by treating the whole description as human text — a
+    corrupt metadata blob should never make an issue unreadable. That fallback is stable rather
+    than compounding: re-encoding the returned `raw` appends any fresh metadata *after* the
+    corrupt block, and this function then reads back the fresh one. -/
+def decodeMeta (raw : String) : String × Json :=
+  match raw.splitOn metaFence with
+  | [] | [_] => (raw, Json.mkObj [])
+  | parts =>
+    let human := metaFence.intercalate parts.dropLast
+    match (parts.getLastD "").splitOn metaFenceEnd with
+    | metaStr :: _ =>
+      match Json.parse metaStr with
+      | .ok j => (human, j)
+      | .error _ => (raw, Json.mkObj [])
+    | [] => (raw, Json.mkObj [])
 
-def projectFile (pid : ProjectId) : IO System.FilePath := do
-  return (← projectsDir) / s!"{pid.value}.json"
+/-! ## Status ↔ (state, label) mapping -/
 
-def issuesDir (pid : ProjectId) : IO System.FilePath := do
-  return (← projectDir pid) / "issues"
+private structure StatusLabelIds where
+  claimed  : Orchestra.Taxis.LabelId
+  inReview : Orchestra.Taxis.LabelId
+  blocked  : Orchestra.Taxis.LabelId
+  rejected : Orchestra.Taxis.LabelId
+  project  : Orchestra.Taxis.LabelId
 
-def issueFile (pid : ProjectId) (iid : IssueId) : IO System.FilePath := do
-  return (← issuesDir pid) / s!"{iid.value}.json"
+private initialize statusLabelIdsRef : IO.Ref (Option StatusLabelIds) ← IO.mkRef none
 
-def claimsDir (pid : ProjectId) : IO System.FilePath := do
-  return (← projectDir pid) / "claims"
+/-- Resolve (creating on first use if necessary) the fixed set of taxis labels the status mapping
+    and project marker need. Label ids don't change once created, so this is cached for the
+    process's lifetime — every call after the first is free. -/
+private def statusLabelIds : IO StatusLabelIds := do
+  match ← statusLabelIdsRef.get with
+  | some ids => return ids
+  | none =>
+    let cfg ← Orchestra.Taxis.getConfig
+    let ensure (name : String) : IO Orchestra.Taxis.LabelId := do
+      match ← Orchestra.Taxis.ensureLabel cfg name with
+      | .ok id => pure id
+      | .error e => throw (.userError s!"taxis: failed to ensure label '{name}': {e}")
+    let ids : StatusLabelIds :=
+      { claimed  := ← ensure "o-claimed"
+        inReview := ← ensure "o-in-review"
+        blocked  := ← ensure "o-blocked"
+        rejected := ← ensure "o-rejected"
+        project  := ← ensure "t-project" }
+    statusLabelIdsRef.set (some ids)
+    return ids
 
-def claimFile (pid : ProjectId) (iid : IssueId) : IO System.FilePath := do
-  return (← claimsDir pid) / s!"{iid.value}.json"
+/-- The `IssueStatus` a taxis issue's `state` + `labels` represent. -/
+private def statusOf (ids : StatusLabelIds) (state : Orchestra.Taxis.IssueState) (labels : Array Orchestra.Taxis.LabelId) :
+    IssueStatus :=
+  match state with
+  | .completed => .completed
+  | .closed => .abandoned
+  | .open =>
+    if labels.contains ids.claimed then .claimed
+    else if labels.contains ids.inReview then .inReview
+    else if labels.contains ids.blocked then .blocked
+    else if labels.contains ids.rejected then .rejected
+    else .open
 
-/-! ## ID generation
+/-- The taxis `state` a given `IssueStatus` maps to. -/
+private def stateOf : IssueStatus → Orchestra.Taxis.IssueState
+  | .completed => .completed
+  | .abandoned => .closed
+  | _ => .open
 
-Reuse the monotonic-clock 16-char hex scheme from `TaskStore.generateId` so
-all orchestra IDs share one namespace shape. Wrap into the type-safe carriers
-on the way out. -/
+/-- Rewrite `current`'s status labels (clearing all four and re-adding the one for `status`, if
+    any) — always exactly zero or one of the four is present afterward. -/
+private def labelsFor (ids : StatusLabelIds) (current : Array Orchestra.Taxis.LabelId) (status : IssueStatus) :
+    Array Orchestra.Taxis.LabelId :=
+  let statusIds := #[ids.claimed, ids.inReview, ids.blocked, ids.rejected]
+  let cleared := current.filter (fun l => !statusIds.contains l)
+  match status with
+  | .claimed  => cleared.push ids.claimed
+  | .inReview => cleared.push ids.inReview
+  | .blocked  => cleared.push ids.blocked
+  | .rejected => cleared.push ids.rejected
+  | .open | .completed | .abandoned => cleared
 
-def freshProjectId : IO ProjectId := do
-  return ⟨← TaskStore.generateId⟩
+/-! ## Conversions -/
 
-def freshIssueId : IO IssueId := do
-  return ⟨← TaskStore.generateId⟩
+private def toProject (raw : Orchestra.Taxis.Issue) : IO Project := do
+  let (human, metaFields) := decodeMeta raw.description
+  let createdAt ← Orchestra.Taxis.epochToIso8601 raw.createdAt
+  return {
+    id := raw.id
+    name := raw.title
+    description := if human.isEmpty then none else some human
+    createdAt
+    defaultTarget := metaFields.getObjValAs? RepoTarget "target" |>.toOption
+    reviewer := metaFields.getObjValAs? ReviewerTemplate "reviewer" |>.toOption }
 
-/-! ## Persistence -/
+/-- `raw.id`'s parent, reinterpreted in Orchestra's terms: `none` if it points at the project
+    itself (the implicit root, not a "parent issue" from Orchestra's point of view) or is absent,
+    `some` otherwise. -/
+private def orchestraParentOf (projectId : Taxis.IssueId) (raw : Orchestra.Taxis.Issue) : Option Taxis.IssueId :=
+  match raw.parent with
+  | none => none
+  | some p => if p.val == projectId.val then none else some p
 
+private def toIssue (ids : StatusLabelIds) (projectId : Taxis.IssueId) (raw : Orchestra.Taxis.Issue)
+    (artifacts : Array Orchestra.Taxis.ArtifactView := #[]) : IO Issue := do
+  let (human, metaFields) := decodeMeta raw.description
+  let attachedPRs := artifacts.filterMap fun a =>
+    if a.kind == "github-pr" then (FromJson.fromJson? a.payload : Except String PRRef).toOption else none
+  let createdAt ← Orchestra.Taxis.epochToIso8601 raw.createdAt
+  let updatedAt ← Orchestra.Taxis.epochToIso8601 raw.updatedAt
+  return {
+    id := raw.id
+    projectId
+    parentId := orchestraParentOf projectId raw
+    title := raw.title
+    description := human
+    status := statusOf ids raw.state raw.labels
+    target := metaFields.getObjValAs? RepoTarget "target" |>.toOption
+    attachedPRs
+    dependencies := raw.dependencies
+    createdAt
+    updatedAt }
+
+/-! ## Persistence
+
+Unlike the pre-migration file-based API, creating and updating are genuinely different
+operations here (taxis assigns an issue's id on creation — there's no way to know it in advance
+the way `freshProjectId`/`freshIssueId` used to hand out a locally-generated one). `saveProject`/
+`saveIssue` are therefore update-only (PATCH an *existing* record); use `createProject`/
+`createIssue` to make a new one. -/
+
+private def unwrap {α} : Except String α → IO α
+  | .ok v => pure v
+  | .error e => throw (.userError s!"taxis: {e}")
+
+/-- Bound on how far an ancestor walk (`findIssue`) follows `parent` pointers before giving up. -/
+private def maxAncestorDepth : Nat := 256
+
+def createProject (name : String) (description : Option String := none)
+    (defaultTarget : Option RepoTarget := none) (reviewer : Option ReviewerTemplate := none) :
+    IO Project := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  let metaFields : List (String × Json) :=
+    (defaultTarget.map fun t => [("target", ToJson.toJson t)] : Option _).getD [] ++
+    (reviewer.map fun r => [("reviewer", ToJson.toJson r)] : Option _).getD []
+  let desc := encodeMeta (description.getD "") metaFields
+  let raw ← unwrap (← Orchestra.Taxis.createIssue cfg { title := name, description := desc, labels := #[ids.project] })
+  toProject raw
+
+/-- Update an *existing* project's name/description/target/reviewer. -/
 def saveProject (p : Project) : IO Unit := do
-  let dir ← projectsDir
-  IO.FS.createDirAll dir
-  IO.FS.createDirAll (← projectDir p.id)
-  IO.FS.createDirAll (← issuesDir p.id)
-  IO.FS.createDirAll (← claimsDir p.id)
-  IO.FS.writeFile (← projectFile p.id) (Json.compress (ToJson.toJson p))
+  let cfg ← Orchestra.Taxis.getConfig
+  let metaFields : List (String × Json) :=
+    (p.defaultTarget.map fun t => [("target", ToJson.toJson t)] : Option _).getD [] ++
+    (p.reviewer.map fun r => [("reviewer", ToJson.toJson r)] : Option _).getD []
+  let desc := encodeMeta (p.description.getD "") metaFields
+  let _ ← unwrap (← Orchestra.Taxis.updateIssue cfg p.id { title := some p.name, description := some desc })
 
-def loadProject (pid : ProjectId) : IO (Option Project) := do
-  let path ← projectFile pid
-  if !(← path.pathExists) then return none
-  let contents ← IO.FS.readFile path
-  match Json.parse contents with
-  | .error e =>
-    IO.eprintln s!"[warn] failed to parse project file {path}: {e}"
-    return none
-  | .ok j    =>
-    match FromJson.fromJson? j with
-    | .error e =>
-      IO.eprintln s!"[warn] failed to parse project file {path}: {e}"
-      return none
-    | .ok p    => return some p
+def loadProject (pid : Taxis.IssueId) : IO (Option Project) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  match ← Orchestra.Taxis.getIssue cfg pid with
+  | .error _ => return none
+  | .ok raw => return some (← toProject raw)
 
-private def stripJsonExt (name : String) : Option String :=
-  let ext := ".json"
-  if name.endsWith ext then some (name.dropEnd ext.length).toString else none
-
-/-- All projects, newest first by id. -/
+/-- All projects, newest first by id (matching the old newest-first-by-generated-id ordering). -/
 def loadAllProjects : IO (Array Project) := do
-  let dir ← projectsDir
-  if !(← dir.pathExists) then return #[]
-  let entries ← System.FilePath.readDir dir
-  let mut out : Array Project := #[]
-  for entry in entries do
-    if let some idStr := stripJsonExt entry.fileName then
-      if let some p ← loadProject ⟨idStr⟩ then
-        out := out.push p
-  return out.qsort (fun a b => a.id.value > b.id.value)
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  let raws ← unwrap (← Orchestra.Taxis.listIssues cfg (label := some ids.project))
+  let projects ← raws.mapM toProject
+  return projects.qsort (fun a b => a.id.val > b.id.val)
 
+/-- Permanently delete a project. Note this is *not* a status transition (there's no "deleted"
+    `IssueStatus`) — the taxis issue itself is removed, unlike `saveIssue { .. with status := ..}`
+    for the ordinary lifecycle states. taxis's `parent_id` foreign key is `ON DELETE SET NULL`, not
+    cascading, so this does *not* also delete the project's issues — they become orphaned (no
+    project); callers that want a clean sweep should delete issues first. -/
+def deleteProject (pid : Taxis.IssueId) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfig
+  unwrap (← Orchestra.Taxis.deleteIssue cfg pid)
+
+/-- Permanently delete an issue (see `deleteProject`'s note on `ON DELETE SET NULL` — this doesn't
+    cascade to children either). -/
+def deleteIssue (iid : Taxis.IssueId) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfig
+  unwrap (← Orchestra.Taxis.deleteIssue cfg iid)
+
+def createIssue (projectId : Taxis.IssueId) (title description : String)
+    (parentId : Option Taxis.IssueId := none) (target : Option RepoTarget := none)
+    (dependencies : Array Taxis.IssueId := #[]) : IO Issue := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  let metaFields : List (String × Json) :=
+    (target.map fun t => [("target", ToJson.toJson t)] : Option _).getD []
+  let desc := encodeMeta description metaFields
+  let parent := parentId.getD projectId
+  let raw ← unwrap (← Orchestra.Taxis.createIssue cfg
+    { title, description := desc, parent := some parent, dependencies })
+  toIssue ids projectId raw
+
+/-- Update an *existing* issue's title/description/status/target/dependencies.
+
+    Deliberately does **not** write `attachedPRs` — use `attachPR`. An issue's PR set lives in
+    taxis artifacts rather than its body, so reconciling it here would make every status patch
+    also assert the full PR list; combined with `loadIssues` not populating `attachedPRs`, a
+    load-modify-save of a listed issue would then silently detach every PR on it. Attaching is
+    the only mutation Orchestra ever performs on the set, so it gets its own entry point.
+
+    Also does not change `parentId` — nothing in Orchestra re-parents an issue after creation. -/
 def saveIssue (i : Issue) : IO Unit := do
-  IO.FS.createDirAll (← issuesDir i.projectId)
-  IO.FS.writeFile (← issueFile i.projectId i.id) (Json.compress (ToJson.toJson i))
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  -- Need the issue's current label set to only touch the status labels, not clobber any others.
+  let raw ← unwrap (← Orchestra.Taxis.getIssue cfg i.id)
+  let metaFields : List (String × Json) :=
+    (i.target.map fun t => [("target", ToJson.toJson t)] : Option _).getD []
+  let desc := encodeMeta i.description metaFields
+  let _ ← unwrap (← Orchestra.Taxis.updateIssue cfg i.id
+    { title := some i.title
+      description := some desc
+      state := some (stateOf i.status)
+      labels := some (labelsFor ids raw.labels i.status)
+      dependencies := some i.dependencies })
 
-def loadIssue (pid : ProjectId) (iid : IssueId) : IO (Option Issue) := do
-  let path ← issueFile pid iid
-  if !(← path.pathExists) then return none
-  let contents ← IO.FS.readFile path
-  match Json.parse contents with
-  | .error e =>
-    IO.eprintln s!"[warn] failed to parse issue file {path}: {e}"
-    return none
-  | .ok j    =>
-    match FromJson.fromJson? j with
-    | .error e =>
-      IO.eprintln s!"[warn] failed to parse issue file {path}: {e}"
+/-- Attach `pr` to `iid` as a `github-pr` artifact — the counterpart to `Issue.attachedPRs` on
+    the read side (see `saveIssue` for why this isn't folded into it).
+
+    The `github-pr` handler's `validate` requires a `url` field (see `Taxis.Plugins.Github`),
+    which `PRRef.toJson` alone doesn't produce — `prRefArtifactPayload` adds it on write, and
+    `FromJson PRRef` still round-trips the result on read since `repo`/`number`/`branch`/
+    `task_id` are included too. -/
+def attachPR (iid : Taxis.IssueId) (pr : PRRef) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let _ ← unwrap (← Orchestra.Taxis.createArtifact cfg iid "github-pr" (prRefArtifactPayload pr))
+
+def loadIssue (pid : Taxis.IssueId) (iid : Taxis.IssueId) : IO (Option Issue) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  match ← Orchestra.Taxis.getIssueDetail cfg iid with
+  | .error _ => return none
+  | .ok detail =>
+    let ids ← statusLabelIds
+    return some (← toIssue ids pid detail.issue detail.attachedArtifacts)
+
+/-- All issues belonging to `pid` — every taxis issue whose ancestor chain (via native `parent`)
+    reaches `pid`. taxis has no server-side "descendants of X" filter (see the "Migrate Project/
+    Issue data layer" tracking issue), so this fetches every issue in the tracker once and filters
+    client-side. For speed, `attachedPRs` is left empty here — populating it would cost one
+    `GET /issues/:id` per issue, and none of this function's callers (status/dependency
+    filtering, the dispatcher) read it; `loadIssue`/`findIssue` fetch it. Feeding a result of
+    this function back into `saveIssue` is safe regardless: `saveIssue` doesn't write the PR
+    set (see its docs). -/
+def loadIssues (pid : Taxis.IssueId) : IO (Array Issue) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  let all ← unwrap (← Orchestra.Taxis.listIssues cfg)
+  let byId : Std.HashMap Int64 Orchestra.Taxis.Issue := Std.HashMap.ofList (all.toList.map fun i => (i.id.val, i))
+  let rec belongsTo (i : Orchestra.Taxis.Issue) : Nat → Bool
+    | 0 => false
+    | fuel + 1 =>
+      match i.parent with
+      | none => false
+      | some p =>
+        if p.val == pid.val then true
+        else match byId.get? p.val with
+          | some parentIssue => belongsTo parentIssue fuel
+          | none => false
+  let mine := all.filter (belongsTo · all.size)
+  mine.mapM (toIssue ids pid ·)
+
+/-- Find an issue by ID across all projects, without knowing which one in advance. Returns the
+    owning project too, so callers can resolve `effectiveTarget`. Used by the CLI where users name
+    an issue without giving its project. Walks the issue's ancestor chain up to whichever ancestor
+    carries the `t-project` label. -/
+def findIssue (iid : Taxis.IssueId) : IO (Option (Project × Issue)) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  -- Fuel-bounded like `loadIssues`' `belongsTo`: orchestra hierarchies are shallow (project →
+  -- issue → split sub-issue), so the bound only exists so that a `parent` cycle on the taxis
+  -- side fails fast instead of looping forever over HTTP.
+  let rec findProjectOf (id : Taxis.IssueId) : Nat → IO (Option Project)
+    | 0 => do
+      IO.eprintln s!"[warn] findIssue: ancestor chain of {iid.toString} exceeds \
+        {maxAncestorDepth} levels; giving up (parent cycle?)"
       return none
-    | .ok r    => return some r
-
-/-- All issues belonging to a project. -/
-def loadIssues (pid : ProjectId) : IO (Array Issue) := do
-  let dir ← issuesDir pid
-  if !(← dir.pathExists) then return #[]
-  let entries ← System.FilePath.readDir dir
-  let mut out : Array Issue := #[]
-  for entry in entries do
-    if let some idStr := stripJsonExt entry.fileName then
-      if let some r ← loadIssue pid ⟨idStr⟩ then
-        out := out.push r
-  return out
-
-/-- Find an issue by ID across all projects. Returns the owning project too,
-    so callers can resolve `effectiveTarget`. Used by the CLI where users
-    name an issue without giving its project. -/
-def findIssue (iid : IssueId) : IO (Option (Project × Issue)) := do
-  for p in (← loadAllProjects) do
-    if let some i ← loadIssue p.id iid then
-      return some (p, i)
-  return none
+    | fuel + 1 => do
+      match ← Orchestra.Taxis.getIssue cfg id with
+      | .error _ => return none
+      | .ok raw =>
+        if raw.labels.contains ids.project then
+          return some (← toProject raw)
+        else
+          match raw.parent with
+          | none => return none
+          | some p => findProjectOf p fuel
+  match ← Orchestra.Taxis.getIssueDetail cfg iid with
+  | .error _ => return none
+  | .ok detail =>
+    match ← findProjectOf iid maxAncestorDepth with
+    | none => return none
+    | some project => return some (project, ← toIssue ids project.id detail.issue detail.attachedArtifacts)
 
 /-! ## Hierarchy traversal (B1: parentId-only) -/
 
 /-- Direct children of `parent` within `pid`. -/
-def childrenOf (pid : ProjectId) (parent : IssueId) : IO (Array Issue) := do
+def childrenOf (pid : Taxis.IssueId) (parent : Taxis.IssueId) : IO (Array Issue) := do
   let all ← loadIssues pid
   return all.filter (fun i => i.parentId == some parent)
 
 /-- Top-level (parentless) issues of `pid`. -/
-def rootIssues (pid : ProjectId) : IO (Array Issue) := do
+def rootIssues (pid : Taxis.IssueId) : IO (Array Issue) := do
   let all ← loadIssues pid
   return all.filter (fun i => i.parentId.isNone)
 
@@ -360,5 +516,41 @@ explicit upstream/fork at queue time. -/
 
 def effectiveTarget (project : Project) (issue : Issue) : Option RepoTarget :=
   issue.target <|> project.defaultTarget
+
+/-! ## Per-project filesystem directory
+
+Project/issue data itself is taxis-backed now, but roles (`Project.Role`) are explicitly out of
+scope for this migration and stay file-based — `<data>/projects/<pid>/roles/`. This is the one
+filesystem path callers still need for that. -/
+
+/-- Optional override for the projects root directory. Tests set this to a temp directory to
+    avoid touching the user's real data directory. When `none`, paths are derived from the XDG
+    data base. -/
+initialize projectsDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
+
+def setProjectsDirOverride (p : Option System.FilePath) : IO Unit :=
+  projectsDirOverride.set p
+
+def projectsDir : IO System.FilePath := do
+  match ← projectsDirOverride.get with
+  | some p => return p
+  | none   => return (← Dirs.dataBase) / "projects"
+
+def projectDir (pid : Taxis.IssueId) : IO System.FilePath := do
+  return (← projectsDir) / pid.toString
+
+/-- Load the default `AppConfig` and wire its `taxis` section (if any) into
+    `Orchestra.Taxis`'s active config, so every `Project.*`/`Claim.*` function can reach it
+    without every CLI handler threading a `Config` value through — mirrors how `Config.loadAppConfig`
+    itself is already called independently by each of `Main.lean`'s other command handlers. Called
+    once at CLI startup (`Main.main`). Silently does nothing if config.json can't be loaded —
+    commands that don't touch the taxis-backed project subsystem shouldn't fail just because
+    config.json is missing/malformed; a genuinely unconfigured taxis only surfaces as an error once
+    something actually calls `Orchestra.Taxis.getConfig`. -/
+def ensureTaxisConfigured : IO Unit := do
+  try
+    let cfg ← loadAppConfig
+    Orchestra.Taxis.setConfig cfg.taxis
+  catch _ => pure ()
 
 end Orchestra.Project

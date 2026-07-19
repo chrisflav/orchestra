@@ -5,7 +5,6 @@ import Orchestra.TaskStore
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra.Queue
-open Orchestra.Project (ProjectId IssueId)
 
 -- Types
 
@@ -133,9 +132,9 @@ structure QueueEntry where
   issueNumber : Option Nat := none
   /-- Orchestra project this entry belongs to (optional).
       Distinct from `issueNumber` (a GitHub issue number). -/
-  projectId : Option ProjectId := none
+  projectId : Option Taxis.IssueId := none
   /-- Orchestra issue this entry is working on (optional). -/
-  issueId : Option IssueId := none
+  issueId : Option Taxis.IssueId := none
   /-- Optional role name (mirrors `IOTask.role`). Used by the dispatcher to
       count per-role active tasks unambiguously. -/
   role : Option String := none
@@ -221,8 +220,8 @@ instance : FromJson QueueEntry where
     let inputJson        := j.getObjVal?   "input_json"          |>.toOption
     let outputJson       := j.getObjVal?   "output_json"         |>.toOption
     let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
-    let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
-    let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
+    let projectId   := j.getObjValAs? Taxis.IssueId "project_id" |>.toOption
+    let issueId     := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
     let role         := j.getObjValAs? String    "role"          |>.toOption
     let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []

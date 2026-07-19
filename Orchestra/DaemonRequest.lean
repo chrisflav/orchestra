@@ -1,6 +1,6 @@
 import Lean.Data.Json
 import Orchestra.Queue
-import Orchestra.Project.Id
+import Taxis.Domain
 
 open Lean (Json FromJson ToJson)
 
@@ -21,7 +21,7 @@ inductive DaemonRequest where
   /-- Acquire the orchestra-project claim on `issueId` for `taskId`.
       Routed to `ClaimManager.tryClaim` inside the daemon so the in-process
       mutex serialises CLI claims against agent claims. -/
-  | claimIssue (projectId : Project.ProjectId) (issueId : Project.IssueId)
+  | claimIssue (projectId : Taxis.IssueId) (issueId : Taxis.IssueId)
                (taskId : String) (agent : String) (series : Option String := none)
 
 instance : FromJson DaemonRequest where
@@ -42,12 +42,12 @@ instance : FromJson DaemonRequest where
       let force := j.getObjValAs? Bool "force" |>.toOption |>.getD false
       return .shutdown force
     | "claim_issue" =>
-      let pid    ← j.getObjValAs? String "project_id"
-      let iid    ← j.getObjValAs? String "issue_id"
+      let pid    ← j.getObjValAs? Taxis.IssueId "project_id"
+      let iid    ← j.getObjValAs? Taxis.IssueId "issue_id"
       let taskId ← j.getObjValAs? String "task_id"
       let agent  ← j.getObjValAs? String "agent"
       let series := j.getObjValAs? String "series" |>.toOption
-      return .claimIssue ⟨pid⟩ ⟨iid⟩ taskId agent series
+      return .claimIssue pid iid taskId agent series
     | t => throw s!"unknown request type: {t}"
 
 /-- All valid responses the daemon can send back over the socket. -/

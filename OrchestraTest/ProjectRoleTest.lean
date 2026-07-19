@@ -8,6 +8,13 @@ open Orchestra.Listener
 
 namespace OrchestraTest.ProjectRole
 
+/-! Roles stay file-based even after the taxis migration (see the "Migrate Project/Issue data
+    layer" tracking issue — out of scope there), so `projectRolesDir`/`globalRolesDir` isolation
+    via `withTempHome` still applies unchanged. The dispatcher tests below don't touch taxis at
+    all: `dispatcherTick` is a pure function over `Project`/`Issue` values, so fixtures are built
+    as plain record literals with fabricated ids rather than round-tripped through a real
+    tracker — there's nothing here for a taxis instance to add. -/
+
 private def withTempHome (act : IO α) : IO α := do
   let tmpRoot : System.FilePath :=
     System.FilePath.mk "/tmp" / s!"orchestra-role-test-{← IO.monoNanosNow}"
@@ -26,23 +33,17 @@ private def writeRole (dir : System.FilePath) (name : String) (json : String) : 
   IO.FS.createDirAll dir
   IO.FS.writeFile (dir / s!"{name}.json") json
 
-private def setupProject (defaultTarget : Option RepoTarget := none) : IO Project := do
-  let pid ← freshProjectId
-  let now ← TaskStore.currentIso8601
-  let p : Project := { id := pid, name := "demo", createdAt := now, defaultTarget }
-  saveProject p
-  return p
+/-- A fixture project, not backed by any real tracker — just enough of a `Project` value for
+    `projectRolesDir`/`dispatcherTick` to work with. -/
+private def fixtureProject (id : Int64 := 1) : Project :=
+  { id := ⟨id⟩, name := "demo", createdAt := "2026-01-01T00:00:00Z" }
 
-private def addIssue (pid : ProjectId) (status : IssueStatus := .open) (title : String := "i") :
-    IO Issue := do
-  let now ← TaskStore.currentIso8601
-  let iid ← freshIssueId
-  let i : Issue :=
-    { id := iid, projectId := pid, title, description := "x", status
-    , target := some { repo := { owner := "o", name := "r" }, branch := "main" }
-    , createdAt := now, updatedAt := now }
-  saveIssue i
-  return i
+/-- A fixture issue belonging to `fixtureProject`, not backed by any real tracker. -/
+private def fixtureIssue (id : Int64) (project : Project) (status : IssueStatus := .open)
+    (title : String := "i") (dependencies : Array Taxis.IssueId := #[]) : Issue :=
+  { id := ⟨id⟩, projectId := project.id, title, description := "x", status, dependencies
+  , target := some { repo := { owner := "o", name := "r" }, branch := "main" }
+  , createdAt := "2026-01-01T00:00:00Z", updatedAt := "2026-01-01T00:00:00Z" }
 
 @[test]
 def renderSubstitutesPlaceholders : Test := do
@@ -59,7 +60,7 @@ def renderSubstitutesPlaceholders : Test := do
 @[test]
 def projectRoleOverridesGlobal : Test := do
   let outcome ← (withTempHome do
-    let project ← setupProject
+    let project := fixtureProject
     let global ← globalRolesDir
     writeRole global "worker" r#"{"name":"worker","permissions":["a"],"prompt_template":"GLOBAL"}"#
     let pdir ← projectRolesDir project.id
@@ -71,7 +72,7 @@ def projectRoleOverridesGlobal : Test := do
 @[test]
 def loadAllRolesMergesGlobalsThatArentShadowed : Test := do
   let names ← (withTempHome do
-    let project ← setupProject
+    let project := fixtureProject
     let global ← globalRolesDir
     let pdir ← projectRolesDir project.id
     writeRole global "planner"  r#"{"name":"planner","permissions":["manage_issues"],"prompt_template":"P"}"#
@@ -84,18 +85,14 @@ def loadAllRolesMergesGlobalsThatArentShadowed : Test := do
 
 @[test]
 def dispatcherSpawnsWorkerWhenOpenIssueAndCapAllows : Test := do
-  let result ← (withTempHome do
-    let project ← setupProject
-    let _i := ← addIssue project.id (status := .open) (title := "do it")
-    let role : Role :=
-      { name := "implementor", permissions := ["work_issues", "create_pr"]
-      , promptTemplate := "implement"
-      , dispatch := some { trigger := .hasOpenIssues, max := 1, preClaim := true } }
-    return dispatcherTick
-      { activeByRole := {}
-      , issues := ← loadIssues project.id
-      , caps := [("implementor", 2)]
-      , roles := #[role] })
+  let project := fixtureProject
+  let issue := fixtureIssue 101 project (status := .open) (title := "do it")
+  let role : Role :=
+    { name := "implementor", permissions := ["work_issues", "create_pr"]
+    , promptTemplate := "implement"
+    , dispatch := some { trigger := .hasOpenIssues, max := 1, preClaim := true } }
+  let result := dispatcherTick
+    { activeByRole := {}, issues := #[issue], caps := [("implementor", 2)], roles := #[role] }
   TestM.assertEqual result.size 1 (msg := "exactly one spawn")
   match result[0]? with
   | some s =>
@@ -105,56 +102,42 @@ def dispatcherSpawnsWorkerWhenOpenIssueAndCapAllows : Test := do
 
 @[test]
 def dispatcherRespectsCap : Test := do
-  let count ← (withTempHome do
-    let project ← setupProject
-    let _ := ← addIssue project.id .open
-    let _ := ← addIssue project.id .open
-    let role : Role :=
-      { name := "implementor", permissions := []
-      , promptTemplate := "x"
-      , dispatch := some { trigger := .hasOpenIssues, max := 5 } }
-    let active : Std.HashMap String Nat := ({} : Std.HashMap String Nat).insert "implementor" 2
-    return (dispatcherTick
-      { activeByRole := active
-      , issues := ← loadIssues project.id
-      , caps := [("implementor", 2)]
-      , roles := #[role] }).size)
+  let project := fixtureProject
+  let issues := #[fixtureIssue 101 project .open, fixtureIssue 102 project .open]
+  let role : Role :=
+    { name := "implementor", permissions := []
+    , promptTemplate := "x"
+    , dispatch := some { trigger := .hasOpenIssues, max := 5 } }
+  let active : Std.HashMap String Nat := ({} : Std.HashMap String Nat).insert "implementor" 2
+  let count := (dispatcherTick
+    { activeByRole := active, issues, caps := [("implementor", 2)], roles := #[role] }).size
   TestM.assertEqual count 0 (msg := "active==cap blocks spawn")
 
 @[test]
 def dispatcherIdleTriggerOnlyWhenNoWork : Test := do
-  let (idleEmpty, idleWithOpen) ← (withTempHome do
-    let project ← setupProject
-    let role : Role :=
-      { name := "planner", permissions := ["manage_issues"]
-      , promptTemplate := "plan"
-      , dispatch := some { trigger := .idle, max := 1 } }
-    let emptyIssues : Array Issue := #[]
-    let resEmpty := dispatcherTick
-      { activeByRole := {}, issues := emptyIssues
-      , caps := [("planner", 1)], roles := #[role] }
-    let _ := ← addIssue project.id .open
-    let resWithOpen := dispatcherTick
-      { activeByRole := {}, issues := ← loadIssues project.id
-      , caps := [("planner", 1)], roles := #[role] }
-    return (resEmpty.size, resWithOpen.size))
-  TestM.assertEqual idleEmpty 1     (msg := "idle role spawns when no work")
-  TestM.assertEqual idleWithOpen 0  (msg := "idle role suppressed when open issues exist")
+  let project := fixtureProject
+  let role : Role :=
+    { name := "planner", permissions := ["manage_issues"]
+    , promptTemplate := "plan"
+    , dispatch := some { trigger := .idle, max := 1 } }
+  let resEmpty := dispatcherTick
+    { activeByRole := {}, issues := #[], caps := [("planner", 1)], roles := #[role] }
+  let resWithOpen := dispatcherTick
+    { activeByRole := {}, issues := #[fixtureIssue 101 project .open]
+    , caps := [("planner", 1)], roles := #[role] }
+  TestM.assertEqual resEmpty.size 1     (msg := "idle role spawns when no work")
+  TestM.assertEqual resWithOpen.size 0  (msg := "idle role suppressed when open issues exist")
 
 @[test]
 def dispatcherEmitsAtMostOnePerRolePerTick : Test := do
-  let count ← (withTempHome do
-    let project ← setupProject
-    let _ := ← addIssue project.id .open
-    let _ := ← addIssue project.id .open
-    let _ := ← addIssue project.id .open
-    let role : Role :=
-      { name := "implementor", permissions := []
-      , promptTemplate := "x"
-      , dispatch := some { trigger := .hasOpenIssues, max := 10 } }
-    return (dispatcherTick
-      { activeByRole := {}, issues := ← loadIssues project.id
-      , caps := [("implementor", 10)], roles := #[role] }).size)
+  let project := fixtureProject
+  let issues := #[fixtureIssue 101 project .open, fixtureIssue 102 project .open, fixtureIssue 103 project .open]
+  let role : Role :=
+    { name := "implementor", permissions := []
+    , promptTemplate := "x"
+    , dispatch := some { trigger := .hasOpenIssues, max := 10 } }
+  let count := (dispatcherTick
+    { activeByRole := {}, issues, caps := [("implementor", 10)], roles := #[role] }).size
   TestM.assertEqual count 1 (msg := "≤1 spawn per role per tick (gradual ramp)")
 
 end OrchestraTest.ProjectRole

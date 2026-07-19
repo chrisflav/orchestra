@@ -3,12 +3,13 @@ import Orchestra
 
 open Lean (Json FromJson ToJson)
 open Orchestra
-open Orchestra.Project (ProjectId IssueId)
 
 namespace OrchestraTest.ProjectFields
 
-/-! Verify that the new `project_id` / `issue_id` fields:
-    1. round-trip through `QueueEntry` / `TaskRecord` JSON,
+/-! Verify that the `project_id` / `issue_id` fields:
+    1. round-trip through `QueueEntry` / `TaskRecord` JSON as bare numbers (taxis's own id
+       convention, since a migration to a taxis-backed `Taxis.IssueId`/`Taxis.IssueId` — see the "Migrate
+       Project/Issue data layer" tracking issue),
     2. are *omitted* when `none`, so existing on-disk files keep working,
     3. decode fine when entirely absent (backward compat). -/
 
@@ -39,15 +40,15 @@ def queueEntryOmitsProjectFieldsWhenNone : Test := do
 @[test]
 def queueEntryRoundTripWithProjectFields : Test := do
   let entry := { baseEntry with
-                 projectId := some ⟨"proj-abc"⟩
-               , issueId   := some ⟨"iss-xyz"⟩ }
+                 projectId := some (⟨42⟩ : Taxis.IssueId)
+               , issueId   := some (⟨99⟩ : Taxis.IssueId) }
   let encoded := ToJson.toJson entry
   match FromJson.fromJson? encoded (α := Queue.QueueEntry) with
   | .error e => TestM.fail s!"QueueEntry round-trip: {e}"
   | .ok got =>
-    TestM.assertEqual (got.projectId.map (·.value)) (some "proj-abc")
+    TestM.assertEqual (got.projectId.map (·.val)) (some (42 : Int64))
       (msg := "QueueEntry.projectId round-trip")
-    TestM.assertEqual (got.issueId.map (·.value)) (some "iss-xyz")
+    TestM.assertEqual (got.issueId.map (·.val)) (some (99 : Int64))
       (msg := "QueueEntry.issueId round-trip")
 
 @[test]
@@ -66,15 +67,15 @@ def queueEntryDecodesLegacyJson : Test := do
 @[test]
 def taskRecordRoundTripWithProjectFields : Test := do
   let r := { baseRecord with
-               projectId := some ⟨"proj-abc"⟩
-             , issueId   := some ⟨"iss-xyz"⟩ }
+               projectId := some (⟨42⟩ : Taxis.IssueId)
+             , issueId   := some (⟨99⟩ : Taxis.IssueId) }
   let encoded := ToJson.toJson r
   match FromJson.fromJson? encoded (α := TaskStore.TaskRecord) with
   | .error e => TestM.fail s!"TaskRecord round-trip: {e}"
   | .ok got =>
-    TestM.assertEqual (got.projectId.map (·.value)) (some "proj-abc")
+    TestM.assertEqual (got.projectId.map (·.val)) (some (42 : Int64))
       (msg := "TaskRecord.projectId round-trip")
-    TestM.assertEqual (got.issueId.map (·.value)) (some "iss-xyz")
+    TestM.assertEqual (got.issueId.map (·.val)) (some (99 : Int64))
       (msg := "TaskRecord.issueId round-trip")
 
 @[test]
@@ -94,14 +95,14 @@ def taskRecordDecodesLegacyJson : Test := do
 def ioTaskDecodesProjectFields : Test := do
   let raw := r#"{
     "upstream":"org/repo","fork":"me/repo","mode":"pr","prompt":"hi",
-    "project_id":"proj-abc","issue_id":"iss-xyz"
+    "project_id":42,"issue_id":99
   }"#
   match Json.parse raw >>= FromJson.fromJson? (α := Task) with
   | .error e => TestM.fail s!"IOTask decode failed: {e}"
   | .ok got =>
-    TestM.assertEqual (got.ioTask.projectId.map (·.value)) (some "proj-abc")
+    TestM.assertEqual (got.ioTask.projectId.map (·.val)) (some (42 : Int64))
       (msg := "IOTask.projectId decode")
-    TestM.assertEqual (got.ioTask.issueId.map (·.value)) (some "iss-xyz")
+    TestM.assertEqual (got.ioTask.issueId.map (·.val)) (some (99 : Int64))
       (msg := "IOTask.issueId decode")
 
 end OrchestraTest.ProjectFields

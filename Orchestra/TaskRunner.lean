@@ -26,7 +26,7 @@ initialize globalClaimManager : Project.ClaimManager ← Project.ClaimManager.ne
 /-- Enqueue a merger task for `pr` so the queue daemon will merge it later.
     Used by `decide_issue approve` via the `enqueueMerger` hook. Returns the
     new queue entry's ID on success. -/
-def enqueueMergerImpl (pid : Project.ProjectId) (iid : Project.IssueId)
+def enqueueMergerImpl (pid : Taxis.IssueId) (iid : Taxis.IssueId)
     (pr : Project.PRRef) : IO (Except String String) := do
   try
     let id ← TaskStore.generateId
@@ -46,16 +46,16 @@ def enqueueMergerImpl (pid : Project.ProjectId) (iid : Project.IssueId)
     return .error (toString e)
 
 /-- Render the reviewer prompt template with the PR / issue context. -/
-private def renderReviewerPrompt (tmpl : String) (pr : Project.PRRef) (iid : Project.IssueId)
+private def renderReviewerPrompt (tmpl : String) (pr : Project.PRRef) (iid : Taxis.IssueId)
     : String :=
   tmpl.replace "{{repo}}"      pr.repo.toString
     |>.replace "{{pr_number}}" (toString pr.number)
     |>.replace "{{branch}}"    pr.branch
-    |>.replace "{{issue_id}}"  iid.value
+    |>.replace "{{issue_id}}"  iid.toString
 
 /-- Enqueue a reviewer task for `pr` against `tmpl`. Used by `attach_pr` via
     the `enqueueReviewer` hook when a project has a `reviewer` template. -/
-def enqueueReviewerImpl (project : Project.Project) (iid : Project.IssueId)
+def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
     (pr : Project.PRRef) (tmpl : Project.ReviewerTemplate) : IO (Except String String) := do
   try
     let id ← TaskStore.generateId
@@ -90,9 +90,9 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
   let some iid := ioTask.issueId
     | throw (.userError "merger task missing issue_id")
   let some (_, issue) ← Project.findIssue iid
-    | throw (.userError s!"merger: issue {iid.value} not found")
+    | throw (.userError s!"merger: issue {iid.toString} not found")
   let some pr := issue.attachedPRs.toList.reverse.head?
-    | throw (.userError s!"merger: issue {iid.value} has no attached PRs")
+    | throw (.userError s!"merger: issue {iid.toString} has no attached PRs")
   let prRef := s!"{pr.repo}#{pr.number}"
   -- Checkout the PR branch in the shared repo clone.
   IO.println s!"  [merger] gh pr checkout {pr.number}"
@@ -117,7 +117,7 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
     IO.eprintln s!"  [merger] validation failed for {prRef}, rejecting"
     let now ← TaskStore.currentIso8601
     Project.saveIssue { issue with status := .rejected, updatedAt := now }
-    let _ ← Project.forceRelease globalClaimManager pid iid
+    let _ ← Project.forceRelease globalClaimManager iid
     TaskStore.saveTask { initialRecord with status := .failed }
     throw (.userError s!"validation failed for {prRef}")
   -- Validation passed: merge the PR.
@@ -138,7 +138,7 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
     throw (.userError s!"gh pr merge {prRef} failed")
   IO.println s!"  [merger] merged {prRef}\n{mergeOut}"
   Project.saveIssue { issue with status := .completed, updatedAt := now }
-  let _ ← Project.forceRelease globalClaimManager pid iid
+  let _ ← Project.forceRelease globalClaimManager iid
   TaskStore.saveTask { initialRecord with status := .completed }
   -- If this issue has a parent that is blocked, check whether all siblings
   -- are now completed and unblock the parent if so.
@@ -149,7 +149,7 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
         if siblings.all (·.status == .completed) then
           let now2 ← TaskStore.currentIso8601
           Project.saveIssue { parent with status := .open, updatedAt := now2 }
-          IO.println s!"  [merger] all children of {parentId.value} completed; unblocked → open"
+          IO.println s!"  [merger] all children of {parentId.toString} completed; unblocked → open"
 
 /-- Run a triage task: add and/or remove labels on a GitHub issue or pull request.
     Skips the entire agent / sandbox / MCP path.
@@ -294,8 +294,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- If this task was pre-claimed (daemon wrote the claim with the queue-entry
   -- ID before we ran), retag the claim with the real generated taskId so that
   -- ownership checks in attach_pr / split_issue pass.
-  if let (some pid, some iid) := (ioTask.projectId, ioTask.issueId) then
-    Project.updateClaimTaskId globalClaimManager pid iid taskId
+  if let some iid := ioTask.issueId then
+    Project.updateClaimTaskId globalClaimManager iid taskId
   -- Resolve initial resume session from the continued task
   let initialResume : Option String ← match continuesFrom with
     | none => pure none
@@ -314,14 +314,14 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   | none     => pure ()
   | some pid =>
     match ← Project.loadProject pid with
-    | some pr => IO.println s!"  Project: {pid.value} ({pr.name})"
-    | none    => IO.println s!"  Project: {pid.value} (not found)"
+    | some pr => IO.println s!"  Project: {pid.toString} ({pr.name})"
+    | none    => IO.println s!"  Project: {pid.toString} (not found)"
   match ioTask.issueId, ioTask.projectId with
   | some iid, some pid =>
     match ← Project.loadIssue pid iid with
-    | some i => IO.println s!"  Issue:   {iid.value} ({i.title})"
-    | none   => IO.println s!"  Issue:   {iid.value} (not found)"
-  | some iid, none => IO.println s!"  Issue:   {iid.value}"
+    | some i => IO.println s!"  Issue:   {iid.toString} ({i.title})"
+    | none   => IO.println s!"  Issue:   {iid.toString} (not found)"
+  | some iid, none => IO.println s!"  Issue:   {iid.toString}"
   | none,     _    => pure ()
   match continuesFrom, initialResume with
   | some prevId, some sid =>
@@ -503,7 +503,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       let now ← TaskStore.currentIso8601
       let succeeded := finalStatus matches .completed
       if succeeded && issue.status == .inReview then
-        let _ ← Project.forceRelease globalClaimManager project.id iid
+        let _ ← Project.forceRelease globalClaimManager iid
       else
         let _ ← Project.release globalClaimManager project.id iid .open now
     | none => pure ()

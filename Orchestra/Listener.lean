@@ -49,7 +49,7 @@ inductive SourceConfig where
       `caps` maps role name → maximum concurrent active tasks of that role.
       Each tick the dispatcher counts active per-role queue entries and emits
       a synthetic event per role that is below its cap and whose trigger holds. -/
-  | projectDispatcher (projectId : Project.ProjectId) (caps : List (String × Nat))
+  | projectDispatcher (projectId : Taxis.IssueId) (caps : List (String × Nat))
   /-- Fires whenever the number of open issues or pull requests with the given
       labels on a repository is strictly below `max`.  Emits at most one task per
       tick; the tick is skipped while a task from this listener is already pending
@@ -94,7 +94,7 @@ instance : ToJson SourceConfig where
                     ("args", ToJson.toJson args)]
     | .projectDispatcher pid caps =>
         Json.mkObj [("type", "project-dispatcher"),
-                    ("project_id", Json.str pid.value),
+                    ("project_id", ToJson.toJson pid),
                     ("caps", Json.mkObj
                        (caps.map (fun (n, c) => (n, Json.num c))))]
     | .githubLabelCount repos labels max kind =>
@@ -147,12 +147,12 @@ instance : FromJson SourceConfig where
         let args  := j.getObjValAs? (List String) "args" |>.toOption |>.getD []
         return .shell cmd args
     | "project-dispatcher" =>
-        let pid  ← j.getObjValAs? String "project_id"
+        let pid  ← j.getObjValAs? Taxis.IssueId "project_id"
         let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
         let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
         let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
           v.getNat?.toOption.map (k, ·)
-        return .projectDispatcher ⟨pid⟩ caps
+        return .projectDispatcher pid caps
     | "github-label-count" =>
         let repos  ← parseRepos j
         let labels  := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
@@ -493,7 +493,7 @@ structure DispatcherInput where
     trigger is `hasOpenIssues` and we picked a specific issue to bind to. -/
 structure RoleSpawn where
   roleName : String
-  issueId  : Option Project.IssueId := none
+  issueId  : Option Taxis.IssueId := none
 deriving Repr, Inhabited
 
 /-- Pure decision logic. Spawns at most one of each role per tick to avoid
@@ -512,13 +512,13 @@ def dispatcherTick (input : DispatcherInput) : Array RoleSpawn := Id.run do
       -- Pick the first open issue not already in `spawns` (so we don't try
       -- to spawn two workers for the same issue in one tick).
       -- Skip issues whose dependencies are not yet all completed.
-      let alreadyTargeted : Array String := spawns.filterMap fun s => s.issueId.map (·.value)
+      let alreadyTargeted : Array String := spawns.filterMap fun s => s.issueId.map (·.toString)
       let completedIds : Array String := input.issues.filterMap fun i =>
-        if i.status == .completed then some i.id.value else none
+        if i.status == .completed then some i.id.toString else none
       let some issue := input.issues.find? (fun i =>
         i.status == .open &&
-        !alreadyTargeted.contains i.id.value &&
-        i.dependencies.all (fun dep => completedIds.contains dep.value))
+        !alreadyTargeted.contains i.id.toString &&
+        i.dependencies.all (fun dep => completedIds.contains dep.toString))
         | continue
       spawns := spawns.push { roleName, issueId := some issue.id }
     | .hasInReviewIssues =>
@@ -795,7 +795,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
 
   | .projectDispatcher pid caps => do
     let some _project ← Project.loadProject pid
-      | IO.eprintln s!"[dispatcher] project {pid.value} not found; skipping"; return (#[], none)
+      | IO.eprintln s!"[dispatcher] project {pid.toString} not found; skipping"; return (#[], none)
     let issues ← Project.loadIssues pid
     let roles  ← Project.loadAllRoles pid
     -- Count active per-role queue entries scoped to this project.
@@ -813,7 +813,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     return (spawns.map fun s =>
       let baseVars : List (String × String) := [("role_name", s.roleName)]
       let vars := match s.issueId with
-        | some iid => baseVars ++ [("issue_id", iid.value)]
+        | some iid => baseVars ++ [("issue_id", iid.toString)]
         | none     => baseVars
       ("", vars), none)
 

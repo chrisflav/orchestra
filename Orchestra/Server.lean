@@ -39,19 +39,19 @@ structure State where
   /-- Orchestra task ID, recorded as the holder when claims are taken. -/
   taskId : Option String := none
   /-- Orchestra project this task belongs to. Enables the `project_info` tool. -/
-  projectId : Option Project.ProjectId := none
+  projectId : Option Taxis.IssueId := none
   /-- Orchestra issue this task is working on (may be pre-claimed or runtime-claimed). -/
-  issueId : Option Project.IssueId := none
+  issueId : Option Taxis.IssueId := none
   /-- Backend label of the running agent (e.g. "claude"). Recorded with claims. -/
   agentBackend : String := "unknown"
   /-- Series the task belongs to. Recorded with claims. -/
   series : Option String := none
   /-- Hook that enqueues a merger task, set by the daemon. Plumbed by
       `Project.Tools.Env` so `decide_issue approve` can request a merge. -/
-  enqueueMerger : Option (Project.ProjectId → Project.IssueId → Project.PRRef →
+  enqueueMerger : Option (Taxis.IssueId → Taxis.IssueId → Project.PRRef →
                           IO (Except String String)) := none
   /-- Optional auto-reviewer hook (F1). Plumbed to `Project.Tools.Env.enqueueReviewer`. -/
-  enqueueReviewer : Option (Project.Project → Project.IssueId → Project.PRRef →
+  enqueueReviewer : Option (Project.Project → Taxis.IssueId → Project.PRRef →
                             Project.ReviewerTemplate → IO (Except String String)) := none
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/

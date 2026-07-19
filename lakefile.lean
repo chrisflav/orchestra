@@ -7,6 +7,7 @@ package orchestra where
 
 require Cli from git "https://github.com/leanprover/lean4-cli.git" @ "main"
 require Yaml from git "https://github.com/chrisflav/lean-yaml" @ "master"
+require Taxis from git "https://github.com/chrisflav/taxis" @ "f995bbdd7c8b772d74d3fde6c5f488e41235e422"
 
 /-- Compile the Unix domain socket C shim into a static library. -/
 extern_lib udsFFI pkg := do

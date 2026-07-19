@@ -184,6 +184,11 @@ adding them to the `tools` list in the task configuration.
   The `comment` tool requires the task to carry an `issue_number` (set automatically by the
   listener when triggered from an issue or pull request).
 
+Three more tool groups — `manage_issues`, `work_issues`, `review_issues` — are available when a
+task carries them in its `tools` list, backing orchestra's project/issue/claim workflow (a taxis
+issue tracker instance, not local files — see [`examples/projects/README.md`](examples/projects/README.md)
+for the full concept mapping, the `taxis` config section, and a CLI/tool cheat sheet).
+
 ## running tasks
 
 ```

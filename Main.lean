@@ -676,7 +676,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
             match liveCfg.source with
             | .projectDispatcher pid _ =>
               let roleName := vars.find? (·.1 == "role_name") |>.map (·.2) |>.getD ""
-              let issueId := vars.find? (·.1 == "issue_id") |>.map (fun p => (⟨p.2⟩ : Project.IssueId))
+              let issueId := vars.find? (·.1 == "issue_id") |>.bind (fun p => Taxis.IssueId.parse? p.2)
               let some project ← Project.loadProject pid | continue
               let some role ← Project.loadRole pid roleName | continue
               let issue? : Option Project.Issue ← match issueId with
@@ -701,7 +701,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                     | .acquired _ => pure true
                     | .alreadyClaimed e =>
                       IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: \
-                        issue {i.id.value} already claimed by {e.taskId}"
+                        issue {i.id.toString} already claimed by {e.taskId}"
                       pure false
                     | .invalid r =>
                       IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: {r}"
@@ -1292,4 +1292,5 @@ def orchestraCmd : Cmd := `[Cli|
 
 def main (args : List String) : IO UInt32 := do
   gRawArgs.set args
+  Project.ensureTaxisConfigured
   orchestraCmd.validate args
