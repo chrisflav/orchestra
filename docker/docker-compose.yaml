@@ -1,0 +1,41 @@
+name: orchestra
+
+services:
+  orchestra:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: orchestra:latest
+    restart: unless-stopped
+    environment:
+      # taxis instance backing projects/issues/claims. Required — every project, issue and claim
+      # operation fails without it. This compose file expects taxis to be running elsewhere; point
+      # the URL at it. If taxis runs in its own compose project on the same host, use its
+      # container name plus a shared network, or the host gateway (see docker/README.md).
+      # (Left unset-tolerant so `docker compose build` works without a .env; the entrypoint fails
+      # with a clear message at start-up if it's still empty and no config.json is mounted.)
+      ORCHESTRA_TAXIS_URL: ${ORCHESTRA_TAXIS_URL:-}
+      ORCHESTRA_TAXIS_TOKEN: ${ORCHESTRA_TAXIS_TOKEN:-}
+      # GitHub auth: a PAT is the simple path; the GitHub App fields are the alternative and need
+      # the private key mounted at the path given.
+      ORCHESTRA_GITHUB_PAT: ${ORCHESTRA_GITHUB_PAT:-}
+      ORCHESTRA_GITHUB_APP_ID: ${ORCHESTRA_GITHUB_APP_ID:-0}
+      ORCHESTRA_GITHUB_PRIVATE_KEY_PATH: ${ORCHESTRA_GITHUB_PRIVATE_KEY_PATH:-}
+      # Agent auth: one of these, depending on how you authenticate Claude.
+      ORCHESTRA_CLAUDE_TOKEN: ${ORCHESTRA_CLAUDE_TOKEN:-}
+      ORCHESTRA_ANTHROPIC_API_KEY: ${ORCHESTRA_ANTHROPIC_API_KEY:-}
+    # No seccomp/apparmor relaxation here on purpose: orchestra sandboxes every agent with landrun
+    # (Landlock), and that was verified to work under Docker's *default* seccomp profile — the
+    # landlock_* syscalls are allowlisted in current versions. If you are on an older Docker where
+    # they aren't, the entrypoint says so at start-up; see docker/README.md before reaching for
+    # `security_opt: [seccomp=unconfined]`, which is a much bigger hammer than the problem needs.
+    volumes:
+      # config.json is generated here on first start from the environment above; mount your own
+      # over it (read-only) if you need listeners, roles, or agent auth blocks.
+      - orchestra-config:/config
+      # Task history, queue state, cloned repos, per-project roles.
+      - orchestra-data:/data
+
+volumes:
+  orchestra-config:
+  orchestra-data:

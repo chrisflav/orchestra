@@ -7,9 +7,10 @@ through a built-in MCP server.
 
 ## prerequisites
 
-It is recommended to run all of orchestra inside a virtual machine or container. The
-[container section](#container) describes a ready-made NixOS incus image that
-provides the full environment.
+It is recommended to run all of orchestra inside a virtual machine or container. Two ready-made
+environments provide the full set of tools: a NixOS incus image (see the
+[container section](#container)) and a Docker image running the queue daemon (see the
+[docker section](#docker)).
 
 Before starting you will need to create a GitHub App with a private key, installed on the organization owning the fork. Download the private key.
 
@@ -411,3 +412,26 @@ user:
 ```
 incus exec my-orchestra -- su orchestra
 ```
+
+## docker
+
+`docker/` packages the queue daemon and the same dependency set as an image, for hosts without
+incus. See [`docker/README.md`](docker/README.md) for the details.
+
+```
+cd docker
+cp .env.example .env      # fill in at least ORCHESTRA_TAXIS_URL and a token
+docker compose up --build
+```
+
+The container runs `orchestra queue start`; override the command for one-off subcommands against
+the same volumes:
+
+```
+docker compose run --rm orchestra project list
+```
+
+It expects an existing taxis instance rather than starting one — `ORCHESTRA_TAXIS_URL` must be
+reachable from inside the container, so not `localhost`. Agents are sandboxed with landrun
+(Landlock), which works under Docker's default seccomp profile; the entrypoint probes it at
+start-up and `docker/README.md` covers what to check if that warning appears.
