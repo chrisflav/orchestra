@@ -13,9 +13,12 @@ def claude : AgentDef where
     rox     := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
     ro      := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw      := ["/dev/null"]
-    homeRox := [".elan", ".cache", ".local"]
+    homeRox := [".cache", ".local"]
     homeRw  := [".claude", ".claude.json", ".gitconfig",
                 ".config/claude", ".config/gh", ".config/git"]
+    -- elan installs toolchains into ~/.elan and then runs them from there, so it needs
+    -- write and execute, not the read+execute the other home paths get.
+    homeRwx := [".elan"]
   }
   setupMcp port _ _ := do
     let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [

@@ -58,8 +58,9 @@ def opencode : AgentDef where
       "/home"
     ]
     rw      := ["/dev/null"]
-    homeRox := [".elan", ".cache", ".local"]
+    homeRox := [".cache", ".local"]
     homeRw  := [".config/opencode", ".gitconfig", ".local/share/opencode"]
+    homeRwx := [".elan"]
     extraPorts := [4096]
   }
   setupMcp port _ _ := do

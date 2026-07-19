@@ -370,6 +370,12 @@ structure SandboxPaths where
   homeRox : List String := []
   /-- Paths relative to $HOME needing read-write access. -/
   homeRw : List String := []
+  /-- Paths relative to $HOME needing read+write+execute. Needed by toolchain managers, which
+      both install binaries and run them: `~/.elan` has to be writable (elan records settings and
+      unpacks toolchains into it) *and* executable (the `lean`/`lake` it unpacks live under it).
+      Read-only would break installs; write-without-execute would break running what was
+      installed. -/
+  homeRwx : List String := []
   /-- Additional TCP ports to allow outbound connections to (besides 443 and the MCP server port). -/
   extraPorts : List UInt16 := []
 deriving Repr
@@ -381,7 +387,8 @@ instance : FromJson SandboxPaths where
     let rw      := j.getObjValAs? (List String) "rw"       |>.toOption |>.getD []
     let homeRox := j.getObjValAs? (List String) "home_rox" |>.toOption |>.getD []
     let homeRw  := j.getObjValAs? (List String) "home_rw"  |>.toOption |>.getD []
-    return { rox, ro, rw, homeRox, homeRw }
+    let homeRwx := j.getObjValAs? (List String) "home_rwx" |>.toOption |>.getD []
+    return { rox, ro, rw, homeRox, homeRw, homeRwx }
 
 structure AppConfig where
   appId : Nat
