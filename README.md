@@ -14,6 +14,12 @@ environments provide the full set of tools: a NixOS incus image (see the
 
 Before starting you will need to create a GitHub App with a private key, installed on the organization owning the fork. Download the private key.
 
+You will also want a personal access token with repo scope. The two are not alternatives: every
+task mints an installation token from the App and gives it to `gh` for cloning and pushing, so
+without the App no task runs at all, while the PAT covers what an installation token cannot —
+pull requests against the *upstream* repository, issue comments, PR reviews, and the triage
+backend.
+
 Inside the container (or VM), the following must be available (all installed
 automatically when using the provided container image):
 

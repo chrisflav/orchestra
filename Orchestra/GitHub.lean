@@ -97,9 +97,21 @@ def createInstallationToken (jwt : String) (installationId : Nat) : IO String :=
       | throw (.userError "token response missing 'token' field")
     return token
 
-/-- Configure `gh` CLI to use the given token. -/
+/-- Configure `gh` CLI to use the given token.
+
+    Rejects an empty token rather than passing it on: `gh auth login --with-token` given no token
+    does not fail, it falls back to an interactive device-code prompt and blocks forever — which
+    in the daemon is an unattended hang with nothing in the log to explain it.
+
+    The token goes over stdin rather than being interpolated into `sh -c "echo ... | gh ..."`, so
+    there is no shell to quote it for, and a failure is reported as `gh failed` rather than the
+    considerably less helpful `sh failed`. -/
 def setupGhAuth (token : String) : IO Unit := do
-  runCmd' "sh" #["-c", s!"echo '{token}' | gh auth login --with-token"]
+  if token.isEmpty then
+    throw (.userError
+      "refusing to run `gh auth login` with an empty token (it would block on an interactive \
+       prompt). Check github_app.app_id and github_app.private_key_path in config.json.")
+  runCmd' "gh" #["auth", "login", "--with-token"] (input := token)
 
 /-- Ensure the given labels exist on a repository.
     Labels that are missing are created with a default colour; existing ones are not modified. -/

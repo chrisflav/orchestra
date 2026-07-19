@@ -58,13 +58,22 @@ unprivileged user agents run as. The entrypoint therefore starts as root, takes 
 itself never runs as root. Ownership is only rewritten when it is actually wrong, so restarts
 don't walk every cloned repository under `data/`.
 
-### GitHub App private key
+### GitHub credentials
 
-Put the downloaded `.pem` in `docker/secrets/` and point at it *inside* the container:
+A working setup wants **both** a GitHub App and a PAT. They are not alternatives:
+
+| Credential | Covers | Without it |
+| --- | --- | --- |
+| GitHub App | Every task mints an installation token from it and hands that to `gh` for cloning and pushing. | No task runs at all — it fails before the agent starts. |
+| PAT (repo scope) | Pull requests against the **upstream** repo, issue comments, PR reviews, the triage backend. | Those specific operations fail; tasks targeting the fork still work. |
+
+The App is what authenticates the machinery; the PAT covers what an installation token cannot
+reach. Put the downloaded `.pem` in `docker/secrets/` and point at it *inside* the container:
 
 ```sh
 ORCHESTRA_GITHUB_APP_ID=123456
 ORCHESTRA_GITHUB_PRIVATE_KEY_PATH=/secrets/github-app.pem
+ORCHESTRA_GITHUB_PAT=ghp_...
 ```
 
 `ORCHESTRA_SECRETS_DIR` overrides the host side if you keep keys elsewhere.
@@ -73,8 +82,6 @@ Note the compose file mounts the secrets *directory*, not the key file. Bind-mou
 doesn't exist on the host makes Docker silently create a **directory** in its place, which
 surfaces much later as a confusing openssl error; mounting the containing directory avoids that
 entirely. The entrypoint still checks the key path and fails fast if it is a directory.
-
-Not needed when using `ORCHESTRA_GITHUB_PAT` — leave the key path empty and no key is read.
 
 ## Reaching taxis
 
