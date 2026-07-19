@@ -547,8 +547,16 @@ def dispatcherTick (input : DispatcherInput) : Array RoleSpawn := Id.run do
         | continue
       spawns := spawns.push { roleName, issueId := some issue.id }
     | .hasInReviewIssues =>
-      if input.issues.any (·.status == .inReview) then
-        spawns := spawns.push { roleName }
+      -- Bind the issue, like `hasOpenIssues` does. A reviewer used to spawn unbound, which left
+      -- the label-dispatcher unable to place it: that source takes an entry's repository and
+      -- branch from the issue's own artifacts, so a spawn with no issue had no target and was
+      -- dropped — reviewers were never dispatched there at all. Binding is safe for the claim
+      -- protocol because reviewer roles set `pre_claim: false`; nothing claims the issue.
+      let alreadyTargeted : Array String := spawns.filterMap fun s => s.issueId.map (·.toString)
+      let some issue := input.issues.find? (fun i =>
+        i.status == .inReview && !alreadyTargeted.contains i.id.toString)
+        | continue
+      spawns := spawns.push { roleName, issueId := some issue.id }
     | .idle =>
       let hasOpen     := input.issues.any (·.status == .open)
       let hasInReview := input.issues.any (·.status == .inReview)
@@ -877,9 +885,16 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
     let spawns := dispatcherTick { activeByRole := active, issues, caps, roles }
+    -- Report rather than silently drop: this source can only place issue-bound roles, since an
+    -- entry's repository and branch come from the issue's own artifacts. `idle` roles (planners)
+    -- bind to nothing by design and have no project to stand in for it when issues span the whole
+    -- tracker, so they cannot run here — say so instead of looking like nothing was due.
+    for s in spawns do
+      if s.issueId.isNone then
+        IO.eprintln s!"[dispatcher] role '{s.roleName}' was due but binds to no issue, and this \
+          dispatcher takes its target from the issue; not dispatched. Use a project-dispatcher \
+          for roles with the 'idle' trigger."
     return (spawns.filterMap fun s =>
-      -- Every spawn from this source is issue-bound: the target lives on the issue's artifacts,
-      -- so a role that didn't bind to one has nowhere to run.
       match s.issueId with
       | none => none
       | some iid =>
