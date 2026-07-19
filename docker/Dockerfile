@@ -39,8 +39,12 @@ FROM debian:bookworm-slim AS runtime
 # jq: used by the entrypoint to emit config.json. build-essential + elan (below): agent tasks
 # build the Lean projects they are working on, so the toolchain has to be present at *runtime*,
 # not just at build time.
+# netcat-openbsd provides `nc`, which is the MCP transport, not a debugging convenience: every
+# agent backend points Claude/opencode/pi at the built-in MCP server with `nc 127.0.0.1 <port>`
+# (see each `setupMcp` in Orchestra/Agents/). Without it the agent reports the "agent" MCP server
+# as perpetually connecting and gets no orchestra tools at all.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg git openssl jq procps build-essential \
+      ca-certificates curl gnupg git openssl jq procps build-essential netcat-openbsd \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
          -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
