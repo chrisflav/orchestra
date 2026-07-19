@@ -568,32 +568,32 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   -- Serialised by claimMutex so that multiple workers cannot claim the same entry.
   -- Returns (entry, needsWorktree): needsWorktree is true when the repo is already
   -- in use by another parallel task and this task should run in a git worktree.
+  -- Both helpers unlock via `finally`: reading the queue directory and saving an entry
+  -- are file operations that can throw, and leaving the mutex held would wedge every
+  -- worker in the pool for the rest of the daemon's life.
   let claimNextEntry : IO (Option (Queue.QueueEntry × Bool)) := do
     claimMutex.lock
-    let total ← totalActive.get
-    let result ←
-      if total >= parallelLimit then
-        pure none
-      else do
-        let repoMap ← activePerRepo.get
-        let entry ← Queue.nextPendingWithRepoLimits repoMap parallelLimitPerRepo
-        match entry with
-        | none => pure none
-        | some e =>
-          Queue.saveEntry { e with status := .running }
-          let repoCount := repoMap.getD e.fork.toString 0
-          activePerRepo.modify (fun m => m.insert e.fork.toString (repoCount + 1))
-          totalActive.modify (· + 1)
-          pure (some (e, decide (0 < repoCount)))
-    claimMutex.unlock
-    return result
+    try
+      let total ← totalActive.get
+      if total >= parallelLimit then return none
+      let repoMap ← activePerRepo.get
+      let some e ← Queue.nextPendingWithRepoLimits repoMap parallelLimitPerRepo | return none
+      Queue.saveEntry { e with status := .running }
+      let repoCount := repoMap.getD e.fork.toString 0
+      activePerRepo.modify (fun m => m.insert e.fork.toString (repoCount + 1))
+      totalActive.modify (· + 1)
+      return some (e, decide (0 < repoCount))
+    finally
+      claimMutex.unlock
   -- Helper: release parallel-tracking state for a completed entry.
   let releaseEntry (entry : Queue.QueueEntry) : IO Unit := do
     claimMutex.lock
-    let n := (← activePerRepo.get).getD entry.fork.toString 0
-    activePerRepo.modify (fun m => m.insert entry.fork.toString (if n > 0 then n - 1 else 0))
-    totalActive.modify (fun t => if t > 0 then t - 1 else 0)
-    claimMutex.unlock
+    try
+      let n := (← activePerRepo.get).getD entry.fork.toString 0
+      activePerRepo.modify (fun m => m.insert entry.fork.toString (if n > 0 then n - 1 else 0))
+      totalActive.modify (fun t => if t > 0 then t - 1 else 0)
+    finally
+      claimMutex.unlock
   -- Helper: run one queue entry to completion and update its status.
   -- Also signals the ConcertManager if the entry belongs to a concert.
   -- needsWorktree: when true, create an isolated git worktree for this task
@@ -609,10 +609,12 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
           releaseEntry entry
           return
-    -- Cleanup action: remove worktree and release parallel-tracking slot.
+    -- Cleanup action: remove worktree and release the parallel-tracking slot. Runs from
+    -- a `finally` below, so that an exception on any path still frees the slot — a leaked
+    -- slot is permanent and eventually starves the whole worker pool.
     let doCleanup : IO Unit := do
       if let some wt := wtPath then
-        let mainPath := (← Repo.workDir) / entry.fork.owner / entry.fork.name
+        let mainPath ← Repo.clonePath entry.fork
         try Repo.removeWorktree mainPath wt catch _ => pure ()
       releaseEntry entry
     let taskToken ← Std.CancellationToken.new
@@ -647,9 +649,6 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         triageRemoveLabels := entry.triageRemoveLabels
       }
     }
-    let cfg ← match entry.configPath with
-      | none    => pure appConfig
-      | some cp => loadAppConfig (some (System.FilePath.mk cp))
     -- If this entry holds a pre-claimed issue, release it back to open on any
     -- unhandled exception so the issue never gets permanently stuck.
     let releaseClaimOnError : IO Unit := do
@@ -659,6 +658,11 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         let _ ← Project.release TaskRunner.globalClaimManager pid iid .open now
       | _, _ => pure ()
     try
+      -- Inside the `try` so that a bad per-entry config path is reported as a failed
+      -- entry rather than escaping and taking the worker down with it.
+      let cfg ← match entry.configPath with
+        | none    => pure appConfig
+        | some cp => loadAppConfig (some (System.FilePath.mk cp))
       let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
         (cancelToken := some taskToken) (interactive := false)
@@ -682,7 +686,6 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         Queue.saveEntry { entry with status := .done, taskId := some taskId, outputJson }
         if let some key := entry.concertStepKey then
           ConcertManager.signal concertMgr key outputJson
-      doCleanup
     catch e =>
       removeToken
       let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
@@ -695,6 +698,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
         try releaseClaimOnError catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+    finally
       doCleanup
   -- Load listener configs and spawn one fiber per listener.
   let listenerConfigs ← Listener.loadAllListenerConfigs
@@ -888,16 +892,31 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   -- Spawning parallelLimit copies of this loop enables parallel execution.
   let workerLoop : IO Unit := do
     while !(← shutdownToken.isCancelled) do
-      match ← claimNextEntry with
-      | none              => IO.sleep 1000
-      | some (entry, wt)  => runEntry entry wt
+      -- A worker must never die on an unhandled exception. `runEntry` already records
+      -- per-entry failures, but anything escaping here (or out of `claimNextEntry`)
+      -- would silently retire this worker and shrink the pool permanently — invisible
+      -- with one worker on the main thread, and invisible *and* silent for the spawned
+      -- ones, whose task results are discarded.
+      try
+        match ← claimNextEntry with
+        | none              => IO.sleep 1000
+        | some (entry, wt)  => runEntry entry wt
+      catch e =>
+        IO.eprintln s!"Queue worker error: {e}"
+        IO.sleep 1000
   -- Spawn additional workers beyond the first (which runs on the main thread below).
+  let mut workerTasks : Array (Task (Except IO.Error Unit)) := #[]
   for _ in List.range (parallelLimit - 1) do
-    let _workerTask ← IO.asTask (prio := .dedicated) workerLoop
+    workerTasks := workerTasks.push (← IO.asTask (prio := .dedicated) workerLoop)
   if parallelLimit > 1 then
     IO.println s!"Queue daemon running with parallelLimit={parallelLimit}, parallelLimitPerRepo={parallelLimitPerRepo}"
   try
     workerLoop
+    -- Let the other workers finish their in-flight tasks before the socket server and
+    -- PID file are torn down; otherwise `IO.Process.exit 0` below kills them mid-task
+    -- and their entries are left stuck in `running`.
+    for t in workerTasks do
+      let _ ← IO.wait t
   finally
     match ← socketServerRef.get with
     | some s => try s.close catch _ => pure ()

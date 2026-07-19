@@ -370,6 +370,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       let p ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive
       IO.println s!"  Repo at {p}"
       pure p
+  -- A worktree's `.git` is a file pointing into the main clone's `.git/worktrees/<id>`,
+  -- which lies outside `repoPath`. The sandbox only grants `repoPath`, so without the
+  -- main clone's git directory the agent cannot run any git command in the worktree.
+  let repoAuxPaths : Array System.FilePath ← match repoPathOverride with
+    | none   => pure #[]
+    | some _ => pure #[(← Repo.clonePath ioTask.fork) / ".git"]
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
   -- clone setup with all other backends but skips the MCP server and agent.
   if ioTask.backend == some "merger" then
@@ -467,7 +473,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
       (resume := resume) (budget := ioTask.budget.getD 4.0) (cancelToken := cancelToken)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
-      (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
+      (readOnly := ioTask.readOnly) (repoAuxPaths := repoAuxPaths) (extraPorts := extraPorts)
       (additionalPaths := appConfig.additionalSandboxPaths)
       (interactiveAgent := interactiveAgent)
     IO.println s!"  Agent exited with code {result.exitCode}"

@@ -124,18 +124,6 @@ def clonePath (fork : Repository) : IO System.FilePath := do
 def worktreePath (fork : Repository) (entryId : String) : IO System.FilePath := do
   return (← workDir) / fork.owner / s!"{fork.name}-wt-{entryId}"
 
-/-- Create a git worktree for a parallel agent task on the same repository.
-    Ensures the main clone exists and is up to date first, then adds a detached
-    worktree that shares the same git objects. Returns the worktree path. -/
-def ensureWorktree (fork upstream : Repository) (entryId : String) : IO System.FilePath := do
-  let mainPath ← ensureCloned fork upstream (interactive := false)
-  let wtPath ← worktreePath fork entryId
-  if ← wtPath.pathExists then
-    return wtPath
-  IO.println s!"  Creating worktree at {wtPath}..."
-  runGit' #["worktree", "add", "--detach", wtPath.toString] mainPath
-  return wtPath
-
 /-- Remove a git worktree after the task using it finishes. -/
 def removeWorktree (mainPath : System.FilePath) (wtPath : System.FilePath) : IO Unit := do
   try
@@ -144,8 +132,30 @@ def removeWorktree (mainPath : System.FilePath) (wtPath : System.FilePath) : IO 
   catch e =>
     IO.eprintln s!"  Warning: failed to remove worktree {wtPath}: {e}"
     try IO.FS.removeDirAll wtPath catch _ => pure ()
+    -- The directory is gone but git still has it registered; drop the registration
+    -- so a later `worktree add` can reuse the path.
+    try runGit' #["worktree", "prune"] mainPath catch _ => pure ()
 
-/-- Return true if `path` is a main git clone (`.git/` is a directory, not a file). -/
+/-- Create a git worktree for a parallel agent task on the same repository.
+    Ensures the main clone exists and is up to date first, then adds a detached
+    worktree that shares the same git objects. Returns the worktree path. -/
+def ensureWorktree (fork upstream : Repository) (entryId : String) : IO System.FilePath := do
+  let mainPath ← ensureCloned fork upstream (interactive := false)
+  let wtPath ← worktreePath fork entryId
+  -- Drop registrations whose directories vanished behind git's back (e.g. the daemon
+  -- was killed mid-task), otherwise `worktree add` refuses to reuse the path.
+  try runGit' #["worktree", "prune"] mainPath catch _ => pure ()
+  -- A leftover tree from a previous run would start the task from a dirty state,
+  -- so tear it down rather than silently reusing it.
+  if ← wtPath.pathExists then
+    IO.println s!"  Removing stale worktree at {wtPath}..."
+    removeWorktree mainPath wtPath
+  IO.println s!"  Creating worktree at {wtPath}..."
+  runGit' #["worktree", "add", "--detach", wtPath.toString] mainPath
+  return wtPath
+
+/-- Return true if `path` is a main git clone. A worktree's `.git` is a file rather
+    than a directory, so it has no `.git/config` and is correctly excluded here. -/
 private def isMainClone (path : System.FilePath) : IO Bool :=
   (path / ".git" / "config").pathExists
 
@@ -161,12 +171,17 @@ def listClones : IO (Array (System.FilePath × Array System.FilePath)) := do
     for repoEntry in ← ownerPath.readDir do
       let repoPath := repoEntry.path
       if !(← isMainClone repoPath) then continue
+      -- `git worktree list` prints fully resolved absolute paths, so compare against
+      -- the resolved main clone path rather than the one built from `workDir` — a
+      -- symlink anywhere in the data directory would otherwise make the main clone
+      -- list itself as one of its own worktrees.
+      let mainReal ← try IO.FS.realPath repoPath catch _ => pure repoPath
       let worktrees ← try
         let out ← runGit #["worktree", "list", "--porcelain"] repoPath
         let paths := out.splitOn "\n" |>.filterMap fun l =>
           if l.startsWith "worktree " then
             let p := (l.drop "worktree ".length).toString
-            if p != repoPath.toString then some (System.FilePath.mk p)
+            if p != mainReal.toString then some (System.FilePath.mk p)
             else none
           else none
         pure paths.toArray
