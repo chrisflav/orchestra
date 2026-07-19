@@ -100,6 +100,12 @@ structure QueueEntry where
   continuesFrom : Option String := none
   series        : Option String := none
   taskId        : Option String := none
+  /-- Index of the per-repo clone slot this entry ran in, recorded when it is claimed.
+
+      Persisted rather than kept in daemon memory so that a continuation entry can find the
+      workspace its predecessor left behind even across a daemon restart: the successor looks
+      up the entry whose `taskId` it continues from and asks for that same slot. -/
+  slot          : Option Nat    := none
   configPath    : Option String := none
   /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
   budget        : Option Float  := none
@@ -284,27 +290,54 @@ def loadAllEntries : IO (Array QueueEntry) := do
         result := result.push e
   return result.qsort (fun a b => a.id > b.id)
 
-/-- Return the next pending entry to run, skipping repositories that already have
-    `perRepoLimit` tasks running. `activePerRepo` maps a fork key (owner/name) to the
-    number of currently running tasks on that repository.
-    Entries are ordered by priority (higher first), with older entries breaking ties.
-    Returns none if no eligible pending entries exist. -/
-def nextPendingWithRepoLimits (activePerRepo : Std.HashMap String Nat) (perRepoLimit : Nat)
-    : IO (Option QueueEntry) := do
-  let all ← loadAllEntries
+/-- Every pending entry that may start now, in the order the daemon should try them.
+
+    `activePerRepo` maps a fork key (owner/name) to the number of tasks currently running on
+    that repository; entries for a repository already at `perRepoLimit` are excluded.
+    Ordering is by priority (higher first), then oldest first — ids are monotonic, so the
+    smaller id is the older entry.
+
+    A list rather than a single entry, because an entry can turn out to be unclaimable for a
+    reason only the caller knows — a continuation whose predecessor's slot is still busy, or a
+    backend that needs the daemon to itself. Returning just the best candidate would let one
+    such entry stall every other repository behind it for as long as its blocker runs. -/
+def pendingCandidates (all : Array QueueEntry) (activePerRepo : Std.HashMap String Nat)
+    (perRepoLimit : Nat) : Array QueueEntry :=
   let pending := all.filter (fun e =>
     e.status == .pending &&
     activePerRepo.getD e.fork.toString 0 < perRepoLimit)
-  if pending.isEmpty then return none
-  -- Find the maximum priority
-  let maxPri := pending.foldl (·.max ·.priority) 0
-  -- Among entries with max priority, pick the oldest (last in newest-first array)
-  let maxPriEntries := pending.filter (·.priority == maxPri)
-  return maxPriEntries.back?
+  pending.qsort (fun a b =>
+    if a.priority != b.priority then a.priority > b.priority else a.id < b.id)
 
-/-- Return the next pending entry to run, ignoring any per-repository limits. -/
-def nextPending : IO (Option QueueEntry) :=
-  nextPendingWithRepoLimits {} 1
+/-- Choose the per-repo clone slot a freshly claimed entry should run in.
+
+    `occupied` are the slot indices currently in use for that repository, `perRepoLimit` is
+    the configured `--parallel-per-repo`, and `preferred` is the slot recorded on the entry
+    this one continues from, if any.
+
+    Returns `(slot, reuseTree)`, where `reuseTree` asks the caller to leave the working tree
+    exactly as the previous task left it, or `none` when the entry cannot start right now and
+    should stay pending.
+
+    The three cases that matter:
+    * A continuation whose predecessor's slot is free goes back to it and keeps the tree.
+      `--resume` restores the conversation but not the filesystem, so anywhere else the agent
+      wakes up to a tree missing every edit its context refers to.
+    * A continuation whose predecessor's slot is busy **waits** rather than taking a fresh one.
+      Starting it elsewhere would silently discard the work it was queued to build on; the
+      occupying task will finish, so waiting cannot deadlock.
+    * A continuation whose recorded slot is beyond the current limit (the daemon was restarted
+      with a smaller `--parallel-per-repo`) falls back to a free slot and resets it, since the
+      tree it wanted is not reachable any more. -/
+def chooseSlot (occupied : Array Nat) (perRepoLimit : Nat) (preferred : Option Nat)
+    : Option (Nat × Bool) :=
+  let firstFree := (List.range perRepoLimit).find? (!occupied.contains ·)
+  match preferred with
+  | some p =>
+    if occupied.contains p then none
+    else if p < perRepoLimit then some (p, true)
+    else firstFree.map (·, false)
+  | none => firstFree.map (·, false)
 
 /-- Return true if any entry created by `name` is currently pending or running. -/
 def hasActiveEntryForListener (name : String) : IO Bool := do
@@ -365,15 +398,29 @@ def daemonRunning : IO Bool := do
 private def effectiveBackend (backend : Option String) : String :=
   backend.getD "claude"
 
+/-- Cancel `id` if it is *still* pending, and report whether it was.
+
+    The re-read is what makes cascade cancellation safe under a parallel daemon. Both callers
+    below iterate over a snapshot from `loadAllEntries`, and a worker can claim and start any
+    entry in that snapshot while the loop is still running. Writing the snapshot's version back
+    would stamp `cancelled` onto an entry that is at that moment executing — and since
+    `cancelPendingByBackend` matches on the *backend*, with `claude` as the default, that is
+    almost every pending entry rather than a narrow window. -/
+private def cancelIfStillPending (id : String) : IO Bool := do
+  let some cur ← loadEntry id | return false
+  if cur.status != .pending then return false
+  saveEntry { cur with status := .cancelled }
+  return true
+
 /-- Cancel all pending entries that have continuesFrom = taskId, then recurse. -/
 partial def cancelDependents (taskId : String) : IO Unit := do
   let all ← loadAllEntries
   for entry in all do
     if entry.status == .pending && entry.continuesFrom == some taskId then
-      saveEntry { entry with status := .cancelled }
-      -- If this entry already ran and has a taskId, cascade further
-      if let some tid := entry.taskId then
-        cancelDependents tid
+      if ← cancelIfStillPending entry.id then
+        -- If this entry already ran and has a taskId, cascade further
+        if let some tid := entry.taskId then
+          cancelDependents tid
 
 /-- Cancel all pending entries with the same backend as the given one, except the
     entry identified by exceptId (the one that just became unfinished). -/
@@ -383,10 +430,10 @@ def cancelPendingByBackend (backend : Option String) (exceptId : String) : IO Un
   for entry in all do
     if entry.status == .pending && entry.id != exceptId &&
        effectiveBackend entry.backend == target then
-      saveEntry { entry with status := .cancelled }
-      -- Cascade from any taskId this cancelled entry had (rare for pending, but safe)
-      if let some tid := entry.taskId then
-        cancelDependents tid
+      if ← cancelIfStillPending entry.id then
+        -- Cascade from any taskId this cancelled entry had (rare for pending, but safe)
+        if let some tid := entry.taskId then
+          cancelDependents tid
 
 /-- On daemon startup, mark any entries stuck in 'running' state as unfinished.
     These are left over from a previous daemon that was killed mid-task. -/

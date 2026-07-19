@@ -82,7 +82,7 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
     `gh pr merge`. If validation fails the PR is not merged and the reason is recorded as a
     request-changes review on the issue, which returns to the open pool. Skips the entire agent /
     sandbox / MCP path. Used when `ioTask.backend = some "merger"`. -/
-private def runMerger {i o : ResultType} (ioTask : IOTask i o)
+private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
     (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord) : IO Unit := do
   IO.println "  [merger] merge backend"
   let some pid := ioTask.projectId
@@ -100,6 +100,8 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
     { cmd := "gh"
       args := #["pr", "checkout", toString pr.number, "--repo", pr.repo.toString]
       cwd  := repoPath
+      -- This task's own token, not whatever `gh` last had logged in globally.
+      env  := #[("GH_TOKEN", some token), ("GITHUB_TOKEN", some token)]
       stdout := .piped
       stderr := .piped }
   let _ ← coChild.stdout.readToEnd
@@ -132,6 +134,7 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
   let mergeChild ← IO.Process.spawn
     { cmd := "gh"
       args := #["pr", "merge", toString pr.number, "--repo", pr.repo.toString, "--squash", "--delete-branch"]
+      env  := #[("GH_TOKEN", some token), ("GITHUB_TOKEN", some token)]
       stdout := .piped
       stderr := .piped }
   let mergeOut ← mergeChild.stdout.readToEnd
@@ -173,6 +176,23 @@ private def runTriage {i o : ResultType} (pat : String) (ioTask : IOTask i o)
   TaskStore.saveTask { initialRecord with status := .completed }
   IO.println s!"  [triage] done"
 
+/-- Resolve a task's `backend` field to the agent that implements it.
+    Unknown and absent names both fall back to claude, which is the default backend. -/
+def agentDefOfBackend (backend : Option String) : AgentDef :=
+  match backend with
+  | some "pi"       => AgentDef.pi
+  | some "vibe"     => AgentDef.vibe
+  | some "opencode" => AgentDef.opencode
+  | _               => AgentDef.claude
+
+/-- Whether a queue entry's backend tolerates another task running beside it.
+    The non-agent backends (`merger`, `triage`) never launch a sandbox at all, so they are
+    unconditionally safe rather than falling through to claude's answer. -/
+def backendIsParallelSafe (backend : Option String) : Bool :=
+  match backend with
+  | some "merger" | some "triage" => true
+  | _                             => (agentDefOfBackend backend).parallelSafe
+
 /-- `plugin_dirs` from the config, with orchestra's own skills directory prepended when it
     exists (`Dirs.skillsDir`). The skills tell an agent to reach for the MCP tools rather than
     `gh` for anything touching pull requests or taxis issues, which it has no way to know
@@ -202,7 +222,13 @@ private def resolveMemoryDirs (mode : MemoryMode) (upstream : Repository) : IO (
     IO.FS.createDirAll dir
   return dirs.map (·.toString)
 
-/-- Build a system-prompt addition describing the available memory directories. -/
+/-- Build a system-prompt addition describing the available memory directories.
+
+    Memory directories are shared by every task on the same upstream, and the queue daemon
+    can run several of those at once. The one-file-per-memory convention below is what keeps
+    that safe: two agents appending to a single `MEMORY.md` have no way to see each other's
+    write, so the second one to save silently discards the first one's memory. Distinct files
+    make concurrent writes disjoint, and reading the directory still reconstructs everything. -/
 private def memorySystemPrompt (memoryDirs : Array String) : Option String :=
   if memoryDirs.isEmpty then none
   else
@@ -211,9 +237,15 @@ private def memorySystemPrompt (memoryDirs : Array String) : Option String :=
     some s!"## Memory\n\nYou have access to a persistent memory system. \
 The following director{if memoryDirs.size == 1 then "y is" else "ies are"} \
 mounted read-write inside your sandbox:\n\n{list}\n\n\
-Use these directories to store information that should persist across tasks. \
-For example, maintain a `MEMORY.md` file with important context, decisions, and findings \
-that will be valuable for future runs."
+Use these directories to store information that should persist across tasks: important \
+context, decisions, and findings that will be valuable for future runs.\n\n\
+Read the existing files at the start of a task to recover what previous runs learned.\n\n\
+When you save something, write it as its **own new file** named after its subject \
+(`build-cache-layout.md`, `flaky-integration-tests.md`), and never rewrite or append to a \
+file another run created. Other tasks may be running against this same directory right now, \
+and they cannot see your edits — appending to one shared file means whichever agent saves \
+last silently erases what the others wrote. Correcting a memory you find to be wrong is \
+fine; do it by adding a file that supersedes it rather than editing that file in place."
 
 /-- Derive the list of allowed optional tools from a task's `tools` and `mode` fields.
     If `tools` is `some list`, use it directly.
@@ -280,8 +312,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (cancelToken : Option Std.CancellationToken := none)
     (interactive : Bool := true)
     (interactiveAgent : Bool := false)
-    -- When set, skip cloning and use this path (a git worktree) directly.
-    (repoPathOverride : Option System.FilePath := none) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
+    -- When set, run in per-repo clone slot `slot` instead of the shared cache clone.
+    -- `reset` false keeps the working tree as the previous task left it, for a continuation.
+    -- The slot is prepared here rather than by the caller because preparing it (cloning,
+    -- fetching upstream) needs the installation token, which is only minted below.
+    (slotOverride : Option (Nat × Bool) := none) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
@@ -358,33 +393,35 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     | some id => pure id
     | none => GitHub.getInstallationId jwt forkOwner
   let token ← GitHub.createInstallationToken jwt installationId
-  GitHub.setupGhAuth token
+  -- Deliberately no `GitHub.setupGhAuth` here. That writes the token to
+  -- `~/.config/gh/hosts.yml`, which every concurrently running task shares, so under
+  -- `--parallel > 1` the last task to authenticate supplies the credentials for all of them.
+  -- The token is threaded explicitly instead: into `git`/`gh` through `Repo`, and into the
+  -- sandbox through `Sandbox.launchAgent`'s `GH_TOKEN`.
   IO.println "  Token ready"
-  -- 2. Clone / update repo (or use the provided worktree path directly)
-  let repoPath ← match repoPathOverride with
-    | some p =>
-      IO.println s!"  Using worktree at {p}"
+  -- Triage: add/remove labels on an issue or PR. Purely a GitHub API call, so it runs before
+  -- any repository work — it needs no checkout, and provisioning a clone slot for it would
+  -- mean a full `git clone` plus fetch to change a label.
+  if ioTask.backend == some "triage" then
+    runTriage appConfig.pat ioTask initialRecord
+    return ((taskId, false), none, none)
+  -- 2. Prepare the task slot, or clone / update the shared repo when running outside the queue
+  let repoPath ← match slotOverride with
+    | some (slot, reset) =>
+      IO.println s!"Preparing slot {slot} for {ioTask.fork}..."
+      let p ← Repo.ensureSlot ioTask.fork ioTask.upstream slot (token := some token)
+        (reset := reset)
+      IO.println s!"  Slot at {p}"
       pure p
     | none   =>
       IO.println s!"Cloning/updating {ioTask.fork}..."
-      let p ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive
+      let p ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive (token := some token)
       IO.println s!"  Repo at {p}"
       pure p
-  -- A worktree's `.git` is a file pointing into the main clone's `.git/worktrees/<id>`,
-  -- which lies outside `repoPath`. The sandbox only grants `repoPath`, so without the
-  -- main clone's git directory the agent cannot run any git command in the worktree.
-  let repoAuxPaths : Array System.FilePath ← match repoPathOverride with
-    | none   => pure #[]
-    | some _ => pure #[(← Repo.clonePath ioTask.fork) / ".git"]
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
   -- clone setup with all other backends but skips the MCP server and agent.
   if ioTask.backend == some "merger" then
-    runMerger ioTask repoPath initialRecord
-    return ((taskId, false), none, none)
-  -- Triage: add/remove labels on an issue or PR. Shares auth setup but skips
-  -- the repo clone, MCP server, and agent.
-  if ioTask.backend == some "triage" then
-    runTriage appConfig.pat ioTask initialRecord
+    runMerger token ioTask repoPath initialRecord
     return ((taskId, false), none, none)
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
@@ -451,11 +488,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
     let resume := if attempt == 0 then initialResume else sessionId
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
-    let agentDef := match ioTask.backend with
-      | some "pi"       => AgentDef.pi
-      | some "vibe"     => AgentDef.vibe
-      | some "opencode" => AgentDef.opencode
-      | _           => AgentDef.claude
+    let agentDef := agentDefOfBackend ioTask.backend
     let backendName := ioTask.backend.getD "claude"
     let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName ioTask.authSource
     let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
@@ -473,7 +506,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
       (resume := resume) (budget := ioTask.budget.getD 4.0) (cancelToken := cancelToken)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
-      (readOnly := ioTask.readOnly) (repoAuxPaths := repoAuxPaths) (extraPorts := extraPorts)
+      (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
       (additionalPaths := appConfig.additionalSandboxPaths)
       (interactiveAgent := interactiveAgent)
     IO.println s!"  Agent exited with code {result.exitCode}"
@@ -554,10 +587,10 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (cancelToken : Option Std.CancellationToken := none)
     (interactive : Bool := true)
     (interactiveAgent : Bool := false)
-    (repoPathOverride : Option System.FilePath := none) : IO (String × Bool × Option Lean.Json) := do
+    (slotOverride : Option (Nat × Bool) := none) : IO (String × Bool × Option Lean.Json) := do
   let ((taskId, usageLimitHit), _, outputJson) ←
     runIOTask appConfig task.ioTask idx debug default
-      continuesFrom series cancelToken interactive interactiveAgent repoPathOverride
+      continuesFrom series cancelToken interactive interactiveAgent slotOverride
   return (taskId, usageLimitHit, outputJson)
 
 end Orchestra.TaskRunner

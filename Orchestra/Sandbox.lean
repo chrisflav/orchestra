@@ -54,11 +54,6 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (logFile : Option System.FilePath := none)
     -- If true, mount the project repository read-only in the sandbox.
     (readOnly : Bool := false)
-    -- Extra paths that belong to the repository and get the same access as `repoPath`.
-    -- Used for git worktrees, whose `.git` is a file pointing into the main clone's
-    -- `.git/worktrees/<id>`: without the main clone's git directory mounted too, every
-    -- git command inside the sandbox fails.
-    (repoAuxPaths : Array System.FilePath := #[])
     -- Additional TCP ports to allow, beyond what the agent backend already opens.
     (extraPorts : Array Nat := #[])
     -- Additional sandbox paths from global app config, merged with the agent-backend's built-in paths.
@@ -70,11 +65,10 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let paths := agentDef.sandboxPaths
   let mut args : Array String := #[]
   -- Repo access: read-only or read-write depending on the task's readOnly flag
-  let repoAccess := if readOnly then "--rox" else "--rwx"
-  args := args.push repoAccess |>.push repoPath.toString
-  for p in repoAuxPaths do
-    if ← p.pathExists then
-      args := args.push repoAccess |>.push p.toString
+  if readOnly then
+    args := args.push "--rox" |>.push repoPath.toString
+  else
+    args := args.push "--rwx" |>.push repoPath.toString
   args := args.push "--rw" |>.push "/tmp"
   -- Read+execute system paths (binaries, libraries)
   for p in paths.rox do

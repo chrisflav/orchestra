@@ -12,3 +12,4 @@ import OrchestraTest.LabelDispatcherTest
 import OrchestraTest.DispatchCandidatesTest
 import OrchestraTest.ProjectToolsTest
 import OrchestraTest.ProjectRoleTest
+import OrchestraTest.ParallelQueueTest

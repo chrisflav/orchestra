@@ -128,8 +128,20 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
 private def prepareHandler (p : Parsed) : IO UInt32 := do
   let upstream ← IO.ofExcept (Repository.parse (p.positionalArg! "upstream" |>.as! String))
   let fork ← IO.ofExcept (Repository.parse (p.positionalArg! "fork" |>.as! String))
+  let slots := max 1 (p.flag? "slots" |>.map (·.as! Nat) |>.getD 1)
+  -- Queue tasks never run in the cache clone, they run in slots — so preparing only the
+  -- cache clone would warm a directory the daemon never works in, and every slot would
+  -- still pay a full cold build on its first task. `git clone --local` does not carry
+  -- gitignored build output across either, so each slot has to be initialised on its own.
   let repoPath ← Repo.ensureCloned fork upstream
   IO.println repoPath.toString
+  for slot in List.range slots do
+    let slotPath ← Repo.ensureSlot fork upstream slot
+    -- Run the repo's init hook now rather than inside the first task that lands here, so a
+    -- toolchain install or a cold `lake exe cache get` is paid up front instead of counting
+    -- against that task's budget and wall clock.
+    RepoConfig.runInitIfNeeded slotPath
+    IO.println slotPath.toString
   return (0 : UInt32)
 
 private def cleanupHandler (_ : Parsed) : IO UInt32 := do
@@ -141,10 +153,10 @@ private def cleanupListHandler (_ : Parsed) : IO UInt32 := do
   if clones.isEmpty then
     IO.println "No repository clones found."
     return (0 : UInt32)
-  for (mainPath, worktrees) in clones do
+  for (mainPath, slots) in clones do
     IO.println s!"  {mainPath}"
-    for wt in worktrees do
-      IO.println s!"    worktree: {wt}"
+    for slot in slots do
+      IO.println s!"    slot: {slot}"
   return (0 : UInt32)
 
 private def tasksHandler (p : Parsed) : IO UInt32 := do
@@ -545,10 +557,13 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   let nextTokenId ← IO.mkRef (0 : Nat)
   -- Mutex serialising the "find next pending + mark running" claim operation.
   let claimMutex ← Std.BaseMutex.new
-  -- Tracks number of currently running tasks per repo (fork key) and total.
-  -- Both are protected by claimMutex.
-  let activePerRepo ← IO.mkRef ({} : Std.HashMap String Nat)
-  let totalActive   ← IO.mkRef (0 : Nat)
+  -- Tracks which task slots are currently occupied per repo (fork key), and the total
+  -- number of running tasks. Both are protected by claimMutex.
+  let activeSlots ← IO.mkRef ({} : Std.HashMap String (Array Nat))
+  let totalActive ← IO.mkRef (0 : Nat)
+  -- Set while a task on a backend that is not parallel-safe holds the daemon exclusively.
+  -- Also protected by claimMutex.
+  let exclusiveActive ← IO.mkRef false
   -- Concert manager: handles suspended concert fibers waiting for task results.
   let concertMgr ← ConcertManager.new
   -- Socket server: receives control requests (add_task, add_concert, cancel, shutdown).
@@ -566,62 +581,92 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     catch _ => pure ()
   -- Helper: atomically claim the next pending entry, marking it as running.
   -- Serialised by claimMutex so that multiple workers cannot claim the same entry.
-  -- Returns (entry, needsWorktree): needsWorktree is true when the repo is already
-  -- in use by another parallel task and this task should run in a git worktree.
+  -- Returns (entry, slot, tokenId, reuseTree):
+  --   slot       index of the per-repo task slot reserved for this entry. Slots are
+  --              independent clones, so the entry's agent can create any branch name it
+  --              likes without colliding with another task running on the same repository.
+  --   tokenId    cancellation-token id, allocated here rather than in `runEntry` because
+  --              `IO.Ref.modifyGet` is not atomic across workers: two of them racing on it
+  --              are handed the same id, and `removeToken` then drops the other task's
+  --              token, leaving `queue cancel` unable to reach a running task.
+  --   reuseTree  true when this entry continues a previous task and got that task's slot
+  --              back, so the working tree must be left exactly as it was.
   -- Both helpers unlock via `finally`: reading the queue directory and saving an entry
   -- are file operations that can throw, and leaving the mutex held would wedge every
   -- worker in the pool for the rest of the daemon's life.
-  let claimNextEntry : IO (Option (Queue.QueueEntry × Bool)) := do
+  let claimNextEntry : IO (Option (Queue.QueueEntry × Nat × Nat × Bool)) := do
     claimMutex.lock
     try
       let total ← totalActive.get
       if total >= parallelLimit then return none
-      let repoMap ← activePerRepo.get
-      let some e ← Queue.nextPendingWithRepoLimits repoMap parallelLimitPerRepo | return none
-      Queue.saveEntry { e with status := .running }
-      let repoCount := repoMap.getD e.fork.toString 0
-      activePerRepo.modify (fun m => m.insert e.fork.toString (repoCount + 1))
+      -- Once a task on a backend that needs the daemon to itself is running, nothing else
+      -- may start alongside it.
+      if ← exclusiveActive.get then return none
+      let slotMap ← activeSlots.get
+      let counts := slotMap.fold (fun m k v => m.insert k v.size) ({} : Std.HashMap String Nat)
+      let allEntries ← Queue.loadAllEntries
+      let candidates := Queue.pendingCandidates allEntries counts parallelLimitPerRepo
+      -- Resolve an entry to the slot it would run in, or `none` if it cannot start yet.
+      -- A continuation must land back in the slot its predecessor used: `--resume` restores
+      -- the conversation but not the filesystem, so an agent resuming somewhere else wakes up
+      -- with a tree that has none of the edits its context refers to. Agent CLIs also key
+      -- their session store by working directory, so a different slot loses the session
+      -- outright.
+      let placement := fun (e : Queue.QueueEntry) =>
+        -- A backend that keeps per-run state at a fixed global path only starts when nothing
+        -- else is running. `total == 0` means the daemon is idle.
+        if !TaskRunner.backendIsParallelSafe e.backend && total > 0 then none
+        else
+          let occupied := slotMap.getD e.fork.toString #[]
+          let preferred := e.continuesFrom.bind fun tid =>
+            allEntries.find? (·.taskId == some tid) |>.bind (·.slot)
+          Queue.chooseSlot occupied parallelLimitPerRepo preferred
+      -- Take the best candidate that can actually start. Skipping past one that cannot —
+      -- rather than giving up for this round — is what keeps a continuation waiting on a
+      -- long-running task from stalling every other repository behind it.
+      let some (e, slot, reuseTree) :=
+          candidates.findSome? (fun e => (placement e).map (fun (s, r) => (e, s, r)))
+        | return none
+      let occupied := slotMap.getD e.fork.toString #[]
+      let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
+      Queue.saveEntry { e with status := .running, slot := some slot }
+      activeSlots.modify (fun m => m.insert e.fork.toString (occupied.push slot))
       totalActive.modify (· + 1)
-      return some (e, decide (0 < repoCount))
+      if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
+      return some (e, slot, tokenId, reuseTree)
     finally
       claimMutex.unlock
-  -- Helper: release parallel-tracking state for a completed entry.
-  let releaseEntry (entry : Queue.QueueEntry) : IO Unit := do
+  -- Helper: release the slot held by a completed entry.
+  let releaseEntry (entry : Queue.QueueEntry) (slot : Nat) : IO Unit := do
     claimMutex.lock
     try
-      let n := (← activePerRepo.get).getD entry.fork.toString 0
-      activePerRepo.modify (fun m => m.insert entry.fork.toString (if n > 0 then n - 1 else 0))
+      let occupied := (← activeSlots.get).getD entry.fork.toString #[]
+      activeSlots.modify (fun m => m.insert entry.fork.toString (occupied.filter (· != slot)))
       totalActive.modify (fun t => if t > 0 then t - 1 else 0)
+      if !TaskRunner.backendIsParallelSafe entry.backend then exclusiveActive.set false
     finally
       claimMutex.unlock
   -- Helper: run one queue entry to completion and update its status.
   -- Also signals the ConcertManager if the entry belongs to a concert.
-  -- needsWorktree: when true, create an isolated git worktree for this task
-  -- instead of using the shared main clone, to allow parallel work on the same repo.
-  let runEntry (entry : Queue.QueueEntry) (needsWorktree : Bool) : IO Unit := do
-    -- Create a worktree for parallel tasks on the same repo.
-    let wtPath : Option System.FilePath ←
-      if !needsWorktree then pure none
-      else
-        try some <$> Repo.ensureWorktree entry.fork entry.upstream entry.id
-        catch e =>
-          IO.eprintln s!"  Failed to create worktree for {entry.id}: {e}"
-          try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
-          releaseEntry entry
-          return
-    -- Cleanup action: remove worktree and release the parallel-tracking slot. Runs from
-    -- a `finally` below, so that an exception on any path still frees the slot — a leaked
-    -- slot is permanent and eventually starves the whole worker pool.
-    let doCleanup : IO Unit := do
-      if let some wt := wtPath then
-        let mainPath ← Repo.clonePath entry.fork
-        try Repo.removeWorktree mainPath wt catch _ => pure ()
-      releaseEntry entry
+  -- slot: index of the per-repo task slot reserved for this entry by `claimNextEntry`.
+  -- The slot directory is prepared (created if absent, otherwise reset to a clean default
+  -- branch) inside the try below. The slot is released by `runEntry`, which wraps this.
+  let runEntryBody (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
+      (reuseTree : Bool) : IO Unit := do
     let taskToken ← Std.CancellationToken.new
-    let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
     activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
     let removeToken : IO Unit :=
       activeTaskTokens.atomically (·.modify (·.filter (·.1 != tokenId)))
+    -- Terminal writes go through here rather than saving the claim-time snapshot: a socket
+    -- `cancel`, a listener, or a cascade from another worker can rewrite this entry's file
+    -- while the task runs, and writing the stale snapshot back would silently revert it.
+    let finish (status : Queue.QueueStatus) (taskId : Option String)
+        (outputJson : Option Lean.Json) : IO Unit := do
+      let cur := (← Queue.loadEntry entry.id).getD entry
+      Queue.saveEntry { cur with
+        status
+        taskId     := taskId.orElse (fun _ => cur.taskId)
+        outputJson := outputJson.orElse (fun _ => cur.outputJson) }
     let task : Task := {
       i := entry.inputType, o := entry.outputType
       ioTask := {
@@ -663,27 +708,35 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       let cfg ← match entry.configPath with
         | none    => pure appConfig
         | some cp => loadAppConfig (some (System.FilePath.mk cp))
+      -- Preparing the slot sits inside the `try` so that a failure here — a clone that
+      -- cannot be created, a fetch that cannot reach GitHub — is reported through the same
+      -- path as any other task failure: the entry is marked failed, a pre-claimed issue is
+      -- released, and a concert waiting on this step is signalled instead of hanging until
+      -- the daemon shuts down.
+      -- `reset := false` for a continuation that got its predecessor's slot back: the
+      -- resumed agent's context describes a tree it expects to still be there.
+      -- `runTask` prepares the slot itself, since doing so needs the installation token.
       let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
         (cancelToken := some taskToken) (interactive := false)
-        (repoPathOverride := wtPath)
+        (slotOverride := some (slot, !reuseTree))
       removeToken
       -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
       -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.
       -- Check the reason to distinguish the two cases.
       let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
       if explicitlyCancelled then
-        Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
+        finish .cancelled (some taskId) none
         IO.println s!"  Task cancelled."
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") outputJson
       else if usageLimitHit then
-        Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
+        finish .unfinished (some taskId) none
         Queue.cancelPendingByBackend entry.backend entry.id
         Queue.cancelDependents taskId
         IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
       else
-        Queue.saveEntry { entry with status := .done, taskId := some taskId, outputJson }
+        finish .done (some taskId) outputJson
         if let some key := entry.concertStepKey then
           ConcertManager.signal concertMgr key outputJson
     catch e =>
@@ -691,15 +744,21 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
       if explicitlyCancelled then
         IO.eprintln s!"  Task cancelled (with error: {e})"
-        try Queue.saveEntry { entry with status := .cancelled } catch _ => pure ()
+        try finish .cancelled none none catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
       else
         IO.eprintln s!"Queue entry {entry.id} failed: {e}"
-        try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+        try finish .failed none none catch _ => pure ()
         try releaseClaimOnError catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
-    finally
-      doCleanup
+  -- The release wraps the *whole* body, not just the part that runs the task: allocating the
+  -- cancellation token and registering it are themselves IO, and an exception there would
+  -- otherwise escape past the release and leak the slot. A leaked slot is never recovered, so
+  -- a handful of them permanently shrink the pool until the daemon is restarted.
+  let runEntry (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
+      (reuseTree : Bool) : IO Unit := do
+    try runEntryBody entry slot tokenId reuseTree
+    finally releaseEntry entry slot
   -- Load listener configs and spawn one fiber per listener.
   let listenerConfigs ← Listener.loadAllListenerConfigs
   if !listenerConfigs.isEmpty then
@@ -899,8 +958,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       -- ones, whose task results are discarded.
       try
         match ← claimNextEntry with
-        | none              => IO.sleep 1000
-        | some (entry, wt)  => runEntry entry wt
+        | none => IO.sleep 1000
+        | some (entry, slot, tokenId, reuseTree) => runEntry entry slot tokenId reuseTree
       catch e =>
         IO.eprintln s!"Queue worker error: {e}"
         IO.sleep 1000
@@ -1108,7 +1167,11 @@ private def mcpServerCmd : Cmd := `[Cli|
 
 private def prepareCmd : Cmd := `[Cli|
   prepare VIA prepareHandler; ["0.1.0"]
-  "Clone the fork and configure the upstream remote."
+  "Clone the fork, configure the upstream remote, and warm the task slots the queue runs in."
+
+  FLAGS:
+    slots : Nat; "Number of task slots to create and initialise, matching the \
+--parallel-per-repo the daemon will use (default: 1)"
 
   ARGS:
     "upstream" : String; "Upstream repository in 'owner/repo' format"
@@ -1117,12 +1180,12 @@ private def prepareCmd : Cmd := `[Cli|
 
 private def cleanupListCmd : Cmd := `[Cli|
   list VIA cleanupListHandler; ["0.1.0"]
-  "List all repository clones and their git worktrees."
+  "List all repository clones and their task slots."
 ]
 
 private def cleanupCmd : Cmd := `[Cli|
   cleanup VIA cleanupHandler; ["0.1.0"]
-  "Manage cloned repositories. Without a subcommand, removes all clones and worktrees."
+  "Manage cloned repositories. Without a subcommand, removes all clones and task slots."
 
   SUBCOMMANDS:
     cleanupListCmd
@@ -1199,8 +1262,10 @@ private def queueStartCmd : Cmd := `[Cli|
     c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
     d, debug; "Print the landrun command before executing it"
     b, background; "Run the daemon in the background, detached from the terminal"
-    parallel : Nat; "Maximum number of tasks to run in parallel (default: 1)"
-    "parallel-per-repo" : Nat; "Maximum parallel tasks per repository; additional copies use git worktrees (default: 1)"
+    parallel : Nat; "Maximum number of tasks to run in parallel (default: 1). Backends that \
+keep per-run state at a fixed global path (pi, opencode) always run exclusively"
+    "parallel-per-repo" : Nat; "Maximum parallel tasks per repository; each runs in its own clone (default: 1). \
+Run `orchestra prepare --slots N` first so the clones are warm"
 ]
 
 private def queueStatusCmd : Cmd := `[Cli|

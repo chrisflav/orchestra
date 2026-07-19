@@ -45,6 +45,14 @@ structure AgentDef where
       Called to determine which environment variables to inject when a specific auth source is selected.
       Authentication kinds not supported by the backend produce an empty array. -/
   envVarsOfAuthSource : AuthSource → Array (String × String)
+  /-- Whether two tasks on this backend may run at the same time in one daemon.
+
+      False for backends whose CLI keeps per-run state at a fixed, process-global location —
+      a hard-coded port, or a config file under `$HOME` that `setupMcp` overwrites and
+      `cleanup` restores. Two concurrent runs then read each other's configuration, so an
+      agent can end up talking to another task's MCP server and acting on its repository and
+      issue. The queue daemon runs such backends exclusively; see `Main.queueStartHandler`. -/
+  parallelSafe : Bool := true
 
 namespace AgentDef
 

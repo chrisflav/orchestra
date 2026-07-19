@@ -97,7 +97,14 @@ def createInstallationToken (jwt : String) (installationId : Nat) : IO String :=
       | throw (.userError "token response missing 'token' field")
     return token
 
-/-- Configure `gh` CLI to use the given token.
+/-- Configure `gh` CLI to use the given token, by writing it to `~/.config/gh/hosts.yml`.
+
+    **Process-global, and shared with every other process run by this user.** Only safe in a
+    one-shot CLI command that runs a single task. The queue daemon must not call it: it runs
+    tasks concurrently, each with its own installation token, and whichever task authenticated
+    last would supply the credentials for all of them. Pass the token explicitly instead —
+    `Repo`'s helpers take one, `GitHub`'s take a `pat`/`token` argument, and `Sandbox` injects
+    `GH_TOKEN` into the agent's environment.
 
     Rejects an empty token rather than passing it on: `gh auth login --with-token` given no token
     does not fail, it falls back to an interactive device-code prompt and blocks forever — which

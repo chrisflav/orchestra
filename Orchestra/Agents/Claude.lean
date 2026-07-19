@@ -30,7 +30,7 @@ def claude : AgentDef where
         ("args", .arr #[.str "127.0.0.1", .str (toString port)])
       ])
     ])]
-    let ts ← IO.monoNanosNow
+    let ts ← uniqueToken
     let path := s!"/tmp/agent-mcp-{ts}.json"
     IO.FS.writeFile (System.FilePath.mk path) mcpConfig.compress
     return (path, #[])

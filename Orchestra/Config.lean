@@ -1,10 +1,40 @@
 import Lean.Data.Json
 import Orchestra.Dirs
 import Orchestra.Taxis
+import Std.Sync
 
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra
+
+private initialize uniqueTokenMutex : Std.BaseMutex ← Std.BaseMutex.new
+private initialize uniqueTokenCounter : IO.Ref Nat ← IO.mkRef 0
+
+/-- Lowercase hex, zero-padded to four digits. -/
+private def hex4 (n : Nat) : String :=
+  let digit := fun (k : Nat) =>
+    let v := (n >>> (4 * k)) &&& 15
+    if v < 10 then Char.ofNat (v + '0'.toNat) else Char.ofNat (v - 10 + 'a'.toNat)
+  String.ofList [digit 3, digit 2, digit 1, digit 0]
+
+/-- A process-wide unique, monotonically increasing identifier.
+
+    `IO.monoNanosNow` on its own is not sufficient once the queue daemon runs tasks on
+    several threads: two workers can read the same nanosecond, and the value names task
+    records, per-task log files and temp directories, where a collision means two live tasks
+    silently overwriting each other's state. Appending a mutex-guarded counter makes distinct
+    calls yield distinct results regardless of clock resolution.
+
+    Both components are fixed-width and zero-padded so that lexicographic ordering on the
+    result still agrees with chronological ordering — the queue relies on that when sorting
+    entries and picking the oldest one at a given priority. -/
+def uniqueToken : IO String := do
+  let nanos ← IO.monoNanosNow
+  uniqueTokenMutex.lock
+  let n ← try uniqueTokenCounter.modifyGet (fun n => (n, n + 1))
+          finally uniqueTokenMutex.unlock
+  let padded := ("0000000000000000" ++ toString nanos).takeEnd 16
+  return padded.toString ++ hex4 (n % 65536)
 
 /-- A GitHub repository identified by its owner and name. -/
 structure Repository where
