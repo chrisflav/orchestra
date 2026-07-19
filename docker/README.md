@@ -134,6 +134,48 @@ If step 2 fails while step 1 succeeds, the narrow fix is a seccomp profile that 
 `landlock_create_ruleset`, `landlock_add_rule` and `landlock_restrict_self` on top of Docker's
 default.
 
+## Troubleshooting
+
+### Tasks fail with "error connecting to api.github.com"
+
+Symptom: a queue entry fails with `sh failed (exit 1): ... error connecting to api.github.com`,
+yet `curl https://api.github.com` from inside the same container returns 200.
+
+`gh` is a Go program, and Go's DNS resolver is stricter than glibc's. On a compose network
+`/etc/resolv.conf` points at Docker's embedded resolver (`127.0.0.11`), which forwards to the
+host's upstreams. If one of those answers badly, Go reports `server misbehaving` and gives up,
+while `curl` and `getent` fall through to another and succeed — so the usual connectivity checks
+all pass and only `gh` breaks. This does not happen on Docker's default bridge network, which
+skips the embedded resolver, so `docker run` can also look fine while compose fails.
+
+Confirm it:
+
+```sh
+docker compose run --rm -e GH_DEBUG=api --entrypoint sh orchestra \
+  -c 'echo bogus | gh auth login --with-token'
+```
+
+A line like `lookup api.github.com on 127.0.0.11:53: server misbehaving` is this problem. (A
+`HTTP 401: Bad credentials` reply instead means DNS is fine and the token is the issue.)
+
+Fix by naming an upstream resolver explicitly in `.env`, then recreating:
+
+```sh
+ORCHESTRA_DNS=1.1.1.1        # or your own resolver, if you need internal names
+```
+
+```sh
+docker compose up -d --force-recreate
+```
+
+Leaving `ORCHESTRA_DNS` empty (the default) changes nothing. Only one address is supported —
+compose interpolates the variable as a single scalar, so a comma-separated list becomes one
+invalid entry. One working resolver is enough; edit `docker-compose.yaml` directly if you want a
+fallback list.
+
+Container names still resolve either way: the embedded resolver answers those itself and only
+forwards external queries.
+
 ## Running other subcommands
 
 The image's `CMD` is `queue start`; override it for one-off commands against the same volumes:
