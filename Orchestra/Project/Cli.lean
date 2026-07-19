@@ -60,7 +60,6 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "claimed"   => some .claimed
   | "in_review" => some .inReview
   | "completed" => some .completed
-  | "blocked"   => some .blocked
   | "abandoned" => some .abandoned
   | "rejected"  => some .rejected
   | _           => none
@@ -69,7 +68,6 @@ private def issueStatusToString : IssueStatus → String
   | .open      => "open"
   | .claimed   => "claimed"
   | .inReview  => "in_review"
-  | .blocked   => "blocked"
   | .completed => "completed"
   | .abandoned => "abandoned"
   | .rejected  => "rejected"
@@ -173,17 +171,9 @@ def projectReleaseOrphansHandler (p : Parsed) : IO UInt32 := do
     for (issue, tid) in orphans do
       let _ ← Project.release mgr pid issue.id .open now
       IO.println s!"[released]  {issue.id.toString}  {issue.title}  (was claimed by {tid})"
-    -- Unblock blocked issues whose children are all completed.
-    let allIssues ← loadIssues pid
-    let blocked := allIssues.filter (·.status == .blocked)
-    let mut unblocked : Nat := 0
-    for issue in blocked do
-      let children ← childrenOf pid issue.id
-      if children.all (·.status == .completed) then
-        Project.saveIssue { issue with status := .open, updatedAt := now }
-        IO.println s!"[unblocked] {issue.id.toString}  {issue.title}  (all children completed)"
-        unblocked := unblocked + 1
-    if orphans.isEmpty && unblocked == 0 then
+    -- No unblock sweep: a decomposed parent is recognised by still having open children, so it
+    -- becomes workable again the moment the last one closes. Nothing to reconcile.
+    if orphans.isEmpty then
       IO.println "Nothing to do."
     return (0 : UInt32)
 

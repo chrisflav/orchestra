@@ -50,9 +50,13 @@ inductive SourceConfig where
       Each tick the dispatcher counts active per-role queue entries and emits
       a synthetic event per role that is below its cap and whose trigger holds. -/
   | projectDispatcher (projectId : Taxis.IssueId) (caps : List (String × Nat))
-  /-- Auto-dispatch across *every* project: work on any taxis issue carrying `label`, wherever it
-      lives in the tracker. Same role templates and `caps` semantics as `projectDispatcher`; the
-      difference is only where the issue set and the target come from.
+  /-- Auto-dispatch across *every* project: work on any taxis issue in scope for `label`,
+      wherever it lives in the tracker. Same role templates and `caps` semantics as
+      `projectDispatcher`; the difference is only where the issue set and the target come from.
+
+      In scope means the issue *or any ancestor* carries the label, so labelling a project opts
+      its whole subtree in; and only leaves are dispatched, since an issue with children has been
+      decomposed and those children are the work (`Project.dispatchCandidates`).
 
       With no project behind these issues there is no `defaultTarget` to inherit, so each issue's
       repository and branch are read off `repository` / `github-branch` artifacts on it or an
@@ -853,11 +857,11 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     for (iid, gap) in gaps do
       match gap with
       | .noRepository =>
-        IO.eprintln s!"[dispatcher] issue {iid.toString} is labelled '{label}' but has no \
+        IO.eprintln s!"[dispatcher] issue {iid.toString} is in scope for '{label}' but has no \
           repository artifact on it or any ancestor; skipping"
       | .noBranch repo =>
-        IO.eprintln s!"[dispatcher] issue {iid.toString} is labelled '{label}' and resolves to \
-          {repo} but has no github-branch artifact on it or any ancestor; skipping"
+        IO.eprintln s!"[dispatcher] issue {iid.toString} is in scope for '{label}' and \
+          resolves to {repo} but has no github-branch artifact on it or any ancestor; skipping"
     let issues := candidates.map (·.1)
     let roles ← Project.loadGlobalRoles
     -- Cap counting is scoped to the labelled set, so the caps bound concurrent work *on labelled

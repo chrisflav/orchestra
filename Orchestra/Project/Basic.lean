@@ -74,9 +74,6 @@ inductive IssueStatus where
   | open
   | claimed
   | inReview
-  /-- Parent issue split into sub-issues by a worker; not pickable until
-      either a reviewer / human moves it forward, or you manually re-open. -/
-  | blocked
   | completed
   | abandoned
   /-- PR failed the merger's validation check; not picked up again automatically. -/
@@ -88,7 +85,6 @@ instance : ToJson IssueStatus where
     | .open      => "open"
     | .claimed   => "claimed"
     | .inReview  => "in_review"
-    | .blocked   => "blocked"
     | .completed => "completed"
     | .abandoned => "abandoned"
     | .rejected  => "rejected"
@@ -98,7 +94,6 @@ instance : FromJson IssueStatus where
     | .str "open"      => .ok .open
     | .str "claimed"   => .ok .claimed
     | .str "in_review" => .ok .inReview
-    | .str "blocked"   => .ok .blocked
     | .str "completed" => .ok .completed
     | .str "abandoned" => .ok .abandoned
     | .str "rejected"  => .ok .rejected
@@ -176,8 +171,11 @@ metadata blob appended to the taxis issue's `description`, behind a machine-read
 (a trailing fenced ` ```orchestra-meta ` block), parsed back out on load and stripped before a
 human ever sees the description. `IssueStatus` has no native field either: it's `state` (open /
 closed / completed) plus at most one dedicated status label (`o-claimed`, `o-in-review`,
-`o-blocked`, `o-rejected` — `open`/`completed`/`abandoned` need no label, see `statusOf`/
-`labelsFor`). -/
+`o-rejected` — `open`/`completed`/`abandoned` need no label, see `statusOf`/`labelsFor`).
+
+There is deliberately no "blocked" status. A parent that has been decomposed is recognised by
+still having open children (`dispatchCandidates`), which needs no label to maintain and cannot
+drift out of sync with the tree the way a label can. -/
 
 private def metaFence := "\n```orchestra-meta\n"
 private def metaFenceEnd := "\n```"
@@ -217,7 +215,6 @@ def decodeMeta (raw : String) : String × Json :=
 private structure StatusLabelIds where
   claimed  : Orchestra.Taxis.LabelId
   inReview : Orchestra.Taxis.LabelId
-  blocked  : Orchestra.Taxis.LabelId
   rejected : Orchestra.Taxis.LabelId
   project  : Orchestra.Taxis.LabelId
 
@@ -238,7 +235,6 @@ private def statusLabelIds : IO StatusLabelIds := do
     let ids : StatusLabelIds :=
       { claimed  := ← ensure "o-claimed"
         inReview := ← ensure "o-in-review"
-        blocked  := ← ensure "o-blocked"
         rejected := ← ensure "o-rejected"
         project  := ← ensure "t-project" }
     statusLabelIdsRef.set (some ids)
@@ -253,7 +249,6 @@ private def statusOf (ids : StatusLabelIds) (state : Orchestra.Taxis.IssueState)
   | .open =>
     if labels.contains ids.claimed then .claimed
     else if labels.contains ids.inReview then .inReview
-    else if labels.contains ids.blocked then .blocked
     else if labels.contains ids.rejected then .rejected
     else .open
 
@@ -263,16 +258,15 @@ private def stateOf : IssueStatus → Orchestra.Taxis.IssueState
   | .abandoned => .closed
   | _ => .open
 
-/-- Rewrite `current`'s status labels (clearing all four and re-adding the one for `status`, if
-    any) — always exactly zero or one of the four is present afterward. -/
+/-- Rewrite `current`'s status labels (clearing all three and re-adding the one for `status`, if
+    any) — always exactly zero or one of the three is present afterward. -/
 private def labelsFor (ids : StatusLabelIds) (current : Array Orchestra.Taxis.LabelId) (status : IssueStatus) :
     Array Orchestra.Taxis.LabelId :=
-  let statusIds := #[ids.claimed, ids.inReview, ids.blocked, ids.rejected]
+  let statusIds := #[ids.claimed, ids.inReview, ids.rejected]
   let cleared := current.filter (fun l => !statusIds.contains l)
   match status with
   | .claimed  => cleared.push ids.claimed
   | .inReview => cleared.push ids.inReview
-  | .blocked  => cleared.push ids.blocked
   | .rejected => cleared.push ids.rejected
   | .open | .completed | .abandoned => cleared
 
@@ -569,6 +563,47 @@ def artifactTarget (iid : Taxis.IssueId) : IO (Except TargetGap ArtifactTarget) 
   | (some (repo, owner), some branch) =>
     return .ok { target := { repo, branch }, repoOwner := owner }
 
+/-- The dispatch candidates among `all` for trigger label `label`, by the two rules the
+    project-independent dispatcher selects on:
+
+    * **Open only.** Completed and abandoned issues are never candidates.
+    * **Inherited label.** An issue is in scope if it or any ancestor carries `label`, so
+      labelling a project once opts its whole subtree in instead of needing the label repeated on
+      every issue.
+    * **No open children.** An issue with children still open has been decomposed and those
+      children are the work; dispatching it as well would put an agent on the whole while others
+      work the parts. Only *open* children hold a parent back — once they are all completed or
+      abandoned the parent becomes workable again on its own. A child
+      being worked on is still open (claimed and in-review both map to taxis `open`), so work in
+      flight does hold the parent back. This structural test replaces the `o-blocked` label the
+      file-based system used: nothing has to remember to set or clear it, and it cannot disagree
+      with the actual tree.
+
+    Pure, and the entire selection policy — everything else in `issuesWithLabel` is fetching. -/
+def dispatchCandidates (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Taxis.LabelId) :
+    Array Orchestra.Taxis.Issue :=
+  let byId : Std.HashMap Int64 Orchestra.Taxis.Issue :=
+    Std.HashMap.ofList (all.toList.map fun i => (i.id.val, i))
+  let hasOpenChildren : Std.HashMap Int64 Unit :=
+    Std.HashMap.ofList (all.toList.filterMap fun i =>
+      match i.state with
+      | .open => i.parent.map (·.val, ())
+      | _ => none)
+  let rec inScope (i : Orchestra.Taxis.Issue) : Nat → Bool
+    | 0 => false
+    | fuel + 1 =>
+      if i.labels.contains label then true
+      else match i.parent with
+        | none => false
+        | some p => match byId.get? p.val with
+          | some parent => inScope parent fuel
+          | none => false
+  -- Only open issues are candidates. Without this a completed issue stays "in scope" forever —
+  -- it still inherits the label and has no open children — so every tick would re-resolve its
+  -- target and, if it has no artifacts, warn about it again.
+  all.filter fun i =>
+    i.state == .open && inScope i all.size && !hasOpenChildren.contains i.id.val
+
 /-- Every issue carrying `labelName`, regardless of project — the issue set the
     project-independent dispatcher works from. `none` means no such label exists on the tracker
     (distinct from "the label exists and nothing carries it", which is `some #[]`); the label is
@@ -584,23 +619,70 @@ def issuesWithLabel (labelName : String) :
   let cfg ← Orchestra.Taxis.getConfig
   let labels ← unwrap (← Orchestra.Taxis.listLabels cfg)
   let some label := labels.find? (·.name == labelName) | return none
-  let raws ← unwrap (← Orchestra.Taxis.listIssues cfg (label := some label.id))
+  -- The whole tracker, not just the labelled issues: the label is inherited downward, so
+  -- deciding whether an issue is in scope needs its ancestors, and deciding whether it is a leaf
+  -- needs everyone else's parent pointers. One list call plus in-memory work.
+  let all ← unwrap (← Orchestra.Taxis.listIssues cfg)
   let mut ok : Array (Issue × RepoTarget) := #[]
   let mut gaps : Array (Taxis.IssueId × TargetGap) := #[]
-  -- Deliberately no filtering by `t-project`: carrying that label does not make an issue a
-  -- container. Real trackers apply it broadly, including to leaves that are perfectly good units
-  -- of work and carry their own repository/branch artifacts. The trigger label is the only thing
-  -- that selects work here — if you don't want an issue dispatched, don't label it.
-  for raw in raws do
+  for raw in dispatchCandidates all label.id do
     match ← artifactTarget raw.id with
     | .error gap => gaps := gaps.push (raw.id, gap)
     | .ok at' =>
       -- Re-fetched (rather than reusing `raw`) to pick up attached PRs and the artifact-derived
-      -- project id. One extra GET per labelled issue; taxis has no batch issue-detail endpoint,
-      -- the same limitation `loadIssues` already documents.
+      -- project id. One extra GET per candidate; taxis has no batch issue-detail endpoint, the
+      -- same limitation `loadIssues` already documents.
       if let some issue ← loadIssue at'.repoOwner raw.id then
         ok := ok.push (issue, at'.target)
   return some (ok, gaps)
+
+/-! ## Write scoping
+
+An agent working an issue may only create and update issues within its own project subtree. The
+subtree is identified by its root: the nearest ancestor — the issue itself counts — that anchors a
+project, meaning it carries `t-project` or has both a `repository` and a `github-branch` artifact.
+Those are the same two markers the dispatcher uses to decide where an issue's target comes from,
+so "the project this work belongs to" means the same thing on both sides.
+
+Reads are deliberately not scoped: an agent can still list and inspect issues anywhere, which is
+useful for context and cannot damage anything. -/
+
+/-- The nearest ancestor of `iid` (including `iid`) anchoring a project — see this section's docs.
+    Falls back to `iid` itself when nothing up the chain qualifies, so an agent can always at
+    least create children under its own issue rather than being locked out entirely. -/
+def projectRootOf (iid : Taxis.IssueId) : IO Taxis.IssueId := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  let rec walk (id : Taxis.IssueId) : Nat → IO (Option Taxis.IssueId)
+    | 0 => pure none
+    | fuel + 1 => do
+      match ← Orchestra.Taxis.getIssueDetail cfg id with
+      | .error _ => pure none
+      | .ok detail =>
+        let arts := detail.attachedArtifacts
+        let anchors :=
+          detail.issue.labels.contains ids.project ||
+          (arts.any (·.kind == "repository") && arts.any (·.kind == "github-branch"))
+        if anchors then pure (some id)
+        else match detail.issue.parent with
+          | none => pure none
+          | some p => walk p fuel
+  return (← walk iid maxAncestorDepth).getD iid
+
+/-- Whether `candidate` is `root` itself or lies beneath it. -/
+def isWithinSubtree (root candidate : Taxis.IssueId) : IO Bool := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let rec walk (id : Taxis.IssueId) : Nat → IO Bool
+    | 0 => pure false
+    | fuel + 1 => do
+      if id.val == root.val then return true
+      match ← Orchestra.Taxis.getIssueDetail cfg id with
+      | .error _ => pure false
+      | .ok detail =>
+        match detail.issue.parent with
+        | none => pure false
+        | some p => walk p fuel
+  walk candidate maxAncestorDepth
 
 /-! ## Hierarchy traversal (B1: parentId-only) -/
 

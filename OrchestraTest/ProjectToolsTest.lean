@@ -213,7 +213,10 @@ def splitIssueHappyPath : Test := do
   let claimAfter ← loadClaim parent.id
   cleanup project allIssues
   TestM.assert (jsonContains r "\"ok\":true") "split_issue should report success"
-  TestM.assertEqual (updatedParent.map (·.status)) (some .blocked) (msg := "parent moves to blocked")
+  -- The parent keeps its status: what makes it a container now is having open children, which
+  -- `Project.dispatchCandidates` reads off the tree rather than off a label.
+  TestM.assertEqual (updatedParent.map (·.status)) (some .open)
+    (msg := "split leaves the parent's own status alone")
   TestM.assertEqual allIssues.size 3 (msg := "parent + 2 children = 3 issues")
   TestM.assert claimAfter.isNone "claim should be cleared after split"
 

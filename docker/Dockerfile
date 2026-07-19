@@ -52,6 +52,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code
 
+# Skills shipped with orchestra, seeded into /config on first start by the entrypoint. Baked in
+# at a fixed path because /config is a bind mount and starts empty.
+COPY skills /opt/orchestra/skills
+
 COPY --from=landrun /out/landrun /usr/local/bin/landrun
 COPY --from=build /src/.lake/build/bin/orchestra /usr/local/bin/orchestra
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

@@ -9,5 +9,6 @@ import OrchestraTest.ProjectFieldsTest
 import OrchestraTest.ProjectMetaTest
 import OrchestraTest.ExamplesTest
 import OrchestraTest.LabelDispatcherTest
+import OrchestraTest.DispatchCandidatesTest
 import OrchestraTest.ProjectToolsTest
 import OrchestraTest.ProjectRoleTest

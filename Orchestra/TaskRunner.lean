@@ -140,16 +140,6 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
   Project.saveIssue { issue with status := .completed, updatedAt := now }
   let _ ← Project.forceRelease globalClaimManager iid
   TaskStore.saveTask { initialRecord with status := .completed }
-  -- If this issue has a parent that is blocked, check whether all siblings
-  -- are now completed and unblock the parent if so.
-  if let some parentId := issue.parentId then
-    if let some parent ← Project.loadIssue pid parentId then
-      if parent.status == .blocked then
-        let siblings ← Project.childrenOf pid parentId
-        if siblings.all (·.status == .completed) then
-          let now2 ← TaskStore.currentIso8601
-          Project.saveIssue { parent with status := .open, updatedAt := now2 }
-          IO.println s!"  [merger] all children of {parentId.toString} completed; unblocked → open"
 
 /-- Run a triage task: add and/or remove labels on a GitHub issue or pull request.
     Skips the entire agent / sandbox / MCP path.
@@ -172,6 +162,16 @@ private def runTriage {i o : ResultType} (pat : String) (ioTask : IOTask i o)
       IO.eprintln s!"  [triage] failed to remove label '{label}': {e}"
   TaskStore.saveTask { initialRecord with status := .completed }
   IO.println s!"  [triage] done"
+
+/-- `plugin_dirs` from the config, with orchestra's own skills directory prepended when it
+    exists (`Dirs.skillsDir`). The skills tell an agent to reach for the MCP tools rather than
+    `gh` for anything touching pull requests or taxis issues, which it has no way to know
+    otherwise. Silently skipped when not installed. -/
+private def defaultPluginDirs (appConfig : AppConfig) : IO (Array String) := do
+  let skills ← Dirs.skillsDir
+  if ← skills.pathExists then
+    return #[skills.toString] ++ appConfig.pluginDirs
+  return appConfig.pluginDirs
 
 private def sanitizeProjectName (upstream : Repository) : String :=
   s!"{upstream.owner}-{upstream.name}"
@@ -445,7 +445,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       let suffix := if attempt == 0 then "" else s!".retry{attempt}"
       pure (some ((← Dirs.dataBase) / "logs" / ioTask.fork.toString / s!"{taskId}{suffix}.log"))
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
-      (debug := debug) (pluginDirs := appConfig.pluginDirs) (memoryDirs := memoryDirs)
+      (debug := debug) (pluginDirs := ← defaultPluginDirs appConfig) (memoryDirs := memoryDirs)
       (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
       (resume := resume) (budget := ioTask.budget.getD 4.0) (cancelToken := cancelToken)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)

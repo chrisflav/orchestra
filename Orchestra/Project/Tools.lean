@@ -54,7 +54,7 @@ inductive ProjectTool where
   | releaseClaim     (issueId : Taxis.IssueId) (reason : String)
   | attachPr         (issueId : Taxis.IssueId) (repo : Repository) (number : Nat) (branch : String)
   /-- Worker-driven decomposition: replace the held parent issue with a set of
-      sub-issues, move the parent to `.blocked`, and release the claim. -/
+      sub-issues and release the claim on the parent. -/
   | splitIssue       (parentId : Taxis.IssueId) (children : Array NewSubissueSpec) (reason : String)
   -- review_issues
   | listIssuesInReview (projectId : Taxis.IssueId)
@@ -96,7 +96,7 @@ def toolDefs : List (String × String × Json) :=
         , ("description", "List issues within a project. Optional status / parent_id filters.")
         , ("inputSchema", obj
             [ ("project_id", intProp "Project ID")
-            , ("status", strProp "Optional status filter (open|claimed|in_review|completed|abandoned)")
+            , ("status", strProp "Optional status filter (open|claimed|in_review|completed|abandoned|rejected)")
             , ("parent_id", intProp "Optional parent issue ID; only direct children are returned") ]
             ["project_id"]) ])
   , (manageIssuesPerm, "get_issue",
@@ -136,7 +136,7 @@ def toolDefs : List (String × String × Json) :=
             [ ("issue_id", intProp "Issue ID")
             , ("title", strProp "New title")
             , ("description", strProp "New description")
-            , ("status", strProp "New status (open|claimed|in_review|completed|abandoned)")
+            , ("status", strProp "New status (open|claimed|in_review|completed|abandoned|rejected)")
             , ("target_repo", strProp "New target repo (owner/name)")
             , ("target_branch", strProp "New target branch")
             , ("dependency_ids", Json.mkObj
@@ -175,7 +175,7 @@ def toolDefs : List (String × String × Json) :=
         [ ("name", "split_issue")
         , ("description",
             "Decompose the issue this task currently holds into one or more sub-issues. " ++
-            "The parent moves to `blocked`, the claim is released, and the children become " ++
+            "The parent moves to `a container (it now has open children), the claim is released, and the children become " ++
             "open and pickable. Caller MUST hold the claim on `parent_id`. Each child " ++
             "inherits the parent's effective target unless target_repo + target_branch are set.")
         , ("inputSchema", obj
@@ -242,7 +242,6 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "open"      => some .open
   | "claimed"   => some .claimed
   | "in_review" => some .inReview
-  | "blocked"   => some .blocked
   | "completed" => some .completed
   | "abandoned" => some .abandoned
   | "rejected"  => some .rejected
@@ -389,6 +388,30 @@ structure Env where
 private def deny (perm : String) : String :=
   s!"this task is not authorized for the {perm} tool group"
 
+/-- The issue bounding what this task may create or update: the root of its own project subtree
+    (`Project.projectRootOf`). Anchored on the task's issue when it has one, otherwise on its
+    project — a role dispatched without an issue (a planner, say) is still confined to its
+    project. `none` means the task is attached to neither and cannot be scoped at all. -/
+private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
+  match env.issueId, env.projectId with
+  | some iid, _ => return some (← projectRootOf iid)
+  | none, some pid => return some (← projectRootOf pid)
+  | none, none => return none
+
+/-- Reject a write that would land outside the task's subtree. Returns an error string to
+    surface, or `none` when the write is allowed. Reads are not scoped — see
+    `Project.Basic`'s "Write scoping". -/
+private def refuseOutsideScope (env : Env) (target : Taxis.IssueId) (what : String) :
+    IO (Option String) := do
+  match ← writeScopeRoot env with
+  | none =>
+    return some s!"cannot {what}: this task is attached to no project or issue, so there is no \
+      subtree to scope the change to"
+  | some root =>
+    if ← isWithinSubtree root target then return none
+    return some s!"cannot {what}: issue {target.toString} is outside this task's project \
+      subtree (root {root.toString}); manage_issues may only modify issues at or below it"
+
 private def has (env : Env) (perm : String) : Bool :=
   env.allowedTools.contains perm
 
@@ -399,7 +422,6 @@ private def issueStatusToString : IssueStatus → String
   | .open      => "open"
   | .claimed   => "claimed"
   | .inReview  => "in_review"
-  | .blocked   => "blocked"
   | .completed => "completed"
   | .abandoned => "abandoned"
   | .rejected  => "rejected"
@@ -477,16 +499,22 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     if target.isNone && project.defaultTarget.isNone then
       return content
         "project has no default target; pass target_repo and target_branch" (isError := true)
+    -- A new issue is placed under `parent` when given, otherwise directly under the project;
+    -- either way that anchor is what has to sit inside this task's subtree.
+    if let some msg ← refuseOutsideScope env (parent.getD pid) "create an issue there" then
+      return content msg (isError := true)
+    -- The parent needs no status change: having an open child is what makes it a container,
+    -- and the dispatcher reads that off the tree (`Project.dispatchCandidates`).
     if let some parentId := parent then
-      match ← findIssue parentId with
-      | none => return content s!"parent issue {parentId.toString} not found" (isError := true)
-      | some (_, parentIssue) =>
-        saveIssue { parentIssue with status := .blocked, updatedAt := now }
+      if (← findIssue parentId).isNone then
+        return content s!"parent issue {parentId.toString} not found" (isError := true)
     let issue ← createIssue pid title descr (parentId := parent) (target := target)
       (dependencies := dependencies)
     return content s!"created issue {issue.id.toString} in project {pid.toString}"
   | .updateIssue iid title descr status target dependencies =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
+    if let some msg ← refuseOutsideScope env iid "update that issue" then
+      return content msg (isError := true)
     match ← findIssue iid with
     | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (_, i) =>
@@ -555,7 +583,6 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     | some (project, i) =>
       IO.println s!"  [mcp] release_claim: {iid.toString} \"{i.title}\" — {reason}"
       let newStatus := match i.status with
-        | .blocked  => .blocked
         | .inReview => .inReview
         | _         => .open
       let _ ← release mgr project.id iid newStatus now
@@ -628,10 +655,9 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
               (parentId := some parentId) (target := spec.target <|> inheritedTarget)
             IO.println s!"  [mcp] split_issue: created sub-issue {issue.id.toString} \"{spec.title}\""
             createdIds := createdIds.push issue.id
-          -- Move parent to .blocked and clear the claim. We don't reuse
-          -- `release` here because it sets status unconditionally; we want
-          -- `.blocked` specifically.
-          saveIssue { parent with status := .blocked, updatedAt := now }
+          -- Clear the claim without touching status: the new children are open, which is what
+          -- makes the parent a container as far as the dispatcher is concerned. `forceRelease`
+          -- rather than `release` because the latter sets a status unconditionally.
           let _ ← forceRelease mgr parentId
           let payload := Json.mkObj
             [ ("ok",         true)

@@ -196,6 +196,34 @@ task carries them in its `tools` list, backing orchestra's project/issue/claim w
 issue tracker instance, not local files — see [`examples/projects/README.md`](examples/projects/README.md)
 for the full concept mapping, the `taxis` config section, and a CLI/tool cheat sheet).
 
+## skills
+
+`skills/` is a Claude plugin directory loaded into every agent by default. It carries two skills:
+
+- **`orchestra-pull-requests`** — opening PRs, commenting, reading review feedback.
+- **`orchestra-taxis-issues`** — claiming, splitting, attaching PRs, and managing tracker issues.
+
+Both exist mainly to state one rule the agent cannot infer: **`gh` must never be used for pull
+requests or issues.** Everything goes through the MCP tools, which select the right credential
+(PAT vs GitHub App token), record what the task did, and enforce the per-task permission groups.
+`gh` is authenticated for git transport only. Plain `git` is fine.
+
+They also draw the distinction between **taxis** issues (the tracker; what agents claim and work)
+and **GitHub** issues (the thread a task was launched from). The ids look alike and nothing stops
+you passing one where the other belongs.
+
+Install by copying into the config directory, from where orchestra picks it up automatically:
+
+```
+cp -r skills $XDG_CONFIG_HOME/orchestra/skills      # or ~/.config/orchestra/skills
+```
+
+The Docker image bundles them and seeds `/config/orchestra/skills` on first start, so nothing is
+needed there. Local edits survive restarts; delete the directory to get the shipped copy back.
+
+Anything in `plugin_dirs` in `config.json` is loaded as well — the skills directory is prepended,
+not a replacement.
+
 ## running tasks
 
 ```

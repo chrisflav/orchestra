@@ -68,6 +68,17 @@ else
   echo "[entrypoint] wrote $CONFIG_FILE (taxis: $ORCHESTRA_TAXIS_URL)"
 fi
 
+# Seed the bundled skills into the config volume. They tell agents to use orchestra's MCP tools
+# instead of `gh` for pull requests and taxis issues. Only when absent, so local edits survive
+# restarts; delete the directory to get the shipped copy back.
+# Under CONFIG_DIR, not CONFIG_ROOT: Dirs.skillsDir is <config>/skills where <config> is
+# already the orchestra-suffixed XDG path (Orchestra/Dirs.lean).
+SKILLS_DIR="$CONFIG_DIR/skills"
+if [ ! -e "$SKILLS_DIR" ] && [ -d /opt/orchestra/skills ]; then
+  cp -r /opt/orchestra/skills "$SKILLS_DIR"
+  echo "[entrypoint] installed bundled skills into $SKILLS_DIR"
+fi
+
 # GitHub App auth reads this key from disk to sign a JWT (Orchestra/GitHub.lean). Check it up
 # front: an unreadable key surfaces otherwise as an opaque openssl failure the first time a task
 # needs a GitHub token. Only checked when set — a PAT is the alternative and needs no key.
