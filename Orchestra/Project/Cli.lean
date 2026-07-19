@@ -60,7 +60,6 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "claimed"   => some .claimed
   | "completed" => some .completed
   | "abandoned" => some .abandoned
-  | "rejected"  => some .rejected
   | _           => none
 
 private def issueStatusToString : IssueStatus → String
@@ -68,7 +67,6 @@ private def issueStatusToString : IssueStatus → String
   | .claimed   => "claimed"
   | .completed => "completed"
   | .abandoned => "abandoned"
-  | .rejected  => "rejected"
 
 /-! ## Handlers -/
 
@@ -615,7 +613,7 @@ private def issueListCmd : Cmd := `[Cli|
   "List issues in a project."
 
   FLAGS:
-    status : String; "Filter by status: open|claimed|completed|abandoned|rejected"
+    status : String; "Filter by status: open|claimed|completed|abandoned"
 
   ARGS:
     "project-id" : String; "Project ID"

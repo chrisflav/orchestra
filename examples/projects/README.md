@@ -16,13 +16,13 @@ error.
 | --- | --- |
 | Project | A taxis issue carrying the `t-project` label. `Project.name`/`.description` are the issue's `title`/`description`. |
 | Issue | A taxis issue whose `parent` is the project's issue (root issues) or another orchestra issue (sub-issues created by `split_issue`). |
-| Issue status (`open`/`claimed`/`completed`/`abandoned`/`rejected`) | taxis `state` (`open`/`closed`/`completed`) plus at most one status label (`o-claimed`, `o-rejected`); `open` state with neither label is `open`, `closed` is `abandoned`. Two conditions have no status of their own and are read from the data instead: a decomposed parent is one with open children, and an issue awaiting review is an open one carrying an unmerged pull request. |
+| Issue status (`open`/`claimed`/`completed`/`abandoned`) | taxis `state` (`open`/`closed`/`completed`) plus the single `o-claimed` label; `open` without it is `open`, `closed` is `abandoned`. Three conditions have no status of their own and are read from the data: **decomposed** (has open children), **awaiting review** (open with an unmerged pull request attached), and **rejected** (latest review comment asks for changes). |
 | Dependencies | taxis's native issue-dependency graph — no separate plumbing. |
 | Claim (which task currently holds an issue) | A `session`-kind artifact on the issue (`{task_id, agent, series?, claimed_at}`) — "claimed" means the issue has one. |
 | Attached PR | A `github-pr`-kind artifact on the issue. |
 | `RepoTarget` override / reviewer template | Not a native taxis field — encoded as a JSON blob in a trailing ` ```orchestra-meta ` fenced block appended to the issue's description, stripped before a human sees it. |
 
-`o-claimed`/`o-rejected`/`t-project` are created automatically (if
+`o-claimed`/`t-project` are created automatically (if
 missing) the first time they're needed, so nothing needs to be pre-provisioned on the taxis side
 beyond the instance itself and an actor with permission to manage labels (an admin — see
 "Configuring taxis").
@@ -92,7 +92,7 @@ value in `secrets.json` (`$XDG_CONFIG_HOME/orchestra/secrets.json`) rather than 
 The token must be an API token (`POST /api/me/tokens` while authenticated in the taxis UI, or
 `GET|POST /actors/:id/tokens` as an admin to mint one for a bot actor — see taxis's own README) —
 not a session-login token. Its actor needs **admin** rights on the taxis instance: creating the
-`t-project`/`o-claimed`/`o-rejected` labels on first use requires it.
+`t-project`/`o-claimed` labels on first use requires it.
 
 Without a `taxis` section, `orchestra project`/`orchestra issue`/`manage_issues`/`work_issues`/
 `review_issues` all fail with a clear "taxis is not configured" error; every other orchestra

@@ -125,7 +125,7 @@ def toolDefs : List (String × String × Json) :=
         , ("description", "List issues within a project. Optional status / parent_id filters.")
         , ("inputSchema", obj
             [ ("project_id", intProp "Project ID")
-            , ("status", strProp "Optional status filter (open|claimed|completed|abandoned|rejected)")
+            , ("status", strProp "Optional status filter (open|claimed|completed|abandoned)")
             , ("parent_id", intProp "Optional parent issue ID; only direct children are returned") ]
             ["project_id"]) ])
   , (manageIssuesPerm, "get_issue",
@@ -165,7 +165,7 @@ def toolDefs : List (String × String × Json) :=
             [ ("issue_id", intProp "Issue ID")
             , ("title", strProp "New title")
             , ("description", strProp "New description")
-            , ("status", strProp "New status (open|claimed|completed|abandoned|rejected)")
+            , ("status", strProp "New status (open|claimed|completed|abandoned)")
             , ("target_repo", strProp "New target repo (owner/name)")
             , ("target_branch", strProp "New target branch")
             , ("dependency_ids", Json.mkObj
@@ -281,7 +281,6 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "claimed"   => some .claimed
   | "completed" => some .completed
   | "abandoned" => some .abandoned
-  | "rejected"  => some .rejected
   | _           => none
 
 private def parseTarget? (args : Json) : Except String (Option RepoTarget) := do
@@ -470,7 +469,6 @@ private def issueStatusToString : IssueStatus → String
   | .claimed   => "claimed"
   | .completed => "completed"
   | .abandoned => "abandoned"
-  | .rejected  => "rejected"
 
 /-- Render an issue summary line (used in list responses). -/
 private def issueLine (i : Issue) : String :=

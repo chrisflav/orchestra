@@ -114,8 +114,10 @@ list_issue_comments(issue_id: 57)          read the thread
 comment_issue(issue_id: 57, body: "...")   add to it
 ```
 
-**Read the thread before reworking an issue that came back to open.** A rejection is recorded
-there; without it you will not know what was wrong and are likely to resubmit the same work.
+**Read the thread before reworking an issue that came back to open.** There is no "rejected"
+status — a rejection *is* the request-changes review on the thread, and it is the only record of
+what was wrong. The merger records validation failures the same way. Without reading it you will
+not know what to fix and are likely to resubmit the same work.
 
 `get_issue` also includes the thread, so if you are already fetching detail you have it.
 
@@ -134,7 +136,7 @@ decide_issue(issue_id: 57, decision: "approve" | "complete" | "reject", notes: "
 | --- | --- |
 | `approve` | Enqueues the merger for the latest attached PR. The PR lands; **the issue stays open.** |
 | `complete` | Marks the issue finished. Merges nothing. |
-| `reject` | Returns the issue to open. |
+| `reject` | Returns the issue to open, with your notes recorded as a request-changes review. |
 
 Approving is a verdict on the *pull request*, not on the issue: one PR is rarely the whole issue,
 and an issue may collect several. So approve when the code should land, and `complete` separately

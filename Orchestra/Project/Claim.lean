@@ -119,9 +119,9 @@ def tryClaim (mgr : ClaimManager) (pid : Taxis.IssueId) (iid : Taxis.IssueId)
       | return .invalid s!"issue {iid.toString} not found"
     -- For terminal statuses a stale orphan claim must not mask the real reason the issue is
     -- unavailable. Check status first so callers see .invalid rather than .alreadyClaimed for
-    -- completed/abandoned/rejected issues.
+    -- completed/abandoned issues.
     match issue.status with
-    | .completed | .abandoned | .rejected =>
+    | .completed | .abandoned =>
       return .invalid s!"issue {iid.toString} is not open (status={repr issue.status})"
     | _ => pure ()
     if let some existing ← loadClaim iid then

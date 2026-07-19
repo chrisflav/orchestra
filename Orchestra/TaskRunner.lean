@@ -78,10 +78,10 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
   catch e =>
     return .error (toString e)
 
-/-- Run a merger task: checkout the PR branch, run the validation script, then
-    shell out to `gh pr merge`. If validation fails the issue is marked
-    `.rejected` and the PR is not merged. Skips the entire agent / sandbox /
-    MCP path. Used when `ioTask.backend = some "merger"`. -/
+/-- Run a merger task: checkout the PR branch, run the validation script, then shell out to
+    `gh pr merge`. If validation fails the PR is not merged and the reason is recorded as a
+    request-changes review on the issue, which returns to the open pool. Skips the entire agent /
+    sandbox / MCP path. Used when `ioTask.backend = some "merger"`. -/
 private def runMerger {i o : ResultType} (ioTask : IOTask i o)
     (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord) : IO Unit := do
   IO.println "  [merger] merge backend"
@@ -114,9 +114,16 @@ private def runMerger {i o : ResultType} (ioTask : IOTask i o)
   if !validOutput.isEmpty then
     IO.println s!"  [merger] validation output:\n{validOutput}"
   if !valid then
-    IO.eprintln s!"  [merger] validation failed for {prRef}, rejecting"
-    let now ← TaskStore.currentIso8601
-    Project.saveIssue { issue with status := .rejected, updatedAt := now }
+    IO.eprintln s!"  [merger] validation failed for {prRef}, requesting changes"
+    -- Recorded as a request-changes review rather than a status. The issue goes back to the open
+    -- pool carrying the reason, so the next worker sees what failed instead of finding an issue
+    -- parked in a state nothing dispatches. Failing to record must not swallow the failure
+    -- itself, hence the catch.
+    try
+      Project.addComment iid
+        s!"Validation failed for {prRef}, so it was not merged.\n\n```\n{validOutput}\n```"
+        (review := some .requestChanges)
+    catch e => IO.eprintln s!"  [merger] could not record the validation failure: {e}"
     let _ ← Project.forceRelease globalClaimManager iid
     TaskStore.saveTask { initialRecord with status := .failed }
     throw (.userError s!"validation failed for {prRef}")

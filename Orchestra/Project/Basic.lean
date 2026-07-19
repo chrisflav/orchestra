@@ -75,8 +75,6 @@ inductive IssueStatus where
   | claimed
   | completed
   | abandoned
-  /-- PR failed the merger's validation check; not picked up again automatically. -/
-  | rejected
 deriving Repr, Inhabited, BEq, DecidableEq
 
 instance : ToJson IssueStatus where
@@ -85,7 +83,6 @@ instance : ToJson IssueStatus where
     | .claimed   => "claimed"
     | .completed => "completed"
     | .abandoned => "abandoned"
-    | .rejected  => "rejected"
 
 instance : FromJson IssueStatus where
   fromJson?
@@ -93,7 +90,6 @@ instance : FromJson IssueStatus where
     | .str "claimed"   => .ok .claimed
     | .str "completed" => .ok .completed
     | .str "abandoned" => .ok .abandoned
-    | .str "rejected"  => .ok .rejected
     | j => .error s!"expected issue status string, got {j}"
 
 /-! ## Project record -/
@@ -167,8 +163,16 @@ A project id and an issue id are therefore both plain `Taxis.IssueId` — there 
 metadata blob appended to the taxis issue's `description`, behind a machine-readable marker
 (a trailing fenced ` ```orchestra-meta ` block), parsed back out on load and stripped before a
 human ever sees the description. `IssueStatus` has no native field either: it's `state` (open /
-closed / completed) plus at most one dedicated status label (`o-claimed`, `o-rejected` —
-`open`/`completed`/`abandoned` need no label, see `statusOf`/`labelsFor`).
+closed / completed) plus the single `o-claimed` label — `open`/`completed`/`abandoned` need none,
+see `statusOf`/`labelsFor`).
+
+Nothing else is a status. Three conditions people reach for as one are read from the data
+instead, so none of them can drift out of step with it and issues touched directly in the taxis
+UI behave the same as ones the tools created:
+
+* **decomposed** — the issue has open children (`dispatchCandidates`);
+* **awaiting review** — it is open with an unmerged pull request attached;
+* **rejected** — its latest review comment asked for changes (`ReviewState.requestChanges`).
 
 There is likewise no "in review" status. An issue is under review when it is open and carries an
 attached pull request that has not been merged — read from the tree and from GitHub rather than
@@ -215,7 +219,6 @@ def decodeMeta (raw : String) : String × Json :=
 
 private structure StatusLabelIds where
   claimed  : Orchestra.Taxis.LabelId
-  rejected : Orchestra.Taxis.LabelId
   project  : Orchestra.Taxis.LabelId
 
 private initialize statusLabelIdsRef : IO.Ref (Option StatusLabelIds) ← IO.mkRef none
@@ -234,7 +237,6 @@ private def statusLabelIds : IO StatusLabelIds := do
       | .error e => throw (.userError s!"taxis: failed to ensure label '{name}': {e}")
     let ids : StatusLabelIds :=
       { claimed  := ← ensure "o-claimed"
-        rejected := ← ensure "o-rejected"
         project  := ← ensure "t-project" }
     statusLabelIdsRef.set (some ids)
     return ids
@@ -247,7 +249,6 @@ private def statusOf (ids : StatusLabelIds) (state : Orchestra.Taxis.IssueState)
   | .closed => .abandoned
   | .open =>
     if labels.contains ids.claimed then .claimed
-    else if labels.contains ids.rejected then .rejected
     else .open
 
 /-- The taxis `state` a given `IssueStatus` maps to. -/
@@ -260,11 +261,10 @@ private def stateOf : IssueStatus → Orchestra.Taxis.IssueState
     any) — always exactly zero or one of the three is present afterward. -/
 private def labelsFor (ids : StatusLabelIds) (current : Array Orchestra.Taxis.LabelId) (status : IssueStatus) :
     Array Orchestra.Taxis.LabelId :=
-  let statusIds := #[ids.claimed, ids.rejected]
+  let statusIds := #[ids.claimed]
   let cleared := current.filter (fun l => !statusIds.contains l)
   match status with
-  | .claimed  => cleared.push ids.claimed
-  | .rejected => cleared.push ids.rejected
+  | .claimed => cleared.push ids.claimed
   | .open | .completed | .abandoned => cleared
 
 /-! ## Conversions -/
