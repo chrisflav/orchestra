@@ -642,10 +642,13 @@ Taxis issues carry a comment thread. It is where a reviewer's verdict and reason
 where the next agent to pick the issue up reads why it came back — so both writing and reading
 are exposed to agents, not just to humans in the taxis UI. -/
 
-/-- Post a comment on an issue. -/
-def addComment (iid : Taxis.IssueId) (body : String) : IO Unit := do
+/-- Post a comment on an issue. `review` marks it as a review carrying that verdict, which is
+    what makes it render as one in the taxis UI and count for review-request tracking; plain
+    comments leave it `none`. -/
+def addComment (iid : Taxis.IssueId) (body : String)
+    (review : Option Orchestra.Taxis.ReviewState := none) : IO Unit := do
   let cfg ← Orchestra.Taxis.getConfig
-  let _ ← unwrap (← Orchestra.Taxis.createComment cfg iid body)
+  let _ ← unwrap (← Orchestra.Taxis.createComment cfg iid body (review := review))
 
 /-- An issue's comments, oldest first as taxis returns them. -/
 def loadComments (iid : Taxis.IssueId) : IO (Array Orchestra.Taxis.Comment) := do

@@ -61,7 +61,7 @@ Tool permission groups (set via the task config's `tools` list):
 - `review_issues` — reviewer agents: list in-review, approve / reject.
 
 Reviews are recorded on the taxis issue's comment thread: `decide_issue` posts its `notes` there
-automatically, and `comment_issue` / `list_issue_comments` cover the rest. Reading is available to
+automatically as a native review comment carrying the approve / request-changes verdict, and `comment_issue` / `list_issue_comments` cover the rest. Reading is available to
 all three groups and writing to `work_issues`/`review_issues`, so a rejected issue carries its
 reasoning forward to whoever picks it up next. These are taxis comments, distinct from the
 `comment` tool, which posts to the GitHub issue or PR a task was launched from.

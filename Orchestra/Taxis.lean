@@ -19,7 +19,7 @@ export Taxis.Client (Config listIssues createIssue getIssueDetail getIssue updat
   listActors getMe epochToIso8601)
 
 export _root_.Taxis (Issue IssueDetail IssueInput IssueUpdate IssueState Label LabelId Comment
-  Actor Artifact ArtifactView ArtifactDisplay)
+  ReviewState Actor Artifact ArtifactView ArtifactDisplay)
 
 /-! ## Active configuration
 

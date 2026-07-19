@@ -132,8 +132,9 @@ decide_issue(issue_id: 57, decision: "approve" | "reject", notes: "...")
 Approving enqueues a merger task for the latest attached PR. Rejecting returns the issue to open.
 Judge the PR against what its issue asked for, which `get_issue` will show you.
 
-`decide_issue` records your `notes` as a comment on the issue automatically, so a rejection always
-leaves a trace the next worker can read. Put the actual reasoning in `notes` — "rejected" on its
+`decide_issue` records your `notes` as a **review comment** on the issue automatically, carrying
+the verdict, so it renders as a review in taxis and a rejection always leaves a trace the next
+worker can read. Put the actual reasoning in `notes` — "rejected" on its
 own tells them nothing. Use `comment_issue` for anything beyond the verdict, such as replying to a
 worker's question or leaving guidance without deciding yet.
 

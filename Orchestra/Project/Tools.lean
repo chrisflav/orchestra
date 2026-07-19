@@ -743,7 +743,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         -- The verdict belongs on the issue, not just in the tool response: the next worker to
         -- pick this up needs to know why it came back, and the response is seen only by this
         -- reviewer. Failing to record it must not fail the decision itself.
-        try addComment iid s!"**Rejected.**\n\n{notes}"
+        try addComment iid notes (review := some .requestChanges)
         catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
         -- Move back to .open and clear any claim. Notes are echoed back; the
         -- comment tool is the right place to post them on the PR if desired.
@@ -764,7 +764,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
             match ← hook project.id iid pr with
             | .error msg => return content s!"failed to enqueue merger: {msg}" (isError := true)
             | .ok mergerTaskId =>
-              try addComment iid s!"**Approved.**\n\n{notes}"
+              try addComment iid notes (review := some .approve)
               catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
               IO.println s!"  [mcp] decide_issue: {iid.toString} approved; merger task {mergerTaskId} enqueued"
               return content s!"approved {iid.toString}; merger task {mergerTaskId} enqueued ({notes})"
