@@ -7,9 +7,31 @@
 # blocks, additional_sandbox_paths — should be mounted instead. See examples/ for the full shape.
 set -eu
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-/config}/orchestra"
-DATA_DIR="${XDG_DATA_HOME:-/data}/orchestra"
+RUN_AS=orchestra
+CONFIG_ROOT="${XDG_CONFIG_HOME:-/config}"
+DATA_ROOT="${XDG_DATA_HOME:-/data}"
+CONFIG_DIR="$CONFIG_ROOT/orchestra"
+DATA_DIR="$DATA_ROOT/orchestra"
 CONFIG_FILE="$CONFIG_DIR/config.json"
+
+# /config and /data are bind-mounted host directories, and Docker creates a missing bind-mount
+# source as root — so on a fresh checkout they arrive unwritable by the unprivileged user agents
+# run as. Fix that here, then immediately drop privileges by re-execing this same script as
+# `orchestra`; everything below the drop runs unprivileged.
+#
+# The ownership test keeps this O(1) after first start: a plain `chown -R` would walk every cloned
+# repository under /data on every restart.
+if [ "$(id -u)" = "0" ]; then
+  target_uid="$(id -u "$RUN_AS")"
+  for d in "$CONFIG_ROOT" "$DATA_ROOT"; do
+    mkdir -p "$d"
+    if [ "$(stat -c %u "$d")" != "$target_uid" ]; then
+      echo "[entrypoint] taking ownership of $d for $RUN_AS"
+      chown -R "$RUN_AS:$RUN_AS" "$d"
+    fi
+  done
+  exec setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups "$0" "$@"
+fi
 
 mkdir -p "$CONFIG_DIR" "$DATA_DIR"
 
@@ -44,6 +66,21 @@ else
     > "$CONFIG_FILE"
 
   echo "[entrypoint] wrote $CONFIG_FILE (taxis: $ORCHESTRA_TAXIS_URL)"
+fi
+
+# GitHub App auth reads this key from disk to sign a JWT (Orchestra/GitHub.lean). Check it up
+# front: an unreadable key surfaces otherwise as an opaque openssl failure the first time a task
+# needs a GitHub token. Only checked when set — a PAT is the alternative and needs no key.
+if [ -n "${ORCHESTRA_GITHUB_PRIVATE_KEY_PATH:-}" ]; then
+  if [ -d "$ORCHESTRA_GITHUB_PRIVATE_KEY_PATH" ]; then
+    echo "[entrypoint] error: $ORCHESTRA_GITHUB_PRIVATE_KEY_PATH is a directory, not a key." >&2
+    echo "[entrypoint] Docker creates a directory when a bind-mounted file is missing on the" >&2
+    echo "[entrypoint] host. Put the .pem in the mounted secrets directory and recreate." >&2
+    exit 1
+  elif [ ! -r "$ORCHESTRA_GITHUB_PRIVATE_KEY_PATH" ]; then
+    echo "[entrypoint] warning: GitHub App key $ORCHESTRA_GITHUB_PRIVATE_KEY_PATH is missing" >&2
+    echo "[entrypoint] or unreadable; GitHub App auth will fail. See docker/README.md." >&2
+  fi
 fi
 
 # Probe landrun by actually building a Landlock ruleset and running something inside it — a bare

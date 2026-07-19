@@ -34,19 +34,47 @@ and in the Nix container but are not in this image; add them to the Dockerfile i
 
 ## Configuration
 
-The entrypoint writes `/config/orchestra/config.json` from environment variables on first start,
-covering taxis, GitHub auth and Claude auth. **A `config.json` already present is used as-is and
-the environment is ignored** — mount your own when you need listeners, roles, agent auth blocks
-or `additional_sandbox_paths`:
+Three host directories are bind-mounted, all gitignored and created on first `up`:
 
-```yaml
-volumes:
-  - ./my-config.json:/config/orchestra/config.json:ro
+| Host | Container | Holds |
+| --- | --- | --- |
+| `docker/config/` | `/config` | `orchestra/config.json`, `listeners/`, `roles/`, `prompts/`, `secrets.json` |
+| `docker/data/` | `/data` | Task history, queue state, cloned repos, per-project roles |
+| `docker/secrets/` | `/secrets` (read-only) | GitHub App private key |
+
+Plain directories rather than named volumes, so you can read and edit everything without
+`docker cp`. Paths follow XDG (`Orchestra/Dirs.lean`), which appends `orchestra` to each root —
+hence `config/orchestra/config.json`.
+
+The entrypoint writes `config/orchestra/config.json` from environment variables on first start,
+covering taxis, GitHub auth and Claude auth. **Once that file exists it is used as-is and the
+environment is ignored** — so edit it in place for anything the environment can't express
+(listeners, roles, agent auth blocks, `additional_sandbox_paths`), and restart. To regenerate
+from the environment instead, delete the file.
+
+Docker creates the bind-mount directories as root, which would leave them unwritable by the
+unprivileged user agents run as. The entrypoint therefore starts as root, takes ownership of
+`/config` and `/data`, and immediately re-execs itself as `orchestra` via `setpriv` — the daemon
+itself never runs as root. Ownership is only rewritten when it is actually wrong, so restarts
+don't walk every cloned repository under `data/`.
+
+### GitHub App private key
+
+Put the downloaded `.pem` in `docker/secrets/` and point at it *inside* the container:
+
+```sh
+ORCHESTRA_GITHUB_APP_ID=123456
+ORCHESTRA_GITHUB_PRIVATE_KEY_PATH=/secrets/github-app.pem
 ```
 
-Paths follow XDG (`Orchestra/Dirs.lean`): config at `/config/orchestra/`, state at
-`/data/orchestra/` — task history, queue state, cloned repos, and per-project roles, which stayed
-file-based through the taxis migration.
+`ORCHESTRA_SECRETS_DIR` overrides the host side if you keep keys elsewhere.
+
+Note the compose file mounts the secrets *directory*, not the key file. Bind-mounting a file that
+doesn't exist on the host makes Docker silently create a **directory** in its place, which
+surfaces much later as a confusing openssl error; mounting the containing directory avoids that
+entirely. The entrypoint still checks the key path and fails fast if it is a directory.
+
+Not needed when using `ORCHESTRA_GITHUB_PAT` — leave the key path empty and no key is read.
 
 ## Reaching taxis
 

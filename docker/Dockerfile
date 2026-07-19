@@ -59,21 +59,29 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Agents run as this user, not root: Landlock is an unprivileged LSM, so nothing here needs root,
 # and a sandboxed agent that escapes landrun should not land on a root shell.
-RUN useradd --create-home --shell /bin/bash orchestra \
-    && mkdir -p /config /data \
-    && chown orchestra:orchestra /config /data
+RUN useradd --create-home --shell /bin/bash orchestra
+
 USER orchestra
 
 # Orchestra resolves config/data through XDG (Orchestra/Dirs.lean), appending `orchestra` to each:
 # config.json lands at /config/orchestra/config.json, state under /data/orchestra/.
-ENV XDG_CONFIG_HOME=/config \
+# HOME is set explicitly because the entrypoint starts as root (see below) — without it, the
+# elan toolchain installed here would be looked up under root's home after the privilege drop.
+ENV HOME=/home/orchestra \
+    XDG_CONFIG_HOME=/config \
     XDG_DATA_HOME=/data \
     ELAN_HOME=/home/orchestra/.elan
 ENV PATH="${ELAN_HOME}/bin:${PATH}"
 RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf \
       | sh -s -- -y --no-modify-path --default-toolchain none
 
-VOLUME ["/config", "/data"]
+# Back to root *only* so the entrypoint can take ownership of the bind-mounted /config and /data
+# (Docker creates missing bind-mount sources as root) before re-execing itself as `orchestra` via
+# setpriv. Nothing beyond those two chowns ever runs as root.
+#
+# No VOLUME declaration on purpose: docker-compose.yaml bind-mounts host directories, and a VOLUME
+# here would additionally spawn anonymous volumes for anyone running the image without mounts.
+USER root
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["queue", "start"]

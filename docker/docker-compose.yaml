@@ -20,6 +20,8 @@ services:
       # the private key mounted at the path given.
       ORCHESTRA_GITHUB_PAT: ${ORCHESTRA_GITHUB_PAT:-}
       ORCHESTRA_GITHUB_APP_ID: ${ORCHESTRA_GITHUB_APP_ID:-0}
+      # Path *inside* the container — i.e. under /secrets, see the volume below. Left empty by
+      # default so PAT users get no spurious "key missing" warning at start-up.
       ORCHESTRA_GITHUB_PRIVATE_KEY_PATH: ${ORCHESTRA_GITHUB_PRIVATE_KEY_PATH:-}
       # Agent auth: one of these, depending on how you authenticate Claude.
       ORCHESTRA_CLAUDE_TOKEN: ${ORCHESTRA_CLAUDE_TOKEN:-}
@@ -30,12 +32,18 @@ services:
     # they aren't, the entrypoint says so at start-up; see docker/README.md before reaching for
     # `security_opt: [seccomp=unconfined]`, which is a much bigger hammer than the problem needs.
     volumes:
-      # config.json is generated here on first start from the environment above; mount your own
-      # over it (read-only) if you need listeners, roles, or agent auth blocks.
-      - orchestra-config:/config
+      # Plain host directories rather than named volumes, so config and state are inspectable and
+      # editable without `docker cp`. All three are gitignored. Docker creates them on first `up`
+      # (as root); the entrypoint takes ownership before dropping to the `orchestra` user.
+      #
+      # ./config/orchestra/config.json is generated on first start from the environment above.
+      # Edit it in place afterwards — it is then used as-is and the environment is ignored. The
+      # same directory holds listeners/, roles/, prompts/ and secrets.json.
+      - ./config:/config
       # Task history, queue state, cloned repos, per-project roles.
-      - orchestra-data:/data
-
-volumes:
-  orchestra-config:
-  orchestra-data:
+      - ./data:/data
+      # GitHub App private key and anything else secret. Mounted read-only, and as a *directory*
+      # rather than naming the .pem directly: Docker silently creates a directory in place of a
+      # missing bind-mounted file, which would surface later as a confusing openssl error.
+      # Drop your key in ./secrets/ and set ORCHESTRA_GITHUB_PRIVATE_KEY_PATH to its path here.
+      - ${ORCHESTRA_SECRETS_DIR:-./secrets}:/secrets:ro

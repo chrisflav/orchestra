@@ -431,6 +431,10 @@ the same volumes:
 docker compose run --rm orchestra project list
 ```
 
+Config and state live in gitignored host directories — `docker/config/`, `docker/data/` and
+`docker/secrets/` — created on first `up`, so `config/orchestra/config.json` can be edited
+directly and a GitHub App key just gets dropped in `secrets/`.
+
 It expects an existing taxis instance rather than starting one — `ORCHESTRA_TAXIS_URL` must be
 reachable from inside the container, so not `localhost`. Agents are sandboxed with landrun
 (Landlock), which works under Docker's default seccomp profile; the entrypoint probes it at
