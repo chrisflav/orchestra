@@ -122,10 +122,13 @@ def setupGhAuth (token : String) : IO Unit := do
 def isPrMerged (token : String) (repo : Repository) (number : Nat) : IO Bool := do
   let env := if token.isEmpty then #[] else #[("GH_TOKEN", some token)]
   try
+    -- `state`, not `merged`: gh has no `merged` field, and asking for one makes the whole call
+    -- fail. `state` is OPEN / CLOSED / MERGED, so it also distinguishes a PR closed without
+    -- merging — which still counts as unmerged here, since the issue's work did not land.
     let out ← runCmd "gh"
-      #["pr", "view", toString number, "--repo", repo.toString, "--json", "merged", "-q", ".merged"]
+      #["pr", "view", toString number, "--repo", repo.toString, "--json", "state", "-q", ".state"]
       (env := env)
-    return out.trimAscii.toString == "true"
+    return out.trimAscii.toString == "MERGED"
   catch _ =>
     return false
 

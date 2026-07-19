@@ -290,4 +290,47 @@ def invisibleDependencyDoesNotBlock : Test := do
   TestM.assertEqual (workableIds #[fixtureIssue 102 p .open (dependencies := #[⟨999⟩])]) ["102"]
     (msg := "an id outside the set is treated as satisfied")
 
+/-! ## Decision reporting
+
+    `dispatcherDecisions` reports a verdict for every role the listener names, and `dispatcherTick`
+    is just the spawns among them — so the log lines and the behaviour cannot drift apart. -/
+
+@[test]
+def everyNamedRoleGetsAVerdict : Test := do
+  let p := fixtureProject
+  let reviewer : Role :=
+    { name := "reviewer", permissions := [], promptTemplate := "r"
+    , dispatch := some { trigger := .hasInReviewIssues, max := 1 } }
+  let ds := dispatcherDecisions
+    { activeByRole := {}, issues := #[], reviewable := #[]
+    , caps := [("reviewer", 1), ("ghost", 1), ("implementor", 0)], roles := #[reviewer] }
+  TestM.assertEqual (ds.map (·.roleName)).toList ["reviewer", "ghost", "implementor"]
+    (msg := "a verdict per named role, including ones that cannot run")
+  TestM.assert (ds.any fun d => match d.outcome with | .nothingToReview => true | _ => false)
+    "reviewer with nothing to review reports why"
+  TestM.assert (ds.any fun d => match d.outcome with | .roleMissing => true | _ => false)
+    "a cap naming a role with no file reports that"
+  TestM.assert (ds.any fun d => match d.outcome with | .notEnabled => true | _ => false)
+    "a zero cap reports that auto-dispatch is off"
+
+/-- A reviewer is dispatched from `reviewable`, never from `issues`. This is the wiring that broke
+    twice: a caller that builds the input without `reviewable` silently gets no reviewers, because
+    the field defaults to empty and nothing else complains. -/
+@[test]
+def reviewerComesFromReviewableNotIssues : Test := do
+  let p := fixtureProject
+  let reviewer : Role :=
+    { name := "reviewer", permissions := [], promptTemplate := "r"
+    , dispatch := some { trigger := .hasInReviewIssues, max := 1 } }
+  let withReviewable := dispatcherTick
+    { activeByRole := {}, issues := #[fixtureIssue 101 p .open]
+    , reviewable := #[fixtureIssue 102 p .open], caps := [("reviewer", 1)], roles := #[reviewer] }
+  TestM.assertEqual (withReviewable.map (·.issueId.map (·.toString))).toList [some "102"]
+    (msg := "bound to the reviewable issue")
+  -- Omitting `reviewable` must yield nothing, not fall back to `issues`.
+  let withoutIt := dispatcherTick
+    { activeByRole := {}, issues := #[fixtureIssue 101 p .open]
+    , caps := [("reviewer", 1)], roles := #[reviewer] }
+  TestM.assert withoutIt.isEmpty "no reviewable set means no reviewer, never a worker issue"
+
 end OrchestraTest.ProjectRole

@@ -166,6 +166,18 @@ Auto-dispatch listener:
 
 Each tick the dispatcher counts queue entries `(status ∈ {pending, running}) ∧ projectId == this ∧ role == X`, and if `count < cap` and the role's trigger holds, enqueues exactly one new entry per role.
 
+It says what it checked and what it decided, for every role named in `caps`:
+
+```
+[dispatcher] project 42: 18 issues, 3 workable, 1 awaiting review; roles available: implementor, reviewer, planner
+[dispatcher]   role 'implementor' (has_open_issues): DISPATCH, bound to issue 57
+[dispatcher]   role 'reviewer' (has_in_review_issues): skip: 1 active, cap 1
+[dispatcher]   role 'planner' (idle): skip: not idle (3 workable, 1 awaiting review)
+```
+
+A role named in `caps` that no role file defines, or one whose cap is zero, is reported too — those
+are the two cases that otherwise look identical to "nothing was due".
+
 ### Project-independent dispatch
 
 `label-dispatcher` does the same thing without being tied to one project: it works on **every**
