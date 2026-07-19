@@ -1,12 +1,16 @@
 {
   "name": "reviewer",
-  "permissions": ["review_issues", "comment", "get_pr_comments"],
+  "permissions": [
+    "review_issues",
+    "comment",
+    "get_pr_comments"
+  ],
   "backend": "claude",
   "model": "sonnet",
   "system_prompt": "review-agent",
   "read_only": true,
   "priority": 50,
-  "prompt_template": "Review issues that are in_review for project {{project_name}}.\n\nUse list_issues_in_review to find pending decisions, then decide_issue with approve or reject (with notes).\n\n{{instructions}}",
+  "prompt_template": "Review issues that are in_review for project {{project_name}}.\n\nUse list_issues_in_review to find pending decisions, then decide_issue with approve or reject (with notes). Judge each PR against what its issue actually asked for.\n\n{{instructions}}",
   "dispatch": {
     "trigger": "has_in_review_issues",
     "max": 0,

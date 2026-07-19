@@ -57,6 +57,35 @@ def renderSubstitutesPlaceholders : Test := do
     v
   TestM.assertEqual out "[API / i1] do x on o/r@main: go" (msg := "render substitution")
 
+/-- The issue body has to reach the agent through the prompt: `get_issue` is the only tool that
+    renders it and it needs `manage_issues`, which worker roles don't have. Before
+    `{{issue_description}}` existed, a template asking for it got an empty string and the agent
+    was left with only a title — so this pins both the substitution and that the shipped
+    implementor template actually uses it. -/
+@[test]
+def renderSubstitutesIssueDescription : Test := do
+  let v : RenderVars :=
+    { projectId := "9", projectName := "Formal schemes",
+      instructions := "", issueId := some "9",
+      issueTitle := some "Formal schemes",
+      issueDescription := some "Suggested reference EGA I.",
+      targetRepo := some "o/r", targetBranch := some "master" }
+  TestM.assertEqual (render "{{issue_description}}" v) "Suggested reference EGA I."
+    (msg := "issue_description substitution")
+  -- An issue-less render (planner-style) leaves it empty rather than failing.
+  let noIssue : RenderVars := { projectId := "1", projectName := "P", instructions := "" }
+  TestM.assertEqual (render "[{{issue_description}}]" noIssue) "[]"
+    (msg := "absent description renders empty")
+
+@[test]
+def shippedImplementorTemplateCarriesTheIssueBody : Test := do
+  let raw ← IO.FS.readFile "examples/projects/roles/implementor.json"
+  match Json.parse raw >>= FromJson.fromJson? (α := Role) with
+  | .error e => TestM.fail s!"implementor.json: {e}"
+  | .ok role =>
+    TestM.assert ((role.promptTemplate.splitOn "{{issue_description}}").length > 1)
+      "the shipped implementor template must include {{issue_description}}"
+
 @[test]
 def projectRoleOverridesGlobal : Test := do
   let outcome ← (withTempHome do

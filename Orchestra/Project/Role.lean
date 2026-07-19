@@ -83,8 +83,12 @@ structure Role where
   priority       : Nat           := 10
   budget         : Option Float  := none
   /-- Prompt body — supports {{project_id}}, {{project_name}}, {{instructions}},
-      and (when an issue is bound) {{issue_id}}, {{issue_title}},
-      {{target_repo}}, {{target_branch}}. Unrecognised placeholders pass through. -/
+      and (when an issue is bound) {{issue_id}}, {{issue_title}}, {{issue_description}},
+      {{target_repo}}, {{target_branch}}, {{pr_number}}, {{pr_branch}}, {{pr_repo}}.
+      Unrecognised placeholders pass through.
+
+      Worker templates should include {{issue_description}}: it is the only way the issue body
+      reaches an agent, since the tool that renders it (`get_issue`) needs `manage_issues`. -/
   promptTemplate : String
   /-- Optional auto-dispatch policy. `none` = manual-spawn only. -/
   dispatch       : Option DispatchPolicy := none
@@ -213,6 +217,9 @@ structure RenderVars where
   instructions : String
   issueId      : Option String := none
   issueTitle   : Option String := none
+  /-- The issue's body. Nothing else puts it in front of the agent: `get_issue` is the only tool
+      that renders it and that is gated on `manage_issues`, which worker roles do not have. -/
+  issueDescription : Option String := none
   targetRepo   : Option String := none
   targetBranch : Option String := none
   prNumber     : Option String := none
@@ -229,6 +236,7 @@ def render (tmpl : String) (v : RenderVars) : String :=
     , ("{{instructions}}",  v.instructions)
     , ("{{issue_id}}",      v.issueId.getD "")
     , ("{{issue_title}}",   v.issueTitle.getD "")
+    , ("{{issue_description}}", v.issueDescription.getD "")
     , ("{{target_repo}}",   v.targetRepo.getD "")
     , ("{{target_branch}}", v.targetBranch.getD "")
     , ("{{pr_number}}",     v.prNumber.getD "")
@@ -256,6 +264,7 @@ def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : St
     , instructions
     , issueId      := some i.id.toString
     , issueTitle   := some i.title
+    , issueDescription := some i.description
     , targetRepo   := target.map (·.repo.toString)
     , targetBranch := target.map (·.branch)
     , prNumber     := pr?.map (fun p => toString p.number)
