@@ -136,9 +136,46 @@ def removeWorktree (mainPath : System.FilePath) (wtPath : System.FilePath) : IO 
     -- so a later `worktree add` can reuse the path.
     try runGit' #["worktree", "prune"] mainPath catch _ => pure ()
 
+/-- Return true if `ref` resolves to an object in `repoPath`. -/
+private def refExists (repoPath : System.FilePath) (ref : String) : IO Bool := do
+  try
+    runGit' #["rev-parse", "--verify", "--quiet", ref] repoPath
+    return true
+  catch _ => return false
+
+/-- Name of the default branch (e.g. `master`) recorded in `refs/remotes/<remote>/HEAD`.
+    `git clone` records this at clone time, so for `origin` it is available offline. A
+    remote added afterwards has no HEAD until `git remote set-head` asks the server, so
+    try that once before giving up. -/
+private def defaultBranchName (repoPath : System.FilePath) (remote : String) : IO (Option String) := do
+  let readHead : IO (Option String) := do
+    try
+      -- Yields e.g. `origin/master`; keep the branch part.
+      let out ← runGit #["symbolic-ref", "--short", s!"refs/remotes/{remote}/HEAD"] repoPath
+      let prefix_ := s!"{remote}/"
+      return some (if out.startsWith prefix_ then (out.drop prefix_.length).toString else out)
+    catch _ => return none
+  if let some name ← readHead then return some name
+  try runGit' #["remote", "set-head", remote, "--auto"] repoPath catch _ => pure ()
+  readHead
+
+/-- The commit a new worktree should be based on.
+
+    New work belongs on the default branch, not on whatever branch the previous task
+    happened to leave the main clone sitting on. The branch *name* comes from `origin`
+    (recorded at clone time, so no network call), but the commit is taken from
+    `upstream` when available: `ensureCloned` fetches upstream and never fetches
+    origin, so the fork's remote-tracking refs are stale as of clone time. -/
+private def worktreeBaseRef (repoPath : System.FilePath) : IO (Option String) := do
+  let some branch ← defaultBranchName repoPath "origin" | return none
+  for remote in ["upstream", "origin"] do
+    let ref := s!"{remote}/{branch}"
+    if ← refExists repoPath ref then return some ref
+  return none
+
 /-- Create a git worktree for a parallel agent task on the same repository.
-    Ensures the main clone exists and is up to date first, then adds a detached
-    worktree that shares the same git objects. Returns the worktree path. -/
+    Ensures the main clone exists and is up to date first, then adds a worktree that
+    shares the same git objects, detached at the default branch. Returns the worktree path. -/
 def ensureWorktree (fork upstream : Repository) (entryId : String) : IO System.FilePath := do
   let mainPath ← ensureCloned fork upstream (interactive := false)
   let wtPath ← worktreePath fork entryId
@@ -150,8 +187,14 @@ def ensureWorktree (fork upstream : Repository) (entryId : String) : IO System.F
   if ← wtPath.pathExists then
     IO.println s!"  Removing stale worktree at {wtPath}..."
     removeWorktree mainPath wtPath
-  IO.println s!"  Creating worktree at {wtPath}..."
-  runGit' #["worktree", "add", "--detach", wtPath.toString] mainPath
+  let baseRef ← worktreeBaseRef mainPath
+  if baseRef.isNone then
+    IO.eprintln s!"  Warning: could not determine the default branch of {fork}; basing the \
+      worktree on the main clone's current HEAD, which may be a previous task's branch."
+  IO.println s!"  Creating worktree at {wtPath} (base: {baseRef.getD "HEAD"})..."
+  -- Detached: the default branch is checked out in the main clone, and git refuses to
+  -- have the same branch checked out in two worktrees at once.
+  runGit' (#["worktree", "add", "--detach", wtPath.toString] ++ baseRef.toArray) mainPath
   return wtPath
 
 /-- Return true if `path` is a main git clone. A worktree's `.git` is a file rather
