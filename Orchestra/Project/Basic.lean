@@ -410,6 +410,25 @@ def saveIssue (i : Issue) : IO Unit := do
       labels := some (labelsFor ids raw.labels i.status)
       dependencies := some i.dependencies })
 
+/-- Remove the `o-claimed` label from `iid`, leaving everything else — including the taxis
+    `state`, and therefore whether the issue reads as completed or abandoned — untouched.
+
+    Exists because `IssueStatus` is not a stored field: `.claimed` *is* this label (see
+    `statusOf`). Dropping a claim by deleting its `session` artifact alone therefore leaves the
+    issue reading as claimed forever, which hides it from every consumer that gates on `.open`
+    — the reviewer sweep (`Listener.awaitingReview`), the dispatcher (`workableIssues`) and
+    `list_issues_in_review`. `Project.forceRelease` calls this; `release` does not need it,
+    since it writes a status through `saveIssue`.
+
+    A no-op when the label is absent, so callers can use it unconditionally. -/
+def clearClaimedLabel (iid : Taxis.IssueId) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  let raw ← unwrap (← Orchestra.Taxis.getIssue cfg iid)
+  if !raw.labels.contains ids.claimed then return
+  let _ ← unwrap (← Orchestra.Taxis.updateIssue cfg iid
+    { labels := some (raw.labels.filter (· != ids.claimed)) })
+
 /-- Attach `pr` to `iid` as a `github-pr` artifact — the counterpart to `Issue.attachedPRs` on
     the read side (see `saveIssue` for why this isn't folded into it).
 
