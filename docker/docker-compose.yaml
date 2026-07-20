@@ -7,6 +7,14 @@ services:
       dockerfile: docker/Dockerfile
     image: orchestra:latest
     restart: unless-stopped
+    # `docker compose stop` sends SIGTERM to the daemon (PID 1 in this image), which orchestra
+    # catches and treats as "finish the tasks already running, then exit" — the same drain as
+    # `orchestra queue shutdown`. Docker's default 10s grace period would SIGKILL it long before
+    # an agent task is done, killing the task mid-run and leaving its entry stuck in `running`,
+    # so allow for a realistic task instead. Nothing waits out the full period: the daemon exits
+    # as soon as the last in-flight task lands. A second SIGTERM (stop again, or Ctrl-C twice in
+    # the foreground) cancels the running tasks rather than waiting for them.
+    stop_grace_period: ${ORCHESTRA_STOP_GRACE_PERIOD:-30m}
     environment:
       # taxis instance backing projects/issues/claims. Required — every project, issue and claim
       # operation fails without it. This compose file expects taxis to be running elsewhere; point

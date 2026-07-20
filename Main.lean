@@ -584,6 +584,35 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         let _h ← IO.asTask (prio := .dedicated) do
           handleSocketRequest conn appConfig concertMgr debug shutdownToken activeTaskTokens
     catch _ => pure ()
+  -- Signal watcher: turns SIGTERM/SIGINT into the same graceful drain as `queue shutdown`.
+  -- Needed because the daemon is PID 1 in the container image, where `docker stop` is the way in
+  -- and `queue shutdown` is not: draining works, but the daemon's exit stops the container and
+  -- the restart policy immediately brings up a new one. Handling the signal is also what makes
+  -- it deliverable at all — PID 1 ignores signals left at their default disposition, so before
+  -- this, `docker stop` fell through to SIGKILL and left in-flight entries stuck in `running`.
+  --
+  -- Polled rather than acted on inside the handler itself: a signal handler may not touch the
+  -- Lean heap, so it only bumps a counter (ffi/Signal.c) and the real work happens here. The
+  -- 200ms tick is well inside any sane `docker stop` grace period and costs nothing when idle.
+  Utils.Signals.install
+  let _signalTask ← IO.asTask (prio := .dedicated) do
+    let mut announced := false
+    repeat
+      let n ← Utils.Signals.count
+      if n > 0 && !announced then
+        announced := true
+        IO.println "Received termination signal; finishing in-flight tasks before shutting down."
+        IO.println "Send it again to cancel them instead."
+        shutdownToken.cancel .shutdown
+      -- A second signal escalates to `queue shutdown --force`: whoever is stopping us has said
+      -- once that they are willing to wait, and then changed their mind.
+      if n > 1 then
+        IO.println "Second termination signal; cancelling in-flight tasks."
+        let pairs ← activeTaskTokens.atomically (·.get)
+        for (_, token) in pairs do
+          token.cancel .cancel
+        break
+      IO.sleep 200
   -- Helper: atomically claim the next pending entry, marking it as running.
   -- Serialised by claimMutex so that multiple workers cannot claim the same entry.
   -- Returns (entry, slot, tokenId, reuseTree):
