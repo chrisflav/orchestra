@@ -37,6 +37,60 @@ private def shellEscape (s : String) : String :=
     "'" ++ s.replace "'" "'\\''" ++ "'"
   else s
 
+/-- Byte ceiling for each prompt every backend passes to its CLI as a single argument: the task
+    prompt and the appended system prompt.
+
+    `execve` rejects any single argument longer than `MAX_ARG_STRLEN` — 32 pages, so 131072
+    bytes on every architecture orchestra runs on — with `E2BIG`. The failure lands in the
+    forked child, which can only report it as a bare `could not execute external process
+    'landrun'` and exit 255: nothing names the prompt, and the task then burns its whole retry
+    budget failing the same way. The margin below the hard limit is for the rest of the command
+    line, which is bounded (flags, paths, one env var per name) but not free.
+
+    The ceiling is per argument, not shared between the two: the *combined* size of a command
+    line is governed by a separate and far larger limit (`ARG_MAX`, a couple of megabytes),
+    which two arguments of this size come nowhere near. -/
+private def maxPromptBytes : Nat := 120000
+
+/-- Appended to a prompt that had to be cut, so the agent is told rather than left to infer it
+    from a sentence ending mid-word. Counted against the budget, not added on top of it. -/
+private def promptTruncationNotice : String :=
+  "\n\n[Truncated by orchestra: this prompt exceeded the maximum length a single command-line \
+argument can carry, so everything past this point was cut from the end. What you can see above \
+is complete and unmodified.]"
+
+/-- `s` cut to at most `maxPromptBytes` UTF-8 bytes, with `promptTruncationNotice` appended.
+
+    Cuts on a character boundary rather than a byte one: a prompt carrying an issue thread is
+    full of non-ASCII, and half a code point would leave the agent's CLI to reject the argument
+    as invalid UTF-8 instead — trading one opaque launch failure for another. -/
+private def truncatePrompt (s : String) : String :=
+  if s.utf8ByteSize ≤ maxPromptBytes then s else Id.run do
+    let budget := maxPromptBytes - promptTruncationNotice.utf8ByteSize
+    let mut out   := ""
+    let mut used  := 0
+    for c in s.toList do
+      let width := c.utf8Size
+      if used + width > budget then break
+      out  := out.push c
+      used := used + width
+    return out ++ promptTruncationNotice
+
+/-- `s` capped to `maxPromptBytes`, saying so on stderr when it had to cut. `label` names which
+    prompt overflowed, since the two are built from entirely different inputs and the fix
+    differs accordingly.
+
+    Loud, because an over-long prompt means something expanded without a bound —
+    `{{issue_comments}}` on a long thread is the usual one — and cutting it only keeps the task
+    running, it does not make the prompt right. -/
+private def capPromptArg (label : String) (s : String) : IO String := do
+  if s.utf8ByteSize ≤ maxPromptBytes then return s
+  IO.eprintln s!"  [sandbox] warning: the {label} is {s.utf8ByteSize} bytes, over the \
+{maxPromptBytes}-byte ceiling for a single command-line argument; cutting it off at the end. \
+The agent will not see what was cut — check whether a prompt template is expanding something \
+unbounded."
+  return truncatePrompt s
+
 def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : String)
     (serverPort : UInt16)
     (ghToken : String)
@@ -168,6 +222,12 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   args := args.push agentDef.command
   -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
   let allPluginDirs := pluginDirs ++ memoryDirs
+  -- Enforced here rather than where the prompts are built: every backend and every caller
+  -- reaches the CLI through this one spawn, and the limit is a property of `execve`, not of any
+  -- one template. The system prompt is capped even in interactive mode, where there is no task
+  -- prompt but `--append-system-prompt` is still passed.
+  let prompt ← capPromptArg "prompt" prompt
+  let systemPrompt ← systemPrompt.mapM (capPromptArg "system prompt")
   let agentArgs :=
     if interactiveAgent then
       agentDef.buildInteractiveArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget
