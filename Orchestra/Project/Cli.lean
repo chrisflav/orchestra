@@ -387,7 +387,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let target? :=
     if role.repoless then none
     else mIssue.bind (effectiveTarget project ·) <|> project.defaultTarget
-  if target?.isNone && !role.repoless then
+  if !role.repoless && target?.isNone then
     IO.eprintln "Cannot spawn: no effective target (project has no default and issue has no override)"
     return 1
   warnRepolessPerms role

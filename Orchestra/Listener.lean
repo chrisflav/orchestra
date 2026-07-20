@@ -812,7 +812,7 @@ def buildRoleEntry (project : Project.Project) (role : Project.Role)
     else targetOverride
       <|> issue?.bind (Project.effectiveTarget project ·)
       <|> project.defaultTarget
-  if target?.isNone && !role.repoless then return none
+  if !role.repoless && target?.isNone then return none
   Project.warnRepolessPerms role
   let id ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601

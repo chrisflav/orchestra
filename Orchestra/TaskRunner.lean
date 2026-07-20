@@ -332,6 +332,14 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (slotOverride : Option Repo.SlotAssignment := none) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
   let forkLabel := (ioTask.fork.map (·.toString)).getD "(no repository)"
   IO.println s!"=== Task {idx}: {forkLabel} ({repr ioTask.mode}) ==="
+  -- Half a repository is a configuration mistake, not a repository-independent task. Failing
+  -- here is the difference between a loud error and a task that quietly runs with no clone
+  -- and no credentials because one key was misspelled. Checked before the record is written:
+  -- a task that never starts should not leave a `.running` record behind to be reconciled.
+  match ioTask.upstream, ioTask.fork with
+  | some _, none | none, some _ =>
+    throw (.userError "task sets only one of upstream/fork; set both or neither")
+  | _, _ => pure ()
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
   -- one ID at enqueue time and the task gets a second ID here at run time,
@@ -352,13 +360,6 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     role      := ioTask.role
   }
   TaskStore.saveTask initialRecord
-  -- Half a repository is a configuration mistake, not a repository-independent task. Failing
-  -- here is the difference between a loud error and a task that quietly runs with no clone
-  -- and no credentials because one key was misspelled.
-  match ioTask.upstream, ioTask.fork with
-  | some _, none | none, some _ =>
-    throw (.userError "task sets only one of upstream/fork; set both or neither")
-  | _, _ => pure ()
   -- If this task was pre-claimed (daemon wrote the claim with the queue-entry
   -- ID before we ran), retag the claim with the real generated taskId so that
   -- ownership checks in attach_pr / split_issue pass.

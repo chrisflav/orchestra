@@ -114,8 +114,11 @@ structure Role where
   dispatch       : Option DispatchPolicy := none
 deriving Repr, Inhabited
 
-/-- Repository tools a `repoless` role cannot use, warned about at spawn time. -/
-def repoToolPerms : List String := ["create_pr", "comment", "get_pr_comments"]
+/-- Repository permissions a `repoless` role cannot use, warned about at spawn time.
+
+    Permission tokens only. `get_pr_comments` is not one — it is always-available and gated on
+    the repository itself — so naming it here could never fire. -/
+def repoToolPerms : List String := ["create_pr", "comment"]
 
 /-- Warn when a repository-independent role asks for repository tools. Not fatal: the role is
     still perfectly runnable, it just carries a permission that can only ever refuse. -/
