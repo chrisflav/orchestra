@@ -828,10 +828,15 @@ its workspace; it will start from a clean checkout."
               -- (Project.artifactTarget) rather than inherited from a project default.
               let getVar (k : String) := vars.find? (·.1 == k) |>.map (·.2)
               let roleName := getVar "role_name" |>.getD ""
-              let some issueId := getVar "issue_id" |>.bind Taxis.IssueId.parse?
-                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event without a \
-                    usable issue_id; skipping"
-                  continue
+              -- Absent for an unbound role (`always` trigger): it is scoped to the labelled root
+              -- in `project_id` and picks its own issues from there, claiming each through the
+              -- daemon. Only a malformed id is an error; no id at all is a valid event.
+              let issueIdVar := getVar "issue_id"
+              let issueId? := issueIdVar.bind Taxis.IssueId.parse?
+              if issueIdVar.isSome && issueId?.isNone then
+                IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event with an \
+                  unparseable issue_id; skipping"
+                continue
               let some projectId := getVar "project_id" |>.bind Taxis.IssueId.parse?
                 | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event without a \
                     usable project_id; skipping"
@@ -841,8 +846,9 @@ its workspace; it will start from a clean checkout."
                 | some r, some b => (Repository.parse r).toOption.map ({ repo := ·, branch := b })
                 | _, _ => none
               let some target := target?
-                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event for issue \
-                    {issueId.toString} carried no usable target; skipping"
+                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event for \
+                    {issueId?.map (·.toString) |>.getD projectId.toString} carried no usable \
+                    target; skipping"
                   continue
               let some project ← Project.loadProject projectId | continue
               -- Global roles only: these issues can span projects, so no single project's
@@ -850,18 +856,30 @@ its workspace; it will start from a clean checkout."
               let some role := (← Project.loadGlobalRoles).find? (·.name == roleName)
                 | IO.eprintln s!"  Listener '{lcfg.name}': no global role '{roleName}'; skipping"
                   continue
-              let some issue ← Project.loadIssue projectId issueId | continue
-              let entryOpt ← Listener.buildRoleEntry project role (some issue)
+              let issue? ← match issueId? with
+                | none     => pure none
+                | some iid => Project.loadIssue projectId iid
+              -- A bound event naming an issue that cannot be loaded is a real failure; an
+              -- unbound one legitimately has none.
+              if issueId?.isSome && issue?.isNone then continue
+              let scope := match issue? with
+                | some i => s!"issue {i.id.toString}"
+                | none   => s!"root {projectId.toString}"
+              let entryOpt ← Listener.buildRoleEntry project role issue?
                 (targetOverride := some target)
               match entryOpt with
               | none =>
-                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName} for issue \
-                  {issueId.toString}: no effective target"
+                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName} for \
+                  {scope}: no effective target"
               | some entry =>
-                let needsClaim := match role.dispatch with
-                  | some d => d.preClaim
-                  | none   => false
-                let claimed ← if needsClaim then
+                -- Pre-claiming needs an issue to claim. An unbound role has none by construction;
+                -- it claims for itself through the daemon once it picks one, which is the same
+                -- mutex this would have taken.
+                let needsClaim := match issue?, role.dispatch with
+                  | some _, some d => d.preClaim
+                  | _,      _      => false
+                let claimed ← match issue?, needsClaim with
+                  | some issue, true =>
                     let now ← TaskStore.currentIso8601
                     let agent := role.backend.getD "claude"
                     match ← Project.tryClaim TaskRunner.globalClaimManager projectId issue.id
@@ -874,11 +892,11 @@ its workspace; it will start from a clean checkout."
                     | .invalid r =>
                       IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: {r}"
                       pure false
-                  else pure true
+                  | _, _ => pure true
                 if claimed then
                   Queue.saveEntry entry
-                  IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} for issue \
-                    {issue.id.toString} ({label}) → {entry.id}"
+                  IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} for \
+                    {scope} ({label}) → {entry.id}"
               continue
             | _ => pure ()
             if let some wfPath := liveCfg.action.workflowPath then

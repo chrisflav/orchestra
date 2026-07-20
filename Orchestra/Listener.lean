@@ -564,6 +564,7 @@ private def triggerName : Project.RoleTrigger → String
   | .hasOpenIssues     => "has_open_issues"
   | .hasInReviewIssues => "has_in_review_issues"
   | .idle              => "idle"
+  | .always            => "always"
 
 /-- One log line explaining what was checked for a role and what was decided. -/
 def renderDecision (d : RoleDecision) : String :=
@@ -627,6 +628,12 @@ def dispatcherDecisions (input : DispatcherInput) : Array RoleDecision := Id.run
       else
         decisions := decisions.push
           (record (.notIdle input.issues.size input.reviewable.size))
+    | .always =>
+      -- Unbound on purpose, so nothing is added to `taken`: this role picks its own work and
+      -- claims it through the daemon's claim manager, which is what keeps two of them off the
+      -- same issue. The dispatcher has no issue to reserve on its behalf and no reason to keep
+      -- one out of another role's set — see `splitForDispatch`, which this trigger bypasses.
+      decisions := decisions.push (record (.spawn none))
   return decisions
 
 /-- The spawns among `dispatcherDecisions`. -/
@@ -635,6 +642,41 @@ def dispatcherTick (input : DispatcherInput) : Array RoleSpawn :=
     match d.outcome with
     | .spawn issueId => some { roleName := d.roleName, issueId }
     | _ => none
+
+/-! ### Bound and unbound roles in one `caps` block
+
+The label-dispatcher places issue-bound roles and `always` roles by different rules — the former
+per issue, the latter per labelled root — so a single `caps` block has to be split before either
+can be counted. Both halves are pure so the cap arithmetic, which is what stops a runaway, can be
+tested without a tracker. -/
+
+/-- Partition `caps` into (issue-bound roles, unbound `always` roles). A capped name that no role
+    defines stays on the bound side, where `dispatcherDecisions` reports it as `roleMissing`
+    rather than dropping it silently. -/
+def splitCapsByBinding (roles : Array Project.Role) (caps : List (String × Nat)) :
+    List (String × Nat) × List (String × Nat) :=
+  let isUnbound (roleName : String) : Bool :=
+    match (roles.find? (·.name == roleName)).bind (·.dispatch) with
+    | some d => d.trigger == .always
+    | none   => false
+  (caps.filter (fun (n, _) => !isUnbound n), caps.filter (fun (n, _) => isUnbound n))
+
+/-- Per-role tally of the active unbound entries scoped to `root`.
+
+    Counts entries with **no** `issueId` and `projectId == root`, which is exactly how
+    `buildRoleEntry` stamps an unbound spawn. The issue-bound tally cannot be reused: it keys on
+    `issueId` being in the labelled set, so every unbound entry falls through it, leaving the
+    role's cap permanently unreached and spawning a fresh one on every single tick. -/
+def unboundActiveByRole (entries : Array Queue.QueueEntry) (root : Taxis.IssueId) :
+    Std.HashMap String Nat := Id.run do
+  let mut active : Std.HashMap String Nat := {}
+  for e in entries do
+    if !(e.status == .pending || e.status == .running) then continue
+    if e.issueId.isSome then continue
+    if e.projectId != some root then continue
+    if let some r := e.role then
+      active := active.insert r ((active.getD r 0) + 1)
+  return active
 
 /-! ## Review routing
 
@@ -1074,35 +1116,39 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       of which {reviewable.size} await a reviewer, \
       {gaps.size} skipped for want of a target; roles available: \
       {String.intercalate ", " (roles.map (·.name)).toList}"
+    -- Roles that bind an issue and roles that don't are dispatched by different rules here, so
+    -- they are counted and decided separately. An `always` role has no issue to bind, so it is
+    -- scoped to a labelled root instead (one spawn set per root) — see below.
+    let (boundCaps, unboundCaps) := splitCapsByBinding roles caps
     -- Cap counting is scoped to the labelled set, so the caps bound concurrent work *on labelled
     -- issues* rather than colliding with per-project dispatchers running the same role names.
     let labelled : Array Taxis.IssueId := issues.map (·.id) ++ reviewable.map (·.id)
     let allEntries ← Queue.loadAllEntries
+    let activeEntries := allEntries.filter fun e => e.status == .pending || e.status == .running
     let mut active : Std.HashMap String Nat := {}
-    for e in allEntries do
-      let isActive := e.status == .pending || e.status == .running
-      if !isActive then continue
+    for e in activeEntries do
       let some eIid := e.issueId | continue
       if !labelled.contains eIid then continue
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
-    let input : DispatcherInput := { activeByRole := active, issues, reviewable, caps, roles }
+    let input : DispatcherInput :=
+      { activeByRole := active, issues, reviewable, caps := boundCaps, roles }
     let decisions := dispatcherDecisions input
     if decisions.isEmpty then
       IO.println "[dispatcher] no roles named in caps, so nothing to check"
     for d in decisions do
       IO.println s!"[dispatcher] {renderDecision d}"
     let spawns := dispatcherTick input
-    -- Report rather than silently drop: this source can only place issue-bound roles, since an
-    -- entry's repository and branch come from the issue's own artifacts. `idle` roles (planners)
-    -- bind to nothing by design and have no project to stand in for it when issues span the whole
-    -- tracker, so they cannot run here — say so instead of looking like nothing was due.
+    -- Report rather than silently drop: an entry's repository and branch come from the issue's
+    -- own artifacts, so a role that binds no issue has no target here — unless it is `always`,
+    -- which is scoped to a labelled root below and never reaches this loop. `idle` roles
+    -- (planners) still cannot run here: they bind nothing *and* have no root to stand in for it.
     for s in spawns do
       if s.issueId.isNone then
         IO.eprintln s!"[dispatcher] role '{s.roleName}' was due but binds to no issue, and this \
           dispatcher takes its target from the issue; not dispatched. Use a project-dispatcher \
-          for roles with the 'idle' trigger."
-    return (spawns.filterMap fun s =>
+          for roles with the 'idle' trigger, or the 'always' trigger to run one per labelled root."
+    let boundEvents := spawns.filterMap fun s =>
       match s.issueId with
       | none => none
       | some iid =>
@@ -1113,7 +1159,30 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
                     , ("issue_id",      iid.toString)
                     , ("project_id",    issue.projectId.toString)
                     , ("target_repo",   target.repo.toString)
-                    , ("target_branch", target.branch) ]), none)
+                    , ("target_branch", target.branch) ])
+    -- Unbound roles, one decision set per labelled root. The root is the scope: it supplies the
+    -- target and stands in as the project, and its own id is what the cap is counted against —
+    -- the tally above keys on `issueId`, which an unbound entry does not have, so counting these
+    -- there would leave their cap permanently unreached and spawn one every tick.
+    let mut unboundEvents : Array (String × List (String × String)) := #[]
+    if !unboundCaps.isEmpty then
+      if sets.roots.isEmpty then
+        IO.eprintln s!"[dispatcher] label '{label}' has unbound roles configured \
+          ({String.intercalate ", " (unboundCaps.map (·.1))}) but no open issue carries the label \
+          directly, so there is no root to scope them to; not dispatched"
+      for (root, target) in sets.roots do
+        let rootInput : DispatcherInput :=
+          { activeByRole := unboundActiveByRole allEntries root.id
+          , issues := #[], reviewable := #[], caps := unboundCaps, roles }
+        for d in dispatcherDecisions rootInput do
+          IO.println s!"[dispatcher] root {root.id.toString} \"{root.title}\": {renderDecision d}"
+        for s in dispatcherTick rootInput do
+          unboundEvents := unboundEvents.push
+            ("", [ ("role_name",     s.roleName)
+                 , ("project_id",    root.id.toString)
+                 , ("target_repo",   target.repo.toString)
+                 , ("target_branch", target.branch) ])
+    return (boundEvents ++ unboundEvents, none)
 
   | .githubLabelCount repos labels max kind => do
     let mut allEvents : Array (String × List (String × String)) := #[]

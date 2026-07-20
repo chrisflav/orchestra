@@ -436,12 +436,19 @@ private def deny (perm : String) : String :=
 
 /-- The issue bounding what this task may create or update: the root of its own project subtree
     (`Project.projectRootOf`). Anchored on the task's issue when it has one, otherwise on its
-    project — a role dispatched without an issue (a planner, say) is still confined to its
-    project. `none` means the task is attached to neither and cannot be scoped at all. -/
+    project — a role dispatched without an issue (a planner or a maintainer) is still confined to
+    its project. `none` means the task is attached to neither and cannot be scoped at all.
+
+    An issue-less task's `projectId` is taken as the root as given, *not* re-derived: the
+    dispatcher already chose it deliberately, and for a label-dispatched maintainer it is the
+    labelled issue, which anchors nothing of its own when the repository artifact sits on an
+    ancestor. Re-deriving would walk up to that ancestor and hand the agent write access to
+    sibling subtrees nobody labelled. Where the project id *is* an anchor — every
+    project-dispatcher role — `projectRootOf` returned it unchanged anyway. -/
 private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
   match env.issueId, env.projectId with
   | some iid, _ => return some (← projectRootOf iid)
-  | none, some pid => return some (← projectRootOf pid)
+  | none, some pid => return some pid
   | none, none => return none
 
 /-- Reject a write that would land outside the task's subtree. Returns an error string to

@@ -115,7 +115,7 @@ the new id.
 A *role* is a reusable task template — backend, prompt template, the
 permission set the agent gets, and an optional auto-dispatch policy.
 Role names are user-defined; only the dispatcher's set of triggers is
-fixed (`has_open_issues` | `has_in_review_issues` | `idle`).
+fixed (`has_open_issues` | `has_in_review_issues` | `idle` | `always`).
 
 Roles are the one part of this subsystem that's still plain files, not taxis-backed (project
 overrides global by name):
@@ -138,10 +138,51 @@ template. They are the only way an agent sees what an issue asks for and what a 
 about it — `get_issue` and `list_issue_comments` render both, but a worker has to know to call
 them, and a rejection lives nowhere else now that there is no rejected status.
 
-Examples in `roles/`: `implementor.json`, `reviewer.json`, `planner.json`.
-Each ships with `dispatch.max: 0` so auto-spawn is opt-in — set caps in a
+Examples in `roles/`: `implementor.json`, `reviewer.json`, `planner.json`,
+`maintainer.json`. Each ships with `dispatch.max: 0` so auto-spawn is opt-in — set caps in a
 dispatcher listener config (see `examples/listeners/auto-dispatcher.json`)
 to enable.
+
+### The `always` trigger, and roles that wear every hat
+
+The first three triggers hand the agent its job: `has_open_issues` binds an issue to work,
+`has_in_review_issues` binds one to review, `idle` fires only when there is nothing of either.
+`always` does none of that — it spawns whenever the role is under its cap, bound to no issue, and
+lets the agent decide what the project needs next. `maintainer.json` is the example: it holds
+`manage_issues` + `work_issues` + `review_issues`, so one agent can plan, implement and review.
+
+Two consequences worth understanding before you enable one:
+
+- **It claims for itself.** `pre_claim` is meaningless on an `always` role (there is no issue at
+  spawn time to claim), so the agent must call `claim_issue` before working anything and must
+  honour an `already_claimed` answer by picking something else. That call routes through the
+  daemon's process-wide claim manager, the same mutex the dispatcher's pre-claims take, so two
+  maintainers cannot end up on one issue. The template says so explicitly; keep that in yours.
+  Whatever the agent claims and does not release is released for it when the task ends.
+- **It bypasses `splitForDispatch`.** That is the mechanism keeping a worker and a reviewer off
+  the same issue in one tick, and it only works on issues the dispatcher binds. An `always` role
+  binds nothing, so if you run one *alongside* `has_open_issues`/`has_in_review_issues` roles,
+  the maintainer can claim an issue a worker was dispatched onto in the same tick — the claim
+  arbitrates, but one of the two spawns is then wasted. Simplest configuration is to let the
+  maintainer own the project by itself:
+
+```json
+{
+  "source": {
+    "type": "project-dispatcher",
+    "project_id": 42,
+    "caps": { "maintainer": 3 }
+  },
+  "interval_seconds": 30
+}
+```
+
+With `caps` above 1 you get several maintainers working the project concurrently; the claim
+protocol is what keeps them off each other's issues.
+
+Because the role is unbound, the project **must** have a `default_target` — there is no issue to
+resolve a repository and branch from, and a role whose target cannot be resolved is silently
+never dispatched.
 
 Manual spawning:
 
@@ -220,7 +261,8 @@ Two further differences from `project-dispatcher`:
 - **Only global roles apply** (`<config>/roles/`). The issues can span projects, so no single
   project's `roles/` directory takes precedence.
 - **Caps are scoped to the labelled set** — they bound concurrent work on labelled issues rather
-  than colliding with per-project dispatchers using the same role names.
+  than colliding with per-project dispatchers using the same role names. Unbound (`always`) roles
+  are capped per labelled root instead; see below.
 
 The ancestor carrying the `repository` artifact stands in for the project: it fills the queue
 entry's `project_id` and supplies `{{project_name}}` when the role prompt is rendered.
@@ -247,6 +289,57 @@ to set a flag when children appear or clear it when they finish, and it cannot d
 actual hierarchy. Issues created directly in the taxis UI behave the same as ones created through
 the tools.
 
+### `always` roles here: one per labelled root
+
+Both rules above are about picking an *issue* to bind, which an `always` role has none of. It is
+placed per **labelled root** instead — every still-open issue carrying the trigger label
+*directly*, rather than inheriting it. Each root gets its own set of maintainers:
+
+```json
+{
+  "source": {
+    "type": "label-dispatcher",
+    "label": "agent-ready",
+    "caps": { "maintainer": 2 }
+  },
+  "interval_seconds": 30
+}
+```
+
+Three labelled roots and `"maintainer": 2` means up to six maintainers, two per root, each owning
+its own subtree.
+
+Four things differ from a bound role in this dispatcher:
+
+- **The root is the project**, and it is the *labelled* issue — not the ancestor carrying the
+  `repository` artifact, which is what a bound role's `project_id` points at. The two are often
+  the same issue but need not be, and the labelled one is what scopes a maintainer's planning.
+  It supplies `{{project_name}}`, the `project_id` on the queue entry, and — via its own
+  artifacts — the target the entry is built against, so a root still needs a resolvable
+  `repository` + `github-branch` like everything else.
+- **Caps are counted per root**, over entries with a matching `project_id` and no `issue_id`.
+  Filling one root's cap leaves the others alone.
+- **Workability does not apply.** Nothing is pre-selected for a maintainer, so leaf-ness and
+  dependencies do not gate it; it sees the whole subtree through its tools and decides. It is
+  dispatched while its root is open, *including when the subtree has no open issues at all* —
+  that is the case where you want it planning new work, and no other role in this dispatcher can
+  create issues.
+- **Nothing is pre-claimed.** `pre_claim` is ignored (there is no issue at spawn time), and the
+  agent claims what it works through `claim_issue`, which takes the daemon's claim mutex. That
+  is what keeps two maintainers on one root — or a maintainer and an implementor — off the same
+  issue.
+
+If the label exists but no *open* issue carries it directly, unbound roles have no root to scope
+to and are reported rather than silently skipped:
+
+```
+[dispatcher] label 'agent-ready' has unbound roles configured (maintainer) but no open issue
+  carries the label directly, so there is no root to scope them to; not dispatched
+```
+
+`idle` roles still cannot run in a label dispatcher — they bind nothing *and* have no root to
+stand in for it. Use a `project-dispatcher`, or `always`.
+
 Carrying `t-project` does not exempt an issue from dispatch. Trackers apply that label broadly,
 including to leaves that are perfectly good units of work, so it cannot be used to tell containers
 from work — having children is what does that.
@@ -254,15 +347,31 @@ from work — having children is what does that.
 ### What an agent may modify
 
 `manage_issues` writes are confined to the agent's own project subtree. The root of that subtree
-is the nearest ancestor — the agent's own issue counts — that anchors a project: it carries
+is the nearest ancestor — the agent's own issue counts — that **anchors a project**: it carries
 `t-project`, or it has both a `repository` and a `github-branch` artifact. Those are the same
 markers the dispatcher uses to resolve a target, so "the project this work belongs to" means the
 same thing on both sides.
+
+That one anchor rule decides two separate things, and they agree by construction: which subtree
+an agent may write to, and which issue is reported as an issue's *project* whenever a tool or the
+CLI is handed a bare issue id. A tree assembled purely from artifacts — no `t-project` anywhere,
+which is the normal shape under a label-dispatcher — is a first-class project on both counts.
+
+Nearest wins. A sub-issue carrying its own `repository` + `github-branch` becomes the project for
+everything beneath it, in preference to a `t-project` further up. That is deliberate: those two
+artifacts are what say "work below here targets a different repository", and an agent under them
+should inherit that target rather than the one belonging to the tree above.
 
 `create_issue` may therefore place a new issue under the root or under anything beneath it, and
 `update_issue` may only touch issues in that range. An attempt to reach outside is refused naming
 both the issue and the root. If nothing up the chain qualifies, the agent's own issue becomes the
 root, so it can still create children under itself rather than being locked out.
+
+One exception, for roles dispatched without an issue: their project id is taken as the root
+verbatim rather than re-derived. A label-dispatched maintainer is scoped to the *labelled* issue,
+which typically anchors nothing itself — the repository artifact sits on an ancestor — so
+re-deriving would silently widen its write access to that ancestor's whole subtree, including
+siblings nobody labelled.
 
 Reads are not scoped: `list_issues` and `get_issue` still see the whole tracker, which is useful
 for context and cannot damage anything.

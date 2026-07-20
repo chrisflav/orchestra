@@ -550,9 +550,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Release the orchestra-issue claim on terminal status. A worker that succeeded and attached a
   -- PR leaves the issue awaiting review, so only drop the lock (forceRelease) and leave its
   -- status alone; anything else hands the issue back to the open pool for another worker.
-  match ioTask.projectId, ioTask.issueId with
-  | some _pid, some iid =>
+  let releaseIssue (iid : Taxis.IssueId) : IO Unit := do
     match ← Project.findIssue iid with
+    | none => pure ()
     | some (project, issue) =>
       let now ← TaskStore.currentIso8601
       let succeeded := finalStatus matches .completed
@@ -560,8 +560,17 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
         let _ ← Project.forceRelease globalClaimManager iid
       else
         let _ ← Project.release globalClaimManager project.id iid .open now
-    | none => pure ()
-  | _, _ => pure ()
+  match ioTask.projectId, ioTask.issueId with
+  | some _pid, some iid => releaseIssue iid
+  | some pid, none =>
+    -- An unbound role (`always` trigger) was handed no issue to release, but it may have claimed
+    -- any number of them itself via `claim_issue`. Those claims carry this task's id, and the
+    -- branch above — the only thing that normally releases a claim at task end — never fires for
+    -- them, so without this sweep they would stay `.claimed` for good. One `GET /issues/:id` per
+    -- issue in the project (`loadClaims`), paid once at teardown of an unbound task only.
+    for (iid, claim) in ← Project.loadClaims pid do
+      if claim.taskId == taskId then releaseIssue iid
+  | none, _ => pure ()
   if let some seriesName := series then
     TaskStore.updateSeriesPointer seriesName taskId
   IO.println s!"=== Task {idx} done ===\n"
