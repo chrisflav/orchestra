@@ -202,6 +202,29 @@ fallback list.
 Container names still resolve either way: the embedded resolver answers those itself and only
 forwards external queries.
 
+## Stopping
+
+```sh
+docker compose stop
+```
+
+This sends SIGTERM to the daemon, which stops claiming new work, lets the tasks already running
+finish, and then exits — the same drain as `orchestra queue shutdown`. It returns as soon as the
+last in-flight task lands, so the wait is only as long as the work outstanding.
+
+Send it again while the drain is in progress (`docker compose stop` a second time, or Ctrl-C twice
+if you started it in the foreground) to cancel the running tasks instead, equivalent to
+`orchestra queue shutdown --force`.
+
+Docker's default 10s grace period is far too short for this — it would SIGKILL the daemon
+mid-task and leave the entry stuck in `running`. `docker-compose.yaml` therefore sets
+`stop_grace_period` to 30 minutes; override it with `ORCHESTRA_STOP_GRACE_PERIOD` if your tasks
+routinely run longer.
+
+`orchestra queue shutdown` itself is not the way to stop the container. It drains correctly, but
+the daemon is PID 1, so its exit stops the container and `restart: unless-stopped` immediately
+starts a new one. `docker compose stop` marks the container as deliberately stopped and does not.
+
 ## Running other subcommands
 
 The image's `CMD` is `queue start`; override it for one-off commands against the same volumes:
