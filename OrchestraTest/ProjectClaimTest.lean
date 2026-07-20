@@ -78,6 +78,55 @@ def releaseAllowsReclaim : Test := do
   | (_, other)          => TestM.fail s!"reclaim outcome was not acquired: {repr other}"
 
 @[test]
+def forceReleaseClearsClaimedLabel : Test := do
+  unless ← ensureTestTaxisConfigured do
+    TestM.skip "ORCHESTRA_TEST_TAXIS_URL/TOKEN not set"; return
+  -- The regression this guards: `forceRelease` deleted the session artifact but left the
+  -- `o-claimed` label, and that label *is* `.claimed` (`statusOf`) — so a worker that finished
+  -- and left a PR for review dropped its lock while the issue went on reading as claimed
+  -- forever, invisible to the reviewer sweep and to the dispatcher, both of which gate on
+  -- `.open`.
+  let (project, issue) ← setupProjectWithIssue
+  let outcome ← (do
+    let mgr ← ClaimManager.new
+    let now ← TaskStore.currentIso8601
+    let _ ← tryClaim mgr project.id issue.id "task-1" "claude" now
+    let hadClaim ← forceRelease mgr issue.id
+    let claim ← loadClaim issue.id
+    let reloaded ← loadIssue project.id issue.id
+    -- Reclaiming has to work too: `tryClaim` refuses anything that is not `.open`, so a
+    -- lingering label would also make the issue permanently unclaimable.
+    let reclaim ← tryClaim mgr project.id issue.id "task-2" "vibe" now
+    return (hadClaim, claim, reloaded.map (·.status), reclaim))
+  cleanup project issue
+  let (hadClaim, claim, status, reclaim) := outcome
+  TestM.assert hadClaim "forceRelease should report that it deleted a claim"
+  TestM.assertEqual (claim.map (·.taskId)) none (msg := "the session artifact is gone")
+  TestM.assertEqual status (some IssueStatus.open)
+    (msg := "and the issue reads as open, not stuck in claimed")
+  match reclaim with
+  | .acquired c => TestM.assertEqual c.taskId "task-2" (msg := "the issue is claimable again")
+  | other       => TestM.fail s!"reclaim after forceRelease failed: {repr other}"
+
+@[test]
+def forceReleaseKeepsTerminalState : Test := do
+  unless ← ensureTestTaxisConfigured do
+    TestM.skip "ORCHESTRA_TEST_TAXIS_URL/TOKEN not set"; return
+  -- Clearing the label must not become "reopen the issue": `forceRelease` leaves the taxis
+  -- `state` alone, which is what lets orphan cleanup run over completed issues safely.
+  let (project, issue) ← setupProjectWithIssue
+  let status ← (do
+    let mgr ← ClaimManager.new
+    let now ← TaskStore.currentIso8601
+    let _ ← tryClaim mgr project.id issue.id "task-1" "claude" now
+    let _ ← release mgr project.id issue.id .completed now
+    let _ ← forceRelease mgr issue.id
+    return (← loadIssue project.id issue.id).map (·.status))
+  cleanup project issue
+  TestM.assertEqual status (some IssueStatus.completed)
+    (msg := "a completed issue stays completed")
+
+@[test]
 def cannotClaimNonOpenIssue : Test := do
   unless ← ensureTestTaxisConfigured do
     TestM.skip "ORCHESTRA_TEST_TAXIS_URL/TOKEN not set"; return
