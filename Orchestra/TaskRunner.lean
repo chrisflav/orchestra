@@ -85,7 +85,10 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
 private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
     (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord) : IO Unit := do
   IO.println "  [merger] merge backend"
-  let some pid := ioTask.projectId
+  -- Bound only to be validated: the merger reaches the issue through `findIssue` below, but a
+  -- task arriving here without a project is malformed and should say so rather than fail later
+  -- on something less obvious.
+  let some _pid := ioTask.projectId
     | throw (.userError "merger task missing project_id")
   let some iid := ioTask.issueId
     | throw (.userError "merger task missing issue_id")
@@ -140,7 +143,6 @@ private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
   let mergeOut ← mergeChild.stdout.readToEnd
   let mergeErr ← mergeChild.stderr.readToEnd
   let mergeExit ← mergeChild.wait
-  let now ← TaskStore.currentIso8601
   if mergeExit != 0 then
     IO.eprintln s!"  [merger] gh pr merge failed (exit {mergeExit}):\n{mergeErr}"
     -- Leave the issue in .inReview so the reviewer can rerun the merger or re-decide.
