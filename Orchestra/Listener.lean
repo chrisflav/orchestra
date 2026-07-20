@@ -636,24 +636,89 @@ def dispatcherTick (input : DispatcherInput) : Array RoleSpawn :=
     | .spawn issueId => some { roleName := d.roleName, issueId }
     | _ => none
 
-/-- Of `issues` (whose `attachedPRs` must already be populated), those still awaiting review:
-    open, and carrying at least one pull request that is not merged.
+/-! ## Review routing
 
-    The merge check is a GitHub call per pull request per tick, which is why it lives here rather
-    than in the pure selection. `isPrMerged` answers `false` when it cannot tell, so an
-    unreachable GitHub queues a reviewer that finds nothing to do rather than silently dropping
-    review of real work. -/
-def awaitingReview (ghToken : String) (issues : Array Project.Issue) :
-    IO (Array Project.Issue) := do
-  let mut out : Array Project.Issue := #[]
+An open issue carrying a pull request belongs to exactly one role, and which one is derived
+rather than stored. Before the taxis migration an `.inReview` status kept the reviewer's set and
+the implementor's set apart by construction; the migration made "awaiting review" derived
+(`classifyReview` below) but left `Project.workableIssues` filtering on bare `.open`, so the two
+sets silently started to overlap. Whichever role a dispatcher happens to evaluate first — which
+is alphabetical, since `caps` is parsed from a sorted `Json.obj` — then takes the issue and the
+other never sees it. `splitForDispatch` is what re-establishes the split. -/
+
+/-- What has to happen next on an open issue that carries pull requests, and therefore which
+    role should pick it up. -/
+inductive ReviewDisposition where
+  /-- An unmerged pull request with no outstanding change request: a reviewer decides. -/
+  | awaitingReview
+  /-- The latest review verdict asked for changes, so the ball is back with an implementor.
+      Deliberately *not* reviewable: sending it to a reviewer again would loop it between
+      reviewers forever while the requested changes were never made. -/
+  | changesRequested
+  /-- Every attached pull request has landed. Merging is not completing — that is a separate
+      `decide_issue complete` call — so this is still a reviewer's move, not an implementor's.
+      Leaving it out of both sets is what let a merged issue fall back to an implementor and be
+      worked a second time. -/
+  | merged
+deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- The disposition implied by the two facts that cost a network call to establish. Pure, so the
+    routing table is testable without GitHub or taxis. -/
+def dispositionOf (anyUnmerged requestsChanges : Bool) : ReviewDisposition :=
+  if !anyUnmerged then .merged
+  else if requestsChanges then .changesRequested
+  else .awaitingReview
+
+/-- Whether the most recent review verdict on `iid` asked for changes.
+
+    taxis returns comments ordered by id, so the last one carrying a verdict is the current one;
+    a plain comment posted afterwards does not clear a rejection, only a later verdict does.
+    Answers `false` when the thread cannot be read, which routes the issue to a reviewer — the
+    same direction `isPrMerged` fails in, and the one that cannot silently drop work. -/
+def latestReviewRequestsChanges (iid : Taxis.IssueId) : IO Bool := do
+  try
+    let comments ← Project.loadComments iid
+    return (comments.filterMap (·.review)).back? == some .requestChanges
+  catch _ => return false
+
+/-- Classify those of `issues` (whose `attachedPRs` must already be populated) that carry a pull
+    request. Issues without one are absent from the result: nothing about review applies to them,
+    and they are an implementor's on the structural test alone.
+
+    Costs a GitHub call per pull request and a taxis call per issue per tick, which is why this
+    lives here rather than in the pure selection. `isPrMerged` answers `false` when it cannot
+    tell, so an unreachable GitHub queues a reviewer that finds nothing to do rather than
+    silently dropping review of real work. -/
+def classifyReview (ghToken : String) (issues : Array Project.Issue) :
+    IO (Array (Project.Issue × ReviewDisposition)) := do
+  let mut out : Array (Project.Issue × ReviewDisposition) := #[]
   for i in issues do
     if i.status != .open || i.attachedPRs.isEmpty then continue
     let mut anyUnmerged := false
     for pr in i.attachedPRs do
       unless anyUnmerged do
         unless ← GitHub.isPrMerged ghToken pr.repo pr.number do anyUnmerged := true
-    if anyUnmerged then out := out.push i
+    let requestsChanges ← if anyUnmerged then latestReviewRequestsChanges i.id else pure false
+    out := out.push (i, dispositionOf anyUnmerged requestsChanges)
   return out
+
+/-- Split the dispatcher's two candidate sets so that no issue is offered to both roles.
+
+    `structuralWorkable` is what `Project.workableIssues` (or the label dispatcher's `work` set)
+    produced knowing only the issue tree — open, no open children, nothing blocking. `classified`
+    adds what only a network call can say. An issue a reviewer owns is removed from the
+    implementor's set; one sent back for changes stays there, which is the whole point of
+    distinguishing it. -/
+def splitForDispatch (structuralWorkable : Array Project.Issue)
+    (classified : Array (Project.Issue × ReviewDisposition)) :
+    Array Project.Issue × Array Project.Issue :=
+  let reviewable := classified.filterMap fun (i, d) =>
+    match d with
+    | .awaitingReview | .merged => some i
+    | .changesRequested         => none
+  let reviewableIds := reviewable.map (·.id.val)
+  let workable := structuralWorkable.filter (fun i => !reviewableIds.contains i.id.val)
+  (workable, reviewable)
 
 /-- Re-fetch `issues` with their attached pull requests. `Project.loadIssues` leaves `attachedPRs`
     empty for speed, so the review path has to ask for detail; only open issues are worth it. -/
@@ -952,12 +1017,15 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       if e.projectId != some pid then continue
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
-    let reviewable ← awaitingReview ghToken (← withAttachedPRs pid issues)
+    let classified ← classifyReview ghToken (← withAttachedPRs pid issues)
     -- Narrowed here, where every issue in the project is in hand: whether a child or dependency
-    -- has closed cannot be told from the workable set itself.
-    let workable := Project.workableIssues issues
+    -- has closed cannot be told from the workable set itself. The review split then takes the
+    -- reviewer's issues back out of it, so no issue is offered to two roles in one tick.
+    let (workable, reviewable) := splitForDispatch (Project.workableIssues issues) classified
+    let reworking := classified.filter (·.2 == .changesRequested) |>.size
     IO.println s!"[dispatcher] project {pid.toString}: {issues.size} issues, \
-      {workable.size} workable, {reviewable.size} awaiting review; roles available: \
+      {workable.size} workable (of which {reworking} sent back for changes), \
+      {reviewable.size} awaiting review; roles available: \
       {String.intercalate ", " (roles.map (·.name)).toList}"
     let input : DispatcherInput :=
       { activeByRole := active, issues := workable, reviewable, caps, roles }
@@ -992,13 +1060,18 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
         IO.eprintln s!"[dispatcher] issue {iid.toString} is in scope for '{label}' and \
           resolves to {repo} but has no github-branch artifact on it or any ancestor; skipping"
     let issues := sets.work.map (·.1)
-    -- An attached PR that is already merged needs no review. Checked here rather than in the
-    -- selection because it is a GitHub call per PR; `isPrMerged` answers false when it cannot
-    -- tell, which queues a reviewer that finds nothing rather than dropping review of real work.
-    let reviewable ← awaitingReview ghToken (sets.reviewable.map (·.1))
+    -- What happens next to an issue carrying a PR needs a GitHub call per PR and a taxis call
+    -- per issue, so it is settled here rather than in the selection. `issuesWithLabel` builds
+    -- `work` and `reviewable` from two independent tests, so an issue that is both a dispatch
+    -- candidate and carries a PR appears in both; the split below is what keeps one role from
+    -- taking it out from under the other.
+    let classified ← classifyReview ghToken (sets.reviewable.map (·.1))
+    let (issues, reviewable) := splitForDispatch issues classified
+    let reworking := classified.filter (·.2 == .changesRequested) |>.size
     let roles ← Project.loadGlobalRoles
-    IO.println s!"[dispatcher] label '{label}': {issues.size} workable, \
-      {sets.reviewable.size} with a PR attached of which {reviewable.size} still unmerged, \
+    IO.println s!"[dispatcher] label '{label}': {issues.size} workable \
+      (of which {reworking} sent back for changes), {sets.reviewable.size} with a PR attached \
+      of which {reviewable.size} await a reviewer, \
       {gaps.size} skipped for want of a target; roles available: \
       {String.intercalate ", " (roles.map (·.name)).toList}"
     -- Cap counting is scoped to the labelled set, so the caps bound concurrent work *on labelled

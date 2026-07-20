@@ -333,4 +333,56 @@ def reviewerComesFromReviewableNotIssues : Test := do
     , caps := [("reviewer", 1)], roles := #[reviewer] }
   TestM.assert withoutIt.isEmpty "no reviewable set means no reviewer, never a worker issue"
 
+/-! ## Review routing
+
+`dispositionOf` and `splitForDispatch` are the pure halves of the reviewer/implementor split;
+the impure half is the two network calls that establish their inputs. -/
+
+@[test]
+def dispositionRoutesEachCaseToOneRole : Test := do
+  TestM.assertEqual (Listener.dispositionOf (anyUnmerged := true) (requestsChanges := false))
+    Listener.ReviewDisposition.awaitingReview
+    (msg := "an unreviewed pull request is a reviewer's")
+  TestM.assertEqual (Listener.dispositionOf (anyUnmerged := true) (requestsChanges := true))
+    Listener.ReviewDisposition.changesRequested
+    (msg := "a rejection sends it back to an implementor, not round to another reviewer")
+  TestM.assertEqual (Listener.dispositionOf (anyUnmerged := false) (requestsChanges := false))
+    Listener.ReviewDisposition.merged
+    (msg := "a landed PR still needs the decide_issue complete call")
+  -- A stale rejection on an issue whose PR has since merged must not resurrect it as work.
+  TestM.assertEqual (Listener.dispositionOf (anyUnmerged := false) (requestsChanges := true))
+    Listener.ReviewDisposition.merged
+    (msg := "merge wins over an older change request")
+
+@[test]
+def splitForDispatchKeepsTheSetsDisjoint : Test := do
+  -- The regression: an issue awaiting review is `.open`, so it satisfies the structural
+  -- workable test too and was offered to both roles. The implementor is evaluated first
+  -- (caps sort alphabetically), took it, and the reviewer was never dispatched.
+  let p := fixtureProject
+  let awaiting := fixtureIssue 101 p .open
+  let rework   := fixtureIssue 102 p .open
+  let landed   := fixtureIssue 103 p .open
+  let plain    := fixtureIssue 104 p .open
+  let (workable, reviewable) := Listener.splitForDispatch
+    #[awaiting, rework, landed, plain]
+    #[ (awaiting, .awaitingReview), (rework, .changesRequested), (landed, .merged) ]
+  TestM.assertEqual (workable.map (·.id.toString)).toList ["102", "104"]
+    (msg := "an implementor gets the rejected issue and the one with no PR")
+  TestM.assertEqual (reviewable.map (·.id.toString)).toList ["101", "103"]
+    (msg := "a reviewer gets the unreviewed and the landed one")
+  let overlap := workable.filter (fun w => (reviewable.map (·.id.val)).contains w.id.val)
+  TestM.assert overlap.isEmpty "the two sets must never share an issue"
+
+@[test]
+def splitForDispatchLeavesStructuralExclusionsAlone : Test := do
+  -- A container with a PR of its own is reviewable even though it is not workable — the
+  -- reviewable set is not a subset of the workable one, so the split must not assume it is.
+  let p := fixtureProject
+  let container := fixtureIssue 201 p .open
+  let (workable, reviewable) := Listener.splitForDispatch #[] #[(container, .awaitingReview)]
+  TestM.assert workable.isEmpty "nothing structurally workable stays that way"
+  TestM.assertEqual (reviewable.map (·.id.toString)).toList ["201"]
+    (msg := "and the container is still reviewed")
+
 end OrchestraTest.ProjectRole

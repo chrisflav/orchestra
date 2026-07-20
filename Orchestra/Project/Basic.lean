@@ -416,7 +416,7 @@ def saveIssue (i : Issue) : IO Unit := do
     Exists because `IssueStatus` is not a stored field: `.claimed` *is* this label (see
     `statusOf`). Dropping a claim by deleting its `session` artifact alone therefore leaves the
     issue reading as claimed forever, which hides it from every consumer that gates on `.open`
-    — the reviewer sweep (`Listener.awaitingReview`), the dispatcher (`workableIssues`) and
+    — the reviewer sweep (`Listener.classifyReview`), the dispatcher (`workableIssues`) and
     `list_issues_in_review`. `Project.forceRelease` calls this; `release` does not need it,
     since it writes a status through `saveIssue`.
 
