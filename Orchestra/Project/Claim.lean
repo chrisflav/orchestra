@@ -185,21 +185,37 @@ def updateClaimTaskId (mgr : ClaimManager) (iid : Taxis.IssueId)
   finally
     mgr.mutex.unlock
 
-/-- Force-release without changing the issue status. Useful for daemon
-    shutdown / orphan cleanup where we don't want to overwrite the current
-    issue state. -/
+/-- Force-release without choosing a new status: the issue keeps its taxis `state`, so a
+    completed or abandoned issue stays that way. Useful where the caller has no business
+    deciding what happens next — daemon shutdown, orphan cleanup, a worker that finished and
+    left a pull request behind for review.
+
+    "Without changing the status" still has to clear the `o-claimed` label, because that label
+    *is* `.claimed` (`statusOf`) — an issue whose claim artifact is gone but whose label
+    remains reads as claimed forever and is skipped by everything that gates on `.open`,
+    including the reviewer sweep. The label is cleared even when no artifact was found, since
+    that combination is exactly the state older releases left behind.
+
+    Returns whether a claim artifact was actually deleted. -/
 def forceRelease (mgr : ClaimManager) (iid : Taxis.IssueId) : IO Bool := do
   mgr.mutex.lock
   try
     let cfg ← Orchestra.Taxis.getConfig
-    match ← Orchestra.Taxis.getIssueDetail cfg iid with
-    | .error _ => return false
-    | .ok detail =>
-      match sessionArtifact? detail.attachedArtifacts with
-      | none => return false
-      | some (art, _) =>
-        let _ ← Orchestra.Taxis.deleteArtifact cfg art.id
-        return true
+    let hadClaim ← match ← Orchestra.Taxis.getIssueDetail cfg iid with
+      | .error _ => pure false
+      | .ok detail =>
+        match sessionArtifact? detail.attachedArtifacts with
+        | none => pure false
+        | some (art, _) => do
+          let _ ← Orchestra.Taxis.deleteArtifact cfg art.id
+          pure true
+    -- Best-effort: the claim is already gone by this point, and throwing here would turn a
+    -- released lock into a failed task on paths that only call this to clean up.
+    try clearClaimedLabel iid
+    catch e =>
+      IO.eprintln s!"  Warning: released the claim on {iid.toString} but could not clear its \
+o-claimed label: {e}"
+    return hadClaim
   finally
     mgr.mutex.unlock
 
