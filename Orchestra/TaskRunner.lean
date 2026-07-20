@@ -33,8 +33,8 @@ def enqueueMergerImpl (pid : Taxis.IssueId) (iid : Taxis.IssueId)
     let createdAt ← TaskStore.currentIso8601
     let entry : Queue.QueueEntry :=
       { id, createdAt
-      , upstream := pr.repo, fork := pr.repo
-      , mode := .pr
+      , upstream := some pr.repo, fork := some pr.repo
+      , mode := some .pr
       , prompt := s!"merge {pr.repo}#{pr.number}"
       , backend := some "merger"
       , projectId := some pid
@@ -62,8 +62,8 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
     let createdAt ← TaskStore.currentIso8601
     let entry : Queue.QueueEntry :=
       { id, createdAt
-      , upstream := pr.repo, fork := pr.repo
-      , mode := .pr
+      , upstream := some pr.repo, fork := some pr.repo
+      , mode := some .pr
       , prompt := renderReviewerPrompt tmpl.promptTemplate pr iid
       , backend := tmpl.backend
       , projectId := some project.id
@@ -164,15 +164,17 @@ private def runTriage {i o : ResultType} (pat : String) (ioTask : IOTask i o)
   IO.println "  [triage] label backend"
   let some issueNumber := ioTask.issueNumber
     | throw (.userError "triage task missing issue_number")
+  let some upstream := ioTask.upstream
+    | throw (.userError "triage task has no upstream repository to label")
   let addLabels    := ioTask.triageAddLabels
   let removeLabels := ioTask.triageRemoveLabels
   if !addLabels.isEmpty then
-    IO.println s!"  [triage] adding labels {addLabels} to {ioTask.upstream}#{issueNumber}"
-    GitHub.addIssueLabels pat ioTask.upstream issueNumber addLabels
+    IO.println s!"  [triage] adding labels {addLabels} to {upstream}#{issueNumber}"
+    GitHub.addIssueLabels pat upstream issueNumber addLabels
   for label in removeLabels do
-    IO.println s!"  [triage] removing label '{label}' from {ioTask.upstream}#{issueNumber}"
+    IO.println s!"  [triage] removing label '{label}' from {upstream}#{issueNumber}"
     try
-      GitHub.removeIssueLabel pat ioTask.upstream issueNumber label
+      GitHub.removeIssueLabel pat upstream issueNumber label
     catch e =>
       IO.eprintln s!"  [triage] failed to remove label '{label}': {e}"
   TaskStore.saveTask { initialRecord with status := .completed }
@@ -209,17 +211,24 @@ private def sanitizeProjectName (upstream : Repository) : String :=
   s!"{upstream.owner}-{upstream.name}"
 
 /-- Return the active memory directories for the given mode and upstream repo.
-    Creates the directories if they do not yet exist. -/
-private def resolveMemoryDirs (mode : MemoryMode) (upstream : Repository) : IO (Array String) := do
+    Creates the directories if they do not yet exist.
+
+    A repository-independent task has no project directory to key on, so it falls back to
+    global memory alone. That is the right shape for a tracker-wide role: it should share
+    what every task knows without owning a per-repository store of its own. -/
+private def resolveMemoryDirs (mode : MemoryMode) (upstream : Option Repository) :
+    IO (Array String) := do
   let memBase    := (← Dirs.dataBase) / "memory"
   let globalDir  := memBase
-  let projectDir := memBase / sanitizeProjectName upstream
+  let projectDir? := upstream.map (memBase / sanitizeProjectName ·)
   let dirs : Array System.FilePath :=
-    match mode with
-    | .none    => #[]
-    | .global  => #[globalDir]
-    | .project => #[projectDir]
-    | .both    => #[globalDir, projectDir]
+    match mode, projectDir? with
+    | .none,    _         => #[]
+    | .global,  _         => #[globalDir]
+    | .project, some p    => #[p]
+    | .project, none      => #[]
+    | .both,    some p    => #[globalDir, p]
+    | .both,    none      => #[globalDir]
   for dir in dirs do
     IO.FS.createDirAll dir
   return dirs.map (·.toString)
@@ -255,13 +264,16 @@ fine; do it by adding a file that supersedes it rather than editing that file in
     - `pr`   → `["create_pr"]`
     - `fork` → `[]`
     Returns the resolved tool list and a flag indicating whether the legacy `mode` fallback was used. -/
-private def resolveTools (mode : TaskMode) (tools : Option (List String)) :
+private def resolveTools (mode : Option TaskMode) (tools : Option (List String)) :
     List String × Bool :=
   match tools with
   | some ts => (ts, false)
   | none    => match mode with
-    | .pr   => (["create_pr"], true)
-    | .fork => ([], true)
+    | some .pr   => (["create_pr"], true)
+    | some .fork => ([], true)
+    -- Neither field set is the repository-independent shape, not a legacy config: there are
+    -- no repository tools to grant, so it must not trip the deprecation warning.
+    | none       => ([], false)
 
 /-- Resolve the authentication environment variables for a given backend and optional auth source label.
     If the task specifies an auth source label (or a default is configured), looks it up in the
@@ -318,7 +330,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- The slot is prepared here rather than by the caller because preparing it (cloning,
     -- fetching upstream) needs the installation token, which is only minted below.
     (slotOverride : Option Repo.SlotAssignment := none) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
-  IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
+  let forkLabel := (ioTask.fork.map (·.toString)).getD "(no repository)"
+  IO.println s!"=== Task {idx}: {forkLabel} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
   -- one ID at enqueue time and the task gets a second ID here at run time,
@@ -339,6 +352,13 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     role      := ioTask.role
   }
   TaskStore.saveTask initialRecord
+  -- Half a repository is a configuration mistake, not a repository-independent task. Failing
+  -- here is the difference between a loud error and a task that quietly runs with no clone
+  -- and no credentials because one key was misspelled.
+  match ioTask.upstream, ioTask.fork with
+  | some _, none | none, some _ =>
+    throw (.userError "task sets only one of upstream/fork; set both or neither")
+  | _, _ => pure ()
   -- If this task was pre-claimed (daemon wrote the claim with the queue-entry
   -- ID before we ran), retag the claim with the real generated taskId so that
   -- ownership checks in attach_pr / split_issue pass.
@@ -386,42 +406,61 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   IO.println "  Prompt:"
   for line in ioTask.prompt.splitOn "\n" do
     IO.println s!"    {line}"
-  -- 1. Create GitHub App token
-  IO.println "  Creating GitHub App token..."
-  let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let forkOwner := ioTask.fork.owner
-  let installationId ← match appConfig.installationId with
-    | some id => pure id
-    | none => GitHub.getInstallationId jwt forkOwner
-  let token ← GitHub.createInstallationToken jwt installationId
-  -- Deliberately no `GitHub.setupGhAuth` here. That writes the token to
-  -- `~/.config/gh/hosts.yml`, which every concurrently running task shares, so under
-  -- `--parallel > 1` the last task to authenticate supplies the credentials for all of them.
-  -- The token is threaded explicitly instead: into `git`/`gh` through `Repo`, and into the
-  -- sandbox through `Sandbox.launchAgent`'s `GH_TOKEN`.
-  IO.println "  Token ready"
+  -- 1. Create GitHub App token — only when there is a repository to authenticate against.
+  -- A repository-independent task gets no token at all, and therefore no `GH_TOKEN` in its
+  -- sandbox and no credential helper: it cannot reach GitHub even if it tries.
+  let tokenInfo : Option (String × Nat) ← match ioTask.fork with
+    | none => pure none
+    | some fork => do
+      IO.println "  Creating GitHub App token..."
+      let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
+      let installationId ← match appConfig.installationId with
+        | some id => pure id
+        | none => GitHub.getInstallationId jwt fork.owner
+      let t ← GitHub.createInstallationToken jwt installationId
+      -- Deliberately no `GitHub.setupGhAuth` here. That writes the token to
+      -- `~/.config/gh/hosts.yml`, which every concurrently running task shares, so under
+      -- `--parallel > 1` the last task to authenticate supplies the credentials for all of them.
+      -- The token is threaded explicitly instead: into `git`/`gh` through `Repo`, and into the
+      -- sandbox through `Sandbox.launchAgent`'s `GH_TOKEN`.
+      IO.println "  Token ready"
+      pure (some (t, installationId))
+  let token          : Option String := tokenInfo.map (·.1)
+  let installationId : Option Nat    := tokenInfo.map (·.2)
   -- Triage: add/remove labels on an issue or PR. Purely a GitHub API call, so it runs before
   -- any repository work — it needs no checkout, and provisioning a clone slot for it would
   -- mean a full `git clone` plus fetch to change a label.
   if ioTask.backend == some "triage" then
     runTriage appConfig.pat ioTask initialRecord
     return ((taskId, false), none, none)
-  -- 2. Prepare the task slot, or clone / update the shared repo when running outside the queue
-  let repoPath ← match slotOverride with
-    | some assign =>
-      IO.println s!"Preparing slot {assign.slot} for {ioTask.fork}..."
-      let p ← Repo.ensureSlot ioTask.fork ioTask.upstream assign (token := some token)
-      IO.println s!"  Slot at {p}"
-      pure p
-    | none   =>
-      IO.println s!"Cloning/updating {ioTask.fork}..."
-      let p ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive (token := some token)
-      IO.println s!"  Repo at {p}"
+  -- 2. Prepare the task slot, or clone / update the shared repo when running outside the queue.
+  -- With no repository there is nothing to clone, so the agent gets a private scratch
+  -- directory to work in instead. It must be a real directory rather than somewhere under
+  -- `/tmp`, which the sandbox grants `--rw` without execute: a script the agent writes there
+  -- could not be run.
+  let workPath ← match ioTask.fork, ioTask.upstream with
+    | some fork, some upstream => match slotOverride with
+      | some assign =>
+        IO.println s!"Preparing slot {assign.slot} for {fork}..."
+        let p ← Repo.ensureSlot fork upstream assign (token := token)
+        IO.println s!"  Slot at {p}"
+        pure p
+      | none   =>
+        IO.println s!"Cloning/updating {fork}..."
+        let p ← Repo.ensureCloned fork upstream interactive (token := token)
+        IO.println s!"  Repo at {p}"
+        pure p
+    | _, _ =>
+      let p := (← Dirs.scratchDir) / taskId
+      IO.FS.createDirAll p
+      IO.println s!"  No repository; scratch workspace at {p}"
       pure p
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
   -- clone setup with all other backends but skips the MCP server and agent.
   if ioTask.backend == some "merger" then
-    runMerger token ioTask repoPath initialRecord
+    let some token := token
+      | throw (.userError "merger task has no repository, so there is nothing to merge")
+    runMerger token ioTask workPath initialRecord
     return ((taskId, false), none, none)
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
@@ -457,8 +496,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"
   -- 4. Run init hook and load per-repository config
-  RepoConfig.runInitIfNeeded repoPath
-  let repoConfig ← RepoConfig.loadRepoConfig repoPath
+  RepoConfig.runInitIfNeeded workPath
+  let repoConfig ← RepoConfig.loadRepoConfig workPath
   -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
   let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
   -- 5a. Resolve memory directories and amend system prompt
@@ -482,7 +521,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
-    RepoConfig.runHook repoPath "before.sh"
+    RepoConfig.runHook workPath "before.sh"
     let prompt :=
       if attempt == 0 then baseTaskPrompt
       else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
@@ -500,8 +539,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       else pure none
     let taskLogFile : Option System.FilePath ← do
       let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-      pure (some ((← Dirs.dataBase) / "logs" / ioTask.fork.toString / s!"{taskId}{suffix}.log"))
-    let result ← Sandbox.launchAgent agentDef repoPath prompt port token
+      -- `_norepo` cannot collide with a real owner: GitHub logins are alphanumerics and
+      -- hyphens, so none of them start with an underscore.
+      let logRepoDir := (ioTask.fork.map (·.toString)).getD "_norepo"
+      pure (some ((← Dirs.dataBase) / "logs" / logRepoDir / s!"{taskId}{suffix}.log"))
+    let result ← Sandbox.launchAgent agentDef workPath prompt port token
       (debug := debug) (pluginDirs := ← defaultPluginDirs appConfig) (memoryDirs := memoryDirs)
       (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
       (resume := resume) (budget := ioTask.budget.getD 4.0) (cancelToken := cancelToken)
@@ -522,11 +564,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       IO.println "  Agent hit usage limit."
       usageLimitHit := true
       break
-    if !(← RepoConfig.hasValidationScript repoPath) then
+    if !(← RepoConfig.hasValidationScript workPath) then
       IO.println "  No validation script found, skipping validation."
       break
     IO.println "  Running validation script..."
-    let (valid, validationOutput) ← RepoConfig.runValidation repoPath
+    let (valid, validationOutput) ← RepoConfig.runValidation workPath
     lastValidationOutput := validationOutput
     if !validationOutput.isEmpty then
       IO.println s!"  Validation output:\n{validationOutput}"
@@ -538,7 +580,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     else
       IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
   -- 6. Run after hook and shut down MCP server
-  RepoConfig.runHook repoPath "after.sh"
+  RepoConfig.runHook workPath "after.sh"
   shutdown
   -- 7. Persist final task state
   let finalStatus :=

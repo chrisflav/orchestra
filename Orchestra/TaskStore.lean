@@ -38,9 +38,12 @@ instance : FromJson TaskStatus where
 structure TaskRecord where
   id            : String
   createdAt     : String
-  upstream      : Repository
-  fork          : Repository
-  mode          : TaskMode
+  /-- The repository the task ran against; `none` for a repository-independent task. -/
+  upstream      : Option Repository := none
+  /-- See `upstream`. Must be set together with it. -/
+  fork          : Option Repository := none
+  /-- Legacy tool-derivation field (deprecated); `none` when there is no repository. -/
+  mode          : Option TaskMode := none
   prompt        : String
   sessionId     : Option String := none
   status        : TaskStatus    := .running
@@ -73,13 +76,13 @@ instance : ToJson TaskRecord where
     let base : List (String × Json) := [
       ("id",         r.id),
       ("created_at", r.createdAt),
-      ("upstream",   ToJson.toJson r.upstream),
-      ("fork",       ToJson.toJson r.fork),
-      ("mode",       ToJson.toJson r.mode),
       ("prompt",     r.prompt),
       ("status",     ToJson.toJson r.status)
     ]
     let fields := base
+    let fields := if let some x := r.upstream      then fields ++ [("upstream",       ToJson.toJson x)] else fields
+    let fields := if let some x := r.fork          then fields ++ [("fork",           ToJson.toJson x)] else fields
+    let fields := if let some m := r.mode          then fields ++ [("mode",           ToJson.toJson m)] else fields
     let fields := if let some s := r.sessionId     then fields ++ [("session_id",    Json.str s)]      else fields
     let fields := if let some s := r.continuesFrom then fields ++ [("continues_from", Json.str s)]     else fields
     let fields := if let some s := r.series        then fields ++ [("series",         Json.str s)]     else fields
@@ -99,9 +102,9 @@ instance : FromJson TaskRecord where
   fromJson? j := do
     let id           ← j.getObjValAs? String "id"
     let createdAt    ← j.getObjValAs? String "created_at"
-    let upstream     ← j.getObjValAs? Repository "upstream"
-    let fork         ← j.getObjValAs? Repository "fork"
-    let mode         ← j.getObjValAs? TaskMode "mode"
+    let upstream     ← getOptObjValAs? Repository j "upstream"
+    let fork         ← getOptObjValAs? Repository j "fork"
+    let mode         ← getOptObjValAs? TaskMode j "mode"
     let prompt       ← j.getObjValAs? String "prompt"
     let status       ← j.getObjValAs? TaskStatus "status"
     let sessionId     := j.getObjValAs? String "session_id"     |>.toOption

@@ -91,9 +91,13 @@ The agent will not see what was cut — check whether a prompt template is expan
 unbounded."
   return truncatePrompt s
 
-def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : String)
+def launchAgent (agentDef : AgentDef) (workPath : System.FilePath) (prompt : String)
     (serverPort : UInt16)
-    (ghToken : String)
+    -- GitHub credentials for the sandboxed agent. `none` for a repository-independent task:
+    -- the `--env GH_TOKEN` flag is then omitted entirely rather than passed empty, so "no
+    -- credentials" is visible on the command line instead of depending on how `git` and `gh`
+    -- happen to treat an empty value.
+    (ghToken : Option String)
     (debug : Bool := false)
     (extraEnv : Array (String × Option String) := #[])
     (pluginDirs : Array String := #[])
@@ -120,9 +124,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let mut args : Array String := #[]
   -- Repo access: read-only or read-write depending on the task's readOnly flag
   if readOnly then
-    args := args.push "--rox" |>.push repoPath.toString
+    args := args.push "--rox" |>.push workPath.toString
   else
-    args := args.push "--rwx" |>.push repoPath.toString
+    args := args.push "--rwx" |>.push workPath.toString
   args := args.push "--rw" |>.push "/tmp"
   -- Read+execute system paths (binaries, libraries)
   for p in paths.rox do
@@ -202,7 +206,8 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     args := args.push "--connect-tcp" |>.push (toString p)
     args := args.push "--bind-tcp" |>.push (toString p)
   -- Environment variables for the sandboxed command
-  args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
+  if let some t := ghToken then
+    args := args.push "--env" |>.push s!"GH_TOKEN={t}"
   args := args.push "--env" |>.push "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"
   -- Pass through inherited env vars by name
   for name in ["SHELL", "PATH", "HOME", "USER", "TERM"] do
@@ -236,14 +241,14 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   args := args ++ agentArgs
   if debug then
     let argsStr := String.intercalate " " (args.toList.map shellEscape)
-    IO.eprintln s!"[debug] cd {shellEscape repoPath.toString} && landrun {argsStr}"
+    IO.eprintln s!"[debug] cd {shellEscape workPath.toString} && landrun {argsStr}"
   if interactiveAgent then
     -- Interactive mode: inherit stdio so the user drops into the agent TUI.
     -- No stream parsing; just wait for the process to exit.
     let child ← IO.Process.spawn {
       cmd := "landrun"
       args
-      cwd := repoPath
+      cwd := workPath
       stdin := .inherit
       stdout := .inherit
       stderr := .inherit
@@ -285,7 +290,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let child ← IO.Process.spawn {
     cmd := "landrun"
     args
-    cwd := repoPath
+    cwd := workPath
     stdin := .null
     stdout := .piped
     stderr := .piped

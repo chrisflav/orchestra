@@ -88,9 +88,14 @@ structure QueueEntry where
   id            : String
   createdAt     : String
   status        : QueueStatus   := .pending
-  upstream      : Repository
-  fork          : Repository
-  mode          : TaskMode
+  /-- The repository the entry works against. `none` for a repository-independent entry:
+      it takes no clone slot, mints no GitHub token, and runs in a scratch directory.
+      Must be set together with `fork`. -/
+  upstream      : Option Repository := none
+  /-- See `upstream`. Must be set together with it. -/
+  fork          : Option Repository := none
+  /-- Legacy tool-derivation field (deprecated); `none` when there is no repository. -/
+  mode          : Option TaskMode := none
   prompt        : String
   agent         : Option String := none
   systemPrompt  : Option String := none
@@ -159,11 +164,11 @@ instance : ToJson QueueEntry where
       ("id",         e.id),
       ("created_at", e.createdAt),
       ("status",     ToJson.toJson e.status),
-      ("upstream",   ToJson.toJson e.upstream),
-      ("fork",       ToJson.toJson e.fork),
-      ("mode",       ToJson.toJson e.mode),
       ("prompt",     e.prompt)
     ]
+    let fields := if let some r := e.upstream      then fields ++ [("upstream",        ToJson.toJson r)] else fields
+    let fields := if let some r := e.fork          then fields ++ [("fork",            ToJson.toJson r)] else fields
+    let fields := if let some m := e.mode          then fields ++ [("mode",            ToJson.toJson m)] else fields
     let fields := if let some s := e.agent         then fields ++ [("agent",           Json.str s)]      else fields
     let fields := if let some s := e.systemPrompt  then fields ++ [("system_prompt",   Json.str s)]      else fields
     let fields := if let some s := e.prependPrompt   then fields ++ [("prepend_prompt",   Json.str s)]      else fields
@@ -200,9 +205,9 @@ instance : FromJson QueueEntry where
     let id           ← j.getObjValAs? String "id"
     let createdAt    ← j.getObjValAs? String "created_at"
     let status       ← j.getObjValAs? QueueStatus "status"
-    let upstream     ← j.getObjValAs? Repository "upstream"
-    let fork         ← j.getObjValAs? Repository "fork"
-    let mode         ← j.getObjValAs? TaskMode "mode"
+    let upstream     ← getOptObjValAs? Repository j "upstream"
+    let fork         ← getOptObjValAs? Repository j "fork"
+    let mode         ← getOptObjValAs? TaskMode j "mode"
     let prompt       ← j.getObjValAs? String "prompt"
     let agent         := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt  := j.getObjValAs? String "system_prompt"  |>.toOption
@@ -305,7 +310,11 @@ def pendingCandidates (all : Array QueueEntry) (activePerRepo : Std.HashMap Stri
     (perRepoLimit : Nat) : Array QueueEntry :=
   let pending := all.filter (fun e =>
     e.status == .pending &&
-    activePerRepo.getD e.fork.toString 0 < perRepoLimit)
+    -- A repository-independent entry occupies no clone slot, so the per-repo limit has
+    -- nothing to say about it; it is still bounded by `parallelLimit` like everything else.
+    match e.fork with
+    | none   => true
+    | some f => activePerRepo.getD f.toString 0 < perRepoLimit)
   pending.qsort (fun a b =>
     if a.priority != b.priority then a.priority > b.priority else a.id < b.id)
 
@@ -368,8 +377,9 @@ structure ClaimContext where
 /-- The outcome of a successful claim. -/
 structure Claim where
   entry : QueueEntry
-  /-- Slot the entry will run in. -/
-  slot : Nat
+  /-- Slot the entry will run in. `none` for a repository-independent entry, which has no
+      clone to run in and gets a scratch directory instead. -/
+  slot : Option Nat
   /-- Set when the entry is a continuation that got its predecessor's workspace back, naming
       that predecessor. The slot must then be left exactly as it was. -/
   resumeFrom : Option String := none
@@ -396,6 +406,10 @@ def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
     -- A backend that keeps per-run state at a fixed global path only starts when nothing else
     -- is running. `total == 0` means the daemon is idle.
     if !ctx.parallelSafe e.backend && ctx.total > 0 then continue
+    -- A repository-independent entry allocates no slot: there is no clone to pool, and no
+    -- predecessor tree to resume onto. It still had to pass the checks above.
+    let some fork := e.fork
+      | return some { entry := e, slot := none }
     -- The predecessor entry, and the slot it recorded — the workspace this entry was queued
     -- to build on.
     let predecessor := e.continuesFrom.bind fun tid => all.find? (·.taskId == some tid)
@@ -403,13 +417,13 @@ def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
       | none => pure none
       | some (predId, predSlot) =>
         -- Confirm the predecessor's tree is still there before asking to wait for its slot.
-        if (← slotOccupant e.fork predSlot) == some predId then pure (some predSlot)
+        if (← slotOccupant fork predSlot) == some predId then pure (some predSlot)
         else pure none
-    let occupied := ctx.occupiedSlots.getD e.fork.toString #[]
+    let occupied := ctx.occupiedSlots.getD fork.toString #[]
     let some (slot, reuseTree) := chooseSlot occupied ctx.perRepoLimit preferred | continue
     return some {
       entry := e
-      slot
+      slot := some slot
       resumeFrom := if reuseTree then predecessor.map (·.id) else none
     }
   return none

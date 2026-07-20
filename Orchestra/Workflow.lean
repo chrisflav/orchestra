@@ -164,7 +164,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
   let inputSection := buildInputSection env spec.input
   if spec.output.isEmpty then
     let ioTask : IOTask .unit .unit := {
-      upstream, fork, mode := .fork
+      upstream := some upstream, fork := some fork, mode := some .fork
       prompt := spec.prompt ++ inputSection
       agent := spec.agent, model := spec.model, readOnly := spec.readOnly
       systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt
@@ -178,7 +178,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
     let mappingFields := spec.output.map fun o => (o.name, o.type)
     let outInstr := s!"\n\nCommunicate your result by calling the `submit_task_output` MCP tool with a JSON object matching this schema:\n{(ResultType.mapping mappingFields).toJsonSchema.compress}"
     let ioTask : IOTask .unit (.mapping mappingFields) := {
-      upstream, fork, mode := .fork
+      upstream := some upstream, fork := some fork, mode := some .fork
       prompt := spec.prompt ++ inputSection ++ outInstr
       agent := spec.agent, model := spec.model, readOnly := spec.readOnly
       systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt

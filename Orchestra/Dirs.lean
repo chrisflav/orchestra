@@ -50,4 +50,12 @@ def skillsDir : IO System.FilePath := do
 def dataBase : IO System.FilePath :=
   orchestraDataDir
 
+/-- Working directories for repository-independent tasks: `<data>/scratch/<task-id>`.
+
+    A sibling of `logs`/`memory`/`tasks` rather than a subdirectory of `repos`, which
+    `Repo.listClones` walks assuming owner directories and `Repo.cleanup` removes wholesale —
+    a scratch directory there would show up as a bogus clone. -/
+def scratchDir : IO System.FilePath := do
+  return (← dataBase) / "scratch"
+
 end Orchestra.Dirs

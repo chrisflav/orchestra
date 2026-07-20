@@ -382,11 +382,15 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   -- 4. Build the queue entry first (we need its id as the claim's task id).
   let entryId ← TaskStore.generateId
   let createdAt ← currentIso8601
-  let target := mIssue.bind (effectiveTarget project ·)
-            <|> project.defaultTarget
-  let some target' := target
-    | IO.eprintln "Cannot spawn: no effective target (project has no default and issue has no override)"
-      return 1
+  -- A repository-independent role resolves no target and must not be rejected for lacking
+  -- one; every other role still is, since a missing target means the project is misconfigured.
+  let target? :=
+    if role.repoless then none
+    else mIssue.bind (effectiveTarget project ·) <|> project.defaultTarget
+  if target?.isNone && !role.repoless then
+    IO.eprintln "Cannot spawn: no effective target (project has no default and issue has no override)"
+    return 1
+  warnRepolessPerms role
   let comments ← match mIssue with
     | some i => renderCommentThread i.id
     | none   => pure none
@@ -394,9 +398,9 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let prompt := render role.promptTemplate vars
   let entry : Queue.QueueEntry :=
     { id := entryId, createdAt
-    , upstream      := target'.repo
-    , fork          := target'.repo
-    , mode          := .pr
+    , upstream      := target?.map (·.repo)
+    , fork          := target?.map (·.repo)
+    , mode          := target?.map (fun _ => .pr)
     , prompt
     , backend       := role.backend
     , model         := role.model

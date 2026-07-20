@@ -64,6 +64,17 @@ inductive SourceConfig where
       ancestor (`Project.artifactTarget`). An issue missing either is reported and skipped —
       dispatching an agent at a guessed repository is worse than not dispatching. -/
   | labelDispatcher   (label : String) (caps : List (String × Nat))
+  /-- Auto-dispatch tracker-wide supervisory roles — a manager that surveys every project
+      rather than working inside one.
+
+      Unlike the project- and label-dispatchers there is no issue set and no target: roles are
+      spawned unbound, with no project, no issue and no repository. Only the `always` trigger
+      is meaningful, since the others all key off an issue set this source does not have;
+      roles carrying any other trigger are reported and skipped.
+
+      Cadence is the listener's own `interval_seconds` combined with a cap of 1: the manager
+      runs, finishes, and is respawned on the next tick that finds it under its cap. -/
+  | managerDispatcher (caps : List (String × Nat))
   /-- Fires whenever the number of open issues or pull requests with the given
       labels on a repository is strictly below `max`.  Emits at most one task per
       tick; the tick is skipped while a task from this listener is already pending
@@ -114,6 +125,10 @@ instance : ToJson SourceConfig where
     | .labelDispatcher label caps =>
         Json.mkObj [("type", "label-dispatcher"),
                     ("label", Json.str label),
+                    ("caps", Json.mkObj
+                       (caps.map (fun (n, c) => (n, Json.num c))))]
+    | .managerDispatcher caps =>
+        Json.mkObj [("type", "manager-dispatcher"),
                     ("caps", Json.mkObj
                        (caps.map (fun (n, c) => (n, Json.num c))))]
     | .githubLabelCount repos labels max kind =>
@@ -179,6 +194,12 @@ instance : FromJson SourceConfig where
         let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
           v.getNat?.toOption.map (k, ·)
         return .labelDispatcher label caps
+    | "manager-dispatcher" =>
+        let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
+        let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
+        let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
+          v.getNat?.toOption.map (k, ·)
+        return .managerDispatcher caps
     | "github-label-count" =>
         let repos  ← parseRepos j
         let labels  := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
@@ -783,10 +804,16 @@ def buildRoleEntry (project : Project.Project) (role : Project.Role)
     (issue? : Option Project.Issue) (instructions : String := "")
     (targetOverride : Option Project.RepoTarget := none) :
     IO (Option Queue.QueueEntry) := do
-  let target := targetOverride
-            <|> issue?.bind (Project.effectiveTarget project ·)
-            <|> project.defaultTarget
-  let some target' := target | return none
+  -- A repository-independent role has no target to resolve and must not be rejected for
+  -- lacking one; every other role still is, since a missing target means a misconfigured
+  -- project rather than a deliberate choice.
+  let target? :=
+    if role.repoless then none
+    else targetOverride
+      <|> issue?.bind (Project.effectiveTarget project ·)
+      <|> project.defaultTarget
+  if target?.isNone && !role.repoless then return none
+  Project.warnRepolessPerms role
   let id ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
   -- One extra fetch per dispatch (not per tick) so the thread lands in the prompt: a worker
@@ -798,9 +825,9 @@ def buildRoleEntry (project : Project.Project) (role : Project.Role)
   let prompt := Project.render role.promptTemplate vars
   return some
     { id, createdAt
-    , upstream      := target'.repo
-    , fork          := target'.repo
-    , mode          := .pr
+    , upstream      := target?.map (·.repo)
+    , fork          := target?.map (·.repo)
+    , mode          := target?.map (fun _ => .pr)
     , prompt
     , backend       := role.backend
     , model         := role.model
@@ -813,6 +840,34 @@ def buildRoleEntry (project : Project.Project) (role : Project.Role)
     , projectId     := some project.id
     , issueId       := issue?.map (·.id)
     , role          := some role.name }
+
+/-- Build a queue entry for a tracker-wide supervisory role: bound to no project, no issue and
+    no repository.
+
+    Distinct from `buildRoleEntry` because there is no `Project` to render against — the whole
+    point of the role is that it spans every project — so the prompt template gets empty
+    project variables and the entry carries no `projectId`. That absence is also what the
+    manager dispatcher counts to enforce its cap. -/
+def buildManagerEntry (role : Project.Role) (instructions : String := "") :
+    IO Queue.QueueEntry := do
+  Project.warnRepolessPerms role
+  let id ← TaskStore.generateId
+  let createdAt ← TaskStore.currentIso8601
+  let vars : Project.RenderVars :=
+    { projectId := "", projectName := "", instructions }
+  let entry : Queue.QueueEntry :=
+    { id, createdAt
+    , prompt        := Project.render role.promptTemplate vars
+    , backend       := role.backend
+    , model         := role.model
+    , systemPrompt  := role.systemPrompt
+    , prependPrompt := role.prependPrompt
+    , budget        := role.budget
+    , priority      := role.priority
+    , readOnly      := role.readOnly
+    , tools         := some role.permissions
+    , role          := some role.name }
+  return entry
 
 -- Source polling
 
@@ -1183,6 +1238,41 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
                  , ("target_repo",   target.repo.toString)
                  , ("target_branch", target.branch) ])
     return (boundEvents ++ unboundEvents, none)
+
+  | .managerDispatcher caps => do
+    -- Global roles only. There is no project whose `roles/` directory could take precedence,
+    -- for the same reason as the label-dispatcher: these roles span the whole tracker.
+    let roles ← Project.loadGlobalRoles
+    -- Only `always` is meaningful without an issue set. The others would either never fire or
+    -- fire for the wrong reason — `idle` in particular reads "no open and no in-review issues",
+    -- which is trivially true of the empty sets below and would spawn a planner every tick.
+    let (boundCaps, unboundCaps) := splitCapsByBinding roles caps
+    for (n, _) in boundCaps do
+      match (roles.find? (·.name == n)).bind (·.dispatch) with
+      | none   => IO.eprintln s!"[dispatcher] manager role '{n}' has no dispatch policy or does \
+          not exist among the global roles; not dispatched"
+      | some d => IO.eprintln s!"[dispatcher] manager role '{n}' has the \
+          '{triggerName d.trigger}' trigger, which needs an issue set this dispatcher does not \
+          have; use the 'always' trigger for a tracker-wide role. Not dispatched."
+    -- A manager binds no project, so it is the *absence* of one that identifies its entries.
+    -- Counting them any other way would leave the cap permanently unreached.
+    let allEntries ← Queue.loadAllEntries
+    let mut active : Std.HashMap String Nat := {}
+    for e in allEntries do
+      let isActive := e.status == .pending || e.status == .running
+      if !isActive then continue
+      if e.projectId != none || e.issueId != none then continue
+      if let some r := e.role then
+        active := active.insert r ((active.getD r 0) + 1)
+    let input : DispatcherInput :=
+      { activeByRole := active, issues := #[], reviewable := #[]
+      , caps := unboundCaps, roles }
+    let decisions := dispatcherDecisions input
+    if decisions.isEmpty && boundCaps.isEmpty then
+      IO.println "[dispatcher] no manager roles named in caps, so nothing to check"
+    for d in decisions do
+      IO.println s!"[dispatcher] {renderDecision d}"
+    return (dispatcherTick input |>.map fun s => ("", [("role_name", s.roleName)]), none)
 
   | .githubLabelCount repos labels max kind => do
     let mut allEvents : Array (String × List (String × String)) := #[]

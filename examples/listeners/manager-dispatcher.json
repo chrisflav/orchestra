@@ -1,0 +1,14 @@
+{
+  "name": "demo-manager-dispatcher",
+  "source": {
+    "type": "manager-dispatcher",
+    "caps": {
+      "manager": 1
+    }
+  },
+  "action": {
+    "mode": "pr",
+    "prompt_template": ""
+  },
+  "interval_seconds": 3600
+}

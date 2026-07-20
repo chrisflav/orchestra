@@ -23,6 +23,22 @@ def manageIssuesPerm : String := "manage_issues"
 def workIssuesPerm   : String := "work_issues"
 def reviewIssuesPerm : String := "review_issues"
 
+/-- The `manage_issues` toolset with write scoping lifted: the task may create and modify
+    issues anywhere in the tracker rather than only within its own project subtree.
+
+    For supervisory roles that survey every project and file scoped work onto the sub-project
+    it belongs to — which is by definition a subtree they are not themselves attached to.
+    Reads were never scoped, so this changes writes only. -/
+def manageAllIssuesPerm : String := "manage_all_issues"
+
+/-- Expand permission labels that imply others. `manage_all_issues` grants the same tools as
+    `manage_issues`; it differs only in how far the writes may reach, so the tool *set* is
+    derived here once and the scope check consults the original label. -/
+def expandPerms (perms : List String) : List String :=
+  if perms.contains manageAllIssuesPerm && !perms.contains manageIssuesPerm then
+    manageIssuesPerm :: perms
+  else perms
+
 inductive ReviewDecision where
   /-- The pull request should land. Enqueues the merger; the issue stays open, because merging a
       PR is not the same as finishing the issue — see `complete`. -/
@@ -456,6 +472,10 @@ private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
     `Project.Basic`'s "Write scoping". -/
 private def refuseOutsideScope (env : Env) (target : Taxis.IssueId) (what : String) :
     IO (Option String) := do
+  -- The single bypass point for tracker-wide roles. A manager surveys every project and files
+  -- work onto whichever sub-project owns it, so there is no subtree that could scope it — the
+  -- whole tracker is its scope, deliberately.
+  if env.allowedTools.contains manageAllIssuesPerm then return none
   match ← writeScopeRoot env with
   | none =>
     return some s!"cannot {what}: this task is attached to no project or issue, so there is no \
