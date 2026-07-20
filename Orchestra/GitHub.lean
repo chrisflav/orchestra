@@ -12,6 +12,22 @@ structure InlineComment where
   body : String
   side : String
 
+/-- Failure text for a command that exited non-zero.
+
+    Falls back to stdout when stderr is empty, and says so explicitly when both are: `curl -s`
+    writes nothing to stderr, so a message built from stderr alone came out as a bare exit code
+    with a blank line under it and no way to tell a rejected credential from an unreachable
+    host. Command arguments are deliberately never included — they carry the JWT and the
+    installation token. -/
+private def commandFailure (cmd : String) (code : UInt32) (stdout stderr : String) : String :=
+  let err := stderr.trimAscii.toString
+  let out := stdout.trimAscii.toString
+  let detail :=
+    if !err.isEmpty then (if out.isEmpty then err else s!"{err}\n{out}")
+    else if !out.isEmpty then out
+    else "(the command produced no output on stdout or stderr)"
+  s!"{cmd} failed (exit {code}):\n{detail}"
+
 private def runCmd (cmd : String) (args : Array String)
     (input : Option String := none)
     (env : Array (String × Option String) := #[]) : IO String := do
@@ -31,18 +47,107 @@ private def runCmd (cmd : String) (args : Array String)
     let stderr ← child'.stderr.readToEnd
     let code ← child'.wait
     if code != 0 then
-      throw (.userError s!"{cmd} failed (exit {code}):\n{stderr}")
+      throw (.userError (commandFailure cmd code stdout stderr))
     return stdout.trimAscii.toString
   let stdout ← child.stdout.readToEnd
   let stderr ← child.stderr.readToEnd
   let code ← child.wait
   if code != 0 then
-    throw (.userError s!"{cmd} failed (exit {code}):\n{stderr}")
+    throw (.userError (commandFailure cmd code stdout stderr))
   return stdout.trimAscii.toString
 
 private def runCmd' (cmd : String) (args : Array String)
     (input : Option String := none) : IO Unit := do
   let _ ← runCmd cmd args input
+
+/-! ## GitHub App REST calls
+
+These run against `api.github.com` with a JWT rather than through `gh`, because `gh` cannot
+authenticate as an App. They are the first thing every task does, so their failures are the
+ones most worth reading. -/
+
+/-- Separates the response body from the status code `-w` appends. Long and unlikely enough that
+    a body containing it would have to be trying. -/
+private def httpStatusMarker : String := "\n<<<orchestra-http-status:"
+
+/-- Split curl's `-w`-augmented output into `(status, body)`, or `none` when the status line is
+    absent — which means curl died before writing it and the whole output is a diagnostic.
+
+    Splits on the *last* marker, so a response body that happens to contain the marker is
+    returned intact rather than truncated at it. Not private: this is the one part of the error
+    path with logic worth testing, and it needs no network to test. -/
+def splitHttpStatus (out : String) : Option (Nat × String) :=
+  let parts := out.splitOn httpStatusMarker
+  if parts.length < 2 then none
+  else
+    let status := (parts.getLastD "").trimAscii.toString
+    match status.toNat? with
+    | none   => none
+    | some s => some (s, httpStatusMarker.intercalate parts.dropLast)
+
+/-- Run curl and return `(status, body)`.
+
+    Deliberately **not** `curl -f`. With `-f` curl exits 22 on any 4xx/5xx *and discards the
+    response body*, and with `-s` it prints nothing to stderr either — so every authentication
+    failure arrived as `curl failed (exit 22)` with nothing after the colon, when GitHub had in
+    fact replied with a sentence saying exactly what was wrong. The status is requested
+    explicitly via `-w` and the body kept, so the caller can report both. `-S` restores curl's
+    own message for transport failures (DNS, refused connection) that produce no body at all. -/
+private def curlWithStatus (args : Array String) : IO (Nat × String) := do
+  let out ← runCmd "curl" (#["-sS", "-w", httpStatusMarker ++ "%{http_code}"] ++ args)
+  match splitHttpStatus out with
+  | some r => return r
+  | none   => throw (.userError s!"curl wrote no status line; its output was:\n{out}")
+
+/-- GitHub's own explanation of a failure, for putting in a log line.
+
+    Error responses are `{"message": ..., "documentation_url": ...}`, so the `message` field is
+    the useful sentence; anything else (an HTML error page from a proxy, say) is passed through
+    truncated rather than dropped, since the point of this is to stop discarding evidence.
+
+    Not private: exercised directly by `OrchestraTest.GitHubError`. -/
+def githubErrorDetail (body : String) : String :=
+  let trimmed := body.trimAscii.toString
+  if trimmed.isEmpty then "(empty response body)"
+  else match Json.parse trimmed with
+    | .ok j =>
+      match j.getObjValAs? String "message" with
+      | .ok m => m
+      | .error _ => (trimmed.take 2000).toString
+    | .error _ => (trimmed.take 2000).toString
+
+/-- What usually causes a given status on the App endpoints, when it is worth saying. -/
+private def appAuthHint (status : Nat) : String :=
+  if status == 401 then
+    "\n  A 401 here means GitHub rejected the signed JWT. Check github_app.app_id and \
+github_app.private_key_path in config.json, that the key is the App's current private key, \
+and that this machine's clock is right — a JWT whose 'iat' is in the future is rejected."
+  else if status == 404 then
+    -- Observed: app_id 12345 against a well-formed key answers 404 \"Integration not found\",
+    -- so a wrong app_id lands here rather than on the 401 path one might expect.
+    "\n  A 404 here means GitHub found no App or installation to match. Check that \
+github_app.app_id is the App's own id (not the installation id), and that the App is installed \
+on the account owning the repository."
+  else ""
+
+/-- Call a GitHub App REST endpoint, returning the response body.
+
+    `what` names the operation for the error message. Request headers are never included in it:
+    they carry the JWT. Neither is the body of a *successful* response, since for the token
+    endpoint that is the credential itself — only error bodies are quoted, and those carry no
+    secret. -/
+private def githubAppApi (what : String) (jwt : String) (method : String) (url : String) :
+    IO String := do
+  let (status, body) ← curlWithStatus #[
+    "-X", method,
+    "-H", s!"Authorization: Bearer {jwt}",
+    "-H", "Accept: application/vnd.github+json",
+    url ]
+  if status < 200 || status >= 300 then
+    throw (.userError
+      s!"{what} failed: GitHub answered HTTP {status} to {method} {url}\n  \
+{githubErrorDetail body}{appAuthHint status}")
+  return body
 
 /-- Create a JWT for GitHub App authentication using `openssl`. -/
 def createJWT (appId : Nat) (privateKeyPath : String) : IO String := do
@@ -64,14 +169,13 @@ def createJWT (appId : Nat) (privateKeyPath : String) : IO String := do
 
 /-- Get the installation ID for a GitHub App on a given owner/org. -/
 def getInstallationId (jwt : String) (owner : String) : IO Nat := do
-  let result ← runCmd "curl" #[
-    "-s", "-f",
-    "-H", s!"Authorization: Bearer {jwt}",
-    "-H", "Accept: application/vnd.github+json",
-    s!"https://api.github.com/app/installations"
-  ]
+  let result ← githubAppApi "listing the App's installations" jwt "GET"
+    "https://api.github.com/app/installations"
   match Json.parse result with
-  | .error e => throw (.userError s!"failed to parse installations response: {e}")
+  | .error e =>
+    -- The body is safe to quote here: this endpoint returns installation metadata, not a
+    -- credential.
+    throw (.userError s!"failed to parse installations response: {e}\n  response was:\n{result.take 2000}")
   | .ok j =>
     let .ok installations := j.getArr? | throw (.userError "expected array of installations")
     for inst in installations do
@@ -84,14 +188,13 @@ def getInstallationId (jwt : String) (owner : String) : IO Nat := do
 
 /-- Create an installation access token. -/
 def createInstallationToken (jwt : String) (installationId : Nat) : IO String := do
-  let result ← runCmd "curl" #[
-    "-s", "-f", "-X", "POST",
-    "-H", s!"Authorization: Bearer {jwt}",
-    "-H", "Accept: application/vnd.github+json",
-    s!"https://api.github.com/app/installations/{installationId}/access_tokens"
-  ]
+  let result ← githubAppApi s!"minting an installation token for installation {installationId}"
+    jwt "POST" s!"https://api.github.com/app/installations/{installationId}/access_tokens"
   match Json.parse result with
-  | .error e => throw (.userError s!"failed to parse token response: {e}")
+  -- Deliberately without the response body: a 2xx here *is* the token, so quoting what could
+  -- not be parsed would put a live credential in the daemon log.
+  | .error e => throw (.userError
+      s!"failed to parse token response: {e} (body withheld — it may contain the token)")
   | .ok j =>
     let .ok token := j.getObjValAs? String "token"
       | throw (.userError "token response missing 'token' field")
