@@ -184,6 +184,53 @@ Because the role is unbound, the project **must** have a `default_target` — th
 resolve a repository and branch from, and a role whose target cannot be resolved is silently
 never dispatched.
 
+### Repository-independent roles, and the manager
+
+Everything above assumes a role works *inside* a repository. A role with `"repoless": true`
+does not: nothing is cloned, no GitHub App token is minted, and the agent runs in a private
+scratch directory under `<data>/scratch/<task-id>` with no `GH_TOKEN` and no git credential
+helper. It cannot reach a repository even if it tries — the credentials are absent, not merely
+unused. Such a task takes no per-repo clone slot either, so it never competes with real work
+for one, though it still counts against `--parallel`.
+
+`manager.json` is the example, and the reason the feature exists. The manager supervises the
+whole tracker rather than working in one project: it checks that issues are clear, correctly
+parented and carry the dependencies they need, looks for work duplicated across issues and
+repositories, and files audit/polish/review issues for repositories that have not had one in a
+long time (judged from the tracker's own history — nothing new is persisted). It deliberately
+does no detail work: when in doubt it creates a scoped issue on the sub-project that owns the
+problem.
+
+That job needs writes the ordinary `manage_issues` permission will not allow. Writes are scoped
+to the task's own project subtree, and filing work onto a sub-project you are not attached to is
+by definition outside it. So the manager holds **`manage_all_issues`** instead: the same toolset
+as `manage_issues`, with the subtree check lifted. Reads were never scoped, so this changes
+writes only. It is not included in `--tools all` — lifting write scoping tracker-wide is a
+decision a role makes explicitly.
+
+Because a manager belongs to no project, neither the project- nor the label-dispatcher can
+place it. Use a **`manager-dispatcher`**:
+
+```json
+{
+  "source": {
+    "type": "manager-dispatcher",
+    "caps": { "manager": 1 }
+  },
+  "interval_seconds": 3600
+}
+```
+
+Roles come from the *global* roles directory only (`$XDG_CONFIG_HOME/orchestra/roles/`) — these
+span every project, so no single project's `roles/` takes precedence. Only the `always` trigger
+is meaningful: the others key off an issue set this dispatcher does not have, and are reported
+and skipped. Cadence is `interval_seconds` plus the cap: with `1`, a manager runs, finishes, and
+is respawned on the next tick that finds it under its cap — so the interval is what paces it.
+
+The dispatcher counts a manager's entries by the *absence* of a project, which is why the role
+must be `repoless` and unbound; a role named in `caps` that is not marked `repoless` is reported
+and not dispatched, since there is no repository for it to resolve.
+
 Manual spawning:
 
 ```sh

@@ -99,9 +99,35 @@ structure Role where
       Worker templates should include {{issue_description}}: it is the only way the issue body
       reaches an agent, since the tool that renders it (`get_issue`) needs `manage_issues`. -/
   promptTemplate : String
+  /-- Run with no repository at all: nothing is cloned, no GitHub token is minted, and the
+      agent works in a scratch directory with no credentials. For supervisory roles that act
+      only on the issue tracker.
+
+      Declared rather than inferred from a missing target: both spawn paths refuse to build an
+      entry without one, and that refusal is what catches a misconfigured project.
+
+      `permissions` should not name the repository tools (`create_pr`, `comment`) — they are
+      withheld from a repository-independent task, so listing them only costs the agent a turn
+      discovering they refuse. -/
+  repoless       : Bool          := false
   /-- Optional auto-dispatch policy. `none` = manual-spawn only. -/
   dispatch       : Option DispatchPolicy := none
 deriving Repr, Inhabited
+
+/-- Repository permissions a `repoless` role cannot use, warned about at spawn time.
+
+    Permission tokens only. `get_pr_comments` is not one — it is always-available and gated on
+    the repository itself — so naming it here could never fire. -/
+def repoToolPerms : List String := ["create_pr", "comment"]
+
+/-- Warn when a repository-independent role asks for repository tools. Not fatal: the role is
+    still perfectly runnable, it just carries a permission that can only ever refuse. -/
+def warnRepolessPerms (r : Role) : IO Unit := do
+  if !r.repoless then return
+  let bad := r.permissions.filter (repoToolPerms.contains ·)
+  if bad.isEmpty then return
+  IO.eprintln s!"[role] '{r.name}' is repoless but grants {bad}; \
+    those tools need a repository and will refuse every call"
 
 instance : ToJson Role where
   toJson r :=
@@ -117,6 +143,7 @@ instance : ToJson Role where
     let f := if let some s := r.systemPrompt  then f ++ [("system_prompt",  Json.str s)] else f
     let f := if let some s := r.prependPrompt then f ++ [("prepend_prompt", Json.str s)] else f
     let f := if let some b := r.budget        then f ++ [("budget",         ToJson.toJson b)] else f
+    let f := if r.repoless                    then f ++ [("repoless",       Json.bool true)] else f
     let f := if let some d := r.dispatch      then f ++ [("dispatch",       ToJson.toJson d)] else f
     Json.mkObj f
 
@@ -132,9 +159,10 @@ instance : FromJson Role where
     let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority      := j.getObjValAs? Nat "priority"   |>.toOption |>.getD 10
     let budget        := j.getObjValAs? Float "budget"   |>.toOption
+    let repoless      := j.getObjValAs? Bool "repoless"  |>.toOption |>.getD false
     let dispatch      := j.getObjValAs? DispatchPolicy "dispatch" |>.toOption
     return { name, permissions, backend, model, systemPrompt, prependPrompt
-           , readOnly, priority, budget, promptTemplate, dispatch }
+           , readOnly, priority, budget, promptTemplate, repoless, dispatch }
 
 /-! ## Filesystem layout -/
 

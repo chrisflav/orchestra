@@ -409,7 +409,9 @@ def createIssue (projectId : Taxis.IssueId) (title description : String)
     load-modify-save of a listed issue would then silently detach every PR on it. Attaching is
     the only mutation Orchestra ever performs on the set, so it gets its own entry point.
 
-    Also does not change `parentId` — nothing in Orchestra re-parents an issue after creation. -/
+    Also does not change `parentId`: `parent` is left unset in the patch, so a load-modify-save
+    never disturbs the hierarchy. Re-parenting is `reparentIssue`, which is the only thing that
+    writes it. -/
 def saveIssue (i : Issue) : IO Unit := do
   let cfg ← Orchestra.Taxis.getConfig
   let ids ← statusLabelIds
@@ -424,6 +426,16 @@ def saveIssue (i : Issue) : IO Unit := do
       state := some (stateOf i.status)
       labels := some (labelsFor ids raw.labels i.status)
       dependencies := some i.dependencies })
+
+/-- Move `iid` under `newParent`, touching nothing else.
+
+    Separate from `saveIssue` because taxis models `parent` as a tri-state (absent = leave alone,
+    null = detach, id = move): folding it into the load-modify-save path would make every status
+    patch also assert a parent, and `loadIssues` does not populate enough to assert one safely.
+    Callers that re-parent say so explicitly. -/
+def reparentIssue (iid : Taxis.IssueId) (newParent : Taxis.IssueId) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let _ ← unwrap (← Orchestra.Taxis.updateIssue cfg iid { parent := some (some newParent) })
 
 /-- Remove the `o-claimed` label from `iid`, leaving everything else — including the taxis
     `state`, and therefore whether the issue reads as completed or abandoned — untouched.

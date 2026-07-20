@@ -71,7 +71,7 @@ private def mkEntry (id : String) (fork : String) (priority : Nat := 10)
     (status : Queue.QueueStatus := .pending) : Queue.QueueEntry :=
   let repo : Repository := { owner := fork, name := "r" }
   { id, createdAt := "2026-01-01T00:00:00Z", status
-  , upstream := repo, fork := repo, mode := .pr, prompt := "", priority }
+  , upstream := some repo, fork := some repo, mode := some .pr, prompt := "", priority }
 
 @[test]
 def pendingCandidates_ordersByPriorityThenAge : Test := do
@@ -153,7 +153,7 @@ def claimDecision_continuationResumesItsPredecessorsTree : Test := do
   let got ← Queue.claimDecision (ctx 4 3) #[pred, cont] (occupantIs 1 "0001")
   match got with
   | some c =>
-    TestM.assertEqual c.slot 1 (msg := "back to the predecessor's slot")
+    TestM.assertEqual c.slot (some 1) (msg := "back to the predecessor's slot")
     TestM.assertEqual c.resumeFrom (some "0001") (msg := "and keeps its working tree")
   | none => TestM.fail "expected a claim"
 
@@ -170,7 +170,7 @@ def claimDecision_continuationResetsWhenAnotherTaskTookItsSlot : Test := do
   match got with
   | some c =>
     TestM.assertEqual c.resumeFrom none (msg := "the tree is not the predecessor's, so reset")
-    TestM.assertEqual c.slot 0 (msg := "and there is no reason to wait for slot 1")
+    TestM.assertEqual c.slot (some 0) (msg := "and there is no reason to wait for slot 1")
   | none => TestM.fail "expected a claim, not a wait"
 
 @[test]

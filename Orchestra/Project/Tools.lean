@@ -23,6 +23,22 @@ def manageIssuesPerm : String := "manage_issues"
 def workIssuesPerm   : String := "work_issues"
 def reviewIssuesPerm : String := "review_issues"
 
+/-- The `manage_issues` toolset with write scoping lifted: the task may create and modify
+    issues anywhere in the tracker rather than only within its own project subtree.
+
+    For supervisory roles that survey every project and file scoped work onto the sub-project
+    it belongs to — which is by definition a subtree they are not themselves attached to.
+    Reads were never scoped, so this changes writes only. -/
+def manageAllIssuesPerm : String := "manage_all_issues"
+
+/-- Expand permission labels that imply others. `manage_all_issues` grants the same tools as
+    `manage_issues`; it differs only in how far the writes may reach, so the tool *set* is
+    derived here once and the scope check consults the original label. -/
+def expandPerms (perms : List String) : List String :=
+  if perms.contains manageAllIssuesPerm && !perms.contains manageIssuesPerm then
+    manageIssuesPerm :: perms
+  else perms
+
 inductive ReviewDecision where
   /-- The pull request should land. Enqueues the merger; the issue stays open, because merging a
       PR is not the same as finishing the issue — see `complete`. -/
@@ -52,6 +68,7 @@ inductive ProjectTool where
   | updateIssue      (issueId : Taxis.IssueId) (title description : Option String)
                      (status : Option IssueStatus) (target : Option RepoTarget)
                      (dependencies : Option (Array Taxis.IssueId) := none)
+                     (parentId : Option Taxis.IssueId := none)
   -- work_issues
   | listOpenIssues   (projectId : Taxis.IssueId) (targetRepo : Option Repository)
   | claimIssue       (issueId : Taxis.IssueId)
@@ -159,13 +176,16 @@ def toolDefs : List (String × String × Json) :=
       Json.mkObj
         [ ("name", "update_issue")
         , ("description",
-            "Update an issue's title, description, status, target, or dependencies. " ++
-            "Pass dependency_ids to replace the full dependency list; omit to leave it unchanged.")
+            "Update an issue's title, description, status, target, parent, or dependencies. " ++
+            "Pass dependency_ids to replace the full dependency list; omit to leave it unchanged. " ++
+            "Pass parent_id to move the issue under a different parent; omit to leave it where " ++
+            "it is.")
         , ("inputSchema", obj
             [ ("issue_id", intProp "Issue ID")
             , ("title", strProp "New title")
             , ("description", strProp "New description")
             , ("status", strProp "New status (open|claimed|completed|abandoned)")
+            , ("parent_id", intProp "Move the issue under this parent issue")
             , ("target_repo", strProp "New target repo (owner/name)")
             , ("target_branch", strProp "New target branch")
             , ("dependency_ids", Json.mkObj
@@ -240,6 +260,9 @@ def toolDefs : List (String × String × Json) :=
   , (manageIssuesPerm, "list_issue_comments", commentsToolDef)
   , (workIssuesPerm, "comment_issue", commentIssueToolDef)
   , (reviewIssuesPerm, "comment_issue", commentIssueToolDef)
+  -- A supervisory role needs somewhere to put a judgement it should not act on unilaterally:
+  -- commenting is the non-destructive alternative to closing an issue that merely looks stale.
+  , (manageIssuesPerm, "comment_issue", commentIssueToolDef)
     -- review_issues
   , (reviewIssuesPerm, "list_issues_in_review",
       Json.mkObj
@@ -332,7 +355,8 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | some s => issueStatusOfString? s
       let target ← parseTarget? args
       let dependencies := args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" |>.toOption
-      return .updateIssue iid title descr status target dependencies
+      let parent := args.getObjValAs? Taxis.IssueId "parent_id" |>.toOption
+      return .updateIssue iid title descr status target dependencies parent
   | "list_open_issues" =>
     some <| do
       let pid ← args.getObjValAs? Taxis.IssueId "project_id"
@@ -456,6 +480,10 @@ private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
     `Project.Basic`'s "Write scoping". -/
 private def refuseOutsideScope (env : Env) (target : Taxis.IssueId) (what : String) :
     IO (Option String) := do
+  -- The single bypass point for tracker-wide roles. A manager surveys every project and files
+  -- work onto whichever sub-project owns it, so there is no subtree that could scope it — the
+  -- whole tracker is its scope, deliberately.
+  if env.allowedTools.contains manageAllIssuesPerm then return none
   match ← writeScopeRoot env with
   | none =>
     return some s!"cannot {what}: this task is attached to no project or issue, so there is no \
@@ -566,13 +594,29 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     let issue ← createIssue pid title descr (parentId := parent) (target := target)
       (dependencies := dependencies)
     return content s!"created issue {issue.id.toString} in project {pid.toString}"
-  | .updateIssue iid title descr status target dependencies =>
+  | .updateIssue iid title descr status target dependencies parent =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     if let some msg ← refuseOutsideScope env iid "update that issue" then
       return content msg (isError := true)
+    -- Re-parenting is two writes in one: it removes the issue from where it is and puts it
+    -- where it is going. The destination has to clear the scope check on its own, or a scoped
+    -- role could lift an issue out of its subtree and drop it into somebody else's.
+    if let some newParent := parent then
+      if let some msg ← refuseOutsideScope env newParent "move an issue there" then
+        return content msg (isError := true)
     match ← findIssue iid with
     | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (_, i) =>
+      if let some newParent := parent then
+        if (← findIssue newParent).isNone then
+          return content s!"parent issue {newParent.toString} not found" (isError := true)
+        -- Unconditional, unlike the scope checks above: a cycle is not a permission question,
+        -- and `manage_all_issues` must not be able to detach a subtree from the tracker by
+        -- parenting an issue under its own descendant.
+        if ← isWithinSubtree iid newParent then
+          return content
+            s!"cannot move {iid.toString} under {newParent.toString}: that would put it beneath \
+              itself" (isError := true)
       let updated : Issue :=
         { i with
           title        := title.getD i.title
@@ -582,6 +626,9 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           dependencies := dependencies.getD i.dependencies
           updatedAt    := now }
       saveIssue updated
+      -- After `saveIssue`, which deliberately leaves `parent` alone.
+      if let some newParent := parent then
+        reparentIssue iid newParent
       return content s!"updated issue {iid.toString}"
   -- ---------------- work_issues ----------------
   | .listOpenIssues pid targetRepo? =>
@@ -732,7 +779,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     let rendered ← comments.mapM renderComment
     return content (joinLines rendered)
   | .commentIssue iid body =>
-    if !(has env workIssuesPerm || has env reviewIssuesPerm) then
+    if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
       return content (deny reviewIssuesPerm) (isError := true)
     addComment iid body
     IO.println s!"  [mcp] comment_issue: {iid.toString}"

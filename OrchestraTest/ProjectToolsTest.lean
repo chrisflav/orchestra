@@ -73,6 +73,36 @@ def parseSplitIssueRejectsEmptyChildren : Test := do
   | some (.error _) => TestM.assert true "empty children rejected"
   | other => TestM.fail s!"expected error, got {repr other}"
 
+@[test]
+def parseUpdateIssueWithParentId : Test := do
+  let args := Json.mkObj [("issue_id", Json.num 5), ("parent_id", Json.num 9)]
+  match tryParseToolCall "update_issue" args with
+  | some (.ok (.updateIssue iid _ _ _ _ _ parent)) =>
+    TestM.assertEqual iid.val (5 : Int64) (msg := "issue id")
+    TestM.assertEqual (parent.map (·.val)) (some (9 : Int64)) (msg := "new parent parsed")
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
+def parseUpdateIssueWithoutParentIdLeavesItAlone : Test := do
+  -- Absent must stay absent rather than defaulting to some root: `none` is what tells the
+  -- evaluator to skip `reparentIssue` entirely and leave the hierarchy untouched.
+  let args := Json.mkObj [("issue_id", Json.num 5), ("title", "t")]
+  match tryParseToolCall "update_issue" args with
+  | some (.ok (.updateIssue _ _ _ _ _ _ parent)) =>
+    TestM.assertEqual (parent.map (·.val)) none (msg := "no reparent requested")
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
+def manageIssuesCanComment : Test := do
+  -- A supervisory role's non-destructive alternative to closing a stale issue. It reaches the
+  -- toolset through `manage_issues`, so `manage_all_issues` gets it via `expandPerms` too.
+  let names := toolDefs.filterMap fun (perm, name, _) =>
+    if perm == manageIssuesPerm then some name else none
+  TestM.assert (names.contains "comment_issue")
+    "manage_issues must advertise comment_issue"
+  TestM.assert ((expandPerms [manageAllIssuesPerm]).contains manageIssuesPerm)
+    "and manage_all_issues must expand to it"
+
 /-! ## Evaluation (needs a real taxis instance) -/
 
 @[test]
@@ -110,6 +140,64 @@ def createIssueWithoutTargetIsRejected : Test := do
   let r ← evalProjectTool env (.createIssue project.id "t" "d" none none)
   cleanup project #[]
   TestM.assert (jsonContains r "no default target") "issue without effective target should be rejected"
+
+@[test]
+def updateIssueReparentsWithinTheSubtree : Test := do
+  unless ← ensureTestTaxisConfigured do
+    TestM.skip "ORCHESTRA_TEST_TAXIS_URL/TOKEN not set"; return
+  let project ← setupProject
+  let newParent ← addOpenIssue project.id "container"
+  let child ← addOpenIssue project.id "moves under the container"
+  let env := { baseEnv [manageIssuesPerm] with projectId := some project.id }
+  let r ← evalProjectTool env (.updateIssue child.id none none none none none (some newParent.id))
+  let after ← loadIssue project.id child.id
+  let issues ← loadIssues project.id
+  cleanup project issues
+  TestM.assert (jsonContains r "updated issue") "reparent should report success"
+  TestM.assertEqual (after.bind (·.parentId) |>.map (·.val)) (some newParent.id.val)
+    (msg := "the issue now sits under its new parent")
+
+@[test]
+def updateIssueRefusesToParentAnIssueUnderItself : Test := do
+  unless ← ensureTestTaxisConfigured do
+    TestM.skip "ORCHESTRA_TEST_TAXIS_URL/TOKEN not set"; return
+  -- Unconditional, unlike the scope checks: `manage_all_issues` lifts scoping but must not be
+  -- able to detach a subtree from the tracker by parenting an issue under its own descendant.
+  let project ← setupProject
+  let parent ← addOpenIssue project.id "parent"
+  let child ← createIssue project.id "child" "x" (parentId := some parent.id)
+    (target := some { repo := { owner := "o", name := "r" }, branch := "main" })
+  let env := baseEnv [manageAllIssuesPerm, manageIssuesPerm]
+  let r ← evalProjectTool env (.updateIssue parent.id none none none none none (some child.id))
+  let after ← loadIssue project.id parent.id
+  let issues ← loadIssues project.id
+  cleanup project issues
+  TestM.assert (jsonContains r "beneath itself") "the cycle should be refused"
+  -- `none`, not `some project.id`: an issue sitting directly under the project reports no
+  -- Orchestra parent, since the project root is implicit (`orchestraParentOf`).
+  TestM.assertEqual (after.bind (·.parentId) |>.map (·.val)) none
+    (msg := "and the parent must not have moved")
+
+@[test]
+def updateIssueRefusesAReparentOutOfTheSubtree : Test := do
+  unless ← ensureTestTaxisConfigured do
+    TestM.skip "ORCHESTRA_TEST_TAXIS_URL/TOKEN not set"; return
+  -- The destination is checked as well as the issue: otherwise a scoped role could lift one of
+  -- its own issues out of its subtree and drop it into somebody else's.
+  let home ← setupProject
+  let elsewhere ← setupProject
+  let issue ← addOpenIssue home.id "stays put"
+  let env := { baseEnv [manageIssuesPerm] with projectId := some home.id }
+  let r ← evalProjectTool env (.updateIssue issue.id none none none none none (some elsewhere.id))
+  let after ← loadIssue home.id issue.id
+  cleanup home (← loadIssues home.id)
+  cleanup elsewhere #[]
+  TestM.assert (jsonContains r "outside this task's project subtree")
+    "a destination outside the subtree should be refused"
+  -- Still directly under its own project, which reports as no Orchestra parent — see the
+  -- cycle test above.
+  TestM.assertEqual (after.bind (·.parentId) |>.map (·.val)) none
+    (msg := "and the issue must not have moved")
 
 @[test]
 def claimAndListOpenInteract : Test := do

@@ -80,6 +80,18 @@ instance : FromJson Repository where
     let s ← FromJson.fromJson? (α := String) j
     Repository.parse s |>.mapError id
 
+/-- Decode an optional field, distinguishing "absent" from "present but malformed".
+
+    `getObjValAs? … |>.toOption` collapses both into `none`, which is wrong for fields whose
+    absence changes what a task *is*: a typo'd `"upstream": "ownername"` would stop being a
+    parse failure and silently become a repository-less task. Absent is `none`; present and
+    unparseable is a hard error, so the entry is rejected exactly as it was before the field
+    became optional. -/
+def getOptObjValAs? (α) [FromJson α] (j : Json) (key : String) : Except String (Option α) :=
+  match j.getObjVal? key with
+  | .error _ => .ok none
+  | .ok v    => (FromJson.fromJson? (α := α) v).map some
+
 inductive TaskMode where
   | fork
   | pr
@@ -245,13 +257,18 @@ partial def ResultType.valueFromJson : (t : ResultType) → Json → Except Stri
 
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
-  upstream : Repository
-  fork : Repository
+  /-- The repository the task works against. `none` for a repository-independent task:
+      nothing is cloned, no GitHub token is minted, and the agent runs in a scratch
+      directory with no credentials. Must be set together with `fork`. -/
+  upstream : Option Repository := none
+  /-- See `upstream`. Must be set together with it. -/
+  fork : Option Repository := none
   /-- Legacy mode field (deprecated). Use `tools` instead.
       If `tools` is absent, this field is used to derive the allowed tools:
       - `fork` → no tools
-      - `pr`   → `["create_pr"]` -/
-  mode : TaskMode
+      - `pr`   → `["create_pr"]`
+      `none` on a repository-independent task, which has no repository tools to grant. -/
+  mode : Option TaskMode := none
   prompt : String
   agent : Option String := none
   systemPrompt : Option String := none
@@ -378,9 +395,9 @@ instance : FromJson Task where
   fromJson? j := do
     let i          := j.getObjValAs? ResultType "input_type"  |>.toOption |>.getD .unit
     let o          := j.getObjValAs? ResultType "output_type" |>.toOption |>.getD .unit
-    let upstream   ← j.getObjValAs? Repository "upstream"
-    let fork       ← j.getObjValAs? Repository "fork"
-    let mode       ← j.getObjValAs? TaskMode "mode"
+    let upstream   ← getOptObjValAs? Repository j "upstream"
+    let fork       ← getOptObjValAs? Repository j "fork"
+    let mode       ← getOptObjValAs? TaskMode j "mode"
     let prompt     ← j.getObjValAs? String "prompt"
     let agent      := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption

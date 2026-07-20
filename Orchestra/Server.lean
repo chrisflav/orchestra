@@ -13,15 +13,22 @@ namespace Orchestra.Server
 
 /-- Mutable state for the server, shared with request handlers. -/
 structure State where
-  upstream : Repository
-  fork : Repository
+  /-- The repository this task works against. `none` for a repository-independent task,
+      in which case the repository tools (`create_pr`, `comment`, `get_pr_comments`) are
+      neither advertised nor answered. -/
+  upstream : Option Repository := none
+  /-- See `upstream`. -/
+  fork : Option Repository := none
   /-- Optional tools enabled for this run.
-      Always-available tools (health, refresh_token, get_pr_comments) are never in this list.
+      Always-available tools (health, and — given a repository — refresh_token and
+      get_pr_comments) are never in this list.
       Currently the only optional tool is `"create_pr"`. -/
   allowedTools : List String
   appId : Nat
   privateKeyPath : String
-  installationId : Nat
+  /-- GitHub App installation backing `refresh_token`. `none` when no token was minted,
+      which is the case for a repository-independent task. -/
+  installationId : Option Nat := none
   pat : String
   /-- Input type of the current task. When not `.unit`, the `get_task_input` tool is exposed. -/
   inputType : ResultType := .unit
@@ -92,14 +99,22 @@ private def alwaysAvailableTools : Array Json := #[
     ("name", "health"),
     ("description", "Check that the agent MCP server is running."),
     ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
-  ],
+  ]
+]
+
+/-- Advertised only when the task has a GitHub App installation behind it. A
+    repository-independent task mints no token, so there is nothing to refresh. -/
+private def refreshTokenToolDef : Json :=
   Json.mkObj [
     ("name", "refresh_token"),
     ("description", "Mint a fresh GitHub App installation token and return it. \
 Export it as GH_TOKEN to use it; it is not applied to the gh CLI for you, because other \
 tasks may be running in the same daemon and share that configuration."),
     ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
-  ],
+  ]
+
+/-- Advertised only when the task has a repository to read pull requests from. -/
+private def getPrCommentsToolDef : Json :=
   Json.mkObj [
     ("name", "get_pr_comments"),
     ("description", "Fetch review comments on a pull request from the upstream repository."),
@@ -122,7 +137,6 @@ tasks may be running in the same daemon and share that configuration."),
       ("required", .arr #["pr_number"])
     ])
   ]
-]
 
 private def optionalToolDefs : List (String × Json) := [
   ("create_pr", Json.mkObj [
@@ -262,15 +276,23 @@ private def toolsList (state : State) : Json :=
   -- Deduped by name: a tool may be listed under more than one permission group (an issue's
   -- comment thread is readable by workers and reviewers alike), and a task holding two of them
   -- would otherwise be offered the same tool twice.
+  let perms := Project.Tools.expandPerms state.allowedTools
   let project := (Project.Tools.toolDefs.filterMap fun (perm, name, def_) =>
-      if state.allowedTools.contains perm then some (name, def_) else none)
+      if perms.contains perm then some (name, def_) else none)
     |>.foldl (fun acc (name, def_) =>
         if acc.any (·.1 == name) then acc else acc ++ [(name, def_)]) []
     |>.map (·.2)
   let io := ioToolDefs state.inputType state.outputType
   let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
+  -- Withheld from a repository-independent task, which would only be able to refuse them.
+  -- The evaluator refuses them too: advertisement is not a security boundary, since an agent
+  -- can call a tool it was never offered.
+  let repoTools :=
+    (if state.installationId.isSome then #[refreshTokenToolDef] else #[]) ++
+    (if state.upstream.isSome then #[getPrCommentsToolDef] else #[])
   Json.mkObj [("tools",
-    .arr (alwaysAvailableTools ++ projectInfo ++ optional.toArray ++ project.toArray ++ io))]
+    .arr (alwaysAvailableTools ++ repoTools ++ projectInfo ++ optional.toArray ++
+          project.toArray ++ io))]
 
 -- Types
 
@@ -432,9 +454,15 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     return toolContent "ok"
   | .refreshToken =>
     log "tool refresh_token: creating new installation token"
+    -- Gated on the installation, not on the repository: this tool never touches one. A task
+    -- that minted no token has no installation to refresh.
+    let some installationId := state.installationId
+      | log "tool refresh_token: denied (no GitHub App installation for this task)"
+        return toolContent "this task has no GitHub App installation, so there is no token \
+          to refresh" (isError := true)
     try
       let jwt ← GitHub.createJWT state.appId state.privateKeyPath
-      let token ← GitHub.createInstallationToken jwt state.installationId
+      let token ← GitHub.createInstallationToken jwt installationId
       -- Returned to the calling agent only, never written to `~/.config/gh/hosts.yml`.
       -- This tool is reachable from inside any task's sandbox at any moment, so a global
       -- `gh auth login` here would swap the credentials out from under every other task
@@ -449,6 +477,14 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     if !state.allowedTools.contains "create_pr" then
       log "tool create_pr: denied (not in allowed tools)"
       return toolContent "PR creation is not enabled for this task" (isError := true)
+    let some upstream := state.upstream
+      | log "tool create_pr: denied (no repository for this task)"
+        return toolContent "this task runs without a repository, so it cannot open a pull \
+          request" (isError := true)
+    let some fork := state.fork
+      | log "tool create_pr: denied (no repository for this task)"
+        return toolContent "this task runs without a repository, so it cannot open a pull \
+          request" (isError := true)
     match target with
     | .upstream =>
       if state.pat.isEmpty then
@@ -456,23 +492,27 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         return toolContent
           "github.pat not set in config (required when target=upstream; pass target=\"fork\" to use the App token)"
           (isError := true)
-      log s!"tool create_pr [upstream]: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
+      log s!"tool create_pr [upstream]: {fork}:{head} -> {upstream} base={base} title={repr title}"
       try
-        let result ← GitHub.createPullRequest state.pat state.upstream
-          s!"{state.fork.owner}:{head}" base title body state.prLabels
+        let result ← GitHub.createPullRequest state.pat upstream
+          s!"{fork.owner}:{head}" base title body state.prLabels
         log s!"tool create_pr: ok: {result.trimAscii}"
         return toolContent result
       catch e =>
         log s!"tool create_pr: error: {e}"
         return toolContent (toString e) (isError := true)
     | .fork =>
-      log s!"tool create_pr [fork]: {state.fork}:{head} base={base} title={repr title}"
+      log s!"tool create_pr [fork]: {fork}:{head} base={base} title={repr title}"
+      let some installationId := state.installationId
+        | log "tool create_pr: error: no GitHub App installation for this task"
+          return toolContent "this task has no GitHub App installation, so it cannot mint a \
+            token to open the pull request with" (isError := true)
       try
         -- Mint a fresh installation token so the PR is attributed to the
         -- GitHub App, not the PAT owner.
         let jwt ← GitHub.createJWT state.appId state.privateKeyPath
-        let token ← GitHub.createInstallationToken jwt state.installationId
-        let result ← GitHub.createPullRequestOnRepo token state.fork
+        let token ← GitHub.createInstallationToken jwt installationId
+        let result ← GitHub.createPullRequestOnRepo token fork
           head base title body state.prLabels
         log s!"tool create_pr: ok: {result.trimAscii}"
         return toolContent result
@@ -482,8 +522,12 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
   | .getPrComments prNumber unresolvedOnly excludeOutdated =>
     log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
       exclude_outdated={excludeOutdated}"
+    let some upstream := state.upstream
+      | log "tool get_pr_comments: denied (no repository for this task)"
+        return toolContent "this task runs without a repository, so it has no pull request \
+          comments to read" (isError := true)
     try
-      let response ← GitHub.getPrReviewThreads state.upstream prNumber state.pat
+      let response ← GitHub.getPrReviewThreads upstream prNumber state.pat
       let text := GitHub.formatPrReviewThreads response unresolvedOnly excludeOutdated
       log "tool get_pr_comments: ok"
       return toolContent text
@@ -494,6 +538,10 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     if !state.allowedTools.contains "comment" then
       log "tool comment: denied (not in allowed tools)"
       return toolContent "comment tool is not enabled for this task" (isError := true)
+    let some upstream := state.upstream
+      | log "tool comment: denied (no repository for this task)"
+        return toolContent "this task runs without a repository, so it has nowhere to \
+          comment" (isError := true)
     match state.issueNumber with
     | none =>
       log "tool comment: no issue number configured"
@@ -501,42 +549,42 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     | some n =>
       match action with
       | .issue body =>
-        log s!"tool comment: posting to {state.upstream}#{n}"
+        log s!"tool comment: posting to {upstream}#{n}"
         try
-          let result ← GitHub.createIssueComment state.pat state.upstream n body
+          let result ← GitHub.createIssueComment state.pat upstream n body
           log "tool comment: ok"
           return toolContent result
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
       | .review body inlineComments =>
-        log s!"tool comment: posting review to {state.upstream}#{n} \
+        log s!"tool comment: posting review to {upstream}#{n} \
           ({inlineComments.size} inline comments)"
         try
-          let result ← GitHub.createPrReview state.pat state.upstream n body inlineComments
+          let result ← GitHub.createPrReview state.pat upstream n body inlineComments
           log "tool comment: ok"
           return toolContent result
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
       | .replyInline body cid =>
-        log s!"tool comment: replying to inline comment {cid} on {state.upstream}#{n}"
+        log s!"tool comment: replying to inline comment {cid} on {upstream}#{n}"
         try
-          let cidPr ← GitHub.getPrReviewCommentPrNumber state.pat state.upstream cid
+          let cidPr ← GitHub.getPrReviewCommentPrNumber state.pat upstream cid
           if cidPr ≠ n then
             log s!"tool comment: comment {cid} belongs to PR #{cidPr}, not #{n}"
             return toolContent s!"comment {cid} does not belong to issue #{n}" (isError := true)
-          let result ← GitHub.replyToPrReviewComment state.pat state.upstream n cid body
+          let result ← GitHub.replyToPrReviewComment state.pat upstream n cid body
           log "tool comment: ok"
           return toolContent result
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
       | .newInline comment =>
-        log s!"tool comment: new inline comment on {state.upstream}#{n} \
+        log s!"tool comment: new inline comment on {upstream}#{n} \
           {comment.path}:{comment.line} ({comment.side})"
         try
-          let result ← GitHub.createPrReviewComment state.pat state.upstream n
+          let result ← GitHub.createPrReviewComment state.pat upstream n
             comment.body comment.path comment.line comment.side
           log "tool comment: ok"
           return toolContent result
@@ -559,7 +607,7 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
   | .project call =>
     let env : Project.Tools.Env :=
       { claimManager  := state.claimManager
-      , allowedTools  := state.allowedTools
+      , allowedTools  := Project.Tools.expandPerms state.allowedTools
       , taskId        := state.taskId
       , agentBackend  := state.agentBackend
       , series        := state.series

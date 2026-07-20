@@ -88,7 +88,7 @@ private def mkUnboundEntry (id : String) (role : String) (project : Option Taxis
     (status : Queue.QueueStatus := .running) : Queue.QueueEntry :=
   let repo : Repository := { owner := "o", name := "r" }
   { id, createdAt := "2026-01-01T00:00:00Z", status
-  , upstream := repo, fork := repo, mode := .pr, prompt := ""
+  , upstream := some repo, fork := some repo, mode := some .pr, prompt := ""
   , role := some role, projectId := project, issueId := issue }
 
 @[test]

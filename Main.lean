@@ -182,7 +182,7 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
       | some run => run.id
       | none     => ""
     let seriesLabel := r.series.getD ""
-    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork.toString 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
+    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight ((r.fork.map (·.toString)).getD "-") 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 private def taskShowHandler (p : Parsed) : IO UInt32 := do
@@ -195,11 +195,11 @@ private def taskShowHandler (p : Parsed) : IO UInt32 := do
     let status := match r.status with
       | .running => "running" | .completed => "completed" | .failed => "failed"
       | .unfinished => "unfinished" | .cancelled => "cancelled"
-    let mode := match r.mode with | .fork => "fork" | .pr => "pr"
+    let mode := match r.mode with | some .fork => "fork" | some .pr => "pr" | none => "-"
     IO.println s!"ID:             {r.id}"
     IO.println s!"Created:        {r.createdAt}"
     IO.println s!"Status:         {status}"
-    IO.println s!"Fork:           {r.fork}"
+    IO.println s!"Fork:           {(r.fork.map (·.toString)).getD "(no repository)"}"
     IO.println s!"Upstream:       {r.upstream}"
     IO.println s!"Mode:           {mode}"
     IO.println s!"Series:         {r.series.getD "-"}"
@@ -645,10 +645,16 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       let allEntries ← Queue.loadAllEntries
       let some claim ← Queue.claimDecision ctx allEntries Repo.slotOccupant | return none
       let e := claim.entry
-      let occupied := slotMap.getD e.fork.toString #[]
       let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
-      Queue.saveEntry { e with status := .running, slot := some claim.slot }
-      activeSlots.modify (fun m => m.insert e.fork.toString (occupied.push claim.slot))
+      Queue.saveEntry { e with status := .running, slot := claim.slot }
+      -- Slot bookkeeping only applies to entries that took one. `totalActive` below is
+      -- unconditional: a repository-independent entry occupies a worker just like any other,
+      -- and `parallelLimit` is what bounds it.
+      match e.fork, claim.slot with
+      | some f, some s =>
+        let occupied := slotMap.getD f.toString #[]
+        activeSlots.modify (fun m => m.insert f.toString (occupied.push s))
+      | _, _ => pure ()
       totalActive.modify (· + 1)
       if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
       if e.continuesFrom.isSome && claim.resumeFrom.isNone then
@@ -658,11 +664,17 @@ its workspace; it will start from a clean checkout."
     finally
       claimMutex.unlock
   -- Helper: release the slot held by a completed entry.
-  let releaseEntry (entry : Queue.QueueEntry) (slot : Nat) : IO Unit := do
+  let releaseEntry (entry : Queue.QueueEntry) (slot : Option Nat) : IO Unit := do
     claimMutex.lock
     try
-      let occupied := (← activeSlots.get).getD entry.fork.toString #[]
-      activeSlots.modify (fun m => m.insert entry.fork.toString (occupied.filter (· != slot)))
+      -- Mirrors the claim side: only entries that took a slot give one back. The
+      -- `totalActive` decrement stays unconditional — missing it would permanently shrink
+      -- the worker pool for the lifetime of the daemon.
+      match entry.fork, slot with
+      | some f, some s =>
+        let occupied := (← activeSlots.get).getD f.toString #[]
+        activeSlots.modify (fun m => m.insert f.toString (occupied.filter (· != s)))
+      | _, _ => pure ()
       totalActive.modify (fun t => if t > 0 then t - 1 else 0)
       if !TaskRunner.backendIsParallelSafe entry.backend then exclusiveActive.set false
     finally
@@ -672,7 +684,7 @@ its workspace; it will start from a clean checkout."
   -- slot: index of the per-repo task slot reserved for this entry by `claimNextEntry`.
   -- The slot directory is prepared (created if absent, otherwise reset to a clean default
   -- branch) inside the try below. The slot is released by `runEntry`, which wraps this.
-  let runEntryBody (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
+  let runEntryBody (entry : Queue.QueueEntry) (slot : Option Nat) (tokenId : Nat)
       (resumeFrom : Option String) : IO Unit := do
     let taskToken ← Std.CancellationToken.new
     activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
@@ -743,7 +755,7 @@ its workspace; it will start from a clean checkout."
       let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
         (cancelToken := some taskToken) (interactive := false)
-        (slotOverride := some { slot, occupant := some entry.id, resumeFrom })
+        (slotOverride := slot.map (fun s => { slot := s, occupant := some entry.id, resumeFrom }))
       removeToken
       -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
       -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.
@@ -779,7 +791,7 @@ its workspace; it will start from a clean checkout."
   -- cancellation token and registering it are themselves IO, and an exception there would
   -- otherwise escape past the release and leak the slot. A leaked slot is never recovered, so
   -- a handful of them permanently shrink the pool until the daemon is restarted.
-  let runEntry (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
+  let runEntry (entry : Queue.QueueEntry) (slot : Option Nat) (tokenId : Nat)
       (resumeFrom : Option String) : IO Unit := do
     try runEntryBody entry slot tokenId resumeFrom
     finally releaseEntry entry slot
@@ -927,6 +939,23 @@ its workspace; it will start from a clean checkout."
                   IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} for \
                     {scope} ({label}) → {entry.id}"
               continue
+            | .managerDispatcher _ =>
+              -- The simplest of the three: nothing is bound, so there is no project to load, no
+              -- target to resolve and no claim protocol to run. The role is global by
+              -- definition, so it is looked up among the global roles alone.
+              let roleName := vars.find? (·.1 == "role_name") |>.map (·.2) |>.getD ""
+              let some role := (← Project.loadGlobalRoles).find? (·.name == roleName)
+                | IO.eprintln s!"  Listener '{lcfg.name}': no global role '{roleName}'; skipping"
+                  continue
+              if !role.repoless then
+                IO.eprintln s!"  Listener '{lcfg.name}': manager role '{roleName}' is not \
+                  marked repoless, but this dispatcher resolves no repository; set \
+                  \"repoless\": true on the role. Not dispatched."
+                continue
+              let entry ← Listener.buildManagerEntry role
+              Queue.saveEntry entry
+              IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} → {entry.id}"
+              continue
             | _ => pure ()
             if let some wfPath := liveCfg.action.workflowPath then
               -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
@@ -1061,7 +1090,7 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
       | .unfinished => "unfinished" | .cancelled => "cancelled"
     let concertLabel := e.concertId.getD ""
     let seriesLabel := e.series.getD ""
-    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork.toString 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
+    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight ((e.fork.map (·.toString)).getD "-") 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 private def listenerListHandler (_ : Parsed) : IO UInt32 := do
@@ -1136,7 +1165,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
       let status := if e.status == .running then "running" else "pending"
       let concertLabel := e.concertId.getD ""
       let seriesLabel := e.series.getD ""
-      IO.println s!"{padRight e.id 16} {padRight e.fork.toString 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
+      IO.println s!"{padRight e.id 16} {padRight ((e.fork.map (·.toString)).getD "-") 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
   -- Listener status
   let listenerConfigs ← Listener.loadAllListenerConfigs
   if !listenerConfigs.isEmpty then
@@ -1445,6 +1474,9 @@ private def migrateCmd : Cmd := `[Cli|
 ]
 
 -- All optional tool permission tokens recognised by --tools.
+-- `manage_all_issues` is deliberately absent from the `--tools all` expansion below: it lifts
+-- write scoping tracker-wide, which is a decision a role makes explicitly, not something
+-- "all" should hand out. Naming it directly in `--tools` still works.
 private def allOptionalTools : List String :=
   ["create_pr", "comment", "manage_issues", "work_issues", "review_issues"]
 
