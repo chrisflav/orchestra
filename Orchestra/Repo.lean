@@ -1,4 +1,5 @@
 import Orchestra.Config
+import Std.Data.HashMap
 import Std.Sync
 
 namespace Orchestra.Repo
@@ -25,13 +26,27 @@ private def credentialHelperScript : String :=
   "!f() { if [ -n \"$GH_TOKEN\" ]; then echo username=x-access-token; \
 echo \"password=$GH_TOKEN\"; else gh auth git-credential \"$@\"; fi; }; f"
 
+/-- Config key the helper is installed under.
+
+    Deliberately scoped to `https://github.com` rather than the bare `credential.helper`. The
+    helper hands `$GH_TOKEN` to whoever invokes it, and the slot it is installed in is mounted
+    read-write into the agent's sandbox — so under the bare key a `git push
+    https://elsewhere.example/x`, whether a typo or a URL an agent was talked into, would ship
+    the installation token to that host. Git matches this key against the remote's URL and
+    simply does not invoke the helper for anything else, which is a stronger guarantee than
+    parsing the `host=` line inside the script. -/
+private def credentialConfigKey : String :=
+  "credential.https://github.com.helper"
+
 /-- `-c` overrides installing `credentialHelperScript` for a single `git` invocation.
-    The empty first value clears any helper inherited from `~/.gitconfig`, so a stale global
-    helper left by an earlier `gh auth setup-git` cannot take precedence and feed git a
-    different task's token. -/
+    The empty values clear any helper inherited from `~/.gitconfig` — under either the bare or
+    the scoped key — so a stale global helper left by an earlier `gh auth setup-git` cannot
+    take precedence and feed git a different task's token. -/
 private def credentialArgs (token : Option String) : Array String :=
   if token.isNone then #[]
-  else #["-c", "credential.helper=", "-c", s!"credential.helper={credentialHelperScript}"]
+  else #["-c", "credential.helper=",
+         "-c", s!"{credentialConfigKey}=",
+         "-c", s!"{credentialConfigKey}={credentialHelperScript}"]
 
 private def runGit (args : Array String) (cwd : Option System.FilePath := none)
     (token : Option String := none) : IO String := do
@@ -88,9 +103,14 @@ private def githubUrl (repo : Repository) : String :=
     Repository-local rather than global, for two reasons. `gh auth setup-git` writes
     `~/.gitconfig`, which every concurrent task shares. And the sandboxed agent needs a
     helper too — it pushes from inside the sandbox with the `GH_TOKEN` that `Sandbox` injects
-    for its own task, and the repository is mounted while `~/.gitconfig` may not be. -/
+    for its own task, and the repository is mounted while `~/.gitconfig` may not be.
+
+    Installed under `credentialConfigKey`, so it only ever fires for github.com remotes. -/
 private def configureCredentialHelper (repoPath : System.FilePath) : IO Unit := do
-  try runGit' #["config", "credential.helper", credentialHelperScript] repoPath
+  -- Drop a bare `credential.helper` a previous version of orchestra installed here: it is
+  -- unscoped, so leaving it behind would keep offering the token to any host.
+  try runGit' #["config", "--unset-all", "credential.helper"] repoPath catch _ => pure ()
+  try runGit' #["config", credentialConfigKey, credentialHelperScript] repoPath
   catch e =>
     IO.eprintln s!"  Warning: could not configure the credential helper in {repoPath}: {e}"
 
@@ -107,7 +127,9 @@ private def excludeOrchestraArtifacts (repoPath : System.FilePath) : IO Unit := 
     IO.FS.createDirAll infoDir
     let excludePath := infoDir / "exclude"
     let existing ← try IO.FS.readFile excludePath catch _ => pure ""
-    let marker := "# orchestra"
+    -- Specific enough that a repository mentioning orchestra in its own exclude file for
+    -- some other reason does not read as "already done" and suppress the write.
+    let marker := "# orchestra: init-hook markers"
     -- `splitOn` yields one piece exactly when the marker is absent; appending is idempotent.
     if (existing.splitOn marker).length == 1 then
       IO.FS.writeFile excludePath
@@ -201,6 +223,56 @@ def slotPath (fork : Repository) (slot : Nat) : IO System.FilePath := do
 /-- Return true if `path` is a git repository with a real `.git` directory. -/
 private def isGitRepo (path : System.FilePath) : IO Bool :=
   (path / ".git" / "config").pathExists
+
+/-- File recording which task's working tree currently sits in a slot.
+
+    Kept under `.git/` rather than in the working tree so that `resetSlot`'s `git clean` does
+    not remove it and the agent never sees it in `git status`. -/
+private def slotOccupantPath (slot : System.FilePath) : System.FilePath :=
+  slot / ".git" / "orchestra-occupant"
+
+/-- The task whose working tree currently sits in slot `slot` of `fork`, if it is known.
+
+    `none` covers a slot that does not exist yet, one created before this bookkeeping
+    existed, and one whose marker could not be read — all of which mean the same thing to a
+    caller: do not assume the tree is anybody's in particular. -/
+def slotOccupant (fork : Repository) (slot : Nat) : IO (Option String) := do
+  let path := slotOccupantPath (← slotPath fork slot)
+  try
+    let s := (← IO.FS.readFile path).trimAscii.toString
+    return if s.isEmpty then none else some s
+  catch _ => return none
+
+/-- Record `occupant` as the owner of the tree now sitting in `slot`. -/
+private def setSlotOccupant (slot : System.FilePath) (occupant : Option String) : IO Unit := do
+  let path := slotOccupantPath slot
+  try
+    match occupant with
+    | some o => IO.FS.writeFile path o
+    | none   => IO.FS.removeFile path
+  catch e =>
+    -- Losing the marker is not fatal on its own: a slot with no recorded occupant reads as
+    -- "provenance unknown", which makes a later continuation reset rather than resume — the
+    -- safe direction.
+    if occupant.isSome then
+      IO.eprintln s!"  Warning: could not record the slot occupant in {slot}: {e}"
+
+/-- Which slot a task runs in, and what should become of the tree already sitting there. -/
+structure SlotAssignment where
+  /-- Index of the per-repo clone slot. -/
+  slot : Nat
+  /-- Identifier stamped into the slot once it is prepared, naming this task as the owner of
+      the working tree it leaves behind. A later continuation checks it before concluding the
+      tree is still the one its predecessor left. -/
+  occupant : Option String := none
+  /-- When set, keep the working tree instead of resetting it — but only if the slot's
+      recorded occupant is still this identifier. Slots are reused across tasks, so a
+      predecessor's slot being *free* is not evidence that its tree is still there: an
+      unrelated task may have taken the slot and reset it in between. Resuming onto that
+      tree would hand the agent someone else's branch and working state while its context
+      describes edits that are gone. -/
+  resumeFrom : Option String := none
+  deriving Inhabited
 
 /-- Serialises first-time creation of the shared cache clone: two tasks starting at once
     on a never-cloned repository would otherwise both run `gh repo clone` into the same
@@ -304,11 +376,13 @@ private def resetSlot (slotPath : System.FilePath) (token : Option String) : IO 
     Slots are reused across tasks rather than created per task so that gitignored build
     output survives; see `resetSlot`.
 
-    `reset := false` keeps the working tree exactly as the previous task left it. The queue
+    `assign.resumeFrom` keeps the working tree exactly as the previous task left it. The queue
     passes this for a `continuesFrom` entry, whose agent resumes a conversation full of
-    references to files it had just edited and would otherwise wake up to a wiped tree. -/
-def ensureSlot (fork upstream : Repository) (slot : Nat) (token : Option String := none)
-    (reset : Bool := true) : IO System.FilePath := do
+    references to files it had just edited and would otherwise wake up to a wiped tree. The
+    tree is only kept when the slot's recorded occupant still matches; see `SlotAssignment`. -/
+def ensureSlot (fork upstream : Repository) (assign : SlotAssignment)
+    (token : Option String := none) : IO System.FilePath := do
+  let slot := assign.slot
   let mainPath ← ensureCacheClone fork upstream token
   let sPath ← slotPath fork slot
   if ← isGitRepo sPath then
@@ -343,15 +417,39 @@ def ensureSlot (fork upstream : Repository) (slot : Nat) (token : Option String 
     runGit' #["remote", "add", "upstream", githubUrl upstream] sPath
   configureCredentialHelper sPath
   excludeOrchestraArtifacts sPath
-  if reset then
-    resetSlot sPath token
+  -- A continuation only inherits the tree if the slot still holds *its predecessor's* tree.
+  -- Slots are pooled and reset between tasks, so "the slot is free" is not the same claim.
+  let keepTree ← match assign.resumeFrom with
+    | none      => pure false
+    | some pred =>
+      match ← slotOccupant fork slot with
+      | some cur =>
+        if cur == pred then pure true
+        else do
+          IO.eprintln s!"  Warning: slot {slot} was last used by {cur}, not {pred}; \
+resetting it. The resumed agent will not find the working tree its session refers to."
+          pure false
+      | none => do
+        IO.eprintln s!"  Warning: slot {slot} has no recorded occupant, so the tree {pred} \
+left cannot be confirmed; resetting it. The resumed agent will not find the working tree \
+its session refers to."
+        pure false
+  if keepTree then
+    let pred := assign.resumeFrom.getD "?"
+    IO.println s!"  Keeping slot {slot} as-is (continuation of {pred})"
   else
-    IO.println s!"  Keeping slot {slot} as-is (continuation task)"
+    resetSlot sPath token
+  -- Stamped after preparation, so a task that dies during `resetSlot` does not leave the slot
+  -- claiming to hold a tree it never produced.
+  setSlotOccupant sPath assign.occupant
   return sPath
 
 /-- Split a slot directory name into the repository it belongs to, e.g.
-    `mathlib4-slot-2` ↦ `mathlib4`. Returns none for a non-slot directory. -/
-private def slotBaseName (name : String) : Option String :=
+    `mathlib4-slot-2` ↦ `mathlib4`. Returns none for a non-slot directory.
+
+    Only the trailing `-slot-<digits>` counts, so a repository genuinely named
+    `my-slot-repo` is not mistaken for slot `repo` of some repository `my`. -/
+def slotBaseName (name : String) : Option String :=
   let parts := name.splitOn "-slot-"
   if parts.length < 2 then none
   else
@@ -372,13 +470,19 @@ def listClones : IO (Array (System.FilePath × Array System.FilePath)) := do
     -- keeps `cleanup list` from throwing on `readDir`.
     if !(← ownerPath.isDir) then continue
     let entries ← ownerPath.readDir
+    -- Group the slots by the repository they belong to in one pass, rather than rescanning
+    -- the owner directory once per repository.
+    let slotsByRepo := entries.foldl (init := ({} : Std.HashMap String (Array System.FilePath)))
+      fun m s =>
+        match slotBaseName s.fileName with
+        | some base => m.insert base ((m.getD base #[]).push s.path)
+        | none      => m
     for e in entries do
       let name := e.fileName
       -- Slots are listed under their repository, never as repositories of their own.
       if (slotBaseName name).isSome then continue
       if !(← isGitRepo e.path) then continue
-      let slots := entries.filterMap fun s =>
-        if slotBaseName s.fileName == some name then some s.path else none
+      let slots := slotsByRepo.getD name #[]
       result := result.push (e.path, slots.qsort (fun a b => decide (a.toString < b.toString)))
   return result
 

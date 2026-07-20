@@ -312,11 +312,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (cancelToken : Option Std.CancellationToken := none)
     (interactive : Bool := true)
     (interactiveAgent : Bool := false)
-    -- When set, run in per-repo clone slot `slot` instead of the shared cache clone.
-    -- `reset` false keeps the working tree as the previous task left it, for a continuation.
+    -- When set, run in the per-repo clone slot it names instead of the shared cache clone.
     -- The slot is prepared here rather than by the caller because preparing it (cloning,
     -- fetching upstream) needs the installation token, which is only minted below.
-    (slotOverride : Option (Nat × Bool) := none) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
+    (slotOverride : Option Repo.SlotAssignment := none) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
@@ -407,10 +406,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     return ((taskId, false), none, none)
   -- 2. Prepare the task slot, or clone / update the shared repo when running outside the queue
   let repoPath ← match slotOverride with
-    | some (slot, reset) =>
-      IO.println s!"Preparing slot {slot} for {ioTask.fork}..."
-      let p ← Repo.ensureSlot ioTask.fork ioTask.upstream slot (token := some token)
-        (reset := reset)
+    | some assign =>
+      IO.println s!"Preparing slot {assign.slot} for {ioTask.fork}..."
+      let p ← Repo.ensureSlot ioTask.fork ioTask.upstream assign (token := some token)
       IO.println s!"  Slot at {p}"
       pure p
     | none   =>
@@ -587,7 +585,7 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (cancelToken : Option Std.CancellationToken := none)
     (interactive : Bool := true)
     (interactiveAgent : Bool := false)
-    (slotOverride : Option (Nat × Bool) := none) : IO (String × Bool × Option Lean.Json) := do
+    (slotOverride : Option Repo.SlotAssignment := none) : IO (String × Bool × Option Lean.Json) := do
   let ((taskId, usageLimitHit), _, outputJson) ←
     runIOTask appConfig task.ioTask idx debug default
       continuesFrom series cancelToken interactive interactiveAgent slotOverride

@@ -136,7 +136,7 @@ private def prepareHandler (p : Parsed) : IO UInt32 := do
   let repoPath ← Repo.ensureCloned fork upstream
   IO.println repoPath.toString
   for slot in List.range slots do
-    let slotPath ← Repo.ensureSlot fork upstream slot
+    let slotPath ← Repo.ensureSlot fork upstream { slot }
     -- Run the repo's init hook now rather than inside the first task that lands here, so a
     -- toolchain install or a cold `lake exe cache get` is paid up front instead of counting
     -- against that task's budget and wall clock.
@@ -494,11 +494,9 @@ private def handleSocketRequest
   try conn.close catch _ => pure ()
 
 private def queueStartHandler (p : Parsed) : IO UInt32 := do
-  let configPath          := p.flag? "config" |>.map (·.as! String)
-  let debug               := p.hasFlag "debug"
-  let background          := p.hasFlag "background"
-  let parallelLimit       := max 1 (p.flag? "parallel"          |>.map (·.as! Nat) |>.getD 1)
-  let parallelLimitPerRepo := max 1 (p.flag? "parallel-per-repo" |>.map (·.as! Nat) |>.getD 1)
+  let configPath           := p.flag? "config" |>.map (·.as! String)
+  let debug                := p.hasFlag "debug"
+  let background           := p.hasFlag "background"
   -- Background mode: re-exec as a detached daemon and exit
   if background then
     if ← Queue.daemonRunning then
@@ -550,6 +548,13 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   Queue.cancelStaleConcertEntries
   Queue.cancelStaleRunningConcerts
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  -- Concurrency limits: the `queue` block in config.json, overridden by the flags for a single
+  -- run. Resolved here rather than at the top of the handler because it needs the config, and
+  -- `max 1` because zero workers would be a daemon that silently never runs anything.
+  let parallelLimit := max 1 <|
+    (p.flag? "parallel" |>.map (·.as! Nat)).getD appConfig.queue.parallel
+  let parallelLimitPerRepo := max 1 <|
+    (p.flag? "parallel-per-repo" |>.map (·.as! Nat)).getD appConfig.queue.parallelPerRepo
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
   -- Map of (id → cancel token) for all currently running tasks (one per worker).
@@ -589,51 +594,38 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   --              `IO.Ref.modifyGet` is not atomic across workers: two of them racing on it
   --              are handed the same id, and `removeToken` then drops the other task's
   --              token, leaving `queue cancel` unable to reach a running task.
-  --   reuseTree  true when this entry continues a previous task and got that task's slot
-  --              back, so the working tree must be left exactly as it was.
+  --   resumeFrom set when this entry continues a previous task and got that task's slot back
+  --              *with its tree intact*, naming the predecessor entry.
+  -- The decision itself lives in `Queue.claimDecision`, which is a function of its inputs and
+  -- therefore testable; this wrapper is only the locking and the bookkeeping around it.
   -- Both helpers unlock via `finally`: reading the queue directory and saving an entry
   -- are file operations that can throw, and leaving the mutex held would wedge every
   -- worker in the pool for the rest of the daemon's life.
-  let claimNextEntry : IO (Option (Queue.QueueEntry × Nat × Nat × Bool)) := do
+  let claimNextEntry : IO (Option (Queue.Claim × Nat)) := do
     claimMutex.lock
     try
-      let total ← totalActive.get
-      if total >= parallelLimit then return none
-      -- Once a task on a backend that needs the daemon to itself is running, nothing else
-      -- may start alongside it.
-      if ← exclusiveActive.get then return none
       let slotMap ← activeSlots.get
-      let counts := slotMap.fold (fun m k v => m.insert k v.size) ({} : Std.HashMap String Nat)
+      let ctx : Queue.ClaimContext := {
+        occupiedSlots   := slotMap
+        total           := ← totalActive.get
+        exclusiveActive := ← exclusiveActive.get
+        parallelLimit
+        perRepoLimit    := parallelLimitPerRepo
+        parallelSafe    := TaskRunner.backendIsParallelSafe
+      }
       let allEntries ← Queue.loadAllEntries
-      let candidates := Queue.pendingCandidates allEntries counts parallelLimitPerRepo
-      -- Resolve an entry to the slot it would run in, or `none` if it cannot start yet.
-      -- A continuation must land back in the slot its predecessor used: `--resume` restores
-      -- the conversation but not the filesystem, so an agent resuming somewhere else wakes up
-      -- with a tree that has none of the edits its context refers to. Agent CLIs also key
-      -- their session store by working directory, so a different slot loses the session
-      -- outright.
-      let placement := fun (e : Queue.QueueEntry) =>
-        -- A backend that keeps per-run state at a fixed global path only starts when nothing
-        -- else is running. `total == 0` means the daemon is idle.
-        if !TaskRunner.backendIsParallelSafe e.backend && total > 0 then none
-        else
-          let occupied := slotMap.getD e.fork.toString #[]
-          let preferred := e.continuesFrom.bind fun tid =>
-            allEntries.find? (·.taskId == some tid) |>.bind (·.slot)
-          Queue.chooseSlot occupied parallelLimitPerRepo preferred
-      -- Take the best candidate that can actually start. Skipping past one that cannot —
-      -- rather than giving up for this round — is what keeps a continuation waiting on a
-      -- long-running task from stalling every other repository behind it.
-      let some (e, slot, reuseTree) :=
-          candidates.findSome? (fun e => (placement e).map (fun (s, r) => (e, s, r)))
-        | return none
+      let some claim ← Queue.claimDecision ctx allEntries Repo.slotOccupant | return none
+      let e := claim.entry
       let occupied := slotMap.getD e.fork.toString #[]
       let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
-      Queue.saveEntry { e with status := .running, slot := some slot }
-      activeSlots.modify (fun m => m.insert e.fork.toString (occupied.push slot))
+      Queue.saveEntry { e with status := .running, slot := some claim.slot }
+      activeSlots.modify (fun m => m.insert e.fork.toString (occupied.push claim.slot))
       totalActive.modify (· + 1)
       if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
-      return some (e, slot, tokenId, reuseTree)
+      if e.continuesFrom.isSome && claim.resumeFrom.isNone then
+        IO.eprintln s!"  Note: queue entry {e.id} continues a previous task but no longer has \
+its workspace; it will start from a clean checkout."
+      return some (claim, tokenId)
     finally
       claimMutex.unlock
   -- Helper: release the slot held by a completed entry.
@@ -652,7 +644,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   -- The slot directory is prepared (created if absent, otherwise reset to a clean default
   -- branch) inside the try below. The slot is released by `runEntry`, which wraps this.
   let runEntryBody (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
-      (reuseTree : Bool) : IO Unit := do
+      (resumeFrom : Option String) : IO Unit := do
     let taskToken ← Std.CancellationToken.new
     activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
     let removeToken : IO Unit :=
@@ -713,13 +705,16 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       -- path as any other task failure: the entry is marked failed, a pre-claimed issue is
       -- released, and a concert waiting on this step is signalled instead of hanging until
       -- the daemon shuts down.
-      -- `reset := false` for a continuation that got its predecessor's slot back: the
-      -- resumed agent's context describes a tree it expects to still be there.
+      -- `resumeFrom` for a continuation that got its predecessor's slot back: the resumed
+      -- agent's context describes a tree it expects to still be there. `ensureSlot` re-checks
+      -- that the tree really is the predecessor's before keeping it.
+      -- `occupant` stamps this entry as the owner of the tree it leaves behind, which is what
+      -- a later continuation of *this* task will check.
       -- `runTask` prepares the slot itself, since doing so needs the installation token.
       let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
         (cancelToken := some taskToken) (interactive := false)
-        (slotOverride := some (slot, !reuseTree))
+        (slotOverride := some { slot, occupant := some entry.id, resumeFrom })
       removeToken
       -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
       -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.
@@ -756,8 +751,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   -- otherwise escape past the release and leak the slot. A leaked slot is never recovered, so
   -- a handful of them permanently shrink the pool until the daemon is restarted.
   let runEntry (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
-      (reuseTree : Bool) : IO Unit := do
-    try runEntryBody entry slot tokenId reuseTree
+      (resumeFrom : Option String) : IO Unit := do
+    try runEntryBody entry slot tokenId resumeFrom
     finally releaseEntry entry slot
   -- Load listener configs and spawn one fiber per listener.
   let listenerConfigs ← Listener.loadAllListenerConfigs
@@ -959,7 +954,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       try
         match ← claimNextEntry with
         | none => IO.sleep 1000
-        | some (entry, slot, tokenId, reuseTree) => runEntry entry slot tokenId reuseTree
+        | some (claim, tokenId) =>
+          runEntry claim.entry claim.slot tokenId claim.resumeFrom
       catch e =>
         IO.eprintln s!"Queue worker error: {e}"
         IO.sleep 1000
@@ -1262,9 +1258,12 @@ private def queueStartCmd : Cmd := `[Cli|
     c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
     d, debug; "Print the landrun command before executing it"
     b, background; "Run the daemon in the background, detached from the terminal"
-    parallel : Nat; "Maximum number of tasks to run in parallel (default: 1). Backends that \
-keep per-run state at a fixed global path (pi, opencode) always run exclusively"
-    "parallel-per-repo" : Nat; "Maximum parallel tasks per repository; each runs in its own clone (default: 1). \
+    parallel : Nat; "Maximum number of tasks to run in parallel. Overrides queue.parallel in \
+config.json (default: 1). Backends that keep per-run state at a fixed global path (pi, \
+opencode) always run exclusively, so they start only while the daemon is otherwise idle and \
+may wait a long time under steady load"
+    "parallel-per-repo" : Nat; "Maximum parallel tasks per repository; each runs in its own clone. \
+Overrides queue.parallel_per_repo in config.json (default: 1). \
 Run `orchestra prepare --slots N` first so the clones are warm"
 ]
 

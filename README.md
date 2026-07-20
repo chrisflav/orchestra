@@ -60,7 +60,11 @@ Create `~/.config/orchestra/config.json`:
   },
   "plugin_dirs": [],
   "claude_token": "...",
-  "authorized_users": ["<GitHub_username>"]
+  "authorized_users": ["<GitHub_username>"],
+  "queue": {
+    "parallel": 4,
+    "parallel_per_repo": 2
+  }
 }
 ```
 
@@ -73,6 +77,28 @@ sessions lapse frequently; a stable token avoids repeated re-authentication.
 Obtain one by running `claude setup-token` and copy the token value here. When
 set, it is passed to the agent as the `CLAUDE_CODE_OAUTH_TOKEN` environment
 variable.
+
+The `queue` block sets how many tasks the daemon runs at once. Both keys default
+to `1`, which is the serial behaviour, and `orchestra queue start --parallel N` /
+`--parallel-per-repo N` override them for a single run.
+
+`parallel_per_repo` is capped separately because concurrent tasks on the same
+repository each need their own clone — a *slot* — so that two agents can create
+the same branch name without git refusing. Raising it costs one working tree per
+slot; the git history itself is hardlinked from a shared cache clone, so it is
+the checkout and its build output that take the space, not the objects. Run
+
+```sh
+orchestra prepare <upstream> <fork> --slots 2
+```
+
+with `--slots` matching `parallel_per_repo`, so each slot's init hook is paid up
+front rather than charged to whichever task lands there first.
+
+Two backends always run exclusively regardless of these settings: `pi` and
+`opencode` keep per-run state at a fixed path under `$HOME`, so a second
+concurrent run would read the first one's MCP configuration. They start only
+while the daemon is otherwise idle.
 
 ## authentication sources
 

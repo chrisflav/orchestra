@@ -328,7 +328,12 @@ def pendingCandidates (all : Array QueueEntry) (activePerRepo : Std.HashMap Stri
       occupying task will finish, so waiting cannot deadlock.
     * A continuation whose recorded slot is beyond the current limit (the daemon was restarted
       with a smaller `--parallel-per-repo`) falls back to a free slot and resets it, since the
-      tree it wanted is not reachable any more. -/
+      tree it wanted is not reachable any more.
+
+    `preferred` means "the predecessor's slot, *and* its tree is still sitting there". The
+    caller is responsible for that second half — see `claimDecision`. Passing a slot whose
+    tree has since been reset by an unrelated task would make this function wait for a
+    workspace that no longer exists. -/
 def chooseSlot (occupied : Array Nat) (perRepoLimit : Nat) (preferred : Option Nat)
     : Option (Nat × Bool) :=
   let firstFree := (List.range perRepoLimit).find? (!occupied.contains ·)
@@ -338,6 +343,76 @@ def chooseSlot (occupied : Array Nat) (perRepoLimit : Nat) (preferred : Option N
     else if p < perRepoLimit then some (p, true)
     else firstFree.map (·, false)
   | none => firstFree.map (·, false)
+
+/-- Everything the daemon knows about its own occupancy when it goes to claim an entry.
+
+    Bundled into a structure so that the decision below is an ordinary function of its inputs
+    rather than a closure over the daemon's `IO.Ref`s, which makes the interesting cases —
+    exclusive backends, blocked continuations, per-repo limits — reachable from a test. -/
+structure ClaimContext where
+  /-- Fork key (owner/name) → slot indices currently in use for that repository. -/
+  occupiedSlots : Std.HashMap String (Array Nat)
+  /-- Number of tasks running across all repositories. -/
+  total : Nat
+  /-- Set while a backend that needs the daemon to itself is running. -/
+  exclusiveActive : Bool
+  /-- `--parallel`. -/
+  parallelLimit : Nat
+  /-- `--parallel-per-repo`. -/
+  perRepoLimit : Nat
+  /-- Whether a backend tolerates another task running beside it. Passed in rather than
+      imported: `TaskRunner` depends on this module, so the dependency cannot run the other
+      way, and the queue has no business knowing about agent backends anyway. -/
+  parallelSafe : Option String → Bool
+
+/-- The outcome of a successful claim. -/
+structure Claim where
+  entry : QueueEntry
+  /-- Slot the entry will run in. -/
+  slot : Nat
+  /-- Set when the entry is a continuation that got its predecessor's workspace back, naming
+      that predecessor. The slot must then be left exactly as it was. -/
+  resumeFrom : Option String := none
+
+/-- Pick the entry the daemon should start next, or `none` if nothing can start right now.
+
+    `slotOccupant fork slot` reports which entry's working tree currently sits in a slot. It
+    is consulted for continuations only, and it is what makes resuming safe: a predecessor's
+    slot being *free* does not mean the predecessor's tree is still in it, because slots are
+    pooled and an unrelated task may have taken it and reset it in between. Resuming onto that
+    tree would silently hand the agent someone else's branch and edits while its restored
+    conversation describes work that is gone — so when the occupant does not match, the
+    continuation is treated as an ordinary entry that resets whatever slot it lands in. -/
+def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
+    (slotOccupant : Repository → Nat → IO (Option String)) : IO (Option Claim) := do
+  if ctx.total >= ctx.parallelLimit then return none
+  -- Once a task on a backend that needs the daemon to itself is running, nothing else may
+  -- start alongside it.
+  if ctx.exclusiveActive then return none
+  let counts := ctx.occupiedSlots.fold (fun m k v => m.insert k v.size)
+    ({} : Std.HashMap String Nat)
+  let candidates := pendingCandidates all counts ctx.perRepoLimit
+  for e in candidates do
+    -- A backend that keeps per-run state at a fixed global path only starts when nothing else
+    -- is running. `total == 0` means the daemon is idle.
+    if !ctx.parallelSafe e.backend && ctx.total > 0 then continue
+    -- The predecessor entry, and the slot it recorded — the workspace this entry was queued
+    -- to build on.
+    let predecessor := e.continuesFrom.bind fun tid => all.find? (·.taskId == some tid)
+    let preferred ← match predecessor.bind (fun p => p.slot.map (p.id, ·)) with
+      | none => pure none
+      | some (predId, predSlot) =>
+        -- Confirm the predecessor's tree is still there before asking to wait for its slot.
+        if (← slotOccupant e.fork predSlot) == some predId then pure (some predSlot)
+        else pure none
+    let occupied := ctx.occupiedSlots.getD e.fork.toString #[]
+    let some (slot, reuseTree) := chooseSlot occupied ctx.perRepoLimit preferred | continue
+    return some {
+      entry := e
+      slot
+      resumeFrom := if reuseTree then predecessor.map (·.id) else none
+    }
+  return none
 
 /-- Return true if any entry created by `name` is currently pending or running. -/
 def hasActiveEntryForListener (name : String) : IO Bool := do
