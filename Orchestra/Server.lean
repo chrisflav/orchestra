@@ -95,7 +95,9 @@ private def alwaysAvailableTools : Array Json := #[
   ],
   Json.mkObj [
     ("name", "refresh_token"),
-    ("description", "Refresh the GitHub App installation token and reconfigure the gh CLI."),
+    ("description", "Mint a fresh GitHub App installation token and return it. \
+Export it as GH_TOKEN to use it; it is not applied to the gh CLI for you, because other \
+tasks may be running in the same daemon and share that configuration."),
     ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
   ],
   Json.mkObj [
@@ -433,7 +435,11 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     try
       let jwt ← GitHub.createJWT state.appId state.privateKeyPath
       let token ← GitHub.createInstallationToken jwt state.installationId
-      GitHub.setupGhAuth token
+      -- Returned to the calling agent only, never written to `~/.config/gh/hosts.yml`.
+      -- This tool is reachable from inside any task's sandbox at any moment, so a global
+      -- `gh auth login` here would swap the credentials out from under every other task
+      -- running in the daemon. The agent uses the value by exporting it as `GH_TOKEN`,
+      -- which is also how the sandbox supplied its original token.
       log "tool refresh_token: ok"
       return toolContent token
     catch e =>

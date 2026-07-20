@@ -241,6 +241,21 @@ private def statusLabelIds : IO StatusLabelIds := do
     statusLabelIdsRef.set (some ids)
     return ids
 
+/-- Whether an issue anchors a project: it carries `t-project`, or it has both a `repository` and
+    a `github-branch` artifact.
+
+    The single definition behind both `findIssue` (which project an issue belongs to) and
+    `projectRootOf` (what an agent may write to). They used to disagree — this one accepted only
+    `t-project` — so in a label-dispatched tree with no `t-project` anywhere, every agent-side
+    tool that resolves an issue reported it as not found, while write scoping happily anchored on
+    the artifacts. The artifact pair is the same marker the dispatcher already uses to decide
+    where an issue's target comes from, so treating it as a project boundary here is what makes
+    "the project this work belongs to" mean one thing across the codebase. -/
+private def anchorsProject (ids : StatusLabelIds) (detail : Orchestra.Taxis.IssueDetail) : Bool :=
+  detail.issue.labels.contains ids.project ||
+    (detail.attachedArtifacts.any (·.kind == "repository") &&
+     detail.attachedArtifacts.any (·.kind == "github-branch"))
+
 /-- The `IssueStatus` a taxis issue's `state` + `labels` represent. -/
 private def statusOf (ids : StatusLabelIds) (state : Orchestra.Taxis.IssueState) (labels : Array Orchestra.Taxis.LabelId) :
     IssueStatus :=
@@ -416,7 +431,7 @@ def saveIssue (i : Issue) : IO Unit := do
     Exists because `IssueStatus` is not a stored field: `.claimed` *is* this label (see
     `statusOf`). Dropping a claim by deleting its `session` artifact alone therefore leaves the
     issue reading as claimed forever, which hides it from every consumer that gates on `.open`
-    — the reviewer sweep (`Listener.awaitingReview`), the dispatcher (`workableIssues`) and
+    — the reviewer sweep (`Listener.classifyReview`), the dispatcher (`workableIssues`) and
     `list_issues_in_review`. `Project.forceRelease` calls this; `release` does not need it,
     since it writes a status through `saveIssue`.
 
@@ -476,8 +491,12 @@ def loadIssues (pid : Taxis.IssueId) : IO (Array Issue) := do
 
 /-- Find an issue by ID across all projects, without knowing which one in advance. Returns the
     owning project too, so callers can resolve `effectiveTarget`. Used by the CLI where users name
-    an issue without giving its project. Walks the issue's ancestor chain up to whichever ancestor
-    carries the `t-project` label. -/
+    an issue without giving its project, and by every agent-side tool that takes an issue id.
+
+    Walks the ancestor chain (the issue itself counts) to the nearest one that `anchorsProject`.
+    *Nearest*, so a sub-issue pinning its own `repository` + `github-branch` becomes the project
+    for everything beneath it rather than the `t-project` further up — matching `projectRootOf`,
+    which has always scoped writes that way. -/
 def findIssue (iid : Taxis.IssueId) : IO (Option (Project × Issue)) := do
   let cfg ← Orchestra.Taxis.getConfig
   let ids ← statusLabelIds
@@ -490,13 +509,15 @@ def findIssue (iid : Taxis.IssueId) : IO (Option (Project × Issue)) := do
         {maxAncestorDepth} levels; giving up (parent cycle?)"
       return none
     | fuel + 1 => do
-      match ← Orchestra.Taxis.getIssue cfg id with
+      -- Detail rather than the bare issue: the anchor test reads artifacts. Same number of round
+      -- trips, a little more per hop.
+      match ← Orchestra.Taxis.getIssueDetail cfg id with
       | .error _ => return none
-      | .ok raw =>
-        if raw.labels.contains ids.project then
-          return some (← toProject raw)
+      | .ok detail =>
+        if anchorsProject ids detail then
+          return some (← toProject detail.issue)
         else
-          match raw.parent with
+          match detail.issue.parent with
           | none => return none
           | some p => findProjectOf p fuel
   match ← Orchestra.Taxis.getIssueDetail cfg iid with
@@ -683,6 +704,16 @@ structure LabelDispatchSets where
   reviewable : Array (Issue × RepoTarget)
   /-- Issues in scope whose target could not be resolved, with the reason. -/
   gaps       : Array (Taxis.IssueId × TargetGap)
+  /-- Open issues carrying the label *directly*, rather than inheriting it — each one roots a
+      subtree. An unbound role (`always` trigger) is scoped to one of these: it has no issue of
+      its own to take a target or a project from, so the root supplies both, and the claims it
+      makes are swept against the root's descendants when its task ends.
+
+      Deliberately the labelled issue, not `Issue.projectId` — that is the ancestor carrying the
+      `repository` artifact (see `ArtifactTarget.repoOwner`), which is what a *bound* role gets
+      and may sit well above the label. A maintainer scoped there would be planning across
+      subtrees nobody labelled. -/
+  roots      : Array (Issue × RepoTarget)
 
 def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
   let cfg ← Orchestra.Taxis.getConfig
@@ -696,8 +727,11 @@ def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
   let mut work : Array (Issue × RepoTarget) := #[]
   let mut reviewable : Array (Issue × RepoTarget) := #[]
   let mut gaps : Array (Taxis.IssueId × TargetGap) := #[]
-  -- Walk the wider set once: workers are the leaf subset of it, and reviewables are those with a
-  -- PR attached, so both come out of the same fetches.
+  let mut roots : Array (Issue × RepoTarget) := #[]
+  -- Walk the wider set once: workers are the leaf subset of it, reviewables are those with a
+  -- PR attached, and roots are those carrying the label themselves, so all three come out of the
+  -- same fetches. `inScopeOpenIssues` is already open-only, which is the whole of the root test
+  -- besides carrying the label: a completed or abandoned root has nothing left to maintain.
   for raw in inScopeOpenIssues all label.id do
     match ← artifactTarget raw.id with
     | .error gap => gaps := gaps.push (raw.id, gap)
@@ -708,7 +742,8 @@ def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
       if let some issue ← loadIssue at'.repoOwner raw.id then
         if workIds.contains raw.id.val then work := work.push (issue, at'.target)
         if !issue.attachedPRs.isEmpty then reviewable := reviewable.push (issue, at'.target)
-  return some { work, reviewable, gaps }
+        if raw.labels.contains label.id then roots := roots.push (issue, at'.target)
+  return some { work, reviewable, gaps, roots }
 
 /-! ## Comments
 
@@ -771,11 +806,7 @@ def projectRootOf (iid : Taxis.IssueId) : IO Taxis.IssueId := do
       match ← Orchestra.Taxis.getIssueDetail cfg id with
       | .error _ => pure none
       | .ok detail =>
-        let arts := detail.attachedArtifacts
-        let anchors :=
-          detail.issue.labels.contains ids.project ||
-          (arts.any (·.kind == "repository") && arts.any (·.kind == "github-branch"))
-        if anchors then pure (some id)
+        if anchorsProject ids detail then pure (some id)
         else match detail.issue.parent with
           | none => pure none
           | some p => walk p fuel

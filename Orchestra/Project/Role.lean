@@ -30,6 +30,11 @@ inductive RoleTrigger where
   /-- Spawnable when the project has no open and no in-review issues
       (your "planner runs when there's nothing else to do" policy). -/
   | idle
+  /-- Spawnable whenever the role is under its cap, bound to no issue. For a role that holds
+      every hat at once: it decides for itself whether to plan, work or review, and claims any
+      issue it works on through `claim_issue` rather than being handed one. `pre_claim` is
+      meaningless here — there is no issue at spawn time to pre-claim. -/
+  | always
 deriving Repr, Inhabited, BEq, DecidableEq
 
 instance : ToJson RoleTrigger where
@@ -37,13 +42,16 @@ instance : ToJson RoleTrigger where
     | .hasOpenIssues     => "has_open_issues"
     | .hasInReviewIssues => "has_in_review_issues"
     | .idle              => "idle"
+    | .always            => "always"
 
 instance : FromJson RoleTrigger where
   fromJson?
     | .str "has_open_issues"      => .ok .hasOpenIssues
     | .str "has_in_review_issues" => .ok .hasInReviewIssues
     | .str "idle"                 => .ok .idle
-    | j => .error s!"unknown role trigger {j}; expected has_open_issues | has_in_review_issues | idle"
+    | .str "always"               => .ok .always
+    | j => .error s!"unknown role trigger {j}; \
+        expected has_open_issues | has_in_review_issues | idle | always"
 
 /-- Auto-dispatch policy for a role. Default `max := 0` means "off unless a
     project-dispatcher listener explicitly sets a cap" (Q2 decision). -/

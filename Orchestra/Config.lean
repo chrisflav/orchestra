@@ -1,10 +1,58 @@
 import Lean.Data.Json
 import Orchestra.Dirs
 import Orchestra.Taxis
+import Std.Sync
 
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra
+
+private initialize uniqueTokenMutex : Std.BaseMutex ← Std.BaseMutex.new
+private initialize uniqueTokenCounter : IO.Ref Nat ← IO.mkRef 0
+/-- Set once `uniqueToken` has reported a clock past its 16-digit field; see there. -/
+private initialize uniqueTokenOverflowed : IO.Ref Bool ← IO.mkRef false
+
+/-- Lowercase hex, zero-padded to four digits. -/
+private def hex4 (n : Nat) : String :=
+  let digit := fun (k : Nat) =>
+    let v := (n >>> (4 * k)) &&& 15
+    if v < 10 then Char.ofNat (v + '0'.toNat) else Char.ofNat (v - 10 + 'a'.toNat)
+  String.ofList [digit 3, digit 2, digit 1, digit 0]
+
+/-- A process-wide unique, monotonically increasing identifier.
+
+    `IO.monoNanosNow` on its own is not sufficient once the queue daemon runs tasks on
+    several threads: two workers can read the same nanosecond, and the value names task
+    records, per-task log files and temp directories, where a collision means two live tasks
+    silently overwriting each other's state. Appending a mutex-guarded counter makes distinct
+    calls yield distinct results regardless of clock resolution.
+
+    Both components are fixed-width and zero-padded so that lexicographic ordering on the
+    result still agrees with chronological ordering — the queue relies on that when sorting
+    entries and picking the oldest one at a given priority.
+
+    That ordering guarantee has a ceiling: `IO.monoNanosNow` counts from an unspecified epoch
+    which on Linux is boot, and at 10^16 ns — about 116 days of uptime — it outgrows the
+    16-digit field and the padding truncates it, wrapping ids back to `0000…`. Widening the
+    field is not free, because ids are compared against those already on disk and a wider
+    field sorts *below* every existing id, so the discontinuity would be immediate rather
+    than once per 116 days. The width therefore stays, and the overflow is reported instead
+    of passing silently. -/
+def uniqueToken : IO String := do
+  let nanos ← IO.monoNanosNow
+  uniqueTokenMutex.lock
+  let n ← try uniqueTokenCounter.modifyGet (fun n => (n, n + 1))
+          finally uniqueTokenMutex.unlock
+  let digits := toString nanos
+  if digits.length > 16 then
+    -- Warn once rather than on every id: past the ceiling this fires for the rest of the
+    -- process's life, and the ordering anomaly it describes is a single event, not a stream.
+    if ← uniqueTokenOverflowed.modifyGet (fun seen => (!seen, true)) then
+      IO.eprintln s!"Warning: the monotonic clock ({digits} ns) has outgrown the 16-digit id \
+field. New ids sort before existing ones, so queue entries may be picked out of order until \
+this host reboots."
+  let padded := ("0000000000000000" ++ digits).takeEnd 16
+  return padded.toString ++ hex4 (n % 65536)
 
 /-- A GitHub repository identified by its owner and name. -/
 structure Repository where
@@ -390,6 +438,28 @@ instance : FromJson SandboxPaths where
     let homeRwx := j.getObjValAs? (List String) "home_rwx" |>.toOption |>.getD []
     return { rox, ro, rw, homeRox, homeRw, homeRwx }
 
+/-- Queue daemon concurrency, from the `queue` object in `config.json`.
+
+    Both default to 1, which is the serial behaviour the daemon had before parallel mode
+    existed. `orchestra queue start`'s `--parallel` / `--parallel-per-repo` flags override
+    these for a single run. -/
+structure QueueConfig where
+  /-- Maximum tasks running at once across all repositories. -/
+  parallel : Nat := 1
+  /-- Maximum tasks running at once on any one repository. Each gets its own clone slot, so
+      raising this costs a working tree per slot — run `orchestra prepare --slots N` to match,
+      or the first task to reach each new slot pays its repository's init hook. -/
+  parallelPerRepo : Nat := 1
+deriving Repr, Inhabited
+
+instance : FromJson QueueConfig where
+  fromJson? j := do
+    -- Both optional: a `queue` block that sets only one of them keeps the default for the
+    -- other, and `max 1` because zero workers would be a daemon that silently does nothing.
+    let parallel := j.getObjValAs? Nat "parallel" |>.toOption |>.getD 1
+    let parallelPerRepo := j.getObjValAs? Nat "parallel_per_repo" |>.toOption |>.getD 1
+    return { parallel := max 1 parallel, parallelPerRepo := max 1 parallelPerRepo }
+
 structure AppConfig where
   appId : Nat
   privateKeyPath : String
@@ -419,6 +489,8 @@ structure AppConfig where
       disables it — any project/issue/claim operation then fails with a clear "not configured"
       error rather than falling back to the old file-based storage. -/
   taxis : Option Taxis.Config := none
+  /-- Queue daemon concurrency. Read only by `orchestra queue start`. -/
+  queue : QueueConfig := {}
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -440,9 +512,10 @@ instance : FromJson AppConfig where
     let agentAuthConfigs := j.getObjValAs? (Array AgentAuthConfig) "agents" |>.toOption |>.getD #[]
     let additionalSandboxPaths := j.getObjValAs? SandboxPaths "additional_sandbox_paths" |>.toOption |>.getD {}
     let taxis := j.getObjValAs? Taxis.Config "taxis" |>.toOption
+    let queue := j.getObjValAs? QueueConfig "queue" |>.toOption |>.getD {}
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs, additionalSandboxPaths, taxis }
+             agentAuthConfigs, additionalSandboxPaths, taxis, queue }
 
 structure TaskFile where
   tasks : Array Task

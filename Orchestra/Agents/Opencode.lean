@@ -101,6 +101,11 @@ def opencode : AgentDef where
     if let some sid := resume then
       args := args.push "-s" |>.push sid
     return args
+  -- Two fixed resources per run: the hard-coded port 4096 that `buildArgs` passes to
+  -- `opencode run`, and the config file `~/.config/opencode/opencode.json` that `setupMcp`
+  -- overwrites with this task's MCP port. A second concurrent run either fails to bind the
+  -- port or attaches to the first run's server and executes inside its session.
+  parallelSafe := false
   parseOutputLine := parseOpencodeOutput
   extractSessionId _ := pure none
   cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()

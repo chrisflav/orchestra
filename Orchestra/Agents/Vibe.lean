@@ -110,7 +110,7 @@ def vibe : AgentDef where
     homeRwx := [".elan", ".cache"]
   }
   setupMcp port model systemPrompt := do
-    let ts ← IO.monoNanosNow
+    let ts ← uniqueToken
     let vibeHome := s!"/tmp/agent-vibe-{ts}"
     let vibeHomePath := System.FilePath.mk vibeHome
     -- Create the temp VIBE_HOME

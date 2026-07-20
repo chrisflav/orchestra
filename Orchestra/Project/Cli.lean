@@ -101,8 +101,22 @@ def projectListHandler (_ : Parsed) : IO UInt32 := do
     IO.println s!"{padRight pr.id.toString 18} {padRight pr.createdAt 22} {padRight pr.name 30} {target}"
   return (0 : UInt32)
 
-/-- Find all claimed issues in `pid` whose claiming task is missing and has no
-    active queue entry. Returns an array of `(issue, missingTaskId)` pairs. -/
+/-- Whether the task holding a claim is still running — the first half of "is this claim live",
+    shared by `project health` and `project releaseOrphans` so the two cannot disagree about
+    which issues are orphaned.
+
+    Still *running*, not merely "a record exists": records outlive the run, so testing only for
+    existence made a claim left behind by a *finished* task read as healthy forever — exactly the
+    claims that need clearing, and the ones an unbound `always` role produces if its teardown
+    sweep does not run. A pre-claimed issue whose task has not started yet has no record at all
+    (the claim carries the queue-entry id until `updateClaimTaskId` retags it); the caller's
+    `onQueue` check is what covers that window. -/
+private def claimTaskRunning (allTasks : Array TaskStore.TaskRecord) (taskId : Option String) :
+    Bool :=
+  taskId.any fun tid => allTasks.any fun t => t.id == tid && t.status matches .running
+
+/-- Find all claimed issues in `pid` whose claiming task is no longer running and which have no
+    active queue entry. Returns an array of `(issue, staleTaskId)` pairs. -/
 private def findOrphanedIssues (pid : Taxis.IssueId) : IO (Array (Issue × String)) := do
   let issues ← loadIssues pid
   let claimed := issues.filter (·.status == .claimed)
@@ -114,7 +128,7 @@ private def findOrphanedIssues (pid : Taxis.IssueId) : IO (Array (Issue × Strin
   for issue in claimed do
     let claim ← Project.loadClaim issue.id
     let taskId := claim.map (·.taskId)
-    let hasTask := taskId.any (fun tid => allTasks.any (·.id == tid))
+    let hasTask := claimTaskRunning allTasks taskId
     let onQueue := activeEntries.any (·.issueId == some issue.id)
     if !hasTask && !onQueue then
       orphans := orphans.push (issue, taskId.getD "(no claim)")
@@ -141,7 +155,7 @@ def projectHealthHandler (p : Parsed) : IO UInt32 := do
     for issue in claimed do
       let claim ← Project.loadClaim issue.id
       let taskId := claim.map (·.taskId)
-      let hasTask := taskId.any (fun tid => allTasks.any (·.id == tid))
+      let hasTask := claimTaskRunning allTasks taskId
       if hasTask then
         IO.println s!"[ok]      {issue.id.toString}  {issue.title}"
       else if activeEntries.any (·.issueId == some issue.id) then
@@ -149,7 +163,8 @@ def projectHealthHandler (p : Parsed) : IO UInt32 := do
       else
         ok := false
         let tid := taskId.getD "(no claim)"
-        IO.println s!"[orphan]  {issue.id.toString}  {issue.title}  — claimed by missing task {tid}"
+        IO.println s!"[orphan]  {issue.id.toString}  {issue.title}  \
+— claimed by task {tid}, which is no longer running"
     return if ok then 0 else 1
 
 def projectReleaseOrphansHandler (p : Parsed) : IO UInt32 := do
@@ -416,6 +431,7 @@ private def renderTriggerStr : RoleTrigger → String
   | .hasOpenIssues     => "has_open_issues"
   | .hasInReviewIssues => "has_in_review_issues"
   | .idle              => "idle"
+  | .always            => "always"
 
 def rolesListHandler (p : Parsed) : IO UInt32 := do
   let pidStr := p.positionalArg! "project-id" |>.as! String

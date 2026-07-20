@@ -129,18 +129,10 @@ def tasksDir : IO System.FilePath :=
 def seriesDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "series"
 
--- ID generation: 16-char lowercase hex from the nanosecond monotonic clock
+-- ID generation: the nanosecond monotonic clock plus a counter, so that two tasks starting
+-- in the same nanosecond on different daemon workers cannot land on the same record.
 
-private def hexChar (n : UInt64) : Char :=
-  let d := (n % 16).toNat
-  if d < 10 then Char.ofNat (d + '0'.toNat) else Char.ofNat (d - 10 + 'a'.toNat)
-
-def generateId : IO String := do
-  let nanos ← IO.monoNanosNow
-  let s := toString nanos
-  let padding := "0000000000000000"
-  let padded := (padding ++ s).takeEnd 16
-  return padded.toString
+def generateId : IO String := uniqueToken
 
 -- Timestamp
 

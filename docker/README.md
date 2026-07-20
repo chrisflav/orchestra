@@ -52,6 +52,25 @@ environment is ignored** — so edit it in place for anything the environment ca
 (listeners, roles, agent auth blocks, `additional_sandbox_paths`), and restart. To regenerate
 from the environment instead, delete the file.
 
+### Parallelism
+
+The container runs `queue start`, which is serial by default. To run tasks concurrently, add a
+`queue` block to `config/orchestra/config.json` after first start and restart the container:
+
+```json
+"queue": { "parallel": 4, "parallel_per_repo": 2 }
+```
+
+`parallel_per_repo` gives each concurrent task on one repository its own clone, so size
+`docker/data/` accordingly — the git objects are hardlinked from a shared cache clone, but each
+slot carries its own checkout and its own build output, and the build output usually dominates.
+Warm them up front, matching `--slots` to `parallel_per_repo`, or the first task to reach each
+new slot pays that repository's init hook:
+
+```sh
+docker compose run --rm orchestra prepare <upstream> <fork> --slots 2
+```
+
 Docker creates the bind-mount directories as root, which would leave them unwritable by the
 unprivileged user agents run as. The entrypoint therefore starts as root, takes ownership of
 `/config` and `/data`, and immediately re-execs itself as `orchestra` via `setpriv` — the daemon

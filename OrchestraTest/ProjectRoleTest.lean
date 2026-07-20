@@ -86,6 +86,26 @@ def shippedImplementorTemplateCarriesTheIssueBody : Test := do
     TestM.assert ((role.promptTemplate.splitOn "{{issue_description}}").length > 1)
       "the shipped implementor template must include {{issue_description}}"
 
+/-- The shipped do-everything role has to be unbound *and* unclaimed at spawn: `pre_claim` on an
+    `always` role would be a no-op the reader could easily mistake for a working reservation, and
+    the whole point is that the agent claims for itself through the daemon. -/
+@[test]
+def shippedMaintainerIsAlwaysTriggeredAndNotPreClaimed : Test := do
+  let raw ← IO.FS.readFile "examples/projects/roles/maintainer.json"
+  match Json.parse raw >>= FromJson.fromJson? (α := Role) with
+  | .error e => TestM.fail s!"maintainer.json: {e}"
+  | .ok role =>
+    match role.dispatch with
+    | none => TestM.fail "maintainer.json must carry a dispatch policy"
+    | some d =>
+      TestM.assertEqual (toString (repr d.trigger)) (toString (repr Project.RoleTrigger.always))
+        (msg := "maintainer trigger")
+      TestM.assert (!d.preClaim) "an always role must not set pre_claim"
+    TestM.assert ((role.promptTemplate.splitOn "claim_issue").length > 1)
+      "the maintainer template must tell the agent to claim before working"
+    for p in ["manage_issues", "work_issues", "review_issues"] do
+      TestM.assert (role.permissions.contains p) s!"maintainer needs {p}"
+
 @[test]
 def projectRoleOverridesGlobal : Test := do
   let outcome ← (withTempHome do
@@ -193,6 +213,62 @@ def dispatcherIdleTriggerOnlyWhenNoWork : Test := do
     , caps := [("planner", 1)], roles := #[role] }
   TestM.assertEqual resEmpty.size 1     (msg := "idle role spawns when no work")
   TestM.assertEqual resWithOpen.size 0  (msg := "idle role suppressed when open issues exist")
+
+/-- The `always` trigger is the opposite of `idle`: it fires whatever the workload looks like,
+    and never binds an issue. The agent chooses its own work and claims it through
+    `claim_issue`, so there is nothing for the dispatcher to reserve up front. -/
+@[test]
+def dispatcherAlwaysTriggerSpawnsUnboundRegardlessOfWorkload : Test := do
+  let project := fixtureProject
+  let role : Role :=
+    { name := "maintainer", permissions := ["manage_issues", "work_issues", "review_issues"]
+    , promptTemplate := "drive the project"
+    , dispatch := some { trigger := .always, max := 1 } }
+  let inputs : List (Array Issue × Array Issue) :=
+    [ (#[], #[])
+    , (#[fixtureIssue 101 project .open], #[])
+    , (#[], #[fixtureIssue 102 project .open])
+    , (#[fixtureIssue 101 project .open], #[fixtureIssue 102 project .open]) ]
+  for (issues, reviewable) in inputs do
+    let result := dispatcherTick
+      { activeByRole := {}, issues, reviewable, caps := [("maintainer", 1)], roles := #[role] }
+    TestM.assertEqual result.size 1
+      (msg := s!"always spawns with {issues.size} workable / {reviewable.size} reviewable")
+    match result[0]? with
+    | some s => TestM.assertEqual s.issueId none (msg := "always spawn must be unbound")
+    | none   => TestM.fail "expected one spawn"
+
+/-- The cap is the only thing throttling an `always` role, so it had better hold. -/
+@[test]
+def dispatcherAlwaysTriggerRespectsCap : Test := do
+  let role : Role :=
+    { name := "maintainer", permissions := []
+    , promptTemplate := "x"
+    , dispatch := some { trigger := .always, max := 5 } }
+  let active : Std.HashMap String Nat := ({} : Std.HashMap String Nat).insert "maintainer" 2
+  let count := (dispatcherTick
+    { activeByRole := active, issues := #[], caps := [("maintainer", 2)], roles := #[role] }).size
+  TestM.assertEqual count 0 (msg := "active==cap blocks an always spawn like any other")
+
+/-- An unbound spawn must not consume an issue from the tick's `taken` set: it has not claimed
+    anything yet, and reserving on its behalf would starve the bound roles for no reason. -/
+@[test]
+def dispatcherAlwaysTriggerDoesNotReserveAnIssue : Test := do
+  let project := fixtureProject
+  let maintainer : Role :=
+    { name := "maintainer", permissions := [], promptTemplate := "x"
+    , dispatch := some { trigger := .always, max := 1 } }
+  let implementor : Role :=
+    { name := "implementor", permissions := [], promptTemplate := "y"
+    , dispatch := some { trigger := .hasOpenIssues, max := 1 } }
+  let result := dispatcherTick
+    { activeByRole := {}, issues := #[fixtureIssue 101 project .open]
+    , caps := [("maintainer", 1), ("implementor", 1)]
+    , roles := #[maintainer, implementor] }
+  TestM.assertEqual result.size 2 (msg := "both roles spawn")
+  let bound := result.filterMap (·.issueId)
+  TestM.assertEqual (bound.map (·.toString)) #["101"]
+    (msg := "the implementor still gets the only open issue; the maintainer took nothing")
 
 @[test]
 def dispatcherEmitsAtMostOnePerRolePerTick : Test := do
@@ -332,5 +408,57 @@ def reviewerComesFromReviewableNotIssues : Test := do
     { activeByRole := {}, issues := #[fixtureIssue 101 p .open]
     , caps := [("reviewer", 1)], roles := #[reviewer] }
   TestM.assert withoutIt.isEmpty "no reviewable set means no reviewer, never a worker issue"
+
+/-! ## Review routing
+
+`dispositionOf` and `splitForDispatch` are the pure halves of the reviewer/implementor split;
+the impure half is the two network calls that establish their inputs. -/
+
+@[test]
+def dispositionRoutesEachCaseToOneRole : Test := do
+  TestM.assertEqual (Listener.dispositionOf (anyUnmerged := true) (requestsChanges := false))
+    Listener.ReviewDisposition.awaitingReview
+    (msg := "an unreviewed pull request is a reviewer's")
+  TestM.assertEqual (Listener.dispositionOf (anyUnmerged := true) (requestsChanges := true))
+    Listener.ReviewDisposition.changesRequested
+    (msg := "a rejection sends it back to an implementor, not round to another reviewer")
+  TestM.assertEqual (Listener.dispositionOf (anyUnmerged := false) (requestsChanges := false))
+    Listener.ReviewDisposition.merged
+    (msg := "a landed PR still needs the decide_issue complete call")
+  -- A stale rejection on an issue whose PR has since merged must not resurrect it as work.
+  TestM.assertEqual (Listener.dispositionOf (anyUnmerged := false) (requestsChanges := true))
+    Listener.ReviewDisposition.merged
+    (msg := "merge wins over an older change request")
+
+@[test]
+def splitForDispatchKeepsTheSetsDisjoint : Test := do
+  -- The regression: an issue awaiting review is `.open`, so it satisfies the structural
+  -- workable test too and was offered to both roles. The implementor is evaluated first
+  -- (caps sort alphabetically), took it, and the reviewer was never dispatched.
+  let p := fixtureProject
+  let awaiting := fixtureIssue 101 p .open
+  let rework   := fixtureIssue 102 p .open
+  let landed   := fixtureIssue 103 p .open
+  let plain    := fixtureIssue 104 p .open
+  let (workable, reviewable) := Listener.splitForDispatch
+    #[awaiting, rework, landed, plain]
+    #[ (awaiting, .awaitingReview), (rework, .changesRequested), (landed, .merged) ]
+  TestM.assertEqual (workable.map (·.id.toString)).toList ["102", "104"]
+    (msg := "an implementor gets the rejected issue and the one with no PR")
+  TestM.assertEqual (reviewable.map (·.id.toString)).toList ["101", "103"]
+    (msg := "a reviewer gets the unreviewed and the landed one")
+  let overlap := workable.filter (fun w => (reviewable.map (·.id.val)).contains w.id.val)
+  TestM.assert overlap.isEmpty "the two sets must never share an issue"
+
+@[test]
+def splitForDispatchLeavesStructuralExclusionsAlone : Test := do
+  -- A container with a PR of its own is reviewable even though it is not workable — the
+  -- reviewable set is not a subset of the workable one, so the split must not assume it is.
+  let p := fixtureProject
+  let container := fixtureIssue 201 p .open
+  let (workable, reviewable) := Listener.splitForDispatch #[] #[(container, .awaitingReview)]
+  TestM.assert workable.isEmpty "nothing structurally workable stays that way"
+  TestM.assertEqual (reviewable.map (·.id.toString)).toList ["201"]
+    (msg := "and the container is still reviewed")
 
 end OrchestraTest.ProjectRole

@@ -89,7 +89,11 @@ def createIssueWithDefaultTargetSucceeds : Test := do
     TestM.skip "ORCHESTRA_TEST_TAXIS_URL/TOKEN not set"; return
   let target : RepoTarget := { repo := { owner := "o", name := "r" }, branch := "main" }
   let project ← setupProject (defaultTarget := some target)
-  let env := baseEnv [manageIssuesPerm]
+  -- Scoped to the project: `manage_issues` writes are confined to the task's own subtree, and an
+  -- env naming neither project nor issue has no subtree at all, so every write is refused. The
+  -- sibling test below never reaches that check — the missing-target rejection short-circuits
+  -- first — which is why only this one noticed.
+  let env := { baseEnv [manageIssuesPerm] with projectId := some project.id }
   let r1 ← evalProjectTool env (.createIssue project.id "t" "d" none none)
   let r2 ← evalProjectTool env (.listIssues project.id none none)
   let issues ← loadIssues project.id
@@ -138,8 +142,11 @@ def attachPrMovesToInReview : Test := do
   let updated ← loadIssue project.id issue.id
   cleanup project #[issue]
   TestM.assert (jsonContains r "awaiting review") "attach_pr should say the issue awaits review"
-  -- No status flip any more: an issue awaits review because it has an unmerged PR attached.
-  TestM.assertEqual (updated.map (·.status)) (some .open) (msg := "status is unchanged")
+  -- No status flip any more: an issue awaits review because it has an unmerged PR attached, not
+  -- because a status says so. "Unchanged" means unchanged from `.claimed`, though — the worker
+  -- still holds its claim here and may push more commits; the issue only becomes `.open` when
+  -- the worker finishes and releases (see `releaseClaimAfterAttachPrPreservesInReview`).
+  TestM.assertEqual (updated.map (·.status)) (some .claimed) (msg := "status is unchanged")
   TestM.assertEqual (updated.map (·.attachedPRs.size)) (some 1) (msg := "the PR is attached")
 
 @[test]
