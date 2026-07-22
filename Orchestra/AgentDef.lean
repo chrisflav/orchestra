@@ -60,15 +60,28 @@ namespace AgentDef
 def containsCI (haystack needle : String) : Bool :=
   (haystack.toLower.splitOn needle.toLower).length > 1
 
-/-- Shared usage-limit detection patterns used by all backends. -/
-def stdUsageLimitError (exitCode : UInt32) (stderr : String) : Bool :=
-  exitCode != 0 &&
-    let s := stderr.toLower
+/-- Shared usage-limit detection patterns used by all backends.
+
+    Matched against the agent's stderr *and* the text of its final result event, because the two
+    backends differ in where they say it: an API-key run reports the 429 on stderr, while a
+    subscription run reports it through the output stream as a result the CLI marks as an error
+    (`"You've reached your Fable 5 limit."`). Reading only one of the two misses half the cases.
+
+    The patterns are deliberately phrase-level rather than word-level. `"limit"` alone would fire
+    on an agent that merely discussed a rate limiter; each phrase here is one a provider writes
+    and ordinary output does not. -/
+def stdUsageLimitError (exitCode : UInt32) (output : String) : Bool :=
+  exitCode != 0 && (
+    let s := output.toLower
     containsCI s "usage limit" ||
+    containsCI s "rate_limit_error" ||
     containsCI s "rate limit exceeded" ||
+    containsCI s "reached your" ||
+    containsCI s "limit reached" ||
+    containsCI s "exceed your" ||
     containsCI s "exceeded your" ||
     containsCI s "insufficient credits" ||
-    containsCI s "credit balance"
+    containsCI s "credit balance")
 
 end AgentDef
 

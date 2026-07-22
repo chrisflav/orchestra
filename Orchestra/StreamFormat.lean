@@ -46,6 +46,11 @@ inductive Event where
   | toolResult (stdout : String) (stderr : String)
   | result (subtype : ResultSubtype) (numTurns : Option Nat) (durationMs : Option Nat)
             (costUsd : Option Json) (res : String)
+  /-- A `rate_limit_event` from the agent's stream. Its payload is undocumented and has changed
+      shape between CLI releases, so only the reset timestamp is lifted out — and only if one is
+      present anywhere in it. Never displayed; it exists so the usage monitor can learn a real
+      reset time instead of guessing one. -/
+  | rateLimit (resetsAt : Option String)
   | unknown (type : String)
 
 -- Serialisation
@@ -85,6 +90,12 @@ instance : ToJson Event where
       let fields := match durationMs with | some n => fields ++ [("duration_ms", ToJson.toJson n)]   | none => fields
       let fields := match costUsd   with | some v => fields ++ [("total_cost_usd", v)] | none => fields
       Json.mkObj fields
+    | .rateLimit resetsAt =>
+      let fields : List (String × Json) := [("type", "rate_limit")]
+      let fields := match resetsAt with
+        | some r => fields ++ [("resets_at", Json.str r)]
+        | none   => fields
+      Json.mkObj fields
     | .unknown t =>
       Json.mkObj [("type", "unknown"), ("event_type", t)]
 
@@ -102,8 +113,24 @@ private def parseContentItem (item : Json) : Option ContentItem :=
     if t.isEmpty then none else some (.text t)
   | _ => none
 
+/-- Pull the value of a `"key": "value"` pair out of a raw JSON line.
+
+    Deliberately textual rather than structural. It is used on `rate_limit_event`, whose payload
+    is undocumented and whose nesting has moved between CLI releases; a scan for the key finds it
+    wherever it currently sits, where a path-based lookup would silently return nothing the next
+    time it moves. Nothing depends on the result being present, so a false negative costs only a
+    less precise reset time. -/
+def extractStringField (s key : String) : Option String := do
+  let parts := s.splitOn ("\"" ++ key ++ "\"")
+  let after ← (parts.drop 1).head?
+  let rest := after.toList.dropWhile fun c => c == ' ' || c == ':'
+  guard (rest.head? == some '"')
+  let val := (rest.drop 1).takeWhile (· != '"')
+  guard !val.isEmpty
+  return String.ofList val
+
 /-- Parse a stream-json event line into a typed `Event`.
-    Returns `none` for suppressed events (rate limits, empty tool output). -/
+    Returns `none` for suppressed events (empty tool output). -/
 def parseEvent (line : String) : Option Event := do
   let json ← (Json.parse line.trimAscii.toString).toOption
   match jStr json "type" with
@@ -140,7 +167,9 @@ def parseEvent (line : String) : Option Event := do
       (json.getObjValAs? Nat "duration_ms" |>.toOption)
       (jVal json "total_cost_usd")
       res)
-  | "rate_limit_event" => none
+  | "rate_limit_event" =>
+    some (.rateLimit ((extractStringField line "resets_at").orElse fun _ =>
+      extractStringField line "resetsAt"))
   | other => some (.unknown other)
 
 -- Formatting
@@ -191,6 +220,10 @@ def format : Event → String
       | .error msg => s!"\n{truncate msg 300}"
       | _ => if res.isEmpty then "" else s!"\n{truncate res 300}"
     s!"[done] {resultSubtypeStr sub}{turns}{dur}{cost}{resPart}"
+  | .rateLimit resetsAt =>
+    match resetsAt with
+    | some r => s!"[rate-limit] resets at {r}"
+    | none   => "[rate-limit]"
   | .unknown t => s!"[{t}]"
 
 /-- Parse and format a single stream-json event line for human-readable display.

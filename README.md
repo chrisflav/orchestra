@@ -48,6 +48,10 @@ Three pieces carry everything else.
   subset of them.
 - **A queue daemon** with priorities, parallel execution backed by per-repository clone slots,
   re-enqueueing of unfinished entries, and a graceful drain on `SIGTERM`.
+- **Usage-limit awareness.** Every Claude subscription limit is tracked — session, weekly, and
+  the weekly limits scoped to one model family — so work is routed to an account that can still
+  run it instead of into a wall. Several accounts can back one listener, used in order or
+  balanced across → [usage limits](#usage-limits)
 - **Listeners** that poll GitHub issues, comments, pull request reviews, labels, or an arbitrary
   shell command, and enqueue a task — or a whole workflow — when something matches.
 - **An autonomous project pipeline.** Projects and issues live in a
@@ -284,6 +288,102 @@ The legacy flat fields (`claude_token`, `anthropic_api_key`,
 `anthropic_base_url`, `anthropic_auth_token`) still work when no `agents`
 array is present, so existing configurations remain valid.
 
+### using several sources, and failing over between them
+
+A task, queue entry or listener action can name *several* candidate sources
+instead of one, and say how to choose between them:
+
+```json
+{
+  "upstream": "owner/repo",
+  "fork": "org/repo",
+  "mode": "pr",
+  "prompt": "Fix the bug.",
+  "auth_sources": ["work", "personal"],
+  "auth_mode": "ordered"
+}
+```
+
+- `ordered` (default) — use the sources in the order listed, falling through
+  to the next when one is out of quota. Burn the subscription first, then the
+  API key.
+- `distribute` — spread work across every source that is not limited,
+  preferring the least-consumed one. Two accounts with the same plan end up
+  roughly level rather than one being exhausted before the other is touched.
+  Between sources at the same utilisation it round-robins, so a burst of
+  parallel claims fans out instead of landing on one account.
+
+Which source ran a task is recorded on its queue entry. Under `distribute` the
+choice is made and stamped while the daemon holds its claim lock, so parallel
+workers cannot all read the same pre-dispatch state and pick the same account.
+
+`auth_sources` takes precedence over `auth_source`; either can be omitted, in
+which case `default_auth_source` applies as before.
+
+**Which source a task runs on is decided when it starts, not when it is
+queued.** An entry can sit in the queue for hours, and the account that was
+free when a listener created it may be exhausted by the time a worker picks it
+up. The daemon resolves the list at claim time and records the winner on the
+entry.
+
+### usage limits
+
+Orchestra tracks how much of each subscription is left, so it can route around
+a limit instead of running into it. For OAuth sources it polls the same
+endpoint Claude Code itself uses, which reports every limit at once: the
+rolling session window, the weekly total, and weekly limits scoped to a single
+model family.
+
+```
+$ orchestra usage --select --model claude-opus-4-8
+claude:
+  work [oauth]: BLOCKED (weekly_scoped limit for Opus at 100%, resets in 16h 22m)
+    session: 13% [normal], resets in 1h 51m
+    weekly_all: 77% [warning], resets in 16h 22m
+    weekly_scoped (Opus): 100% [critical], resets in 16h 22m
+  personal [api-key]: available
+    no subscription limits to report (API-key sources are billed per token)
+  → would select: personal (ordered)
+```
+
+Two details matter in practice:
+
+- **Model-scoped limits only close one model family.** An exhausted weekly-Opus
+  window leaves Sonnet work on the same account perfectly runnable, so
+  availability is a question about *(source, model)* — not about the account.
+  Pass `--model` to ask about a specific one.
+- **A limited source does not cancel anything.** Queue entries that would land
+  on it stay pending and run when the window resets; entries on any other
+  source, backend or model family keep going. Earlier versions cancelled every
+  pending entry sharing a backend, which threw away work that was about to
+  become runnable.
+
+Limits are learned two ways, and the two cover each other: the poll sees a
+limit coming and knows the exact reset time, while a run that comes back
+rate-limited is recorded immediately, before anything else can be dispatched to
+that source. Both write to `<data>/usage/<backend>/<label>.json`, which is
+shared across processes — a limit `orchestra run` discovers in a terminal stops
+the daemon from dispatching to that source too.
+
+API-key sources have no subscription window to poll (they bill per token
+against an organisation), so they are always considered available until a run
+proves otherwise.
+
+Polling is an account-metadata call, not an inference call: **it costs no input
+or output tokens and consumes none of the quota it reports.** It is metered as
+*requests*, though — a burst gets `429` with a `retry-after` of about five
+minutes. Orchestra keeps well under that: the daemon polls each source every
+five minutes, dispatch reuses anything fetched in the last minute, and a `429`
+suppresses polling for five minutes rather than retrying into it. `orchestra
+usage` reuses fresh data too; pass `--refresh` to force a poll. While a backoff
+is in effect the command says so, and dispatch falls back to the last known
+limits — an unreachable endpoint is never treated as an exhausted account.
+
+`orchestra usage` flags: `--backend` to narrow to one backend, `--model` to
+judge model-scoped limits, `--cached` to skip polling, `--select` to also show
+which source a task queued now would be dispatched to, and `--auth_mode` to
+simulate `distribute` instead of `ordered`.
+
 System prompts can be placed in `~/.config/orchestra/prompts/`. The file
 `~/.config/orchestra/prompts/default.md` is loaded automatically; named prompts can be
 referenced via the `system_prompt` field in a task file.
@@ -320,6 +420,9 @@ Fields:
 - `model` — optional model override passed to the agent
 - `agent` — optional sub-agent name passed to the backend
 - `auth_source` — label of the authentication source to use
+- `auth_sources` — candidate authentication sources, tried per `auth_mode`; takes precedence over
+  `auth_source` → [authentication sources](#using-several-sources-and-failing-over-between-them)
+- `auth_mode` — `"ordered"` (default) or `"distribute"`
 - `system_prompt` — optional name of a file in `~/.config/orchestra/prompts/` (without
   `.md`); defaults to `default.md` if present
 - `budget` — maximum spend in USD (default `4.0`)
@@ -587,6 +690,10 @@ Fields:
 - `source.authorized_users` — list of GitHub logins that may trigger the listener; empty means allow everyone
 - `action.prompt_template` — template rendered with event variables (e.g. `{{upstream}}`, `{{fork}}`, `{{issue_number}}`, `{{body}}`, `{{author}}`)
 - `action.workflow_path` — path to a `.yaml` workflow file; when set the listener starts a concert instead of enqueueing a single task
+- `action.auth_sources` / `action.auth_mode` — candidate authentication sources for the tasks this
+  listener queues, and how to pick among them. A listener that fires repeatedly is the case
+  several accounts exist for: it keeps producing runnable work after one account's weekly window
+  closes → [usage limits](#usage-limits)
 
 To trigger a multi-step workflow from a listener, replace `prompt_template` with `workflow_path`:
 
@@ -655,6 +762,7 @@ orchestra prepare <upstream> <fork>   # clone the fork and configure remotes
 orchestra cleanup                     # remove all cloned repositories
 orchestra cleanup list                # list clones and their task slots
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
+orchestra usage                       # usage limits of every configured auth source
 orchestra migrate                     # move ~/.agent/ to the XDG directories
 ```
 
