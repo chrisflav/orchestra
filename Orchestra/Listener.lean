@@ -779,7 +779,7 @@ def withAttachedPRs (pid : Taxis.IssueId) (issues : Array Project.Issue) :
     `targetOverride` is used by the project-independent dispatcher, whose target comes from taxis
     artifacts rather than from the project or the issue's own override — see
     `Project.artifactTarget`. It wins over both; `none` keeps the ordinary resolution. -/
-def buildRoleEntry (project : Project.Project) (role : Project.Role)
+def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : Project.Role)
     (issue? : Option Project.Issue) (instructions : String := "")
     (targetOverride : Option Project.RepoTarget := none) :
     IO (Option Queue.QueueEntry) := do
@@ -787,6 +787,10 @@ def buildRoleEntry (project : Project.Project) (role : Project.Role)
             <|> issue?.bind (Project.effectiveTarget project ·)
             <|> project.defaultTarget
   let some target' := target | return none
+  -- The agent pushes to `fork`; PRs land in `upstream` (= the target repo). When the App can push
+  -- to the target directly the fork is the target itself, otherwise it is a fork in the configured
+  -- default organisation. `none` means the task cannot be dispatched (nothing writable to push to).
+  let some fork ← GitHub.resolveFork appConfig target'.repo | return none
   let id ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
   -- One extra fetch per dispatch (not per tick) so the thread lands in the prompt: a worker
@@ -799,7 +803,7 @@ def buildRoleEntry (project : Project.Project) (role : Project.Role)
   return some
     { id, createdAt
     , upstream      := target'.repo
-    , fork          := target'.repo
+    , fork
     , mode          := .pr
     , prompt
     , backend       := role.backend

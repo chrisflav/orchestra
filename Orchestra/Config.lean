@@ -485,6 +485,12 @@ structure AppConfig where
       Merged on top of the agent-backend's built-in paths.
       Useful for granting rw access to directories like `.cache`. -/
   additionalSandboxPaths : SandboxPaths := {}
+  /-- Organisation under which orchestra may create repositories, i.e. where it forks a
+      target repository the GitHub App cannot push to. Used by every project/role-based task:
+      when the App has no write access to a task's target repo, the target is forked into this
+      org and the fork is what the agent pushes to. `none` disables forking — a task whose
+      target is not writable is then skipped rather than dispatched at a repo it cannot push to. -/
+  defaultOrganization : Option String := none
   /-- taxis instance backing the project/issue/claim subsystem (`Orchestra.Project`). `none`
       disables it — any project/issue/claim operation then fails with a clear "not configured"
       error rather than falling back to the old file-based storage. -/
@@ -513,9 +519,10 @@ instance : FromJson AppConfig where
     let additionalSandboxPaths := j.getObjValAs? SandboxPaths "additional_sandbox_paths" |>.toOption |>.getD {}
     let taxis := j.getObjValAs? Taxis.Config "taxis" |>.toOption
     let queue := j.getObjValAs? QueueConfig "queue" |>.toOption |>.getD {}
+    let defaultOrganization := j.getObjValAs? String "default_organization" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs, additionalSandboxPaths, taxis, queue }
+             agentAuthConfigs, additionalSandboxPaths, taxis, queue, defaultOrganization }
 
 structure TaskFile where
   tasks : Array Task

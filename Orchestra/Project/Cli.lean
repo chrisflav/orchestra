@@ -1,5 +1,6 @@
 import Cli
 import Orchestra.Config
+import Orchestra.GitHub
 import Orchestra.Queue
 import Orchestra.DaemonRequest
 import Orchestra.TaskStore
@@ -379,7 +380,9 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     | some _, some d => d.preClaim
     | some _, none   => true   -- default: if user gave --issue, claim it
     | none,   _      => false
-  -- 4. Build the queue entry first (we need its id as the claim's task id).
+  -- 4. Mint the entry's id and resolve its target. The id comes first because the claim below
+  --    records it as the claiming task; the entry it names is built once everything that could
+  --    still fail has succeeded.
   let entryId ← TaskStore.generateId
   let createdAt ← currentIso8601
   let target := mIssue.bind (effectiveTarget project ·)
@@ -387,6 +390,27 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let some target' := target
     | IO.eprintln "Cannot spawn: no effective target (project has no default and issue has no override)"
       return 1
+  -- 5. Pre-claim if requested. Before both of the steps that follow: claiming ahead of the entry
+  --    means a failed claim leaves no orphan queue entry, and claiming ahead of `resolveFork`
+  --    means it leaves no orphan repository in `default_organization` either.
+  if shouldPreClaim then
+    let some issue := mIssue
+      | IO.eprintln "internal: pre-claim requested without --issue"; return (1 : UInt32)
+    let agent := role.backend.getD "claude"
+    match ← daemonClaim project.id issue.id entryId agent none with
+    | .error msg =>
+      IO.eprintln s!"Pre-claim failed: {msg}"
+      return (1 : UInt32)
+    | .ok () => pure ()
+  -- 6. The agent pushes to `fork`; PRs land in `upstream` (= the target repo). When the App can
+  --    push to the target directly the fork is the target itself, otherwise it is a fork in the
+  --    configured default organisation. Needs `config.json` and a reachable GitHub — a spawn
+  --    whose target is already writable still has to ask before it can know that.
+  let appConfig ← loadAppConfig
+  let some fork ← GitHub.resolveFork appConfig target'.repo
+    | IO.eprintln s!"Cannot spawn: the GitHub App cannot push to {target'.repo} and it could not \
+        be forked (see [fork] logs above; set default_organization to enable forking)"
+      return (1 : UInt32)
   let comments ← match mIssue with
     | some i => renderCommentThread i.id
     | none   => pure none
@@ -395,7 +419,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let entry : Queue.QueueEntry :=
     { id := entryId, createdAt
     , upstream      := target'.repo
-    , fork          := target'.repo
+    , fork
     , mode          := .pr
     , prompt
     , backend       := role.backend
@@ -409,18 +433,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     , projectId     := some project.id
     , issueId       := mIssue.map (·.id)
     , role          := some role.name }
-  -- 5. Pre-claim if requested. We claim *before* writing the entry so a
-  --    failed claim leaves no orphan queue entry.
-  if shouldPreClaim then
-    let some issue := mIssue
-      | IO.eprintln "internal: pre-claim requested without --issue"; return (1 : UInt32)
-    let agent := role.backend.getD "claude"
-    match ← daemonClaim project.id issue.id entryId agent none with
-    | .error msg =>
-      IO.eprintln s!"Pre-claim failed: {msg}"
-      return (1 : UInt32)
-    | .ok () => pure ()
-  -- 6. Persist the entry. The daemon picks it up on its next poll.
+  -- 7. Persist the entry. The daemon picks it up on its next poll.
   Queue.saveEntry entry
   IO.println entryId
   return (0 : UInt32)

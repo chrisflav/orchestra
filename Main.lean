@@ -821,10 +821,11 @@ its workspace; it will start from a clean checkout."
               let issue? : Option Project.Issue ← match issueId with
                 | none => pure none
                 | some iid => Project.loadIssue pid iid
-              let entryOpt ← Listener.buildRoleEntry project role issue?
+              let entryOpt ← Listener.buildRoleEntry appConfig project role issue?
               match entryOpt with
               | none =>
-                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName}: no effective target"
+                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName}: no effective \
+                  target, or its target is not writable and could not be forked (see [fork] logs)"
               | some entry =>
                 -- Pre-claim if the role wants it and we have an issue.
                 let needsClaim :=
@@ -894,12 +895,13 @@ its workspace; it will start from a clean checkout."
               let scope := match issue? with
                 | some i => s!"issue {i.id.toString}"
                 | none   => s!"root {projectId.toString}"
-              let entryOpt ← Listener.buildRoleEntry project role issue?
+              let entryOpt ← Listener.buildRoleEntry appConfig project role issue?
                 (targetOverride := some target)
               match entryOpt with
               | none =>
                 IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName} for \
-                  {scope}: no effective target"
+                  {scope}: no effective target, or its target is not writable and could not be \
+                  forked (see [fork] logs)"
               | some entry =>
                 -- Pre-claiming needs an issue to claim. An unbound role has none by construction;
                 -- it claims for itself through the daemon once it picks one, which is the same
