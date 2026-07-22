@@ -685,16 +685,26 @@ private def contentTypeOf (name : String) : String :=
   else if name.endsWith ".woff2" then "font/woff2"
   else "application/octet-stream"
 
-/-- Resolve a request path to a file under `root`, or `none` if it names nothing.
+/-- The file a request path names under `root`, or `none` if it escapes.
 
-    Path segments are rebuilt onto `root` one at a time and `.`/`..` are rejected outright
-    rather than normalised, so no request can address a file outside the site directory.
+    Segments are rebuilt onto `root` one at a time and `.`/`..` are rejected outright rather
+    than normalised, so no request can address a file outside the site directory. Nothing is
+    percent-decoded, which is what keeps `%2e%2e` an ordinary (and absent) filename rather
+    than a second spelling of `..`.
+
+    Not `private`: `OrchestraTest.Dashboard` covers the traversal cases directly, which is the
+    part of static serving worth testing and the part that must not silently regress. -/
+def staticCandidate (root : System.FilePath) (path : String) : Option System.FilePath :=
+  let segs := (path.splitOn "/").filter (!·.isEmpty)
+  if segs.any (fun s => s == "." || s == ".." || s.contains '\\') then none
+  else some (segs.foldl (fun (p : System.FilePath) (s : String) => p / s) root)
+
+/-- Resolve a request path to an existing file under `root`, or `none` if it names nothing.
+
     A directory resolves to its `index.html`, which is how the generated site is laid out
     (`queue/index.html` and friends). -/
 private def resolveStatic (root : System.FilePath) (path : String) : IO (Option System.FilePath) := do
-  let segs := (path.splitOn "/").filter (!·.isEmpty)
-  if segs.any (fun s => s == "." || s == ".." || s.contains '\\') then return none
-  let file := segs.foldl (fun (p : System.FilePath) (s : String) => p / s) root
+  let some file := staticCandidate root path | return none
   if ← file.isDir then
     let index := file / "index.html"
     return if ← index.pathExists then some index else none
