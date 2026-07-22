@@ -24,6 +24,9 @@ structure LaunchResult where
   resultSubtype  : Option StreamFormat.ResultSubtype := none
   /-- The result text from the agent's result event, if one was emitted. -/
   resultText     : Option String := none
+  /-- Reset timestamp reported by a `rate_limit_event`, if the agent emitted one. Lets the usage
+      monitor record when a limit actually lifts instead of falling back to a default backoff. -/
+  rateLimitReset : Option String := none
 
 /--
 Launch the coding agent inside a landrun sandbox.
@@ -330,6 +333,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let sessionIdRef    ← IO.mkRef (none : Option String)
   let resultSubtypeRef ← IO.mkRef (none : Option StreamFormat.ResultSubtype)
   let resultTextRef   ← IO.mkRef (none : Option String)
+  let rateLimitResetRef ← IO.mkRef (none : Option String)
   let outTask ← IO.asTask (prio := .dedicated) do
     let out ← IO.getStdout
     let err ← IO.getStderr
@@ -355,8 +359,14 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
         if let .result sub _ _ _ res := event then
           resultSubtypeRef.set (some sub)
           unless res.isEmpty do resultTextRef.set (some res)
-        out.putStrLn (StreamFormat.format event)
-        out.flush
+        -- Rate-limit events are bookkeeping, not progress: they are recorded for the usage
+        -- monitor but kept off the console, which is what the old `parseOutputLine` returning
+        -- `none` for them achieved before there was anywhere to record them.
+        if let .rateLimit reset := event then
+          if reset.isSome then rateLimitResetRef.set reset
+        else
+          out.putStrLn (StreamFormat.format event)
+          out.flush
         -- Write the parsed event as a JSON line to the structured log
         if let some h := logHandle then
           h.putStrLn (Lean.Json.compress (Lean.ToJson.toJson event))
@@ -383,9 +393,6 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let sessionId ← match ← sessionIdRef.get with
     | some sid => pure (some sid)
     | none     => agentDef.extractSessionId mcpContext
-  -- Detect usage limit from exit code and captured stderr
-  let stderrContent ← stderrRef.get
-  let usageLimitHit := agentDef.isUsageLimitError exitCode stderrContent
   -- Determine whether this run ended due to user cancellation
   let wasCancelled ← match cancelToken with
     | none => pure false
@@ -394,8 +401,25 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
       pure (reason == some .cancel)
   let resultSubtype ← resultSubtypeRef.get
   let resultText    ← resultTextRef.get
+  let rateLimitReset ← rateLimitResetRef.get
+  -- Detect a usage limit from everything the run said about itself, not just stderr.
+  --
+  -- Both halves matter. A subscription run reports the limit through the output stream — an
+  -- error result reading "You've reached your <model> limit" — and writes nothing to stderr, so
+  -- stderr alone never sees it. And an error result is itself evidence the run failed, so it
+  -- stands in for a non-zero exit: a backend that reports the limit in the stream and still
+  -- exits 0 would otherwise read as a clean success.
+  let stderrContent ← stderrRef.get
+  let combinedOutput := stderrContent ++ "\n" ++ resultText.getD ""
+  let effectiveExit :=
+    if exitCode != 0 then exitCode
+    else match resultSubtype with
+      | some (.error _) => 1
+      | _               => 0
+  let usageLimitHit := agentDef.isUsageLimitError effectiveExit combinedOutput
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
-  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype, resultText }
+  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype, resultText,
+           rateLimitReset }
 
 end Orchestra.Sandbox

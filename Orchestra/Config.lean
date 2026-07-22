@@ -243,6 +243,36 @@ partial def ResultType.valueFromJson : (t : ResultType) → Json → Except Stri
         let _ ← ResultType.valueFromJson t v
       return j
 
+/-- How a task picks among several configured authentication sources.
+
+    Lives here rather than beside the usage monitor because it is a *config* value — tasks,
+    queue entries and listener actions all carry one — and `Orchestra.Usage`, which consumes it,
+    imports this module. -/
+inductive AuthMode where
+  /-- Use the sources in the order listed, falling through to the next when one is limited.
+      The default: with a single source it is indistinguishable from having no modes at all. -/
+  | ordered
+  /-- Spread work across every source that is not limited, preferring the least-consumed. -/
+  | distribute
+deriving Repr, BEq, Inhabited
+
+def AuthMode.toString : AuthMode → String
+  | .ordered    => "ordered"
+  | .distribute => "distribute"
+
+def AuthMode.ofString? : String → Option AuthMode
+  | "ordered"    => some .ordered
+  | "distribute" => some .distribute
+  | _            => none
+
+instance : ToJson AuthMode where toJson m := Json.str m.toString
+instance : FromJson AuthMode where
+  fromJson?
+    | .str s => match AuthMode.ofString? s with
+      | some m => .ok m
+      | none   => .error s!"expected \"ordered\" or \"distribute\", got \"{s}\""
+    | j => .error s!"expected auth mode string, got {j}"
+
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
   upstream : Repository
@@ -267,6 +297,14 @@ structure IOTask (i o : ResultType) where
   /-- Label of the authentication source to use for this task.
       Must match a label in the agent's `auth_sources` config. -/
   authSource : Option String := none
+  /-- Candidate authentication sources, tried according to `authMode`.
+
+      Takes precedence over `authSource`. Resolution to one label is deferred until the task is
+      about to launch, not fixed when it is queued: an entry can wait hours for a slot, and the
+      source that was free when it was created may be exhausted by the time it runs. -/
+  authSources : List String := []
+  /-- How to choose among `authSources`. Ignored when fewer than two are configured. -/
+  authMode : AuthMode := .ordered
   /-- Optional tools to enable beyond the always-available ones (health, refresh_token,
       get_pr_comments). Currently the only optional tool is `"create_pr"`.
       When absent, the allowed tools are derived from `mode` for backwards compatibility. -/
@@ -390,6 +428,8 @@ instance : FromJson Task where
     let budget     := j.getObjValAs? Float "budget"          |>.toOption
     let memory     := j.getObjValAs? MemoryMode "memory"     |>.toOption |>.getD .both
     let authSource := j.getObjValAs? String "auth_source"    |>.toOption
+    let authSources := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
+    let authMode   := j.getObjValAs? AuthMode "auth_mode"    |>.toOption |>.getD .ordered
     let tools      := j.getObjValAs? (List String) "tools"   |>.toOption
     let readOnly   := j.getObjValAs? Bool "read_only"        |>.toOption |>.getD false
     let series      := j.getObjValAs? String "series"          |>.toOption
@@ -402,7 +442,8 @@ instance : FromJson Task where
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
     let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
     return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, prependPrompt, backend, model,
-                                budget, memory, authSource, tools, readOnly, series, priority,
+                                budget, memory, authSource, authSources, authMode, tools, readOnly,
+                                series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,
                                 triageAddLabels, triageRemoveLabels } }
 

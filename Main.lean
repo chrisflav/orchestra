@@ -93,7 +93,13 @@ private def runHandler (p : Parsed) : IO UInt32 := do
         | some b =>
           let t := tasks[i]!
           { t with ioTask := { t.ioTask with budget := some b } }
-      let _ ← TaskRunner.runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
+      let (_, status, _) ← TaskRunner.runTask appConfig task i debug
+        (continuesFrom := continuesFrom) (series := series)
+      -- `unfinished` is what a usage limit looks like from here. Saying so is the difference
+      -- between "that task is done" and "that task stopped early and can be resumed".
+      if status matches .unfinished then
+        IO.eprintln s!"Task {i} did not finish (usage limit or budget exhausted); \
+resume it with 'orchestra continue'."
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
 
@@ -404,6 +410,8 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         configPath
         budget           := budgetFlag.orElse (fun _ => task.ioTask.budget)
         authSource       := task.ioTask.authSource
+        authSources      := task.ioTask.authSources
+        authMode         := task.ioTask.authMode
         tools            := task.ioTask.tools
         readOnly         := task.ioTask.readOnly
         priority         := priorityFlag.getD task.ioTask.priority
@@ -630,6 +638,36 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   -- Both helpers unlock via `finally`: reading the queue directory and saving an entry
   -- are file operations that can throw, and leaving the mutex held would wedge every
   -- worker in the pool for the rest of the daemon's life.
+  -- Which authentication source an entry may run on, asked once per claim attempt.
+  --
+  -- Entries whose sources are all usage-limited are reported as `wait`, which leaves them
+  -- pending: unlike a cancellation, waiting costs nothing and the entry runs the moment the
+  -- window resets, without anyone having to re-queue it. The reason is logged once per entry so
+  -- a queue that looks stalled says why it is stalled.
+  let authWaitNoted ← IO.mkRef ({} : Std.HashSet String)
+  let resolveEntryAuth (e : Queue.QueueEntry) : IO Queue.AuthDecision := do
+    let backend := e.backend.getD "claude"
+    -- Per-entry config, so an entry pinned to a different config file is judged against the
+    -- auth sources that file declares.
+    let cfg ← match e.configPath with
+      | none    => pure appConfig
+      | some cp => try loadAppConfig (some (System.FilePath.mk cp)) catch _ => pure appConfig
+    match ← Usage.resolveLabel cfg backend e.authSources e.authSource e.authMode e.model with
+    | .ok label =>
+      authWaitNoted.modify (·.erase e.id)
+      -- Stamp the source as used *here*, while `claimMutex` is still held and before any other
+      -- worker can resolve. `distribute` breaks ties on least-recently-used, and this is the
+      -- only point at which that ordering is serialised: recording it once the task is actually
+      -- launching would be several seconds later — a clone and a token mint later — by which
+      -- time every other worker claiming in that window has read the same stale timestamp and
+      -- picked the same account, which is precisely what `distribute` exists to avoid.
+      if let some l := label then Usage.markUsed backend l
+      return .use label
+    | .error reason =>
+      unless (← authWaitNoted.get).contains e.id do
+        authWaitNoted.modify (·.insert e.id)
+        IO.println s!"  Entry {e.id} waiting on {backend} usage limits: {reason}"
+      return .wait reason
   let claimNextEntry : IO (Option (Queue.Claim × Nat)) := do
     claimMutex.lock
     try
@@ -641,13 +679,18 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         parallelLimit
         perRepoLimit    := parallelLimitPerRepo
         parallelSafe    := TaskRunner.backendIsParallelSafe
+        resolveAuth     := resolveEntryAuth
       }
       let allEntries ← Queue.loadAllEntries
       let some claim ← Queue.claimDecision ctx allEntries Repo.slotOccupant | return none
       let e := claim.entry
       let occupied := slotMap.getD e.fork.toString #[]
       let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
-      Queue.saveEntry { e with status := .running, slot := some claim.slot }
+      -- Record the resolved source on the entry, so `orchestra queue list` and any later
+      -- continuation show which account actually ran it.
+      Queue.saveEntry { e with
+        status := .running, slot := some claim.slot
+        authSource := claim.authSource.orElse fun _ => e.authSource }
       activeSlots.modify (fun m => m.insert e.fork.toString (occupied.push claim.slot))
       totalActive.modify (· + 1)
       if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
@@ -673,7 +716,7 @@ its workspace; it will start from a clean checkout."
   -- The slot directory is prepared (created if absent, otherwise reset to a clean default
   -- branch) inside the try below. The slot is released by `runEntry`, which wraps this.
   let runEntryBody (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
-      (resumeFrom : Option String) : IO Unit := do
+      (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
     let taskToken ← Std.CancellationToken.new
     activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
     let removeToken : IO Unit :=
@@ -703,6 +746,8 @@ its workspace; it will start from a clean checkout."
         budget           := entry.budget
         memory           := entry.memory
         authSource       := entry.authSource
+        authSources      := entry.authSources
+        authMode         := entry.authMode
         tools            := entry.tools
         readOnly         := entry.readOnly
         priority         := entry.priority
@@ -740,10 +785,11 @@ its workspace; it will start from a clean checkout."
       -- `occupant` stamps this entry as the owner of the tree it leaves behind, which is what
       -- a later continuation of *this* task will check.
       -- `runTask` prepares the slot itself, since doing so needs the installation token.
-      let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
+      let (taskId, taskStatus, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
         (cancelToken := some taskToken) (interactive := false)
         (slotOverride := some { slot, occupant := some entry.id, resumeFrom })
+        (preresolvedAuth := authSource)
       removeToken
       -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
       -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.
@@ -753,16 +799,31 @@ its workspace; it will start from a clean checkout."
         finish .cancelled (some taskId) none
         IO.println s!"  Task cancelled."
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") outputJson
-      else if usageLimitHit then
-        finish .unfinished (some taskId) none
-        Queue.cancelPendingByBackend entry.backend entry.id
-        Queue.cancelDependents taskId
-        IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
-        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
       else
-        finish .done (some taskId) outputJson
-        if let some key := entry.concertStepKey then
-          ConcertManager.signal concertMgr key outputJson
+        -- The queue entry now records exactly what the task record says. These used to be
+        -- computed separately, and a run that exhausted its budget ended up `unfinished` in the
+        -- task store and `done` in the queue — so `queue retry`, which reads queue status, could
+        -- never pick it up.
+        let queueStatus : Queue.QueueStatus := match taskStatus with
+          | .completed  => .done
+          | .unfinished => .unfinished
+          | .failed     => .failed
+          | .cancelled  => .cancelled
+          | .running    => .done
+        finish queueStatus (some taskId) outputJson
+        match taskStatus with
+        | .unfinished =>
+          -- Nothing is cancelled here any more. The source that ran out is now marked in the
+          -- usage store, so entries that would land on it are held back at claim time and every
+          -- other entry — different account, different backend, different model family — keeps
+          -- running. Dependents still go, because they were queued to continue *this* task's
+          -- session and it did not finish.
+          Queue.cancelDependents taskId
+          IO.println s!"  Task unfinished; entry stays retryable and dependents were cancelled."
+          ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+        | _ =>
+          if let some key := entry.concertStepKey then
+            ConcertManager.signal concertMgr key outputJson
     catch e =>
       removeToken
       let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
@@ -780,9 +841,27 @@ its workspace; it will start from a clean checkout."
   -- otherwise escape past the release and leak the slot. A leaked slot is never recovered, so
   -- a handful of them permanently shrink the pool until the daemon is restarted.
   let runEntry (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
-      (resumeFrom : Option String) : IO Unit := do
-    try runEntryBody entry slot tokenId resumeFrom
+      (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
+    try runEntryBody entry slot tokenId resumeFrom authSource
     finally releaseEntry entry slot
+  -- Usage poller: refresh every configured OAuth source on a slow cadence.
+  --
+  -- Claim-time resolution already refreshes what it is about to use, but only for sources it is
+  -- about to use. This is what notices that a *blocked* source has come back, and what keeps
+  -- `orchestra usage` truthful while the daemon is otherwise idle. Errors are swallowed per
+  -- source inside `refreshAll`; an unreachable endpoint must not take the fiber down.
+  let usageBackends := appConfig.agentAuthConfigs.toList.map (·.name)
+  if !usageBackends.isEmpty then
+    let _usageTask ← IO.asTask (prio := .dedicated) do
+      while !(← shutdownToken.isCancelled) do
+        for backend in usageBackends do
+          try Usage.refreshAll appConfig backend
+          catch e => IO.eprintln s!"[usage] poll failed for {backend}: {e}"
+        -- Five minutes: fast enough that a reset is picked up promptly, slow enough that an
+        -- idle daemon makes a handful of requests an hour.
+        for _ in List.range 300 do
+          if ← shutdownToken.isCancelled then break
+          IO.sleep 1000
   -- Load listener configs and spawn one fiber per listener.
   let listenerConfigs ← Listener.loadAllListenerConfigs
   if !listenerConfigs.isEmpty then
@@ -1004,7 +1083,7 @@ its workspace; it will start from a clean checkout."
         match ← claimNextEntry with
         | none => IO.sleep 1000
         | some (claim, tokenId) =>
-          runEntry claim.entry claim.slot tokenId claim.resumeFrom
+          runEntry claim.entry claim.slot tokenId claim.resumeFrom claim.authSource
       catch e =>
         IO.eprintln s!"Queue worker error: {e}"
         IO.sleep 1000
@@ -1433,6 +1512,84 @@ private def queueCmd : Cmd := `[Cli|
     queueRetryCmd
 ]
 
+/-- `orchestra usage` — what every configured authentication source has left.
+
+    The thing to look at when the queue seems stalled: it names the limit that is binding, when
+    it lifts, and which model families are affected. -/
+private def usageHandler (p : Parsed) : IO UInt32 := do
+  let configPath := p.flag? "config" |>.map (·.as! String)
+  let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  let backends : List String := match p.flag? "backend" |>.map (·.as! String) with
+    | some b => [b]
+    | none   => appConfig.agentAuthConfigs.toList.map (fun a => a.name)
+  let model := p.flag? "model" |>.map (·.as! String)
+  -- Default to a TTL-bounded poll rather than an unconditional one: the usage endpoint meters
+  -- requests, and this command is the kind of thing that ends up in a status line or a watch
+  -- loop. `--refresh` forces, `--cached` never polls.
+  let pollMode := if p.hasFlag "cached" then 0 else if p.hasFlag "refresh" then 2 else 1
+  let now ← Usage.nowEpoch
+  if backends.isEmpty then
+    IO.println "No agent auth sources configured (see the 'agents' block in config.json)."
+    return 0
+  for backend in backends do
+    let labels := Usage.configuredLabels appConfig backend
+    if labels.isEmpty then continue
+    IO.println s!"{backend}:"
+    for label in labels do
+      if pollMode == 2 then
+        match ← Usage.refresh appConfig backend label with
+        | .error e => IO.println s!"  {label}: poll failed: {e}"
+        | .ok _    => pure ()
+      else if pollMode == 1 then
+        Usage.ensureFresh appConfig backend label
+      let st ← Usage.loadState backend label
+      let verdict := match Usage.availabilityOf st model now with
+        | .available          => "available"
+        | .blocked until' r =>
+          match until' with
+          | some u => s!"BLOCKED ({r}, resets {Usage.relativeToNow u now})"
+          | none   => s!"BLOCKED ({r})"
+      let kind := if (Usage.oauthTokenOf appConfig backend label).isSome then "oauth" else "api-key"
+      IO.println s!"  {label} [{kind}]: {verdict}"
+      if let some e := st.lastError then
+        IO.println s!"    last poll error: {e}"
+      if let some pa := st.pollAfter then
+        if pa > now then
+          IO.println s!"    not polling until {Usage.relativeToNow pa now} \
+(the usage endpoint is rate-limiting requests)"
+      for l in st.limits do
+        let scope := match l.scopeModel with | some m => s!" ({m})" | none => ""
+        let resets := match l.resetsAt.bind Usage.parseIso8601 with
+          | some r => s!", resets {Usage.relativeToNow r now}"
+          | none   => ""
+        IO.println s!"    {l.kind.toString}{scope}: {l.percent}% [{l.severity}]{resets}"
+      if st.limits.isEmpty && (Usage.oauthTokenOf appConfig backend label).isNone then
+        IO.println "    no subscription limits to report (API-key sources are billed per token)"
+    -- What a task queued right now would actually be dispatched to. Answers the operator
+    -- question the per-source list only implies, and exercises the same resolver the daemon
+    -- uses at claim time.
+    if p.hasFlag "select" then
+      let mode := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
+        |>.getD .ordered
+      match ← Usage.select backend labels mode model with
+      | .ok label => IO.println s!"  → would select: {label} ({mode.toString})"
+      | .error e  => IO.println s!"  → would select: nothing ({e})"
+  return 0
+
+private def usageCmd : Cmd := `[Cli|
+  usage VIA usageHandler; ["0.1.0"]
+  "Show the usage limits of every configured authentication source."
+
+  FLAGS:
+    c, config : String; "Path to config file"
+    backend   : String; "Only show this backend (default: all configured)"
+    model     : String; "Judge availability for this model (affects model-scoped limits)"
+    cached    ;         "Do not poll; report the last stored values"
+    refresh   ;         "Force a poll even if the stored values are still fresh"
+    select    ;         "Also show which source a task queued now would be dispatched to"
+    auth_mode : String; "Selection mode to simulate with --select: ordered (default) or distribute"
+]
+
 private def migrateHandler (_ : Parsed) : IO UInt32 := do
   try
     Migrate.run
@@ -1460,6 +1617,10 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let debug       := p.hasFlag "debug"
   let configPath  := p.flag? "config"   |>.map (·.as! String)
   let authSource  := p.flag? "auth_source" |>.map (·.as! String)
+  let authSources := (p.flag? "auth_sources" |>.map (·.as! String)).map
+    (fun s => (s.splitOn ",").map (·.trimAscii.toString) |>.filter (!·.isEmpty)) |>.getD []
+  let authMode    := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
+    |>.getD .ordered
   let upstream ← IO.ofExcept (Repository.parse upstreamStr)
   let fork     ← IO.ofExcept (Repository.parse forkStr)
   let allowedTools : List String := match toolsStr with
@@ -1494,7 +1655,19 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     | _               => AgentDef.claude
   let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
     |>.map (·.extraPorts) |>.getD #[]
-  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName authSource
+  -- Interactive sessions go through the same resolver as queued and one-shot runs, so an
+  -- account the daemon has already found to be out of quota is not handed to a human either.
+  let resolved ← match ← Usage.resolveLabel appConfig backendName authSources authSource
+                          authMode model with
+    | .ok label => pure label
+    | .error e  =>
+      IO.eprintln s!"No usable authentication source for '{backendName}': {e}"
+      shutdown
+      return 1
+  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName resolved
+  if let some label := resolved then
+    IO.println s!"  Auth source: {label}"
+    Usage.markUsed backendName label
   IO.println "  Launching agent..."
   let result ← Sandbox.launchAgent agentDef repoPath "" port token
     (debug := debug) (pluginDirs := appConfig.pluginDirs)
@@ -1520,6 +1693,8 @@ private def interactiveCmd : Cmd := `[Cli|
     model       : String; "Model override passed to the agent"
     budget      : String; "Maximum spend in USD (default: 4.0)"
     auth_source : String; "Authentication source label to use (overrides default_auth_source)"
+    auth_sources : String; "Comma-separated candidate auth source labels, tried per --auth_mode"
+    auth_mode   : String; "How to pick among --auth_sources: ordered (default) or distribute"
 ]
 
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
@@ -1547,6 +1722,7 @@ def orchestraCmd : Cmd := `[Cli|
     issueCmd;
     spawnCmd;
     rolesCmd;
+    usageCmd;
     migrateCmd
 ]
 

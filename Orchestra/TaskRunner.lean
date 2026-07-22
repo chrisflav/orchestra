@@ -13,6 +13,7 @@ import Orchestra.Queue
 import Orchestra.Server
 import Orchestra.StreamFormat
 import Orchestra.TaskStore
+import Orchestra.Usage
 import Std.Sync
 
 open Orchestra
@@ -323,8 +324,31 @@ def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
       let vars := agentDef.envVarsOfAuthSource src
       return vars.map fun (k, v) => (k, some v)
 
+/-- Read back the status an agent-less backend (`merger`, `triage`) wrote for itself.
+
+    Those two save their own task record and return before the agent loop, so this is how their
+    outcome reaches the caller — without it the queue would record every merge, successful or
+    failed, as `done`. -/
+private def finalStatusOf (taskId : String) : IO TaskStore.TaskStatus := do
+  match ← TaskStore.loadTask taskId with
+  | some r => return r.status
+  | none   => return .completed
+
+/-- Pick the authentication source a task will run on, and fail loudly when none can.
+
+    Shared by every launch path so a usage limit is handled the same way whichever mode
+    discovered it. The returned label is `none` only on the legacy flat-token config, where
+    there are no named sources to choose between. -/
+def selectAuthSource {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
+    : IO (Option String) := do
+  let backendName := ioTask.backend.getD "claude"
+  match ← Usage.resolveLabel appConfig backendName ioTask.authSources ioTask.authSource
+          ioTask.authMode ioTask.model with
+  | .ok label => return label
+  | .error e  => throw (.userError s!"no usable authentication source for '{backendName}': {e}")
+
 /-- Run a single IOTask: clone repo, start MCP server, run validation loop.
-    Returns the task ID, whether the run was cut short by a usage limit, and the typed output. -/
+    Returns the task ID, the status the run ended in, and the typed output. -/
 def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (idx : Nat) (debug : Bool) (input : i.Type)
     (continuesFrom : Option String := none)
@@ -335,7 +359,13 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- When set, run in the per-repo clone slot it names instead of the shared cache clone.
     -- The slot is prepared here rather than by the caller because preparing it (cloning,
     -- fetching upstream) needs the installation token, which is only minted below.
-    (slotOverride : Option Repo.SlotAssignment := none) : IO ((String × Bool) × Option o.Type × Option Lean.Json) := do
+    (slotOverride : Option Repo.SlotAssignment := none)
+    -- Already resolved by the caller through `Usage.resolveLabel` (the queue daemon does this at
+    -- claim time). Passed through rather than re-derived so the source that was checked is the
+    -- source that runs, and so a task is not re-judged against a limit that appeared in the
+    -- milliseconds since — which would surface as a failed entry rather than a retryable one.
+    (preresolvedAuth : Option String := none)
+    : IO ((String × TaskStore.TaskStatus) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
@@ -423,7 +453,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- mean a full `git clone` plus fetch to change a label.
   if ioTask.backend == some "triage" then
     runTriage appConfig.pat ioTask initialRecord
-    return ((taskId, false), none, none)
+    return ((taskId, ← finalStatusOf taskId), none, none)
   -- 2. Prepare the task slot, or clone / update the shared repo when running outside the queue
   let repoPath ← match slotOverride with
     | some assign =>
@@ -440,7 +470,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- clone setup with all other backends but skips the MCP server and agent.
   if ioTask.backend == some "merger" then
     runMerger token ioTask repoPath initialRecord
-    return ((taskId, false), none, none)
+    return ((taskId, ← finalStatusOf taskId), none, none)
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
   let (allowedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
@@ -498,6 +528,18 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let mut wasCancelled := false
   let mut lastValidationOutput : String := ""
   let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
+  -- Resolved once, before the first attempt, rather than per attempt: the retries below
+  -- `--resume` the same conversation, and moving that conversation to a different account
+  -- part-way through would hand the agent a session the new account has never seen.
+  -- Marked at the point the choice is made, not here: a caller that resolved for us (the queue
+  -- daemon, under its claim lock) already recorded it, and re-stamping would make two accounts
+  -- look equally recently used when only one of them ran.
+  let authLabel ← match preresolvedAuth with
+    | some l => pure (some l)
+    | none   => do
+      let label ← selectAuthSource appConfig ioTask
+      if let some l := label then Usage.markUsed (ioTask.backend.getD "claude") l
+      pure label
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
     RepoConfig.runHook repoPath "before.sh"
@@ -508,7 +550,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
     let agentDef := agentDefOfBackend ioTask.backend
     let backendName := ioTask.backend.getD "claude"
-    let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName ioTask.authSource
+    let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName authLabel
     let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
       |>.map (·.extraPorts) |>.getD #[]
     let debugLogFile : Option System.FilePath ←
@@ -539,6 +581,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     if result.usageLimitHit then
       IO.println "  Agent hit usage limit."
       usageLimitHit := true
+      -- Record against the source that actually ran, before anything else can be dispatched to
+      -- it. The reset time comes from the agent's own `rate_limit_event` when it emitted one;
+      -- otherwise `markLimited` falls back to the last poll, then to a default backoff.
+      if let some label := authLabel then
+        Usage.markLimited backendName label ioTask.model "agent reported a usage limit"
+          (resetHint := result.rateLimitReset)
       break
     if !(← RepoConfig.hasValidationScript repoPath) then
       IO.println "  No validation script found, skipping validation."
@@ -559,13 +607,23 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   RepoConfig.runHook repoPath "after.sh"
   shutdown
   -- 7. Persist final task state
-  let finalStatus :=
+  --
+  -- A usage limit is checked before the result subtype, not after: the CLI reports the limit
+  -- *as* an error result, so consulting the subtype first would classify every limited run as
+  -- `failed` — permanently, when the truth is "unfinished, retry after the reset".
+  let finalStatus : TaskStore.TaskStatus :=
     if wasCancelled then .cancelled
+    else if usageLimitHit then .unfinished
     else match lastResultSubtype with
       | some .success           => .completed
       | some .errorMaxBudgetUsd => .unfinished
       | some (.error _)         => .failed
-      | _                       => if usageLimitHit then .unfinished else .completed
+      | _                       => .completed
+  -- A run that got all the way through is proof the source is usable, which retires any block
+  -- guessed at earlier.
+  if finalStatus matches .completed then
+    if let some label := authLabel then
+      Usage.markOk (ioTask.backend.getD "claude") label
   TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
   -- Release the orchestra-issue claim on terminal status. A worker that succeeded and attached a
   -- PR leaves the issue awaiting review, so only drop the lock (forceRelease) and leave its
@@ -604,20 +662,25 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | .error e =>
         IO.eprintln s!"  Warning: failed to parse task output: {e}"
         pure none
-  return ((taskId, usageLimitHit), typedOutput, outputJson)
+  return ((taskId, finalStatus), typedOutput, outputJson)
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.
-    Returns the task ID, whether the run was cut short by a usage limit, and the raw output JSON. -/
+
+    Returns the task ID, the status the run ended in, and the raw output JSON. The status is the
+    same value written to the task store, so callers that record their own state — the queue
+    daemon, above all — can no longer disagree with it. -/
 def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (continuesFrom : Option String := none)
     (series : Option String := none)
     (cancelToken : Option Std.CancellationToken := none)
     (interactive : Bool := true)
     (interactiveAgent : Bool := false)
-    (slotOverride : Option Repo.SlotAssignment := none) : IO (String × Bool × Option Lean.Json) := do
-  let ((taskId, usageLimitHit), _, outputJson) ←
+    (slotOverride : Option Repo.SlotAssignment := none)
+    (preresolvedAuth : Option String := none)
+    : IO (String × TaskStore.TaskStatus × Option Lean.Json) := do
+  let ((taskId, status), _, outputJson) ←
     runIOTask appConfig task.ioTask idx debug default
-      continuesFrom series cancelToken interactive interactiveAgent slotOverride
-  return (taskId, usageLimitHit, outputJson)
+      continuesFrom series cancelToken interactive interactiveAgent slotOverride preresolvedAuth
+  return (taskId, status, outputJson)
 
 end Orchestra.TaskRunner

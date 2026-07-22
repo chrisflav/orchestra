@@ -111,8 +111,19 @@ structure QueueEntry where
   budget        : Option Float  := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory        : MemoryMode    := .both
-  /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
+  /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`.
+
+      Written back when the daemon resolves `authSources` at claim time, so the entry records
+      which source actually ran it. -/
   authSource    : Option String := none
+  /-- Candidate authentication sources for this entry, tried according to `authMode`.
+
+      Resolved when the entry is claimed rather than when it is created: an entry may sit pending
+      for hours, and the source that was free when a listener queued it may be exhausted by the
+      time a worker is ready for it. -/
+  authSources   : List String := []
+  /-- How to choose among `authSources`. -/
+  authMode      : AuthMode := .ordered
   /-- Optional tools to enable beyond the always-available ones.
       When absent, allowed tools are derived from `mode` for backwards compatibility. -/
   tools         : Option (List String) := none
@@ -176,6 +187,8 @@ instance : ToJson QueueEntry where
     let fields := if let some b := e.budget        then fields ++ [("budget",          ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson e.memory)]
     let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
+    let fields := if !e.authSources.isEmpty        then fields ++ [("auth_sources",    ToJson.toJson e.authSources)] else fields
+    let fields := if e.authMode != .ordered        then fields ++ [("auth_mode",       ToJson.toJson e.authMode)]    else fields
     let fields := if let some t := e.tools         then fields ++ [("tools",           ToJson.toJson t)] else fields
     let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
     let fields := if e.priority != 10              then fields ++ [("priority",         Json.num e.priority)]           else fields
@@ -216,6 +229,8 @@ instance : FromJson QueueEntry where
     let budget        := j.getObjValAs? Float      "budget"  |>.toOption
     let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
     let authSource    := j.getObjValAs? String "auth_source" |>.toOption
+    let authSources   := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
+    let authMode      := j.getObjValAs? AuthMode "auth_mode" |>.toOption |>.getD .ordered
     let tools         := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority       := j.getObjValAs? Nat        "priority"         |>.toOption |>.getD 10
@@ -235,7 +250,7 @@ instance : FromJson QueueEntry where
     let listenerName := j.getObjValAs? String "listener_name"    |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget, memory, authSource, tools, readOnly, priority,
+             budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
              listenerName }
@@ -344,6 +359,19 @@ def chooseSlot (occupied : Array Nat) (perRepoLimit : Nat) (preferred : Option N
     else firstFree.map (·, false)
   | none => firstFree.map (·, false)
 
+/-- What the auth resolver decided about an entry.
+
+    `wait` is deliberately not a failure: an entry whose only authentication source is out of
+    quota is not broken, it is early. Cancelling it would throw away work that will be perfectly
+    runnable once the window resets, so it stays pending and the daemon moves on to something
+    else. -/
+inductive AuthDecision where
+  /-- Claimable, running on this source (`none` on the legacy config with no named sources). -/
+  | use (label : Option String)
+  /-- Not claimable right now; every candidate source is usage-limited. -/
+  | wait (reason : String)
+deriving Repr, Inhabited
+
 /-- Everything the daemon knows about its own occupancy when it goes to claim an entry.
 
     Bundled into a structure so that the decision below is an ordinary function of its inputs
@@ -364,12 +392,25 @@ structure ClaimContext where
       imported: `TaskRunner` depends on this module, so the dependency cannot run the other
       way, and the queue has no business knowing about agent backends anyway. -/
   parallelSafe : Option String → Bool
+  /-- Which authentication source an entry may run on right now.
+
+      Passed in for the same reason as `parallelSafe`: the queue has no business knowing about
+      subscriptions, and injecting it keeps the usage-limited cases reachable from a test with
+      no config and no network. Defaults to "always claimable on no particular source", which is
+      what every caller that predates multiple auth sources wants. -/
+  resolveAuth : QueueEntry → IO AuthDecision := fun _ => pure (.use none)
 
 /-- The outcome of a successful claim. -/
 structure Claim where
   entry : QueueEntry
   /-- Slot the entry will run in. -/
   slot : Nat
+  /-- Authentication source resolved for this entry, stamped onto it before it launches.
+
+      Resolved here rather than when the entry was created because an entry can sit pending for
+      hours: the account that was free when a listener queued it may be out of quota by the time
+      a worker picks it up. -/
+  authSource : Option String := none
   /-- Set when the entry is a continuation that got its predecessor's workspace back, naming
       that predecessor. The slot must then be left exactly as it was. -/
   resumeFrom : Option String := none
@@ -407,10 +448,14 @@ def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
         else pure none
     let occupied := ctx.occupiedSlots.getD e.fork.toString #[]
     let some (slot, reuseTree) := chooseSlot occupied ctx.perRepoLimit preferred | continue
+    -- Last, because it is the only check that can cost a network round trip: an entry ruled out
+    -- by occupancy never reaches the usage monitor.
+    let .use authSource ← ctx.resolveAuth e | continue
     return some {
       entry := e
       slot
       resumeFrom := if reuseTree then predecessor.map (·.id) else none
+      authSource
     }
   return none
 
@@ -469,18 +514,12 @@ def daemonRunning : IO Bool := do
 
 -- Cascade cancellation
 
-/-- Normalize backend: treat `none` and `some "claude"` as the same backend. -/
-private def effectiveBackend (backend : Option String) : String :=
-  backend.getD "claude"
-
 /-- Cancel `id` if it is *still* pending, and report whether it was.
 
-    The re-read is what makes cascade cancellation safe under a parallel daemon. Both callers
-    below iterate over a snapshot from `loadAllEntries`, and a worker can claim and start any
-    entry in that snapshot while the loop is still running. Writing the snapshot's version back
-    would stamp `cancelled` onto an entry that is at that moment executing — and since
-    `cancelPendingByBackend` matches on the *backend*, with `claude` as the default, that is
-    almost every pending entry rather than a narrow window. -/
+    The re-read is what makes cascade cancellation safe under a parallel daemon. The caller
+    iterates over a snapshot from `loadAllEntries`, and a worker can claim and start any entry in
+    that snapshot while the loop is still running; writing the snapshot's version back would
+    stamp `cancelled` onto an entry that is at that moment executing. -/
 private def cancelIfStillPending (id : String) : IO Bool := do
   let some cur ← loadEntry id | return false
   if cur.status != .pending then return false
@@ -494,19 +533,6 @@ partial def cancelDependents (taskId : String) : IO Unit := do
     if entry.status == .pending && entry.continuesFrom == some taskId then
       if ← cancelIfStillPending entry.id then
         -- If this entry already ran and has a taskId, cascade further
-        if let some tid := entry.taskId then
-          cancelDependents tid
-
-/-- Cancel all pending entries with the same backend as the given one, except the
-    entry identified by exceptId (the one that just became unfinished). -/
-def cancelPendingByBackend (backend : Option String) (exceptId : String) : IO Unit := do
-  let target := effectiveBackend backend
-  let all ← loadAllEntries
-  for entry in all do
-    if entry.status == .pending && entry.id != exceptId &&
-       effectiveBackend entry.backend == target then
-      if ← cancelIfStillPending entry.id then
-        -- Cascade from any taskId this cancelled entry had (rare for pending, but safe)
         if let some tid := entry.taskId then
           cancelDependents tid
 

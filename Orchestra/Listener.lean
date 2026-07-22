@@ -215,6 +215,14 @@ structure ActionConfig where
   memory         : MemoryMode    := .both
   /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
   authSource     : Option String := none
+  /-- Candidate authentication sources for tasks this listener queues, tried per `authMode`.
+
+      A listener firing repeatedly is exactly the case multiple sources exist for: it can keep
+      producing work after one account's weekly window closes. Which source each task lands on is
+      decided when the daemon claims it, not here. -/
+  authSources    : List String := []
+  /-- How to choose among `authSources`: `"ordered"` (default) or `"distribute"`. -/
+  authMode       : AuthMode := .ordered
   /-- Optional tools to enable beyond the always-available ones.
       When absent, allowed tools are derived from `mode` for backwards compatibility. -/
   tools          : Option (List String) := none
@@ -250,6 +258,8 @@ instance : ToJson ActionConfig where
     let fields := if let some b := a.budget       then fields ++ [("budget",        ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson a.memory)]
     let fields := if let some s := a.authSource   then fields ++ [("auth_source",   Json.str s)]      else fields
+    let fields := if !a.authSources.isEmpty       then fields ++ [("auth_sources",  ToJson.toJson a.authSources)] else fields
+    let fields := if a.authMode != .ordered       then fields ++ [("auth_mode",     ToJson.toJson a.authMode)]    else fields
     let fields := if let some t := a.tools        then fields ++ [("tools",         ToJson.toJson t)] else fields
     let fields := if a.readOnly                   then fields ++ [("read_only",      Json.bool true)]  else fields
     let fields := if a.priority != 10             then fields ++ [("priority",        Json.num a.priority)] else fields
@@ -280,6 +290,8 @@ instance : FromJson ActionConfig where
       | _ => none
     let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
+    let authSources := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
+    let authMode := j.getObjValAs? AuthMode "auth_mode" |>.toOption |>.getD .ordered
     let tools := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority     := j.getObjValAs? Nat    "priority"      |>.toOption |>.getD 10
@@ -287,8 +299,8 @@ instance : FromJson ActionConfig where
     let issueNumber  := j.getObjValAs? String "issue_number"  |>.toOption
     let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, tools, readOnly, priority, workflowPath, issueNumber,
-             prLabels }
+             budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
+             workflowPath, issueNumber, prLabels }
 
 -- Listener config
 
@@ -444,6 +456,8 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
     budget       := action.budget
     memory       := action.memory
     authSource   := action.authSource
+    authSources  := action.authSources
+    authMode     := action.authMode
     tools        := action.tools
     readOnly     := action.readOnly
     priority     := action.priority
