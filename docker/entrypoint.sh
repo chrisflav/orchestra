@@ -47,6 +47,12 @@ else
   # Built with jq rather than a heredoc so tokens containing quotes or backslashes can't break
   # the JSON. `github_app` is emitted unconditionally because AppConfig's FromJson requires it
   # (Orchestra/Config.lean) even when GitHub App auth is unused — a PAT is the usual alternative.
+  #
+  # Written to a per-process temporary file and renamed into place, so a reader never sees a
+  # half-written config: on a first `up` the daemon and the dashboard containers start together
+  # and both find the file missing. `mv` within one directory is atomic, so the loser simply
+  # replaces identical content.
+  tmp="$CONFIG_FILE.$$.tmp"
   jq -n \
     --arg taxis_url    "$ORCHESTRA_TAXIS_URL" \
     --arg taxis_token  "${ORCHESTRA_TAXIS_TOKEN:-}" \
@@ -63,7 +69,8 @@ else
      }
      + (if $claude_token == "" then {} else { claude_token: $claude_token } end)
      + (if $api_key == "" then {} else { anthropic_api_key: $api_key } end)' \
-    > "$CONFIG_FILE"
+    > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
 
   echo "[entrypoint] wrote $CONFIG_FILE (taxis: $ORCHESTRA_TAXIS_URL)"
 fi
@@ -78,6 +85,14 @@ if [ ! -e "$SKILLS_DIR" ] && [ -d /opt/orchestra/skills ]; then
   cp -r /opt/orchestra/skills "$SKILLS_DIR"
   echo "[entrypoint] installed bundled skills into $SKILLS_DIR"
 fi
+
+# The two checks below are about *running tasks*: signing a GitHub JWT and sandboxing an agent.
+# The dashboard container shares this entrypoint and this environment but does neither — it has
+# no /secrets mount and never launches anything — so running them there produces warnings that
+# are false for that container and would teach people to ignore the real ones.
+case "${1:-}" in
+  dashboard) exec orchestra "$@" ;;
+esac
 
 # GitHub App auth reads this key from disk to sign a JWT (Orchestra/GitHub.lean). Check it up
 # front: an unreadable key surfaces otherwise as an opaque openssl failure the first time a task

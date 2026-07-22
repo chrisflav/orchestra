@@ -32,6 +32,12 @@ COPY ffi ./ffi
 # `lake build orchestra` (not the bare `lake build`) so this doesn't also compile the test driver.
 RUN lake build orchestra
 
+# The dashboard's static site (HTML/CSS/JS) is emitted by the binary itself. Generated here
+# rather than at start-up because it is identical in every container and depends on no config or
+# state: only the CSS/JS baked into the binary and the Verso page shells. `dashboard serve --site`
+# then serves it, so the site and the JSON API answer on one port.
+RUN .lake/build/bin/orchestra dashboard generate /out/dashboard-site
+
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
 
@@ -62,6 +68,9 @@ COPY skills /opt/orchestra/skills
 
 COPY --from=landrun /out/landrun /usr/local/bin/landrun
 COPY --from=build /src/.lake/build/bin/orchestra /usr/local/bin/orchestra
+# Served by the `dashboard` service in docker-compose.yaml. Baked in at a fixed path for the
+# same reason as the skills above: it must not depend on a bind mount.
+COPY --from=build /out/dashboard-site /opt/orchestra/dashboard-site
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
