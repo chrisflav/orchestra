@@ -259,3 +259,49 @@ tr:hover td { background: #fafbfc; }
   border-top: 2px dashed #c084fc;
   height: 0;
 }
+
+/* Auth sources.
+   One card per configured source: a header identifying it, then a bar per reported
+   limit. The bar is the point of the page — a percentage in a table does not show at a
+   glance which of the several concurrent limits is the one about to bite. */
+.authhead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--bd);
+}
+.authlabel { font-weight: 600; font-size: 13px; color: var(--tx); margin-right: 4px; }
+.card .note { padding: 10px 12px 0; margin-top: 0; }
+.authfoot {
+  padding: 10px 12px;
+  font-size: 11px;
+  color: var(--mu);
+  border-top: 1px solid var(--bd);
+}
+.authfoot .err { color: #b91c1c; font-weight: 600; margin-top: 4px; }
+
+/* Fixed columns so the bars line up across cards; otherwise every card sizes its own
+   table and an "active" badge on one limit shifts that card's bars out of step. */
+.authlimits { table-layout: fixed; }
+.authlimits td.lname   { width: 34%; }
+.authlimits td.barcell { width: 40%; }
+.authlimits td.pct     { width: 9%; text-align: right; }
+.authlimits td.rst     { width: 17%; text-align: right; }
+.bar {
+  background: var(--code);
+  border-radius: 4px;
+  height: 8px;
+  overflow: hidden;
+  margin-top: 5px;
+}
+.barfill { height: 100%; border-radius: 4px; }
+.sev-ok   { background: #2563eb; }
+.sev-warn { background: #d97706; }
+.sev-crit { background: #dc2626; }
+
+/* A stat box that is also a link (the overview's auth tile). */
+.stlink { display: block; }
+.stlink:hover { text-decoration: none; }
+.stlink .st { height: 100%; }
+.stlink:hover .st { border-color: var(--ac); }

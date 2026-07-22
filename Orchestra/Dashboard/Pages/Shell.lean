@@ -36,5 +36,6 @@ def concertDetailShell   : Html := shell "concert-detail"  "concerts/"   "id"
 def listenerDetailShell  : Html := shell "listener-detail" "listeners/"  "name"
 def projectsShell        : Html := shell "projects"        "projects"    ""
 def projectDetailShell   : Html := shell "project-detail"  "projects/"   "id"
+def authShell            : Html := shell "auth"            "auth"        ""
 
 end Orchestra.Dashboard.Pages.Shell

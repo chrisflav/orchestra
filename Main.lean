@@ -1605,13 +1605,18 @@ private def migrateCmd : Cmd := `[Cli|
 
 private def dashboardGenerateHandler (p : Parsed) : IO UInt32 := do
   let dir     := p.positionalArg! "dir" |>.as! String
-  let apiBase := p.flag? "api-url" |>.map (·.as! String) |>.getD "http://localhost:8080"
+  -- Empty means same-origin: `dashboard.js` then builds root-relative `/api/…` URLs, which
+  -- is right whenever the site and the API answer on one port (`serve --site`, the container).
+  -- A split deployment has to name the backend explicitly.
+  let apiBase := p.flag? "api-url" |>.map (·.as! String) |>.getD ""
   Dashboard.generate dir apiBase
-  IO.println s!"Generated static dashboard site in '{dir}' (API base: {apiBase})."
+  IO.println s!"Generated static dashboard site in '{dir}' \
+(API base: {if apiBase.isEmpty then "same origin" else apiBase})."
   IO.println "The dashboard will prompt for the API token in the browser on first load."
-  IO.println "Serve it with any static HTTP server, e.g.:"
-  IO.println s!"  python3 -m http.server -d {dir} 8000"
-  IO.println "Then start the JSON API backend with: orchestra dashboard serve"
+  IO.println "Serve site and API together with:"
+  IO.println s!"  orchestra dashboard serve --site {dir}"
+  IO.println "or host the directory with any static HTTP server and run 'orchestra dashboard"
+  IO.println "serve' separately — in which case --api-url must point at the backend."
   return 0
 
 private def dashboardGenerateCmd : Cmd := `[Cli|
@@ -1619,7 +1624,7 @@ private def dashboardGenerateCmd : Cmd := `[Cli|
   "Generate the static dashboard site (HTML/CSS/JS) into a target directory."
 
   FLAGS:
-    a, "api-url" : String; "Base URL of the JSON API the site talks to (default: http://localhost:8080)"
+    a, "api-url" : String; "Base URL of the JSON API the site talks to (default: same origin)"
 
   ARGS:
     dir : String; "Target directory for the generated site"
@@ -1627,24 +1632,40 @@ private def dashboardGenerateCmd : Cmd := `[Cli|
 
 private def dashboardServeHandler (p : Parsed) : IO UInt32 := do
   let port := p.flag? "port" |>.map (·.as! Nat) |>.getD 8080
+  let host := p.flag? "host" |>.map (·.as! String) |>.getD "127.0.0.1"
   let token ← Dashboard.resolveToken (p.flag? "token" |>.map (·.as! String))
-  let (boundPort, _shutdown) ← Dashboard.serve token port.toUInt16
-  IO.println s!"Orchestra dashboard JSON API + SSE listening on http://127.0.0.1:{boundPort}"
+  let siteDir := p.flag? "site" |>.map (fun f => System.FilePath.mk (f.as! String))
+  let configPath := p.flag? "config" |>.map (fun f => System.FilePath.mk (f.as! String))
+  if let some dir := siteDir then
+    unless ← (dir / "index.html").pathExists do
+      IO.eprintln s!"error: '{dir}' does not look like a generated site (no index.html)."
+      IO.eprintln s!"Generate it first: orchestra dashboard generate {dir}"
+      return 1
+  let (boundPort, _shutdown) ← Dashboard.serve
+    { token, port := port.toUInt16, host, siteDir, configPath }
+  match siteDir with
+  | some _ => IO.println s!"Orchestra dashboard listening on http://{host}:{boundPort}"
+  | none   => IO.println s!"Orchestra dashboard JSON API + SSE listening on http://{host}:{boundPort}"
   IO.println s!"API token: {token}"
   IO.println "Requests must present it as 'Authorization: Bearer <token>' or '?token=<token>'."
   IO.println "Enter this token in the dashboard when it prompts you on first load."
-  IO.println "Serve the generated static site separately (e.g. python3 -m http.server)."
+  if siteDir.isNone then
+    IO.println "Serve the generated static site separately (e.g. python3 -m http.server),"
+    IO.println "or pass --site <dir> to serve it from here."
   repeat do
     IO.sleep 60000
   return 0
 
 private def dashboardServeCmd : Cmd := `[Cli|
   serve VIA dashboardServeHandler; ["0.1.0"]
-  "Start the dashboard JSON API + SSE backend (bound to 127.0.0.1)."
+  "Start the dashboard JSON API + SSE backend, and optionally the static site."
 
   FLAGS:
     p, port : Nat; "Port to listen on (default: 8080)"
+    h, host : String; "Address to bind (default: 127.0.0.1; use 0.0.0.0 in a container)"
     t, token : String; "API token to require (default: $ORCHESTRA_DASHBOARD_TOKEN or a generated, persisted token)"
+    s, site : String; "Also serve the static site generated into this directory"
+    c, config : String; "Path to config file (read for the auth-sources page)"
 ]
 
 private def dashboardDefaultHandler (_ : Parsed) : IO UInt32 := do

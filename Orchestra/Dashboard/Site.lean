@@ -1,5 +1,6 @@
 import VersoBlog
 import Lean.Data.Json
+import Orchestra.Dirs
 import Orchestra.Dashboard.Pages.Overview
 import Orchestra.Dashboard.Pages.Queue
 import Orchestra.Dashboard.Pages.Concerts
@@ -10,6 +11,7 @@ import Orchestra.Dashboard.Pages.ConcertDetail
 import Orchestra.Dashboard.Pages.ListenerDetail
 import Orchestra.Dashboard.Pages.Projects
 import Orchestra.Dashboard.Pages.ProjectDetail
+import Orchestra.Dashboard.Pages.Auth
 import Orchestra.Dashboard.Pages.About
 
 /-!
@@ -85,6 +87,7 @@ def theme (apiBase : String) : Theme := { Theme.default with
               {{ navItem active "projects/"  "Projects"  "projects"  }}
               {{ navItem active "listeners/" "Listeners" "listeners" }}
               {{ navItem active "tasks/"     "Tasks"     "tasks"     }}
+              {{ navItem active "auth/"      "Auth"      "auth"      }}
               {{ navItem active "about/"     "About"     "about"     }}
             </nav>
           </header>
@@ -111,6 +114,7 @@ def versoSite : Site :=
     "task"      Orchestra.Dashboard.Pages.TaskDetail
     "concert"   Orchestra.Dashboard.Pages.ConcertDetail
     "listener"  Orchestra.Dashboard.Pages.ListenerDetail
+    "auth"      Orchestra.Dashboard.Pages.Auth
     "about"     Orchestra.Dashboard.Pages.About
 
 /-- Light theme stylesheet, written out by `generate`. -/
@@ -119,13 +123,36 @@ def dashCss : String := include_str "dashboard.css"
 /-- Front-end JS bundle, written out by `generate`. -/
 def dashJs : String := include_str "dashboard.js"
 
+/-- Run `act` from a scratch directory that looks like a Lean project.
+
+    Verso's pipeline insists on being run from inside one: `blogMain` refreshes its
+    cross-reference remotes on every run, and that walks up from the working directory
+    looking for a `lean-toolchain`, throwing "No 'lean-toolchain' found in a parent
+    directory" when there is none (`MultiVerso.findProject`). An installed `orchestra` is
+    run from wherever the user happens to stand — and in a container, from `/`.
+
+    Only the file's *existence* is checked, never its contents, and the dashboard site has
+    no cross-references to resolve, so an empty marker under the data dir is enough. -/
+private def withProjectDir (act : IO α) : IO α := do
+  let dir := (← Dirs.dataBase) / "dashboard-build"
+  IO.FS.createDirAll dir
+  IO.FS.writeFile (dir / "lean-toolchain") ""
+  let previous ← IO.currentDir
+  IO.Process.setCurrentDir dir
+  try act finally IO.Process.setCurrentDir previous
+
 /-- Generate the complete static dashboard site into `targetDir`. The generated
     front-end fetches (and streams over SSE) from the JSON API at `apiBase` — the
-    base URL of a running `orchestra dashboard serve`. -/
+    base URL of a running `orchestra dashboard serve`, or the empty string to use
+    whatever origin served the page. -/
 def generate (targetDir : System.FilePath) (apiBase : String) : IO Unit := do
-  IO.FS.createDirAll targetDir
-  let _ ← blogMain (theme apiBase) versoSite (options := ["--output", targetDir.toString])
-  IO.FS.writeFile (targetDir / "dashboard.css") dashCss
-  IO.FS.writeFile (targetDir / "dashboard.js") dashJs
+  -- Resolved before `withProjectDir` changes what a relative path means.
+  let cwd ← IO.currentDir
+  let target := if targetDir.isAbsolute then targetDir else cwd / targetDir
+  IO.FS.createDirAll target
+  withProjectDir do
+    let _ ← blogMain (theme apiBase) versoSite (options := ["--output", target.toString])
+  IO.FS.writeFile (target / "dashboard.css") dashCss
+  IO.FS.writeFile (target / "dashboard.js") dashJs
 
 end Orchestra.Dashboard

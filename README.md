@@ -755,6 +755,38 @@ orchestra project health <project-id>          # find claims whose task is gone
 concepts map onto taxis, the `taxis` config block, role templates and their prompt variables, the
 dispatch triggers, and how the two dispatchers differ.
 
+## dashboard
+
+A read-only web view of everything above: the queue and concert runs, listeners and when they last
+checked, task history with the full structured log of each run, projects with their issue
+dependency graph, and every configured authentication source with the usage limits last reported
+for it. Pages stream updates over Server-Sent Events, so they stay current without a reload.
+
+It is two commands. `generate` writes a static site — the pages are authored as
+[Verso](https://github.com/leanprover/verso) documents and emitted by its site pipeline — and
+`serve` runs the JSON API those pages read, optionally serving the site next to it so one port
+answers both:
+
+```sh
+orchestra dashboard generate ~/orchestra-site
+orchestra dashboard serve --site ~/orchestra-site --port 8080
+```
+
+Every `/api` and `/sse` request needs a bearer token; the pages ask for it once and keep it in
+`localStorage`, and `?token=<token>` in the URL supplies it without the prompt. `serve` prints the
+token at start-up: it comes from `--token`, `$ORCHESTRA_DASHBOARD_TOKEN`, or one generated on
+first run and persisted to `<data>/dashboard.token`. The server binds loopback unless `--host`
+says otherwise — it is plain HTTP behind that token, so anything wider wants TLS in front.
+
+The generated pages carry no data, so they can equally be hosted by any static web server; point
+them at the API with `generate --api-url <url>` in that case. The docker image bakes a generated
+site in and runs `serve --site` as [its own container](docker/README.md#dashboard).
+
+The **Auth** page is the one to open when the queue has pending work but nothing is running: it
+names the limit that is binding on each source and when it lifts — the same data as
+[`orchestra usage`](#usage-limits), read from the usage store rather than polled, so opening the
+page costs nothing.
+
 ## other commands
 
 ```
@@ -763,6 +795,7 @@ orchestra cleanup                     # remove all cloned repositories
 orchestra cleanup list                # list clones and their task slots
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
 orchestra usage                       # usage limits of every configured auth source
+orchestra dashboard serve             # the web dashboard's API (and site, with --site)
 orchestra migrate                     # move ~/.agent/ to the XDG directories
 ```
 
@@ -809,8 +842,13 @@ cp .env.example .env      # fill in at least ORCHESTRA_TAXIS_URL and a token
 docker compose up --build
 ```
 
-The container runs `orchestra queue start`; override the command for one-off subcommands against
-the same volumes:
+Two containers come up off the one image: the daemon, and the [dashboard](#dashboard) on
+<http://127.0.0.1:8080> (`docker compose logs dashboard` prints the token it asks for). They are
+separate because the daemon drains in-flight tasks for up to half an hour on every stop, and a
+read-only web view should not be unavailable for that long.
+
+The daemon container runs `orchestra queue start`; override the command for one-off subcommands
+against the same volumes:
 
 ```
 docker compose run --rm orchestra project list

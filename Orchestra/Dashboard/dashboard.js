@@ -149,8 +149,13 @@
       ["running", "Running"], ["pending", "Pending"], ["failed", "Failed"],
       ["concerts", "Concerts"], ["listeners", "Listeners"], ["totalTasks", "Total Tasks"],
     ];
+    // Auth is shown as available/total rather than a plain count: a stalled queue is
+    // usually an exhausted account, and "0/2" says that where "2" would not.
+    const authStat = c.authTotal
+      ? `<a class="stlink" href="auth/">${statBox(`${c.authFree}/${c.authTotal}`, "Auth Sources")}</a>`
+      : "";
     const stats = `<div class="stats">${
-      labels.map(([k, l]) => statBox(c[k], l)).join("")
+      labels.map(([k, l]) => statBox(c[k], l)).join("") + authStat
     }</div>`;
     const qRows = d.activeQueue.map((e) => `
       <tr>
@@ -519,6 +524,91 @@
       <h2>Issues</h2>${t}`;
   };
 
+  // ---- authentication sources -------------------------------------------
+
+  // Utilisation is shown as a bar per reported limit rather than a single number,
+  // because a subscription runs several at once (a rolling session window, a weekly
+  // total, and weekly limits scoped to one model family) and only one of them is
+  // usually the one biting. The severity the server reports drives the colour.
+  const SEVERITY_CLS = { normal: "sev-ok", warning: "sev-warn", critical: "sev-crit" };
+
+  function limitRow(l) {
+    const pct = Math.max(0, Math.min(100, Number(l.percent) || 0));
+    const cls = SEVERITY_CLS[l.severity] || "sev-ok";
+    // A scoped limit closes exactly one model family; naming it is the difference
+    // between "the account is done" and "Opus is done, Sonnet is fine".
+    const name = l.scope ? `${l.kind} (${l.scope})` : l.kind;
+    return `
+      <tr>
+        <td class="lname">${E(name)}${l.active ? ' <span class="b bf">active</span>' : ""}</td>
+        <td class="barcell"><div class="bar"><div class="barfill ${cls}" style="width:${pct}%"></div></div></td>
+        <td class="m pct">${pct}%</td>
+        <td class="m rst">${E(l.resets || "—")}</td>
+      </tr>`;
+  }
+
+  function authSource(s) {
+    const stateBadge = s.state === "available"
+      ? `<span class="b bd">available</span>`
+      : `<span class="b bf">blocked</span>`;
+    const tags = [
+      `<span class="b bc">${E(s.kind)}</span>`,
+      s.isDefault ? `<span class="b bo">default</span>` : "",
+    ].join("");
+    const why = s.state === "blocked"
+      ? `<div class="note">${E(s.reason)}${s.resets ? ` — frees up ${E(s.resets)}` : ""}</div>`
+      : "";
+    // An API-key source has no subscription window to poll, so an empty limit table on
+    // one is the expected state and not a gap in the data.
+    const limits = (s.limits || []).length
+      ? `<table class="authlimits">${(s.limits || []).map(limitRow).join("")}</table>`
+      : `<p class="empty">${s.pollable
+          ? "No usage data yet — nothing has polled this source."
+          : "Billed per token; no subscription limits to report."}</p>`;
+    const notes = [
+      s.pollable ? `polled ${E(s.polled)}` : "",
+      `last used ${E(s.lastUsed)}`,
+      s.baseUrl ? `base ${E(s.baseUrl)}` : "",
+      s.backoff ? `not polling until ${E(s.backoff)} (endpoint rate-limited)` : "",
+    ].filter(Boolean).join(" · ");
+    const err = s.lastError
+      ? `<div class="note err">last poll error: ${E(s.lastError)}</div>` : "";
+    return `
+      <div class="card">
+        <div class="authhead">
+          <span class="authlabel mono">${E(s.label)}</span>${tags}${stateBadge}
+        </div>
+        ${why}${limits}
+        <div class="authfoot">${notes}${err}</div>
+      </div>`;
+  }
+
+  pages.auth = (d) => {
+    if (d && d.configError) {
+      return `<h1>Auth Sources</h1>
+        <div class="card"><p class="empty">Could not read the configuration:<br>
+        <span class="mono">${E(d.configError)}</span></p></div>`;
+    }
+    const backends = (d && d.backends) || [];
+    if (backends.length === 0) {
+      return `<h1>Auth Sources</h1>
+        <div class="card"><p class="empty">No agent auth sources configured —
+        see the <span class="mono">agents</span> block in config.json.</p></div>`;
+    }
+    const body = backends.map((b) => {
+      const sources = (b.sources || []).length
+        ? b.sources.map(authSource).join("")
+        : `<div class="card"><p class="empty">No sources configured for this backend.</p></div>`;
+      return `<h2>${E(b.name)}</h2>${sources}`;
+    }).join("");
+    // Availability here is judged with no model in hand, which is the only question a
+    // reader can ask; a task naming an exhausted model family sees less than this.
+    return `<h1>Auth Sources</h1>${body}
+      <p class="note">Availability is judged without a model, so a source limited only for
+      one model family still reads as available — the limits above show which. Values come
+      from the usage store the daemon refreshes; this page never polls the API itself.</p>`;
+  };
+
   // ---- boot + live updates ---------------------------------------------
 
   // Snapshot every scrollable region inside the page (the task-detail log,
@@ -599,6 +689,20 @@
     t ? window.localStorage.setItem(TOKEN_KEY, t)
       : window.localStorage.removeItem(TOKEN_KEY);
 
+  // Adopt a `?token=…` from the URL, then strip it. Lets the token be handed over in a
+  // link — which is how it reaches someone whose orchestra runs in a container and who
+  // never sees the start-up banner — without leaving the secret sitting in the address
+  // bar, in the back/forward history, or in whatever the next page's Referer header is.
+  function adoptTokenFromUrl() {
+    const params = new URLSearchParams(location.search);
+    const t = (params.get("token") || "").trim();
+    if (!t) return;
+    setToken(t);
+    params.delete("token");
+    const qs = params.toString();
+    history.replaceState(null, "", location.pathname + (qs ? "?" + qs : "") + location.hash);
+  }
+
   // Prompt the user for the token; returns the new token, or "" if cancelled.
   function promptToken(message) {
     const t = window.prompt(
@@ -656,6 +760,9 @@
   //                   to data-endpoint for detail pages (task/?id=…)
   // Pages without a data-endpoint (e.g. the static About page) are left alone.
   document.addEventListener("DOMContentLoaded", () => {
+    // Before anything reads the query string: `data-param` pages look for `?id=`/`?name=`
+    // there too, and this leaves those untouched.
+    adoptTokenFromUrl();
     const main = document.querySelector("[data-page]");
     if (!main) return;
     const page = main.dataset.page;
