@@ -167,8 +167,15 @@ def createJWT (appId : Nat) (privateKeyPath : String) : IO String := do
     s!"echo -n '{unsigned}' | openssl dgst -sha256 -sign {privateKeyPath} | openssl base64 -e -A | tr '+/' '-_' | tr -d '='"]
   return s!"{unsigned}.{signature}"
 
-/-- Get the installation ID for a GitHub App on a given owner/org. -/
-def getInstallationId (jwt : String) (owner : String) : IO Nat := do
+/-- Get the installation ID for a GitHub App on a given owner/org, or `none` when the App has no
+    installation on that account.
+
+    The `none` case is a *definitive* answer — the App is not installed there — as opposed to the
+    thrown errors, which are transport or parse failures (an unreachable GitHub, a malformed
+    response) that leave the question unanswered. Callers deciding whether the App can write to a
+    repo rely on that distinction: "not installed" means it cannot, where a transport failure
+    means "unknown". -/
+def getInstallationId? (jwt : String) (owner : String) : IO (Option Nat) := do
   let result ← githubAppApi "listing the App's installations" jwt "GET"
     "https://api.github.com/app/installations"
   match Json.parse result with
@@ -183,8 +190,16 @@ def getInstallationId (jwt : String) (owner : String) : IO Nat := do
       let .ok login := account.getObjValAs? String "login" | continue
       if login == owner then
         let .ok id := inst.getObjValAs? Nat "id" | throw (.userError "installation missing id")
-        return id
-    throw (.userError s!"no installation found for owner '{owner}'")
+        return some id
+    return none
+
+/-- Get the installation ID for a GitHub App on a given owner/org. Throws when the App has no
+    installation on that account; use `getInstallationId?` when "not installed" is a case to
+    handle rather than an error. -/
+def getInstallationId (jwt : String) (owner : String) : IO Nat := do
+  match ← getInstallationId? jwt owner with
+  | some id => return id
+  | none    => throw (.userError s!"no installation found for owner '{owner}'")
 
 /-- Create an installation access token. -/
 def createInstallationToken (jwt : String) (installationId : Nat) : IO String := do
@@ -199,6 +214,143 @@ def createInstallationToken (jwt : String) (installationId : Nat) : IO String :=
     let .ok token := j.getObjValAs? String "token"
       | throw (.userError "token response missing 'token' field")
     return token
+
+/-! ## Write-access probing and forking
+
+Project/role-based tasks name a *target* repository their pull requests must land in. The agent
+does its work on a `fork` it can push to; when the App can already push to the target, the fork
+*is* the target. These functions decide which case applies and, when a fork is needed, create it.
+They authenticate as the App installation, not with the PAT: the question is specifically what the
+*App* may do. -/
+
+/-- Decide repo write access from a `GET /repos/{owner}/{repo}` response, as a three-way answer:
+    `some true`/`some false` are definitive (the App can / cannot push), `none` means the response
+    did not settle it and the caller should retry or treat it as unknown.
+
+    A 2xx carries a `permissions` object reflecting the installation's access — `push` is the field
+    that matters. 403/404 are the App having no visibility of the repo at all, a definitive "cannot
+    push". Anything else (5xx, an unparseable body, a 2xx with no `permissions` field) is
+    inconclusive. Pure, so the mapping is tested without a network. -/
+def repoAccessDecision (status : Nat) (body : String) : Option Bool :=
+  if status == 403 || status == 404 then some false
+  else if status < 200 || status >= 300 then none
+  else match Json.parse body with
+    | .error _ => none
+    | .ok j =>
+      match j.getObjVal? "permissions" with
+      | .error _ => none
+      | .ok perms => (perms.getObjValAs? Bool "push").toOption
+
+/-- Whether the App installation identified by `token` can push to `repo`, as the three-way answer
+    of `repoAccessDecision` — `none` when the call did not settle it. -/
+def repoPushPermission (token : String) (repo : Repository) : IO (Option Bool) := do
+  let (status, body) ← curlWithStatus #[
+    "-X", "GET",
+    "-H", s!"Authorization: Bearer {token}",
+    "-H", "Accept: application/vnd.github+json",
+    s!"https://api.github.com/repos/{repo.owner}/{repo.name}" ]
+  return repoAccessDecision status body
+
+/-- Whether the GitHub App can push to `target`. `some true`/`some false` are definitive; `none`
+    means the question could not be answered (an unreachable GitHub, say).
+
+    The installation is looked up by `target`'s owner rather than using `installationId` from the
+    config: that field names one installation, but the target may live under a different account,
+    and the point here is whether *that account's* installation grants push. An App not installed
+    on the owner at all is a definitive "no". -/
+def probeWriteAccess (appConfig : AppConfig) (target : Repository) : IO (Option Bool) := do
+  try
+    let jwt ← createJWT appConfig.appId appConfig.privateKeyPath
+    match ← getInstallationId? jwt target.owner with
+    | none        => return some false
+    | some instId =>
+      let token ← createInstallationToken jwt instId
+      repoPushPermission token target
+  catch e =>
+    IO.eprintln s!"[fork] could not determine App write access to {target}: {e}"
+    return none
+
+/-- `probeWriteAccess`, retried while the answer is inconclusive (`none`), up to `attempts` times
+    with a short pause between tries. A definitive answer returns immediately; a persistently
+    unreachable GitHub returns `none` after the last attempt. -/
+def probeWriteAccessRetrying (appConfig : AppConfig) (target : Repository)
+    (attempts : Nat := 3) : IO (Option Bool) := do
+  let mut result : Option Bool := none
+  for i in [0:attempts] do
+    result ← probeWriteAccess appConfig target
+    if result.isSome then return result
+    if i + 1 < attempts then IO.sleep 1000
+  return result
+
+/-- Fork `target` into organisation `org`, returning the fork as `org/{target.name}`.
+
+    Authenticates as `org`'s own installation — the one with permission to create repositories
+    there — so the App must be installed on `org`. Idempotent: GitHub returns the existing fork if
+    one is already present. Forking is asynchronous, so this polls until the fork is queryable
+    before returning, so a task cloning it next does not race the copy. -/
+def forkRepo (appConfig : AppConfig) (target : Repository) (org : String) : IO Repository := do
+  let fork : Repository := { owner := org, name := target.name }
+  let jwt ← createJWT appConfig.appId appConfig.privateKeyPath
+  let some instId ← getInstallationId? jwt org
+    | throw (.userError s!"cannot fork {target} into '{org}': the GitHub App is not installed on \
+        '{org}', so it cannot create repositories there")
+  let token ← createInstallationToken jwt instId
+  let reqBody := Json.mkObj [("organization", Json.str org)] |>.compress
+  let (status, respBody) ← curlWithStatus #[
+    "-X", "POST",
+    "-H", s!"Authorization: Bearer {token}",
+    "-H", "Accept: application/vnd.github+json",
+    "-d", reqBody,
+    s!"https://api.github.com/repos/{target.owner}/{target.name}/forks" ]
+  -- 202 Accepted is the normal answer (the fork is created asynchronously); 200 comes back when
+  -- the fork already exists. Both are fine; anything else is a failure worth quoting.
+  if status < 200 || status >= 300 then
+    throw (.userError s!"forking {target} into '{org}' failed: GitHub answered HTTP {status}\n  \
+      {githubErrorDetail respBody}")
+  for _ in [0:10] do
+    let (s, _) ← curlWithStatus #[
+      "-X", "GET",
+      "-H", s!"Authorization: Bearer {token}",
+      "-H", "Accept: application/vnd.github+json",
+      s!"https://api.github.com/repos/{fork.owner}/{fork.name}" ]
+    if s >= 200 && s < 300 then return fork
+    IO.sleep 1000
+  -- The POST succeeded, so the fork will appear; return it rather than failing on a slow copy.
+  return fork
+
+/-- Resolve which repository a project/role-based task should push to, given `target` as its
+    upstream / pull-request destination. Returns `none` when the task cannot be dispatched.
+
+    - App can push to `target` → `some target` (work on it directly, no fork).
+    - App cannot push, `defaultOrganization` set → fork `target` into it and return the fork.
+    - App cannot push, no `defaultOrganization` → `none` (nothing to fork into).
+    - Write access could not be determined after retries → `none`.
+
+    Never throws: a failure to fork is logged and yields `none` like the other skip cases, so the
+    caller has a single "cannot dispatch" branch to handle. Every branch logs its reason. -/
+def resolveFork (appConfig : AppConfig) (target : Repository) : IO (Option Repository) := do
+  match ← probeWriteAccessRetrying appConfig target with
+  | some true =>
+    return some target
+  | some false =>
+    match appConfig.defaultOrganization with
+    | some org =>
+      try
+        IO.println s!"[fork] the GitHub App cannot push to {target}; forking into '{org}'"
+        let fork ← forkRepo appConfig target org
+        IO.println s!"[fork] using fork {fork} (upstream {target})"
+        return some fork
+      catch e =>
+        IO.eprintln s!"[fork] could not fork {target} into '{org}': {e}; skipping"
+        return none
+    | none =>
+      IO.eprintln s!"[fork] the GitHub App cannot push to {target} and no default_organization \
+        is configured to fork into; skipping"
+      return none
+  | none =>
+    IO.eprintln s!"[fork] could not determine whether the GitHub App can push to {target} after \
+      retrying; skipping"
+    return none
 
 /-- Configure `gh` CLI to use the given token, by writing it to `~/.config/gh/hosts.yml`.
 

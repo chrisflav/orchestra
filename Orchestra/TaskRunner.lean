@@ -25,14 +25,28 @@ initialize globalClaimManager : Project.ClaimManager ← Project.ClaimManager.ne
 
 /-- Enqueue a merger task for `pr` so the queue daemon will merge it later.
     Used by `decide_issue approve` via the `enqueueMerger` hook. Returns the
-    new queue entry's ID on success. -/
-def enqueueMergerImpl (pid : Taxis.IssueId) (iid : Taxis.IssueId)
+    new queue entry's ID on success, or an error when the GitHub App has no
+    write access to `pr.repo` and therefore could not merge it. -/
+def enqueueMergerImpl (appConfig : AppConfig) (pid : Taxis.IssueId) (iid : Taxis.IssueId)
     (pr : Project.PRRef) : IO (Except String String) := do
   try
+    -- The merger is the one role-based task that cannot be served by a fork. It merges with
+    -- `gh pr merge --repo <pr.repo>` using the App's installation token, so it needs write access
+    -- to the PR's own repository; a fork would only give it somewhere else to push. If the App
+    -- cannot push to `pr.repo` the merger is disabled rather than dispatched at a merge it cannot
+    -- perform. An inconclusive probe is treated the same way — retried, then refused.
+    let writable ← GitHub.probeWriteAccessRetrying appConfig pr.repo
+    if writable != some true then
+      let why := if writable == some false then "cannot push to" else "could not determine \
+        whether it can push to"
+      return .error s!"no merger was queued: the GitHub App {why} {pr.repo}, and merging requires \
+        write access to the pull request's own repository (forking does not help). Merge \
+        {pr.repo}#{pr.number} manually or grant the App write access."
     let id ← TaskStore.generateId
     let createdAt ← TaskStore.currentIso8601
     let entry : Queue.QueueEntry :=
       { id, createdAt
+      -- Both sides are the PR's repo: the merger works directly in it, never in a fork.
       , upstream := pr.repo, fork := pr.repo
       , mode := .pr
       , prompt := s!"merge {pr.repo}#{pr.number}"
@@ -55,14 +69,20 @@ private def renderReviewerPrompt (tmpl : String) (pr : Project.PRRef) (iid : Tax
 
 /-- Enqueue a reviewer task for `pr` against `tmpl`. Used by `attach_pr` via
     the `enqueueReviewer` hook when a project has a `reviewer` template. -/
-def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
+def enqueueReviewerImpl (appConfig : AppConfig) (project : Project.Project) (iid : Taxis.IssueId)
     (pr : Project.PRRef) (tmpl : Project.ReviewerTemplate) : IO (Except String String) := do
   try
+    -- Same fork/upstream resolution as every other role-based task: the reviewer clones `fork` and
+    -- the PR lives in `upstream` (= the PR's repo). When the App can push to it directly the fork
+    -- is the repo itself; otherwise it is a fork in the configured default organisation.
+    let some fork ← GitHub.resolveFork appConfig pr.repo
+      | return .error s!"the GitHub App cannot push to {pr.repo} and it could not be forked \
+          (set default_organization to enable forking)"
     let id ← TaskStore.generateId
     let createdAt ← TaskStore.currentIso8601
     let entry : Queue.QueueEntry :=
       { id, createdAt
-      , upstream := pr.repo, fork := pr.repo
+      , upstream := pr.repo, fork
       , mode := .pr
       , prompt := renderReviewerPrompt tmpl.promptTemplate pr iid
       , backend := tmpl.backend
@@ -450,8 +470,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     series
     projectId := ioTask.projectId
     issueId   := ioTask.issueId
-    enqueueMerger   := some enqueueMergerImpl
-    enqueueReviewer := some enqueueReviewerImpl
+    enqueueMerger   := some (enqueueMergerImpl appConfig)
+    enqueueReviewer := some (enqueueReviewerImpl appConfig)
     prLabels  := ioTask.prLabels
   }
   let (port, shutdown) ← Server.start serverState

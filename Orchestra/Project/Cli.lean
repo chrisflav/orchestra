@@ -1,5 +1,6 @@
 import Cli
 import Orchestra.Config
+import Orchestra.GitHub
 import Orchestra.Queue
 import Orchestra.DaemonRequest
 import Orchestra.TaskStore
@@ -387,6 +388,14 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let some target' := target
     | IO.eprintln "Cannot spawn: no effective target (project has no default and issue has no override)"
       return 1
+  -- The agent pushes to `fork`; PRs land in `upstream` (= the target repo). When the App can push
+  -- to the target directly the fork is the target itself, otherwise it is a fork in the configured
+  -- default organisation.
+  let appConfig ← loadAppConfig
+  let some fork ← GitHub.resolveFork appConfig target'.repo
+    | IO.eprintln s!"Cannot spawn: the GitHub App cannot push to {target'.repo} and it could not \
+        be forked (see [fork] logs above; set default_organization to enable forking)"
+      return 1
   let comments ← match mIssue with
     | some i => renderCommentThread i.id
     | none   => pure none
@@ -395,7 +404,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let entry : Queue.QueueEntry :=
     { id := entryId, createdAt
     , upstream      := target'.repo
-    , fork          := target'.repo
+    , fork
     , mode          := .pr
     , prompt
     , backend       := role.backend
