@@ -11,57 +11,82 @@ namespace OrchestraTest.ForkResolve
 
 Project/role-based tasks name a target repository; the agent works on a `fork` it can push to.
 When the GitHub App can already push to the target the fork is the target itself, otherwise the
-target is forked into `default_organization`. The decision hinges on reading the App's push
-permission out of a `GET /repos/{owner}/{repo}` response, on the branch table that turns that
-answer into a repository to push to, and on parsing the config option that names the org to fork
-into. All three are covered here — the branch table through `resolveForkWith`, which takes the
-probe and the fork step as arguments precisely so it can be driven by stubs. What is not covered
-is the code that actually talks to GitHub.
+target is forked into `default_organization`. The decision hinges on reading the App's `contents`
+permission out of a `GET /repos/{owner}/{repo}/installation` response, on the branch table that
+turns that answer into a repository to push to, and on parsing the config option that names the org
+to fork into. All three are covered here — the branch table through `resolveForkWith`, which takes
+the probe and the fork step as arguments precisely so it can be driven by stubs. What is not
+covered is the code that actually talks to GitHub.
 -/
 
--- Orchestra.GitHub.repoAccessDecision
+-- Orchestra.GitHub.installationWriteDecision
 
-/-- A 2xx whose `permissions.push` is true is a definitive "can push". -/
+/-- An installation holding `contents: write` on the repo can push. -/
 @[test]
-def access_pushTrueIsWritable : Test := do
-  let body := "{\"name\":\"repo\",\"permissions\":{\"admin\":false,\"push\":true,\"pull\":true}}"
-  TestM.assertEqual (GitHub.repoAccessDecision 200 body) (some true)
-    (msg := "push:true ⇒ writable")
+def access_contentsWriteIsWritable : Test := do
+  let body := "{\"id\":1,\"permissions\":{\"contents\":\"write\",\"metadata\":\"read\"}}"
+  TestM.assertEqual (GitHub.installationWriteDecision 200 body) (some true)
+    (msg := "contents:write ⇒ writable")
 
-/-- A 2xx whose `permissions.push` is false is a definitive "cannot push". -/
+/-- `contents: read`, or a `permissions` object that omits `contents` altogether (GitHub leaves
+    ungranted permissions out), is a definitive "cannot push". -/
 @[test]
-def access_pushFalseIsNotWritable : Test := do
-  let body := "{\"permissions\":{\"admin\":false,\"push\":false,\"pull\":true}}"
-  TestM.assertEqual (GitHub.repoAccessDecision 200 body) (some false)
-    (msg := "push:false ⇒ not writable")
+def access_contentsNotWriteIsNotWritable : Test := do
+  TestM.assertEqual
+    (GitHub.installationWriteDecision 200 "{\"permissions\":{\"contents\":\"read\"}}") (some false)
+    (msg := "contents:read ⇒ not writable")
+  TestM.assertEqual
+    (GitHub.installationWriteDecision 200 "{\"permissions\":{\"metadata\":\"read\"}}") (some false)
+    (msg := "no contents permission ⇒ not writable")
 
-/-- A 404 is the App having no visibility of the repo — a definitive "cannot push", not an
+/-- The repository's *own* `permissions` block — a user's role, all-false under an installation
+    token even where the App holds `contents: write` — must not be what settles this. A body
+    shaped like that response is a body with no installation `permissions` in it: inconclusive,
+    never "can push". -/
+@[test]
+def access_repoRolePermissionsAreNotTheSignal : Test := do
+  let body := "{\"full_name\":\"org/repo\",\
+    \"permissions\":{\"admin\":false,\"push\":false,\"pull\":false}}"
+  TestM.assertEqual (GitHub.installationWriteDecision 200 body) (some false)
+    (msg := "a role block has no contents key ⇒ not writable, not silently writable")
+
+/-- A 404 is no installation of the App reaching the repo — a definitive "cannot push", not an
     inconclusive result, so the caller forks rather than retrying forever. -/
 @[test]
 def access_notFoundIsNotWritable : Test := do
-  TestM.assertEqual (GitHub.repoAccessDecision 404 "{\"message\":\"Not Found\"}") (some false)
-    (msg := "404 ⇒ cannot push")
+  TestM.assertEqual (GitHub.installationWriteDecision 404 "{\"message\":\"Not Found\"}")
+    (some false) (msg := "404 ⇒ cannot push")
 
-/-- A 403 is *not* a definitive "cannot push": under an installation token an invisible repo
-    answers 404, so a 403 is a rate limit or a suspended/blocked installation. Reading it as
-    "cannot push" would fork a repository over a rate limit. -/
+/-- A 403 is *not* a definitive "cannot push": a repo the App cannot see answers 404, so a 403 is
+    a rate limit or a blocked App. Reading it as "cannot push" would fork over a rate limit. -/
 @[test]
 def access_forbiddenIsInconclusive : Test := do
   TestM.assertEqual
-    (GitHub.repoAccessDecision 403 "{\"message\":\"API rate limit exceeded\"}") none
+    (GitHub.installationWriteDecision 403 "{\"message\":\"API rate limit exceeded\"}") none
     (msg := "403 rate limit ⇒ inconclusive")
-  TestM.assertEqual (GitHub.repoAccessDecision 403 "{\"message\":\"Forbidden\"}") none
+  TestM.assertEqual (GitHub.installationWriteDecision 403 "{\"message\":\"Forbidden\"}") none
     (msg := "403 ⇒ inconclusive")
 
-/-- A 5xx, an unparseable body, or a 2xx without a `permissions` field is inconclusive (`none`):
+/-- A suspended installation still reports its permissions but cannot use them; that needs a human,
+    not a fork, so it is inconclusive. -/
+@[test]
+def access_suspendedIsInconclusive : Test := do
+  let body := "{\"suspended_at\":\"2026-01-01T00:00:00Z\",\"permissions\":{\"contents\":\"write\"}}"
+  TestM.assertEqual (GitHub.installationWriteDecision 200 body) none
+    (msg := "suspended installation ⇒ inconclusive")
+  let live := "{\"suspended_at\":null,\"permissions\":{\"contents\":\"write\"}}"
+  TestM.assertEqual (GitHub.installationWriteDecision 200 live) (some true)
+    (msg := "suspended_at:null ⇒ not suspended")
+
+/-- A 5xx, an unparseable body, or a 2xx without a `permissions` object is inconclusive (`none`):
     the answer is unknown and the caller should retry rather than assume either way. -/
 @[test]
 def access_inconclusiveCases : Test := do
-  TestM.assertEqual (GitHub.repoAccessDecision 500 "oops") none
+  TestM.assertEqual (GitHub.installationWriteDecision 500 "oops") none
     (msg := "5xx ⇒ inconclusive")
-  TestM.assertEqual (GitHub.repoAccessDecision 200 "<html>not json</html>") none
+  TestM.assertEqual (GitHub.installationWriteDecision 200 "<html>not json</html>") none
     (msg := "unparseable 2xx ⇒ inconclusive")
-  TestM.assertEqual (GitHub.repoAccessDecision 200 "{\"name\":\"repo\"}") none
+  TestM.assertEqual (GitHub.installationWriteDecision 200 "{\"id\":1}") none
     (msg := "2xx without permissions ⇒ inconclusive")
 
 -- Orchestra.GitHub.resolveForkWith

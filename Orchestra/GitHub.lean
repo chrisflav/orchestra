@@ -215,11 +215,10 @@ private def installationIdFrom (what : String) (status : Nat) (body : String) :
 
     Asks GitHub for *this account's* installation directly rather than scanning
     `GET /app/installations` for it. That listing is paginated at 30, so an App installed on more
-    accounts than that answered "not installed" for everything past the first page — harmless
-    while the caller turned that into a hard error, but `probeWriteAccess` now reads it as "cannot
-    push", which would silently fork a repository the App could have pushed to. An account is
-    either an org or a user and GitHub has a separate endpoint for each, so a 404 from the org one
-    is not yet an answer; only a 404 from both is. -/
+    accounts than that answered "not installed" for everything past the first page, which
+    `forkRepo` would report as "the App is not installed on that org" for an org it is installed
+    on. An account is either an org or a user and GitHub has a separate endpoint for each, so a 404
+    from the org one is not yet an answer; only a 404 from both is. -/
 def getInstallationId? (jwt : String) (owner : String) : IO (Option Nat) := do
   let (orgStatus, orgBody) ← githubAppGet jwt s!"https://api.github.com/orgs/{owner}/installation"
   match ← installationIdFrom s!"looking up the App's installation on org '{owner}'"
@@ -229,18 +228,6 @@ def getInstallationId? (jwt : String) (owner : String) : IO (Option Nat) := do
     let (userStatus, userBody) ←
       githubAppGet jwt s!"https://api.github.com/users/{owner}/installation"
     installationIdFrom s!"looking up the App's installation on user '{owner}'" userStatus userBody
-
-/-- The installation covering `repo` specifically, or `none` when no installation of this App
-    reaches it — the App is not installed on the owner at all, or is installed with a repository
-    selection that excludes this one. Both are a definitive "the App cannot touch this repo".
-
-    Distinct from `getInstallationId?` on the owner: an installation can exist on the account and
-    still not include the repository, which is exactly the case `probeWriteAccess` must not
-    mistake for access. -/
-def repoInstallationId? (jwt : String) (repo : Repository) : IO (Option Nat) := do
-  let (status, body) ←
-    githubAppGet jwt s!"https://api.github.com/repos/{repo.owner}/{repo.name}/installation"
-  installationIdFrom s!"looking up the App's installation on {repo}" status body
 
 /-- Get the installation ID for a GitHub App on a given owner/org. Throws when the App has no
     installation on that account; use `getInstallationId?` when "not installed" is a case to
@@ -269,58 +256,65 @@ def createInstallationToken (jwt : String) (installationId : Nat) : IO String :=
 Project/role-based tasks name a *target* repository their pull requests must land in. The agent
 does its work on a `fork` it can push to; when the App can already push to the target, the fork
 *is* the target. These functions decide which case applies and, when a fork is needed, create it.
-They authenticate as the App installation, not with the PAT: the question is specifically what the
-*App* may do. -/
+They authenticate as the App, not with the PAT: the question is specifically what the *App* may
+do. -/
 
-/-- Decide repo write access from a `GET /repos/{owner}/{repo}` response, as a three-way answer:
-    `some true`/`some false` are definitive (the App can / cannot push), `none` means the response
-    did not settle it and the caller should retry or treat it as unknown.
+/-- Decide repo write access from a `GET /repos/{owner}/{repo}/installation` response, as a
+    three-way answer: `some true`/`some false` are definitive (the App can / cannot push), `none`
+    means the response did not settle it and the caller should retry or treat it as unknown.
 
-    A 2xx carries a `permissions` object reflecting the installation's access — `push` is the field
-    that matters. A 404 is the App having no visibility of the repo at all, a definitive "cannot
-    push". Anything else (403, 5xx, an unparseable body, a 2xx with no `permissions` field) is
-    inconclusive. Pure, so the mapping is tested without a network.
+    The signal is the installation's own `permissions.contents`, which is what a git push under an
+    installation token is checked against: `write` can push, `read` cannot, and a `permissions`
+    object carrying no `contents` key at all is GitHub omitting a permission that was never
+    granted — also a no. A 404 means no installation of this App reaches the repository (not
+    installed on the owner, or installed with a repository selection that excludes it), a
+    definitive "cannot push". Anything else (403, 5xx, an unparseable body, a 2xx with no
+    `permissions` object) is inconclusive. Pure, so the mapping is tested without a network.
 
-    403 is deliberately *not* a definitive no. Under an installation token a repository the
-    installation cannot see answers 404, not 403; a 403 is overwhelmingly a primary or secondary
-    rate limit, a suspended installation, or an org blocking the App — all transient or needing a
-    human, and none of them a reason to go create a repository. Treating it as "cannot push" would
-    turn a rate limit into a real fork and a pull request opened from the wrong head. -/
-def repoAccessDecision (status : Nat) (body : String) : Option Bool :=
+    Deliberately *not* taken from `GET /repos/{owner}/{repo}`'s `permissions` block, which is what
+    this used to read. That block reports a *user's* role on the repository — `admin`/`push`/`pull`
+    — and under an installation token GitHub returns every field of it `false`, including for
+    repositories the installation holds `contents: write` on. Reading `push` out of it therefore
+    made every target look unwritable, so every project/role-based task was forked away from its
+    target, or skipped outright where no `default_organization` was configured.
+
+    403 is deliberately *not* a definitive no. A repository the App cannot see answers 404, not
+    403; a 403 is overwhelmingly a primary or secondary rate limit or an org blocking the App —
+    transient or needing a human, and neither a reason to go create a repository. Treating it as
+    "cannot push" would turn a rate limit into a real fork and a pull request opened from the wrong
+    head. A suspended installation is inconclusive for the same reason: it still reports its
+    permissions, but cannot exercise them until a human unsuspends it, and forking is not the
+    answer to that either. -/
+def installationWriteDecision (status : Nat) (body : String) : Option Bool :=
   if status == 404 then some false
   else if status < 200 || status >= 300 then none
   else match Json.parse body with
     | .error _ => none
     | .ok j =>
-      match j.getObjVal? "permissions" with
-      | .error _ => none
-      | .ok perms => (perms.getObjValAs? Bool "push").toOption
-
-/-- Whether the App installation identified by `token` can push to `repo`, as the three-way answer
-    of `repoAccessDecision` — `none` when the call did not settle it. -/
-def repoPushPermission (token : String) (repo : Repository) : IO (Option Bool) := do
-  let (status, body) ← curlWithStatus #[
-    "-X", "GET",
-    "-H", s!"Authorization: Bearer {token}",
-    "-H", "Accept: application/vnd.github+json",
-    s!"https://api.github.com/repos/{repo.owner}/{repo.name}" ]
-  return repoAccessDecision status body
+      match j.getObjVal? "suspended_at" with
+      | .ok (.str _) => none
+      | _ =>
+        match j.getObjVal? "permissions" with
+        | .error _ => none
+        | .ok perms =>
+          match perms.getObjValAs? String "contents" with
+          | .ok "write" => some true
+          | _           => some false
 
 /-- Whether the GitHub App can push to `target`. `some true`/`some false` are definitive; `none`
     means the question could not be answered (an unreachable GitHub, say).
 
     The installation is looked up from `target` itself rather than using `installationId` from the
     config: that field names one installation, but the target may live under a different account,
-    and the point here is whether the installation reaching *this repository* grants push. No
-    installation reaching it is a definitive "no". -/
+    and the point here is whether the installation reaching *this repository* grants write. One
+    request under the App JWT settles it — no installation token is minted, because the token's
+    permissions are exactly what the installation object already reports. -/
 def probeWriteAccess (appConfig : AppConfig) (target : Repository) : IO (Option Bool) := do
   try
     let jwt ← createJWT appConfig.appId appConfig.privateKeyPath
-    match ← repoInstallationId? jwt target with
-    | none        => return some false
-    | some instId =>
-      let token ← createInstallationToken jwt instId
-      repoPushPermission token target
+    let (status, body) ← githubAppGet jwt
+      s!"https://api.github.com/repos/{target.owner}/{target.name}/installation"
+    return installationWriteDecision status body
   catch e =>
     IO.eprintln s!"[fork] could not determine App write access to {target}: {e}"
     return none
@@ -328,8 +322,8 @@ def probeWriteAccess (appConfig : AppConfig) (target : Repository) : IO (Option 
 /-- `probeWriteAccess`, retried while the answer is inconclusive (`none`), up to `attempts` times.
     A definitive answer returns immediately; a persistently unreachable GitHub returns `none` after
     the last attempt. The pause doubles between tries, so the common case of one blip costs a
-    second while a rate limit — which `repoAccessDecision` reports as inconclusive — gets a little
-    longer to clear. -/
+    second while a rate limit — which `installationWriteDecision` reports as inconclusive — gets a
+    little longer to clear. -/
 def probeWriteAccessRetrying (appConfig : AppConfig) (target : Repository)
     (attempts : Nat := 3) : IO (Option Bool) := do
   let mut result : Option Bool := none
