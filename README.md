@@ -70,20 +70,26 @@ Create `~/.config/orchestra/config.json`:
 ```
 
 `default_organization` is the organisation under which orchestra may create repositories. It is
-used by every project/role-based task (the automatic dispatcher, `orchestra spawn`, and the
-auto-reviewer): a task targets a repository its pull requests must land in, and the agent
-works on a *fork* it can push to. When the GitHub App already has write access to the target, the
-fork is the target itself and nothing is created; when it does not, the target is forked into
-`default_organization` and that fork is what the agent pushes to. If the App cannot push to a
-target and `default_organization` is unset, the task is skipped rather than dispatched at a
-repository it cannot push to — so set this whenever the dispatcher works on repositories the App
-is not directly installed on. The App must be installed on `default_organization` with permission
-to create repositories.
+used by every project/role-based task that pushes (the automatic dispatcher and `orchestra spawn`):
+a task targets a repository its pull requests must land in, and the agent works on a *fork* it can
+push to. When the GitHub App already has write access to the target, the fork is the target itself
+and nothing is created; when it does not, the target is forked into `default_organization` and that
+fork is what the agent pushes to. If the App cannot push to a target and `default_organization` is
+unset, the task is skipped rather than dispatched at a repository it cannot push to — so set this
+whenever the dispatcher works on repositories the App is not directly installed on. The App must be
+installed on `default_organization` with permission to create repositories.
 
-The merger is the exception: it merges with `gh pr merge` as the GitHub App, which requires write
-access to the pull request's own repository, and a fork cannot supply that. When the App cannot
-push to a pull request's repository — or the check stays inconclusive — no merger is queued and
-`decide_issue approve` reports that the pull request has to be merged by hand.
+**The target must be readable by the App.** A task's token is minted for the *fork's* installation,
+and that token is what fetches the upstream. Public targets are fine. A private target the App is
+not installed on cannot be fetched — and cannot be forked in the first place — so such a task is
+skipped, with the reason on stderr under `[fork]`.
+
+Two roles never fork. The **merger** merges with `gh pr merge` as the GitHub App, which requires
+write access to the pull request's own repository, and a fork cannot supply that; when the App
+cannot push to a pull request's repository — or the check stays inconclusive — no merger is queued
+and `decide_issue approve` reports that the pull request has to be merged by hand. The
+**auto-reviewer** is read-only and pushes nothing, so it works in the pull request's own repository
+and needs no writable fork at all.
 
 `installation_id` is optional; if omitted it is looked up automatically.
 `pat` is a personal access token used to create pull requests to the upstream

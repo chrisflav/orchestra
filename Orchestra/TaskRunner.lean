@@ -69,20 +69,18 @@ private def renderReviewerPrompt (tmpl : String) (pr : Project.PRRef) (iid : Tax
 
 /-- Enqueue a reviewer task for `pr` against `tmpl`. Used by `attach_pr` via
     the `enqueueReviewer` hook when a project has a `reviewer` template. -/
-def enqueueReviewerImpl (appConfig : AppConfig) (project : Project.Project) (iid : Taxis.IssueId)
+def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
     (pr : Project.PRRef) (tmpl : Project.ReviewerTemplate) : IO (Except String String) := do
   try
-    -- Same fork/upstream resolution as every other role-based task: the reviewer clones `fork` and
-    -- the PR lives in `upstream` (= the PR's repo). When the App can push to it directly the fork
-    -- is the repo itself; otherwise it is a fork in the configured default organisation.
-    let some fork ← GitHub.resolveFork appConfig pr.repo
-      | return .error s!"the GitHub App cannot push to {pr.repo} and it could not be forked \
-          (set default_organization to enable forking)"
     let id ← TaskStore.generateId
     let createdAt ← TaskStore.currentIso8601
     let entry : Queue.QueueEntry :=
       { id, createdAt
-      , upstream := pr.repo, fork
+      -- Both sides are the PR's repo, and no fork is resolved: the reviewer is `readOnly` with
+      -- `review_issues`/`comment`/`get_pr_comments` below and no `create_pr`, so it never pushes
+      -- anything. It needs a readable checkout, which the PR's own repo already is. Forking to
+      -- give it one would create a repository per reviewed upstream for nothing.
+      , upstream := pr.repo, fork := pr.repo
       , mode := .pr
       , prompt := renderReviewerPrompt tmpl.promptTemplate pr iid
       , backend := tmpl.backend
@@ -471,7 +469,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     projectId := ioTask.projectId
     issueId   := ioTask.issueId
     enqueueMerger   := some (enqueueMergerImpl appConfig)
-    enqueueReviewer := some (enqueueReviewerImpl appConfig)
+    enqueueReviewer := some enqueueReviewerImpl
     prLabels  := ioTask.prLabels
   }
   let (port, shutdown) ← Server.start serverState
