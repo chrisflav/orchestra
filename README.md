@@ -1,9 +1,63 @@
 # orchestra
 
-A CLI tool for managing and sandboxing coding agents. It clones repositories,
-authenticates via a GitHub App, runs an agent inside a landrun sandbox, and
-exposes GitHub actions (creating pull requests, posting comments) to the agent
-through a built-in MCP server.
+orchestra is a daemon that runs agentic coding tasks. Listeners watch issues, comments, pull
+request reviews and an issue tracker, turn what they find into tasks, and the daemon runs each one
+in a sandbox with credentials the agent never gets to hold.
+
+## the moving parts
+
+Three pieces carry everything else.
+
+- A **task** is the unit of work and the only thing that ever runs an agent: a repository pair, a
+  prompt, a set of tools, a budget → [task files](#task-files)
+- The **queue** is where tasks wait for the daemon that runs them, by priority and in parallel →
+  [queue mode](#queue-mode)
+- **Listeners** poll an event source and enqueue a task whenever something matches →
+  [listeners](#listeners)
+
+```
+ task file      workflow       listener event      role dispatcher
+      \             \                /                  /
+       ─────────────► queue (priority, parallel slots) ◄──────
+                             │
+                             ▼
+                        task runner
+                             │
+          clone + GitHub App token + per-repo hooks
+                             │
+                             ▼
+              landrun sandbox ──── agent backend
+                             │           │
+                             └► MCP server ◄┘
+                              (GitHub + issues)
+```
+
+## what it does
+
+- **Sandboxed runs.** Every agent runs under landrun: write access to its own clone and `/tmp`,
+  read+execute on the toolchain, outbound TCP to HTTPS and the MCP port, nothing else. A task can
+  mount its clone read-only, which is what review tasks use.
+- **Credentials the agent never sees.** A GitHub App installation token is minted per task and
+  handed to `gh` for git transport only. The personal access token used for upstream pull
+  requests, reviews and comments stays in the MCP server process.
+- **Four agent backends** — `claude` (Claude Code), `vibe` (mistral-vibe), `opencode` and `pi` —
+  plus two built-in agent-less backends: `merger`, which lands an approved pull request, and
+  `triage`, which applies and removes labels deterministically.
+- **GitHub actions as MCP tools.** Creating pull requests, comments, reviews with inline
+  annotations, and reading review threads are tools, not `gh` invocations. Each task is granted a
+  subset of them.
+- **A queue daemon** with priorities, parallel execution backed by per-repository clone slots,
+  re-enqueueing of unfinished entries, and a graceful drain on `SIGTERM`.
+- **Listeners** that poll GitHub issues, comments, pull request reviews, labels, or an arbitrary
+  shell command, and enqueue a task — or a whole workflow — when something matches.
+- **An autonomous project pipeline.** Projects and issues live in a
+  [taxis](https://github.com/chrisflav/taxis) tracker; *roles* are task templates a dispatcher
+  spawns as work appears, with claim locks so two agents never pick up the same issue.
+- **Concert workflows**: YAML multi-step programs with typed step outputs, loops and conditionals.
+- **Per-repository hooks** for setup, validation and teardown, with an automatic retry loop when
+  validation fails.
+- **Recorded history.** Every run is stored, can be grouped into a named series, and resumed with
+  a follow-up prompt.
 
 ## prerequisites
 
@@ -26,12 +80,12 @@ automatically when using the provided container image):
 - [Lean 4 / Lake](https://leanprover.github.io/lean4/doc/setup.html) to build
   the tool
 - [landrun](https://github.com/Zouuup/landrun) for sandboxing
-- `claude` (Claude Code CLI) and/or `vibe` (mistral-vibe) installed and
-  authenticated
+- at least one agent CLI, installed and authenticated: `claude` (Claude Code), `vibe`
+  (mistral-vibe), `opencode`, or `pi`
 - `gh` (GitHub CLI) for repository operations
 - [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) — **Optional**
-  MCP OAuth support for the **Pi agent** specifically (not needed for Claude Code
-  or vibe agents). Tested with the MCP tools defined in this project. Install in
+  MCP OAuth support for the **Pi agent** specifically (not needed for the other
+  backends). Tested with the MCP tools defined in this project. Install in
   the container with `pi install npm:pi-mcp-adapter`.
 
 In addition, the private key from the GitHub App must be included as a file in the container.
@@ -101,6 +155,22 @@ Obtain one by running `claude setup-token` and copy the token value here. When
 set, it is passed to the agent as the `CLAUDE_CODE_OAUTH_TOKEN` environment
 variable.
 
+`additional_sandbox_paths` grants every agent launched by this instance extra filesystem access on
+top of what its backend already needs — `rox`/`ro`/`rw` for absolute paths, `home_rox`/`home_rw`/
+`home_rwx` for `$HOME`-relative ones. It is the usual fix when a repository's build needs a shared
+cache directory:
+
+```json
+{
+  "additional_sandbox_paths": {
+    "home_rw": [".cache/mybuildtool"]
+  }
+}
+```
+
+TCP ports beyond HTTPS and the MCP server are opened per backend, via `extra_ports` on that
+backend's entry in the `agents` array — for a local model server, for instance.
+
 The `queue` block sets how many tasks the daemon runs at once. Both keys default
 to `1`, which is the serial behaviour, and `orchestra queue start --parallel N` /
 `--parallel-per-repo N` override them for a single run.
@@ -122,6 +192,34 @@ Two backends always run exclusively regardless of these settings: `pi` and
 `opencode` keep per-run state at a fixed path under `$HOME`, so a second
 concurrent run would read the first one's MCP configuration. They start only
 while the daemon is otherwise idle.
+
+### files and directories
+
+orchestra separates configuration from state:
+
+| Path | Contents |
+| --- | --- |
+| `$XDG_CONFIG_HOME/orchestra/` (or `~/.config/orchestra/`) | `config.json`, `secrets.json`, `prompts/`, `listeners/`, `roles/`, `skills/` |
+| `$XDG_DATA_HOME/orchestra/` (or `~/.local/share/orchestra/`) | clones, task records, queue entries, logs, per-project role overrides |
+
+Installations predating this split keep everything in `~/.agent/`; that layout is still read, with
+a deprecation warning. `orchestra migrate` moves it into place.
+
+### secrets
+
+Values that should not sit in `config.json` — or that are shared between it and the listener
+configs — can live in `secrets.json` next to it:
+
+```json
+{
+  "github_pat": "github_pat_...",
+  "taxis_token": "..."
+}
+```
+
+Every `{{key}}` occurrence in `config.json` and in listener configs is replaced with the
+corresponding value before the file is parsed, so `"pat": "{{github_pat}}"` works in either.
+The file is optional; when absent, nothing is substituted.
 
 ## authentication sources
 
@@ -200,8 +298,9 @@ Tasks are described in a JSON file:
     {
       "upstream": "owner/repo",
       "fork": "your-org/fork-repo",
-      "mode": "pr",
-      "prompt": "Implement feature X and open a pull request."
+      "tools": ["create_pr"],
+      "prompt": "Implement feature X and open a pull request.",
+      "budget": 8.0
     }
   ]
 }
@@ -211,14 +310,49 @@ Fields:
 
 - `upstream` — upstream repository in `owner/repo` format
 - `fork` — fork repository the agent has write access to
-- `mode` — `"fork"` (work on the fork only) or `"pr"` (allow opening pull
-  requests to upstream)
 - `prompt` — instruction sent to the agent
+- `tools` — optional tools granted to this task on top of the always-available ones; see
+  [MCP tools](#mcp-tools)
+- `mode` — legacy shorthand for `tools`, kept for compatibility: `"fork"` grants nothing, `"pr"`
+  grants `create_pr`. Ignored when `tools` is present
+- `backend` — `"claude"` (default), `"vibe"`, `"opencode"`, `"pi"`, or one of the agent-less
+  backends `"merger"` / `"triage"`
+- `model` — optional model override passed to the agent
 - `agent` — optional sub-agent name passed to the backend
+- `auth_source` — label of the authentication source to use
 - `system_prompt` — optional name of a file in `~/.config/orchestra/prompts/` (without
   `.md`); defaults to `default.md` if present
-- `backend` — `"claude"` (default) or `"vibe"`
-- `model` — optional model override passed to the agent
+- `budget` — maximum spend in USD (default `4.0`)
+- `read_only` — mount the clone read-only; used by review tasks
+- `memory` — which memory directories the agent may persist to: `"none"`, `"global"`,
+  `"project"`, or `"both"` (default)
+- `priority` — queue priority, higher runs first (default `10`)
+- `series` — name of the series this run belongs to
+- `issue_number` — GitHub issue or PR the task was launched from; enables the `comment` tool
+- `pr_labels` — labels applied to every pull request `create_pr` opens during the task, created on
+  the target repository if missing
+- `triage_add_labels` / `triage_remove_labels` — labels the `triage` backend applies
+- `project_id` / `issue_id` / `role` — set by the project subsystem; see
+  [projects, issues and roles](#projects-issues-and-roles)
+
+## sandboxing
+
+Agents are confined with landrun, which uses the Linux Landlock LSM — no container or VM is
+involved, so this works inside the Docker image as well. A task's agent gets:
+
+- read+write+execute on its own clone (read+execute only when `read_only` is set) and read+write
+  on `/tmp`
+- read+execute on the toolchain paths its backend declares, and read+write on the `$HOME`
+  subdirectories that backend needs for its own configuration and state
+- read+execute on plugin directories, read+write on the memory directories permitted by `memory`
+- outbound TCP to port 443 and to the local MCP server port, plus any `extra_ports` configured for
+  the backend
+- `GH_TOKEN` (the installation token) and the selected authentication source's key in the
+  environment — nothing else is inherited beyond `SHELL`, `PATH`, `HOME`, `USER` and `TERM`
+
+`orchestra run --debug` prints the exact landrun invocation before executing it, which is the
+quickest way to find out why an agent cannot see a path. A path that does not exist cannot be
+granted — orchestra warns about missing `$HOME`-relative paths rather than letting the agent hang.
 
 ## MCP tools
 
@@ -297,6 +431,13 @@ Group runs into a named series for later resumption:
 orchestra run --series my-series tasks.json
 ```
 
+To sit in front of the agent yourself, with the same clone, credentials and sandbox a task would
+get, use its interactive TUI:
+
+```
+orchestra interactive --upstream owner/repo --fork your-org/fork
+```
+
 ## concert workflows
 
 Workflows are YAML files that describe a multi-step agent program. Steps run
@@ -328,6 +469,7 @@ See `docs/workflow.md` for the full workflow DSL reference and
 orchestra tasks
 orchestra task <id>
 orchestra series
+orchestra tag <id> <series>    # append a finished task to a series
 ```
 
 ## resuming a series
@@ -361,10 +503,13 @@ orchestra queue add workflow.yaml
 orchestra queue add --vars '{"key": "value"}' workflow.yaml
 ```
 
-Show the queue:
+Inspect and control the daemon:
 
 ```
-orchestra queue
+orchestra queue                # show queued entries
+orchestra queue status         # daemon status and running tasks
+orchestra queue cancel         # cancel the running task, keep the daemon going
+orchestra queue shutdown       # stop after the current task (--force cancels it)
 ```
 
 Re-enqueue unfinished or cancelled entries:
@@ -373,6 +518,10 @@ Re-enqueue unfinished or cancelled entries:
 orchestra queue retry
 orchestra queue retry --series my-series
 ```
+
+Unfinished entries resume the partial agent session they died in; cancelled ones start over. On
+`SIGTERM` the daemon stops accepting work and drains what is in flight, so a `docker compose down`
+does not lose a running task.
 
 ## per-repository configuration
 
@@ -394,6 +543,8 @@ file:
   }
 }
 ```
+
+The failing script's output is available to the retry prompt as `{{validation_output}}`.
 
 ## listeners
 
@@ -458,14 +609,53 @@ To trigger a multi-step workflow from a listener, replace `prompt_template` with
 }
 ```
 
+Listeners are picked up by the running daemon; they can be inspected and switched on or off
+without restarting it:
+
+```
+orchestra listener list
+orchestra listener enable <name>
+orchestra listener disable <name>
+```
+
 See `examples/listeners/` for further listener examples.
+
+## projects, issues and roles
+
+This is the autonomous end of orchestra. A **project** is a repository-independent unit owning a
+tree of **issues**; tasks attach to issues, worker agents *claim* them, reviewer agents approve or
+reject, and the built-in `merger` backend lands the pull request. All of it is stored in a
+[taxis](https://github.com/chrisflav/taxis) instance configured under `taxis` in `config.json` —
+issues created in the taxis UI behave exactly like ones created through the tools.
+
+A **role** (`<config>/roles/<name>.json`) is a reusable task template: backend, prompt template,
+tool permissions, and a dispatch policy. `examples/projects/roles/` ships `implementor`,
+`reviewer`, `planner` and `maintainer`. A `project-dispatcher` or `label-dispatcher` listener
+spawns them as work appears, up to per-role caps, taking a claim lock so no two agents land on the
+same issue.
+
+```sh
+orchestra project create "API v2" --default-repo myorg/api --default-branch main
+orchestra issue add <project-id> --title "Rewrite the auth handler"
+orchestra issue list <project-id> --status open
+orchestra issue show <issue-id>
+orchestra roles list <project-id>
+orchestra spawn implementor <project-id> --issue <issue-id>
+orchestra project health <project-id>          # find claims whose task is gone
+```
+
+[`examples/projects/README.md`](examples/projects/README.md) is the full reference: how orchestra
+concepts map onto taxis, the `taxis` config block, role templates and their prompt variables, the
+dispatch triggers, and how the two dispatchers differ.
 
 ## other commands
 
 ```
 orchestra prepare <upstream> <fork>   # clone the fork and configure remotes
 orchestra cleanup                     # remove all cloned repositories
+orchestra cleanup list                # list clones and their task slots
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
+orchestra migrate                     # move ~/.agent/ to the XDG directories
 ```
 
 ## container
