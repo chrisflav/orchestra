@@ -6,5 +6,13 @@ import OrchestraTest.StreamFormatTest
 import OrchestraTest.WorkflowParserTest
 import OrchestraTest.ProjectClaimTest
 import OrchestraTest.ProjectFieldsTest
+import OrchestraTest.ProjectMetaTest
+import OrchestraTest.ExamplesTest
+import OrchestraTest.LabelDispatcherTest
+import OrchestraTest.DispatchCandidatesTest
 import OrchestraTest.ProjectToolsTest
 import OrchestraTest.ProjectRoleTest
+import OrchestraTest.ParallelQueueTest
+import OrchestraTest.GitHubErrorTest
+import OrchestraTest.ForkResolveTest
+import OrchestraTest.UsageLimitTest

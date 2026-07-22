@@ -2,7 +2,7 @@
   "name": "demo-dispatcher",
   "source": {
     "type": "project-dispatcher",
-    "project_id": "0123456789abcdef",
+    "project_id": 42,
     "caps": {
       "implementor": 2,
       "reviewer":    1,

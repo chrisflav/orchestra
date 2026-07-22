@@ -5,7 +5,6 @@ import Init.Data.String.Basic
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra.TaskStore
-open Orchestra.Project (ProjectId IssueId)
 
 -- Types
 
@@ -62,9 +61,9 @@ structure TaskRecord where
   /-- Priority used for queue ordering. Defaults to 10. -/
   priority      : Nat           := 10
   /-- Orchestra project this task belongs to (optional). -/
-  projectId     : Option ProjectId := none
+  projectId     : Option Taxis.IssueId := none
   /-- Orchestra issue this task is/was working on (optional). -/
-  issueId       : Option IssueId   := none
+  issueId       : Option Taxis.IssueId   := none
   /-- Optional role name. -/
   role          : Option String    := none
 deriving Repr
@@ -115,8 +114,8 @@ instance : FromJson TaskRecord where
     let prependPrompt   := j.getObjValAs? String "prepend_prompt"  |>.toOption
     let budget        := j.getObjValAs? Float  "budget"         |>.toOption
     let priority      := j.getObjValAs? Nat   "priority"      |>.toOption |>.getD 10
-    let projectId     := j.getObjValAs? ProjectId "project_id" |>.toOption
-    let issueId       := j.getObjValAs? IssueId   "issue_id"   |>.toOption
+    let projectId     := j.getObjValAs? Taxis.IssueId "project_id" |>.toOption
+    let issueId       := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
     let role          := j.getObjValAs? String    "role"       |>.toOption
     return { id, createdAt, upstream, fork, mode, prompt, status, sessionId,
              continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority,
@@ -130,18 +129,10 @@ def tasksDir : IO System.FilePath :=
 def seriesDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "series"
 
--- ID generation: 16-char lowercase hex from the nanosecond monotonic clock
+-- ID generation: the nanosecond monotonic clock plus a counter, so that two tasks starting
+-- in the same nanosecond on different daemon workers cannot land on the same record.
 
-private def hexChar (n : UInt64) : Char :=
-  let d := (n % 16).toNat
-  if d < 10 then Char.ofNat (d + '0'.toNat) else Char.ofNat (d - 10 + 'a'.toNat)
-
-def generateId : IO String := do
-  let nanos ← IO.monoNanosNow
-  let s := toString nanos
-  let padding := "0000000000000000"
-  let padded := (padding ++ s).takeEnd 16
-  return padded.toString
+def generateId : IO String := uniqueToken
 
 -- Timestamp
 

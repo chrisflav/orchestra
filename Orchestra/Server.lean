@@ -39,19 +39,19 @@ structure State where
   /-- Orchestra task ID, recorded as the holder when claims are taken. -/
   taskId : Option String := none
   /-- Orchestra project this task belongs to. Enables the `project_info` tool. -/
-  projectId : Option Project.ProjectId := none
+  projectId : Option Taxis.IssueId := none
   /-- Orchestra issue this task is working on (may be pre-claimed or runtime-claimed). -/
-  issueId : Option Project.IssueId := none
+  issueId : Option Taxis.IssueId := none
   /-- Backend label of the running agent (e.g. "claude"). Recorded with claims. -/
   agentBackend : String := "unknown"
   /-- Series the task belongs to. Recorded with claims. -/
   series : Option String := none
   /-- Hook that enqueues a merger task, set by the daemon. Plumbed by
       `Project.Tools.Env` so `decide_issue approve` can request a merge. -/
-  enqueueMerger : Option (Project.ProjectId → Project.IssueId → Project.PRRef →
+  enqueueMerger : Option (Taxis.IssueId → Taxis.IssueId → Project.PRRef →
                           IO (Except String String)) := none
   /-- Optional auto-reviewer hook (F1). Plumbed to `Project.Tools.Env.enqueueReviewer`. -/
-  enqueueReviewer : Option (Project.Project → Project.IssueId → Project.PRRef →
+  enqueueReviewer : Option (Project.Project → Taxis.IssueId → Project.PRRef →
                             Project.ReviewerTemplate → IO (Except String String)) := none
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
@@ -95,7 +95,9 @@ private def alwaysAvailableTools : Array Json := #[
   ],
   Json.mkObj [
     ("name", "refresh_token"),
-    ("description", "Refresh the GitHub App installation token and reconfigure the gh CLI."),
+    ("description", "Mint a fresh GitHub App installation token and return it. \
+Export it as GH_TOKEN to use it; it is not applied to the gh CLI for you, because other \
+tasks may be running in the same daemon and share that configuration."),
     ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
   ],
   Json.mkObj [
@@ -257,8 +259,14 @@ Call this tool exactly once when the task is complete."),
 private def toolsList (state : State) : Json :=
   let optional := optionalToolDefs.filterMap fun entry =>
     if state.allowedTools.contains entry.1 then some entry.2 else none
-  let project := Project.Tools.toolDefs.filterMap fun (perm, _name, def_) =>
-    if state.allowedTools.contains perm then some def_ else none
+  -- Deduped by name: a tool may be listed under more than one permission group (an issue's
+  -- comment thread is readable by workers and reviewers alike), and a task holding two of them
+  -- would otherwise be offered the same tool twice.
+  let project := (Project.Tools.toolDefs.filterMap fun (perm, name, def_) =>
+      if state.allowedTools.contains perm then some (name, def_) else none)
+    |>.foldl (fun acc (name, def_) =>
+        if acc.any (·.1 == name) then acc else acc ++ [(name, def_)]) []
+    |>.map (·.2)
   let io := ioToolDefs state.inputType state.outputType
   let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
   Json.mkObj [("tools",
@@ -427,7 +435,11 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     try
       let jwt ← GitHub.createJWT state.appId state.privateKeyPath
       let token ← GitHub.createInstallationToken jwt state.installationId
-      GitHub.setupGhAuth token
+      -- Returned to the calling agent only, never written to `~/.config/gh/hosts.yml`.
+      -- This tool is reachable from inside any task's sandbox at any moment, so a global
+      -- `gh auth login` here would swap the credentials out from under every other task
+      -- running in the daemon. The agent uses the value by exporting it as `GH_TOKEN`,
+      -- which is also how the sandbox supplied its original token.
       log "tool refresh_token: ok"
       return toolContent token
     catch e =>

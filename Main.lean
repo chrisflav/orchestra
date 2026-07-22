@@ -93,7 +93,13 @@ private def runHandler (p : Parsed) : IO UInt32 := do
         | some b =>
           let t := tasks[i]!
           { t with ioTask := { t.ioTask with budget := some b } }
-      let _ ← TaskRunner.runTask appConfig task i debug (continuesFrom := continuesFrom) (series := series)
+      let (_, status, _) ← TaskRunner.runTask appConfig task i debug
+        (continuesFrom := continuesFrom) (series := series)
+      -- `unfinished` is what a usage limit looks like from here. Saying so is the difference
+      -- between "that task is done" and "that task stopped early and can be resumed".
+      if status matches .unfinished then
+        IO.eprintln s!"Task {i} did not finish (usage limit or budget exhausted); \
+resume it with 'orchestra continue'."
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
 
@@ -128,12 +134,35 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
 private def prepareHandler (p : Parsed) : IO UInt32 := do
   let upstream ← IO.ofExcept (Repository.parse (p.positionalArg! "upstream" |>.as! String))
   let fork ← IO.ofExcept (Repository.parse (p.positionalArg! "fork" |>.as! String))
+  let slots := max 1 (p.flag? "slots" |>.map (·.as! Nat) |>.getD 1)
+  -- Queue tasks never run in the cache clone, they run in slots — so preparing only the
+  -- cache clone would warm a directory the daemon never works in, and every slot would
+  -- still pay a full cold build on its first task. `git clone --local` does not carry
+  -- gitignored build output across either, so each slot has to be initialised on its own.
   let repoPath ← Repo.ensureCloned fork upstream
   IO.println repoPath.toString
+  for slot in List.range slots do
+    let slotPath ← Repo.ensureSlot fork upstream { slot }
+    -- Run the repo's init hook now rather than inside the first task that lands here, so a
+    -- toolchain install or a cold `lake exe cache get` is paid up front instead of counting
+    -- against that task's budget and wall clock.
+    RepoConfig.runInitIfNeeded slotPath
+    IO.println slotPath.toString
   return (0 : UInt32)
 
 private def cleanupHandler (_ : Parsed) : IO UInt32 := do
   Repo.cleanup
+  return (0 : UInt32)
+
+private def cleanupListHandler (_ : Parsed) : IO UInt32 := do
+  let clones ← Repo.listClones
+  if clones.isEmpty then
+    IO.println "No repository clones found."
+    return (0 : UInt32)
+  for (mainPath, slots) in clones do
+    IO.println s!"  {mainPath}"
+    for slot in slots do
+      IO.println s!"    slot: {slot}"
   return (0 : UInt32)
 
 private def tasksHandler (p : Parsed) : IO UInt32 := do
@@ -254,13 +283,6 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
   return (0 : UInt32)
 
 -- Queue helpers
-
-/-- Read the current process PID from /proc/self/stat (Linux-specific). -/
-private def getOwnPid : IO UInt32 := do
-  let stat ← IO.FS.readFile (System.FilePath.mk "/proc/self/stat")
-  match stat.splitOn " " with
-  | pid :: _ => return (pid.toNat?.getD 0).toUInt32
-  | _        => return 0
 
 /-- Send a JSON request to the daemon socket and return the parsed response.
     Throws if the daemon returns an "error" field. -/
@@ -388,6 +410,8 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         configPath
         budget           := budgetFlag.orElse (fun _ => task.ioTask.budget)
         authSource       := task.ioTask.authSource
+        authSources      := task.ioTask.authSources
+        authMode         := task.ioTask.authMode
         tools            := task.ioTask.tools
         readOnly         := task.ioTask.readOnly
         priority         := priorityFlag.getD task.ioTask.priority
@@ -478,9 +502,9 @@ private def handleSocketRequest
   try conn.close catch _ => pure ()
 
 private def queueStartHandler (p : Parsed) : IO UInt32 := do
-  let configPath   := p.flag? "config" |>.map (·.as! String)
-  let debug        := p.hasFlag "debug"
-  let background   := p.hasFlag "background"
+  let configPath           := p.flag? "config" |>.map (·.as! String)
+  let debug                := p.hasFlag "debug"
+  let background           := p.hasFlag "background"
   -- Background mode: re-exec as a detached daemon and exit
   if background then
     if ← Queue.daemonRunning then
@@ -524,7 +548,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   if ← Queue.daemonRunning then
     IO.eprintln "Queue daemon is already running."
     return 1
-  let pid ← getOwnPid
+  let pid ← Queue.ownPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
   -- Startup cleanup
@@ -532,6 +556,13 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   Queue.cancelStaleConcertEntries
   Queue.cancelStaleRunningConcerts
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  -- Concurrency limits: the `queue` block in config.json, overridden by the flags for a single
+  -- run. Resolved here rather than at the top of the handler because it needs the config, and
+  -- `max 1` because zero workers would be a daemon that silently never runs anything.
+  let parallelLimit := max 1 <|
+    (p.flag? "parallel" |>.map (·.as! Nat)).getD appConfig.queue.parallel
+  let parallelLimitPerRepo := max 1 <|
+    (p.flag? "parallel-per-repo" |>.map (·.as! Nat)).getD appConfig.queue.parallelPerRepo
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
   -- Map of (id → cancel token) for all currently running tasks (one per worker).
@@ -539,6 +570,13 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   let nextTokenId ← IO.mkRef (0 : Nat)
   -- Mutex serialising the "find next pending + mark running" claim operation.
   let claimMutex ← Std.BaseMutex.new
+  -- Tracks which task slots are currently occupied per repo (fork key), and the total
+  -- number of running tasks. Both are protected by claimMutex.
+  let activeSlots ← IO.mkRef ({} : Std.HashMap String (Array Nat))
+  let totalActive ← IO.mkRef (0 : Nat)
+  -- Set while a task on a backend that is not parallel-safe holds the daemon exclusively.
+  -- Also protected by claimMutex.
+  let exclusiveActive ← IO.mkRef false
   -- Concert manager: handles suspended concert fibers waiting for task results.
   let concertMgr ← ConcertManager.new
   -- Socket server: receives control requests (add_task, add_concert, cancel, shutdown).
@@ -554,23 +592,145 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         let _h ← IO.asTask (prio := .dedicated) do
           handleSocketRequest conn appConfig concertMgr debug shutdownToken activeTaskTokens
     catch _ => pure ()
+  -- Signal watcher: turns SIGTERM/SIGINT into the same graceful drain as `queue shutdown`.
+  -- Needed because the daemon is PID 1 in the container image, where `docker stop` is the way in
+  -- and `queue shutdown` is not: draining works, but the daemon's exit stops the container and
+  -- the restart policy immediately brings up a new one. Handling the signal is also what makes
+  -- it deliverable at all — PID 1 ignores signals left at their default disposition, so before
+  -- this, `docker stop` fell through to SIGKILL and left in-flight entries stuck in `running`.
+  --
+  -- Polled rather than acted on inside the handler itself: a signal handler may not touch the
+  -- Lean heap, so it only bumps a counter (ffi/Signal.c) and the real work happens here. The
+  -- 200ms tick is well inside any sane `docker stop` grace period and costs nothing when idle.
+  Utils.Signals.install
+  let _signalTask ← IO.asTask (prio := .dedicated) do
+    let mut announced := false
+    repeat
+      let n ← Utils.Signals.count
+      if n > 0 && !announced then
+        announced := true
+        IO.println "Received termination signal; finishing in-flight tasks before shutting down."
+        IO.println "Send it again to cancel them instead."
+        shutdownToken.cancel .shutdown
+      -- A second signal escalates to `queue shutdown --force`: whoever is stopping us has said
+      -- once that they are willing to wait, and then changed their mind.
+      if n > 1 then
+        IO.println "Second termination signal; cancelling in-flight tasks."
+        let pairs ← activeTaskTokens.atomically (·.get)
+        for (_, token) in pairs do
+          token.cancel .cancel
+        break
+      IO.sleep 200
   -- Helper: atomically claim the next pending entry, marking it as running.
   -- Serialised by claimMutex so that multiple workers cannot claim the same entry.
-  let claimNextEntry : IO (Option Queue.QueueEntry) := do
+  -- Returns (entry, slot, tokenId, reuseTree):
+  --   slot       index of the per-repo task slot reserved for this entry. Slots are
+  --              independent clones, so the entry's agent can create any branch name it
+  --              likes without colliding with another task running on the same repository.
+  --   tokenId    cancellation-token id, allocated here rather than in `runEntry` because
+  --              `IO.Ref.modifyGet` is not atomic across workers: two of them racing on it
+  --              are handed the same id, and `removeToken` then drops the other task's
+  --              token, leaving `queue cancel` unable to reach a running task.
+  --   resumeFrom set when this entry continues a previous task and got that task's slot back
+  --              *with its tree intact*, naming the predecessor entry.
+  -- The decision itself lives in `Queue.claimDecision`, which is a function of its inputs and
+  -- therefore testable; this wrapper is only the locking and the bookkeeping around it.
+  -- Both helpers unlock via `finally`: reading the queue directory and saving an entry
+  -- are file operations that can throw, and leaving the mutex held would wedge every
+  -- worker in the pool for the rest of the daemon's life.
+  -- Which authentication source an entry may run on, asked once per claim attempt.
+  --
+  -- Entries whose sources are all usage-limited are reported as `wait`, which leaves them
+  -- pending: unlike a cancellation, waiting costs nothing and the entry runs the moment the
+  -- window resets, without anyone having to re-queue it. The reason is logged once per entry so
+  -- a queue that looks stalled says why it is stalled.
+  let authWaitNoted ← IO.mkRef ({} : Std.HashSet String)
+  let resolveEntryAuth (e : Queue.QueueEntry) : IO Queue.AuthDecision := do
+    let backend := e.backend.getD "claude"
+    -- Per-entry config, so an entry pinned to a different config file is judged against the
+    -- auth sources that file declares.
+    let cfg ← match e.configPath with
+      | none    => pure appConfig
+      | some cp => try loadAppConfig (some (System.FilePath.mk cp)) catch _ => pure appConfig
+    match ← Usage.resolveLabel cfg backend e.authSources e.authSource e.authMode e.model with
+    | .ok label =>
+      authWaitNoted.modify (·.erase e.id)
+      -- Stamp the source as used *here*, while `claimMutex` is still held and before any other
+      -- worker can resolve. `distribute` breaks ties on least-recently-used, and this is the
+      -- only point at which that ordering is serialised: recording it once the task is actually
+      -- launching would be several seconds later — a clone and a token mint later — by which
+      -- time every other worker claiming in that window has read the same stale timestamp and
+      -- picked the same account, which is precisely what `distribute` exists to avoid.
+      if let some l := label then Usage.markUsed backend l
+      return .use label
+    | .error reason =>
+      unless (← authWaitNoted.get).contains e.id do
+        authWaitNoted.modify (·.insert e.id)
+        IO.println s!"  Entry {e.id} waiting on {backend} usage limits: {reason}"
+      return .wait reason
+  let claimNextEntry : IO (Option (Queue.Claim × Nat)) := do
     claimMutex.lock
-    let entry ← Queue.nextPending
-    if let some e := entry then
-      Queue.saveEntry { e with status := .running }
-    claimMutex.unlock
-    return entry
+    try
+      let slotMap ← activeSlots.get
+      let ctx : Queue.ClaimContext := {
+        occupiedSlots   := slotMap
+        total           := ← totalActive.get
+        exclusiveActive := ← exclusiveActive.get
+        parallelLimit
+        perRepoLimit    := parallelLimitPerRepo
+        parallelSafe    := TaskRunner.backendIsParallelSafe
+        resolveAuth     := resolveEntryAuth
+      }
+      let allEntries ← Queue.loadAllEntries
+      let some claim ← Queue.claimDecision ctx allEntries Repo.slotOccupant | return none
+      let e := claim.entry
+      let occupied := slotMap.getD e.fork.toString #[]
+      let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
+      -- Record the resolved source on the entry, so `orchestra queue list` and any later
+      -- continuation show which account actually ran it.
+      Queue.saveEntry { e with
+        status := .running, slot := some claim.slot
+        authSource := claim.authSource.orElse fun _ => e.authSource }
+      activeSlots.modify (fun m => m.insert e.fork.toString (occupied.push claim.slot))
+      totalActive.modify (· + 1)
+      if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
+      if e.continuesFrom.isSome && claim.resumeFrom.isNone then
+        IO.eprintln s!"  Note: queue entry {e.id} continues a previous task but no longer has \
+its workspace; it will start from a clean checkout."
+      return some (claim, tokenId)
+    finally
+      claimMutex.unlock
+  -- Helper: release the slot held by a completed entry.
+  let releaseEntry (entry : Queue.QueueEntry) (slot : Nat) : IO Unit := do
+    claimMutex.lock
+    try
+      let occupied := (← activeSlots.get).getD entry.fork.toString #[]
+      activeSlots.modify (fun m => m.insert entry.fork.toString (occupied.filter (· != slot)))
+      totalActive.modify (fun t => if t > 0 then t - 1 else 0)
+      if !TaskRunner.backendIsParallelSafe entry.backend then exclusiveActive.set false
+    finally
+      claimMutex.unlock
   -- Helper: run one queue entry to completion and update its status.
   -- Also signals the ConcertManager if the entry belongs to a concert.
-  let runEntry (entry : Queue.QueueEntry) : IO Unit := do
+  -- slot: index of the per-repo task slot reserved for this entry by `claimNextEntry`.
+  -- The slot directory is prepared (created if absent, otherwise reset to a clean default
+  -- branch) inside the try below. The slot is released by `runEntry`, which wraps this.
+  let runEntryBody (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
+      (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
     let taskToken ← Std.CancellationToken.new
-    let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
     activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
     let removeToken : IO Unit :=
       activeTaskTokens.atomically (·.modify (·.filter (·.1 != tokenId)))
+    -- Terminal writes go through here rather than saving the claim-time snapshot: a socket
+    -- `cancel`, a listener, or a cascade from another worker can rewrite this entry's file
+    -- while the task runs, and writing the stale snapshot back would silently revert it.
+    let finish (status : Queue.QueueStatus) (taskId : Option String)
+        (outputJson : Option Lean.Json) : IO Unit := do
+      let cur := (← Queue.loadEntry entry.id).getD entry
+      Queue.saveEntry { cur with
+        status
+        taskId     := taskId.orElse (fun _ => cur.taskId)
+        outputJson := outputJson.orElse (fun _ => cur.outputJson) }
     let task : Task := {
       i := entry.inputType, o := entry.outputType
       ioTask := {
@@ -586,6 +746,8 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         budget           := entry.budget
         memory           := entry.memory
         authSource       := entry.authSource
+        authSources      := entry.authSources
+        authMode         := entry.authMode
         tools            := entry.tools
         readOnly         := entry.readOnly
         priority         := entry.priority
@@ -598,9 +760,6 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         triageRemoveLabels := entry.triageRemoveLabels
       }
     }
-    let cfg ← match entry.configPath with
-      | none    => pure appConfig
-      | some cp => loadAppConfig (some (System.FilePath.mk cp))
     -- If this entry holds a pre-claimed issue, release it back to open on any
     -- unhandled exception so the issue never gets permanently stuck.
     let releaseClaimOnError : IO Unit := do
@@ -610,40 +769,99 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         let _ ← Project.release TaskRunner.globalClaimManager pid iid .open now
       | _, _ => pure ()
     try
-      let (taskId, usageLimitHit, outputJson) ← TaskRunner.runTask cfg task 0 debug
+      -- Inside the `try` so that a bad per-entry config path is reported as a failed
+      -- entry rather than escaping and taking the worker down with it.
+      let cfg ← match entry.configPath with
+        | none    => pure appConfig
+        | some cp => loadAppConfig (some (System.FilePath.mk cp))
+      -- Preparing the slot sits inside the `try` so that a failure here — a clone that
+      -- cannot be created, a fetch that cannot reach GitHub — is reported through the same
+      -- path as any other task failure: the entry is marked failed, a pre-claimed issue is
+      -- released, and a concert waiting on this step is signalled instead of hanging until
+      -- the daemon shuts down.
+      -- `resumeFrom` for a continuation that got its predecessor's slot back: the resumed
+      -- agent's context describes a tree it expects to still be there. `ensureSlot` re-checks
+      -- that the tree really is the predecessor's before keeping it.
+      -- `occupant` stamps this entry as the owner of the tree it leaves behind, which is what
+      -- a later continuation of *this* task will check.
+      -- `runTask` prepares the slot itself, since doing so needs the installation token.
+      let (taskId, taskStatus, outputJson) ← TaskRunner.runTask cfg task 0 debug
         (continuesFrom := entry.continuesFrom) (series := entry.series)
         (cancelToken := some taskToken) (interactive := false)
+        (slotOverride := some { slot, occupant := some entry.id, resumeFrom })
+        (preresolvedAuth := authSource)
       removeToken
       -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
       -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.
       -- Check the reason to distinguish the two cases.
       let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
       if explicitlyCancelled then
-        Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
+        finish .cancelled (some taskId) none
         IO.println s!"  Task cancelled."
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") outputJson
-      else if usageLimitHit then
-        Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
-        Queue.cancelPendingByBackend entry.backend entry.id
-        Queue.cancelDependents taskId
-        IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
-        ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
       else
-        Queue.saveEntry { entry with status := .done, taskId := some taskId, outputJson }
-        if let some key := entry.concertStepKey then
-          ConcertManager.signal concertMgr key outputJson
+        -- The queue entry now records exactly what the task record says. These used to be
+        -- computed separately, and a run that exhausted its budget ended up `unfinished` in the
+        -- task store and `done` in the queue — so `queue retry`, which reads queue status, could
+        -- never pick it up.
+        let queueStatus : Queue.QueueStatus := match taskStatus with
+          | .completed  => .done
+          | .unfinished => .unfinished
+          | .failed     => .failed
+          | .cancelled  => .cancelled
+          | .running    => .done
+        finish queueStatus (some taskId) outputJson
+        match taskStatus with
+        | .unfinished =>
+          -- Nothing is cancelled here any more. The source that ran out is now marked in the
+          -- usage store, so entries that would land on it are held back at claim time and every
+          -- other entry — different account, different backend, different model family — keeps
+          -- running. Dependents still go, because they were queued to continue *this* task's
+          -- session and it did not finish.
+          Queue.cancelDependents taskId
+          IO.println s!"  Task unfinished; entry stays retryable and dependents were cancelled."
+          ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+        | _ =>
+          if let some key := entry.concertStepKey then
+            ConcertManager.signal concertMgr key outputJson
     catch e =>
       removeToken
       let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
       if explicitlyCancelled then
         IO.eprintln s!"  Task cancelled (with error: {e})"
-        try Queue.saveEntry { entry with status := .cancelled } catch _ => pure ()
+        try finish .cancelled none none catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
       else
         IO.eprintln s!"Queue entry {entry.id} failed: {e}"
-        try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+        try finish .failed none none catch _ => pure ()
         try releaseClaimOnError catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+  -- The release wraps the *whole* body, not just the part that runs the task: allocating the
+  -- cancellation token and registering it are themselves IO, and an exception there would
+  -- otherwise escape past the release and leak the slot. A leaked slot is never recovered, so
+  -- a handful of them permanently shrink the pool until the daemon is restarted.
+  let runEntry (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
+      (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
+    try runEntryBody entry slot tokenId resumeFrom authSource
+    finally releaseEntry entry slot
+  -- Usage poller: refresh every configured OAuth source on a slow cadence.
+  --
+  -- Claim-time resolution already refreshes what it is about to use, but only for sources it is
+  -- about to use. This is what notices that a *blocked* source has come back, and what keeps
+  -- `orchestra usage` truthful while the daemon is otherwise idle. Errors are swallowed per
+  -- source inside `refreshAll`; an unreachable endpoint must not take the fiber down.
+  let usageBackends := appConfig.agentAuthConfigs.toList.map (·.name)
+  if !usageBackends.isEmpty then
+    let _usageTask ← IO.asTask (prio := .dedicated) do
+      while !(← shutdownToken.isCancelled) do
+        for backend in usageBackends do
+          try Usage.refreshAll appConfig backend
+          catch e => IO.eprintln s!"[usage] poll failed for {backend}: {e}"
+        -- Five minutes: fast enough that a reset is picked up promptly, slow enough that an
+        -- idle daemon makes a handful of requests an hour.
+        for _ in List.range 300 do
+          if ← shutdownToken.isCancelled then break
+          IO.sleep 1000
   -- Load listener configs and spawn one fiber per listener.
   let listenerConfigs ← Listener.loadAllListenerConfigs
   if !listenerConfigs.isEmpty then
@@ -676,16 +894,17 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
             match liveCfg.source with
             | .projectDispatcher pid _ =>
               let roleName := vars.find? (·.1 == "role_name") |>.map (·.2) |>.getD ""
-              let issueId := vars.find? (·.1 == "issue_id") |>.map (fun p => (⟨p.2⟩ : Project.IssueId))
+              let issueId := vars.find? (·.1 == "issue_id") |>.bind (fun p => Taxis.IssueId.parse? p.2)
               let some project ← Project.loadProject pid | continue
               let some role ← Project.loadRole pid roleName | continue
               let issue? : Option Project.Issue ← match issueId with
                 | none => pure none
                 | some iid => Project.loadIssue pid iid
-              let entryOpt ← Listener.buildRoleEntry project role issue?
+              let entryOpt ← Listener.buildRoleEntry appConfig project role issue?
               match entryOpt with
               | none =>
-                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName}: no effective target"
+                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName}: no effective \
+                  target, or its target is not writable and could not be forked (see [fork] logs)"
               | some entry =>
                 -- Pre-claim if the role wants it and we have an issue.
                 let needsClaim :=
@@ -701,7 +920,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                     | .acquired _ => pure true
                     | .alreadyClaimed e =>
                       IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: \
-                        issue {i.id.value} already claimed by {e.taskId}"
+                        issue {i.id.toString} already claimed by {e.taskId}"
                       pure false
                     | .invalid r =>
                       IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: {r}"
@@ -710,6 +929,84 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
                 if claimed then
                   Queue.saveEntry entry
                   IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} → {entry.id}"
+              continue
+            | .labelDispatcher label _ =>
+              -- Same shape as the branch above, but the project and target come from the event
+              -- rather than the listener config: this source spans projects, and each issue's
+              -- target was resolved from its taxis artifacts at poll time
+              -- (Project.artifactTarget) rather than inherited from a project default.
+              let getVar (k : String) := vars.find? (·.1 == k) |>.map (·.2)
+              let roleName := getVar "role_name" |>.getD ""
+              -- Absent for an unbound role (`always` trigger): it is scoped to the labelled root
+              -- in `project_id` and picks its own issues from there, claiming each through the
+              -- daemon. Only a malformed id is an error; no id at all is a valid event.
+              let issueIdVar := getVar "issue_id"
+              let issueId? := issueIdVar.bind Taxis.IssueId.parse?
+              if issueIdVar.isSome && issueId?.isNone then
+                IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event with an \
+                  unparseable issue_id; skipping"
+                continue
+              let some projectId := getVar "project_id" |>.bind Taxis.IssueId.parse?
+                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event without a \
+                    usable project_id; skipping"
+                  continue
+              let target? : Option Project.RepoTarget :=
+                match getVar "target_repo", getVar "target_branch" with
+                | some r, some b => (Repository.parse r).toOption.map ({ repo := ·, branch := b })
+                | _, _ => none
+              let some target := target?
+                | IO.eprintln s!"  Listener '{lcfg.name}': label-dispatcher event for \
+                    {issueId?.map (·.toString) |>.getD projectId.toString} carried no usable \
+                    target; skipping"
+                  continue
+              let some project ← Project.loadProject projectId | continue
+              -- Global roles only: these issues can span projects, so no single project's
+              -- roles/ directory takes precedence (see Project.loadGlobalRoles).
+              let some role := (← Project.loadGlobalRoles).find? (·.name == roleName)
+                | IO.eprintln s!"  Listener '{lcfg.name}': no global role '{roleName}'; skipping"
+                  continue
+              let issue? ← match issueId? with
+                | none     => pure none
+                | some iid => Project.loadIssue projectId iid
+              -- A bound event naming an issue that cannot be loaded is a real failure; an
+              -- unbound one legitimately has none.
+              if issueId?.isSome && issue?.isNone then continue
+              let scope := match issue? with
+                | some i => s!"issue {i.id.toString}"
+                | none   => s!"root {projectId.toString}"
+              let entryOpt ← Listener.buildRoleEntry appConfig project role issue?
+                (targetOverride := some target)
+              match entryOpt with
+              | none =>
+                IO.eprintln s!"  Listener '{lcfg.name}': cannot dispatch {roleName} for \
+                  {scope}: no effective target, or its target is not writable and could not be \
+                  forked (see [fork] logs)"
+              | some entry =>
+                -- Pre-claiming needs an issue to claim. An unbound role has none by construction;
+                -- it claims for itself through the daemon once it picks one, which is the same
+                -- mutex this would have taken.
+                let needsClaim := match issue?, role.dispatch with
+                  | some _, some d => d.preClaim
+                  | _,      _      => false
+                let claimed ← match issue?, needsClaim with
+                  | some issue, true =>
+                    let now ← TaskStore.currentIso8601
+                    let agent := role.backend.getD "claude"
+                    match ← Project.tryClaim TaskRunner.globalClaimManager projectId issue.id
+                                             entry.id agent now none with
+                    | .acquired _ => pure true
+                    | .alreadyClaimed e =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: issue \
+                        {issue.id.toString} already claimed by {e.taskId}"
+                      pure false
+                    | .invalid r =>
+                      IO.eprintln s!"  Listener '{lcfg.name}': skipping {roleName}: {r}"
+                      pure false
+                  | _, _ => pure true
+                if claimed then
+                  Queue.saveEntry entry
+                  IO.println s!"  Listener '{lcfg.name}': dispatched {roleName} for \
+                    {scope} ({label}) → {entry.id}"
               continue
             | _ => pure ()
             if let some wfPath := liveCfg.action.workflowPath then
@@ -773,13 +1070,36 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           Listener.saveListenerState lcfg.name newState
         catch e =>
           IO.eprintln s!"  Listener '{lcfg.name}' poll error: {e}"
-  -- Queue worker loop: claim and run entries one at a time.
-  -- To support parallel execution in the future, spawn multiple copies of this loop.
-  try
+  -- Queue worker loop: claim and run one entry at a time.
+  -- Spawning parallelLimit copies of this loop enables parallel execution.
+  let workerLoop : IO Unit := do
     while !(← shutdownToken.isCancelled) do
-      match ← claimNextEntry with
-      | none       => IO.sleep 1000
-      | some entry => runEntry entry
+      -- A worker must never die on an unhandled exception. `runEntry` already records
+      -- per-entry failures, but anything escaping here (or out of `claimNextEntry`)
+      -- would silently retire this worker and shrink the pool permanently — invisible
+      -- with one worker on the main thread, and invisible *and* silent for the spawned
+      -- ones, whose task results are discarded.
+      try
+        match ← claimNextEntry with
+        | none => IO.sleep 1000
+        | some (claim, tokenId) =>
+          runEntry claim.entry claim.slot tokenId claim.resumeFrom claim.authSource
+      catch e =>
+        IO.eprintln s!"Queue worker error: {e}"
+        IO.sleep 1000
+  -- Spawn additional workers beyond the first (which runs on the main thread below).
+  let mut workerTasks : Array (Task (Except IO.Error Unit)) := #[]
+  for _ in List.range (parallelLimit - 1) do
+    workerTasks := workerTasks.push (← IO.asTask (prio := .dedicated) workerLoop)
+  if parallelLimit > 1 then
+    IO.println s!"Queue daemon running with parallelLimit={parallelLimit}, parallelLimitPerRepo={parallelLimitPerRepo}"
+  try
+    workerLoop
+    -- Let the other workers finish their in-flight tasks before the socket server and
+    -- PID file are torn down; otherwise `IO.Process.exit 0` below kills them mid-task
+    -- and their entries are left stuck in `running`.
+    for t in workerTasks do
+      let _ ← IO.wait t
   finally
     match ← socketServerRef.get with
     | some s => try s.close catch _ => pure ()
@@ -971,16 +1291,28 @@ private def mcpServerCmd : Cmd := `[Cli|
 
 private def prepareCmd : Cmd := `[Cli|
   prepare VIA prepareHandler; ["0.1.0"]
-  "Clone the fork and configure the upstream remote."
+  "Clone the fork, configure the upstream remote, and warm the task slots the queue runs in."
+
+  FLAGS:
+    slots : Nat; "Number of task slots to create and initialise, matching the \
+--parallel-per-repo the daemon will use (default: 1)"
 
   ARGS:
     "upstream" : String; "Upstream repository in 'owner/repo' format"
     "fork" : String; "Fork repository in 'owner/repo' format"
 ]
 
+private def cleanupListCmd : Cmd := `[Cli|
+  list VIA cleanupListHandler; ["0.1.0"]
+  "List all repository clones and their task slots."
+]
+
 private def cleanupCmd : Cmd := `[Cli|
   cleanup VIA cleanupHandler; ["0.1.0"]
-  "Remove all cloned repositories."
+  "Manage cloned repositories. Without a subcommand, removes all clones and task slots."
+
+  SUBCOMMANDS:
+    cleanupListCmd
 ]
 
 private def tasksCmd : Cmd := `[Cli|
@@ -1048,12 +1380,19 @@ private def queueAddCmd : Cmd := `[Cli|
 
 private def queueStartCmd : Cmd := `[Cli|
   start VIA queueStartHandler; ["0.1.0"]
-  "Start the queue daemon. Polls for pending tasks and runs them serially."
+  "Start the queue daemon. Polls for pending tasks and runs them in parallel up to the configured limit."
 
   FLAGS:
     c, config : String; "Path to config file (default: ~/.config/orchestra/config.json)"
     d, debug; "Print the landrun command before executing it"
     b, background; "Run the daemon in the background, detached from the terminal"
+    parallel : Nat; "Maximum number of tasks to run in parallel. Overrides queue.parallel in \
+config.json (default: 1). Backends that keep per-run state at a fixed global path (pi, \
+opencode) always run exclusively, so they start only while the daemon is otherwise idle and \
+may wait a long time under steady load"
+    "parallel-per-repo" : Nat; "Maximum parallel tasks per repository; each runs in its own clone. \
+Overrides queue.parallel_per_repo in config.json (default: 1). \
+Run `orchestra prepare --slots N` first so the clones are warm"
 ]
 
 private def queueStatusCmd : Cmd := `[Cli|
@@ -1173,6 +1512,84 @@ private def queueCmd : Cmd := `[Cli|
     queueRetryCmd
 ]
 
+/-- `orchestra usage` — what every configured authentication source has left.
+
+    The thing to look at when the queue seems stalled: it names the limit that is binding, when
+    it lifts, and which model families are affected. -/
+private def usageHandler (p : Parsed) : IO UInt32 := do
+  let configPath := p.flag? "config" |>.map (·.as! String)
+  let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  let backends : List String := match p.flag? "backend" |>.map (·.as! String) with
+    | some b => [b]
+    | none   => appConfig.agentAuthConfigs.toList.map (fun a => a.name)
+  let model := p.flag? "model" |>.map (·.as! String)
+  -- Default to a TTL-bounded poll rather than an unconditional one: the usage endpoint meters
+  -- requests, and this command is the kind of thing that ends up in a status line or a watch
+  -- loop. `--refresh` forces, `--cached` never polls.
+  let pollMode := if p.hasFlag "cached" then 0 else if p.hasFlag "refresh" then 2 else 1
+  let now ← Usage.nowEpoch
+  if backends.isEmpty then
+    IO.println "No agent auth sources configured (see the 'agents' block in config.json)."
+    return 0
+  for backend in backends do
+    let labels := Usage.configuredLabels appConfig backend
+    if labels.isEmpty then continue
+    IO.println s!"{backend}:"
+    for label in labels do
+      if pollMode == 2 then
+        match ← Usage.refresh appConfig backend label with
+        | .error e => IO.println s!"  {label}: poll failed: {e}"
+        | .ok _    => pure ()
+      else if pollMode == 1 then
+        Usage.ensureFresh appConfig backend label
+      let st ← Usage.loadState backend label
+      let verdict := match Usage.availabilityOf st model now with
+        | .available          => "available"
+        | .blocked until' r =>
+          match until' with
+          | some u => s!"BLOCKED ({r}, resets {Usage.relativeToNow u now})"
+          | none   => s!"BLOCKED ({r})"
+      let kind := if (Usage.oauthTokenOf appConfig backend label).isSome then "oauth" else "api-key"
+      IO.println s!"  {label} [{kind}]: {verdict}"
+      if let some e := st.lastError then
+        IO.println s!"    last poll error: {e}"
+      if let some pa := st.pollAfter then
+        if pa > now then
+          IO.println s!"    not polling until {Usage.relativeToNow pa now} \
+(the usage endpoint is rate-limiting requests)"
+      for l in st.limits do
+        let scope := match l.scopeModel with | some m => s!" ({m})" | none => ""
+        let resets := match l.resetsAt.bind Usage.parseIso8601 with
+          | some r => s!", resets {Usage.relativeToNow r now}"
+          | none   => ""
+        IO.println s!"    {l.kind.toString}{scope}: {l.percent}% [{l.severity}]{resets}"
+      if st.limits.isEmpty && (Usage.oauthTokenOf appConfig backend label).isNone then
+        IO.println "    no subscription limits to report (API-key sources are billed per token)"
+    -- What a task queued right now would actually be dispatched to. Answers the operator
+    -- question the per-source list only implies, and exercises the same resolver the daemon
+    -- uses at claim time.
+    if p.hasFlag "select" then
+      let mode := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
+        |>.getD .ordered
+      match ← Usage.select backend labels mode model with
+      | .ok label => IO.println s!"  → would select: {label} ({mode.toString})"
+      | .error e  => IO.println s!"  → would select: nothing ({e})"
+  return 0
+
+private def usageCmd : Cmd := `[Cli|
+  usage VIA usageHandler; ["0.1.0"]
+  "Show the usage limits of every configured authentication source."
+
+  FLAGS:
+    c, config : String; "Path to config file"
+    backend   : String; "Only show this backend (default: all configured)"
+    model     : String; "Judge availability for this model (affects model-scoped limits)"
+    cached    ;         "Do not poll; report the last stored values"
+    refresh   ;         "Force a poll even if the stored values are still fresh"
+    select    ;         "Also show which source a task queued now would be dispatched to"
+    auth_mode : String; "Selection mode to simulate with --select: ordered (default) or distribute"
+]
+
 private def migrateHandler (_ : Parsed) : IO UInt32 := do
   try
     Migrate.run
@@ -1259,6 +1676,10 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let debug       := p.hasFlag "debug"
   let configPath  := p.flag? "config"   |>.map (·.as! String)
   let authSource  := p.flag? "auth_source" |>.map (·.as! String)
+  let authSources := (p.flag? "auth_sources" |>.map (·.as! String)).map
+    (fun s => (s.splitOn ",").map (·.trimAscii.toString) |>.filter (!·.isEmpty)) |>.getD []
+  let authMode    := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
+    |>.getD .ordered
   let upstream ← IO.ofExcept (Repository.parse upstreamStr)
   let fork     ← IO.ofExcept (Repository.parse forkStr)
   let allowedTools : List String := match toolsStr with
@@ -1293,7 +1714,19 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     | _               => AgentDef.claude
   let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
     |>.map (·.extraPorts) |>.getD #[]
-  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName authSource
+  -- Interactive sessions go through the same resolver as queued and one-shot runs, so an
+  -- account the daemon has already found to be out of quota is not handed to a human either.
+  let resolved ← match ← Usage.resolveLabel appConfig backendName authSources authSource
+                          authMode model with
+    | .ok label => pure label
+    | .error e  =>
+      IO.eprintln s!"No usable authentication source for '{backendName}': {e}"
+      shutdown
+      return 1
+  let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName resolved
+  if let some label := resolved then
+    IO.println s!"  Auth source: {label}"
+    Usage.markUsed backendName label
   IO.println "  Launching agent..."
   let result ← Sandbox.launchAgent agentDef repoPath "" port token
     (debug := debug) (pluginDirs := appConfig.pluginDirs)
@@ -1319,6 +1752,8 @@ private def interactiveCmd : Cmd := `[Cli|
     model       : String; "Model override passed to the agent"
     budget      : String; "Maximum spend in USD (default: 4.0)"
     auth_source : String; "Authentication source label to use (overrides default_auth_source)"
+    auth_sources : String; "Comma-separated candidate auth source labels, tried per --auth_mode"
+    auth_mode   : String; "How to pick among --auth_sources: ordered (default) or distribute"
 ]
 
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
@@ -1346,10 +1781,34 @@ def orchestraCmd : Cmd := `[Cli|
     issueCmd;
     spawnCmd;
     rolesCmd;
+    usageCmd;
     migrateCmd;
     dashboardCmd
 ]
 
+/-- Wrap a stream so that every write is flushed immediately.
+
+    Lean block-buffers its output streams when they are not a TTY. A long-running process writing
+    to a pipe therefore produces *nothing* until it exits or fills the buffer — so the queue
+    daemon, which is meant to run for days, shows no output at all under `docker compose logs`,
+    systemd's journal, `tee`, or anything else that isn't a terminal. Short-lived commands hide
+    the problem by flushing on exit.
+
+    Only applied when the stream is not already a TTY: an interactive terminal is line-buffered
+    by default and does not need a flush per write. -/
+private def autoFlushing (s : IO.FS.Stream) : IO.FS.Stream :=
+  { s with
+    write  := fun bs  => do s.write bs;  s.flush
+    putStr := fun str => do s.putStr str; s.flush }
+
+private def unbufferIfPiped : IO Unit := do
+  let out ← IO.getStdout
+  unless ← out.isTty do discard <| IO.setStdout (autoFlushing out)
+  let err ← IO.getStderr
+  unless ← err.isTty do discard <| IO.setStderr (autoFlushing err)
+
 def main (args : List String) : IO UInt32 := do
+  unbufferIfPiped
   gRawArgs.set args
+  Project.ensureTaxisConfigured
   orchestraCmd.validate args

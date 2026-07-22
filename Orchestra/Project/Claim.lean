@@ -1,6 +1,7 @@
 import Lean.Data.Json
 import Std.Sync
 import Orchestra.Project.Basic
+import Orchestra.Taxis
 
 open Lean (Json FromJson ToJson)
 
@@ -8,21 +9,22 @@ namespace Orchestra.Project
 
 /-! # Issue claim locks
 
-An open issue may only be worked on by one task at a time. The claim is
-recorded as a separate file `~/.agent/projects/<pid>/claims/<iid>.json` so
-that the issue record itself stays read-mostly. Decision **C1** of the plan:
-file-create-as-lock guarded by a daemon-wide mutex.
-
-The mutex protects against intra-process races (two MCP requests handled by
-the daemon at once). The on-disk file is what survives daemon restarts and
-what other processes (CLI, future external tools) read to learn that an
-issue is taken. -/
+An open issue may only be worked on by one task at a time. The claim is recorded as a taxis
+`session`-kind artifact attached to the issue (see the taxis-side "add `session` artifact kind for
+claim tracking" tracking issue) — "claimed" = the issue has at least one `session` artifact.
+Decision **C1** of the original plan (file-create-as-lock guarded by a daemon-wide mutex) carries
+over unchanged in spirit: taxis has no compare-and-swap primitive, so the `Std.BaseMutex` below is
+still what prevents two MCP requests handled by the same daemon process from racing each other
+between the "is it claimed" read and the "attach the claim" write. Cross-process races (a second
+orchestra daemon, or a human using the taxis UI directly) are not protected by the mutex either
+way — same limitation the pre-migration file-lock design already had (file-create isn't atomic
+across NFS etc. either), not a regression. -/
 
 structure Claim where
   taskId    : String
   series    : Option String := none
-  /-- Backend identifier of the claiming agent (e.g. `"claude"`), recorded
-      so cascade-cancel can target the right work later. -/
+  /-- Backend identifier of the claiming agent (e.g. `"claude"`), recorded so cascade-cancel can
+      target the right work later. -/
   agent     : String
   claimedAt : String
 deriving Repr, Inhabited
@@ -47,8 +49,8 @@ instance : FromJson Claim where
 /-! ## Manager -/
 
 /-- In-process serialiser for claim acquire/release. One instance lives in
-    the daemon for the duration of its run; the on-disk files are the source
-    of truth across restarts. -/
+    the daemon for the duration of its run; taxis is the source of truth
+    across restarts. -/
 structure ClaimManager where
   private mutex : Std.BaseMutex
 deriving Nonempty
@@ -58,7 +60,7 @@ def ClaimManager.new : IO ClaimManager := do
 
 /-- Outcome of a `tryClaim` attempt. -/
 inductive ClaimResult where
-  /-- Lock acquired; the recorded `Claim` is now on disk. -/
+  /-- Lock acquired; the recorded `Claim` is now attached to the issue. -/
   | acquired (claim : Claim)
   /-- Issue is already claimed; the existing `Claim` is returned for context. -/
   | alreadyClaimed (existing : Claim)
@@ -66,79 +68,73 @@ inductive ClaimResult where
   | invalid (reason : String)
 deriving Repr
 
-/-! ## Disk helpers -/
+/-! ## Reads -/
 
-/-- Read the claim file for an issue, if any. Tolerates malformed JSON by
-    returning `none` (the daemon will treat such files as missing). -/
-def loadClaim (pid : ProjectId) (iid : IssueId) : IO (Option Claim) := do
-  let path ← claimFile pid iid
-  if !(← path.pathExists) then return none
-  let contents ← IO.FS.readFile path
-  match Json.parse contents with
-  | .error e =>
-    IO.eprintln s!"[warn] failed to parse claim file {path}: {e}"
-    return none
-  | .ok j    =>
-    match FromJson.fromJson? j with
-    | .error e =>
-      IO.eprintln s!"[warn] failed to parse claim file {path}: {e}"
-      return none
-    | .ok c    => return some c
+/-- The `session`-kind artifact on `artifacts`, decoded, if any — at most one is ever created
+    (`tryClaim` checks first), but if several somehow exist the first is used. -/
+private def sessionArtifact? (artifacts : Array Orchestra.Taxis.ArtifactView) :
+    Option (Orchestra.Taxis.ArtifactView × Claim) :=
+  artifacts.findSome? fun a =>
+    if a.kind == "session" then
+      match (FromJson.fromJson? a.payload : Except String Claim) with
+      | .ok c => some (a, c)
+      | .error _ => none
+    else none
 
-/-- All claims currently held within a project. -/
-def loadClaims (pid : ProjectId) : IO (Array (IssueId × Claim)) := do
-  let dir ← claimsDir pid
-  if !(← dir.pathExists) then return #[]
-  let entries ← System.FilePath.readDir dir
-  let mut out : Array (IssueId × Claim) := #[]
-  for entry in entries do
-    let name := entry.fileName
-    let ext := ".json"
-    if name.endsWith ext then
-      let idStr := (name.dropEnd ext.length).toString
-      if let some c ← loadClaim pid ⟨idStr⟩ then
-        out := out.push (⟨idStr⟩, c)
+/-- Read the claim on an issue, if any. Tolerates a malformed/unreachable issue by returning
+    `none` (the caller treats that the same as "not claimed"). -/
+def loadClaim (iid : Taxis.IssueId) : IO (Option Claim) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  match ← Orchestra.Taxis.getIssueDetail cfg iid with
+  | .error _ => return none
+  | .ok detail => return (sessionArtifact? detail.attachedArtifacts).map (·.2)
+
+/-- All claims currently held within a project. taxis has no bulk "claims across these issues"
+    endpoint, so this is one `GET /issues/:id` per issue (via `loadClaim`) after the lightweight
+    project-wide list — the same shape `Project.loadIssues` already accepts as a cost of not
+    having a server-side descendants filter. -/
+def loadClaims (pid : Taxis.IssueId) : IO (Array (Taxis.IssueId × Claim)) := do
+  let issues ← loadIssues pid
+  let mut out : Array (Taxis.IssueId × Claim) := #[]
+  for i in issues do
+    if let some c ← loadClaim i.id then
+      out := out.push (i.id, c)
   return out
-
-private def writeClaim (pid : ProjectId) (iid : IssueId) (c : Claim) : IO Unit := do
-  IO.FS.createDirAll (← claimsDir pid)
-  IO.FS.writeFile (← claimFile pid iid) (Json.compress (ToJson.toJson c))
-
-private def deleteClaimFile (pid : ProjectId) (iid : IssueId) : IO Unit := do
-  let path ← claimFile pid iid
-  if ← path.pathExists then IO.FS.removeFile path
 
 /-! ## Operations
 
-All public operations take the manager and serialise on its mutex. The
-critical section is small (one read of the claim file, one write of the
-claim + issue files) so contention is not a concern at orchestra's scale. -/
+All public operations take the manager and serialise on its mutex. The critical section is one or
+two HTTP calls (read the issue's artifacts, then attach/remove one and patch the status label) so
+contention is not a concern at orchestra's scale. -/
 
 /-- Attempt to claim `iid` for `taskId`. On success the issue's status moves
-    to `.claimed` and a claim file is written. On failure the issue is left
+    to `.claimed` and a `session` artifact is attached. On failure the issue is left
     untouched and the existing claim (if any) is returned. -/
-def tryClaim (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId)
+def tryClaim (mgr : ClaimManager) (pid : Taxis.IssueId) (iid : Taxis.IssueId)
     (taskId : String) (agent : String) (nowIso : String)
     (series : Option String := none) : IO ClaimResult := do
   mgr.mutex.lock
   try
     let some issue ← loadIssue pid iid
-      | return .invalid s!"issue {iid.value} not found"
-    -- For terminal/blocked statuses a stale orphan claim file must not mask the real
-    -- reason the issue is unavailable.  Check status first so callers see .invalid
-    -- rather than .alreadyClaimed for completed/blocked/abandoned/rejected issues.
+      | return .invalid s!"issue {iid.toString} not found"
+    -- For terminal statuses a stale orphan claim must not mask the real reason the issue is
+    -- unavailable. Check status first so callers see .invalid rather than .alreadyClaimed for
+    -- completed/abandoned issues.
     match issue.status with
-    | .completed | .abandoned | .rejected | .blocked =>
-      return .invalid s!"issue {iid.value} is not open (status={repr issue.status})"
+    | .completed | .abandoned =>
+      return .invalid s!"issue {iid.toString} is not open (status={repr issue.status})"
     | _ => pure ()
-    if let some existing ← loadClaim pid iid then
+    if let some existing ← loadClaim iid then
       return .alreadyClaimed existing
     if issue.status != .open then
-      return .invalid s!"issue {iid.value} is not open (status={repr issue.status})"
+      return .invalid s!"issue {iid.toString} is not open (status={repr issue.status})"
     let claim : Claim := { taskId, agent, series, claimedAt := nowIso }
-    writeClaim pid iid claim
-    saveIssue { issue with status := .claimed, updatedAt := nowIso }
-    return .acquired claim
+    let cfg ← Orchestra.Taxis.getConfig
+    match ← Orchestra.Taxis.createArtifact cfg iid "session" (ToJson.toJson claim) with
+    | .error e => return .invalid s!"failed to record claim: {e}"
+    | .ok _ =>
+      saveIssue { issue with status := .claimed, updatedAt := nowIso }
+      return .acquired claim
   finally
     mgr.mutex.unlock
 
@@ -147,12 +143,19 @@ def tryClaim (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId)
     is expected to choose the right next status; this function does not
     enforce a transition graph. Returns `true` if a claim was actually
     released. -/
-def release (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId)
+def release (mgr : ClaimManager) (pid : Taxis.IssueId) (iid : Taxis.IssueId)
     (newStatus : IssueStatus) (nowIso : String) : IO Bool := do
   mgr.mutex.lock
   try
-    let hadClaim := (← loadClaim pid iid).isSome
-    deleteClaimFile pid iid
+    let cfg ← Orchestra.Taxis.getConfig
+    let hadClaim ← match ← Orchestra.Taxis.getIssueDetail cfg iid with
+      | .error _ => pure false
+      | .ok detail =>
+        match sessionArtifact? detail.attachedArtifacts with
+        | none => pure false
+        | some (art, _) => do
+          let _ ← Orchestra.Taxis.deleteArtifact cfg art.id
+          pure true
     if let some issue ← loadIssue pid iid then
       saveIssue { issue with status := newStatus, updatedAt := nowIso }
     return hadClaim
@@ -161,24 +164,57 @@ def release (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId)
 
 /-- Retag an existing claim with a new task ID. Called when a pre-claimed issue
     is picked up by a freshly-generated session: the claim was written with the
-    queue-entry ID, but the running task has a different generated ID. -/
-def updateClaimTaskId (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId)
+    queue-entry ID, but the running task has a different generated ID. Artifacts are immutable
+    (there's no `PATCH /artifacts/:id`), so "update" is delete-then-recreate — the artifact gets a
+    new id, which is fine since callers only ever look it up by `kind`, never by stored id. -/
+def updateClaimTaskId (mgr : ClaimManager) (iid : Taxis.IssueId)
     (newTaskId : String) : IO Unit := do
   mgr.mutex.lock
   try
-    if let some claim ← loadClaim pid iid then
-      writeClaim pid iid { claim with taskId := newTaskId }
+    let cfg ← Orchestra.Taxis.getConfig
+    match ← Orchestra.Taxis.getIssueDetail cfg iid with
+    | .error _ => pure ()
+    | .ok detail =>
+      match sessionArtifact? detail.attachedArtifacts with
+      | none => pure ()
+      | some (art, claim) =>
+        let _ ← Orchestra.Taxis.deleteArtifact cfg art.id
+        let _ ← Orchestra.Taxis.createArtifact cfg iid "session"
+          (ToJson.toJson { claim with taskId := newTaskId })
+        pure ()
   finally
     mgr.mutex.unlock
 
-/-- Force-release without changing the issue status. Useful for daemon
-    shutdown / orphan cleanup where we don't want to overwrite the current
-    issue state. -/
-def forceRelease (mgr : ClaimManager) (pid : ProjectId) (iid : IssueId) : IO Bool := do
+/-- Force-release without choosing a new status: the issue keeps its taxis `state`, so a
+    completed or abandoned issue stays that way. Useful where the caller has no business
+    deciding what happens next — daemon shutdown, orphan cleanup, a worker that finished and
+    left a pull request behind for review.
+
+    "Without changing the status" still has to clear the `o-claimed` label, because that label
+    *is* `.claimed` (`statusOf`) — an issue whose claim artifact is gone but whose label
+    remains reads as claimed forever and is skipped by everything that gates on `.open`,
+    including the reviewer sweep. The label is cleared even when no artifact was found, since
+    that combination is exactly the state older releases left behind.
+
+    Returns whether a claim artifact was actually deleted. -/
+def forceRelease (mgr : ClaimManager) (iid : Taxis.IssueId) : IO Bool := do
   mgr.mutex.lock
   try
-    let hadClaim := (← loadClaim pid iid).isSome
-    deleteClaimFile pid iid
+    let cfg ← Orchestra.Taxis.getConfig
+    let hadClaim ← match ← Orchestra.Taxis.getIssueDetail cfg iid with
+      | .error _ => pure false
+      | .ok detail =>
+        match sessionArtifact? detail.attachedArtifacts with
+        | none => pure false
+        | some (art, _) => do
+          let _ ← Orchestra.Taxis.deleteArtifact cfg art.id
+          pure true
+    -- Best-effort: the claim is already gone by this point, and throwing here would turn a
+    -- released lock into a failed task on paths that only call this to clean up.
+    try clearClaimedLabel iid
+    catch e =>
+      IO.eprintln s!"  Warning: released the claim on {iid.toString} but could not clear its \
+o-claimed label: {e}"
     return hadClaim
   finally
     mgr.mutex.unlock

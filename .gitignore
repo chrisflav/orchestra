@@ -3,3 +3,8 @@ tasks.json
 container/*.squashfs
 container/*.tar.xz
 .agent/.initialized
+docker/.env
+docker/config/
+docker/data/
+docker/secrets/*
+!docker/secrets/.gitkeep

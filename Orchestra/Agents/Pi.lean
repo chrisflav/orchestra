@@ -111,8 +111,9 @@ def pi : AgentDef where
     rox        := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
     ro         := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw         := ["/dev/null"]
-    homeRox    := [".elan", ".cache", ".local"]
+    homeRox    := [".local"]
     homeRw     := [".pi", ".gitconfig", ".config/gh", ".config/git"]
+    homeRwx    := [".elan", ".cache"]
     extraPorts := [8080]   -- llama.cpp
   }
   -- Configure MCP connectivity via pi-mcp-adapter.  Writes ~/.pi/agent/mcp.json
@@ -170,6 +171,11 @@ def pi : AgentDef where
     if let some sid := resume then
       args := args.push "--session" |>.push sid
     return args
+  -- `setupMcp` overwrites the fixed path `~/.pi/agent/mcp.json` (pi discovers it there and
+  -- offers no per-run override) and `cleanup` restores the saved copy. Two concurrent runs
+  -- would leave the second task's port in the file for both agents, and the first to finish
+  -- would delete or revert the config underneath the other.
+  parallelSafe := false
   parseOutputLine := piParseOutputLine
   -- The session UUID is captured from the "session" header line emitted to stdout,
   -- so there is nothing left to extract after the run.

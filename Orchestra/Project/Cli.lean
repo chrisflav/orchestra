@@ -1,5 +1,6 @@
 import Cli
 import Orchestra.Config
+import Orchestra.GitHub
 import Orchestra.Queue
 import Orchestra.DaemonRequest
 import Orchestra.TaskStore
@@ -12,11 +13,11 @@ import Orchestra.Project.Role
 open Cli
 open Orchestra (Repository Task)
 open Orchestra.TaskStore (currentIso8601)
-open Orchestra.Project (Project Issue ProjectId IssueId IssueStatus RepoTarget
+open Orchestra.Project (Project Issue IssueStatus RepoTarget
                         Role RoleTrigger DispatchPolicy
-                        loadProject saveProject loadAllProjects
-                        loadIssue saveIssue loadIssues childrenOf findIssue
-                        freshProjectId freshIssueId effectiveTarget
+                        loadProject saveProject loadAllProjects createProject
+                        loadIssue saveIssue loadIssues childrenOf findIssue createIssue
+                        effectiveTarget
                         loadRole loadAllRoles roleSearchPaths render renderVarsFor)
 
 namespace Orchestra.Project.Cli
@@ -26,6 +27,19 @@ namespace Orchestra.Project.Cli
 Handlers and `Cli.Cmd` definitions live next to the project domain code so
 that `Main.lean` only needs to import this module and reference `projectCmd`
 / `issueCmd` from its top-level subcommand list. -/
+
+/-- Parse a `--flag`/positional string argument as a project/issue id (taxis's own numeric ids,
+    see `Taxis.IssueId`), printing a CLI-appropriate error and returning `none` on anything that
+    isn't a plain integer. -/
+private def parseProjectIdArg (context : String) (s : String) : IO (Option Taxis.IssueId) := do
+  match Taxis.IssueId.parse? s with
+  | some pid => pure (some pid)
+  | none => IO.eprintln s!"{context}: invalid project id '{s}' (expected a number)"; pure none
+
+private def parseIssueIdArg (context : String) (s : String) : IO (Option Taxis.IssueId) := do
+  match Taxis.IssueId.parse? s with
+  | some iid => pure (some iid)
+  | none => IO.eprintln s!"{context}: invalid issue id '{s}' (expected a number)"; pure none
 
 private def parseRepoFlag? (p : Parsed) : Except String (Option Repository) := do
   match p.flag? "default-repo" |>.map (·.as! String) with
@@ -45,21 +59,15 @@ private def parseTargetFlags? (p : Parsed) : Except String (Option RepoTarget) :
 private def issueStatusOfString? : String → Option IssueStatus
   | "open"      => some .open
   | "claimed"   => some .claimed
-  | "in_review" => some .inReview
   | "completed" => some .completed
-  | "blocked"   => some .blocked
   | "abandoned" => some .abandoned
-  | "rejected"  => some .rejected
   | _           => none
 
 private def issueStatusToString : IssueStatus → String
   | .open      => "open"
   | .claimed   => "claimed"
-  | .inReview  => "in_review"
-  | .blocked   => "blocked"
   | .completed => "completed"
   | .abandoned => "abandoned"
-  | .rejected  => "rejected"
 
 /-! ## Handlers -/
 
@@ -76,11 +84,8 @@ def projectCreateHandler (p : Parsed) : IO UInt32 := do
     | _,      _      =>
       IO.eprintln "orchestra project create: --default-repo and --default-branch must be set together"
       return (1 : UInt32)
-  let now ← TaskStore.currentIso8601
-  let pid ← freshProjectId
-  let project : Project := { id := pid, name, description, createdAt := now, defaultTarget }
-  saveProject project
-  IO.println s!"Created project {pid.value} ({name})"
+  let project ← createProject name description defaultTarget
+  IO.println s!"Created project {project.id.toString} ({name})"
   return (0 : UInt32)
 
 def projectListHandler (_ : Parsed) : IO UInt32 := do
@@ -94,12 +99,26 @@ def projectListHandler (_ : Parsed) : IO UInt32 := do
     let target := match pr.defaultTarget with
       | some t => s!"{t.repo}@{t.branch}"
       | none   => "-"
-    IO.println s!"{padRight pr.id.value 18} {padRight pr.createdAt 22} {padRight pr.name 30} {target}"
+    IO.println s!"{padRight pr.id.toString 18} {padRight pr.createdAt 22} {padRight pr.name 30} {target}"
   return (0 : UInt32)
 
-/-- Find all claimed issues in `pid` whose claiming task is missing and has no
-    active queue entry. Returns an array of `(issue, missingTaskId)` pairs. -/
-private def findOrphanedIssues (pid : ProjectId) : IO (Array (Issue × String)) := do
+/-- Whether the task holding a claim is still running — the first half of "is this claim live",
+    shared by `project health` and `project releaseOrphans` so the two cannot disagree about
+    which issues are orphaned.
+
+    Still *running*, not merely "a record exists": records outlive the run, so testing only for
+    existence made a claim left behind by a *finished* task read as healthy forever — exactly the
+    claims that need clearing, and the ones an unbound `always` role produces if its teardown
+    sweep does not run. A pre-claimed issue whose task has not started yet has no record at all
+    (the claim carries the queue-entry id until `updateClaimTaskId` retags it); the caller's
+    `onQueue` check is what covers that window. -/
+private def claimTaskRunning (allTasks : Array TaskStore.TaskRecord) (taskId : Option String) :
+    Bool :=
+  taskId.any fun tid => allTasks.any fun t => t.id == tid && t.status matches .running
+
+/-- Find all claimed issues in `pid` whose claiming task is no longer running and which have no
+    active queue entry. Returns an array of `(issue, staleTaskId)` pairs. -/
+private def findOrphanedIssues (pid : Taxis.IssueId) : IO (Array (Issue × String)) := do
   let issues ← loadIssues pid
   let claimed := issues.filter (·.status == .claimed)
   let allTasks ← TaskStore.loadAllTasks
@@ -108,17 +127,17 @@ private def findOrphanedIssues (pid : ProjectId) : IO (Array (Issue × String)) 
     e.status == .pending || e.status == .running
   let mut orphans : Array (Issue × String) := #[]
   for issue in claimed do
-    let claim ← Project.loadClaim pid issue.id
+    let claim ← Project.loadClaim issue.id
     let taskId := claim.map (·.taskId)
-    let hasTask := taskId.any (fun tid => allTasks.any (·.id == tid))
+    let hasTask := claimTaskRunning allTasks taskId
     let onQueue := activeEntries.any (·.issueId == some issue.id)
     if !hasTask && !onQueue then
-      orphans := orphans.push (issue, taskId.getD "(no claim file)")
+      orphans := orphans.push (issue, taskId.getD "(no claim)")
   return orphans
 
 def projectHealthHandler (p : Parsed) : IO UInt32 := do
   let id := p.positionalArg! "id" |>.as! String
-  let pid : ProjectId := ⟨id⟩
+  let some pid ← parseProjectIdArg "orchestra project health" id | return (1 : UInt32)
   match ← loadProject pid with
   | none =>
     IO.eprintln s!"Project '{id}' not found"
@@ -135,22 +154,23 @@ def projectHealthHandler (p : Parsed) : IO UInt32 := do
       e.status == .pending || e.status == .running
     let mut ok := true
     for issue in claimed do
-      let claim ← Project.loadClaim pid issue.id
+      let claim ← Project.loadClaim issue.id
       let taskId := claim.map (·.taskId)
-      let hasTask := taskId.any (fun tid => allTasks.any (·.id == tid))
+      let hasTask := claimTaskRunning allTasks taskId
       if hasTask then
-        IO.println s!"[ok]      {issue.id.value}  {issue.title}"
+        IO.println s!"[ok]      {issue.id.toString}  {issue.title}"
       else if activeEntries.any (·.issueId == some issue.id) then
-        IO.println s!"[ok]      {issue.id.value}  {issue.title}  — pending on queue"
+        IO.println s!"[ok]      {issue.id.toString}  {issue.title}  — pending on queue"
       else
         ok := false
-        let tid := taskId.getD "(no claim file)"
-        IO.println s!"[orphan]  {issue.id.value}  {issue.title}  — claimed by missing task {tid}"
+        let tid := taskId.getD "(no claim)"
+        IO.println s!"[orphan]  {issue.id.toString}  {issue.title}  \
+— claimed by task {tid}, which is no longer running"
     return if ok then 0 else 1
 
 def projectReleaseOrphansHandler (p : Parsed) : IO UInt32 := do
   let id := p.positionalArg! "id" |>.as! String
-  let pid : ProjectId := ⟨id⟩
+  let some pid ← parseProjectIdArg "orchestra project releaseOrphans" id | return (1 : UInt32)
   match ← loadProject pid with
   | none =>
     IO.eprintln s!"Project '{id}' not found"
@@ -162,29 +182,22 @@ def projectReleaseOrphansHandler (p : Parsed) : IO UInt32 := do
     let orphans ← findOrphanedIssues pid
     for (issue, tid) in orphans do
       let _ ← Project.release mgr pid issue.id .open now
-      IO.println s!"[released]  {issue.id.value}  {issue.title}  (was claimed by {tid})"
-    -- Unblock blocked issues whose children are all completed.
-    let allIssues ← loadIssues pid
-    let blocked := allIssues.filter (·.status == .blocked)
-    let mut unblocked : Nat := 0
-    for issue in blocked do
-      let children ← childrenOf pid issue.id
-      if children.all (·.status == .completed) then
-        Project.saveIssue { issue with status := .open, updatedAt := now }
-        IO.println s!"[unblocked] {issue.id.value}  {issue.title}  (all children completed)"
-        unblocked := unblocked + 1
-    if orphans.isEmpty && unblocked == 0 then
+      IO.println s!"[released]  {issue.id.toString}  {issue.title}  (was claimed by {tid})"
+    -- No unblock sweep: a decomposed parent is recognised by still having open children, so it
+    -- becomes workable again the moment the last one closes. Nothing to reconcile.
+    if orphans.isEmpty then
       IO.println "Nothing to do."
     return (0 : UInt32)
 
 def projectShowHandler (p : Parsed) : IO UInt32 := do
   let id := p.positionalArg! "id" |>.as! String
-  match ← loadProject ⟨id⟩ with
+  let some pid ← parseProjectIdArg "orchestra project show" id | return (1 : UInt32)
+  match ← loadProject pid with
   | none =>
     IO.eprintln s!"Project '{id}' not found"
     return (1 : UInt32)
   | some pr =>
-    IO.println s!"ID:          {pr.id.value}"
+    IO.println s!"ID:          {pr.id.toString}"
     IO.println s!"Name:        {pr.name}"
     IO.println s!"Description: {pr.description.getD "-"}"
     IO.println s!"Created:     {pr.createdAt}"
@@ -202,8 +215,13 @@ def issueAddHandler (p : Parsed) : IO UInt32 := do
   let descr   := p.flag?  "description" |>.map (·.as! String) |>.getD ""
   if title.isEmpty then
     IO.eprintln "orchestra issue add: --title is required"; return (1 : UInt32)
-  let parentId : Option IssueId := p.flag? "parent" |>.map (fun v => ⟨v.as! String⟩)
-  let project ← match ← loadProject ⟨pidStr⟩ with
+  let some pid ← parseProjectIdArg "orchestra issue add" pidStr | return (1 : UInt32)
+  let parentId : Option Taxis.IssueId ← match p.flag? "parent" |>.map (·.as! String) with
+    | none => pure none
+    | some s =>
+      let some iid ← parseIssueIdArg "orchestra issue add" s | return (1 : UInt32)
+      pure (some iid)
+  let project ← match ← loadProject pid with
     | none => IO.eprintln s!"Project '{pidStr}' not found"; return (1 : UInt32)
     | some pr => pure pr
   let target ← match parseTargetFlags? p with
@@ -212,13 +230,8 @@ def issueAddHandler (p : Parsed) : IO UInt32 := do
   if target.isNone && project.defaultTarget.isNone then
     IO.eprintln "orchestra issue add: project has no default target; pass --target-repo and --target-branch"
     return (1 : UInt32)
-  let now ← TaskStore.currentIso8601
-  let iid ← freshIssueId
-  let issue : Issue :=
-    { id := iid, projectId := project.id, parentId, title, description := descr
-    , target, createdAt := now, updatedAt := now }
-  saveIssue issue
-  IO.println s!"Created issue {iid.value} in project {project.id.value}"
+  let issue ← createIssue project.id title descr (parentId := parentId) (target := target)
+  IO.println s!"Created issue {issue.id.toString} in project {project.id.toString}"
   return (0 : UInt32)
 
 def issueListHandler (p : Parsed) : IO UInt32 := do
@@ -231,7 +244,8 @@ def issueListHandler (p : Parsed) : IO UInt32 := do
       | none    =>
         IO.eprintln s!"orchestra issue list: invalid --status (got {s})"
         return (1 : UInt32)
-  let project ← match ← loadProject ⟨pidStr⟩ with
+  let some pid ← parseProjectIdArg "orchestra issue list" pidStr | return (1 : UInt32)
+  let project ← match ← loadProject pid with
     | none => IO.eprintln s!"Project '{pidStr}' not found"; return (1 : UInt32)
     | some pr => pure pr
   let all ← loadIssues project.id
@@ -244,24 +258,25 @@ def issueListHandler (p : Parsed) : IO UInt32 := do
   IO.println s!"{padRight "ID" 18} {padRight "STATUS" 10} {padRight "PARENT" 18} TITLE"
   IO.println (String.ofList (List.replicate 90 '-'))
   for i in issues do
-    let parent := i.parentId.map (·.value) |>.getD "-"
-    IO.println s!"{padRight i.id.value 18} {padRight (issueStatusToString i.status) 10} {padRight parent 18} {i.title}"
+    let parent := i.parentId.map (·.toString) |>.getD "-"
+    IO.println s!"{padRight i.id.toString 18} {padRight (issueStatusToString i.status) 10} {padRight parent 18} {i.title}"
   return (0 : UInt32)
 
 def issueShowHandler (p : Parsed) : IO UInt32 := do
   let id := p.positionalArg! "id" |>.as! String
-  match ← findIssue ⟨id⟩ with
+  let some iid ← parseIssueIdArg "orchestra issue show" id | return (1 : UInt32)
+  match ← findIssue iid with
   | none => IO.eprintln s!"Issue '{id}' not found"; return (1 : UInt32)
   | some (project, i) =>
     let target := (effectiveTarget project i).map (fun t => s!"{t.repo}@{t.branch}") |>.getD "-"
-    IO.println s!"ID:           {i.id.value}"
-    IO.println s!"Project:      {project.id.value} ({project.name})"
-    IO.println s!"Parent:       {i.parentId.map (·.value) |>.getD "-"}"
+    IO.println s!"ID:           {i.id.toString}"
+    IO.println s!"Project:      {project.id.toString} ({project.name})"
+    IO.println s!"Parent:       {i.parentId.map (·.toString) |>.getD "-"}"
     IO.println s!"Title:        {i.title}"
     IO.println s!"Status:       {issueStatusToString i.status}"
     IO.println s!"Target:       {target}"
     let depsStr := if i.dependencies.isEmpty then "-"
-                   else String.intercalate ", " (i.dependencies.map (·.value)).toList
+                   else String.intercalate ", " (i.dependencies.map (·.toString)).toList
     IO.println s!"Dependencies: {depsStr}"
     IO.println s!"Created:      {i.createdAt}"
     IO.println s!"Updated:      {i.updatedAt}"
@@ -275,7 +290,7 @@ def issueShowHandler (p : Parsed) : IO UInt32 := do
     if !children.isEmpty then
       IO.println "Children:"
       for c in children do
-        IO.println s!"  - {c.id.value}  {issueStatusToString c.status}  {c.title}"
+        IO.println s!"  - {c.id.toString}  {issueStatusToString c.status}  {c.title}"
     let allTasks ← TaskStore.loadAllTasks
     let issueTasks := allTasks.filter (·.issueId == some i.id)
       |>.toList.mergeSort (·.createdAt < ·.createdAt) |>.toArray
@@ -298,7 +313,7 @@ in-process mutex serialises CLI claims against agent claims. We talk to the
 daemon over the same UNIX socket that `enqueueHandler` uses, sending a
 `claim_issue` request and parsing the structured response. -/
 
-private def daemonClaim (pid : ProjectId) (iid : IssueId) (taskId : String)
+private def daemonClaim (pid : Taxis.IssueId) (iid : Taxis.IssueId) (taskId : String)
     (agent : String) (series : Option String) : IO (Except String Unit) := do
   if !(← Queue.daemonRunning) then
     return .error "queue daemon is not running (start it with 'orchestra queue start')"
@@ -306,8 +321,8 @@ private def daemonClaim (pid : ProjectId) (iid : IssueId) (taskId : String)
   let conn ← Utils.UnixSocket.Connection.connect socketPath
   let req := Lean.Json.mkObj
     [ ("type",       "claim_issue")
-    , ("project_id", Lean.Json.str pid.value)
-    , ("issue_id",   Lean.Json.str iid.value)
+    , ("project_id", Lean.ToJson.toJson pid)
+    , ("issue_id",   Lean.ToJson.toJson iid)
     , ("task_id",    Lean.Json.str taskId)
     , ("agent",      Lean.Json.str agent)
     , match series with
@@ -331,10 +346,15 @@ private def renderTargetStr : RepoTarget → String
 def spawnHandler (p : Parsed) : IO UInt32 := do
   let roleName := p.positionalArg! "role"       |>.as! String
   let pidStr   := p.positionalArg! "project-id" |>.as! String
-  let issueIdFlag : Option IssueId := p.flag? "issue" |>.map (fun v => ⟨v.as! String⟩)
+  let issueIdFlag : Option Taxis.IssueId ← match p.flag? "issue" |>.map (·.as! String) with
+    | none => pure none
+    | some s =>
+      let some iid ← parseIssueIdArg "orchestra spawn" s | return 1
+      pure (some iid)
   let extraInstructions := p.flag? "prompt" |>.map (·.as! String) |>.getD ""
   -- 1. Resolve project + role.
-  let project ← match ← loadProject ⟨pidStr⟩ with
+  let some pid ← parseProjectIdArg "orchestra spawn" pidStr | return 1
+  let project ← match ← loadProject pid with
     | none => IO.eprintln s!"Project '{pidStr}' not found"; return 1
     | some pr => pure pr
   let role ← match ← loadRole project.id roleName with
@@ -351,7 +371,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     | some iid =>
       match ← loadIssue project.id iid with
       | none =>
-        IO.eprintln s!"Issue '{iid.value}' not found in project {project.id.value}"
+        IO.eprintln s!"Issue '{iid.toString}' not found in project {project.id.toString}"
         return 1
       | some i => pure (some i)
   -- 3. Determine pre-claim. Required for the issue to be safely held.
@@ -360,7 +380,9 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     | some _, some d => d.preClaim
     | some _, none   => true   -- default: if user gave --issue, claim it
     | none,   _      => false
-  -- 4. Build the queue entry first (we need its id as the claim's task id).
+  -- 4. Mint the entry's id and resolve its target. The id comes first because the claim below
+  --    records it as the claiming task; the entry it names is built once everything that could
+  --    still fail has succeeded.
   let entryId ← TaskStore.generateId
   let createdAt ← currentIso8601
   let target := mIssue.bind (effectiveTarget project ·)
@@ -368,12 +390,36 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let some target' := target
     | IO.eprintln "Cannot spawn: no effective target (project has no default and issue has no override)"
       return 1
-  let vars := renderVarsFor project mIssue extraInstructions
+  -- 5. Pre-claim if requested. Before both of the steps that follow: claiming ahead of the entry
+  --    means a failed claim leaves no orphan queue entry, and claiming ahead of `resolveFork`
+  --    means it leaves no orphan repository in `default_organization` either.
+  if shouldPreClaim then
+    let some issue := mIssue
+      | IO.eprintln "internal: pre-claim requested without --issue"; return (1 : UInt32)
+    let agent := role.backend.getD "claude"
+    match ← daemonClaim project.id issue.id entryId agent none with
+    | .error msg =>
+      IO.eprintln s!"Pre-claim failed: {msg}"
+      return (1 : UInt32)
+    | .ok () => pure ()
+  -- 6. The agent pushes to `fork`; PRs land in `upstream` (= the target repo). When the App can
+  --    push to the target directly the fork is the target itself, otherwise it is a fork in the
+  --    configured default organisation. Needs `config.json` and a reachable GitHub — a spawn
+  --    whose target is already writable still has to ask before it can know that.
+  let appConfig ← loadAppConfig
+  let some fork ← GitHub.resolveFork appConfig target'.repo
+    | IO.eprintln s!"Cannot spawn: the GitHub App cannot push to {target'.repo} and it could not \
+        be forked (see [fork] logs above; set default_organization to enable forking)"
+      return (1 : UInt32)
+  let comments ← match mIssue with
+    | some i => renderCommentThread i.id
+    | none   => pure none
+  let vars := renderVarsFor project mIssue extraInstructions (comments := comments)
   let prompt := render role.promptTemplate vars
   let entry : Queue.QueueEntry :=
     { id := entryId, createdAt
     , upstream      := target'.repo
-    , fork          := target'.repo
+    , fork
     , mode          := .pr
     , prompt
     , backend       := role.backend
@@ -387,18 +433,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     , projectId     := some project.id
     , issueId       := mIssue.map (·.id)
     , role          := some role.name }
-  -- 5. Pre-claim if requested. We claim *before* writing the entry so a
-  --    failed claim leaves no orphan queue entry.
-  if shouldPreClaim then
-    let some issue := mIssue
-      | IO.eprintln "internal: pre-claim requested without --issue"; return (1 : UInt32)
-    let agent := role.backend.getD "claude"
-    match ← daemonClaim project.id issue.id entryId agent none with
-    | .error msg =>
-      IO.eprintln s!"Pre-claim failed: {msg}"
-      return (1 : UInt32)
-    | .ok () => pure ()
-  -- 6. Persist the entry. The daemon picks it up on its next poll.
+  -- 7. Persist the entry. The daemon picks it up on its next poll.
   Queue.saveEntry entry
   IO.println entryId
   return (0 : UInt32)
@@ -409,10 +444,12 @@ private def renderTriggerStr : RoleTrigger → String
   | .hasOpenIssues     => "has_open_issues"
   | .hasInReviewIssues => "has_in_review_issues"
   | .idle              => "idle"
+  | .always            => "always"
 
 def rolesListHandler (p : Parsed) : IO UInt32 := do
   let pidStr := p.positionalArg! "project-id" |>.as! String
-  let project ← match ← loadProject ⟨pidStr⟩ with
+  let some pid ← parseProjectIdArg "orchestra roles list" pidStr | return 1
+  let project ← match ← loadProject pid with
     | none => IO.eprintln s!"Project '{pidStr}' not found"; return 1
     | some pr => pure pr
   let roles ← loadAllRoles project.id
@@ -445,9 +482,10 @@ def issueContinueHandler (p : Parsed) : IO UInt32 := do
     | some t => pure t
     | none   => IO.eprintln "orchestra issue continue: --prompt is required"; return 1
   -- 1. Locate issue + claim.
-  let some (project, issue) ← findIssue ⟨id⟩
+  let some iid ← parseIssueIdArg "orchestra issue continue" id | return 1
+  let some (project, issue) ← findIssue iid
     | IO.eprintln s!"Issue '{id}' not found"; return 1
-  let some claim ← loadClaim project.id issue.id
+  let some claim ← loadClaim issue.id
     | IO.eprintln s!"Issue '{id}' has no active claim — nothing to continue. \
         Either claim it first or use 'orchestra queue add'."; return 1
   -- 2. Pull repo / backend / model details from the prior task record.
@@ -487,12 +525,13 @@ def issueContinueHandler (p : Parsed) : IO UInt32 := do
 
 def issueCloseHandler (p : Parsed) : IO UInt32 := do
   let id := p.positionalArg! "id" |>.as! String
-  match ← findIssue ⟨id⟩ with
+  let some iid ← parseIssueIdArg "orchestra issue close" id | return (1 : UInt32)
+  match ← findIssue iid with
   | none => IO.eprintln s!"Issue '{id}' not found"; return (1 : UInt32)
   | some (_, i) =>
     let now ← TaskStore.currentIso8601
     saveIssue { i with status := .abandoned, updatedAt := now }
-    IO.println s!"Issue {i.id.value} marked abandoned"
+    IO.println s!"Issue {i.id.toString} marked abandoned"
     return (0 : UInt32)
 
 /-! ## Issue → tasks listing -/
@@ -506,12 +545,13 @@ private def taskStatusToString : TaskStore.TaskStatus → String
 
 def issueTasksHandler (p : Parsed) : IO UInt32 := do
   let id := p.positionalArg! "id" |>.as! String
-  let some (_project, issue) ← findIssue ⟨id⟩
+  let some iid ← parseIssueIdArg "orchestra issue tasks" id | return 1
+  let some (_project, issue) ← findIssue iid
     | IO.eprintln s!"Issue '{id}' not found"; return 1
   let all ← TaskStore.loadAllTasks
   let matching := all.filter (fun r => r.issueId == some issue.id)
   if matching.isEmpty then
-    IO.println s!"No tasks recorded for issue {issue.id.value}."
+    IO.println s!"No tasks recorded for issue {issue.id.toString}."
     return 0
   IO.println s!"{padRight "TASK ID" 18} {padRight "CREATED" 22} {padRight "STATUS" 11} {padRight "ROLE" 16} SERIES"
   IO.println (String.ofList (List.replicate 90 '-'))
@@ -605,7 +645,7 @@ private def issueListCmd : Cmd := `[Cli|
   "List issues in a project."
 
   FLAGS:
-    status : String; "Filter by status: open|claimed|in_review|completed|abandoned"
+    status : String; "Filter by status: open|claimed|completed|abandoned"
 
   ARGS:
     "project-id" : String; "Project ID"

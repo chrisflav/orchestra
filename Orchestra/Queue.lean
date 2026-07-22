@@ -5,7 +5,6 @@ import Orchestra.TaskStore
 open Lean (Json FromJson ToJson)
 
 namespace Orchestra.Queue
-open Orchestra.Project (ProjectId IssueId)
 
 -- Types
 
@@ -101,13 +100,30 @@ structure QueueEntry where
   continuesFrom : Option String := none
   series        : Option String := none
   taskId        : Option String := none
+  /-- Index of the per-repo clone slot this entry ran in, recorded when it is claimed.
+
+      Persisted rather than kept in daemon memory so that a continuation entry can find the
+      workspace its predecessor left behind even across a daemon restart: the successor looks
+      up the entry whose `taskId` it continues from and asks for that same slot. -/
+  slot          : Option Nat    := none
   configPath    : Option String := none
   /-- Maximum spend in USD. Defaults to 4.0 if not set. -/
   budget        : Option Float  := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory        : MemoryMode    := .both
-  /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
+  /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`.
+
+      Written back when the daemon resolves `authSources` at claim time, so the entry records
+      which source actually ran it. -/
   authSource    : Option String := none
+  /-- Candidate authentication sources for this entry, tried according to `authMode`.
+
+      Resolved when the entry is claimed rather than when it is created: an entry may sit pending
+      for hours, and the source that was free when a listener queued it may be exhausted by the
+      time a worker is ready for it. -/
+  authSources   : List String := []
+  /-- How to choose among `authSources`. -/
+  authMode      : AuthMode := .ordered
   /-- Optional tools to enable beyond the always-available ones.
       When absent, allowed tools are derived from `mode` for backwards compatibility. -/
   tools         : Option (List String) := none
@@ -133,9 +149,9 @@ structure QueueEntry where
   issueNumber : Option Nat := none
   /-- Orchestra project this entry belongs to (optional).
       Distinct from `issueNumber` (a GitHub issue number). -/
-  projectId : Option ProjectId := none
+  projectId : Option Taxis.IssueId := none
   /-- Orchestra issue this entry is working on (optional). -/
-  issueId : Option IssueId := none
+  issueId : Option Taxis.IssueId := none
   /-- Optional role name (mirrors `IOTask.role`). Used by the dispatcher to
       count per-role active tasks unambiguously. -/
   role : Option String := none
@@ -171,6 +187,8 @@ instance : ToJson QueueEntry where
     let fields := if let some b := e.budget        then fields ++ [("budget",          ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson e.memory)]
     let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
+    let fields := if !e.authSources.isEmpty        then fields ++ [("auth_sources",    ToJson.toJson e.authSources)] else fields
+    let fields := if e.authMode != .ordered        then fields ++ [("auth_mode",       ToJson.toJson e.authMode)]    else fields
     let fields := if let some t := e.tools         then fields ++ [("tools",           ToJson.toJson t)] else fields
     let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
     let fields := if e.priority != 10              then fields ++ [("priority",         Json.num e.priority)]           else fields
@@ -211,6 +229,8 @@ instance : FromJson QueueEntry where
     let budget        := j.getObjValAs? Float      "budget"  |>.toOption
     let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
     let authSource    := j.getObjValAs? String "auth_source" |>.toOption
+    let authSources   := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
+    let authMode      := j.getObjValAs? AuthMode "auth_mode" |>.toOption |>.getD .ordered
     let tools         := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority       := j.getObjValAs? Nat        "priority"         |>.toOption |>.getD 10
@@ -221,8 +241,8 @@ instance : FromJson QueueEntry where
     let inputJson        := j.getObjVal?   "input_json"          |>.toOption
     let outputJson       := j.getObjVal?   "output_json"         |>.toOption
     let issueNumber := j.getObjValAs? Nat "issue_number" |>.toOption
-    let projectId   := j.getObjValAs? ProjectId "project_id" |>.toOption
-    let issueId     := j.getObjValAs? IssueId   "issue_id"   |>.toOption
+    let projectId   := j.getObjValAs? Taxis.IssueId "project_id" |>.toOption
+    let issueId     := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
     let role         := j.getObjValAs? String    "role"          |>.toOption
     let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
@@ -230,7 +250,7 @@ instance : FromJson QueueEntry where
     let listenerName := j.getObjValAs? String "listener_name"    |>.toOption
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget, memory, authSource, tools, readOnly, priority,
+             budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
              listenerName }
@@ -285,18 +305,159 @@ def loadAllEntries : IO (Array QueueEntry) := do
         result := result.push e
   return result.qsort (fun a b => a.id > b.id)
 
-/-- Return the next pending entry to run.
-    Entries are ordered by priority (higher first), with older entries breaking ties.
-    Returns none if no pending entries exist. -/
-def nextPending : IO (Option QueueEntry) := do
-  let all ← loadAllEntries
-  let pending := all.filter (fun e => e.status == .pending)
-  if pending.isEmpty then return none
-  -- Find the maximum priority
-  let maxPri := pending.foldl (·.max ·.priority) 0
-  -- Among entries with max priority, pick the oldest (last in newest-first array)
-  let maxPriEntries := pending.filter (·.priority == maxPri)
-  return (maxPriEntries.back? |>.filter (·.priority == maxPri))
+/-- Every pending entry that may start now, in the order the daemon should try them.
+
+    `activePerRepo` maps a fork key (owner/name) to the number of tasks currently running on
+    that repository; entries for a repository already at `perRepoLimit` are excluded.
+    Ordering is by priority (higher first), then oldest first — ids are monotonic, so the
+    smaller id is the older entry.
+
+    A list rather than a single entry, because an entry can turn out to be unclaimable for a
+    reason only the caller knows — a continuation whose predecessor's slot is still busy, or a
+    backend that needs the daemon to itself. Returning just the best candidate would let one
+    such entry stall every other repository behind it for as long as its blocker runs. -/
+def pendingCandidates (all : Array QueueEntry) (activePerRepo : Std.HashMap String Nat)
+    (perRepoLimit : Nat) : Array QueueEntry :=
+  let pending := all.filter (fun e =>
+    e.status == .pending &&
+    activePerRepo.getD e.fork.toString 0 < perRepoLimit)
+  pending.qsort (fun a b =>
+    if a.priority != b.priority then a.priority > b.priority else a.id < b.id)
+
+/-- Choose the per-repo clone slot a freshly claimed entry should run in.
+
+    `occupied` are the slot indices currently in use for that repository, `perRepoLimit` is
+    the configured `--parallel-per-repo`, and `preferred` is the slot recorded on the entry
+    this one continues from, if any.
+
+    Returns `(slot, reuseTree)`, where `reuseTree` asks the caller to leave the working tree
+    exactly as the previous task left it, or `none` when the entry cannot start right now and
+    should stay pending.
+
+    The three cases that matter:
+    * A continuation whose predecessor's slot is free goes back to it and keeps the tree.
+      `--resume` restores the conversation but not the filesystem, so anywhere else the agent
+      wakes up to a tree missing every edit its context refers to.
+    * A continuation whose predecessor's slot is busy **waits** rather than taking a fresh one.
+      Starting it elsewhere would silently discard the work it was queued to build on; the
+      occupying task will finish, so waiting cannot deadlock.
+    * A continuation whose recorded slot is beyond the current limit (the daemon was restarted
+      with a smaller `--parallel-per-repo`) falls back to a free slot and resets it, since the
+      tree it wanted is not reachable any more.
+
+    `preferred` means "the predecessor's slot, *and* its tree is still sitting there". The
+    caller is responsible for that second half — see `claimDecision`. Passing a slot whose
+    tree has since been reset by an unrelated task would make this function wait for a
+    workspace that no longer exists. -/
+def chooseSlot (occupied : Array Nat) (perRepoLimit : Nat) (preferred : Option Nat)
+    : Option (Nat × Bool) :=
+  let firstFree := (List.range perRepoLimit).find? (!occupied.contains ·)
+  match preferred with
+  | some p =>
+    if occupied.contains p then none
+    else if p < perRepoLimit then some (p, true)
+    else firstFree.map (·, false)
+  | none => firstFree.map (·, false)
+
+/-- What the auth resolver decided about an entry.
+
+    `wait` is deliberately not a failure: an entry whose only authentication source is out of
+    quota is not broken, it is early. Cancelling it would throw away work that will be perfectly
+    runnable once the window resets, so it stays pending and the daemon moves on to something
+    else. -/
+inductive AuthDecision where
+  /-- Claimable, running on this source (`none` on the legacy config with no named sources). -/
+  | use (label : Option String)
+  /-- Not claimable right now; every candidate source is usage-limited. -/
+  | wait (reason : String)
+deriving Repr, Inhabited
+
+/-- Everything the daemon knows about its own occupancy when it goes to claim an entry.
+
+    Bundled into a structure so that the decision below is an ordinary function of its inputs
+    rather than a closure over the daemon's `IO.Ref`s, which makes the interesting cases —
+    exclusive backends, blocked continuations, per-repo limits — reachable from a test. -/
+structure ClaimContext where
+  /-- Fork key (owner/name) → slot indices currently in use for that repository. -/
+  occupiedSlots : Std.HashMap String (Array Nat)
+  /-- Number of tasks running across all repositories. -/
+  total : Nat
+  /-- Set while a backend that needs the daemon to itself is running. -/
+  exclusiveActive : Bool
+  /-- `--parallel`. -/
+  parallelLimit : Nat
+  /-- `--parallel-per-repo`. -/
+  perRepoLimit : Nat
+  /-- Whether a backend tolerates another task running beside it. Passed in rather than
+      imported: `TaskRunner` depends on this module, so the dependency cannot run the other
+      way, and the queue has no business knowing about agent backends anyway. -/
+  parallelSafe : Option String → Bool
+  /-- Which authentication source an entry may run on right now.
+
+      Passed in for the same reason as `parallelSafe`: the queue has no business knowing about
+      subscriptions, and injecting it keeps the usage-limited cases reachable from a test with
+      no config and no network. Defaults to "always claimable on no particular source", which is
+      what every caller that predates multiple auth sources wants. -/
+  resolveAuth : QueueEntry → IO AuthDecision := fun _ => pure (.use none)
+
+/-- The outcome of a successful claim. -/
+structure Claim where
+  entry : QueueEntry
+  /-- Slot the entry will run in. -/
+  slot : Nat
+  /-- Authentication source resolved for this entry, stamped onto it before it launches.
+
+      Resolved here rather than when the entry was created because an entry can sit pending for
+      hours: the account that was free when a listener queued it may be out of quota by the time
+      a worker picks it up. -/
+  authSource : Option String := none
+  /-- Set when the entry is a continuation that got its predecessor's workspace back, naming
+      that predecessor. The slot must then be left exactly as it was. -/
+  resumeFrom : Option String := none
+
+/-- Pick the entry the daemon should start next, or `none` if nothing can start right now.
+
+    `slotOccupant fork slot` reports which entry's working tree currently sits in a slot. It
+    is consulted for continuations only, and it is what makes resuming safe: a predecessor's
+    slot being *free* does not mean the predecessor's tree is still in it, because slots are
+    pooled and an unrelated task may have taken it and reset it in between. Resuming onto that
+    tree would silently hand the agent someone else's branch and edits while its restored
+    conversation describes work that is gone — so when the occupant does not match, the
+    continuation is treated as an ordinary entry that resets whatever slot it lands in. -/
+def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
+    (slotOccupant : Repository → Nat → IO (Option String)) : IO (Option Claim) := do
+  if ctx.total >= ctx.parallelLimit then return none
+  -- Once a task on a backend that needs the daemon to itself is running, nothing else may
+  -- start alongside it.
+  if ctx.exclusiveActive then return none
+  let counts := ctx.occupiedSlots.fold (fun m k v => m.insert k v.size)
+    ({} : Std.HashMap String Nat)
+  let candidates := pendingCandidates all counts ctx.perRepoLimit
+  for e in candidates do
+    -- A backend that keeps per-run state at a fixed global path only starts when nothing else
+    -- is running. `total == 0` means the daemon is idle.
+    if !ctx.parallelSafe e.backend && ctx.total > 0 then continue
+    -- The predecessor entry, and the slot it recorded — the workspace this entry was queued
+    -- to build on.
+    let predecessor := e.continuesFrom.bind fun tid => all.find? (·.taskId == some tid)
+    let preferred ← match predecessor.bind (fun p => p.slot.map (p.id, ·)) with
+      | none => pure none
+      | some (predId, predSlot) =>
+        -- Confirm the predecessor's tree is still there before asking to wait for its slot.
+        if (← slotOccupant e.fork predSlot) == some predId then pure (some predSlot)
+        else pure none
+    let occupied := ctx.occupiedSlots.getD e.fork.toString #[]
+    let some (slot, reuseTree) := chooseSlot occupied ctx.perRepoLimit preferred | continue
+    -- Last, because it is the only check that can cost a network round trip: an entry ruled out
+    -- by occupancy never reaches the usage monitor.
+    let .use authSource ← ctx.resolveAuth e | continue
+    return some {
+      entry := e
+      slot
+      resumeFrom := if reuseTree then predecessor.map (·.id) else none
+      authSource
+    }
+  return none
 
 /-- Return true if any entry created by `name` is currently pending or running. -/
 def hasActiveEntryForListener (name : String) : IO Bool := do
@@ -320,41 +481,60 @@ def readPid : IO (Option UInt32) := do
 def deletePid : IO Unit :=
   try IO.FS.removeFile (← pidFile) catch _ => pure ()
 
-/-- Return true if a daemon process with the stored PID is still alive. -/
+/-- This process's own PID. -/
+def ownPid : IO UInt32 := do
+  let stat ← IO.FS.readFile (System.FilePath.mk "/proc/self/stat")
+  match stat.splitOn " " with
+  | pid :: _ => return (pid.toNat?.getD 0).toUInt32
+  | _        => return 0
+
+/-- Return true if a daemon process with the stored PID is still alive.
+
+    "The PID is in `/proc`" is not sufficient on its own, for two reasons:
+
+    * **It can be us.** The PID file outlives the process that wrote it, and in a container the
+      daemon is PID 1 — so after a restart the next container's PID 1 is the very process running
+      this check, which would otherwise conclude a daemon is already running and refuse to start,
+      on every restart, forever.
+    * **PIDs are recycled.** A daemon that died without cleaning up leaves a PID that some
+      unrelated process may later take, wedging `queue start` until the file is deleted by hand.
+
+    An unreadable `comm` (hardened `/proc`, different user) is treated as "running": refusing to
+    start is recoverable, whereas two daemons racing on the same queue directory is not. -/
 def daemonRunning : IO Bool := do
   match ← readPid with
   | none => return false
   | some pid =>
-    return ← (System.FilePath.mk s!"/proc/{pid}").pathExists
+    if pid == (← ownPid) then return false
+    if !(← (System.FilePath.mk s!"/proc/{pid}").pathExists) then return false
+    let comm ← try some <$> IO.FS.readFile s!"/proc/{pid}/comm" catch _ => pure none
+    match comm with
+    | none => return true
+    | some c => return c.trimAscii.toString == "orchestra"
 
 -- Cascade cancellation
 
-/-- Normalize backend: treat `none` and `some "claude"` as the same backend. -/
-private def effectiveBackend (backend : Option String) : String :=
-  backend.getD "claude"
+/-- Cancel `id` if it is *still* pending, and report whether it was.
+
+    The re-read is what makes cascade cancellation safe under a parallel daemon. The caller
+    iterates over a snapshot from `loadAllEntries`, and a worker can claim and start any entry in
+    that snapshot while the loop is still running; writing the snapshot's version back would
+    stamp `cancelled` onto an entry that is at that moment executing. -/
+private def cancelIfStillPending (id : String) : IO Bool := do
+  let some cur ← loadEntry id | return false
+  if cur.status != .pending then return false
+  saveEntry { cur with status := .cancelled }
+  return true
 
 /-- Cancel all pending entries that have continuesFrom = taskId, then recurse. -/
 partial def cancelDependents (taskId : String) : IO Unit := do
   let all ← loadAllEntries
   for entry in all do
     if entry.status == .pending && entry.continuesFrom == some taskId then
-      saveEntry { entry with status := .cancelled }
-      -- If this entry already ran and has a taskId, cascade further
-      if let some tid := entry.taskId then
-        cancelDependents tid
-
-/-- Cancel all pending entries with the same backend as the given one, except the
-    entry identified by exceptId (the one that just became unfinished). -/
-def cancelPendingByBackend (backend : Option String) (exceptId : String) : IO Unit := do
-  let target := effectiveBackend backend
-  let all ← loadAllEntries
-  for entry in all do
-    if entry.status == .pending && entry.id != exceptId &&
-       effectiveBackend entry.backend == target then
-      saveEntry { entry with status := .cancelled }
-      -- Cascade from any taskId this cancelled entry had (rare for pending, but safe)
-      if let some tid := entry.taskId then
-        cancelDependents tid
+      if ← cancelIfStillPending entry.id then
+        -- If this entry already ran and has a taskId, cascade further
+        if let some tid := entry.taskId then
+          cancelDependents tid
 
 /-- On daemon startup, mark any entries stuck in 'running' state as unfinished.
     These are left over from a previous daemon that was killed mid-task. -/

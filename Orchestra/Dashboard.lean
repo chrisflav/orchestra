@@ -13,7 +13,7 @@ import Orchestra.Dashboard.Site
 open Lean (Json ToJson)
 open Std.Net
 open Std.Internal.UV.TCP
-open Orchestra.Project (Project Issue IssueStatus ProjectId Claim
+open Orchestra.Project (Project Issue IssueStatus Claim
   loadAllProjects loadProject loadIssues loadClaims)
 
 /-!
@@ -257,7 +257,10 @@ private def sourceSummary : Listener.SourceConfig → (String × String)
   | .shell cmd args                   => ("shell", s!"{cmd} {String.intercalate " " args}")
   | .projectDispatcher pid caps       =>
       let cs := String.intercalate ", " (caps.map (fun (n,c) => s!"{n}={c}"))
-      ("project-dispatcher", s!"project={pid.value} caps=[{cs}]")
+      ("project-dispatcher", s!"project={pid.toString} caps=[{cs}]")
+  | .labelDispatcher label caps       =>
+      let cs := String.intercalate ", " (caps.map (fun (n,c) => s!"{n}={c}"))
+      ("label-dispatcher", s!"label={label} caps=[{cs}]")
   | .githubLabelCount repos labels max kind =>
       let r := String.intercalate ", " (repos.map (·.upstream.toString))
       ("github-label-count", s!"{r} kind={kind} max={max} labels=[{String.intercalate "," labels}]")
@@ -338,26 +341,26 @@ private def tasksApi : IO Json := do
 
 private def issueStText : IssueStatus → String
   | .open      => "open"      | .claimed   => "claimed"
-  | .inReview  => "in_review" | .blocked   => "blocked"
   | .completed => "completed" | .abandoned => "abandoned"
-  | .rejected  => "rejected"
 
-/-- Per-status issue counts plus the total, for a project's issue set. -/
+/-- Per-status issue counts, for a project's issue set. The four statuses here are the
+    whole set taxis backs (`Orchestra/Project/Basic.lean`): "in review", "blocked" and
+    "rejected" are read from the tree and from GitHub rather than stored, so they are not
+    counted here. -/
 private def issueCountsJson (issues : Array Issue) : Json :=
   let n := fun (s : IssueStatus) => (issues.filter (·.status == s)).size
   Json.mkObj [
     ("open",      ToJson.toJson (n .open)),
     ("claimed",   ToJson.toJson (n .claimed)),
-    ("inReview",  ToJson.toJson (n .inReview)),
-    ("blocked",   ToJson.toJson (n .blocked)),
     ("completed", ToJson.toJson (n .completed)),
-    ("abandoned", ToJson.toJson (n .abandoned)),
-    ("rejected",  ToJson.toJson (n .rejected))
+    ("abandoned", ToJson.toJson (n .abandoned))
   ]
 
 private def projectSummaryJson (p : Project) (issues : Array Issue) : Json :=
   Json.mkObj [
-    ("id",            ToJson.toJson p.id),
+    -- Ids are taxis integers; emitted as strings so the front-end can compare them and put
+    -- them in URLs without worrying about numeric coercion.
+    ("id",            Json.str p.id.toString),
     ("name",          p.name),
     ("description",   p.description.getD ""),
     ("createdAt",     p.createdAt),
@@ -371,11 +374,11 @@ private def projectSummaryJson (p : Project) (issues : Array Issue) : Json :=
     dependency edges (both by issue id), and who (if anyone) currently holds it. -/
 private def issueNodeJson (i : Issue) (claim : Option Claim) : Json :=
   Json.mkObj [
-    ("id",           ToJson.toJson i.id),
+    ("id",           Json.str i.id.toString),
     ("title",        i.title),
     ("status",       issueStText i.status),
-    ("parentId",     match i.parentId with | some p => ToJson.toJson p | none => Json.str ""),
-    ("dependencies", Json.arr (i.dependencies.map ToJson.toJson)),
+    ("parentId",     match i.parentId with | some p => Json.str p.toString | none => Json.str ""),
+    ("dependencies", Json.arr (i.dependencies.map (Json.str ·.toString))),
     ("prCount",      ToJson.toJson i.attachedPRs.size),
     ("claimedBy",    match claim with | some c => Json.str c.agent | none => Json.str ""),
     ("updatedAt",    i.updatedAt)
@@ -388,7 +391,9 @@ private def projectsApi : IO Json := do
   return Json.mkObj [("projects", Json.arr rows)]
 
 private def projectDetailApi (id : String) : IO (Option Json) := do
-  let pid : ProjectId := ⟨id⟩
+  -- A taxis id is an integer; anything else is a 404 rather than a lookup, so a stray
+  -- `?id=` in the URL bar can't reach the tracker at all.
+  let some pid := Taxis.IssueId.parse? id | return none
   match ← loadProject pid with
   | none => return none
   | some p =>

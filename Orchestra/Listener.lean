@@ -3,6 +3,7 @@ import Orchestra.Config
 import Orchestra.TaskStore
 import Orchestra.Queue
 import Orchestra.Project
+import Orchestra.GitHub
 
 open Lean (Json FromJson ToJson)
 
@@ -49,7 +50,20 @@ inductive SourceConfig where
       `caps` maps role name → maximum concurrent active tasks of that role.
       Each tick the dispatcher counts active per-role queue entries and emits
       a synthetic event per role that is below its cap and whose trigger holds. -/
-  | projectDispatcher (projectId : Project.ProjectId) (caps : List (String × Nat))
+  | projectDispatcher (projectId : Taxis.IssueId) (caps : List (String × Nat))
+  /-- Auto-dispatch across *every* project: work on any taxis issue in scope for `label`,
+      wherever it lives in the tracker. Same role templates and `caps` semantics as
+      `projectDispatcher`; the difference is only where the issue set and the target come from.
+
+      In scope means the issue *or any ancestor* carries the label, so labelling a project opts
+      its whole subtree in; and only leaves are dispatched, since an issue with children has been
+      decomposed and those children are the work (`Project.dispatchCandidates`).
+
+      With no project behind these issues there is no `defaultTarget` to inherit, so each issue's
+      repository and branch are read off `repository` / `github-branch` artifacts on it or an
+      ancestor (`Project.artifactTarget`). An issue missing either is reported and skipped —
+      dispatching an agent at a guessed repository is worse than not dispatching. -/
+  | labelDispatcher   (label : String) (caps : List (String × Nat))
   /-- Fires whenever the number of open issues or pull requests with the given
       labels on a repository is strictly below `max`.  Emits at most one task per
       tick; the tick is skipped while a task from this listener is already pending
@@ -94,7 +108,12 @@ instance : ToJson SourceConfig where
                     ("args", ToJson.toJson args)]
     | .projectDispatcher pid caps =>
         Json.mkObj [("type", "project-dispatcher"),
-                    ("project_id", Json.str pid.value),
+                    ("project_id", ToJson.toJson pid),
+                    ("caps", Json.mkObj
+                       (caps.map (fun (n, c) => (n, Json.num c))))]
+    | .labelDispatcher label caps =>
+        Json.mkObj [("type", "label-dispatcher"),
+                    ("label", Json.str label),
                     ("caps", Json.mkObj
                        (caps.map (fun (n, c) => (n, Json.num c))))]
     | .githubLabelCount repos labels max kind =>
@@ -147,12 +166,19 @@ instance : FromJson SourceConfig where
         let args  := j.getObjValAs? (List String) "args" |>.toOption |>.getD []
         return .shell cmd args
     | "project-dispatcher" =>
-        let pid  ← j.getObjValAs? String "project_id"
+        let pid  ← j.getObjValAs? Taxis.IssueId "project_id"
         let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
         let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
         let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
           v.getNat?.toOption.map (k, ·)
-        return .projectDispatcher ⟨pid⟩ caps
+        return .projectDispatcher pid caps
+    | "label-dispatcher" =>
+        let label ← j.getObjValAs? String "label"
+        let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
+        let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
+        let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
+          v.getNat?.toOption.map (k, ·)
+        return .labelDispatcher label caps
     | "github-label-count" =>
         let repos  ← parseRepos j
         let labels  := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
@@ -189,6 +215,14 @@ structure ActionConfig where
   memory         : MemoryMode    := .both
   /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
   authSource     : Option String := none
+  /-- Candidate authentication sources for tasks this listener queues, tried per `authMode`.
+
+      A listener firing repeatedly is exactly the case multiple sources exist for: it can keep
+      producing work after one account's weekly window closes. Which source each task lands on is
+      decided when the daemon claims it, not here. -/
+  authSources    : List String := []
+  /-- How to choose among `authSources`: `"ordered"` (default) or `"distribute"`. -/
+  authMode       : AuthMode := .ordered
   /-- Optional tools to enable beyond the always-available ones.
       When absent, allowed tools are derived from `mode` for backwards compatibility. -/
   tools          : Option (List String) := none
@@ -224,6 +258,8 @@ instance : ToJson ActionConfig where
     let fields := if let some b := a.budget       then fields ++ [("budget",        ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson a.memory)]
     let fields := if let some s := a.authSource   then fields ++ [("auth_source",   Json.str s)]      else fields
+    let fields := if !a.authSources.isEmpty       then fields ++ [("auth_sources",  ToJson.toJson a.authSources)] else fields
+    let fields := if a.authMode != .ordered       then fields ++ [("auth_mode",     ToJson.toJson a.authMode)]    else fields
     let fields := if let some t := a.tools        then fields ++ [("tools",         ToJson.toJson t)] else fields
     let fields := if a.readOnly                   then fields ++ [("read_only",      Json.bool true)]  else fields
     let fields := if a.priority != 10             then fields ++ [("priority",        Json.num a.priority)] else fields
@@ -254,6 +290,8 @@ instance : FromJson ActionConfig where
       | _ => none
     let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
+    let authSources := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
+    let authMode := j.getObjValAs? AuthMode "auth_mode" |>.toOption |>.getD .ordered
     let tools := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority     := j.getObjValAs? Nat    "priority"      |>.toOption |>.getD 10
@@ -261,8 +299,8 @@ instance : FromJson ActionConfig where
     let issueNumber  := j.getObjValAs? String "issue_number"  |>.toOption
     let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, tools, readOnly, priority, workflowPath, issueNumber,
-             prLabels }
+             budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
+             workflowPath, issueNumber, prLabels }
 
 -- Listener config
 
@@ -418,6 +456,8 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
     budget       := action.budget
     memory       := action.memory
     authSource   := action.authSource
+    authSources  := action.authSources
+    authMode     := action.authMode
     tools        := action.tools
     readOnly     := action.readOnly
     priority     := action.priority
@@ -481,8 +521,17 @@ structure DispatcherInput where
   /-- Currently active queue entries (status pending|running) for this project,
       grouped by role name. Only roles that appear in `caps` need to be counted. -/
   activeByRole : Std.HashMap String Nat := {}
-  /-- Issues for the project. Used to evaluate role triggers. -/
+  /-- Issues a worker may be dispatched onto: already narrowed by `Project.workableIssues` /
+      `Project.dispatchCandidates` to those that are open with no open children and no open
+      dependencies. The narrowing happens in the caller because it needs the state of issues that
+      are *not* workable — children and dependencies that have closed — which this set by
+      definition does not contain. -/
   issues       : Array Project.Issue
+  /-- Issues awaiting review: open, with an unmerged pull request attached. Kept separate from
+      `issues` because the two sets differ — a container with children is not work, but it can
+      still have a pull request of its own that needs reviewing, and merge state is resolved by
+      the caller since it costs a GitHub call. -/
+  reviewable   : Array Project.Issue := #[]
   /-- Caps from the listener config: role name → maximum concurrent. -/
   caps         : List (String × Nat)
   /-- Roles available for this project (project files override globals).
@@ -493,61 +542,282 @@ structure DispatcherInput where
     trigger is `hasOpenIssues` and we picked a specific issue to bind to. -/
 structure RoleSpawn where
   roleName : String
-  issueId  : Option Project.IssueId := none
+  issueId  : Option Taxis.IssueId := none
 deriving Repr, Inhabited
 
-/-- Pure decision logic. Spawns at most one of each role per tick to avoid
-    bursts; if you want N at once across consecutive ticks, set the cap and
-    the dispatcher will fill up gradually. -/
-def dispatcherTick (input : DispatcherInput) : Array RoleSpawn := Id.run do
-  let mut spawns : Array RoleSpawn := #[]
+/-- Why a role was or was not dispatched this tick. Carried out of the decision logic rather than
+    logged inside it, so the reasoning is available to the caller without making the decision
+    impure — and so the log lines and the behaviour cannot drift apart. -/
+inductive DispatchOutcome where
+  /-- Dispatched, bound to this issue when the trigger picks one. -/
+  | spawn (issueId : Option Taxis.IssueId)
+  /-- No cap configured for the role, or it is zero, so auto-dispatch is off. -/
+  | notEnabled
+  /-- At or over the configured cap. -/
+  | atCap (active cap : Nat)
+  /-- The listener names a role that no role file defines. -/
+  | roleMissing
+  /-- The role file has no `dispatch` block, so it is manual-spawn only. -/
+  | noDispatchPolicy
+  /-- Trigger is `has_open_issues`, but nothing is workable — or everything workable was already
+      taken by another role this tick. -/
+  | noWorkableIssue (workable alreadyTaken : Nat)
+  /-- Trigger is `has_in_review_issues`, but nothing is awaiting review. -/
+  | nothingToReview
+  /-- Trigger is `idle`, but there is still work or review outstanding. -/
+  | notIdle (workable reviewable : Nat)
+deriving Repr, Inhabited
+
+structure RoleDecision where
+  roleName : String
+  trigger  : Option Project.RoleTrigger
+  outcome  : DispatchOutcome
+deriving Repr, Inhabited
+
+private def triggerName : Project.RoleTrigger → String
+  | .hasOpenIssues     => "has_open_issues"
+  | .hasInReviewIssues => "has_in_review_issues"
+  | .idle              => "idle"
+  | .always            => "always"
+
+/-- One log line explaining what was checked for a role and what was decided. -/
+def renderDecision (d : RoleDecision) : String :=
+  let trig := d.trigger.map (fun t => s!" ({triggerName t})") |>.getD ""
+  let verdict := match d.outcome with
+    | .spawn (some iid) => s!"DISPATCH, bound to issue {iid.toString}"
+    | .spawn none       => "DISPATCH (no issue bound)"
+    | .notEnabled       => "skip: no cap configured for this role (auto-dispatch is opt-in)"
+    | .atCap active cap => s!"skip: {active} active, cap {cap}"
+    | .roleMissing      => "skip: named in caps but no role file defines it"
+    | .noDispatchPolicy => "skip: role has no dispatch policy, so it is manual-spawn only"
+    | .noWorkableIssue workable taken =>
+        s!"skip: no workable issue ({workable} workable, {taken} already taken this tick)"
+    | .nothingToReview  => "skip: nothing awaiting review"
+    | .notIdle workable reviewable =>
+        s!"skip: not idle ({workable} workable, {reviewable} awaiting review)"
+  s!"  role '{d.roleName}'{trig}: {verdict}"
+
+/-- Pure decision logic, reporting a verdict for every role the listener names. Spawns at most one
+    of each role per tick to avoid bursts; if you want N at once across consecutive ticks, set the
+    cap and the dispatcher will fill up gradually. -/
+def dispatcherDecisions (input : DispatcherInput) : Array RoleDecision := Id.run do
+  let mut decisions : Array RoleDecision := #[]
+  let mut taken : Array String := #[]
   for (roleName, cap) in input.caps do
-    if cap == 0 then continue
+    let role? := input.roles.find? (·.name == roleName)
+    let trigger := role?.bind (·.dispatch.map (·.trigger))
+    let record (o : DispatchOutcome) : RoleDecision := { roleName, trigger, outcome := o }
+    if cap == 0 then
+      decisions := decisions.push (record .notEnabled); continue
+    let some role := role? | decisions := decisions.push (record .roleMissing); continue
+    let some dispatch := role.dispatch
+      | decisions := decisions.push (record .noDispatchPolicy); continue
     let active := input.activeByRole.getD roleName 0
-    if active >= cap then continue
-    let some role := input.roles.find? (·.name == roleName) | continue
-    let some dispatch := role.dispatch | continue
+    if active >= cap then
+      decisions := decisions.push (record (.atCap active cap)); continue
     match dispatch.trigger with
     | .hasOpenIssues =>
-      -- Pick the first open issue not already in `spawns` (so we don't try
-      -- to spawn two workers for the same issue in one tick).
-      -- Skip issues whose dependencies are not yet all completed.
-      let alreadyTargeted : Array String := spawns.filterMap fun s => s.issueId.map (·.value)
-      let completedIds : Array String := input.issues.filterMap fun i =>
-        if i.status == .completed then some i.id.value else none
-      let some issue := input.issues.find? (fun i =>
-        i.status == .open &&
-        !alreadyTargeted.contains i.id.value &&
-        i.dependencies.all (fun dep => completedIds.contains dep.value))
-        | continue
-      spawns := spawns.push { roleName, issueId := some issue.id }
+      -- Everything in `issues` is already workable, so the only thing left to avoid is spawning
+      -- two workers onto the same issue in one tick.
+      match input.issues.find? (fun i => !taken.contains i.id.toString) with
+      | none =>
+        decisions := decisions.push
+          (record (.noWorkableIssue input.issues.size taken.size))
+      | some issue =>
+        taken := taken.push issue.id.toString
+        decisions := decisions.push (record (.spawn (some issue.id)))
     | .hasInReviewIssues =>
-      if input.issues.any (·.status == .inReview) then
-        spawns := spawns.push { roleName }
+      -- Bound to the issue being reviewed, like `hasOpenIssues` binds the one being worked. Safe
+      -- for the claim protocol because reviewer roles set `pre_claim: false`; nothing claims it.
+      -- Drawn from `reviewable` rather than `issues`, so a container with a pull request of its
+      -- own still gets reviewed even though no worker would be dispatched onto it.
+      match input.reviewable.find? (fun i => !taken.contains i.id.toString) with
+      | none => decisions := decisions.push (record .nothingToReview)
+      | some issue =>
+        taken := taken.push issue.id.toString
+        decisions := decisions.push (record (.spawn (some issue.id)))
     | .idle =>
-      let hasOpen     := input.issues.any (·.status == .open)
-      let hasInReview := input.issues.any (·.status == .inReview)
-      if !hasOpen && !hasInReview then
-        spawns := spawns.push { roleName }
-  return spawns
+      if input.issues.isEmpty && input.reviewable.isEmpty then
+        decisions := decisions.push (record (.spawn none))
+      else
+        decisions := decisions.push
+          (record (.notIdle input.issues.size input.reviewable.size))
+    | .always =>
+      -- Unbound on purpose, so nothing is added to `taken`: this role picks its own work and
+      -- claims it through the daemon's claim manager, which is what keeps two of them off the
+      -- same issue. The dispatcher has no issue to reserve on its behalf and no reason to keep
+      -- one out of another role's set — see `splitForDispatch`, which this trigger bypasses.
+      decisions := decisions.push (record (.spawn none))
+  return decisions
+
+/-- The spawns among `dispatcherDecisions`. -/
+def dispatcherTick (input : DispatcherInput) : Array RoleSpawn :=
+  (dispatcherDecisions input).filterMap fun d =>
+    match d.outcome with
+    | .spawn issueId => some { roleName := d.roleName, issueId }
+    | _ => none
+
+/-! ### Bound and unbound roles in one `caps` block
+
+The label-dispatcher places issue-bound roles and `always` roles by different rules — the former
+per issue, the latter per labelled root — so a single `caps` block has to be split before either
+can be counted. Both halves are pure so the cap arithmetic, which is what stops a runaway, can be
+tested without a tracker. -/
+
+/-- Partition `caps` into (issue-bound roles, unbound `always` roles). A capped name that no role
+    defines stays on the bound side, where `dispatcherDecisions` reports it as `roleMissing`
+    rather than dropping it silently. -/
+def splitCapsByBinding (roles : Array Project.Role) (caps : List (String × Nat)) :
+    List (String × Nat) × List (String × Nat) :=
+  let isUnbound (roleName : String) : Bool :=
+    match (roles.find? (·.name == roleName)).bind (·.dispatch) with
+    | some d => d.trigger == .always
+    | none   => false
+  (caps.filter (fun (n, _) => !isUnbound n), caps.filter (fun (n, _) => isUnbound n))
+
+/-- Per-role tally of the active unbound entries scoped to `root`.
+
+    Counts entries with **no** `issueId` and `projectId == root`, which is exactly how
+    `buildRoleEntry` stamps an unbound spawn. The issue-bound tally cannot be reused: it keys on
+    `issueId` being in the labelled set, so every unbound entry falls through it, leaving the
+    role's cap permanently unreached and spawning a fresh one on every single tick. -/
+def unboundActiveByRole (entries : Array Queue.QueueEntry) (root : Taxis.IssueId) :
+    Std.HashMap String Nat := Id.run do
+  let mut active : Std.HashMap String Nat := {}
+  for e in entries do
+    if !(e.status == .pending || e.status == .running) then continue
+    if e.issueId.isSome then continue
+    if e.projectId != some root then continue
+    if let some r := e.role then
+      active := active.insert r ((active.getD r 0) + 1)
+  return active
+
+/-! ## Review routing
+
+An open issue carrying a pull request belongs to exactly one role, and which one is derived
+rather than stored. Before the taxis migration an `.inReview` status kept the reviewer's set and
+the implementor's set apart by construction; the migration made "awaiting review" derived
+(`classifyReview` below) but left `Project.workableIssues` filtering on bare `.open`, so the two
+sets silently started to overlap. Whichever role a dispatcher happens to evaluate first — which
+is alphabetical, since `caps` is parsed from a sorted `Json.obj` — then takes the issue and the
+other never sees it. `splitForDispatch` is what re-establishes the split. -/
+
+/-- What has to happen next on an open issue that carries pull requests, and therefore which
+    role should pick it up. -/
+inductive ReviewDisposition where
+  /-- An unmerged pull request with no outstanding change request: a reviewer decides. -/
+  | awaitingReview
+  /-- The latest review verdict asked for changes, so the ball is back with an implementor.
+      Deliberately *not* reviewable: sending it to a reviewer again would loop it between
+      reviewers forever while the requested changes were never made. -/
+  | changesRequested
+  /-- Every attached pull request has landed. Merging is not completing — that is a separate
+      `decide_issue complete` call — so this is still a reviewer's move, not an implementor's.
+      Leaving it out of both sets is what let a merged issue fall back to an implementor and be
+      worked a second time. -/
+  | merged
+deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- The disposition implied by the two facts that cost a network call to establish. Pure, so the
+    routing table is testable without GitHub or taxis. -/
+def dispositionOf (anyUnmerged requestsChanges : Bool) : ReviewDisposition :=
+  if !anyUnmerged then .merged
+  else if requestsChanges then .changesRequested
+  else .awaitingReview
+
+/-- Whether the most recent review verdict on `iid` asked for changes.
+
+    taxis returns comments ordered by id, so the last one carrying a verdict is the current one;
+    a plain comment posted afterwards does not clear a rejection, only a later verdict does.
+    Answers `false` when the thread cannot be read, which routes the issue to a reviewer — the
+    same direction `isPrMerged` fails in, and the one that cannot silently drop work. -/
+def latestReviewRequestsChanges (iid : Taxis.IssueId) : IO Bool := do
+  try
+    let comments ← Project.loadComments iid
+    return (comments.filterMap (·.review)).back? == some .requestChanges
+  catch _ => return false
+
+/-- Classify those of `issues` (whose `attachedPRs` must already be populated) that carry a pull
+    request. Issues without one are absent from the result: nothing about review applies to them,
+    and they are an implementor's on the structural test alone.
+
+    Costs a GitHub call per pull request and a taxis call per issue per tick, which is why this
+    lives here rather than in the pure selection. `isPrMerged` answers `false` when it cannot
+    tell, so an unreachable GitHub queues a reviewer that finds nothing to do rather than
+    silently dropping review of real work. -/
+def classifyReview (ghToken : String) (issues : Array Project.Issue) :
+    IO (Array (Project.Issue × ReviewDisposition)) := do
+  let mut out : Array (Project.Issue × ReviewDisposition) := #[]
+  for i in issues do
+    if i.status != .open || i.attachedPRs.isEmpty then continue
+    let mut anyUnmerged := false
+    for pr in i.attachedPRs do
+      unless anyUnmerged do
+        unless ← GitHub.isPrMerged ghToken pr.repo pr.number do anyUnmerged := true
+    let requestsChanges ← if anyUnmerged then latestReviewRequestsChanges i.id else pure false
+    out := out.push (i, dispositionOf anyUnmerged requestsChanges)
+  return out
+
+/-- Split the dispatcher's two candidate sets so that no issue is offered to both roles.
+
+    `structuralWorkable` is what `Project.workableIssues` (or the label dispatcher's `work` set)
+    produced knowing only the issue tree — open, no open children, nothing blocking. `classified`
+    adds what only a network call can say. An issue a reviewer owns is removed from the
+    implementor's set; one sent back for changes stays there, which is the whole point of
+    distinguishing it. -/
+def splitForDispatch (structuralWorkable : Array Project.Issue)
+    (classified : Array (Project.Issue × ReviewDisposition)) :
+    Array Project.Issue × Array Project.Issue :=
+  let reviewable := classified.filterMap fun (i, d) =>
+    match d with
+    | .awaitingReview | .merged => some i
+    | .changesRequested         => none
+  let reviewableIds := reviewable.map (·.id.val)
+  let workable := structuralWorkable.filter (fun i => !reviewableIds.contains i.id.val)
+  (workable, reviewable)
+
+/-- Re-fetch `issues` with their attached pull requests. `Project.loadIssues` leaves `attachedPRs`
+    empty for speed, so the review path has to ask for detail; only open issues are worth it. -/
+def withAttachedPRs (pid : Taxis.IssueId) (issues : Array Project.Issue) :
+    IO (Array Project.Issue) := do
+  let mut out : Array Project.Issue := #[]
+  for i in issues do
+    if i.status != .open then continue
+    if let some full ← Project.loadIssue pid i.id then out := out.push full
+  return out
 
 /-- Build a queue entry for a role spawn. Returns `none` if the role refers
     to a missing target (multi-org project where neither the role's bound
-    issue nor the project default sets one). -/
-def buildRoleEntry (project : Project.Project) (role : Project.Role)
-    (issue? : Option Project.Issue) (instructions : String := "") :
+    issue nor the project default sets one).
+
+    `targetOverride` is used by the project-independent dispatcher, whose target comes from taxis
+    artifacts rather than from the project or the issue's own override — see
+    `Project.artifactTarget`. It wins over both; `none` keeps the ordinary resolution. -/
+def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : Project.Role)
+    (issue? : Option Project.Issue) (instructions : String := "")
+    (targetOverride : Option Project.RepoTarget := none) :
     IO (Option Queue.QueueEntry) := do
-  let target := issue?.bind (Project.effectiveTarget project ·)
+  let target := targetOverride
+            <|> issue?.bind (Project.effectiveTarget project ·)
             <|> project.defaultTarget
   let some target' := target | return none
+  -- The agent pushes to `fork`; PRs land in `upstream` (= the target repo). When the App can push
+  -- to the target directly the fork is the target itself, otherwise it is a fork in the configured
+  -- default organisation. `none` means the task cannot be dispatched (nothing writable to push to).
+  let some fork ← GitHub.resolveFork appConfig target'.repo | return none
   let id ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
-  let vars   := Project.renderVarsFor project issue? instructions
+  -- One extra fetch per dispatch (not per tick) so the thread lands in the prompt: a worker
+  -- picking up a rejected issue would otherwise have to know to ask for it.
+  let comments ← match issue? with
+    | some i => Project.renderCommentThread i.id
+    | none   => pure none
+  let vars   := Project.renderVarsFor project issue? instructions targetOverride comments
   let prompt := Project.render role.promptTemplate vars
   return some
     { id, createdAt
     , upstream      := target'.repo
-    , fork          := target'.repo
+    , fork
     , mode          := .pr
     , prompt
     , backend       := role.backend
@@ -795,7 +1065,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
 
   | .projectDispatcher pid caps => do
     let some _project ← Project.loadProject pid
-      | IO.eprintln s!"[dispatcher] project {pid.value} not found; skipping"; return (#[], none)
+      | IO.eprintln s!"[dispatcher] project {pid.toString} not found; skipping"; return (#[], none)
     let issues ← Project.loadIssues pid
     let roles  ← Project.loadAllRoles pid
     -- Count active per-role queue entries scoped to this project.
@@ -807,15 +1077,130 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       if e.projectId != some pid then continue
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
-    let spawns := dispatcherTick { activeByRole := active, issues, caps, roles }
+    let classified ← classifyReview ghToken (← withAttachedPRs pid issues)
+    -- Narrowed here, where every issue in the project is in hand: whether a child or dependency
+    -- has closed cannot be told from the workable set itself. The review split then takes the
+    -- reviewer's issues back out of it, so no issue is offered to two roles in one tick.
+    let (workable, reviewable) := splitForDispatch (Project.workableIssues issues) classified
+    let reworking := classified.filter (·.2 == .changesRequested) |>.size
+    IO.println s!"[dispatcher] project {pid.toString}: {issues.size} issues, \
+      {workable.size} workable (of which {reworking} sent back for changes), \
+      {reviewable.size} awaiting review; roles available: \
+      {String.intercalate ", " (roles.map (·.name)).toList}"
+    let input : DispatcherInput :=
+      { activeByRole := active, issues := workable, reviewable, caps, roles }
+    let decisions := dispatcherDecisions input
+    if decisions.isEmpty then
+      IO.println "[dispatcher] no roles named in caps, so nothing to check"
+    for d in decisions do
+      IO.println s!"[dispatcher] {renderDecision d}"
+    let spawns := dispatcherTick input
     -- Emit synthetic events. eventId is empty so the listener-state dedup
     -- doesn't accumulate (each tick is fresh; the cap is the dedup mechanism).
     return (spawns.map fun s =>
       let baseVars : List (String × String) := [("role_name", s.roleName)]
       let vars := match s.issueId with
-        | some iid => baseVars ++ [("issue_id", iid.value)]
+        | some iid => baseVars ++ [("issue_id", iid.toString)]
         | none     => baseVars
       ("", vars), none)
+
+  | .labelDispatcher label caps => do
+    let some sets ← Project.issuesWithLabel label
+      | IO.eprintln s!"[dispatcher] label '{label}' does not exist on the taxis instance; \
+          skipping"; return (#[], none)
+    let gaps := sets.gaps
+    -- Report unroutable issues every tick rather than once: the fix is to attach an artifact in
+    -- taxis, and a line that scrolled past on daemon start is not going to prompt that.
+    for (iid, gap) in gaps do
+      match gap with
+      | .noRepository =>
+        IO.eprintln s!"[dispatcher] issue {iid.toString} is in scope for '{label}' but has no \
+          repository artifact on it or any ancestor; skipping"
+      | .noBranch repo =>
+        IO.eprintln s!"[dispatcher] issue {iid.toString} is in scope for '{label}' and \
+          resolves to {repo} but has no github-branch artifact on it or any ancestor; skipping"
+    let issues := sets.work.map (·.1)
+    -- What happens next to an issue carrying a PR needs a GitHub call per PR and a taxis call
+    -- per issue, so it is settled here rather than in the selection. `issuesWithLabel` builds
+    -- `work` and `reviewable` from two independent tests, so an issue that is both a dispatch
+    -- candidate and carries a PR appears in both; the split below is what keeps one role from
+    -- taking it out from under the other.
+    let classified ← classifyReview ghToken (sets.reviewable.map (·.1))
+    let (issues, reviewable) := splitForDispatch issues classified
+    let reworking := classified.filter (·.2 == .changesRequested) |>.size
+    let roles ← Project.loadGlobalRoles
+    IO.println s!"[dispatcher] label '{label}': {issues.size} workable \
+      (of which {reworking} sent back for changes), {sets.reviewable.size} with a PR attached \
+      of which {reviewable.size} await a reviewer, \
+      {gaps.size} skipped for want of a target; roles available: \
+      {String.intercalate ", " (roles.map (·.name)).toList}"
+    -- Roles that bind an issue and roles that don't are dispatched by different rules here, so
+    -- they are counted and decided separately. An `always` role has no issue to bind, so it is
+    -- scoped to a labelled root instead (one spawn set per root) — see below.
+    let (boundCaps, unboundCaps) := splitCapsByBinding roles caps
+    -- Cap counting is scoped to the labelled set, so the caps bound concurrent work *on labelled
+    -- issues* rather than colliding with per-project dispatchers running the same role names.
+    let labelled : Array Taxis.IssueId := issues.map (·.id) ++ reviewable.map (·.id)
+    let allEntries ← Queue.loadAllEntries
+    let activeEntries := allEntries.filter fun e => e.status == .pending || e.status == .running
+    let mut active : Std.HashMap String Nat := {}
+    for e in activeEntries do
+      let some eIid := e.issueId | continue
+      if !labelled.contains eIid then continue
+      if let some r := e.role then
+        active := active.insert r ((active.getD r 0) + 1)
+    let input : DispatcherInput :=
+      { activeByRole := active, issues, reviewable, caps := boundCaps, roles }
+    let decisions := dispatcherDecisions input
+    if decisions.isEmpty then
+      IO.println "[dispatcher] no roles named in caps, so nothing to check"
+    for d in decisions do
+      IO.println s!"[dispatcher] {renderDecision d}"
+    let spawns := dispatcherTick input
+    -- Report rather than silently drop: an entry's repository and branch come from the issue's
+    -- own artifacts, so a role that binds no issue has no target here — unless it is `always`,
+    -- which is scoped to a labelled root below and never reaches this loop. `idle` roles
+    -- (planners) still cannot run here: they bind nothing *and* have no root to stand in for it.
+    for s in spawns do
+      if s.issueId.isNone then
+        IO.eprintln s!"[dispatcher] role '{s.roleName}' was due but binds to no issue, and this \
+          dispatcher takes its target from the issue; not dispatched. Use a project-dispatcher \
+          for roles with the 'idle' trigger, or the 'always' trigger to run one per labelled root."
+    let boundEvents := spawns.filterMap fun s =>
+      match s.issueId with
+      | none => none
+      | some iid =>
+        match (sets.work ++ sets.reviewable).find? (fun (i, _) => i.id == iid) with
+        | none => none
+        | some (issue, target) =>
+          some ("", [ ("role_name",     s.roleName)
+                    , ("issue_id",      iid.toString)
+                    , ("project_id",    issue.projectId.toString)
+                    , ("target_repo",   target.repo.toString)
+                    , ("target_branch", target.branch) ])
+    -- Unbound roles, one decision set per labelled root. The root is the scope: it supplies the
+    -- target and stands in as the project, and its own id is what the cap is counted against —
+    -- the tally above keys on `issueId`, which an unbound entry does not have, so counting these
+    -- there would leave their cap permanently unreached and spawn one every tick.
+    let mut unboundEvents : Array (String × List (String × String)) := #[]
+    if !unboundCaps.isEmpty then
+      if sets.roots.isEmpty then
+        IO.eprintln s!"[dispatcher] label '{label}' has unbound roles configured \
+          ({String.intercalate ", " (unboundCaps.map (·.1))}) but no open issue carries the label \
+          directly, so there is no root to scope them to; not dispatched"
+      for (root, target) in sets.roots do
+        let rootInput : DispatcherInput :=
+          { activeByRole := unboundActiveByRole allEntries root.id
+          , issues := #[], reviewable := #[], caps := unboundCaps, roles }
+        for d in dispatcherDecisions rootInput do
+          IO.println s!"[dispatcher] root {root.id.toString} \"{root.title}\": {renderDecision d}"
+        for s in dispatcherTick rootInput do
+          unboundEvents := unboundEvents.push
+            ("", [ ("role_name",     s.roleName)
+                 , ("project_id",    root.id.toString)
+                 , ("target_repo",   target.repo.toString)
+                 , ("target_branch", target.branch) ])
+    return (boundEvents ++ unboundEvents, none)
 
   | .githubLabelCount repos labels max kind => do
     let mut allEvents : Array (String × List (String × String)) := #[]

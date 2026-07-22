@@ -1,0 +1,62 @@
+name: orchestra
+
+services:
+  orchestra:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: orchestra:latest
+    restart: unless-stopped
+    # `docker compose stop` sends SIGTERM to the daemon (PID 1 in this image), which orchestra
+    # catches and treats as "finish the tasks already running, then exit" — the same drain as
+    # `orchestra queue shutdown`. Docker's default 10s grace period would SIGKILL it long before
+    # an agent task is done, killing the task mid-run and leaving its entry stuck in `running`,
+    # so allow for a realistic task instead. Nothing waits out the full period: the daemon exits
+    # as soon as the last in-flight task lands. A second SIGTERM (stop again, or Ctrl-C twice in
+    # the foreground) cancels the running tasks rather than waiting for them.
+    stop_grace_period: ${ORCHESTRA_STOP_GRACE_PERIOD:-30m}
+    environment:
+      # taxis instance backing projects/issues/claims. Required — every project, issue and claim
+      # operation fails without it. This compose file expects taxis to be running elsewhere; point
+      # the URL at it. If taxis runs in its own compose project on the same host, use its
+      # container name plus a shared network, or the host gateway (see docker/README.md).
+      # (Left unset-tolerant so `docker compose build` works without a .env; the entrypoint fails
+      # with a clear message at start-up if it's still empty and no config.json is mounted.)
+      ORCHESTRA_TAXIS_URL: ${ORCHESTRA_TAXIS_URL:-}
+      ORCHESTRA_TAXIS_TOKEN: ${ORCHESTRA_TAXIS_TOKEN:-}
+      # GitHub auth: a PAT is the simple path; the GitHub App fields are the alternative and need
+      # the private key mounted at the path given.
+      ORCHESTRA_GITHUB_PAT: ${ORCHESTRA_GITHUB_PAT:-}
+      ORCHESTRA_GITHUB_APP_ID: ${ORCHESTRA_GITHUB_APP_ID:-0}
+      # Path *inside* the container — i.e. under /secrets, see the volume below. Left empty by
+      # default so PAT users get no spurious "key missing" warning at start-up.
+      ORCHESTRA_GITHUB_PRIVATE_KEY_PATH: ${ORCHESTRA_GITHUB_PRIVATE_KEY_PATH:-}
+      # Agent auth: one of these, depending on how you authenticate Claude.
+      ORCHESTRA_CLAUDE_TOKEN: ${ORCHESTRA_CLAUDE_TOKEN:-}
+      ORCHESTRA_ANTHROPIC_API_KEY: ${ORCHESTRA_ANTHROPIC_API_KEY:-}
+    # Upstream resolvers, when the host's own are unusable from a container — see
+    # docker/README.md's "error connecting to api.github.com". Empty (the default) changes
+    # nothing.
+    dns: ${ORCHESTRA_DNS:-}
+
+    # No seccomp/apparmor relaxation here on purpose: orchestra sandboxes every agent with landrun
+    # (Landlock), and that was verified to work under Docker's *default* seccomp profile — the
+    # landlock_* syscalls are allowlisted in current versions. If you are on an older Docker where
+    # they aren't, the entrypoint says so at start-up; see docker/README.md before reaching for
+    # `security_opt: [seccomp=unconfined]`, which is a much bigger hammer than the problem needs.
+    volumes:
+      # Plain host directories rather than named volumes, so config and state are inspectable and
+      # editable without `docker cp`. All three are gitignored. Docker creates them on first `up`
+      # (as root); the entrypoint takes ownership before dropping to the `orchestra` user.
+      #
+      # ./config/orchestra/config.json is generated on first start from the environment above.
+      # Edit it in place afterwards — it is then used as-is and the environment is ignored. The
+      # same directory holds listeners/, roles/, prompts/ and secrets.json.
+      - ./config:/config
+      # Task history, queue state, cloned repos, per-project roles.
+      - ./data:/data
+      # GitHub App private key and anything else secret. Mounted read-only, and as a *directory*
+      # rather than naming the .pem directly: Docker silently creates a directory in place of a
+      # missing bind-mounted file, which would surface later as a confusing openssl error.
+      # Drop your key in ./secrets/ and set ORCHESTRA_GITHUB_PRIVATE_KEY_PATH to its path here.
+      - ${ORCHESTRA_SECRETS_DIR:-./secrets}:/secrets:ro

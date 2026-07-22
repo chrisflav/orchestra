@@ -28,9 +28,9 @@
     running: "br", pending: "bp",
     done: "bd", completed: "bd",
     failed: "bf", rejected: "bf",
-    cancelled: "bc", unfinished: "bc", abandoned: "bc", blocked: "bc",
+    cancelled: "bc", unfinished: "bc", abandoned: "bc",
     // issue statuses
-    open: "bo", claimed: "bp", in_review: "br",
+    open: "bo", claimed: "bp",
   };
   function badge(s) {
     const cls = BADGE_CLS[s] || "bo";
@@ -339,20 +339,19 @@
   pages.projects = (d) => {
     const rows = (d.projects || []).map((p) => {
       const c = p.counts || {};
-      const active = (c.open || 0) + (c.claimed || 0) + (c.inReview || 0);
       return `
         <tr>
           <td>${link("project/?id=" +p.id, p.name || p.id)}</td>
           <td class="m mono trunc">${E(p.id)}</td>
           <td>${E(p.issueCount)}</td>
-          <td>${active}</td>
-          <td>${E(c.blocked || 0)}</td>
+          <td>${E(c.open || 0)}</td>
+          <td>${E(c.claimed || 0)}</td>
           <td>${E(c.completed || 0)}</td>
           <td class="m trunc">${E(p.defaultTarget || "—")}</td>
         </tr>`;
     });
     const t = table(
-      ["Project", "ID", "Issues", "Active", "Blocked", "Completed", "Default Target"],
+      ["Project", "ID", "Issues", "Open", "Claimed", "Completed", "Default Target"],
       rows, "No projects");
     return `<h1>Projects</h1>${t}`;
   };
@@ -361,14 +360,12 @@
 
   // Fill colour per issue status (keeps the graph readable at a glance).
   const NODE_FILL = {
-    open: "#dbeafe", claimed: "#fef3c7", in_review: "#dcfce7",
-    blocked: "#e5e7eb", completed: "#dcfce7",
-    abandoned: "#e5e7eb", rejected: "#fee2e2",
+    open: "#dbeafe", claimed: "#fef3c7",
+    completed: "#dcfce7", abandoned: "#e5e7eb",
   };
   const NODE_STROKE = {
-    open: "#1d4ed8", claimed: "#a16207", in_review: "#15803d",
-    blocked: "#4b5563", completed: "#166534",
-    abandoned: "#9ca3af", rejected: "#b91c1c",
+    open: "#1d4ed8", claimed: "#a16207",
+    completed: "#166534", abandoned: "#9ca3af",
   };
 
   // Assign each node a layer = longest dependency chain reaching it, so that a
@@ -499,8 +496,8 @@
       ["Issues",         E(p.issueCount), ""],
     ]);
     const stats = `<div class="stats">${[
-      ["open", "Open"], ["claimed", "Claimed"], ["inReview", "In Review"],
-      ["blocked", "Blocked"], ["completed", "Completed"], ["rejected", "Rejected"],
+      ["open", "Open"], ["claimed", "Claimed"],
+      ["completed", "Completed"], ["abandoned", "Abandoned"],
     ].map(([k, l]) => statBox(c[k] || 0, l)).join("")}</div>`;
     const rows = (d.issues || []).map((i) => `
       <tr>

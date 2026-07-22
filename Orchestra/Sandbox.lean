@@ -24,6 +24,9 @@ structure LaunchResult where
   resultSubtype  : Option StreamFormat.ResultSubtype := none
   /-- The result text from the agent's result event, if one was emitted. -/
   resultText     : Option String := none
+  /-- Reset timestamp reported by a `rate_limit_event`, if the agent emitted one. Lets the usage
+      monitor record when a limit actually lifts instead of falling back to a default backoff. -/
+  rateLimitReset : Option String := none
 
 /--
 Launch the coding agent inside a landrun sandbox.
@@ -36,6 +39,60 @@ private def shellEscape (s : String) : String :=
                    || c == ';' || c == '\n' || c == '\t') then
     "'" ++ s.replace "'" "'\\''" ++ "'"
   else s
+
+/-- Byte ceiling for each prompt every backend passes to its CLI as a single argument: the task
+    prompt and the appended system prompt.
+
+    `execve` rejects any single argument longer than `MAX_ARG_STRLEN` — 32 pages, so 131072
+    bytes on every architecture orchestra runs on — with `E2BIG`. The failure lands in the
+    forked child, which can only report it as a bare `could not execute external process
+    'landrun'` and exit 255: nothing names the prompt, and the task then burns its whole retry
+    budget failing the same way. The margin below the hard limit is for the rest of the command
+    line, which is bounded (flags, paths, one env var per name) but not free.
+
+    The ceiling is per argument, not shared between the two: the *combined* size of a command
+    line is governed by a separate and far larger limit (`ARG_MAX`, a couple of megabytes),
+    which two arguments of this size come nowhere near. -/
+private def maxPromptBytes : Nat := 120000
+
+/-- Appended to a prompt that had to be cut, so the agent is told rather than left to infer it
+    from a sentence ending mid-word. Counted against the budget, not added on top of it. -/
+private def promptTruncationNotice : String :=
+  "\n\n[Truncated by orchestra: this prompt exceeded the maximum length a single command-line \
+argument can carry, so everything past this point was cut from the end. What you can see above \
+is complete and unmodified.]"
+
+/-- `s` cut to at most `maxPromptBytes` UTF-8 bytes, with `promptTruncationNotice` appended.
+
+    Cuts on a character boundary rather than a byte one: a prompt carrying an issue thread is
+    full of non-ASCII, and half a code point would leave the agent's CLI to reject the argument
+    as invalid UTF-8 instead — trading one opaque launch failure for another. -/
+private def truncatePrompt (s : String) : String :=
+  if s.utf8ByteSize ≤ maxPromptBytes then s else Id.run do
+    let budget := maxPromptBytes - promptTruncationNotice.utf8ByteSize
+    let mut out   := ""
+    let mut used  := 0
+    for c in s.toList do
+      let width := c.utf8Size
+      if used + width > budget then break
+      out  := out.push c
+      used := used + width
+    return out ++ promptTruncationNotice
+
+/-- `s` capped to `maxPromptBytes`, saying so on stderr when it had to cut. `label` names which
+    prompt overflowed, since the two are built from entirely different inputs and the fix
+    differs accordingly.
+
+    Loud, because an over-long prompt means something expanded without a bound —
+    `{{issue_comments}}` on a long thread is the usual one — and cutting it only keeps the task
+    running, it does not make the prompt right. -/
+private def capPromptArg (label : String) (s : String) : IO String := do
+  if s.utf8ByteSize ≤ maxPromptBytes then return s
+  IO.eprintln s!"  [sandbox] warning: the {label} is {s.utf8ByteSize} bytes, over the \
+{maxPromptBytes}-byte ceiling for a single command-line argument; cutting it off at the end. \
+The agent will not see what was cut — check whether a prompt template is expanding something \
+unbounded."
+  return truncatePrompt s
 
 def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : String)
     (serverPort : UInt16)
@@ -86,10 +143,26 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   for p in ← expandHomePaths paths.homeRox do
     if ← p.pathExists then
       args := args.push "--rox" |>.push p.toString
-  -- Home-relative paths read-write (agent config/state)
+  -- Home-relative paths read-write (agent config/state).
+  --
+  -- A missing path here is not benign, unlike the system paths above. Landlock can only attach a
+  -- rule to a path that exists, so a missing one is dropped — and since $HOME itself is never
+  -- granted, the agent cannot create it either. It typically reports that it cannot write its
+  -- config directory and then hangs, with nothing in the log to explain why. Warn instead: the
+  -- fix is to create the path in whatever image or machine image is being used.
   for p in ← expandHomePaths paths.homeRw do
     if ← p.pathExists then
       args := args.push "--rw" |>.push p.toString
+    else
+      IO.eprintln s!"  [sandbox] warning: {p} does not exist, so the agent gets no write access \
+        to it and cannot create it — the agent may hang on startup. Create it and retry."
+  -- Home-relative paths needing write *and* execute (toolchain managers — see `SandboxPaths`).
+  for p in ← expandHomePaths paths.homeRwx do
+    if ← p.pathExists then
+      args := args.push "--rwx" |>.push p.toString
+    else
+      IO.eprintln s!"  [sandbox] warning: {p} does not exist, so the agent gets no write access \
+        to it and cannot create it — the agent may hang on startup. Create it and retry."
   -- Additional paths from global app config
   for p in additionalPaths.rox do
     if ← System.FilePath.pathExists p then
@@ -106,6 +179,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   for p in ← expandHomePaths additionalPaths.homeRw do
     if ← p.pathExists then
       args := args.push "--rw" |>.push p.toString
+  for p in ← expandHomePaths additionalPaths.homeRwx do
+    if ← p.pathExists then
+      args := args.push "--rwx" |>.push p.toString
   for p in additionalPaths.extraPorts do
     args := args.push "--connect-tcp" |>.push (toString p)
     args := args.push "--bind-tcp" |>.push (toString p)
@@ -149,6 +225,12 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   args := args.push agentDef.command
   -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
   let allPluginDirs := pluginDirs ++ memoryDirs
+  -- Enforced here rather than where the prompts are built: every backend and every caller
+  -- reaches the CLI through this one spawn, and the limit is a property of `execve`, not of any
+  -- one template. The system prompt is capped even in interactive mode, where there is no task
+  -- prompt but `--append-system-prompt` is still passed.
+  let prompt ← capPromptArg "prompt" prompt
+  let systemPrompt ← systemPrompt.mapM (capPromptArg "system prompt")
   let agentArgs :=
     if interactiveAgent then
       agentDef.buildInteractiveArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget
@@ -251,6 +333,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let sessionIdRef    ← IO.mkRef (none : Option String)
   let resultSubtypeRef ← IO.mkRef (none : Option StreamFormat.ResultSubtype)
   let resultTextRef   ← IO.mkRef (none : Option String)
+  let rateLimitResetRef ← IO.mkRef (none : Option String)
   let outTask ← IO.asTask (prio := .dedicated) do
     let out ← IO.getStdout
     let err ← IO.getStderr
@@ -276,8 +359,14 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
         if let .result sub _ _ _ res := event then
           resultSubtypeRef.set (some sub)
           unless res.isEmpty do resultTextRef.set (some res)
-        out.putStrLn (StreamFormat.format event)
-        out.flush
+        -- Rate-limit events are bookkeeping, not progress: they are recorded for the usage
+        -- monitor but kept off the console, which is what the old `parseOutputLine` returning
+        -- `none` for them achieved before there was anywhere to record them.
+        if let .rateLimit reset := event then
+          if reset.isSome then rateLimitResetRef.set reset
+        else
+          out.putStrLn (StreamFormat.format event)
+          out.flush
         -- Write the parsed event as a JSON line to the structured log
         if let some h := logHandle then
           h.putStrLn (Lean.Json.compress (Lean.ToJson.toJson event))
@@ -304,9 +393,6 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let sessionId ← match ← sessionIdRef.get with
     | some sid => pure (some sid)
     | none     => agentDef.extractSessionId mcpContext
-  -- Detect usage limit from exit code and captured stderr
-  let stderrContent ← stderrRef.get
-  let usageLimitHit := agentDef.isUsageLimitError exitCode stderrContent
   -- Determine whether this run ended due to user cancellation
   let wasCancelled ← match cancelToken with
     | none => pure false
@@ -315,8 +401,25 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
       pure (reason == some .cancel)
   let resultSubtype ← resultSubtypeRef.get
   let resultText    ← resultTextRef.get
+  let rateLimitReset ← rateLimitResetRef.get
+  -- Detect a usage limit from everything the run said about itself, not just stderr.
+  --
+  -- Both halves matter. A subscription run reports the limit through the output stream — an
+  -- error result reading "You've reached your <model> limit" — and writes nothing to stderr, so
+  -- stderr alone never sees it. And an error result is itself evidence the run failed, so it
+  -- stands in for a non-zero exit: a backend that reports the limit in the stream and still
+  -- exits 0 would otherwise read as a clean success.
+  let stderrContent ← stderrRef.get
+  let combinedOutput := stderrContent ++ "\n" ++ resultText.getD ""
+  let effectiveExit :=
+    if exitCode != 0 then exitCode
+    else match resultSubtype with
+      | some (.error _) => 1
+      | _               => 0
+  let usageLimitHit := agentDef.isUsageLimitError effectiveExit combinedOutput
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
-  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype, resultText }
+  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype, resultText,
+           rateLimitReset }
 
 end Orchestra.Sandbox
