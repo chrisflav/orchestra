@@ -1662,7 +1662,7 @@ private def dashboardServeCmd : Cmd := `[Cli|
 
   FLAGS:
     p, port : Nat; "Port to listen on (default: 8080)"
-    h, host : String; "Address to bind (default: 127.0.0.1; use 0.0.0.0 in a container)"
+    host : String; "Address to bind (default: 127.0.0.1; use 0.0.0.0 in a container)"
     t, token : String; "API token to require (default: $ORCHESTRA_DASHBOARD_TOKEN or a generated, persisted token)"
     s, site : String; "Also serve the static site generated into this directory"
     c, config : String; "Path to config file (read for the auth-sources page)"
