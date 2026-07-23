@@ -8,3 +8,8 @@ docker/config/
 docker/data/
 docker/secrets/*
 !docker/secrets/.gitkeep
+
+# Dashboard front-end. `dist/` is a build artifact: the Docker image builds it in a Node
+# stage, and a local `orchestra dashboard --site web/dist` needs `npm run build` first.
+web/node_modules/
+web/dist/

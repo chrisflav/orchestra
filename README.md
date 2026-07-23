@@ -762,25 +762,36 @@ checked, task history with the full structured log of each run, projects with th
 dependency graph, and every configured authentication source with the usage limits last reported
 for it. Pages stream updates over Server-Sent Events, so they stay current without a reload.
 
-It is two commands. `generate` writes a static site — the pages are authored as
-[Verso](https://github.com/leanprover/verso) documents and emitted by its site pipeline — and
-`serve` runs the JSON API those pages read, optionally serving the site next to it so one port
-answers both:
+The UI is a React/TypeScript app under [`web/`](web/), built by Vite; the backend is the Lean
+server behind `orchestra dashboard`, which answers the JSON API, its SSE streams, and — with
+`--site` — the built front-end, all on one port:
 
 ```sh
-orchestra dashboard generate ~/orchestra-site
-orchestra dashboard serve --site ~/orchestra-site --port 8080
+cd web && npm ci && npm run build && cd ..
+orchestra dashboard --site web/dist --port 8080
 ```
 
-Every `/api` and `/sse` request needs a bearer token; the pages ask for it once and keep it in
-`localStorage`, and `?token=<token>` in the URL supplies it without the prompt. `serve` prints the
-token at start-up: it comes from `--token`, `$ORCHESTRA_DASHBOARD_TOKEN`, or one generated on
-first run and persisted to `<data>/dashboard.token`. The server binds loopback unless `--host`
-says otherwise — it is plain HTTP behind that token, so anything wider wants TLS in front.
+`web/dist` is a build artifact and is not tracked, so `npm run build` has to run before
+`--site` has anything to point at. During front-end work `npm run dev` is the better loop: it
+serves the app with hot reload and proxies `/api` and `/sse` through to a `orchestra dashboard`
+running on 8080, which keeps the app same-origin in development exactly as it is in production.
 
-The generated pages carry no data, so they can equally be hosted by any static web server; point
-them at the API with `generate --api-url <url>` in that case. The docker image bakes a generated
-site in and runs `serve --site` as [its own container](docker/README.md#dashboard).
+Access is gated by a password. The login screen exchanges it for an `HttpOnly`,
+`SameSite=Strict` session cookie, so the secret is never held in `localStorage` and never rides
+in a URL — including on the SSE streams, which authenticate with the same cookie. The password
+comes from `--password`, `$ORCHESTRA_DASHBOARD_PASSWORD`, or one generated on first run and
+persisted to `<data>/dashboard.secret`; a generated one is printed at start-up. Scripts can skip
+the login and send `Authorization: Bearer <password>` instead:
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.local/share/orchestra/dashboard.secret)" \
+     http://127.0.0.1:8080/api/overview
+```
+
+The server binds loopback unless `--host` says otherwise — it is plain HTTP behind that
+password, so anything wider wants TLS in front, plus `--secure-cookie` so the session cookie is
+only ever sent over HTTPS. The docker image builds the front-end in a Node stage and runs the
+server as [its own container](docker/README.md#dashboard).
 
 The **Auth** page is the one to open when the queue has pending work but nothing is running: it
 names the limit that is binding on each source and when it lifts — the same data as
@@ -795,7 +806,7 @@ orchestra cleanup                     # remove all cloned repositories
 orchestra cleanup list                # list clones and their task slots
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
 orchestra usage                       # usage limits of every configured auth source
-orchestra dashboard serve             # the web dashboard's API (and site, with --site)
+orchestra dashboard --site web/dist   # the web dashboard (API, SSE and UI on one port)
 orchestra migrate                     # move ~/.agent/ to the XDG directories
 ```
 

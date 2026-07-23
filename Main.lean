@@ -1603,84 +1603,55 @@ private def migrateCmd : Cmd := `[Cli|
   "Migrate configuration and state from ~/.agent/ to XDG directories (~/.config/orchestra/ and ~/.local/share/orchestra/)."
 ]
 
-private def dashboardGenerateHandler (p : Parsed) : IO UInt32 := do
-  let dir     := p.positionalArg! "dir" |>.as! String
-  -- Empty means same-origin: `dashboard.js` then builds root-relative `/api/…` URLs, which
-  -- is right whenever the site and the API answer on one port (`serve --site`, the container).
-  -- A split deployment has to name the backend explicitly.
-  let apiBase := p.flag? "api-url" |>.map (·.as! String) |>.getD ""
-  Dashboard.generate dir apiBase
-  IO.println s!"Generated static dashboard site in '{dir}' \
-(API base: {if apiBase.isEmpty then "same origin" else apiBase})."
-  IO.println "The dashboard will prompt for the API token in the browser on first load."
-  IO.println "Serve site and API together with:"
-  IO.println s!"  orchestra dashboard serve --site {dir}"
-  IO.println "or host the directory with any static HTTP server and run 'orchestra dashboard"
-  IO.println "serve' separately — in which case --api-url must point at the backend."
-  return 0
-
-private def dashboardGenerateCmd : Cmd := `[Cli|
-  generate VIA dashboardGenerateHandler; ["0.1.0"]
-  "Generate the static dashboard site (HTML/CSS/JS) into a target directory."
-
-  FLAGS:
-    a, "api-url" : String; "Base URL of the JSON API the site talks to (default: same origin)"
-
-  ARGS:
-    dir : String; "Target directory for the generated site"
-]
-
-private def dashboardServeHandler (p : Parsed) : IO UInt32 := do
+private def dashboardHandler (p : Parsed) : IO UInt32 := do
   let port := p.flag? "port" |>.map (·.as! Nat) |>.getD 8080
   let host := p.flag? "host" |>.map (·.as! String) |>.getD "127.0.0.1"
-  let token ← Dashboard.resolveToken (p.flag? "token" |>.map (·.as! String))
+  let (password, generated) ← Dashboard.resolvePassword (p.flag? "password" |>.map (·.as! String))
   let siteDir := p.flag? "site" |>.map (fun f => System.FilePath.mk (f.as! String))
   let configPath := p.flag? "config" |>.map (fun f => System.FilePath.mk (f.as! String))
+  let sessionTtl := p.flag? "session-ttl" |>.map (·.as! Nat) |>.getD 43200
   if let some dir := siteDir then
     unless ← (dir / "index.html").pathExists do
-      IO.eprintln s!"error: '{dir}' does not look like a generated site (no index.html)."
-      IO.eprintln s!"Generate it first: orchestra dashboard generate {dir}"
+      IO.eprintln s!"error: '{dir}' has no index.html, so it is not a built front-end."
+      IO.eprintln "Build it first:  cd web && npm ci && npm run build"
+      IO.eprintln s!"then point --site at web/dist (given here: {dir})."
       return 1
   let (boundPort, _shutdown) ← Dashboard.serve
-    { token, port := port.toUInt16, host, siteDir, configPath }
+    { password, port := port.toUInt16, host, siteDir, configPath, sessionTtlSeconds := sessionTtl,
+      secureCookie := p.hasFlag "secure-cookie" }
   match siteDir with
   | some _ => IO.println s!"Orchestra dashboard listening on http://{host}:{boundPort}"
-  | none   => IO.println s!"Orchestra dashboard JSON API + SSE listening on http://{host}:{boundPort}"
-  IO.println s!"API token: {token}"
-  IO.println "Requests must present it as 'Authorization: Bearer <token>' or '?token=<token>'."
-  IO.println "Enter this token in the dashboard when it prompts you on first load."
+  | none   => IO.println s!"Orchestra dashboard API (no front-end) on http://{host}:{boundPort}"
+  -- A configured password is already known to whoever configured it, and echoing it would
+  -- only copy it into the container logs; a generated one has to be shown once or it is lost.
+  if generated then
+    IO.println ""
+    IO.println s!"  Dashboard password: {password}"
+    IO.println ""
+    IO.println "Generated on first run and saved to <data>/dashboard.secret. Set --password or"
+    IO.println s!"${Dashboard.passwordEnvVar} to choose it yourself."
+  else
+    IO.println "Log in with the configured password (--password / \
+$ORCHESTRA_DASHBOARD_PASSWORD / <data>/dashboard.secret)."
+  IO.println "Scripts can authenticate with 'Authorization: Bearer <password>' instead."
   if siteDir.isNone then
-    IO.println "Serve the generated static site separately (e.g. python3 -m http.server),"
-    IO.println "or pass --site <dir> to serve it from here."
+    IO.println "Pass --site web/dist to serve the built front-end from here as well."
   repeat do
     IO.sleep 60000
   return 0
 
-private def dashboardServeCmd : Cmd := `[Cli|
-  serve VIA dashboardServeHandler; ["0.1.0"]
-  "Start the dashboard JSON API + SSE backend, and optionally the static site."
+private def dashboardCmd : Cmd := `[Cli|
+  dashboard VIA dashboardHandler; ["0.1.0"]
+  "Serve the web dashboard: the JSON API, its SSE streams, and the built front-end."
 
   FLAGS:
     p, port : Nat; "Port to listen on (default: 8080)"
     host : String; "Address to bind (default: 127.0.0.1; use 0.0.0.0 in a container)"
-    t, token : String; "API token to require (default: $ORCHESTRA_DASHBOARD_TOKEN or a generated, persisted token)"
-    s, site : String; "Also serve the static site generated into this directory"
+    password : String; "Password to require (default: $ORCHESTRA_DASHBOARD_PASSWORD or a generated, persisted one)"
+    s, site : String; "Serve the front-end built into this directory (web/dist)"
     c, config : String; "Path to config file (read for the auth-sources page)"
-]
-
-private def dashboardDefaultHandler (_ : Parsed) : IO UInt32 := do
-  IO.println "Usage: orchestra dashboard <generate|serve>"
-  IO.println "  generate <dir>   Generate the static dashboard site into <dir>."
-  IO.println "  serve            Start the JSON API + SSE backend the site talks to."
-  return 0
-
-private def dashboardCmd : Cmd := `[Cli|
-  dashboard VIA dashboardDefaultHandler; ["0.1.0"]
-  "Generate the static web dashboard and run its JSON API backend."
-
-  SUBCOMMANDS:
-    dashboardGenerateCmd;
-    dashboardServeCmd
+    "session-ttl" : Nat; "Session cookie lifetime in seconds (default: 43200)"
+    "secure-cookie"; "Mark the session cookie Secure (only behind a TLS-terminating proxy)"
 ]
 
 -- All optional tool permission tokens recognised by --tools.

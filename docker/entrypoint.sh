@@ -14,6 +14,17 @@ CONFIG_DIR="$CONFIG_ROOT/orchestra"
 DATA_DIR="$DATA_ROOT/orchestra"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 
+# The dashboard runs off this same entrypoint but is a *reader*: it dispatches nothing, holds
+# none of the daemon's credentials (see docker-compose.yaml, where its environment is
+# deliberately narrower), and mounts /config read-only. So it must not render config.json —
+# assembled from variables it was not given, that file would be missing the PAT and the agent
+# tokens, and the daemon would then adopt it as authoritative — and it must not try to write
+# anywhere under /config at all.
+IS_DASHBOARD=0
+case "${1:-}" in
+  dashboard) IS_DASHBOARD=1 ;;
+esac
+
 # /config and /data are bind-mounted host directories, and Docker creates a missing bind-mount
 # source as root — so on a fresh checkout they arrive unwritable by the unprivileged user agents
 # run as. Fix that here, then immediately drop privileges by re-execing this same script as
@@ -23,7 +34,14 @@ CONFIG_FILE="$CONFIG_DIR/config.json"
 # repository under /data on every restart.
 if [ "$(id -u)" = "0" ]; then
   target_uid="$(id -u "$RUN_AS")"
-  for d in "$CONFIG_ROOT" "$DATA_ROOT"; do
+  if [ "$IS_DASHBOARD" = "1" ]; then
+    # /config is read-only here, so neither the mkdir nor the chown below could succeed on it —
+    # and neither is needed: the daemon's container owns that directory.
+    roots="$DATA_ROOT"
+  else
+    roots="$CONFIG_ROOT $DATA_ROOT"
+  fi
+  for d in $roots; do
     mkdir -p "$d"
     if [ "$(stat -c %u "$d")" != "$target_uid" ]; then
       echo "[entrypoint] taking ownership of $d for $RUN_AS"
@@ -33,7 +51,20 @@ if [ "$(id -u)" = "0" ]; then
   exec setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups "$0" "$@"
 fi
 
-mkdir -p "$CONFIG_DIR" "$DATA_DIR"
+mkdir -p "$DATA_DIR"
+
+# The dashboard container stops here: everything below renders config.json or checks the
+# machinery for *running tasks* (signing a GitHub JWT, sandboxing an agent), and it does
+# neither.
+#
+# On a very first `up` this means the dashboard may start before any config.json exists. That
+# is self-healing: the auth page re-reads the config on every request, so it fills in as soon
+# as the daemon has written it, without a restart.
+if [ "$IS_DASHBOARD" = "1" ]; then
+  exec orchestra "$@"
+fi
+
+mkdir -p "$CONFIG_DIR"
 
 if [ -f "$CONFIG_FILE" ]; then
   echo "[entrypoint] using existing $CONFIG_FILE (env vars ignored)"
@@ -49,9 +80,8 @@ else
   # (Orchestra/Config.lean) even when GitHub App auth is unused — a PAT is the usual alternative.
   #
   # Written to a per-process temporary file and renamed into place, so a reader never sees a
-  # half-written config: on a first `up` the daemon and the dashboard containers start together
-  # and both find the file missing. `mv` within one directory is atomic, so the loser simply
-  # replaces identical content.
+  # half-written config — the dashboard container reads this file while the daemon may be
+  # writing it. `mv` within one directory is atomic.
   tmp="$CONFIG_FILE.$$.tmp"
   jq -n \
     --arg taxis_url    "$ORCHESTRA_TAXIS_URL" \
@@ -85,14 +115,6 @@ if [ ! -e "$SKILLS_DIR" ] && [ -d /opt/orchestra/skills ]; then
   cp -r /opt/orchestra/skills "$SKILLS_DIR"
   echo "[entrypoint] installed bundled skills into $SKILLS_DIR"
 fi
-
-# The two checks below are about *running tasks*: signing a GitHub JWT and sandboxing an agent.
-# The dashboard container shares this entrypoint and this environment but does neither — it has
-# no /secrets mount and never launches anything — so running them there produces warnings that
-# are false for that container and would teach people to ignore the real ones.
-case "${1:-}" in
-  dashboard) exec orchestra "$@" ;;
-esac
 
 # GitHub App auth reads this key from disk to sign a JWT (Orchestra/GitHub.lean). Check it up
 # front: an unreadable key surfaces otherwise as an opaque openssl failure the first time a task

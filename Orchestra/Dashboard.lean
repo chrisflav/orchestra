@@ -9,7 +9,6 @@ import Orchestra.Listener
 import Orchestra.Project.Basic
 import Orchestra.Project.Claim
 import Orchestra.Usage
-import Orchestra.Dashboard.Site
 
 open Lean (Json ToJson)
 open Std.Net
@@ -20,41 +19,50 @@ open Orchestra.Project (Project Issue IssueStatus Claim
 /-!
 # Orchestra Web Dashboard
 
-The dashboard is split into two independently-run pieces:
+`orchestra dashboard serve` runs a minimal HTTP/1.1 server that answers three things on one
+port:
 
-  * **`generate`** (in `Orchestra/Dashboard/Site.lean`) writes a fully static
-    website (HTML/CSS/JS) into a target directory. The pages are authored as
-    Verso `#doc (Page)` documents and emitted with Verso's Blog pipeline
-    (`blogMain`), like `leanprover/verso-website`. The generated files can be
-    served by any plain HTTP server — orchestra ships no front-end server.
+  * `POST /api/login`, `POST /api/logout`, `GET /api/session` — the authentication surface.
+  * `GET /api/<kind>` — JSON view models, one per page.
+  * `GET /sse/<kind>` — the same JSON pushed every two seconds as Server-Sent Events.
+  * everything else — the compiled front-end from `--site`, with a single-page-app fallback.
 
-  * **`serve`** (this module) runs a minimal HTTP/1.1 server (bound to
-    `127.0.0.1`) exposing only the JSON API under `/api/...` and Server-Sent
-    Event streams under `/sse/...`, with permissive CORS so the separately-served
-    static site can fetch cross-origin. It serves no HTML.
+The front-end is a React/TypeScript app under `web/`, built by Vite into `web/dist` and
+handed to `serve` with `--site`. It is not compiled into the binary: the bundle is a build
+artifact, so the Docker image builds it in a Node stage and copies it to a fixed path (see
+`docker/Dockerfile`). Nothing here renders HTML.
 
-Adding a page = a verso `#doc (Page)` shell (in `Dashboard/Pages/`) wired into
-`versoSite` + a Lean `IO Json` builder (here) + a JS renderer keyed on
-`data-page` (in `Dashboard/dashboard.js`).
+Adding a page = a Lean `IO Json` builder plus a route arm in `renderApi` (here) + a typed
+client call and a React page under `web/src/pages/`.
+
+## Authentication
+
+One shared secret, presented two ways:
+
+  * **Browsers** `POST /api/login` with it and get an opaque session id back in an `HttpOnly`,
+    `SameSite=Strict` cookie. The secret itself never reaches JavaScript, so an XSS bug in the
+    front-end cannot exfiltrate it, and the cookie rides SSE requests automatically — which is
+    what lets `EventSource` authenticate without a token in the URL (and therefore out of
+    access logs, `Referer` headers and browser history).
+  * **Scripts** send `Authorization: Bearer <secret>` directly.
+
+Both comparisons are constant-time. There is no CORS header anywhere: the site and the API
+are the same origin, and a wildcard `Access-Control-Allow-Origin` is incompatible with cookie
+credentials in the first place. Development against Vite's dev server goes through its proxy
+(`web/vite.config.ts`), which keeps that property.
 -/
 
 namespace Orchestra.Dashboard
 
--- API authentication
---
--- The server binds to `127.0.0.1` but replies with a wildcard `Access-Control-
--- Allow-Origin`, so any web page the user visits could otherwise `fetch` the
--- API cross-origin. A shared bearer token gates every `/api/...` and `/sse/...`
--- request. `generate` bakes the same token into the static site (see
--- `Dashboard/Site.lean`) and `dashboard.js` presents it on each request.
+/-! ## Secret resolution -/
 
-/-- The env var that overrides the persisted dashboard API token. -/
-def tokenEnvVar : String := "ORCHESTRA_DASHBOARD_TOKEN"
+/-- The env var that supplies the dashboard password. -/
+def passwordEnvVar : String := "ORCHESTRA_DASHBOARD_PASSWORD"
 
-/-- Where an auto-generated token is persisted so that `generate` and `serve`
-    (typically separate invocations) agree on the same secret. -/
-private def tokenFile : IO System.FilePath := do
-  return (← Dirs.dataBase) / "dashboard.token"
+/-- Where a generated password is persisted, so restarts don't invalidate what the user
+    already wrote down. -/
+private def secretFile : IO System.FilePath := do
+  return (← Dirs.dataBase) / "dashboard.secret"
 
 private def hexDigits : Array Char := "0123456789abcdef".toList.toArray
 
@@ -62,55 +70,61 @@ private def toHex (b : UInt8) : String :=
   let n := b.toNat
   String.ofList [hexDigits[n >>> 4]!, hexDigits[n &&& 0xf]!]
 
-/-- Generate a fresh random token (60 hex chars / 30 bytes of entropy) sourced
-    from `/dev/urandom`. -/
-private def genToken : IO String := do
-  let bytes ← IO.FS.withFile "/dev/urandom" .read fun h => h.read 30
+/-- `n` bytes of `/dev/urandom`, hex-encoded. -/
+private def randomHex (n : Nat) : IO String := do
+  let bytes ← IO.FS.withFile "/dev/urandom" .read fun h => h.read n.toUSize
   return String.join (bytes.toList.map toHex)
 
-/-- Resolve the dashboard API token, in priority order:
-    1. an explicit `flagToken` (e.g. `--token`),
-    2. the `ORCHESTRA_DASHBOARD_TOKEN` env var,
-    3. a token previously persisted under the data dir,
-    4. otherwise a freshly generated token (persisted for reuse).
+/-- Resolve the dashboard password, in priority order:
+    1. an explicit `flagPassword` (`--password`),
+    2. `$ORCHESTRA_DASHBOARD_PASSWORD`,
+    3. one previously persisted under the data dir,
+    4. otherwise a freshly generated one (persisted for reuse).
 
-    Shared by `generate` (which bakes the token into the site) and `serve`
-    (which enforces it), so both agree without the user wiring anything up. -/
-def resolveToken (flagToken : Option String := none) : IO String := do
-  if let some t := flagToken then
-    if !t.trimAscii.isEmpty then return t.trimAscii.toString
-  if let some t ← IO.getEnv tokenEnvVar then
-    if !t.trimAscii.isEmpty then return t.trimAscii.toString
-  let path ← tokenFile
+    Returns the password and whether it had to be generated, so the caller can print a
+    generated one prominently and stay quiet about a configured one. -/
+def resolvePassword (flagPassword : Option String := none) : IO (String × Bool) := do
+  if let some p := flagPassword then
+    if !p.trimAscii.isEmpty then return (p.trimAscii.toString, false)
+  if let some p ← IO.getEnv passwordEnvVar then
+    if !p.trimAscii.isEmpty then return (p.trimAscii.toString, false)
+  let path ← secretFile
   if ← path.pathExists then
-    let t := (← IO.FS.readFile path).trimAscii.toString
-    if !t.isEmpty then return t
-  let t ← genToken
+    let p := (← IO.FS.readFile path).trimAscii.toString
+    if !p.isEmpty then return (p, false)
+  let p ← randomHex 24
   IO.FS.createDirAll (← Dirs.dataBase)
-  IO.FS.writeFile path (t ++ "\n")
-  -- Best-effort: restrict the token file to the owner.
+  -- Created empty with owner-only permissions *before* the secret goes in, so the value is
+  -- never briefly world-readable under a permissive umask.
+  IO.FS.writeFile path ""
   try
     let _ ← IO.Process.run { cmd := "chmod", args := #["600", path.toString] }
   catch _ => pure ()
-  return t
+  IO.FS.writeFile path (p ++ "\n")
+  return (p, true)
 
--- TCP helper (mirrors the one in Orchestra.Server)
+/-- Length-independent byte comparison, so a wrong secret takes the same time to reject
+    whatever its content. Length itself is not hidden — it leaks through the early return —
+    which is the standard trade-off and harmless for a high-entropy secret. -/
+def constantTimeEq (a b : String) : Bool := Id.run do
+  let ab := a.toUTF8
+  let bb := b.toUTF8
+  if ab.size != bb.size then return false
+  let mut diff : UInt8 := 0
+  for i in [0:ab.size] do
+    diff := diff ||| (ab[i]! ^^^ bb[i]!)
+  return diff == 0
 
-private def awaitTcp (p : IO.Promise (Except IO.Error α)) : IO α := do
-  let result ← IO.wait p.result!
-  match result with
-  | .error e => throw e
-  | .ok v    => return v
+/-! ## HTTP types -/
 
--- HTTP types
-
-private structure HttpRequest where
+structure HttpRequest where
   method  : String
   path    : String
   headers : Array (String × String)
   body    : String
+  deriving Inhabited
 
-private structure HttpResponse where
+structure HttpResponse where
   status  : Nat
   headers : Array (String × String)
   body    : String
@@ -119,32 +133,117 @@ private def statusText : Nat → String
   | 200 => "OK"           | 204 => "No Content"
   | 400 => "Bad Request"  | 404 => "Not Found"
   | 401 => "Unauthorized" | 405 => "Method Not Allowed"
+  | 413 => "Payload Too Large"
+  | 500 => "Internal Server Error"
   | n   => s!"Status {n}"
 
-/-- Permissive CORS headers so a separately-served static front-end can call the
-    API/SSE endpoints from another origin. -/
-private def corsHeaders : Array (String × String) :=
-  #[("Access-Control-Allow-Origin", "*"),
-    ("Access-Control-Allow-Methods", "GET, OPTIONS"),
-    ("Access-Control-Allow-Headers", "Content-Type, Authorization")]
+/-- Sent on every response. `nosniff` and `DENY` matter because this server hands out both
+    JSON and the app bundle: they stop a JSON body from being coerced into a script context
+    and stop the whole dashboard from being framed by another page. -/
+private def securityHeaders : Array (String × String) :=
+  #[("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer")]
 
 private def httpResponse (resp : HttpResponse) : String :=
   let statusLine := s!"HTTP/1.1 {resp.status} {statusText resp.status}\r\n"
   let contentLen := s!"Content-Length: {resp.body.utf8ByteSize}\r\n"
-  let hdrs := resp.headers.map (fun (k, v) => s!"{k}: {v}\r\n") |>.toList
+  let hdrs := (resp.headers ++ securityHeaders).map (fun (k, v) => s!"{k}: {v}\r\n") |>.toList
   statusLine ++ String.join hdrs ++ contentLen ++ "Connection: close\r\n\r\n" ++ resp.body
 
-private def jsonResp (j : Json) (status : Nat := 200) : HttpResponse :=
+private def jsonResp (j : Json) (status : Nat := 200)
+    (extraHeaders : Array (String × String) := #[]) : HttpResponse :=
   { status
-    headers := #[("Content-Type", "application/json; charset=utf-8")] ++ corsHeaders
+    headers := #[("Content-Type", "application/json; charset=utf-8"),
+                 ("Cache-Control", "no-store")] ++ extraHeaders
     body    := Json.compress j }
 
--- The static-site generator (`generate`, the theme, the page shells) lives in
--- `Orchestra/Dashboard/Site.lean`; this module contributes only the JSON API and
--- SSE server below.
+private def errorResp (msg : String) (status : Nat) : HttpResponse :=
+  jsonResp (Json.mkObj [("error", msg)]) status
 
--- View-model builders: each `/api/...` endpoint produces a `Json` value
--- tailored for the corresponding page renderer in `dashboard.js`.
+private def unauthorizedResp : HttpResponse := errorResp "unauthorized" 401
+private def notFoundJsonResp : HttpResponse := errorResp "not found" 404
+
+/-! ## Request parsing -/
+
+private def hexVal? (c : Char) : Option UInt8 :=
+  if '0' ≤ c && c ≤ '9' then some (UInt8.ofNat (c.toNat - '0'.toNat))
+  else if 'a' ≤ c && c ≤ 'f' then some (UInt8.ofNat (c.toNat - 'a'.toNat + 10))
+  else if 'A' ≤ c && c ≤ 'F' then some (UInt8.ofNat (c.toNat - 'A'.toNat + 10))
+  else none
+
+private def percentDecodeAux : List Char → ByteArray → Option ByteArray
+  | [],               acc => some acc
+  | '%' :: h :: l :: t, acc =>
+    match hexVal? h, hexVal? l with
+    | some hv, some lv => percentDecodeAux t (acc.push (hv * 16 + lv))
+    | _,       _       => none
+  | '%' :: _,         _   => none
+  | c :: t,           acc => percentDecodeAux t (acc ++ c.toString.toUTF8)
+
+/-- Percent-decode a URL component. `none` when the escapes are malformed or the result is
+    not valid UTF-8 — a rejected request beats a silently mangled one. -/
+def percentDecode (s : String) : Option String := do
+  let bytes ← percentDecodeAux s.toList ByteArray.empty
+  String.fromUTF8? bytes
+
+/-- Decode one path component and accept it only if it can name nothing but itself.
+
+    Every detail endpoint (`/api/tasks/<id>`, `/api/listeners/<name>`, …) feeds its component
+    to a loader that builds a filename from it, so this is the same boundary `staticCandidate`
+    guards for the site directory, and it is enforced *after* decoding — otherwise `%2e%2e`
+    would be a second spelling of `..` that the raw check never sees. -/
+def safeSegment (raw : String) : Option String := do
+  let s ← percentDecode raw
+  if s.isEmpty || s == "." || s == ".." then none
+  else if s.any (fun c => c == '/' || c == '\\' || c.toNat < 0x20 || c.toNat == 0x7f) then none
+  else some s
+
+def parseRequest (raw : String) : Option HttpRequest :=
+  match raw.splitOn "\r\n" with
+  | [] => none
+  | reqLine :: rest =>
+    match reqLine.splitOn " " with
+    | method :: path :: _ =>
+      let rec parseHdrs (acc : Array (String × String)) : List String → Array (String × String)
+        | [] | "" :: _ => acc
+        | h :: t =>
+          match h.splitOn ": " with
+          | k :: vs => parseHdrs (acc.push (k, String.intercalate ": " vs)) t
+          | _       => parseHdrs acc t
+      let headers := parseHdrs #[] rest
+      let body := match rest.dropWhile (· != "") with
+        | _ :: b => String.intercalate "\r\n" b
+        | _      => ""
+      some { method, path, headers, body }
+    | _ => none
+
+private def pathOnly (path : String) : String :=
+  match path.splitOn "?" with
+  | p :: _ => p
+  | _      => path
+
+/-- Look up a request header case-insensitively. -/
+def headerValue (req : HttpRequest) (name : String) : Option String :=
+  (req.headers.find? (fun (k, _) => k.toLower == name.toLower)).map (·.2)
+
+/-- The value of one cookie in a `Cookie:` header value. -/
+def cookieValue (raw : String) (name : String) : Option String :=
+  (raw.splitOn ";").findSome? fun kv =>
+    match kv.trimAscii.toString.splitOn "=" with
+    | k :: vs => if k == name then some (String.intercalate "=" vs) else none
+    | _       => none
+
+/-- Extract the API/SSE kind from a `/api/<kind>` or `/sse/<kind>` path. The prefix is
+    stripped verbatim; individual components are validated later by `renderApi`. -/
+def apiKind (prefix_ : String) (path : String) : Option String :=
+  if path.startsWith prefix_ then some (path.drop prefix_.length).toString else none
+
+/-! ## View-model builders
+
+Each `/api/...` endpoint produces a `Json` value tailored for the matching React page. The
+shapes here are mirrored by the TypeScript declarations in `web/src/api.ts`; changing one
+means changing the other. -/
 
 private def qStText : Queue.QueueStatus → String
   | .pending    => "pending"   | .running    => "running"
@@ -525,19 +624,29 @@ private def projectDetailApi (id : String) : IO (Option Json) := do
       ("issues",  Json.arr nodes)
     ])
 
-/-- Parse the per-task structured JSONL log into an array of `Json` events.
-    Returns an empty array if the file is missing. -/
-private def loadTaskLog (fork : Repository) (id : String) : IO (Array Json) := do
+/-- How many trailing log events a task detail response carries.
+
+    Bounded because this payload is re-sent on every SSE tick: an agent that has been running
+    for hours produces a log far larger than anything a reader scrolls through, and shipping
+    all of it every two seconds costs the server a full re-read and the browser a full
+    re-parse. The tail is the end people actually read; `logTotal` reports what was left out. -/
+private def logTailLimit : Nat := 500
+
+/-- Parse the per-task structured JSONL log, keeping only the last `logTailLimit` events.
+    Returns the kept events and the total number present. -/
+private def loadTaskLog (fork : Repository) (id : String) : IO (Array Json × Nat) := do
   let path := (← Dirs.dataBase) / "logs" / fork.toString / s!"{id}.log"
-  if !(← path.pathExists) then return #[]
+  if !(← path.pathExists) then return (#[], 0)
   let raw ← IO.FS.readFile path
+  let lines := (raw.splitOn "\n").filter (!·.trimAscii.isEmpty)
+  let total := lines.length
+  let kept := if total ≤ logTailLimit then lines else lines.drop (total - logTailLimit)
   let mut out : Array Json := #[]
-  for line in raw.splitOn "\n" do
-    if line.trimAscii.isEmpty then continue
+  for line in kept do
     match Json.parse line with
     | .ok j    => out := out.push j
     | .error _ => out := out.push (Json.mkObj [("type", "unknown"), ("event_type", "parse_error")])
-  return out
+  return (out, total)
 
 private def taskDetailApi (id : String) : IO (Option Json) := do
   let record  ← TaskStore.loadTask id
@@ -553,18 +662,24 @@ private def taskDetailApi (id : String) : IO (Option Json) := do
   match infoOpt with
   | none => return none
   | some (fork, st, createdAt, prompt) =>
-    let log ← loadTaskLog fork id
+    let (log, total) ← loadTaskLog fork id
     return some (Json.mkObj [
       ("id",        id),
       ("status",    st),
       ("fork",      fork.toString),
       ("createdAt", createdAt),
       ("prompt",    prompt),
-      ("log",       Json.arr log)
+      ("log",       Json.arr log),
+      ("logTotal",  ToJson.toJson total),
+      ("logTruncated", Json.bool (total > log.size))
     ])
 
-/-- Dispatch a `/api/...` or `/sse/...` kind string to the matching builder. -/
-private def renderApi (configPath : Option System.FilePath) (kind : String) : IO (Option Json) := do
+/-- Dispatch an `/api/…` or `/sse/…` kind to the matching builder.
+
+    Detail kinds run their component through `safeSegment` first: every one of them ends up
+    in a filename, and this is the only place that check can be made once for all of them. -/
+private def renderApi (configPath : Option System.FilePath) (kind : String)
+    : IO (Option Json) := do
   if kind == "overview"  then return some (← overviewApi configPath)
   if kind == "queue"     then return some (← queueApi)
   if kind == "concerts"  then return some (← concertsApi)
@@ -572,107 +687,117 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) : IO
   if kind == "tasks"     then return some (← tasksApi)
   if kind == "projects"  then return some (← projectsApi)
   if kind == "auth"      then return some (← authApi configPath)
-  if kind.startsWith "projects/" then
-    return ← projectDetailApi (kind.drop "projects/".length).toString
-  if kind.startsWith "concerts/" then
-    return ← concertDetailApi (kind.drop "concerts/".length).toString
-  if kind.startsWith "listeners/" then
-    return ← listenerDetailApi (kind.drop "listeners/".length).toString
-  if kind.startsWith "tasks/" then
-    return ← taskDetailApi (kind.drop "tasks/".length).toString
+  let detail (prefix_ : String) (f : String → IO (Option Json)) : IO (Option (Option Json)) := do
+    if kind.startsWith prefix_ then
+      match safeSegment (kind.drop prefix_.length).toString with
+      | some seg => return some (← f seg)
+      | none     => return some none
+    else return none
+  if let some r ← detail "projects/"  projectDetailApi  then return r
+  if let some r ← detail "concerts/"  concertDetailApi  then return r
+  if let some r ← detail "listeners/" listenerDetailApi then return r
+  if let some r ← detail "tasks/"     taskDetailApi     then return r
   return none
 
-/-- Encode a payload as a single SSE `message` event. -/
-private def sseFrame (payload : String) : String :=
-  let lines := payload.splitOn "\n"
-  (lines.map (fun l => "data: " ++ l) |> String.intercalate "\n") ++ "\n\n"
-
--- HTTP request parsing
-
-private def parseRequest (raw : String) : Option HttpRequest :=
-  match raw.splitOn "\r\n" with
-  | [] => none
-  | reqLine :: rest =>
-    match reqLine.splitOn " " with
-    | method :: path :: _ =>
-      let rec parseHdrs (acc : Array (String × String)) : List String → Array (String × String)
-        | [] | "" :: _ => acc
-        | h :: t =>
-          match h.splitOn ": " with
-          | k :: vs => parseHdrs (acc.push (k, String.intercalate ": " vs)) t
-          | _       => parseHdrs acc t
-      let headers := parseHdrs #[] rest
-      let body := match rest.dropWhile (· != "") with | _ :: b => String.intercalate "\r\n" b | _ => ""
-      some { method, path, headers, body }
-    | _ => none
-
-private def pathOnly (path : String) : String :=
-  match path.splitOn "?" with
-  | p :: _ => p
-  | _ => path
-
-/-- Extract the API/SSE kind from a `/api/<kind>` (or `.json`-suffixed) path. -/
-private def apiKind (path : String) : Option String :=
-  if path.startsWith "/api/" then
-    let raw := (path.drop "/api/".length).toString
-    some (if raw.endsWith ".json" then (raw.take (raw.length - 5)).toString else raw)
-  else none
-
--- Authentication: every request must present the shared token, either as an
--- `Authorization: Bearer <token>` header (used by `fetch`) or a `?token=<token>`
--- query parameter (needed for SSE, since `EventSource` cannot set headers).
-
-/-- Look up a request header case-insensitively. -/
-private def headerValue (req : HttpRequest) (name : String) : Option String :=
-  (req.headers.find? (fun (k, _) => k.toLower == name.toLower)).map (·.2)
-
-/-- The bearer token from an `Authorization: Bearer <token>` header, if present. -/
-private def bearerToken (req : HttpRequest) : Option String :=
-  match headerValue req "authorization" with
-  | some v =>
-    if v.startsWith "Bearer " then some (v.drop "Bearer ".length).trimAscii.toString else none
-  | none   => none
-
-/-- The value of a `?key=…` (or `&key=…`) query parameter in a raw path. Tokens
-    are hex, so no percent-decoding is required. -/
-private def queryParam (path : String) (key : String) : Option String :=
-  match path.splitOn "?" with
-  | _ :: q :: _ =>
-    (q.splitOn "&").findSome? fun kv =>
-      match kv.splitOn "=" with
-      | k :: v :: _ => if k == key then some v else none
-      | _           => none
-  | _ => none
-
-/-- Whether the request carries the expected token (header or query param). -/
-private def authorized (token : String) (req : HttpRequest) : Bool :=
-  let supplied := (bearerToken req).orElse (fun _ => queryParam req.path "token")
-  supplied == some token
-
-private def unauthorizedResp : HttpResponse :=
-  jsonResp (Json.mkObj [("error", "unauthorized")]) 401
+/-! ## Server configuration and session state -/
 
 /-- How a `serve` invocation is configured. -/
 structure ServeConfig where
-  /-- Shared bearer token required on every `/api/…` and `/sse/…` request. -/
-  token : String
+  /-- The shared secret: the password browsers log in with, and the bearer token scripts
+      send. -/
+  password : String
   /-- Port to bind; `0` auto-assigns. -/
   port : UInt16 := 8080
   /-- Address to bind. Loopback by default — the API is unencrypted, so anything wider is a
       deliberate choice (a container publishing a port, a reverse proxy terminating TLS). -/
   host : String := "127.0.0.1"
-  /-- A generated static site to serve alongside the API, so one origin answers both. When
-      absent no HTML is served at all and the site has to be hosted separately. -/
+  /-- The built front-end (`web/dist`) to serve alongside the API, so one origin answers
+      both. When absent no HTML is served and only the JSON API answers. -/
   siteDir : Option System.FilePath := none
   /-- `config.json` to read authentication sources from; `none` uses the XDG default. -/
   configPath : Option System.FilePath := none
+  /-- How long a session cookie stays valid, in seconds. -/
+  sessionTtlSeconds : Nat := 43200
+  /-- Add `Secure` to the session cookie. Off by default because the default deployment is
+      plain HTTP on loopback, where `Secure` would stop the cookie being stored at all; turn
+      it on whenever a TLS-terminating proxy sits in front. -/
+  secureCookie : Bool := false
 
--- Static site serving
---
--- Optional (`--site`), and unauthenticated by design: the generated pages carry no data at
--- all — every one of them is an empty shell that fetches its content from `/api/…`, which
--- *is* gated. Serving them from the same origin as the API is what makes a single published
--- container port enough, and removes the cross-origin hop the split deployment needs.
+/-- Live server state: the config plus the set of issued sessions.
+
+    An in-memory store, so a restart logs everyone out. That is the honest behaviour for a
+    process whose password can be regenerated on the same restart, and it means a stolen
+    cookie cannot outlive the process it was issued by. -/
+private structure ServeState where
+  cfg : ServeConfig
+  /-- Session id paired with its expiry, as an epoch second. A handful of browser tabs at
+      most, so a linear scan is cheaper than a hash map and prunes in the same pass. -/
+  sessions : IO.Ref (Array (String × Int))
+
+def sessionCookieName : String := "orchestra_session"
+
+private def issueSession (st : ServeState) : IO String := do
+  let id ← randomHex 32
+  let now ← Usage.nowEpoch
+  st.sessions.modify fun ss =>
+    (ss.filter (fun (_, exp) => exp > now)).push (id, now + st.cfg.sessionTtlSeconds)
+  return id
+
+private def sessionValid (st : ServeState) (id : String) : IO Bool := do
+  let now ← Usage.nowEpoch
+  let ss ← st.sessions.get
+  return ss.any fun (sid, exp) => exp > now && constantTimeEq sid id
+
+private def revokeSession (st : ServeState) (id : String) : IO Unit := do
+  st.sessions.modify (·.filter fun (sid, _) => !constantTimeEq sid id)
+
+/-- The session id the request carries, if any. -/
+private def requestSession (req : HttpRequest) : Option String :=
+  (headerValue req "cookie").bind (cookieValue · sessionCookieName)
+
+/-- Whether a request may reach the API: a valid session cookie, or the shared secret as a
+    bearer token. Both comparisons are constant-time. -/
+private def authenticated (st : ServeState) (req : HttpRequest) : IO Bool := do
+  if let some v := headerValue req "authorization" then
+    if v.startsWith "Bearer " then
+      if constantTimeEq (v.drop "Bearer ".length).trimAscii.toString st.cfg.password then
+        return true
+  if let some sid := requestSession req then
+    return ← sessionValid st sid
+  return false
+
+private def cookieHeader (st : ServeState) (value : String) (maxAge : Nat) : String :=
+  let attrs := s!"{sessionCookieName}={value}; HttpOnly; SameSite=Strict; Path=/; \
+Max-Age={maxAge}"
+  if st.cfg.secureCookie then attrs ++ "; Secure" else attrs
+
+/-! ## Authentication endpoints -/
+
+private def loginHandler (st : ServeState) (req : HttpRequest) : IO HttpResponse := do
+  let supplied := match Json.parse req.body with
+    | .ok j    => (j.getObjValAs? String "password").toOption
+    | .error _ => none
+  match supplied with
+  | none => return errorResp "expected a JSON body of the form {\"password\": \"…\"}" 400
+  | some p =>
+    unless constantTimeEq p st.cfg.password do
+      return errorResp "invalid password" 401
+    let sid ← issueSession st
+    return jsonResp (Json.mkObj [("authenticated", Json.bool true)]) 200
+      #[("Set-Cookie", cookieHeader st sid st.cfg.sessionTtlSeconds)]
+
+private def logoutHandler (st : ServeState) (req : HttpRequest) : IO HttpResponse := do
+  if let some sid := requestSession req then revokeSession st sid
+  return jsonResp (Json.mkObj [("authenticated", Json.bool false)]) 200
+    #[("Set-Cookie", cookieHeader st "" 0)]
+
+/-- Whether the caller is already authenticated. Deliberately reachable without credentials:
+    it is what the front-end asks on load to decide between the login screen and the app, and
+    it discloses nothing but a boolean the caller could learn by trying any other endpoint. -/
+private def sessionHandler (st : ServeState) (req : HttpRequest) : IO HttpResponse := do
+  return jsonResp (Json.mkObj [("authenticated", Json.bool (← authenticated st req))])
+
+/-! ## Static single-page-app serving -/
 
 private def contentTypeOf (name : String) : String :=
   if      name.endsWith ".html" then "text/html; charset=utf-8"
@@ -699,132 +824,250 @@ def staticCandidate (root : System.FilePath) (path : String) : Option System.Fil
   if segs.any (fun s => s == "." || s == ".." || s.contains '\\') then none
   else some (segs.foldl (fun (p : System.FilePath) (s : String) => p / s) root)
 
-/-- Resolve a request path to an existing file under `root`, or `none` if it names nothing.
+/-- Whether a path should fall back to `index.html` when it names no file.
 
-    A directory resolves to its `index.html`, which is how the generated site is laid out
-    (`queue/index.html` and friends). -/
-private def resolveStatic (root : System.FilePath) (path : String) : IO (Option System.FilePath) := do
+    Client-side routing means `/tasks/abc123` is a valid app URL with no file behind it, so a
+    reload of that URL has to be answered with the app shell. Paths whose last segment looks
+    like a filename — anything with an extension — are excluded, so a missing
+    `/assets/main.js` still 404s instead of returning HTML that the browser would then fail
+    to parse as a script. -/
+def wantsAppShell (path : String) : Bool :=
+  match (path.splitOn "/").filter (!·.isEmpty) |>.getLast? with
+  | none      => true
+  | some last => !last.contains '.'
+
+/-- Resolve a request path to a file under `root`: the file itself, that directory's
+    `index.html`, or the app shell for a client-side route. -/
+private def resolveStatic (root : System.FilePath) (path : String)
+    : IO (Option System.FilePath) := do
+  let shell := root / "index.html"
+  let fallback : IO (Option System.FilePath) := do
+    if wantsAppShell path && (← shell.pathExists) then return some shell else return none
   let some file := staticCandidate root path | return none
   if ← file.isDir then
     let index := file / "index.html"
-    return if ← index.pathExists then some index else none
-  return if ← file.pathExists then some file else none
+    if ← index.pathExists then return some index else return ← fallback
+  if ← file.pathExists then return some file else return ← fallback
 
-/-- Response head for a static file. Sent uncached: the site is regenerated in place by
-    `dashboard generate`, and a stale `dashboard.js` against a newer API is a confusing
-    failure to debug. -/
-private def staticHead (contentType : String) (length : Nat) : String :=
+/-- Response head for a static file.
+
+    Vite fingerprints everything under `assets/`, so those are immutable and cached for a
+    year; `index.html` names them and must never be cached, or a reload after a rebuild
+    pairs a new shell with stale chunks. -/
+private def staticHead (path : String) (contentType : String) (length : Nat) : String :=
+  let cache :=
+    if path.startsWith "/assets/" then "public, max-age=31536000, immutable" else "no-cache"
   "HTTP/1.1 200 OK\r\n" ++
   s!"Content-Type: {contentType}\r\n" ++
   s!"Content-Length: {length}\r\n" ++
-  "Cache-Control: no-cache\r\n" ++
+  s!"Cache-Control: {cache}\r\n" ++
+  "X-Content-Type-Options: nosniff\r\n" ++
+  "X-Frame-Options: DENY\r\n" ++
   "Connection: close\r\n\r\n"
 
 private def notFoundResp : HttpResponse :=
-  { status := 404, headers := #[("Content-Type", "text/plain; charset=utf-8")], body := "not found\n" }
+  { status := 404, headers := #[("Content-Type", "text/plain; charset=utf-8")],
+    body := "not found\n" }
 
-/-- Send a file from the site directory, or a 404 if the path resolves to nothing.
+/-! ## Socket plumbing -/
 
-    Sent as raw bytes rather than through `HttpResponse`, whose body is a `String`: the
-    generated site is text today, but a font or an image dropped into it must not become a
-    decoding error.  -/
+private def awaitTcp (p : IO.Promise (Except IO.Error α)) : IO α := do
+  let result ← IO.wait p.result!
+  match result with
+  | .error e => throw e
+  | .ok v    => return v
+
+/-- Send a response and close the write side.
+
+    Every response advertises `Connection: close`; without the `shutdown` the peer waits for
+    a FIN that only arrives when the socket is finalised, which for a long-running server is
+    an unbounded wait and a leaked descriptor per request. -/
+private def sendAndClose (client : Socket) (chunks : Array ByteArray) : IO Unit := do
+  try
+    let _ ← awaitTcp (← client.send chunks)
+  catch _ => pure ()
+  try
+    let _ ← awaitTcp (← client.shutdown)
+  catch _ => pure ()
+
 private def serveStatic (root : System.FilePath) (path : String) (client : Socket) : IO Unit := do
   match ← resolveStatic root path with
-  | none => let _ ← awaitTcp (← client.send #[(httpResponse notFoundResp).toUTF8])
+  | none => sendAndClose client #[(httpResponse notFoundResp).toUTF8]
   | some file =>
+    -- Sent as raw bytes rather than through `HttpResponse`, whose body is a `String`: the
+    -- bundle is text today, but a font or an image emitted by Vite must not become a
+    -- decoding error.
     let bytes ← IO.FS.withFile file .read fun h => h.readBinToEnd
-    let head := staticHead (contentTypeOf file.toString) bytes.size
-    let _ ← awaitTcp (← client.send #[head.toUTF8, bytes])
+    let head := staticHead path (contentTypeOf file.toString) bytes.size
+    sendAndClose client #[head.toUTF8, bytes]
 
--- Route dispatch. Only `/api/...` (JSON) is handled here; `/sse/...` and the optional static
--- site are handled by `serveClient` before reaching this function.
+/-! ## Route dispatch -/
 
-private def dispatch (cfg : ServeConfig) (req : HttpRequest) : IO HttpResponse := do
-  if req.method == "OPTIONS" then
-    -- CORS preflight carries no credentials; never require auth for it.
-    return { status := 204, headers := corsHeaders, body := "" }
-  if req.method != "GET" then
-    return jsonResp (Json.mkObj [("error", "method not allowed")]) 405
-  unless authorized cfg.token req do
+private def dispatch (st : ServeState) (req : HttpRequest) : IO HttpResponse := do
+  let path := pathOnly req.path
+  -- The authentication surface, before the gate it configures.
+  if path == "/api/login" then
+    return ← if req.method == "POST" then loginHandler st req
+             else pure (errorResp "method not allowed" 405)
+  if path == "/api/logout" then
+    return ← if req.method == "POST" then logoutHandler st req
+             else pure (errorResp "method not allowed" 405)
+  if path == "/api/session" then
+    return ← if req.method == "GET" then sessionHandler st req
+             else pure (errorResp "method not allowed" 405)
+  unless ← authenticated st req do
     return unauthorizedResp
-  match apiKind (pathOnly req.path) with
+  if req.method != "GET" then
+    return errorResp "method not allowed" 405
+  match apiKind "/api/" path with
   | some kind =>
-    match ← renderApi cfg.configPath kind with
-    | some j => return jsonResp j
-    | none   => return jsonResp (Json.mkObj [("error", "not found")]) 404
-  | none => return jsonResp (Json.mkObj [("error", "not found")]) 404
+    -- A builder that throws must still produce a response. `projects` reaches out to taxis and
+    -- `auth` reads `config.json`, so an unreachable tracker or an unparseable config is an
+    -- ordinary runtime condition here — and without this the exception would escape
+    -- `serveClient`, leaving the caller with a closed connection and no status at all.
+    match ← (try
+        (·.map Except.ok) <$> renderApi st.cfg.configPath kind
+      catch e => pure (some (Except.error (toString e)))) with
+    | some (.ok j)  => return jsonResp j
+    | some (.error e) => return errorResp e 500
+    | none          => return notFoundJsonResp
+  | none => return notFoundJsonResp
 
--- SSE streaming handler
+/-! ## SSE streaming -/
 
-private def sseHeader : String :=
+private def sseHead : String :=
   "HTTP/1.1 200 OK\r\n" ++
   "Content-Type: text/event-stream\r\n" ++
-  "Cache-Control: no-cache\r\n" ++
+  "Cache-Control: no-store\r\n" ++
   "Connection: keep-alive\r\n" ++
-  "Access-Control-Allow-Origin: *\r\n" ++
+  "X-Content-Type-Options: nosniff\r\n" ++
   "X-Accel-Buffering: no\r\n\r\n"
+
+/-- Encode a payload as a single SSE `message` event. -/
+private def sseFrame (payload : String) : String :=
+  let lines := payload.splitOn "\n"
+  (lines.map (fun l => "data: " ++ l) |> String.intercalate "\n") ++ "\n\n"
 
 /-- Refresh interval for SSE pushes, in milliseconds. -/
 private def sseIntervalMs : UInt32 := 2000
 
-private partial def sseLoop (cfg : ServeConfig) (client : Socket) (kind : String) : IO Unit := do
-  let jsonOpt ← try renderApi cfg.configPath kind catch _ => pure none
-  match jsonOpt with
-  | none => return -- unknown kind or vanished resource; close stream
-  | some j =>
-    let ok ← try
-      let _ ← awaitTcp (← client.send #[(sseFrame (Json.compress j)).toUTF8])
-      pure true
-    catch _ => pure false
+/-- Ticks between keep-alive comments when nothing has changed. At the 2s interval above this
+    is one line every 30s, which is under the idle timeout of every proxy worth naming. -/
+private def sseKeepAliveTicks : Nat := 15
+
+/-- Push `kind` until the client goes away.
+
+    Only *changed* payloads are sent. An idle orchestra re-renders to a byte-identical
+    document, and a dashboard left open on a second monitor should cost the network nothing
+    while that is true — the client would discard the frame anyway. -/
+private partial def sseLoop (st : ServeState) (client : Socket) (kind : String)
+    (lastSent : String) (idleTicks : Nat) : IO Unit := do
+  -- A builder that throws (taxis unreachable, config momentarily unreadable) skips this tick
+  -- rather than closing the stream: the client keeps the last good frame on screen and picks
+  -- the next one up when the condition clears. Closing would instead blank the page and set
+  -- `EventSource` reconnecting every few seconds for as long as the outage lasts.
+  let outcome ← try
+      (·.map Except.ok) <$> renderApi st.cfg.configPath kind
+    catch e => pure (some (Except.error (toString e)))
+  match outcome with
+  | none => return -- unknown kind or vanished resource; close the stream
+  | some (.error _) =>
+    IO.sleep sseIntervalMs
+    sseLoop st client kind lastSent idleTicks
+  | some (.ok j) =>
+    let payload := Json.compress j
+    let (frame, idleTicks) :=
+      if payload != lastSent then (some (sseFrame payload), 0)
+      else if idleTicks + 1 ≥ sseKeepAliveTicks then (some ": keep-alive\n\n", 0)
+      else (none, idleTicks + 1)
+    let ok ← match frame with
+      | none => pure true
+      | some f =>
+        try
+          let _ ← awaitTcp (← client.send #[f.toUTF8])
+          pure true
+        catch _ => pure false
     if !ok then return
     IO.sleep sseIntervalMs
-    sseLoop cfg client kind
+    sseLoop st client kind payload idleTicks
 
-private def serveSse (cfg : ServeConfig) (client : Socket) (kind : String) : IO Unit := do
+private def serveSse (st : ServeState) (client : Socket) (kind : String) : IO Unit := do
   try
-    let _ ← awaitTcp (← client.send #[sseHeader.toUTF8])
-    sseLoop cfg client kind
+    let _ ← awaitTcp (← client.send #[sseHead.toUTF8])
+    sseLoop st client kind "" 0
   catch _ => pure ()
 
--- TCP client handler
+/-! ## Connection handling -/
 
-private def serveClient (cfg : ServeConfig) (client : Socket) : IO Unit := do
-  let buf ← IO.mkRef ""
-  let mut i := 0
-  while i < 16 do
-    i := i + 1
-    let chunk? ← awaitTcp (← client.recv? 16384)
-    match chunk? with
-    | none => i := 16
-    | some bytes =>
-      buf.modify (· ++ String.fromUTF8! bytes)
-      let cur ← buf.get
-      if (cur.splitOn "\r\n\r\n").length > 1 then i := 16
-  let raw ← buf.get
-  match parseRequest raw with
+/-- Cap on a single request, headers and body together. Every route here is a `GET` or a
+    one-field login, so anything larger is a mistake or an attempt to sit on memory. -/
+private def maxRequestBytes : Nat := 65536
+
+private def findHeaderEnd (raw : String) : Bool :=
+  (raw.splitOn "\r\n\r\n").length > 1
+
+/-- The declared body length, or 0 when absent or unparseable. -/
+private def contentLength (req : HttpRequest) : Nat :=
+  match (headerValue req "content-length").bind (·.trimAscii.toString.toNat?) with
+  | some n => n
+  | none   => 0
+
+/-- Read one request off the socket.
+
+    Bytes are accumulated as a `ByteArray` and decoded only once the whole thing is in hand:
+    a chunk boundary can land in the middle of a multi-byte character, and decoding each
+    chunk in isolation would corrupt it. -/
+private partial def readRequest (client : Socket) (acc : ByteArray)
+    : IO (Option HttpRequest) := do
+  if acc.size > maxRequestBytes then return none
+  match String.fromUTF8? acc with
+  | none => -- a partial multi-byte character; read more
+    match ← awaitTcp (← client.recv? 16384) with
+    | none       => return none
+    | some bytes => readRequest client (acc ++ bytes)
+  | some raw =>
+    if findHeaderEnd raw then
+      match parseRequest raw with
+      | none     => return none
+      | some req =>
+        -- Headers are complete; keep reading until the declared body has arrived too.
+        if req.body.utf8ByteSize ≥ contentLength req then return some req
+        match ← awaitTcp (← client.recv? 16384) with
+        | none       => return some req
+        | some bytes => readRequest client (acc ++ bytes)
+    else
+      match ← awaitTcp (← client.recv? 16384) with
+      | none       => return none
+      | some bytes => readRequest client (acc ++ bytes)
+
+private def serveClient (st : ServeState) (client : Socket) : IO Unit := do
+  match ← readRequest client ByteArray.empty with
   | none =>
-    let _ ← awaitTcp (← client.send #[httpResponse (jsonResp (Json.mkObj [("error", "bad request")]) 400) |>.toUTF8])
+    sendAndClose client #[(httpResponse (errorResp "bad request" 400)).toUTF8]
   | some req =>
     let path := pathOnly req.path
     if path.startsWith "/sse/" && req.method == "GET" then
-      if authorized cfg.token req then
-        serveSse cfg client (path.drop "/sse/".length).toString
+      if ← authenticated st req then
+        match apiKind "/sse/" path with
+        | some kind => serveSse st client kind
+        | none      => sendAndClose client #[(httpResponse notFoundJsonResp).toUTF8]
       else
-        let _ ← awaitTcp (← client.send #[httpResponse unauthorizedResp |>.toUTF8])
-    else if req.method == "GET" && !(path.startsWith "/api/") && cfg.siteDir.isSome then
-      serveStatic cfg.siteDir.get! path client
+        sendAndClose client #[(httpResponse unauthorizedResp).toUTF8]
+    else if req.method == "GET" && !(path.startsWith "/api/") && st.cfg.siteDir.isSome then
+      serveStatic st.cfg.siteDir.get! path client
     else
-      let resp ← dispatch cfg req
-      let _ ← awaitTcp (← client.send #[httpResponse resp |>.toUTF8])
+      let resp ← dispatch st req
+      sendAndClose client #[(httpResponse resp).toUTF8]
 
-/-- Start the dashboard JSON API + SSE backend (and, with `cfg.siteDir`, the static site),
-    bound to `cfg.host` on `cfg.port` (`0` = auto-assign). Every `/api/…` and `/sse/…`
-    request must present `cfg.token` (see `resolveToken`).
+/-- Start the dashboard server: the JSON API, the SSE streams, and — with `cfg.siteDir` — the
+    built front-end, all on `cfg.host`:`cfg.port` (`0` = auto-assign).
 
     Returns `(boundPort, shutdown)`. Throws if `cfg.host` is not an IPv4 address. -/
 def serve (cfg : ServeConfig) : IO (UInt16 × IO Unit) := do
   let some hostAddr := IPv4Addr.ofString cfg.host
     | throw (.userError s!"dashboard: '{cfg.host}' is not an IPv4 address")
+  let sessions ← IO.mkRef (#[] : Array (String × Int))
+  let st : ServeState := { cfg, sessions }
   let server ← Socket.new
   server.bind (SocketAddress.v4 { addr := hostAddr, port := cfg.port })
   server.listen 32
@@ -838,7 +1081,7 @@ def serve (cfg : ServeConfig) : IO (UInt16 × IO Unit) := do
       | .ok client =>
         if !(← running.get) then break
         let _ ← IO.asTask (prio := .dedicated) do
-          try serveClient cfg client
+          try serveClient st client
           catch _ => pure ()
   let shutdown : IO Unit := do
     running.set false
@@ -849,6 +1092,7 @@ def serve (cfg : ServeConfig) : IO (UInt16 × IO Unit) := do
       let dummy ← Socket.new
       let dAddr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := boundPort }
       let _ ← dummy.connect dAddr
+      let _ ← awaitTcp (← dummy.shutdown)
     catch _ => pure ()
   return (boundPort, shutdown)
 

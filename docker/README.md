@@ -32,7 +32,7 @@ Two containers come up: `orchestra` (the queue daemon) and `dashboard` (the web 
 | `elan` + `build-essential` | Agent tasks build the Lean projects they work on, so the toolchain is needed at runtime, not just to build orchestra. |
 | `jq` | Used by the entrypoint to render `config.json`. |
 | Claude Code CLI | The default agent backend (`role.backend.getD "claude"`). |
-| `/opt/orchestra/dashboard-site` | The dashboard's static pages, generated at build time by the binary itself and served by the `dashboard` container. |
+| `/opt/orchestra/dashboard-site` | The dashboard's React front-end, built by the Dockerfile's Node stage and served by the `dashboard` container. |
 
 Only the Claude backend is installed. `opencode`, `pi` and `vibe` exist in `Orchestra/Agents/`
 and in the Nix container but are not in this image; add them to the Dockerfile if you use them.
@@ -109,19 +109,27 @@ entirely. The entrypoint still checks the key path and fails fast if it is a dir
 
 ## Dashboard
 
-The `dashboard` service runs `orchestra dashboard serve` off the same image and the same
-`/config` and `/data` mounts, published on `127.0.0.1:8080` by default:
+The `dashboard` service runs `orchestra dashboard` off the same image, published on
+`127.0.0.1:8080` by default:
 
 ```sh
-docker compose logs dashboard    # prints the API token
+docker compose logs dashboard    # prints the generated password
 open http://127.0.0.1:8080
 ```
 
-The page asks for that token once and keeps it in `localStorage`; appending `?token=<token>` to
-the URL supplies it without the prompt (the page then strips it from the address bar). Leaving
-`ORCHESTRA_DASHBOARD_TOKEN` empty generates one on first start and persists it to
-`data/orchestra/dashboard.token`, so it survives restarts — set the variable instead if you would
-rather choose it.
+The page asks for that password once. Logging in exchanges it for an `HttpOnly`,
+`SameSite=Strict` session cookie, so the password itself is never stored in the browser and
+never appears in a URL. Leaving `ORCHESTRA_DASHBOARD_PASSWORD` empty generates one on first
+start and persists it to `data/orchestra/dashboard.secret`, so it survives restarts — set the
+variable instead if you would rather choose it. Sessions live in memory, so restarting the
+container signs everyone out.
+
+Scripts can skip the login screen entirely and send the same secret as a bearer token:
+
+```sh
+curl -H "Authorization: Bearer $ORCHESTRA_DASHBOARD_PASSWORD" \
+     http://127.0.0.1:8080/api/overview
+```
 
 What it shows: the queue and concert runs, listeners and their last check, task history with the
 full structured log of each run, projects with their issue dependency graph, and **Auth** — every
@@ -136,12 +144,17 @@ A few deliberate choices:
   `stop_grace_period` on every stop, and a read-only web view should not be unavailable for half
   an hour exactly when someone is trying to see why a task is stuck. The dashboard dispatches
   nothing; it reads the state files the daemon writes.
-- **One port for HTML and JSON.** The image bakes the generated static site in at
-  `/opt/orchestra/dashboard-site` and `--site` serves it next to the API, so there is no second
-  web server and no cross-origin hop. The pages themselves carry no data — each is an empty
-  shell that fetches from `/api/…`, which is what the token gates.
-- **Published on loopback.** The API is plain HTTP behind a bearer token. Put TLS in front of it
-  before setting `ORCHESTRA_DASHBOARD_BIND` to anything wider:
+- **Narrower credentials than the daemon.** This is the only container reachable from outside,
+  and its environment carries no GitHub PAT and no agent tokens — only the taxis URL and token,
+  which the projects and issues pages need. It mounts `/config` read-only and never renders
+  `config.json`; the daemon's container does that (see `entrypoint.sh`).
+- **One port for the UI and the JSON.** The image builds the React front-end in a Node stage and
+  bakes it in at `/opt/orchestra/dashboard-site`; `--site` serves it next to the API. One origin
+  answers both, so there is no second web server, no CORS header anywhere, and nothing for a
+  cross-origin page to reach.
+- **Published on loopback.** The API is plain HTTP behind a password. Put TLS in front of it
+  before setting `ORCHESTRA_DASHBOARD_BIND` to anything wider, and add `--secure-cookie` to the
+  service's `command` so the session cookie is only ever sent over HTTPS:
 
   ```sh
   ORCHESTRA_DASHBOARD_BIND=0.0.0.0     # only behind a reverse proxy

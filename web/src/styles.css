@@ -1,0 +1,1166 @@
+/*
+ * Orchestra.
+ *
+ * Type carries the voice, and width says whose voice it is. One superfamily, three settings:
+ * IBM Plex Sans condensed for what the system asserts (the verdict, page titles, the
+ * wordmark), the same face at normal width for what the interface explains to you, and IBM
+ * Plex Mono for anything the machine emitted verbatim — ids, counts, forks, timestamps,
+ * status words. Nothing is set in italic: liveness is carried by colour and by one moving
+ * element, which is what an operator actually scans for.
+ *
+ * The palette is read off the thing being watched. An orchestra is organised into sections,
+ * and so is this system's state: brass is loud and working, strings are the steady body of the
+ * ensemble waiting to play, percussion is impact, and rests are silence. Hue carries meaning
+ * here — a status is never a decorative colour, and the same hue means the same thing on every
+ * page and in both themes. The neutrals around them are cool and unsaturated, so the four
+ * section hues are the only colour on the page.
+ *
+ * Structure is carried by type and space rather than by boxes. Almost nothing sits in a card:
+ * rows sit on the page separated by hairlines, which is what keeps a page of live data reading
+ * as a page rather than as a control panel.
+ */
+
+/* `wdth.css` rather than `index.css`: it ships the width axis alongside the weight one, which
+   is what makes the condensed display setting available without a second font package. */
+@import "@fontsource-variable/ibm-plex-sans/wdth.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
+
+/* Light is the base. The dark block is written twice — once for the system preference, once
+   for the explicit override — because a set of custom properties cannot be aliased in CSS.
+   Keep the two in step. */
+:root {
+  --page: #f6f7f9;
+  --raised: #ffffff;
+  --sunken: #edeff4;
+  --rule: #dde0e8;
+  --rule-soft: #e9ebf1;
+
+  --text: #14171e;
+  --mute: #555b6a;
+  --faint: #838a9a;
+
+  --brass: #b3760c;
+  --strings: #4a5bd4;
+  --winds: #177a47;
+  --perc: #ce2e3a;
+  --rest: #7b8394;
+  --link: #4a5bd4;
+
+  --shadow: 0 1px 2px rgba(20, 23, 30, 0.05);
+  --bar: rgba(246, 247, 249, 0.86);
+
+  /* `--display` and `--ui` are the same family on purpose. What separates them is
+     `font-stretch: 75%`, which every display-voice rule below sets alongside the family. */
+  --display: "IBM Plex Sans Variable", system-ui, sans-serif;
+  --ui: "IBM Plex Sans Variable", system-ui, sans-serif;
+  --data: "IBM Plex Mono", ui-monospace, monospace;
+
+  --measure: 1080px;
+  --radius: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0c0e13;
+    --raised: #14171e;
+    --sunken: #181c25;
+    --rule: #262b36;
+    --rule-soft: #1e222c;
+
+    --text: #e7eaf0;
+    --mute: #98a0b1;
+    --faint: #6a7183;
+
+    --brass: #e9a23b;
+    --strings: #8b9bff;
+    --winds: #4fbe85;
+    --perc: #f0555b;
+    --rest: #626a7c;
+    --link: #9aa6ff;
+
+    --shadow: none;
+    --bar: rgba(12, 14, 19, 0.86);
+  }
+}
+
+:root[data-theme="dark"] {
+  --page: #0c0e13;
+  --raised: #14171e;
+  --sunken: #181c25;
+  --rule: #262b36;
+  --rule-soft: #1e222c;
+
+  --text: #e7eaf0;
+  --mute: #98a0b1;
+  --faint: #6a7183;
+
+  --brass: #e9a23b;
+  --strings: #8b9bff;
+  --winds: #4fbe85;
+  --perc: #f0555b;
+  --rest: #626a7c;
+  --link: #9aa6ff;
+
+  --shadow: none;
+  --bar: rgba(12, 14, 19, 0.86);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  background: var(--page);
+}
+
+body {
+  font-family: var(--ui);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--page);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--strings);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* The one label treatment: small, monospaced, spaced out, quiet. Used for the wordmark, the
+   eyebrow, section headings, figure labels and status words, so a reader learns once that
+   type set this way is a name for something rather than a value. */
+.eyebrow,
+.pulse,
+.section-title,
+.section-meta,
+.figure-label,
+.status-label,
+.log-kind {
+  font-family: var(--data);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* ============================================================
+   Top bar
+   ============================================================ */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bar);
+  backdrop-filter: saturate(1.6) blur(12px);
+  border-bottom: 1px solid var(--rule);
+}
+
+.topbar-inner {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 0 24px;
+  height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 26px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.brand-name {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.nav::-webkit-scrollbar {
+  display: none;
+}
+
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  color: var(--mute);
+  font-size: 14px;
+  white-space: nowrap;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.nav-link:hover {
+  color: var(--text);
+  background: var(--sunken);
+}
+.nav-link.active {
+  color: var(--text);
+  font-weight: 500;
+}
+
+/* A count appears beside a destination only when it is telling you something: work in flight,
+   or an account that has run out. A badge on every item would be a control panel again. */
+.nav-count {
+  font-family: var(--data);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 6px;
+  border-radius: 20px;
+  background: var(--sunken);
+  color: var(--mute);
+}
+.nav-count.busy {
+  color: var(--brass);
+}
+.nav-count.alert {
+  color: var(--perc);
+}
+
+.topbar-end {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--mute);
+  cursor: pointer;
+}
+.icon-button:hover {
+  background: var(--sunken);
+  color: var(--text);
+}
+
+.text-button {
+  font: inherit;
+  font-size: 13.5px;
+  border: none;
+  background: none;
+  color: var(--mute);
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 7px;
+}
+.text-button:hover {
+  background: var(--sunken);
+  color: var(--text);
+}
+
+/* ============================================================
+   Page
+   ============================================================ */
+
+.page {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 40px 24px 96px;
+}
+
+.page-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 30px;
+}
+
+.page-title {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 40px;
+  font-weight: 600;
+  line-height: 1.08;
+  letter-spacing: -0.005em;
+}
+.page-qualifier {
+  display: block;
+  font-family: var(--data);
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--faint);
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+/* Whether the event stream is attached. It is chrome, not content, so it does not move —
+   the one animated thing on the page is the queue itself. */
+.pulse {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--faint);
+  flex: none;
+}
+.pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--rest);
+}
+.pulse.on .pulse-dot {
+  background: var(--winds);
+}
+.pulse.off .pulse-dot {
+  background: var(--brass);
+}
+
+.eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--faint);
+  margin-bottom: 20px;
+}
+.eyebrow-sep {
+  opacity: 0.4;
+}
+
+/* ============================================================
+   Verdict — the page's opening statement.
+   Counts alone make the reader do the diagnosis. This does it
+   instead, in a sentence, and the strip and ledger below are
+   its evidence. No box: it is a finding, not a widget.
+   ============================================================ */
+
+.verdict {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 46px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.005em;
+  max-width: 30ch;
+  margin-bottom: 16px;
+}
+.verdict .trail {
+  display: block;
+  color: var(--faint);
+}
+/* Red only when something is waiting on a person. */
+.verdict.stuck .lead {
+  color: var(--perc);
+}
+
+.lede {
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--mute);
+  max-width: 62ch;
+}
+.lede a {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ============================================================
+   The strip — the queue drawn at page scale.
+
+   One tick per entry, in the order the daemon will take them:
+   running ticks are full height and brass, waiting ones are
+   half height and strings. A number tells you how much; this
+   tells you how much, in what order, and what shape the queue
+   is in. An empty queue is a broken rule, so silence looks
+   like silence rather than like a zero.
+   ============================================================ */
+
+.strip {
+  margin-top: 44px;
+}
+
+.strip-ticks {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  height: 76px;
+  border-bottom: 1px solid var(--rule);
+}
+
+/* Ticks are strokes, not bars: narrow, evenly spaced, growing from the left so an eighth-full
+   queue looks eighth-full against the rule it sits on. They thin out rather than overflow
+   once the queue is deep. */
+.tick {
+  display: flex;
+  align-items: flex-end;
+  flex: 1 1 6px;
+  min-width: 2px;
+  max-width: 6px;
+  height: 100%;
+}
+.tick-bar {
+  width: 100%;
+  height: 24%;
+  border-radius: 2px 2px 0 0;
+  background: var(--rest);
+  transition: height 0.25s ease;
+}
+.tick-pending .tick-bar {
+  height: 46%;
+  background: var(--strings);
+}
+.tick-done .tick-bar {
+  height: 46%;
+  background: var(--winds);
+}
+.tick-failed .tick-bar {
+  height: 72%;
+  background: var(--perc);
+}
+.tick-running .tick-bar {
+  height: 100%;
+  background: var(--brass);
+  animation: sustain 3.2s ease-in-out infinite;
+}
+a.tick:hover .tick-bar {
+  filter: brightness(1.15);
+}
+@keyframes sustain {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* A broken rule and nothing on it. The verdict directly above already says the queue is
+   empty, so this carries no caption — it is the shape of that sentence. */
+.strip-empty {
+  height: 36px;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.strip-caption {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 11px;
+  font-family: var(--data);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+
+/* ============================================================
+   Ledger — the counts, on one ruled line
+   ============================================================ */
+
+.ledger {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  margin-top: 40px;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+.figure {
+  padding: 15px 18px;
+  border-left: 1px solid var(--rule-soft);
+}
+.figure:first-child {
+  padding-left: 0;
+  border-left: none;
+}
+.figure-value {
+  font-family: var(--data);
+  font-size: 23px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  color: var(--text);
+}
+.figure-value.zero {
+  color: var(--faint);
+}
+.figure-value.brass {
+  color: var(--brass);
+}
+.figure-value.perc {
+  color: var(--perc);
+}
+.figure-label {
+  color: var(--faint);
+  margin-top: 6px;
+}
+a.figure:hover {
+  background: var(--sunken);
+}
+
+/* ============================================================
+   Sections
+   ============================================================ */
+
+.section {
+  margin-top: 46px;
+}
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+.section-title {
+  color: var(--mute);
+}
+.section-meta {
+  color: var(--faint);
+}
+
+/* ============================================================
+   Rows — the one list pattern.
+   Every list in the app is this: what the thing is, then what is
+   true about it. The prompt or the name leads, because that is
+   what a person recognises; the id is metadata like any other.
+   ============================================================ */
+
+.list {
+  border-top: 1px solid var(--rule);
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 18px;
+  padding: 14px 10px;
+  border-bottom: 1px solid var(--rule-soft);
+  margin: 0 -10px;
+  border-radius: 8px;
+  transition: background 0.1s ease;
+}
+a.row:hover {
+  background: var(--sunken);
+}
+
+.row-main {
+  flex: 1;
+  min-width: 0;
+}
+.row-title {
+  font-size: 14.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+a.row:hover .row-title {
+  color: var(--link);
+}
+.row-title.data {
+  font-family: var(--data);
+  font-size: 13px;
+}
+.row-meta {
+  margin-top: 3px;
+  font-family: var(--data);
+  font-size: 11.5px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-meta .sep {
+  opacity: 0.45;
+  margin: 0 6px;
+}
+.row-end {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.empty {
+  padding: 34px 4px;
+  color: var(--faint);
+  font-size: 14px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+
+/* ============================================================
+   Status — one vocabulary, every page, both themes
+   ============================================================ */
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--mute);
+  white-space: nowrap;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--rest);
+}
+.status-running .status-dot {
+  background: var(--brass);
+}
+.status-pending .status-dot {
+  background: var(--strings);
+}
+.status-done .status-dot {
+  background: var(--winds);
+}
+.status-failed .status-dot {
+  background: var(--perc);
+}
+.status-running {
+  color: var(--brass);
+}
+.status-failed {
+  color: var(--perc);
+}
+
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 20px;
+  background: var(--sunken);
+  font-family: var(--data);
+  font-size: 11px;
+  color: var(--mute);
+  white-space: nowrap;
+}
+.tag + .tag {
+  margin-left: 6px;
+}
+.tag-default {
+  color: var(--strings);
+}
+.tag-alert {
+  color: var(--perc);
+}
+
+/* ============================================================
+   Facts — the header block on a detail page
+   ============================================================ */
+
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 40px;
+  padding-bottom: 26px;
+  border-bottom: 1px solid var(--rule);
+}
+.fact {
+  min-width: 0;
+}
+.fact-key {
+  font-size: 12.5px;
+  color: var(--faint);
+  margin-bottom: 1px;
+}
+.fact-value {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.fact-value.data {
+  font-family: var(--data);
+  font-size: 12.5px;
+}
+
+/* ============================================================
+   Panels — only where content genuinely needs a container
+   ============================================================ */
+
+.panel {
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow);
+}
+
+.notice {
+  padding: 40px 24px;
+  text-align: center;
+}
+.notice-title {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  margin-bottom: 6px;
+}
+.notice-note {
+  font-size: 14px;
+  color: var(--mute);
+  max-width: 48ch;
+  margin: 0 auto;
+}
+.notice-note.data {
+  font-family: var(--data);
+  font-size: 12.5px;
+  color: var(--faint);
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+
+.pre {
+  font-family: var(--data);
+  font-size: 12.5px;
+  line-height: 1.65;
+  padding: 16px 18px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 460px;
+  overflow-y: auto;
+}
+
+.caption {
+  padding: 11px 18px;
+  font-size: 12.5px;
+  color: var(--faint);
+  background: var(--sunken);
+  border-bottom: 1px solid var(--rule);
+}
+
+/* ============================================================
+   Task log
+   ============================================================ */
+
+.log {
+  max-height: 640px;
+  overflow-y: auto;
+}
+.log-entry {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 16px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.log-entry:last-child {
+  border-bottom: none;
+}
+.log-kind {
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  padding-top: 3px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+/* The log takes its colour from the same five sections, so a red line means here what a red
+   dot means in a list. */
+.log-kind.k-think {
+  color: var(--strings);
+}
+.log-kind.k-tool {
+  color: var(--brass);
+}
+.log-kind.k-text {
+  color: var(--winds);
+}
+.log-kind.k-err {
+  color: var(--perc);
+}
+.log-body {
+  min-width: 0;
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+.log-body pre {
+  font-family: var(--data);
+  font-size: 11.5px;
+  line-height: 1.55;
+  background: var(--sunken);
+  border-radius: 7px;
+  padding: 10px 12px;
+  margin-top: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 250px;
+  overflow-y: auto;
+}
+.log-meta {
+  color: var(--faint);
+  font-size: 12px;
+  margin-top: 3px;
+}
+.log-tool {
+  font-family: var(--data);
+  font-size: 12.5px;
+  color: var(--brass);
+}
+.log-think {
+  color: var(--mute);
+}
+.log-err {
+  color: var(--perc);
+}
+
+/* ============================================================
+   Dependency graph
+   ============================================================ */
+
+.graph-legend {
+  display: flex;
+  gap: 20px;
+  font-size: 12.5px;
+  color: var(--faint);
+  margin: 10px 0;
+}
+.graph-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.graph-rule {
+  display: inline-block;
+  width: 18px;
+  border-top: 1.5px solid var(--mute);
+}
+.graph-rule.dashed {
+  border-top-style: dashed;
+  border-color: var(--strings);
+}
+.graph {
+  overflow: auto;
+  max-height: 600px;
+  padding: 12px;
+}
+.graph svg {
+  display: block;
+}
+.graph-id {
+  font-family: var(--data);
+  font-size: 10.5px;
+  font-weight: 500;
+  fill: var(--text);
+}
+.graph-title {
+  font-family: var(--ui);
+  font-size: 10.5px;
+  fill: var(--mute);
+}
+
+/* ============================================================
+   Auth
+   ============================================================ */
+
+.source {
+  padding: 22px 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.source-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.source-label {
+  font-family: var(--data);
+  font-size: 14px;
+  font-weight: 500;
+}
+.source-why {
+  font-size: 13.5px;
+  color: var(--perc);
+  margin-bottom: 6px;
+}
+.source-foot {
+  margin-top: 12px;
+  font-size: 12.5px;
+  color: var(--faint);
+}
+.source-error {
+  margin-top: 4px;
+  color: var(--perc);
+}
+.source-none {
+  font-size: 13.5px;
+  color: var(--faint);
+  padding: 6px 0;
+}
+
+.limits {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  margin-top: 12px;
+}
+.limits td {
+  padding: 7px 0;
+  vertical-align: middle;
+}
+.limit-name {
+  width: 30%;
+  font-size: 13.5px;
+  padding-right: 16px;
+}
+.limit-name .tag {
+  margin-left: 8px;
+}
+.limit-track {
+  width: 42%;
+}
+.limit-pct {
+  width: 11%;
+  text-align: right;
+  font-family: var(--data);
+  font-size: 12.5px;
+  color: var(--mute);
+  font-variant-numeric: tabular-nums;
+}
+.limit-reset {
+  width: 17%;
+  text-align: right;
+  font-family: var(--data);
+  font-size: 12px;
+  color: var(--faint);
+}
+.track {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--sunken);
+  overflow: hidden;
+}
+.track-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--strings);
+}
+.track-fill.warn {
+  background: var(--brass);
+}
+.track-fill.crit {
+  background: var(--perc);
+}
+
+/* ============================================================
+   Sign in
+   ============================================================ */
+
+.gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.gate-card {
+  width: 100%;
+  max-width: 340px;
+}
+.gate-mark {
+  margin-bottom: 18px;
+}
+/* The wordmark, set exactly as it is in the top bar, then the one big line. Repeating the
+   lockup rather than shouting the product name is what makes this read as the same place. */
+.gate-title {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--mute);
+  margin-bottom: 14px;
+}
+.gate-note {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1.12;
+  letter-spacing: -0.005em;
+  color: var(--text);
+  margin-bottom: 26px;
+}
+.gate-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.gate-label {
+  font-size: 13px;
+  color: var(--mute);
+}
+.gate-input {
+  font-family: var(--data);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  padding: 11px 13px;
+}
+.gate-input:focus {
+  outline: none;
+  border-color: var(--strings);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--strings) 16%, transparent);
+}
+.gate-button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  margin-top: 8px;
+  padding: 11px 14px;
+  border: none;
+  border-radius: 9px;
+  background: var(--strings);
+  color: #ffffff;
+  cursor: pointer;
+}
+.gate-button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.gate-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.gate-error {
+  font-size: 13px;
+  color: var(--perc);
+}
+.gate-hint {
+  margin-top: 22px;
+  font-size: 12.5px;
+  color: var(--faint);
+  line-height: 1.65;
+}
+.gate-hint code {
+  font-family: var(--data);
+  color: var(--mute);
+}
+.gate-corner {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+}
+
+/* ============================================================
+   Narrow screens
+   ============================================================ */
+
+@media (max-width: 760px) {
+  .topbar-inner {
+    height: auto;
+    padding: 10px 16px;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+  }
+  .nav {
+    order: 3;
+    flex-basis: 100%;
+    margin: 0 -16px;
+    padding: 0 16px 2px;
+  }
+  .topbar-end {
+    margin-left: auto;
+  }
+  .page {
+    padding: 28px 16px 72px;
+  }
+  .page-title {
+    font-size: 31px;
+  }
+  .verdict {
+    font-size: 31px;
+    max-width: none;
+  }
+  .strip-ticks,
+  .strip-empty {
+    height: 56px;
+  }
+  .ledger {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .figure {
+    padding: 13px 14px;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .figure:nth-child(odd) {
+    padding-left: 0;
+    border-left: none;
+  }
+  .figure:last-child {
+    border-bottom: none;
+  }
+  .row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 7px;
+  }
+  /* A stacked row is a column flex container, where `min-width: 0` no longer holds the main
+     block back — without an explicit width a long, non-wrapping prompt sizes the row wider
+     than the page and the whole document scrolls sideways. */
+  .row-main {
+    width: 100%;
+  }
+  .row-end {
+    order: -1;
+  }
+  .log-entry {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+    padding: 12px 14px;
+  }
+  .log-kind {
+    text-align: left;
+    padding-top: 0;
+  }
+  .limit-name {
+    width: 42%;
+  }
+  .limit-track {
+    width: 30%;
+  }
+}
