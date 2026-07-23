@@ -1,6 +1,7 @@
 import type { AuthSource, UsageLimit } from "../api";
 import { LivePage, Section } from "../components/Page";
 import { Status } from "../components/Status";
+import { sinceTime, untilTime } from "../format";
 
 const SEVERITY: Record<string, string> = {
   normal: "",
@@ -35,17 +36,19 @@ function Limit({ limit }: { limit: UsageLimit }) {
         </div>
       </td>
       <td className="limit-pct">{percent}%</td>
-      <td className="limit-reset">{limit.resets || "—"}</td>
+      <td className="limit-reset">{untilTime(limit.resetsAt)}</td>
     </tr>
   );
 }
 
 function Source({ source }: { source: AuthSource }) {
+  // The API sends instants; the phrasing is this page's business, which is what keeps
+  // "4m ago" true four minutes after the frame that carried it arrived.
   const notes = [
-    source.pollable ? `polled ${source.polled}` : "",
-    `last used ${source.lastUsed}`,
+    source.pollable ? `polled ${sinceTime(source.polledAt)}` : "",
+    `last used ${sinceTime(source.lastUsedAt)}`,
     source.baseUrl ? `base ${source.baseUrl}` : "",
-    source.backoff ? `not polling until ${source.backoff}` : "",
+    source.backoffUntil ? `not polling until ${untilTime(source.backoffUntil)}` : "",
   ].filter(Boolean);
 
   return (
@@ -62,7 +65,7 @@ function Source({ source }: { source: AuthSource }) {
       {source.state === "blocked" && (
         <p className="source-why">
           {source.reason}
-          {source.resets && ` — frees up ${source.resets}`}
+          {source.availableAt !== null && ` — frees up ${untilTime(source.availableAt)}`}
         </p>
       )}
 

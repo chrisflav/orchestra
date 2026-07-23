@@ -1,0 +1,785 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "orchestra dashboard API",
+    "version": "1.0.0",
+    "summary": "Read-only HTTP API over a running orchestra daemon.",
+    "description": "Everything the daemon knows about its queue, task history, listeners, projects and authentication sources, as JSON. Every read is also available as a Server-Sent Events stream at the same path under `/sse/v1/`, pushed every two seconds and only when the payload has changed.\n\nThe API is read-only: the only routes that are not `GET` are the two that open and close a session. Nothing here enqueues, cancels or reconfigures anything.\n\n## Conventions\n\n- Instants are RFC 3339 in UTC (`2026-07-23T10:04:11Z`) and live in a field named `...At`.\n- Durations are integer seconds, in a field named `...Seconds`.\n- An absent value is `null`, never an empty string.\n- Enumerations are the lower-case names the daemon itself uses.\n- Collections answer in a common envelope (`items`, `total`, `limit`, `offset`) and accept `limit`, `offset` and — where the collection is ordered by time — `since`.\n- A parameter that is malformed, or that the collection cannot honour, is a `400`. Parameters this version does not define are ignored.",
+    "license": { "name": "See repository" }
+  },
+  "servers": [
+    { "url": "http://127.0.0.1:8080", "description": "Default local bind" }
+  ],
+  "security": [{ "bearerAuth": [] }, { "sessionCookie": [] }],
+  "tags": [
+    { "name": "session", "description": "Acquiring and releasing a credential." },
+    { "name": "queue", "description": "Work waiting, running, and the concerts it belongs to." },
+    { "name": "tasks", "description": "Runs that happened, and their logs." },
+    { "name": "listeners", "description": "Event sources that enqueue work." },
+    { "name": "projects", "description": "Taxis-backed projects and their issue graphs." },
+    { "name": "auth", "description": "Configured credentials and their usage limits." }
+  ],
+  "paths": {
+    "/api/openapi.json": {
+      "get": {
+        "tags": ["session"],
+        "summary": "This document",
+        "description": "Served without a credential and outside the version prefix: a client has to be able to discover what it is talking to before it can authenticate. Always the spec of the binary answering, not of a checkout.",
+        "security": [],
+        "operationId": "getOpenApi",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI description of this API.",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    },
+    "/api/session": {
+      "get": {
+        "tags": ["session"],
+        "summary": "Whether the caller holds a valid credential",
+        "description": "Reachable without one, deliberately: it is what a client asks on load to decide between logging in and proceeding, and it discloses nothing that trying any other endpoint would not.",
+        "security": [],
+        "operationId": "getSession",
+        "responses": {
+          "200": {
+            "description": "The answer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["authenticated"],
+                  "properties": { "authenticated": { "type": "boolean" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/login": {
+      "post": {
+        "tags": ["session"],
+        "summary": "Exchange the password for a session cookie",
+        "description": "For browsers. A script should send `Authorization: Bearer <password>` on each request instead and never call this.",
+        "security": [],
+        "operationId": "login",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["password"],
+                "properties": { "password": { "type": "string" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted. The session id comes back in an `HttpOnly`, `SameSite=Strict` cookie.",
+            "headers": {
+              "Set-Cookie": {
+                "description": "`orchestra_session=<id>; HttpOnly; SameSite=Strict; Path=/; Max-Age=<ttl>`",
+                "schema": { "type": "string" }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["authenticated"],
+                  "properties": { "authenticated": { "type": "boolean", "const": true } }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/logout": {
+      "post": {
+        "tags": ["session"],
+        "summary": "Revoke the caller's session",
+        "operationId": "logout",
+        "responses": {
+          "200": {
+            "description": "Revoked, and the cookie cleared. Sessions live in memory, so a restart revokes every session anyway.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["authenticated"],
+                  "properties": { "authenticated": { "type": "boolean", "const": false } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/overview": {
+      "get": {
+        "tags": ["queue"],
+        "summary": "One-request summary of the whole daemon",
+        "description": "An aggregate, not a resource: counts plus two short projections, so a dashboard can render a first screen — and keep it current over one SSE stream — without fanning out. Everything in it is available in full from the collections below. It takes no parameters; the projections are deliberately fixed in size.",
+        "operationId": "getOverview",
+        "responses": {
+          "200": {
+            "description": "The summary.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Overview" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/queue": {
+      "get": {
+        "tags": ["queue"],
+        "summary": "Queue entries",
+        "description": "Work waiting or running, newest first. Includes entries in terminal states that have not yet been cleared.",
+        "operationId": "listQueue",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" },
+          { "$ref": "#/components/parameters/since" }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of queue entries.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Collection" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/QueueEntry" } }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/tasks": {
+      "get": {
+        "tags": ["tasks"],
+        "summary": "Task history",
+        "description": "Runs that happened, newest first.",
+        "operationId": "listTasks",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" },
+          { "$ref": "#/components/parameters/since" }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of tasks.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Collection" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/tasks/{id}": {
+      "get": {
+        "tags": ["tasks"],
+        "summary": "One task, with the tail of its log",
+        "description": "Resolves against task history first and the queue second, so a run that is still in flight is addressable by the same id.",
+        "operationId": "getTask",
+        "parameters": [
+          { "$ref": "#/components/parameters/id" },
+          {
+            "name": "logLimit",
+            "in": "query",
+            "description": "How many trailing log events to return.",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 500 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The task.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TaskDetail" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/concerts": {
+      "get": {
+        "tags": ["queue"],
+        "summary": "Concert runs",
+        "description": "Multi-step workflow runs, newest first. Ordered and filtered by `startedAt`.",
+        "operationId": "listConcerts",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" },
+          { "$ref": "#/components/parameters/since" }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of concert runs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Collection" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Concert" } }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/concerts/{id}": {
+      "get": {
+        "tags": ["queue"],
+        "summary": "One concert run and its steps",
+        "operationId": "getConcert",
+        "parameters": [{ "$ref": "#/components/parameters/id" }],
+        "responses": {
+          "200": {
+            "description": "The concert run.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["concert", "steps"],
+                  "properties": {
+                    "concert": { "$ref": "#/components/schemas/Concert" },
+                    "steps": { "type": "array", "items": { "$ref": "#/components/schemas/QueueEntry" } }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/listeners": {
+      "get": {
+        "tags": ["listeners"],
+        "summary": "Configured listeners",
+        "description": "Configuration rather than events, so this collection has no time order and does not accept `since`.",
+        "operationId": "listListeners",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of listeners.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Collection" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Listener" } }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/listeners/{name}": {
+      "get": {
+        "tags": ["listeners"],
+        "summary": "One listener, with its source and the task it enqueues",
+        "operationId": "getListener",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "Listener name. Percent-encode it; a component that could name a path is rejected as not found.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The listener.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListenerDetail" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/projects": {
+      "get": {
+        "tags": ["projects"],
+        "summary": "Projects in the taxis tracker",
+        "description": "Configuration rather than events, so this collection does not accept `since`.",
+        "operationId": "listProjects",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of projects.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Collection" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Project" } }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": {
+            "description": "The tracker could not be reached. The body carries what went wrong.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}": {
+      "get": {
+        "tags": ["projects"],
+        "summary": "One project and its issue dependency graph",
+        "operationId": "getProject",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Taxis project id. An id that is not an integer is not found rather than looked up.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The project.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["project", "issues"],
+                  "properties": {
+                    "project": { "$ref": "#/components/schemas/Project" },
+                    "issues": { "type": "array", "items": { "$ref": "#/components/schemas/Issue" } }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/auth": {
+      "get": {
+        "tags": ["auth"],
+        "summary": "Configured authentication sources and their usage limits",
+        "description": "Read from the usage store the daemon maintains, never polled live: the upstream endpoint meters requests, so a client that polled it every couple of seconds would rate-limit the very thing it is monitoring. `polledAt` on each source is how fresh the numbers are.\n\nOpen this when the queue has pending work and nothing is running.",
+        "operationId": "getAuth",
+        "responses": {
+          "200": {
+            "description": "The sources.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Auth" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The dashboard password, sent as `Authorization: Bearer <password>`. This is the path for scripts. The password comes from `--password`, `$ORCHESTRA_DASHBOARD_PASSWORD`, or `<data>/dashboard.secret`."
+      },
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "orchestra_session",
+        "description": "Issued by `POST /api/login`. `HttpOnly` and `SameSite=Strict`, so it also authenticates `EventSource` connections without putting a credential in a URL."
+      }
+    },
+    "parameters": {
+      "limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Maximum items to return. Values above the maximum are clamped to it rather than rejected.",
+        "schema": { "type": "integer", "minimum": 0, "maximum": 500, "default": 50 }
+      },
+      "offset": {
+        "name": "offset",
+        "in": "query",
+        "required": false,
+        "description": "Items to skip. Compare against `total`, which counts matches before the window.",
+        "schema": { "type": "integer", "minimum": 0, "default": 0 }
+      },
+      "since": {
+        "name": "since",
+        "in": "query",
+        "required": false,
+        "description": "Keep only items at or after this instant. Accepted only by collections ordered by time.",
+        "schema": { "type": "string", "format": "date-time" }
+      },
+      "id": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Resource id. Percent-encode it; a component that could name a path is rejected as not found.",
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "A parameter was malformed, or is not one this endpoint accepts.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "No credential, or one that is not valid.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "No such resource.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "description": "The body of every non-2xx response.",
+        "properties": { "error": { "type": "string", "description": "What went wrong, in one sentence." } }
+      },
+      "Collection": {
+        "type": "object",
+        "required": ["items", "total", "limit", "offset"],
+        "description": "The envelope every collection answers in.",
+        "properties": {
+          "items": { "type": "array", "items": {} },
+          "total": { "type": "integer", "description": "Matches before `limit` and `offset` are applied." },
+          "limit": { "type": "integer", "description": "The window size actually used, after clamping." },
+          "offset": { "type": "integer" }
+        }
+      },
+      "QueueStatus": {
+        "type": "string",
+        "enum": ["pending", "running", "done", "failed", "unfinished", "cancelled"]
+      },
+      "TaskStatus": {
+        "type": "string",
+        "enum": ["running", "completed", "failed", "unfinished", "cancelled"]
+      },
+      "ConcertStatus": { "type": "string", "enum": ["running", "done", "failed", "cancelled"] },
+      "IssueStatus": { "type": "string", "enum": ["open", "claimed", "completed", "abandoned"] },
+      "QueueEntry": {
+        "type": "object",
+        "description": "Work waiting or running. Becomes a Task when it is claimed; `taskId` is that run.",
+        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "$ref": "#/components/schemas/QueueStatus" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "priority": { "type": "integer", "description": "Higher runs first." },
+          "upstream": { "type": "string", "description": "`owner/repo` the work targets." },
+          "fork": { "type": "string", "description": "`owner/repo` the agent pushes to." },
+          "prompt": { "type": "string" },
+          "series": { "type": ["string", "null"] },
+          "backend": { "type": ["string", "null"], "description": "Agent backend, e.g. `claude`." },
+          "model": { "type": ["string", "null"] },
+          "taskId": { "type": ["string", "null"], "description": "The run this entry became, once claimed." },
+          "concertId": { "type": ["string", "null"] },
+          "concertStepKey": { "type": ["string", "null"] }
+        }
+      },
+      "Task": {
+        "type": "object",
+        "description": "A run that happened.",
+        "required": ["id", "status", "createdAt", "upstream", "fork", "prompt", "series", "backend", "model", "sessionId", "continuesFrom", "budgetUsd"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "$ref": "#/components/schemas/TaskStatus" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "upstream": { "type": "string" },
+          "fork": { "type": "string" },
+          "prompt": { "type": "string" },
+          "series": { "type": ["string", "null"] },
+          "backend": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "sessionId": { "type": ["string", "null"] },
+          "continuesFrom": { "type": ["string", "null"], "description": "Id of the run this one resumed." },
+          "budgetUsd": { "type": ["number", "null"], "description": "Spend cap for the run." }
+        }
+      },
+      "TaskDetail": {
+        "type": "object",
+        "required": ["id", "status", "fork", "createdAt", "prompt", "log", "logTotal", "logLimit", "logTruncated"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string" },
+          "fork": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "prompt": { "type": "string" },
+          "log": {
+            "type": "array",
+            "description": "The trailing `logLimit` events of the run's structured log, oldest first. Event shape is the agent backend's, not this API's, and is deliberately not constrained here.",
+            "items": { "type": "object" }
+          },
+          "logTotal": { "type": "integer", "description": "Events in the log in total." },
+          "logLimit": { "type": "integer", "description": "The tail size used." },
+          "logTruncated": { "type": "boolean", "description": "Whether `log` is a tail rather than the whole." }
+        }
+      },
+      "Concert": {
+        "type": "object",
+        "required": ["id", "status", "name", "workflowFile", "startedAt", "finishedAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "$ref": "#/components/schemas/ConcertStatus" },
+          "name": { "type": ["string", "null"] },
+          "workflowFile": { "type": ["string", "null"] },
+          "startedAt": { "type": "string", "format": "date-time" },
+          "finishedAt": { "type": ["string", "null"], "format": "date-time" }
+        }
+      },
+      "Listener": {
+        "type": "object",
+        "required": ["name", "enabled", "sourceType", "intervalSeconds", "lastCheckedAt", "eventCount"],
+        "properties": {
+          "name": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "sourceType": { "type": "string", "description": "What the listener polls, e.g. `github-issues`." },
+          "intervalSeconds": { "type": "integer", "description": "Poll interval." },
+          "lastCheckedAt": { "type": ["string", "null"], "format": "date-time", "description": "`null` if it has never run." },
+          "eventCount": { "type": "integer", "description": "Distinct events processed so far." }
+        }
+      },
+      "ListenerDetail": {
+        "type": "object",
+        "required": ["name", "enabled", "intervalSeconds", "lastCheckedAt", "eventCount", "sourceType", "sourceDetail", "sourceExtras", "action", "recentEvents"],
+        "properties": {
+          "name": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "intervalSeconds": { "type": "integer" },
+          "lastCheckedAt": { "type": ["string", "null"], "format": "date-time" },
+          "eventCount": { "type": "integer" },
+          "sourceType": { "type": "string" },
+          "sourceDetail": { "type": "string" },
+          "sourceExtras": {
+            "type": "array",
+            "description": "Source-kind-specific fields, as `[label, value]` pairs.",
+            "items": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 }
+          },
+          "action": { "$ref": "#/components/schemas/ListenerAction" },
+          "recentEvents": {
+            "type": "array",
+            "description": "Ids of the most recently processed events, newest first.",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "ListenerAction": {
+        "type": "object",
+        "description": "The task a listener enqueues when its source matches.",
+        "required": ["mode", "upstream", "fork", "series", "backend", "model", "workflowPath", "priority", "promptTemplate"],
+        "properties": {
+          "mode": { "type": "string", "enum": ["fork", "pr"] },
+          "upstream": { "type": "string" },
+          "fork": { "type": "string" },
+          "series": { "type": ["string", "null"] },
+          "backend": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "workflowPath": { "type": ["string", "null"], "description": "Set when the listener enqueues a whole concert." },
+          "priority": { "type": "integer" },
+          "promptTemplate": { "type": "string" }
+        }
+      },
+      "IssueCounts": {
+        "type": "object",
+        "required": ["open", "claimed", "completed", "abandoned"],
+        "properties": {
+          "open": { "type": "integer" },
+          "claimed": { "type": "integer" },
+          "completed": { "type": "integer" },
+          "abandoned": { "type": "integer" }
+        }
+      },
+      "Project": {
+        "type": "object",
+        "required": ["id", "name", "description", "createdAt", "defaultTarget", "issueCount", "counts"],
+        "properties": {
+          "id": { "type": "string", "description": "Taxis id, as a string so it can be compared and put in a URL without numeric coercion." },
+          "name": { "type": "string" },
+          "description": { "type": ["string", "null"] },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "defaultTarget": { "type": ["string", "null"], "description": "`owner/repo@branch` work lands on by default." },
+          "issueCount": { "type": "integer" },
+          "counts": { "$ref": "#/components/schemas/IssueCounts" }
+        }
+      },
+      "Issue": {
+        "type": "object",
+        "description": "One node of a project's dependency graph.",
+        "required": ["id", "title", "status", "parentId", "dependencies", "prCount", "claimedBy", "updatedAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "status": { "$ref": "#/components/schemas/IssueStatus" },
+          "parentId": { "type": ["string", "null"] },
+          "dependencies": { "type": "array", "items": { "type": "string" }, "description": "Issue ids that must finish first." },
+          "prCount": { "type": "integer" },
+          "claimedBy": { "type": ["string", "null"], "description": "Agent currently holding the claim." },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "UsageLimit": {
+        "type": "object",
+        "required": ["kind", "scope", "percent", "severity", "active", "resetsAt"],
+        "properties": {
+          "kind": { "type": "string", "description": "`session`, `weekly_all`, `weekly_scoped`, or whatever else upstream reports." },
+          "scope": { "type": ["string", "null"], "description": "Model family a scoped limit applies to." },
+          "percent": { "type": "integer", "minimum": 0 },
+          "severity": { "type": "string", "enum": ["normal", "warning", "critical"] },
+          "active": { "type": "boolean", "description": "Whether this limit is currently the binding one." },
+          "resetsAt": { "type": ["string", "null"], "format": "date-time" }
+        }
+      },
+      "AuthSource": {
+        "type": "object",
+        "required": ["label", "backend", "kind", "baseUrl", "isDefault", "pollable", "state", "reason", "availableAt", "pressure", "polledAt", "lastUsedAt", "lastError", "backoffUntil", "limits"],
+        "properties": {
+          "label": { "type": "string" },
+          "backend": { "type": "string", "description": "Agent backend this source belongs to." },
+          "kind": { "type": "string", "enum": ["oauth", "api-key"] },
+          "baseUrl": { "type": ["string", "null"] },
+          "isDefault": { "type": "boolean", "description": "What a task that names no source gets." },
+          "pollable": { "type": "boolean", "description": "False for API-key sources, which bill per token and have no window to report." },
+          "state": { "type": "string", "enum": ["available", "blocked"], "description": "Branch on this, not on `availableAt`." },
+          "reason": { "type": ["string", "null"], "description": "Why it is blocked." },
+          "availableAt": { "type": ["string", "null"], "format": "date-time", "description": "When the block lifts. `null` when available, and also when blocked with no reported reset." },
+          "pressure": { "type": "number", "description": "Highest limit percentage across this source, as a fraction." },
+          "polledAt": { "type": ["string", "null"], "format": "date-time", "description": "How fresh these numbers are." },
+          "lastUsedAt": { "type": ["string", "null"], "format": "date-time" },
+          "lastError": { "type": ["string", "null"] },
+          "backoffUntil": { "type": ["string", "null"], "format": "date-time", "description": "Set only while a polling backoff is still in the future." },
+          "limits": { "type": "array", "items": { "$ref": "#/components/schemas/UsageLimit" } }
+        }
+      },
+      "AuthBackend": {
+        "type": "object",
+        "required": ["name", "defaultSource", "sources"],
+        "properties": {
+          "name": { "type": "string" },
+          "defaultSource": { "type": ["string", "null"] },
+          "sources": { "type": "array", "items": { "$ref": "#/components/schemas/AuthSource" } }
+        }
+      },
+      "Auth": {
+        "type": "object",
+        "required": ["configError", "backends"],
+        "properties": {
+          "configError": { "type": ["string", "null"], "description": "Set instead of `backends` when the config could not be read." },
+          "backends": { "type": "array", "items": { "$ref": "#/components/schemas/AuthBackend" } }
+        }
+      },
+      "OverviewCounts": {
+        "type": "object",
+        "required": ["running", "pending", "failed", "concerts", "listeners", "totalTasks", "authFree", "authTotal"],
+        "properties": {
+          "running": { "type": "integer" },
+          "pending": { "type": "integer" },
+          "failed": { "type": "integer" },
+          "concerts": { "type": "integer", "description": "Concert runs currently running." },
+          "listeners": { "type": "integer" },
+          "totalTasks": { "type": "integer" },
+          "authFree": { "type": "integer", "description": "Sources not currently blocked." },
+          "authTotal": { "type": "integer" }
+        }
+      },
+      "Overview": {
+        "type": "object",
+        "required": ["counts", "activeQueue", "recentTasks", "taxisUrl"],
+        "properties": {
+          "counts": { "$ref": "#/components/schemas/OverviewCounts" },
+          "taxisUrl": {
+            "type": ["string", "null"],
+            "description": "Base URL of the configured taxis tracker, or `null` if none is configured. Projects live in taxis and are its business to display; this is what a client links out to instead of rendering them, and `null` means there is nothing to link to."
+          },
+          "activeQueue": {
+            "type": "array",
+            "description": "Running and pending entries. Not paged; use `/api/v1/queue` for the full list.",
+            "items": { "$ref": "#/components/schemas/QueueEntry" }
+          },
+          "recentTasks": {
+            "type": "array",
+            "description": "The ten most recent runs. Use `/api/v1/tasks` for more.",
+            "items": { "$ref": "#/components/schemas/Task" }
+          }
+        }
+      }
+    }
+  },
+  "x-sse": {
+    "description": "Every path under `/api/v1/` is also a Server-Sent Events stream at the same path under `/sse/v1/`, carrying the identical JSON payload in the `data` field of each `message` event. Query parameters mean the same thing on both.\n\nFrames are pushed every two seconds, but only when the payload has changed since the last one, so an idle daemon costs nothing; a `: keep-alive` comment goes out every thirty seconds of silence to survive idle proxies. A stream whose resource disappears, or whose parameters are rejected, is closed rather than left hanging.\n\nAuthenticate with the session cookie or the bearer header, exactly as for the JSON routes.",
+    "example": "curl -N -H \"Authorization: Bearer $PASSWORD\" http://127.0.0.1:8080/sse/v1/overview"
+  }
+}

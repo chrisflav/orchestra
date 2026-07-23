@@ -8,7 +8,6 @@ import { Auth } from "./pages/Auth";
 import { ConcertDetail } from "./pages/Concerts";
 import { ListenerDetail, Listeners } from "./pages/Listeners";
 import { Overview } from "./pages/Overview";
-import { ProjectDetail, Projects } from "./pages/Projects";
 import { Queue } from "./pages/Queue";
 import { TaskDetail, Tasks } from "./pages/Tasks";
 
@@ -45,8 +44,6 @@ function Gate() {
           <Route index element={<Overview />} />
           <Route path="queue" element={<Queue />} />
           <Route path="concerts/:id" element={<ConcertDetail />} />
-          <Route path="projects" element={<Projects />} />
-          <Route path="projects/:id" element={<ProjectDetail />} />
           <Route path="listeners" element={<Listeners />} />
           <Route path="listeners/:name" element={<ListenerDetail />} />
           <Route path="tasks" element={<Tasks />} />

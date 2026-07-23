@@ -22,6 +22,9 @@ export function Layout() {
 
   const inFlight = counts === undefined ? 0 : counts.running + counts.pending;
   const authExhausted = counts !== undefined && counts.authTotal > 0 && counts.authFree === 0;
+  // `undefined` while the first payload is in flight, so the destination does not flash in
+  // and out on load; only a loaded payload with no tracker hides it for good.
+  const taxisUrl = data?.taxisUrl ?? null;
 
   return (
     <>
@@ -47,9 +50,31 @@ export function Layout() {
             <NavLink to="/tasks" className="nav-link">
               Tasks
             </NavLink>
-            <NavLink to="/projects" className="nav-link">
-              Projects
-            </NavLink>
+            {/* Projects live in taxis, which already displays them well; re-rendering them
+                here was a worse copy of a tool the operator already has open. The
+                destination disappears entirely when no tracker is configured, rather than
+                becoming a link to nowhere. */}
+            {taxisUrl !== null && (
+              <a
+                className="nav-link nav-out"
+                href={taxisUrl}
+                target="_blank"
+                rel="noreferrer noopener"
+              >
+                Projects
+                <svg viewBox="0 0 12 12" width="9" height="9" aria-hidden="true">
+                  <path
+                    d="M4 2h6v6M10 2 3 9"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+                <span className="visually-hidden"> (opens taxis in a new tab)</span>
+              </a>
+            )}
             <NavLink to="/listeners" className="nav-link">
               Listeners
             </NavLink>

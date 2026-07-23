@@ -10,10 +10,10 @@ export function Tasks() {
     <LivePage endpoint="tasks" title="Tasks">
       {(data) => (
         <List>
-          {data.tasks.length === 0 ? (
+          {data.items.length === 0 ? (
             <Empty>No tasks have run yet.</Empty>
           ) : (
-            data.tasks.map((t) => (
+            data.items.map((t) => (
               <Row
                 key={t.id}
                 to={`/tasks/${encodeURIComponent(t.id)}`}

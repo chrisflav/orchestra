@@ -785,7 +785,7 @@ the login and send `Authorization: Bearer <password>` instead:
 
 ```sh
 curl -H "Authorization: Bearer $(cat ~/.local/share/orchestra/dashboard.secret)" \
-     http://127.0.0.1:8080/api/overview
+     http://127.0.0.1:8080/api/v1/overview
 ```
 
 The server binds loopback unless `--host` says otherwise — it is plain HTTP behind that
@@ -797,6 +797,46 @@ The **Auth** page is the one to open when the queue has pending work but nothing
 names the limit that is binding on each source and when it lifts — the same data as
 [`orchestra usage`](#usage-limits), read from the usage store rather than polled, so opening the
 page costs nothing.
+
+### the API
+
+The web UI is one client of the API, not the reason it has the shape it has. Anything that
+speaks HTTP can read the same data, and the server describes itself:
+
+```sh
+curl http://127.0.0.1:8080/api/openapi.json     # needs no credential
+```
+
+That document is embedded in the binary, so it describes the server answering rather than some
+checkout, and a test fails the build if a route and the spec disagree.
+
+Reads live under `/api/v1/`, and every one of them is also a Server-Sent Events stream at the
+same path under `/sse/v1/` — identical payload, pushed when it changes and not otherwise, which
+is what makes it cheap to sit on:
+
+```sh
+curl -N -H "Authorization: Bearer $PASSWORD" http://127.0.0.1:8080/sse/v1/overview
+```
+
+Four conventions hold everywhere:
+
+- **Instants** are RFC 3339 UTC in a `...At` field. Never a rendered phrase — `"3m ago"` cannot
+  be compared or thresholded, and it is only useful if you read English.
+- **Durations** are integer seconds, in a `...Seconds` field.
+- **Absent** is `null`. `""` means present and empty, which for a name is a different fact.
+- **Collections** answer in one envelope — `items`, `total`, `limit`, `offset` — and take
+  `limit`, `offset`, and, where they are ordered by time, `since`. `total` counts matches
+  before the window, so "50 of 812" needs no second request. A parameter that is malformed, or
+  that a collection cannot honour, is a `400` rather than a shrug.
+
+```sh
+# the twenty most recent tasks since yesterday
+curl -H "Authorization: Bearer $PASSWORD" \
+     "http://127.0.0.1:8080/api/v1/tasks?limit=20&since=2026-07-22T00:00:00Z"
+```
+
+The API is read-only. Nothing here enqueues, cancels or reconfigures anything: the only routes
+that are not `GET` are the two that open and close a session.
 
 ## other commands
 
@@ -854,7 +894,7 @@ docker compose up --build
 ```
 
 Two containers come up off the one image: the daemon, and the [dashboard](#dashboard) on
-<http://127.0.0.1:8080> (`docker compose logs dashboard` prints the token it asks for). They are
+<http://127.0.0.1:8080> (`docker compose logs dashboard` prints the password it asks for). They are
 separate because the daemon drains in-flight tasks for up to half an hour on every stop, and a
 read-only web view should not be unavailable for that long.
 

@@ -36,31 +36,42 @@ export type IssueStatus = "open" | "claimed" | "completed" | "abandoned";
 export interface QueueEntry {
   id: string;
   status: QueueStatus;
-  fork: string;
   createdAt: string;
   priority: number;
-  series: string;
-  concertId: string;
-  concertStepKey: string;
+  upstream: string;
+  fork: string;
   prompt: string;
+  series: string | null;
+  backend: string | null;
+  model: string | null;
+  /** The run this entry became, once claimed. */
+  taskId: string | null;
+  concertId: string | null;
+  concertStepKey: string | null;
 }
 
 export interface TaskRecord {
   id: string;
   status: TaskStatus;
-  fork: string;
   createdAt: string;
-  series: string;
+  upstream: string;
+  fork: string;
   prompt: string;
+  series: string | null;
+  backend: string | null;
+  model: string | null;
+  sessionId: string | null;
+  continuesFrom: string | null;
+  budgetUsd: number | null;
 }
 
 export interface ConcertRun {
   id: string;
   status: ConcertStatus;
-  name: string;
-  workflowFile: string;
+  name: string | null;
+  workflowFile: string | null;
   startedAt: string;
-  finishedAt: string;
+  finishedAt: string | null;
 }
 
 export interface Overview {
@@ -76,15 +87,26 @@ export interface Overview {
   };
   activeQueue: QueueEntry[];
   recentTasks: TaskRecord[];
+  /**
+   * Base URL of the configured taxis tracker, or `null` if there is none.
+   *
+   * Projects live in taxis, so the dashboard links out rather than rendering them. `null`
+   * means there is nothing to link to and the destination is hidden entirely.
+   */
+  taxisUrl: string | null;
 }
 
-export interface QueueView {
-  concerts: ConcertRun[];
-  entries: QueueEntry[];
-}
-
-export interface ConcertsView {
-  concerts: ConcertRun[];
+/**
+ * The envelope every collection endpoint answers in.
+ *
+ * `total` counts what matched before `limit` and `offset` were applied, which is what lets a
+ * caller say "50 of 812" without a second request.
+ */
+export interface Collection<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface ConcertDetail {
@@ -97,22 +119,18 @@ export interface ListenerSummary {
   enabled: boolean;
   sourceType: string;
   intervalSeconds: number;
-  lastChecked: string;
+  lastCheckedAt: string | null;
   eventCount: number;
-}
-
-export interface ListenersView {
-  listeners: ListenerSummary[];
 }
 
 export interface ActionConfig {
   mode: "fork" | "pr";
   upstream: string;
   fork: string;
-  series: string;
-  backend: string;
-  model: string;
-  workflowPath: string;
+  series: string | null;
+  backend: string | null;
+  model: string | null;
+  workflowPath: string | null;
   priority: number;
   promptTemplate: string;
 }
@@ -121,7 +139,7 @@ export interface ListenerDetail {
   name: string;
   enabled: boolean;
   intervalSeconds: number;
-  lastChecked: string;
+  lastCheckedAt: string | null;
   eventCount: number;
   sourceType: string;
   sourceDetail: string;
@@ -129,10 +147,6 @@ export interface ListenerDetail {
   sourceExtras: [string, string][];
   action: ActionConfig;
   recentEvents: string[];
-}
-
-export interface TasksView {
-  tasks: TaskRecord[];
 }
 
 /**
@@ -166,10 +180,12 @@ export interface TaskDetail {
   fork: string;
   createdAt: string;
   prompt: string;
-  /** The tail of the log — at most the last 500 events. */
+  /** The trailing `logLimit` events of the run's log, oldest first. */
   log: LogEvent[];
   /** How many events the log holds in total. */
   logTotal: number;
+  /** The tail size the server used. */
+  logLimit: number;
   /** Whether `log` is a tail rather than the whole thing. */
   logTruncated: boolean;
 }
@@ -184,25 +200,21 @@ export interface IssueCounts {
 export interface ProjectSummary {
   id: string;
   name: string;
-  description: string;
+  description: string | null;
   createdAt: string;
-  defaultTarget: string;
+  defaultTarget: string | null;
   issueCount: number;
   counts: IssueCounts;
-}
-
-export interface ProjectsView {
-  projects: ProjectSummary[];
 }
 
 export interface IssueNode {
   id: string;
   title: string;
   status: IssueStatus;
-  parentId: string;
+  parentId: string | null;
   dependencies: string[];
   prCount: number;
-  claimedBy: string;
+  claimedBy: string | null;
   updatedAt: string;
 }
 
@@ -213,38 +225,41 @@ export interface ProjectDetail {
 
 export interface UsageLimit {
   kind: string;
-  scope: string;
+  scope: string | null;
   percent: number;
   severity: "normal" | "warning" | "critical" | string;
   active: boolean;
-  resets: string;
+  resetsAt: string | null;
 }
 
 export interface AuthSource {
   label: string;
+  backend: string;
   kind: "oauth" | "api-key";
-  baseUrl: string;
+  baseUrl: string | null;
   isDefault: boolean;
   pollable: boolean;
+  /** Branch on this, not on `availableAt`: a blocked source may report no reset time. */
   state: "available" | "blocked";
-  reason: string;
-  resets: string;
+  reason: string | null;
+  availableAt: string | null;
   pressure: number;
-  polled: string;
-  lastUsed: string;
-  lastError: string;
-  backoff: string;
+  /** How fresh these numbers are. */
+  polledAt: string | null;
+  lastUsedAt: string | null;
+  lastError: string | null;
+  backoffUntil: string | null;
   limits: UsageLimit[];
 }
 
 export interface AuthBackend {
   name: string;
-  defaultSource: string;
+  defaultSource: string | null;
   sources: AuthSource[];
 }
 
 export interface AuthView {
-  configError: string;
+  configError: string | null;
   backends: AuthBackend[];
 }
 
@@ -255,11 +270,11 @@ export interface AuthView {
  */
 export interface Endpoints {
   overview: Overview;
-  queue: QueueView;
-  concerts: ConcertsView;
-  listeners: ListenersView;
-  tasks: TasksView;
-  projects: ProjectsView;
+  queue: Collection<QueueEntry>;
+  concerts: Collection<ConcertRun>;
+  listeners: Collection<ListenerSummary>;
+  tasks: Collection<TaskRecord>;
+  projects: Collection<ProjectSummary>;
   auth: AuthView;
 }
 
@@ -284,6 +299,9 @@ export type PayloadOf<E extends Endpoint> = E extends keyof Endpoints
           ? ProjectDetail
           : never;
 
+/** The version prefix every read lives under. See `docs/openapi.json`. */
+export const API_VERSION = "v1";
+
 /**
  * Build the URL for an endpoint.
  *
@@ -291,21 +309,36 @@ export type PayloadOf<E extends Endpoint> = E extends keyof Endpoints
  * it before use (`safeSegment` in `Orchestra/Dashboard.lean`) — so an id containing a slash
  * or a `..` arrives as an ordinary name that simply matches nothing, rather than as a path.
  */
-function endpointUrl(kind: "api" | "sse", endpoint: string): string {
+function endpointUrl(kind: "api" | "sse", endpoint: string, query?: QueryParams): string {
   const slash = endpoint.indexOf("/");
   const path =
     slash === -1
       ? endpoint
       : `${endpoint.slice(0, slash)}/${encodeURIComponent(endpoint.slice(slash + 1))}`;
-  return `/${kind}/${path}`;
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value !== undefined) search.set(key, String(value));
+  }
+  const suffix = search.toString();
+  return `/${kind}/${API_VERSION}/${path}${suffix === "" ? "" : `?${suffix}`}`;
 }
 
-export function apiUrl(endpoint: string): string {
-  return endpointUrl("api", endpoint);
+/** Query parameters the API accepts. See `docs/openapi.json` for which endpoint takes which. */
+export interface QueryParams {
+  limit?: number;
+  offset?: number;
+  /** RFC 3339. Only on collections ordered by time. */
+  since?: string;
+  /** Only on a task detail. */
+  logLimit?: number;
 }
 
-export function sseUrl(endpoint: string): string {
-  return endpointUrl("sse", endpoint);
+export function apiUrl(endpoint: string, query?: QueryParams): string {
+  return endpointUrl("api", endpoint, query);
+}
+
+export function sseUrl(endpoint: string, query?: QueryParams): string {
+  return endpointUrl("sse", endpoint, query);
 }
 
 async function readError(response: Response): Promise<string> {
@@ -321,8 +354,11 @@ async function readError(response: Response): Promise<string> {
 }
 
 /** GET a payload, translating a 401 into `UnauthorizedError` so callers can show the login. */
-export async function fetchEndpoint<E extends Endpoint>(endpoint: E): Promise<PayloadOf<E>> {
-  const response = await fetch(apiUrl(endpoint), {
+export async function fetchEndpoint<E extends Endpoint>(
+  endpoint: E,
+  query?: QueryParams,
+): Promise<PayloadOf<E>> {
+  const response = await fetch(apiUrl(endpoint, query), {
     credentials: "same-origin",
     headers: { Accept: "application/json" },
   });

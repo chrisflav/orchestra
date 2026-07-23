@@ -11,10 +11,10 @@ export function Listeners() {
     <LivePage endpoint="listeners" title="Listeners">
       {(data) => (
         <List>
-          {data.listeners.length === 0 ? (
+          {data.items.length === 0 ? (
             <Empty>No listeners are configured.</Empty>
           ) : (
-            data.listeners.map((l) => (
+            data.items.map((l) => (
               <Row
                 key={l.name}
                 to={`/listeners/${encodeURIComponent(l.name)}`}
@@ -24,7 +24,7 @@ export function Listeners() {
                   l.sourceType,
                   `every ${interval(l.intervalSeconds)}`,
                   <>
-                    checked <Time key="t" iso={l.lastChecked} />
+                    checked <Time key="t" iso={l.lastCheckedAt ?? ""} />
                   </>,
                   `${l.eventCount} events`,
                 ]}
@@ -54,7 +54,7 @@ export function ListenerDetail() {
           { key: "State", value: <EnabledStatus enabled={data.enabled} /> },
           { key: "Source", value: data.sourceType, data: true },
           { key: "Polls every", value: interval(data.intervalSeconds), data: true },
-          { key: "Last checked", value: <Time iso={data.lastChecked} />, data: true },
+          { key: "Last checked", value: <Time iso={data.lastCheckedAt ?? ""} />, data: true },
           { key: "Events seen", value: data.eventCount, data: true },
           ...data.sourceExtras.map(([k, v]): Fact => ({ key: k, value: v, data: true })),
         ];

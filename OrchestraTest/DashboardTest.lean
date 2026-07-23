@@ -117,42 +117,77 @@ def apiKind_stripsOnlyItsOwnPrefix : Test := do
     (msg := "an SSE path is not an API path")
   TestM.assertEqual (apiKind "/api/" "/index.html") none
 
-/-! ## Request parsing -/
+/-! ## Request targets
 
-private def crlf (lines : List String) : String := String.intercalate "\r\n" lines
+Parsing a request is `Std.Http`'s job, not this module's, so there is nothing here about
+malformed request lines or truncated bodies — the library rejects those before a handler runs.
 
-@[test]
-def parseRequest_readsTheRequestLineAndHeaders : Test := do
-  let raw := crlf ["GET /api/overview HTTP/1.1", "Host: localhost:8080",
-    "Cookie: orchestra_session=abc", "", ""]
-  match parseRequest raw with
-  | none => TestM.fail "a well-formed GET should parse"
-  | some req =>
-    TestM.assertEqual req.method "GET"
-    TestM.assertEqual req.path "/api/overview"
-    TestM.assertEqual (headerValue req "host") (some "localhost:8080")
-    TestM.assertEqual (headerValue req "COOKIE") (some "orchestra_session=abc")
-      (msg := "header lookup is case-insensitive")
-    TestM.assertEqual (headerValue req "authorization") none
+What *is* covered is the one property of that parse the guards above are built on: the
+request-target arrives verbatim. `Std.Http` does not decode percent-escapes and does not
+normalise dot-segments, which is what keeps `%2e%2e` an ordinary filename rather than a second
+spelling of `..`. That is a property of the toolchain rather than of this code, and if a future
+version starts normalising, `staticCandidate` would silently be handed traversals it was never
+designed to see. Hence: pinned. -/
+
+private def parsedPath (raw : String) : String :=
+  pathOf (Std.Http.RequestTarget.parse! raw)
 
 @[test]
-def parseRequest_keepsTheBody : Test := do
-  let body := "{\"password\":\"hunter2\"}"
-  let raw := crlf ["POST /api/login HTTP/1.1", "Content-Type: application/json",
-    s!"Content-Length: {body.length}", "", body]
-  match parseRequest raw with
-  | none => TestM.fail "a well-formed POST should parse"
-  | some req =>
-    TestM.assertEqual req.method "POST"
-    TestM.assertEqual req.body body
-      (msg := "the login handler parses this as JSON, so it must survive intact")
+def pathOf_leavesTheRequestTargetVerbatim : Test := do
+  TestM.assertEqual (parsedPath "/api/overview") "/api/overview"
+  TestM.assertEqual (parsedPath "/api/tasks/abc123?x=1") "/api/tasks/abc123"
+    (msg := "the query string is not part of the path")
+  -- The two that matter. Either one normalised is a traversal `staticCandidate` cannot see.
+  TestM.assertEqual (parsedPath "/%2e%2e/etc/passwd") "/%2e%2e/etc/passwd"
+    (msg := "percent-escapes are not decoded")
+  TestM.assertEqual (parsedPath "/assets/../../etc/passwd") "/assets/../../etc/passwd"
+    (msg := "dot-segments are not normalised away")
+  TestM.assertEqual (parsedPath "/tasks/with%20space") "/tasks/with%20space"
+    (msg := "an escaped space survives for safeSegment to decode")
+
+/-! ## The published contract
+
+`docs/openapi.json` is embedded in the binary and served, so a client's description of the API
+and the API itself ship together. That is only worth anything if the two agree, and nothing
+about writing a spec by hand makes them agree — so the agreement is checked here rather than
+assumed. A route added without a spec entry, or a spec entry for a route that was removed,
+fails the suite. -/
+
+private def specJson : Except String Lean.Json := Lean.Json.parse openApiSpec
+
+private def specPaths : Except String (Array String) := do
+  let paths ← (← specJson).getObjVal? "paths"
+  let obj ← paths.getObj?
+  return obj.toArray.map (·.1)
 
 @[test]
-def parseRequest_rejectsGarbage : Test := do
-  TestM.assertEqual ((parseRequest "").map (·.method)) none
-    (msg := "an empty request line has no method")
-  TestM.assertEqual ((parseRequest "NONSENSE\r\n\r\n").map (·.method)) none
-    (msg := "a request line without a path is not a request")
+def openApiSpec_isValidAndDescribesEveryRoute : Test := do
+  match specPaths with
+  | .error e => TestM.fail s!"docs/openapi.json is not parseable JSON: {e}"
+  | .ok paths =>
+    TestM.assert (paths.size > 0) (msg := "the spec documents at least one path")
+    -- Every kind the dispatcher serves is documented …
+    for kind in apiKinds do
+      let expected := s!"/api/{apiVersion}/{kind}"
+      TestM.assert (paths.contains expected)
+        (msg := s!"{expected} is served but missing from docs/openapi.json")
+    -- … and nothing under the version prefix is documented that is not served.
+    let prefix_ := s!"/api/{apiVersion}/"
+    for path in paths do
+      if path.startsWith prefix_ then
+        let kind := (path.drop prefix_.length).toString
+        TestM.assert (apiKinds.contains kind)
+          (msg := s!"docs/openapi.json documents {path}, which no route serves")
+
+@[test]
+def openApiSpec_documentsTheAuthenticationSurface : Test := do
+  match specPaths with
+  | .error _ => TestM.fail "docs/openapi.json is not parseable JSON"
+  | .ok paths =>
+    -- These three sit outside the version prefix, so the sweep above cannot see them; they
+    -- are also the only routes a client can reach without a credential.
+    for path in ["/api/login", "/api/logout", "/api/session", "/api/openapi.json"] do
+      TestM.assert (paths.contains path) (msg := s!"{path} is served but not documented")
 
 /-! ## Cookies -/
 

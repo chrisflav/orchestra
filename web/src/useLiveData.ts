@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchEndpoint, sseUrl, UnauthorizedError } from "./api";
-import type { Endpoint, PayloadOf } from "./api";
+import type { Endpoint, PayloadOf, QueryParams } from "./api";
 import { useAuth } from "./auth";
 
 export interface LiveData<T> {
@@ -22,7 +22,13 @@ export interface LiveData<T> {
  * The server only pushes frames whose content changed, so an idle orchestra produces no
  * traffic and this hook does not re-render.
  */
-export function useLiveData<E extends Endpoint>(endpoint: E): LiveData<PayloadOf<E>> {
+export function useLiveData<E extends Endpoint>(
+  endpoint: E,
+  query?: QueryParams,
+): LiveData<PayloadOf<E>> {
+  // Serialised for the dependency list: a fresh object literal on every render would tear
+  // down and rebuild the SSE connection on every render.
+  const queryKey = JSON.stringify(query ?? {});
   const [data, setData] = useState<PayloadOf<E> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [live, setLive] = useState(false);
@@ -44,7 +50,7 @@ export function useLiveData<E extends Endpoint>(endpoint: E): LiveData<PayloadOf
 
     const subscribe = () => {
       if (cancelled) return;
-      source = new EventSource(sseUrl(endpoint), { withCredentials: true });
+      source = new EventSource(sseUrl(endpoint, query), { withCredentials: true });
       source.onopen = () => {
         if (!cancelled) setLive(true);
       };
@@ -62,7 +68,7 @@ export function useLiveData<E extends Endpoint>(endpoint: E): LiveData<PayloadOf
         // EventSource reconnects on its own. It cannot tell us *why* it dropped, so a
         // revoked session would otherwise reconnect forever: re-probe over fetch, which
         // can, and let that path route to the login screen.
-        void fetchEndpoint(endpoint).catch((err: unknown) => {
+        void fetchEndpoint(endpoint, query).catch((err: unknown) => {
           if (err instanceof UnauthorizedError && !cancelled) {
             source?.close();
             onUnauthorizedRef.current();
@@ -71,7 +77,7 @@ export function useLiveData<E extends Endpoint>(endpoint: E): LiveData<PayloadOf
       };
     };
 
-    void fetchEndpoint(endpoint)
+    void fetchEndpoint(endpoint, query)
       .then((initial) => {
         if (cancelled) return;
         setData(initial);
@@ -90,7 +96,9 @@ export function useLiveData<E extends Endpoint>(endpoint: E): LiveData<PayloadOf
       cancelled = true;
       source?.close();
     };
-  }, [endpoint]);
+    // `query` is covered by `queryKey`; including the object itself would defeat it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [endpoint, queryKey]);
 
   return { data, error, live };
 }
