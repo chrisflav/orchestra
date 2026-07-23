@@ -1,0 +1,79 @@
+name: Docker image
+
+# Builds docker/Dockerfile on every pull request and publishes the result to GitHub Container
+# Registry for anything landing on master or a version tag. The build compiles orchestra — and,
+# on a cold cache, the Lean toolchain's dependencies — from source, so it is deliberately kept
+# out of the Lean CI job: that one only needs `lake build`, and pairing them would double the
+# slowest thing in the repo.
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+# The most expensive job here by a wide margin, and a superseded run tells nobody anything.
+# Tags get their own group so a push to master can't cancel a release build sharing its commit.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Cold builds fetch the Lean toolchain and compile orchestra plus its dependencies; the
+    # default 6h limit is far more rope than that ever needs, and a hung build should fail
+    # rather than sit there.
+    timeout-minutes: 90
+    permissions:
+      # Both needed by GITHUB_TOKEN below: read to check out, write to push to ghcr.io.
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # buildx, for the cache backend below — the classic builder has no `--cache-to`.
+      - uses: docker/setup-buildx-action@v3
+
+      # Skipped for pull requests, which don't push. A PR from a fork gets a read-only
+      # GITHUB_TOKEN anyway, so attempting a login there would fail rather than degrade.
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          # The repository root, matching `build.context: ..` in docker/docker-compose.yaml —
+          # the Dockerfile's COPYs are all relative to it, and .dockerignore keeps .lake and the
+          # prebuilt Incus images out.
+          context: .
+          file: docker/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # mode=max caches the intermediate stages too (landrun, the Vite build, the Lean
+          # build), which is where all the time goes — the runtime stage is just apt.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
