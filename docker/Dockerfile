@@ -43,6 +43,9 @@ COPY OrchestraTest.lean TestDriver.lean ./
 COPY Orchestra ./Orchestra
 COPY OrchestraTest ./OrchestraTest
 COPY ffi ./ffi
+# Orchestra/Dashboard.lean embeds docs/openapi.json with `include_str`, so the spec is a build
+# input like any source file — the API and the description a client reads ship in one binary.
+COPY docs ./docs
 # `lake build orchestra` (not the bare `lake build`) so this doesn't also compile the test driver.
 RUN lake build orchestra
 
