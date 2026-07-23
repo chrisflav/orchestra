@@ -1,5 +1,28 @@
 name: orchestra
 
+# Shared by both services below. The dashboard needs it for the same reason the daemon does:
+# whichever container starts first renders config.json from it (see docker/entrypoint.sh), and
+# the dashboard reads the same file to list authentication sources.
+x-orchestra-env: &orchestra-env
+  # taxis instance backing projects/issues/claims. Required — every project, issue and claim
+  # operation fails without it. This compose file expects taxis to be running elsewhere; point
+  # the URL at it. If taxis runs in its own compose project on the same host, use its
+  # container name plus a shared network, or the host gateway (see docker/README.md).
+  # (Left unset-tolerant so `docker compose build` works without a .env; the entrypoint fails
+  # with a clear message at start-up if it's still empty and no config.json is mounted.)
+  ORCHESTRA_TAXIS_URL: ${ORCHESTRA_TAXIS_URL:-}
+  ORCHESTRA_TAXIS_TOKEN: ${ORCHESTRA_TAXIS_TOKEN:-}
+  # GitHub auth: a PAT is the simple path; the GitHub App fields are the alternative and need
+  # the private key mounted at the path given.
+  ORCHESTRA_GITHUB_PAT: ${ORCHESTRA_GITHUB_PAT:-}
+  ORCHESTRA_GITHUB_APP_ID: ${ORCHESTRA_GITHUB_APP_ID:-0}
+  # Path *inside* the container — i.e. under /secrets, see the volume below. Left empty by
+  # default so PAT users get no spurious "key missing" warning at start-up.
+  ORCHESTRA_GITHUB_PRIVATE_KEY_PATH: ${ORCHESTRA_GITHUB_PRIVATE_KEY_PATH:-}
+  # Agent auth: one of these, depending on how you authenticate Claude.
+  ORCHESTRA_CLAUDE_TOKEN: ${ORCHESTRA_CLAUDE_TOKEN:-}
+  ORCHESTRA_ANTHROPIC_API_KEY: ${ORCHESTRA_ANTHROPIC_API_KEY:-}
+
 services:
   orchestra:
     build:
@@ -15,25 +38,7 @@ services:
     # as soon as the last in-flight task lands. A second SIGTERM (stop again, or Ctrl-C twice in
     # the foreground) cancels the running tasks rather than waiting for them.
     stop_grace_period: ${ORCHESTRA_STOP_GRACE_PERIOD:-30m}
-    environment:
-      # taxis instance backing projects/issues/claims. Required — every project, issue and claim
-      # operation fails without it. This compose file expects taxis to be running elsewhere; point
-      # the URL at it. If taxis runs in its own compose project on the same host, use its
-      # container name plus a shared network, or the host gateway (see docker/README.md).
-      # (Left unset-tolerant so `docker compose build` works without a .env; the entrypoint fails
-      # with a clear message at start-up if it's still empty and no config.json is mounted.)
-      ORCHESTRA_TAXIS_URL: ${ORCHESTRA_TAXIS_URL:-}
-      ORCHESTRA_TAXIS_TOKEN: ${ORCHESTRA_TAXIS_TOKEN:-}
-      # GitHub auth: a PAT is the simple path; the GitHub App fields are the alternative and need
-      # the private key mounted at the path given.
-      ORCHESTRA_GITHUB_PAT: ${ORCHESTRA_GITHUB_PAT:-}
-      ORCHESTRA_GITHUB_APP_ID: ${ORCHESTRA_GITHUB_APP_ID:-0}
-      # Path *inside* the container — i.e. under /secrets, see the volume below. Left empty by
-      # default so PAT users get no spurious "key missing" warning at start-up.
-      ORCHESTRA_GITHUB_PRIVATE_KEY_PATH: ${ORCHESTRA_GITHUB_PRIVATE_KEY_PATH:-}
-      # Agent auth: one of these, depending on how you authenticate Claude.
-      ORCHESTRA_CLAUDE_TOKEN: ${ORCHESTRA_CLAUDE_TOKEN:-}
-      ORCHESTRA_ANTHROPIC_API_KEY: ${ORCHESTRA_ANTHROPIC_API_KEY:-}
+    environment: *orchestra-env
     # Upstream resolvers, when the host's own are unusable from a container — see
     # docker/README.md's "error connecting to api.github.com". Empty (the default) changes
     # nothing.
@@ -60,3 +65,60 @@ services:
       # missing bind-mounted file, which would surface later as a confusing openssl error.
       # Drop your key in ./secrets/ and set ORCHESTRA_GITHUB_PRIVATE_KEY_PATH to its path here.
       - ${ORCHESTRA_SECRETS_DIR:-./secrets}:/secrets:ro
+
+  # The web dashboard: `orchestra dashboard serve` over the same /config and /data.
+  #
+  # A separate container rather than a thread inside the daemon, because the two have opposite
+  # restart characteristics: the daemon drains for up to `stop_grace_period` on every stop, and
+  # tying a read-only web view to that would make the dashboard unavailable exactly when someone
+  # is trying to look at why a task is stuck. Nothing here dispatches work — it reads the same
+  # state files the daemon writes.
+  dashboard:
+    # Same build as above so `docker compose build` produces the one image both services use;
+    # Compose builds it once and reuses it.
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: orchestra:latest
+    restart: unless-stopped
+    # `--site` serves the front-end the Dockerfile's Node stage built, so one port answers both
+    # the HTML and the JSON API and no CORS hop is involved. `--host 0.0.0.0` is required
+    # *inside* a container: the default binds loopback, which nothing outside the container can
+    # reach. Exposure is controlled by the published port below, not by this.
+    command:
+      - dashboard
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --site
+      - /opt/orchestra/dashboard-site
+    ports:
+      # Published on the loopback interface of the *host* by default: the API is plain HTTP and
+      # gated only by a password, so it should not be on a LAN — let alone the internet —
+      # without a reverse proxy terminating TLS in front of it. Set ORCHESTRA_DASHBOARD_BIND to
+      # 0.0.0.0 (or a specific interface address) once something is doing that, and add
+      # `--secure-cookie` to the command above so the session cookie is HTTPS-only.
+      - "${ORCHESTRA_DASHBOARD_BIND:-127.0.0.1}:${ORCHESTRA_DASHBOARD_PORT:-8080}:8080"
+    # Deliberately *not* `<<: *orchestra-env`. This is the one container reachable from outside,
+    # and it needs none of the daemon's credentials: it dispatches nothing, opens no PR, and
+    # runs no agent. Only taxis is here, because the projects and issues pages read it. The
+    # entrypoint also skips rendering config.json in this container precisely because it does
+    # not hold the rest (see docker/entrypoint.sh).
+    environment:
+      ORCHESTRA_TAXIS_URL: ${ORCHESTRA_TAXIS_URL:-}
+      ORCHESTRA_TAXIS_TOKEN: ${ORCHESTRA_TAXIS_TOKEN:-}
+      # The password the dashboard asks for. Leave it unset to have one generated and persisted
+      # to data/orchestra/dashboard.secret on first start — the container prints it, so
+      # `docker compose logs dashboard` is the quickest way to read it.
+      ORCHESTRA_DASHBOARD_PASSWORD: ${ORCHESTRA_DASHBOARD_PASSWORD:-}
+    # So the daemon is the container that renders config.json on a first `up`; the dashboard
+    # never writes one. Compose only orders the *starts*, so the dashboard can come up before
+    # config.json exists — the auth page re-reads it per request and fills in on its own.
+    depends_on:
+      - orchestra
+    volumes:
+      # /config read-only: the dashboard reads config.json for the auth-sources page and must
+      # never write it. /data read-write, because a generated password is persisted there.
+      - ./config:/config:ro
+      - ./data:/data

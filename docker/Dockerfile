@@ -11,6 +11,20 @@ FROM golang:1.24-bookworm AS landrun
 ARG LANDRUN_VERSION=v0.1.15
 RUN GOBIN=/out go install github.com/zouuup/landrun/cmd/landrun@${LANDRUN_VERSION}
 
+# ---- dashboard front-end ----
+# The dashboard's UI is a React/TypeScript app built by Vite. It is a build artifact, not a
+# tracked file (see .gitignore), so it is compiled here rather than copied in. Node appears
+# again in the runtime stage below, but only for the Claude Code CLI — nothing at run time
+# needs this toolchain, so it stays confined to its own stage.
+FROM node:22-bookworm-slim AS web
+WORKDIR /web
+# Dependencies first: this layer is keyed on the lockfile alone, so editing a component does
+# not re-run `npm ci`.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 # ---- orchestra build ----
 # elan is installed directly rather than using a Lean base image, so the toolchain pinned by
 # lean-toolchain is fetched exactly as `lake` would locally. `build-essential` provides the `cc`
@@ -62,6 +76,9 @@ COPY skills /opt/orchestra/skills
 
 COPY --from=landrun /out/landrun /usr/local/bin/landrun
 COPY --from=build /src/.lake/build/bin/orchestra /usr/local/bin/orchestra
+# Served by the `dashboard` service in docker-compose.yaml (`--site`). Baked in at a fixed path
+# for the same reason as the skills above: it must not depend on a bind mount.
+COPY --from=web /web/dist /opt/orchestra/dashboard-site
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

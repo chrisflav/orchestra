@@ -1603,6 +1603,57 @@ private def migrateCmd : Cmd := `[Cli|
   "Migrate configuration and state from ~/.agent/ to XDG directories (~/.config/orchestra/ and ~/.local/share/orchestra/)."
 ]
 
+private def dashboardHandler (p : Parsed) : IO UInt32 := do
+  let port := p.flag? "port" |>.map (·.as! Nat) |>.getD 8080
+  let host := p.flag? "host" |>.map (·.as! String) |>.getD "127.0.0.1"
+  let (password, generated) ← Dashboard.resolvePassword (p.flag? "password" |>.map (·.as! String))
+  let siteDir := p.flag? "site" |>.map (fun f => System.FilePath.mk (f.as! String))
+  let configPath := p.flag? "config" |>.map (fun f => System.FilePath.mk (f.as! String))
+  let sessionTtl := p.flag? "session-ttl" |>.map (·.as! Nat) |>.getD 43200
+  if let some dir := siteDir then
+    unless ← (dir / "index.html").pathExists do
+      IO.eprintln s!"error: '{dir}' has no index.html, so it is not a built front-end."
+      IO.eprintln "Build it first:  cd web && npm ci && npm run build"
+      IO.eprintln s!"then point --site at web/dist (given here: {dir})."
+      return 1
+  let (boundPort, _shutdown) ← Dashboard.serve
+    { password, port := port.toUInt16, host, siteDir, configPath, sessionTtlSeconds := sessionTtl,
+      secureCookie := p.hasFlag "secure-cookie" }
+  match siteDir with
+  | some _ => IO.println s!"Orchestra dashboard listening on http://{host}:{boundPort}"
+  | none   => IO.println s!"Orchestra dashboard API (no front-end) on http://{host}:{boundPort}"
+  -- A configured password is already known to whoever configured it, and echoing it would
+  -- only copy it into the container logs; a generated one has to be shown once or it is lost.
+  if generated then
+    IO.println ""
+    IO.println s!"  Dashboard password: {password}"
+    IO.println ""
+    IO.println "Generated on first run and saved to <data>/dashboard.secret. Set --password or"
+    IO.println s!"${Dashboard.passwordEnvVar} to choose it yourself."
+  else
+    IO.println "Log in with the configured password (--password / \
+$ORCHESTRA_DASHBOARD_PASSWORD / <data>/dashboard.secret)."
+  IO.println "Scripts can authenticate with 'Authorization: Bearer <password>' instead."
+  if siteDir.isNone then
+    IO.println "Pass --site web/dist to serve the built front-end from here as well."
+  repeat do
+    IO.sleep 60000
+  return 0
+
+private def dashboardCmd : Cmd := `[Cli|
+  dashboard VIA dashboardHandler; ["0.1.0"]
+  "Serve the web dashboard: the JSON API, its SSE streams, and the built front-end."
+
+  FLAGS:
+    p, port : Nat; "Port to listen on (default: 8080)"
+    host : String; "Address to bind (default: 127.0.0.1; use 0.0.0.0 in a container)"
+    password : String; "Password to require (default: $ORCHESTRA_DASHBOARD_PASSWORD or a generated, persisted one)"
+    s, site : String; "Serve the front-end built into this directory (web/dist)"
+    c, config : String; "Path to config file (read for the auth-sources page)"
+    "session-ttl" : Nat; "Session cookie lifetime in seconds (default: 43200)"
+    "secure-cookie"; "Mark the session cookie Secure (only behind a TLS-terminating proxy)"
+]
+
 -- All optional tool permission tokens recognised by --tools.
 private def allOptionalTools : List String :=
   ["create_pr", "comment", "manage_issues", "work_issues", "review_issues"]
@@ -1723,7 +1774,8 @@ def orchestraCmd : Cmd := `[Cli|
     spawnCmd;
     rolesCmd;
     usageCmd;
-    migrateCmd
+    migrateCmd;
+    dashboardCmd
 ]
 
 /-- Wrap a stream so that every write is flushed immediately.

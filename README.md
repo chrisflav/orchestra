@@ -755,6 +755,89 @@ orchestra project health <project-id>          # find claims whose task is gone
 concepts map onto taxis, the `taxis` config block, role templates and their prompt variables, the
 dispatch triggers, and how the two dispatchers differ.
 
+## dashboard
+
+A read-only web view of everything above: the queue and concert runs, listeners and when they last
+checked, task history with the full structured log of each run, projects with their issue
+dependency graph, and every configured authentication source with the usage limits last reported
+for it. Pages stream updates over Server-Sent Events, so they stay current without a reload.
+
+The UI is a React/TypeScript app under [`web/`](web/), built by Vite; the backend is the Lean
+server behind `orchestra dashboard`, which answers the JSON API, its SSE streams, and — with
+`--site` — the built front-end, all on one port:
+
+```sh
+cd web && npm ci && npm run build && cd ..
+orchestra dashboard --site web/dist --port 8080
+```
+
+`web/dist` is a build artifact and is not tracked, so `npm run build` has to run before
+`--site` has anything to point at. During front-end work `npm run dev` is the better loop: it
+serves the app with hot reload and proxies `/api` and `/sse` through to a `orchestra dashboard`
+running on 8080, which keeps the app same-origin in development exactly as it is in production.
+
+Access is gated by a password. The login screen exchanges it for an `HttpOnly`,
+`SameSite=Strict` session cookie, so the secret is never held in `localStorage` and never rides
+in a URL — including on the SSE streams, which authenticate with the same cookie. The password
+comes from `--password`, `$ORCHESTRA_DASHBOARD_PASSWORD`, or one generated on first run and
+persisted to `<data>/dashboard.secret`; a generated one is printed at start-up. Scripts can skip
+the login and send `Authorization: Bearer <password>` instead:
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.local/share/orchestra/dashboard.secret)" \
+     http://127.0.0.1:8080/api/v1/overview
+```
+
+The server binds loopback unless `--host` says otherwise — it is plain HTTP behind that
+password, so anything wider wants TLS in front, plus `--secure-cookie` so the session cookie is
+only ever sent over HTTPS. The docker image builds the front-end in a Node stage and runs the
+server as [its own container](docker/README.md#dashboard).
+
+The **Auth** page is the one to open when the queue has pending work but nothing is running: it
+names the limit that is binding on each source and when it lifts — the same data as
+[`orchestra usage`](#usage-limits), read from the usage store rather than polled, so opening the
+page costs nothing.
+
+### the API
+
+The web UI is one client of the API, not the reason it has the shape it has. Anything that
+speaks HTTP can read the same data, and the server describes itself:
+
+```sh
+curl http://127.0.0.1:8080/api/openapi.json     # needs no credential
+```
+
+That document is embedded in the binary, so it describes the server answering rather than some
+checkout, and a test fails the build if a route and the spec disagree.
+
+Reads live under `/api/v1/`, and every one of them is also a Server-Sent Events stream at the
+same path under `/sse/v1/` — identical payload, pushed when it changes and not otherwise, which
+is what makes it cheap to sit on:
+
+```sh
+curl -N -H "Authorization: Bearer $PASSWORD" http://127.0.0.1:8080/sse/v1/overview
+```
+
+Four conventions hold everywhere:
+
+- **Instants** are RFC 3339 UTC in a `...At` field. Never a rendered phrase — `"3m ago"` cannot
+  be compared or thresholded, and it is only useful if you read English.
+- **Durations** are integer seconds, in a `...Seconds` field.
+- **Absent** is `null`. `""` means present and empty, which for a name is a different fact.
+- **Collections** answer in one envelope — `items`, `total`, `limit`, `offset` — and take
+  `limit`, `offset`, and, where they are ordered by time, `since`. `total` counts matches
+  before the window, so "50 of 812" needs no second request. A parameter that is malformed, or
+  that a collection cannot honour, is a `400` rather than a shrug.
+
+```sh
+# the twenty most recent tasks since yesterday
+curl -H "Authorization: Bearer $PASSWORD" \
+     "http://127.0.0.1:8080/api/v1/tasks?limit=20&since=2026-07-22T00:00:00Z"
+```
+
+The API is read-only. Nothing here enqueues, cancels or reconfigures anything: the only routes
+that are not `GET` are the two that open and close a session.
+
 ## other commands
 
 ```
@@ -763,6 +846,7 @@ orchestra cleanup                     # remove all cloned repositories
 orchestra cleanup list                # list clones and their task slots
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
 orchestra usage                       # usage limits of every configured auth source
+orchestra dashboard --site web/dist   # the web dashboard (API, SSE and UI on one port)
 orchestra migrate                     # move ~/.agent/ to the XDG directories
 ```
 
@@ -809,8 +893,13 @@ cp .env.example .env      # fill in at least ORCHESTRA_TAXIS_URL and a token
 docker compose up --build
 ```
 
-The container runs `orchestra queue start`; override the command for one-off subcommands against
-the same volumes:
+Two containers come up off the one image: the daemon, and the [dashboard](#dashboard) on
+<http://127.0.0.1:8080> (`docker compose logs dashboard` prints the password it asks for). They are
+separate because the daemon drains in-flight tasks for up to half an hour on every stop, and a
+read-only web view should not be unavailable for that long.
+
+The daemon container runs `orchestra queue start`; override the command for one-off subcommands
+against the same volumes:
 
 ```
 docker compose run --rm orchestra project list

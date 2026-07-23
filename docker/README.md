@@ -1,7 +1,8 @@
 # Running orchestra in Docker
 
 Packages the queue daemon (`orchestra queue start`) with everything it shells out to: `landrun`,
-`git`, `gh`, `openssl`, the Lean toolchain, and the Claude Code CLI.
+`git`, `gh`, `openssl`, the Lean toolchain, and the Claude Code CLI. A second container off the
+same image serves the web dashboard.
 
 This is the Docker equivalent of `container/configuration.nix`, which packages the same thing for
 NixOS/Incus. Both install the same dependency set; keep them in sync.
@@ -17,6 +18,9 @@ docker compose up --build
 The first build takes a while — it fetches the Lean toolchain and compiles orchestra and its
 dependencies from source.
 
+Two containers come up: `orchestra` (the queue daemon) and `dashboard` (the web view, on
+<http://127.0.0.1:8080> — see [Dashboard](#dashboard) for the token it asks for).
+
 ## What is in the image
 
 | Component | Why |
@@ -28,6 +32,7 @@ dependencies from source.
 | `elan` + `build-essential` | Agent tasks build the Lean projects they work on, so the toolchain is needed at runtime, not just to build orchestra. |
 | `jq` | Used by the entrypoint to render `config.json`. |
 | Claude Code CLI | The default agent backend (`role.backend.getD "claude"`). |
+| `/opt/orchestra/dashboard-site` | The dashboard's React front-end, built by the Dockerfile's Node stage and served by the `dashboard` container. |
 
 Only the Claude backend is installed. `opencode`, `pi` and `vibe` exist in `Orchestra/Agents/`
 and in the Nix container but are not in this image; add them to the Dockerfile if you use them.
@@ -101,6 +106,62 @@ Note the compose file mounts the secrets *directory*, not the key file. Bind-mou
 doesn't exist on the host makes Docker silently create a **directory** in its place, which
 surfaces much later as a confusing openssl error; mounting the containing directory avoids that
 entirely. The entrypoint still checks the key path and fails fast if it is a directory.
+
+## Dashboard
+
+The `dashboard` service runs `orchestra dashboard` off the same image, published on
+`127.0.0.1:8080` by default:
+
+```sh
+docker compose logs dashboard    # prints the generated password
+open http://127.0.0.1:8080
+```
+
+The page asks for that password once. Logging in exchanges it for an `HttpOnly`,
+`SameSite=Strict` session cookie, so the password itself is never stored in the browser and
+never appears in a URL. Leaving `ORCHESTRA_DASHBOARD_PASSWORD` empty generates one on first
+start and persists it to `data/orchestra/dashboard.secret`, so it survives restarts — set the
+variable instead if you would rather choose it. Sessions live in memory, so restarting the
+container signs everyone out.
+
+Scripts can skip the login screen entirely and send the same secret as a bearer token:
+
+```sh
+curl -H "Authorization: Bearer $ORCHESTRA_DASHBOARD_PASSWORD" \
+     http://127.0.0.1:8080/api/overview
+```
+
+What it shows: the queue and concert runs, listeners and their last check, task history with the
+full structured log of each run, projects with their issue dependency graph, and **Auth** — every
+configured authentication source with the usage limits last reported for it. That last page is
+the one to open when the queue has pending work but nothing is running: it names the limit that
+is binding and when it lifts. It reads the usage store the daemon refreshes rather than polling
+Anthropic itself, and each row says how long ago it was polled.
+
+A few deliberate choices:
+
+- **A separate container, not a thread in the daemon.** The daemon drains for up to
+  `stop_grace_period` on every stop, and a read-only web view should not be unavailable for half
+  an hour exactly when someone is trying to see why a task is stuck. The dashboard dispatches
+  nothing; it reads the state files the daemon writes.
+- **Narrower credentials than the daemon.** This is the only container reachable from outside,
+  and its environment carries no GitHub PAT and no agent tokens — only the taxis URL and token,
+  which the projects and issues pages need. It mounts `/config` read-only and never renders
+  `config.json`; the daemon's container does that (see `entrypoint.sh`).
+- **One port for the UI and the JSON.** The image builds the React front-end in a Node stage and
+  bakes it in at `/opt/orchestra/dashboard-site`; `--site` serves it next to the API. One origin
+  answers both, so there is no second web server, no CORS header anywhere, and nothing for a
+  cross-origin page to reach.
+- **Published on loopback.** The API is plain HTTP behind a password. Put TLS in front of it
+  before setting `ORCHESTRA_DASHBOARD_BIND` to anything wider, and add `--secure-cookie` to the
+  service's `command` so the session cookie is only ever sent over HTTPS:
+
+  ```sh
+  ORCHESTRA_DASHBOARD_BIND=0.0.0.0     # only behind a reverse proxy
+  ORCHESTRA_DASHBOARD_PORT=8080
+  ```
+
+To run without it, `docker compose up orchestra` starts the daemon alone.
 
 ## Reaching taxis
 
@@ -210,7 +271,9 @@ docker compose stop
 
 This sends SIGTERM to the daemon, which stops claiming new work, lets the tasks already running
 finish, and then exits — the same drain as `orchestra queue shutdown`. It returns as soon as the
-last in-flight task lands, so the wait is only as long as the work outstanding.
+last in-flight task lands, so the wait is only as long as the work outstanding. The dashboard
+container holds nothing and stops immediately; `docker compose stop dashboard` takes it down on
+its own if you want to keep the daemon running.
 
 Send it again while the drain is in progress (`docker compose stop` a second time, or Ctrl-C twice
 if you started it in the foreground) to cancel the running tasks instead, equivalent to

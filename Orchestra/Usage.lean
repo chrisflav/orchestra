@@ -127,15 +127,21 @@ def nowEpoch : IO Int := do
 def nowDispatchTick : IO Int := do
   return (← Std.Time.Timestamp.now).toNanosecondsSinceUnixEpoch.val
 
-/-- A human-readable "in 2h 5m", for log lines and `orchestra usage`. -/
+/-- A human-readable "in 2h 5m", for log lines and `orchestra usage`.
+
+    Days are a bucket of their own because the weekly limits are the ones people read this
+    for, and their windows are up to seven days wide — "in 3d 4h" is an answer, "in 76h 12m"
+    is arithmetic homework. -/
 def relativeToNow (target now : Int) : String :=
   let d := target - now
   if d ≤ 0 then "now"
   else
     let secs := d.toNat
-    let h := secs / 3600
+    let days := secs / 86400
+    let h := (secs % 86400) / 3600
     let m := (secs % 3600) / 60
-    if h > 0 then s!"in {h}h {m}m" else if m > 0 then s!"in {m}m" else s!"in {secs}s"
+    if days > 0 then s!"in {days}d {h}h"
+    else if h > 0 then s!"in {h}h {m}m" else if m > 0 then s!"in {m}m" else s!"in {secs}s"
 
 /-! ## The limit model -/
 
