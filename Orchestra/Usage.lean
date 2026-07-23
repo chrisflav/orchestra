@@ -569,22 +569,55 @@ def defaultBaseUrl : String := "https://api.anthropic.com"
 
     `rateLimited` is called out separately because it is the one failure that must change future
     behaviour rather than just be reported: the endpoint meters requests independently of any
-    subscription, and continuing to poll through a 429 keeps the monitor blind for longer. -/
+    subscription, and continuing to poll through a 429 keeps the monitor blind for longer. It
+    carries the server's own `retry-after`, in seconds, when it sent one. -/
 inductive FetchError where
-  | rateLimited
+  | rateLimited (retryAfterSecs : Option Int)
   | other (msg : String)
 deriving Repr, Inhabited
 
 def FetchError.message : FetchError → String
-  | .rateLimited => "the usage endpoint is rate-limiting requests; backing off"
-  | .other m     => m
+  | .rateLimited _ => "the usage endpoint is rate-limiting requests; backing off"
+  | .other m       => m
 
-/-- How long to stop polling for after a 429 from the usage endpoint.
+/-- How often the background poller refreshes every source, and the age past which any other
+    caller considers the stored numbers stale.
 
-    The endpoint answers a burst with `retry-after: ~287`, so five minutes clears it. Curl gives
-    us the body but not that header, and hard-coding the observed value is enough: the poller's
-    own interval is the same five minutes, so a backoff simply skips one round. -/
+    Sized against what the endpoint actually allows: it answers roughly five requests with a
+    `429` and a `retry-after: 300`, so the sustainable rate is about one request per minute per
+    token and every polling site has to fit inside that together. One round per source per five
+    minutes leaves the rest of the budget for the paths that poll only when they must. -/
+def pollIntervalSecs : Int := 300
+
+/-- Fallback backoff after a 429 that arrived without a usable `retry-after`. -/
 def pollBackoffSecs : Int := 300
+
+/-- Backoff after a poll that failed for any other reason — a network blip, a rejected token, an
+    unparseable body.
+
+    Short, because retrying is what recovers from all three, but not zero: a failed poll leaves
+    `fetchedEpoch` untouched, so without a floor here the source stays permanently *stale* and
+    every claim decision retries it immediately. That turns one blip into a request per claim
+    tick, which is how the endpoint's budget gets spent and how a 429 arrives next. -/
+def errorBackoffSecs : Int := 60
+
+/-- How long to stop polling a source after a poll failed.
+
+    `errorBackoffSecs` is a floor under the 429 case too: a server that answers `retry-after: 0`
+    — or a proxy that invents one — must not be able to talk us into retrying immediately, since
+    the whole point of the backoff is that the next request would fail as well. -/
+def FetchError.backoffSecs : FetchError → Int
+  | .rateLimited ra => max (ra.getD pollBackoffSecs) errorBackoffSecs
+  | .other _        => errorBackoffSecs
+
+/-- The `retry-after` of a rate-limited response, in seconds.
+
+    Only the delta form is read. A date is legal HTTP but this endpoint does not send one, and
+    reading `Wed, 22 Jul 2026 …` as a number would produce a nonsense backoff — so anything that
+    is not a plain count of seconds is reported as absent and the default is used instead. -/
+def retryAfterSecs (headers : Array (String × String)) : Option Int :=
+  (Utils.Http.header? headers "retry-after").bind fun v =>
+    v.trimAscii.toString.toNat?.map Int.ofNat
 
 /-- Fetch and parse `GET /api/oauth/usage` for one OAuth token.
 
@@ -594,10 +627,10 @@ def pollBackoffSecs : Int := 300
 def fetchUtilization (token : String) (baseUrl : String := defaultBaseUrl)
     : IO (Except FetchError (Array Limit)) := do
   try
-    let (status, body) ← Utils.Http.getBearer s!"{baseUrl}/api/oauth/usage" token
+    let (status, headers, body) ← Utils.Http.getBearerFull s!"{baseUrl}/api/oauth/usage" token
       (extraHeaders := #["Content-Type: application/json"])
     if status == 429 then
-      return .error .rateLimited
+      return .error (.rateLimited (retryAfterSecs headers))
     if status == 401 || status == 403 then
       return .error (.other s!"HTTP {status}: token rejected (expired or revoked)")
     if status != 200 then
@@ -632,11 +665,11 @@ def refresh (cfg : AppConfig) (backend label : String) : IO (Except String Bool)
       let msg := err.message
       modifyState backend label fun s => { s with
         lastError := some msg
-        -- Only a 429 suppresses future polls. Any other failure — a network blip, an expired
-        -- token — should be retried at the normal cadence, since retrying is what recovers.
-        pollAfter := match err with
-          | .rateLimited => some (now + pollBackoffSecs)
-          | .other _     => s.pollAfter }
+        -- Every failure suppresses polling for a while, because every failure leaves the source
+        -- stale and would otherwise be retried by the next caller through. A 429 is held off for
+        -- as long as the server asked; anything else only long enough that retrying — which is
+        -- what recovers from a blip — stays cheap.
+        pollAfter := some (now + err.backoffSecs) }
       return .error msg
     | .ok limits =>
       let now ← nowEpoch
@@ -669,17 +702,28 @@ def refreshAll (cfg : AppConfig) (backend : String) : IO Unit := do
         | .ok _    => pure ()
     catch e => IO.eprintln s!"[usage] {backend}/{label}: {e}"
 
-/-- Poll only if the last successful poll is older than `ttlSecs`. Selection calls this, so a
-    fan-out of claim decisions costs one request rather than one per decision. -/
-def ensureFresh (cfg : AppConfig) (backend label : String) (ttlSecs : Int := 60) : IO Unit := do
+/-- Poll only if the last successful poll is older than `ttlSecs`.
+
+    The default is the background poller's own interval, which makes this a *fallback* rather
+    than a second poller: while the queue daemon is up its poller keeps every source fresher
+    than this and nothing here ever fires. What it still covers is the case with no daemon
+    running — a bare `orchestra run`, or a `usage` invocation on a machine that only ever
+    dispatches by hand — where the stored numbers would otherwise be arbitrarily old.
+
+    It is deliberately not shorter. Selection runs on the queue daemon's claim path, which
+    re-resolves every pending entry once a second for as long as the queue is not empty; at the
+    minute-scale TTL this used to carry, that single path spent the whole of the endpoint's
+    budget on its own and the 429 it earned then blinded every other caller for five minutes. -/
+def ensureFresh (cfg : AppConfig) (backend label : String)
+    (ttlSecs : Int := pollIntervalSecs) : IO Unit := do
   let st ← loadState backend label
   let now ← nowEpoch
   let stale : Bool := match st.fetchedEpoch with
     | none   => true
     | some f => decide (now - f > ttlSecs)
-  -- The endpoint meters requests, so a 429 has to actually stop us asking. Without this the
-  -- claim path would retry every minute and stay rate-limited — and therefore blind — instead
-  -- of recovering after one backoff.
+  -- The endpoint meters requests, so a failed poll has to actually stop us asking: `pollAfter`
+  -- is the only gate that holds when `fetchedEpoch` is stale precisely *because* the poll
+  -- failed. Without it a source in that state is re-polled by every caller that passes through.
   let backingOff : Bool := match st.pollAfter with | some p => decide (p > now) | none => false
   if stale && !backingOff then
     try

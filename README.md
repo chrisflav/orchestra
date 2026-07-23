@@ -371,13 +371,21 @@ proves otherwise.
 
 Polling is an account-metadata call, not an inference call: **it costs no input
 or output tokens and consumes none of the quota it reports.** It is metered as
-*requests*, though — a burst gets `429` with a `retry-after` of about five
-minutes. Orchestra keeps well under that: the daemon polls each source every
-five minutes, dispatch reuses anything fetched in the last minute, and a `429`
-suppresses polling for five minutes rather than retrying into it. `orchestra
-usage` reuses fresh data too; pass `--refresh` to force a poll. While a backoff
-is in effect the command says so, and dispatch falls back to the last known
-limits — an unreachable endpoint is never treated as an exhausted account.
+*requests*, though, and the budget is small: about five of them before the
+endpoint answers `429` with a `retry-after` of five minutes, so roughly one
+request per minute per token — shared by everything that polls.
+
+There is therefore one poller, and everything else reads what it wrote. The
+daemon refreshes each source every five minutes; dispatch goes to the network
+only if the stored numbers are older than that, which while the daemon is up
+they never are. A poll that fails backs off before anything retries it — for as
+long as the server's `retry-after` asks after a `429`, a minute otherwise —
+because a failed poll leaves the source stale, and a stale source with no
+backoff is re-polled by every claim decision until the budget is gone.
+`orchestra usage` reuses fresh data too; pass `--refresh` to force a poll or
+`--cached` to make none. While a backoff is in effect the command says so, and
+dispatch falls back to the last known limits — an unreachable endpoint is never
+treated as an exhausted account.
 
 `orchestra usage` flags: `--backend` to narrow to one backend, `--model` to
 judge model-scoped limits, `--cached` to skip polling, `--select` to also show
