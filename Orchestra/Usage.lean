@@ -2,9 +2,13 @@
 Usage-limit monitoring for agent authentication sources.
 
 A Claude subscription is not one limit but several running at once: a rolling session window, a
-weekly total, and weekly limits scoped to a single model family. `GET /api/oauth/usage` reports
-all of them at once — the same call Claude Code itself makes — and the response is the input to
-every decision in this module:
+weekly total, and weekly limits scoped to a single model family. These are read from the
+`anthropic-ratelimit-unified-*` response headers of a minimal inference call (`fetchUtilization`),
+not from `GET /api/oauth/usage`: a long-lived `setup-token` carries inference scope but not the
+profile scope that endpoint needs, so it is answered with 403, whereas the headers ride on any
+inference call the token *can* make. The `limits[]` body shape below is still understood — see
+`parseUtilization`, kept for reading a Claude Code on-disk cache — but the headers are the live
+source. Either way the parsed limits are the input to every decision in this module:
 
 ```
 "limits": [
@@ -16,7 +20,9 @@ every decision in this module:
 
 The scoped entry is why availability is a question about *(source, model)* rather than about a
 source alone: an exhausted weekly-Opus limit leaves Sonnet work on the same account perfectly
-runnable, and treating the account as dead would idle it for a week.
+runnable, and treating the account as dead would idle it for a week. The headers report only the
+session and weekly-all windows — a scoped weekly limit is invisible to the poll and is instead
+caught by `markLimited` the moment a run hits it.
 
 Two things write to the state this module keeps, and they cover each other:
 
@@ -108,6 +114,38 @@ def parseIso8601 (s : String) : Option Int := do
       else pure none
   let off ← offset
   return daysFromCivil y mo d * 86400 + ↑(h * 3600 + mi * 60 + sec) - off
+
+/-- Civil date `(year, month, day)` for a day count since 1970-01-01, by Howard Hinnant's
+    `civil_from_days` — the inverse of `daysFromCivil`. Only ever called with non-negative day
+    counts (reset times are in the future), so the Nat arithmetic never underflows. -/
+private def civilFromDays (z0 : Nat) : Nat × Nat × Nat :=
+  let z := z0 + 719468
+  let era := z / 146097
+  let doe := z - era * 146097
+  let yoe := (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let y := yoe + era * 400
+  let doy := doe - (365 * yoe + yoe / 4 - yoe / 100)
+  let mp := (5 * doy + 2) / 153
+  let d := doy - (153 * mp + 2) / 5 + 1
+  let m := if mp < 10 then mp + 3 else mp - 9
+  (if m ≤ 2 then y + 1 else y, m, d)
+
+private def pad2 (n : Nat) : String := if n < 10 then s!"0{n}" else toString n
+
+private def pad4 (n : Nat) : String :=
+  let s := toString n
+  String.ofList (List.replicate (4 - s.length) '0') ++ s
+
+/-- Format epoch seconds as `YYYY-MM-DDTHH:MM:SSZ`. The inverse direction of `parseIso8601`: the
+    usage endpoint reports resets as timestamps, but the rate-limit *headers* report them as epoch
+    seconds, and `Limit.resetsAt` is a string every consumer re-parses with `parseIso8601`. -/
+def secsToIso8601 (epoch : Int) : String :=
+  if epoch < 0 then "1970-01-01T00:00:00Z"
+  else
+    let e := epoch.toNat
+    let (y, mo, d) := civilFromDays (e / 86400)
+    let rem := e % 86400
+    s!"{pad4 y}-{pad2 mo}-{pad2 d}T{pad2 (rem / 3600)}:{pad2 (rem % 3600 / 60)}:{pad2 (rem % 60)}Z"
 
 /-- Current time in epoch seconds.
 
@@ -568,16 +606,17 @@ def defaultBaseUrl : String := "https://api.anthropic.com"
 /-- Why a poll did not produce limits.
 
     `rateLimited` is called out separately because it is the one failure that must change future
-    behaviour rather than just be reported: the endpoint meters requests independently of any
-    subscription, and continuing to poll through a 429 keeps the monitor blind for longer. It
-    carries the server's own `retry-after`, in seconds, when it sent one. -/
+    behaviour rather than just be reported: continuing to retry through a 429 keeps the monitor
+    blind for longer and — now that the poll is itself an inference request — wastes the very
+    request it is being rate-limited for. It carries the server's own `retry-after`, in seconds,
+    when it sent one. -/
 inductive FetchError where
   | rateLimited (retryAfterSecs : Option Int)
   | other (msg : String)
 deriving Repr, Inhabited
 
 def FetchError.message : FetchError → String
-  | .rateLimited _ => "the usage endpoint is rate-limiting requests; backing off"
+  | .rateLimited _ => "requests are being rate-limited; backing off"
   | .other m       => m
 
 /-- How often the background poller refreshes every source, and the age past which any other
@@ -619,25 +658,104 @@ def retryAfterSecs (headers : Array (String × String)) : Option Int :=
   (Utils.Http.header? headers "retry-after").bind fun v =>
     v.trimAscii.toString.toNat?.map Int.ofNat
 
-/-- Fetch and parse `GET /api/oauth/usage` for one OAuth token.
+/-- What a non-2xx response with no usage headers means, or `none` on a 200. Only reached as a
+    fallback — the usage numbers ride on the rate-limit headers of the inference call itself, and a
+    429 is intercepted by the caller (it carries `retry-after`), so neither the ordinary path nor
+    the rate-limit path consults this.
 
-    Note this is an account-metadata call, not an inference call: it reports quota, it does not
-    consume any. It costs no input or output tokens and does not move the very numbers it
-    returns. It is metered as *requests*, though — see `pollBackoffSecs`. -/
+    401 and 403 are not the same failure and must not be reported as though they were. The server
+    answers a token it does not accept with 401 (`authentication_error`), so *that* is the
+    expired-or-revoked case. A 403 comes from a token the server authenticates fine and then
+    declines; it still may run agents perfectly well, so telling its owner it has expired sends
+    them to rotate a credential that was never the problem. The body explains itself, so we keep
+    it. A 429 still carries the usage headers, so it is handled before this is reached. -/
+def statusError (status : Nat) (body : String) : Option FetchError :=
+  let detail :=
+    let t := body.trimAscii.toString
+    if t.isEmpty then "(no response body)" else t
+  if status == 200 then none
+  else if status == 401 then
+    some (.other s!"HTTP 401: token rejected (expired or revoked): {detail}")
+  else if status == 403 then
+    some (.other s!"HTTP 403: the token authenticated but was declined \
+(scope or account type, not expiry): {detail}")
+  else some (.other s!"HTTP {status}: {detail}")
+
+/-! ## Reading limits from rate-limit headers
+
+A long-lived token minted by `claude setup-token` carries inference scope but not the profile
+scope `GET /api/oauth/usage` requires, so that endpoint answers it with 403. The same subscription
+windows ride on the `anthropic-ratelimit-unified-*` response headers of an ordinary inference call,
+which any inference-scoped token can make — so a `max_tokens: 1` probe recovers them. This spends a
+real (if tiny) request against the very windows it reads; that trade is what lets a setup-token be
+monitored at all. -/
+
+/-- The model the header probe runs against: the cheapest, with `max_tokens: 1`. The probe exists
+    to read headers, not to generate anything. -/
+def probeModel : String := "claude-haiku-4-5"
+
+/-- The headers report utilisation as a fraction (`0.15`); `Limit.percent` is a whole percent. -/
+private def percentOfFraction (s : String) : Option Nat :=
+  match Json.parse s with
+  | .ok (.num n) => let scaled := n.toFloat * 100.0 + 0.5; some scaled.toUInt64.toNat
+  | _            => none
+
+/-- Build one `Limit` from a `unified-<window>-*` header triple, or `none` when the window is
+    absent. `winKey` is `5h` / `7d`; the headers carry no per-model-family (scoped) windows, so
+    `scopeModel` is always `none` and an exhausted single-model weekly limit is invisible here. -/
+private def limitFromHeaders (headers : Array (String × String)) (winKey : String)
+    (kind : LimitKind) (group : String) : Option Limit := do
+  let util ← Utils.Http.header? headers s!"anthropic-ratelimit-unified-{winKey}-utilization"
+  let percent := (percentOfFraction util).getD 0
+  let resetsAt := (Utils.Http.header? headers s!"anthropic-ratelimit-unified-{winKey}-reset").bind
+    (·.toInt?) |>.map secsToIso8601
+  let status := (Utils.Http.header? headers s!"anthropic-ratelimit-unified-{winKey}-status").getD
+    "allowed"
+  return {
+    kind, group, percent
+    severity := if percent ≥ 100 then "critical" else if percent ≥ 75 then "warning" else "normal"
+    resetsAt
+    scopeModel := none
+    isActive := status != "allowed" || percent ≥ 100
+  }
+
+/-- Turn the `anthropic-ratelimit-unified-*` headers into the same `Limit` values the endpoint body
+    would have yielded. Empty when no unified header is present (a transport error, an API-key error
+    page), which the caller treats as "read the status instead". -/
+def parseUnifiedHeaders (headers : Array (String × String)) : Array Limit := Id.run do
+  let mut out : Array Limit := #[]
+  if let some l := limitFromHeaders headers "5h" .session   "session" then out := out.push l
+  if let some l := limitFromHeaders headers "7d" .weeklyAll "weekly"  then out := out.push l
+  return out
+
+/-- Read the subscription windows for one OAuth token off the rate-limit headers of a minimal
+    inference call.
+
+    Unlike `GET /api/oauth/usage` this is *not* free: it spends a real `max_tokens: 1` request that
+    nudges the very windows it reads. That is the deliberate cost of supporting `setup-token`s,
+    which cannot reach the metadata endpoint (403, no profile scope) but can make this call. A 429
+    still carries the headers, so a subscription block reports itself with its reset time rather
+    than as an opaque failure. The OAuth beta header is required for the bearer token to be
+    accepted on `/v1/messages`. -/
 def fetchUtilization (token : String) (baseUrl : String := defaultBaseUrl)
     : IO (Except FetchError (Array Limit)) := do
+  let reqBody := "{\"model\":\"" ++ probeModel ++
+    "\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
   try
-    let (status, headers, body) ← Utils.Http.getBearerFull s!"{baseUrl}/api/oauth/usage" token
-      (extraHeaders := #["Content-Type: application/json"])
+    let (status, headers, body) ← Utils.Http.postBearerFull s!"{baseUrl}/v1/messages" token
+      reqBody (extraHeaders := #["anthropic-version: 2023-06-01",
+                                 "anthropic-beta: oauth-2025-04-20",
+                                 "Content-Type: application/json"])
+    let limits := parseUnifiedHeaders headers
+    if !limits.isEmpty then
+      return .ok limits
+    -- No usage headers. A 429 is a rate limit to back off from, honouring the server's
+    -- `retry-after`; anything else is an auth or other failure the status explains.
     if status == 429 then
       return .error (.rateLimited (retryAfterSecs headers))
-    if status == 401 || status == 403 then
-      return .error (.other s!"HTTP {status}: token rejected (expired or revoked)")
-    if status != 200 then
-      return .error (.other s!"HTTP {status}: {body.trimAscii.toString}")
-    match parseUtilization body with
-    | .error e => return .error (.other s!"could not parse usage response: {e}")
-    | .ok ls   => return .ok ls
+    match statusError status body with
+    | some err => return .error err
+    | none     => return .error (.other "no usage headers in a 200 inference response")
   catch e =>
     return .error (.other (toString e))
 
@@ -688,9 +806,19 @@ def configuredLabels (cfg : AppConfig) (backend : String) : List String :=
   | none   => []
   | some a => a.authSources.toList.map (·.label)
 
+/-- Whether this backend should be polled automatically. Off means never spend a probe request on
+    the daemon or claim-time path; a limit is then discovered only when a run hits it. A backend
+    with no config is treated as pollable — there is nothing to poll, so the choice is moot. -/
+def pollingEnabled (cfg : AppConfig) (backend : String) : Bool :=
+  match cfg.agentAuthConfigs.find? (·.name == backend) with
+  | some a => a.pollUsage
+  | none   => true
+
 /-- Poll every OAuth source configured for `backend`. Errors are recorded per source and never
-    propagate: a poller that throws would take the daemon fiber down with it. -/
+    propagate: a poller that throws would take the daemon fiber down with it. A no-op when polling
+    is disabled for the backend. -/
 def refreshAll (cfg : AppConfig) (backend : String) : IO Unit := do
+  unless pollingEnabled cfg backend do return
   let now ← nowEpoch
   for label in configuredLabels cfg backend do
     try
@@ -713,9 +841,12 @@ def refreshAll (cfg : AppConfig) (backend : String) : IO Unit := do
     It is deliberately not shorter. Selection runs on the queue daemon's claim path, which
     re-resolves every pending entry once a second for as long as the queue is not empty; at the
     minute-scale TTL this used to carry, that single path spent the whole of the endpoint's
-    budget on its own and the 429 it earned then blinded every other caller for five minutes. -/
+    budget on its own and the 429 it earned then blinded every other caller for five minutes.
+
+    A no-op when polling is disabled for the backend. -/
 def ensureFresh (cfg : AppConfig) (backend label : String)
     (ttlSecs : Int := pollIntervalSecs) : IO Unit := do
+  unless pollingEnabled cfg backend do return
   let st ← loadState backend label
   let now ← nowEpoch
   let stale : Bool := match st.fetchedEpoch with

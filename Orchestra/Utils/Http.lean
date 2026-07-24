@@ -146,4 +146,15 @@ def getBearer (url token : String) (extraHeaders : Array String := #[])
   let (status, _, body) ← getBearerFull url token extraHeaders maxTime
   return (status, body)
 
+/-- A POST with bearer authentication, keeping the response headers. The token never appears in an
+    error message. Mirrors `getBearerFull` for the usage poller's inference probe, whose limits are
+    read out of the rate-limit headers. -/
+def postBearerFull (url token body : String) (extraHeaders : Array String := #[])
+    (maxTime : Nat := 30) : IO (Nat × Array (String × String) × String) := do
+  let mut args := #["-X", "POST", "-H", s!"Authorization: Bearer {token}"]
+  for h in extraHeaders do
+    args := args.push "-H" |>.push h
+  args := args.push "--data" |>.push body
+  curlFull (args.push url) (maxTime := maxTime)
+
 end Orchestra.Utils.Http

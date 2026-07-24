@@ -393,6 +393,14 @@ structure AgentAuthConfig where
   /-- Additional TCP ports the agent is allowed to connect to inside the sandbox.
       Appended to the ports the agent backend already opens (MCP server port + 443). -/
   extraPorts : Array Nat := #[]
+  /-- Whether to proactively poll subscription usage for this backend's OAuth sources.
+
+      Polling is no longer free: the numbers ride on the rate-limit headers of an inference call,
+      so each poll spends a real `max_tokens: 1` request (a `setup-token` cannot reach the metadata
+      endpoint). Set `false` to stop the automatic polls — the daemon and claim-time selection —
+      and rely on observed hits (`markLimited`) instead. `orchestra usage --refresh` still forces a
+      one-off poll. Defaults to `true`, preserving prior behaviour. -/
+  pollUsage : Bool := true
 deriving Repr, Inhabited
 
 instance : FromJson AgentAuthConfig where
@@ -401,7 +409,8 @@ instance : FromJson AgentAuthConfig where
     let authSources       := j.getObjValAs? (Array AuthSource) "auth_sources" |>.toOption |>.getD #[]
     let defaultAuthSource := j.getObjValAs? String "default_auth_source" |>.toOption
     let extraPorts        := j.getObjValAs? (Array Nat) "extra_ports" |>.toOption |>.getD #[]
-    return { name, authSources, defaultAuthSource, extraPorts }
+    let pollUsage         := j.getObjValAs? Bool "poll_usage" |>.toOption |>.getD true
+    return { name, authSources, defaultAuthSource, extraPorts, pollUsage }
 
 structure Task where
   /-- The input type of this task. -/

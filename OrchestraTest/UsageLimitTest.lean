@@ -53,6 +53,72 @@ def parseIso8601_rejectsRatherThanGuesses : Test := do
   TestM.assertEqual (parseIso8601 "2026-13-01T00:00:00Z") none (msg := "month 13")
   TestM.assertEqual (parseIso8601 "2026-07-22") none (msg := "date with no time")
 
+@[test]
+def secsToIso8601_roundTripsThroughParse : Test := do
+  -- The headers report resets as epoch seconds; `Limit.resetsAt` is a string every consumer
+  -- re-parses with `parseIso8601`. Formatting then parsing must return the original instant, or a
+  -- reset time silently shifts.
+  for e in [0, 1784867400, 1785351600, 1000000000, 1609459199] do
+    TestM.assertEqual (parseIso8601 (secsToIso8601 e)) (some e)
+      (msg := s!"round-trips {e}")
+
+@[test]
+def secsToIso8601_knownInstant : Test := do
+  -- 2026-07-24T00:00:00Z is a fixed anchor: if the civil-date arithmetic drifts, this catches it.
+  TestM.assertEqual (secsToIso8601 1784851200) "2026-07-24T00:00:00Z"
+    (msg := "epoch 1784851200 is midnight UTC on 2026-07-24")
+
+/-! ## Reading limits from rate-limit headers
+
+The headers carry the same numbers the endpoint body would, but as a fraction plus an epoch reset.
+This is the live source now that a `setup-token` cannot reach `/api/oauth/usage`. -/
+
+private def sampleHeaders : Array (String × String) := #[
+  ("anthropic-ratelimit-unified-5h-status", "allowed"),
+  ("anthropic-ratelimit-unified-5h-utilization", "0.02"),
+  ("anthropic-ratelimit-unified-5h-reset", "1784867400"),
+  ("anthropic-ratelimit-unified-7d-status", "rejected"),
+  ("anthropic-ratelimit-unified-7d-utilization", "1"),
+  ("anthropic-ratelimit-unified-7d-reset", "1785351600"),
+  ("content-type", "application/json")
+]
+
+@[test]
+def parseUnifiedHeaders_readsBothWindows : Test := do
+  let ls := parseUnifiedHeaders sampleHeaders
+  TestM.assertEqual ls.size 2 (msg := "session and weekly-all")
+  match ls.find? (·.kind == .session) with
+  | none   => TestM.fail "expected a session limit"
+  | some l =>
+    TestM.assertEqual l.percent 2 (msg := "0.02 fraction becomes 2 percent")
+    TestM.assert (!l.isActive) (msg := "an allowed window is not binding")
+    TestM.assertEqual (l.resetsAt.bind parseIso8601) (some 1784867400)
+      (msg := "reset epoch survives the format/parse round-trip")
+  match ls.find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l =>
+    TestM.assertEqual l.percent 100 (msg := "1.0 fraction is 100 percent")
+    TestM.assert l.isActive (msg := "a rejected window binds")
+    TestM.assertEqual l.severity "critical" (msg := "100% is critical")
+
+@[test]
+def parseUnifiedHeaders_bindsARejectedWindowThatIsStillInTheFuture : Test := do
+  -- The end-to-end point: a rejected window with a future reset must read as binding, so the
+  -- availability check blocks the source until it lifts.
+  let now := 1785000000
+  let ls := parseUnifiedHeaders sampleHeaders
+  let st : SourceState := { backend := "b", label := "l", limits := ls }
+  match availabilityOf st none now with
+  | .blocked u _ => TestM.assertEqual u (some 1785351600) (msg := "blocked until the 7d reset")
+  | .available   => TestM.fail "a rejected weekly window should block the source"
+
+@[test]
+def parseUnifiedHeaders_emptyWhenNoUnifiedHeaders : Test := do
+  -- A response with no unified headers (a transport error page) yields nothing, and the caller
+  -- reads the status instead of inventing limits.
+  TestM.assert (parseUnifiedHeaders #[("content-type", "text/html")]).isEmpty
+    (msg := "no unified headers, no limits")
+
 /-! ## Parsing the endpoint payload -/
 
 /-- The response shape observed from `GET /api/oauth/usage`, trimmed to the fields read here:
@@ -122,6 +188,41 @@ def parseUtilization_acceptsTheOnDiskCacheShape : Test := do
   match parseUtilization body with
   | .error e => TestM.fail s!"nested shape should parse: {e}"
   | .ok ls   => TestM.assertEqual ls.size 3 (msg := "unwrapped and read")
+
+/-! ## Poll failures
+
+What the poller tells its operator when the endpoint says no. -/
+
+@[test]
+def statusError_separates401From403 : Test := do
+  -- The endpoint answers a token it does not accept with 401, so only 401 may be reported as an
+  -- expiry. A 403 is a token that authenticated and was then declined for this endpoint — it
+  -- still runs agents, and calling it expired sends its owner to rotate the wrong thing.
+  let body := r#"{"type":"error","error":{"type":"permission_error","message":"Not authorized"}}"#
+  match statusError 403 body with
+  | none   => TestM.fail "403 is a failure"
+  | some e =>
+    let m := e.message
+    TestM.assert (m.contains "Not authorized") (msg := "the server's own explanation survives")
+    TestM.assert (!(m.contains "expire")) (msg := "a 403 is not reported as an expiry")
+  match statusError 401 "{\"error\":{\"message\":\"Invalid bearer token\"}}" with
+  | none   => TestM.fail "401 is a failure"
+  | some e =>
+    TestM.assert (e.message.contains "expired") (msg := "401 is the expired-or-revoked case")
+
+@[test]
+def statusError_passesThroughTheOtherOutcomes : Test := do
+  TestM.assert (statusError 200 sampleBody).isNone (msg := "200 is not an error")
+  -- 429 is not classified here: `fetchUtilization` intercepts it to read `retry-after`, so
+  -- `statusError` only reaches it as a generic non-2xx if the caller ever fell through.
+  match statusError 429 "" with
+  | some (.other m) => TestM.assert (m.contains "429") (msg := "reported as a plain HTTP failure")
+  | _ => TestM.fail "429 should still be some failure"
+  match statusError 500 "" with
+  | some (.other m) =>
+    TestM.assert (m.contains "no response body")
+      (msg := "an empty body says so rather than trailing off")
+  | _ => TestM.fail "expected a plain reported failure"
 
 /-! ## Backing off
 
@@ -391,11 +492,13 @@ def chooseFrom_noSourcesConfiguredIsItsOwnMessage : Test := do
 
 Which labels a task is allowed to run on, given the three ways config can express it. -/
 
-private def cfgWithSources (labels : List String) (dflt : Option String := none) : AppConfig :=
+private def cfgWithSources (labels : List String) (dflt : Option String := none)
+    (pollUsage : Bool := true) : AppConfig :=
   { appId := 1, privateKeyPath := ""
     agentAuthConfigs := #[{
       name := "claude"
       defaultAuthSource := dflt
+      pollUsage
       authSources := labels.toArray.map fun l => { label := l, kind := .oauthToken "t" } }] }
 
 @[test]
@@ -430,6 +533,36 @@ def candidatesFor_legacyConfigHasNothingToChooseBetween : Test := do
   -- guessing, and `resolveAuthEnv` produces its "specify one" error.
   TestM.assertEqual (candidatesFor (cfgWithSources ["a", "b"]) "claude" [] none) []
     (msg := "ambiguous config is left to the existing error path")
+
+/-! ## Opt-out of polling
+
+Polling costs a probe request now, so a backend can turn it off and rely on observed hits. -/
+
+@[test]
+def pollUsage_defaultsToTrue : Test := do
+  -- Absent from the config, polling stays on — no silent behaviour change for existing installs.
+  match Lean.Json.parse "{\"name\":\"claude\",\"auth_sources\":[]}" with
+  | .error e => TestM.fail s!"parse: {e}"
+  | .ok j => match (Lean.FromJson.fromJson? j : Except String AgentAuthConfig) with
+    | .error e => TestM.fail s!"fromJson: {e}"
+    | .ok a    => TestM.assert a.pollUsage (msg := "omitted poll_usage defaults to true")
+
+@[test]
+def pollUsage_falseParses : Test := do
+  match Lean.Json.parse "{\"name\":\"claude\",\"poll_usage\":false,\"auth_sources\":[]}" with
+  | .error e => TestM.fail s!"parse: {e}"
+  | .ok j => match (Lean.FromJson.fromJson? j : Except String AgentAuthConfig) with
+    | .error e => TestM.fail s!"fromJson: {e}"
+    | .ok a    => TestM.assert (!a.pollUsage) (msg := "poll_usage:false disables it")
+
+@[test]
+def pollingEnabled_readsTheBackendFlag : Test := do
+  let on  := cfgWithSources ["a"]
+  let off := cfgWithSources ["a"] (pollUsage := false)
+  TestM.assert (pollingEnabled on "claude") (msg := "default on")
+  TestM.assert (!pollingEnabled off "claude") (msg := "honours poll_usage:false")
+  TestM.assert (pollingEnabled off "unknown")
+    (msg := "an unconfigured backend is moot, not disabled")
 
 /-! ## Detection
 

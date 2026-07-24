@@ -850,7 +850,9 @@ its workspace; it will start from a clean checkout."
   -- about to use. This is what notices that a *blocked* source has come back, and what keeps
   -- `orchestra usage` truthful while the daemon is otherwise idle. Errors are swallowed per
   -- source inside `refreshAll`; an unreachable endpoint must not take the fiber down.
-  let usageBackends := appConfig.agentAuthConfigs.toList.map (·.name)
+  -- Only backends that opt into polling; a fully-disabled config spawns no poll fiber at all.
+  let usageBackends := appConfig.agentAuthConfigs.toList.filterMap fun a =>
+    if a.pollUsage then some a.name else none
   if !usageBackends.isEmpty then
     let _usageTask ← IO.asTask (prio := .dedicated) do
       while !(← shutdownToken.isCancelled) do
@@ -1536,6 +1538,11 @@ private def usageHandler (p : Parsed) : IO UInt32 := do
     let labels := Usage.configuredLabels appConfig backend
     if labels.isEmpty then continue
     IO.println s!"{backend}:"
+    -- `--refresh` (mode 2) forces a poll even when polling is disabled; the automatic modes honour
+    -- the config, so say so rather than silently showing stale numbers.
+    if pollMode != 2 && !Usage.pollingEnabled appConfig backend then
+      IO.println "  usage polling disabled (poll_usage: false); showing cached data \
+— run with --refresh to force one poll"
     for label in labels do
       if pollMode == 2 then
         match ← Usage.refresh appConfig backend label with
