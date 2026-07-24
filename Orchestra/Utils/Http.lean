@@ -70,4 +70,52 @@ def getBearer (url token : String) (extraHeaders : Array String := #[])
     args := args.push "-H" |>.push h
   curlWithStatus (args.push url) (maxTime := maxTime)
 
+/-- Split curl's `-D -` output — the dumped header block, a blank line, then the body — into the
+    header lines and the body. The status line and any `key: value` line are returned verbatim;
+    the split is on the first blank line, so a body that itself contains a blank line stays whole
+    (the remainder is rejoined). CRLF and LF are both accepted. -/
+def splitHeaderBody (s : String) : Array String × String :=
+  let sep := if (s.splitOn "\r\n\r\n").length ≥ 2 then "\r\n\r\n" else "\n\n"
+  let parts := s.splitOn sep
+  let hdrRaw := parts.headD ""
+  let body := sep.intercalate (parts.drop 1)
+  let lines := (hdrRaw.splitOn "\n").filterMap fun l =>
+    let l := (l.replace "\r" "").trimAscii.toString
+    if l.isEmpty then none else some l
+  (lines.toArray, body)
+
+/-- Run curl keeping the response headers (`-D -`). Returns `(status, headerLines, body)`.
+
+    Same non-`-f` handling as `curlWithStatus`: the status comes from `-w`, not the HTTP line, so
+    HTTP/2 (which has no reason phrase) and 4xx/5xx bodies are both reported rather than collapsed
+    into a bare exit code. -/
+def curlWithHeaders (args : Array String) (connectTimeout : Nat := 10) (maxTime : Nat := 30)
+    : IO (Nat × Array String × String) := do
+  let full := #["-sS", "--connect-timeout", toString connectTimeout,
+                "--max-time", toString maxTime, "-D", "-",
+                "-w", statusMarker ++ "%{http_code}"] ++ args
+  let child ← IO.Process.spawn {
+    cmd := "curl", args := full, stdin := .null, stdout := .piped, stderr := .piped
+  }
+  let stdout ← child.stdout.readToEnd
+  let stderr ← child.stderr.readToEnd
+  let code   ← child.wait
+  if code != 0 then
+    throw (.userError (curlFailure code stdout stderr))
+  match splitStatus stdout with
+  | some (status, headersAndBody) =>
+    let (hdrs, body) := splitHeaderBody headersAndBody
+    return (status, hdrs, body)
+  | none => throw (.userError s!"curl wrote no status line; its output was:\n{stdout}")
+
+/-- A POST with bearer authentication that keeps the response headers. The token never appears in
+    an error message. -/
+def postBearerWithHeaders (url token body : String) (extraHeaders : Array String := #[])
+    (maxTime : Nat := 30) : IO (Nat × Array String × String) := do
+  let mut args := #["-X", "POST", "-H", s!"Authorization: Bearer {token}"]
+  for h in extraHeaders do
+    args := args.push "-H" |>.push h
+  args := args.push "--data" |>.push body
+  curlWithHeaders (args.push url) (maxTime := maxTime)
+
 end Orchestra.Utils.Http
