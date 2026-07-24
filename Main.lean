@@ -860,8 +860,9 @@ its workspace; it will start from a clean checkout."
           try Usage.refreshAll appConfig backend
           catch e => IO.eprintln s!"[usage] poll failed for {backend}: {e}"
         -- Five minutes: fast enough that a reset is picked up promptly, slow enough that an
-        -- idle daemon makes a handful of requests an hour.
-        for _ in List.range 300 do
+        -- idle daemon makes a handful of requests an hour. Shared with `ensureFresh`'s default
+        -- TTL, which is what keeps this the only path that polls while the daemon is up.
+        for _ in List.range Usage.pollIntervalSecs.toNat do
           if ← shutdownToken.isCancelled then break
           IO.sleep 1000
   -- Load listener configs and spawn one fiber per listener.

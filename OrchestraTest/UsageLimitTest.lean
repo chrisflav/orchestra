@@ -73,15 +73,14 @@ def secsToIso8601_knownInstant : Test := do
 The headers carry the same numbers the endpoint body would, but as a fraction plus an epoch reset.
 This is the live source now that a `setup-token` cannot reach `/api/oauth/usage`. -/
 
-private def sampleHeaders : Array String := #[
-  "HTTP/2 200",
-  "anthropic-ratelimit-unified-5h-status: allowed",
-  "anthropic-ratelimit-unified-5h-utilization: 0.02",
-  "anthropic-ratelimit-unified-5h-reset: 1784867400",
-  "anthropic-ratelimit-unified-7d-status: rejected",
-  "anthropic-ratelimit-unified-7d-utilization: 1",
-  "anthropic-ratelimit-unified-7d-reset: 1785351600",
-  "content-type: application/json"
+private def sampleHeaders : Array (String × String) := #[
+  ("anthropic-ratelimit-unified-5h-status", "allowed"),
+  ("anthropic-ratelimit-unified-5h-utilization", "0.02"),
+  ("anthropic-ratelimit-unified-5h-reset", "1784867400"),
+  ("anthropic-ratelimit-unified-7d-status", "rejected"),
+  ("anthropic-ratelimit-unified-7d-utilization", "1"),
+  ("anthropic-ratelimit-unified-7d-reset", "1785351600"),
+  ("content-type", "application/json")
 ]
 
 @[test]
@@ -117,7 +116,7 @@ def parseUnifiedHeaders_bindsARejectedWindowThatIsStillInTheFuture : Test := do
 def parseUnifiedHeaders_emptyWhenNoUnifiedHeaders : Test := do
   -- A response with no unified headers (a transport error page) yields nothing, and the caller
   -- reads the status instead of inventing limits.
-  TestM.assert (parseUnifiedHeaders #["HTTP/2 500", "content-type: text/html"]).isEmpty
+  TestM.assert (parseUnifiedHeaders #[("content-type", "text/html")]).isEmpty
     (msg := "no unified headers, no limits")
 
 /-! ## Parsing the endpoint payload -/
@@ -214,14 +213,98 @@ def statusError_separates401From403 : Test := do
 @[test]
 def statusError_passesThroughTheOtherOutcomes : Test := do
   TestM.assert (statusError 200 sampleBody).isNone (msg := "200 is not an error")
+  -- 429 is not classified here: `fetchUtilization` intercepts it to read `retry-after`, so
+  -- `statusError` only reaches it as a generic non-2xx if the caller ever fell through.
   match statusError 429 "" with
-  | some .rateLimited => TestM.assert true
-  | _ => TestM.fail "429 must stay the one status that changes future behaviour"
+  | some (.other m) => TestM.assert (m.contains "429") (msg := "reported as a plain HTTP failure")
+  | _ => TestM.fail "429 should still be some failure"
   match statusError 500 "" with
   | some (.other m) =>
     TestM.assert (m.contains "no response body")
       (msg := "an empty body says so rather than trailing off")
   | _ => TestM.fail "expected a plain reported failure"
+
+/-! ## Backing off
+
+`/api/oauth/usage` allows on the order of five requests before answering `429` with a
+`retry-after`, and every polling site in orchestra shares that one budget. What is testable
+without a network is the reading of the response that says so, and the backoff derived from it. -/
+
+/-- A `429` exactly as curl's `-D -` writes it: CRLF throughout, headers, a blank line, body. -/
+private def rateLimitedDump : String :=
+  "HTTP/2 429\r\nretry-after: 300\r\nContent-Type: application/json\r\ncf-ray: a1f9\r\n\r\n" ++
+  "{\n  \"error\": {\"type\": \"rate_limit_error\"}\n}"
+
+@[test]
+def splitHeaders_separatesTheDumpFromTheBody : Test := do
+  let (headers, body) := Utils.Http.splitHeaders rateLimitedDump
+  TestM.assertEqual (Utils.Http.header? headers "Retry-After") (some "300")
+    (msg := "found however the caller spells it")
+  TestM.assertEqual (Utils.Http.header? headers "content-type") (some "application/json")
+    (msg := "a value containing no colon")
+  TestM.assertEqual (Utils.Http.header? headers "x-absent") none (msg := "absent stays absent")
+  TestM.assert (body.startsWith "{") (msg := "the body survives intact")
+  TestM.assert ((body.splitOn "rate_limit_error").length > 1) (msg := "…all of it")
+
+@[test]
+def splitHeaders_keepsTheLastBlockAndABlankLineInTheBody : Test := do
+  -- A proxy answers CONNECT before the real response, so two header blocks arrive. Reading the
+  -- first would report the proxy's status headers as the endpoint's.
+  let dump := "HTTP/1.1 200 Connection established\r\n\r\n" ++ rateLimitedDump
+  let (headers, _) := Utils.Http.splitHeaders dump
+  TestM.assertEqual (Utils.Http.header? headers "retry-after") (some "300")
+    (msg := "the real block wins")
+  -- A body with a blank line in it must not be mistaken for a header boundary; only a block
+  -- that starts with a status line is one.
+  let withGap := "HTTP/2 200\r\ncontent-type: text/plain\r\n\r\nfirst\n\nsecond"
+  TestM.assertEqual (Utils.Http.splitHeaders withGap).2 "first\n\nsecond"
+    (msg := "the body is not re-split at its own blank line")
+  -- …and a body that opens with something that reads like a status line is still a body: only
+  -- an informational block or a proxy's CONNECT answer precedes the real response.
+  let echoed := "HTTP/2 200\r\ncontent-type: text/plain\r\n\r\nHTTP/1.1 500\r\n\r\nnot a header"
+  TestM.assertEqual (Utils.Http.header? (Utils.Http.splitHeaders echoed).1 "content-type")
+    (some "text/plain") (msg := "the real block is not skipped for one quoted in the body")
+
+@[test]
+def splitHeaders_toleratesOutputThatIsAllBody : Test := do
+  -- Nothing forces a caller to have asked for headers; the body must come back untouched.
+  TestM.assertEqual (Utils.Http.splitHeaders "{\"ok\":true}").2 "{\"ok\":true}"
+    (msg := "no dump, no change")
+
+@[test]
+def retryAfter_isReadOnlyWhenItIsACountOfSeconds : Test := do
+  TestM.assertEqual (retryAfterSecs #[("retry-after", "300")]) (some 300) (msg := "a delta")
+  TestM.assertEqual (retryAfterSecs #[("retry-after", "Wed, 22 Jul 2026 18:59:59 GMT")]) none
+    (msg := "the date form is not mistaken for a number")
+  TestM.assertEqual (retryAfterSecs #[("cf-ray", "a1f9")]) none (msg := "no header at all")
+
+@[test]
+def backoff_honoursTheServerAndFloorsIt : Test := do
+  TestM.assertEqual (FetchError.rateLimited (some 300)).backoffSecs 300
+    (msg := "what the server asked for")
+  TestM.assertEqual (FetchError.rateLimited none).backoffSecs pollBackoffSecs
+    (msg := "no retry-after ⇒ the observed default")
+  -- A `retry-after: 0` would otherwise mean "retry now", and the next request would earn the
+  -- same 429: the point of the backoff is that asking again immediately cannot work.
+  TestM.assertEqual (FetchError.rateLimited (some 0)).backoffSecs errorBackoffSecs
+    (msg := "floored")
+
+@[test]
+def backoff_appliesToOrdinaryFailuresToo : Test := do
+  -- The one that used to be missing. A failed poll leaves `fetchedEpoch` untouched, so the
+  -- source reads as stale forever after; with no backoff the claim path re-polls it on every
+  -- tick and spends the endpoint's whole budget answering a blip.
+  TestM.assertEqual (FetchError.other "curl failed (exit 6)").backoffSecs errorBackoffSecs
+    (msg := "a network failure is throttled as well")
+  TestM.assert (errorBackoffSecs > 0) (msg := "…by something, at least")
+
+@[test]
+def pollInterval_leavesRoomUnderTheEndpointBudget : Test := do
+  -- The claim path's freshness TTL is this same constant, which is what makes it a fallback
+  -- rather than a second poller: while the daemon is up nothing else ever reaches the network.
+  -- Five requests per five minutes is the observed ceiling; one per source per interval, plus
+  -- the occasional manual `orchestra usage`, has to fit under it.
+  TestM.assert (pollIntervalSecs ≥ 60) (msg := "at most one request per source per minute")
 
 /-! ## Availability
 

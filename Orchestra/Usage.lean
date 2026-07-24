@@ -606,29 +606,62 @@ def defaultBaseUrl : String := "https://api.anthropic.com"
 /-- Why a poll did not produce limits.
 
     `rateLimited` is called out separately because it is the one failure that must change future
-    behaviour rather than just be reported: continuing to hammer the endpoint through a 429 keeps
-    the monitor blind for longer, and — now that the poll is itself an inference request — wastes
-    the request it is being rate-limited for. -/
+    behaviour rather than just be reported: continuing to retry through a 429 keeps the monitor
+    blind for longer and — now that the poll is itself an inference request — wastes the very
+    request it is being rate-limited for. It carries the server's own `retry-after`, in seconds,
+    when it sent one. -/
 inductive FetchError where
-  | rateLimited
+  | rateLimited (retryAfterSecs : Option Int)
   | other (msg : String)
 deriving Repr, Inhabited
 
 def FetchError.message : FetchError → String
-  | .rateLimited => "the endpoint is rate-limiting requests; backing off"
-  | .other m     => m
+  | .rateLimited _ => "requests are being rate-limited; backing off"
+  | .other m       => m
 
-/-- How long to stop polling for after a 429 whose headers we could not read.
+/-- How often the background poller refreshes every source, and the age past which any other
+    caller considers the stored numbers stale.
 
-    A 429 that still carries the `unified-*` headers is not a failure — it reports the block and is
-    returned as limits. This backoff is for a 429 with no usable headers: five minutes clears a
-    request-rate burst, and the poller's own interval is the same, so a backoff simply skips one
-    round. -/
+    Sized against what the endpoint actually allows: it answers roughly five requests with a
+    `429` and a `retry-after: 300`, so the sustainable rate is about one request per minute per
+    token and every polling site has to fit inside that together. One round per source per five
+    minutes leaves the rest of the budget for the paths that poll only when they must. -/
+def pollIntervalSecs : Int := 300
+
+/-- Fallback backoff after a 429 that arrived without a usable `retry-after`. -/
 def pollBackoffSecs : Int := 300
 
-/-- What a response carrying no usage headers means, or `none` on a 200 (which should have carried
-    them). Only reached as a fallback — the usage numbers ride on the rate-limit headers of the
-    inference call itself, so the ordinary path never consults this.
+/-- Backoff after a poll that failed for any other reason — a network blip, a rejected token, an
+    unparseable body.
+
+    Short, because retrying is what recovers from all three, but not zero: a failed poll leaves
+    `fetchedEpoch` untouched, so without a floor here the source stays permanently *stale* and
+    every claim decision retries it immediately. That turns one blip into a request per claim
+    tick, which is how the endpoint's budget gets spent and how a 429 arrives next. -/
+def errorBackoffSecs : Int := 60
+
+/-- How long to stop polling a source after a poll failed.
+
+    `errorBackoffSecs` is a floor under the 429 case too: a server that answers `retry-after: 0`
+    — or a proxy that invents one — must not be able to talk us into retrying immediately, since
+    the whole point of the backoff is that the next request would fail as well. -/
+def FetchError.backoffSecs : FetchError → Int
+  | .rateLimited ra => max (ra.getD pollBackoffSecs) errorBackoffSecs
+  | .other _        => errorBackoffSecs
+
+/-- The `retry-after` of a rate-limited response, in seconds.
+
+    Only the delta form is read. A date is legal HTTP but this endpoint does not send one, and
+    reading `Wed, 22 Jul 2026 …` as a number would produce a nonsense backoff — so anything that
+    is not a plain count of seconds is reported as absent and the default is used instead. -/
+def retryAfterSecs (headers : Array (String × String)) : Option Int :=
+  (Utils.Http.header? headers "retry-after").bind fun v =>
+    v.trimAscii.toString.toNat?.map Int.ofNat
+
+/-- What a non-2xx response with no usage headers means, or `none` on a 200. Only reached as a
+    fallback — the usage numbers ride on the rate-limit headers of the inference call itself, and a
+    429 is intercepted by the caller (it carries `retry-after`), so neither the ordinary path nor
+    the rate-limit path consults this.
 
     401 and 403 are not the same failure and must not be reported as though they were. The server
     answers a token it does not accept with 401 (`authentication_error`), so *that* is the
@@ -641,7 +674,6 @@ def statusError (status : Nat) (body : String) : Option FetchError :=
     let t := body.trimAscii.toString
     if t.isEmpty then "(no response body)" else t
   if status == 200 then none
-  else if status == 429 then some .rateLimited
   else if status == 401 then
     some (.other s!"HTTP 401: token rejected (expired or revoked): {detail}")
   else if status == 403 then
@@ -662,17 +694,6 @@ monitored at all. -/
     to read headers, not to generate anything. -/
 def probeModel : String := "claude-haiku-4-5"
 
-/-- Value of a response header by case-insensitive name, or `none` if absent. -/
-private def headerValue (lines : Array String) (name : String) : Option String := Id.run do
-  let target := name.toLower
-  for line in lines do
-    match line.splitOn ":" with
-    | k :: rest =>
-      if !rest.isEmpty && k.trimAscii.toString.toLower == target then
-        return some ((":".intercalate rest).trimAscii.toString)
-    | [] => pure ()
-  return none
-
 /-- The headers report utilisation as a fraction (`0.15`); `Limit.percent` is a whole percent. -/
 private def percentOfFraction (s : String) : Option Nat :=
   match Json.parse s with
@@ -682,13 +703,14 @@ private def percentOfFraction (s : String) : Option Nat :=
 /-- Build one `Limit` from a `unified-<window>-*` header triple, or `none` when the window is
     absent. `winKey` is `5h` / `7d`; the headers carry no per-model-family (scoped) windows, so
     `scopeModel` is always `none` and an exhausted single-model weekly limit is invisible here. -/
-private def limitFromHeaders (lines : Array String) (winKey : String)
+private def limitFromHeaders (headers : Array (String × String)) (winKey : String)
     (kind : LimitKind) (group : String) : Option Limit := do
-  let util ← headerValue lines s!"anthropic-ratelimit-unified-{winKey}-utilization"
+  let util ← Utils.Http.header? headers s!"anthropic-ratelimit-unified-{winKey}-utilization"
   let percent := (percentOfFraction util).getD 0
-  let resetsAt := (headerValue lines s!"anthropic-ratelimit-unified-{winKey}-reset").bind
+  let resetsAt := (Utils.Http.header? headers s!"anthropic-ratelimit-unified-{winKey}-reset").bind
     (·.toInt?) |>.map secsToIso8601
-  let status := (headerValue lines s!"anthropic-ratelimit-unified-{winKey}-status").getD "allowed"
+  let status := (Utils.Http.header? headers s!"anthropic-ratelimit-unified-{winKey}-status").getD
+    "allowed"
   return {
     kind, group, percent
     severity := if percent ≥ 100 then "critical" else if percent ≥ 75 then "warning" else "normal"
@@ -700,10 +722,10 @@ private def limitFromHeaders (lines : Array String) (winKey : String)
 /-- Turn the `anthropic-ratelimit-unified-*` headers into the same `Limit` values the endpoint body
     would have yielded. Empty when no unified header is present (a transport error, an API-key error
     page), which the caller treats as "read the status instead". -/
-def parseUnifiedHeaders (lines : Array String) : Array Limit := Id.run do
+def parseUnifiedHeaders (headers : Array (String × String)) : Array Limit := Id.run do
   let mut out : Array Limit := #[]
-  if let some l := limitFromHeaders lines "5h" .session   "session" then out := out.push l
-  if let some l := limitFromHeaders lines "7d" .weeklyAll "weekly"  then out := out.push l
+  if let some l := limitFromHeaders headers "5h" .session   "session" then out := out.push l
+  if let some l := limitFromHeaders headers "7d" .weeklyAll "weekly"  then out := out.push l
   return out
 
 /-- Read the subscription windows for one OAuth token off the rate-limit headers of a minimal
@@ -720,14 +742,17 @@ def fetchUtilization (token : String) (baseUrl : String := defaultBaseUrl)
   let reqBody := "{\"model\":\"" ++ probeModel ++
     "\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
   try
-    let (status, headers, body) ← Utils.Http.postBearerWithHeaders s!"{baseUrl}/v1/messages" token
+    let (status, headers, body) ← Utils.Http.postBearerFull s!"{baseUrl}/v1/messages" token
       reqBody (extraHeaders := #["anthropic-version: 2023-06-01",
                                  "anthropic-beta: oauth-2025-04-20",
                                  "Content-Type: application/json"])
     let limits := parseUnifiedHeaders headers
     if !limits.isEmpty then
       return .ok limits
-    -- No usage headers: fall back to interpreting the status (auth failure, rate limit, …).
+    -- No usage headers. A 429 is a rate limit to back off from, honouring the server's
+    -- `retry-after`; anything else is an auth or other failure the status explains.
+    if status == 429 then
+      return .error (.rateLimited (retryAfterSecs headers))
     match statusError status body with
     | some err => return .error err
     | none     => return .error (.other "no usage headers in a 200 inference response")
@@ -758,11 +783,11 @@ def refresh (cfg : AppConfig) (backend label : String) : IO (Except String Bool)
       let msg := err.message
       modifyState backend label fun s => { s with
         lastError := some msg
-        -- Only a 429 suppresses future polls. Any other failure — a network blip, an expired
-        -- token — should be retried at the normal cadence, since retrying is what recovers.
-        pollAfter := match err with
-          | .rateLimited => some (now + pollBackoffSecs)
-          | .other _     => s.pollAfter }
+        -- Every failure suppresses polling for a while, because every failure leaves the source
+        -- stale and would otherwise be retried by the next caller through. A 429 is held off for
+        -- as long as the server asked; anything else only long enough that retrying — which is
+        -- what recovers from a blip — stays cheap.
+        pollAfter := some (now + err.backoffSecs) }
       return .error msg
     | .ok limits =>
       let now ← nowEpoch
@@ -805,18 +830,31 @@ def refreshAll (cfg : AppConfig) (backend : String) : IO Unit := do
         | .ok _    => pure ()
     catch e => IO.eprintln s!"[usage] {backend}/{label}: {e}"
 
-/-- Poll only if the last successful poll is older than `ttlSecs`. Selection calls this, so a
-    fan-out of claim decisions costs one request rather than one per decision. -/
-def ensureFresh (cfg : AppConfig) (backend label : String) (ttlSecs : Int := 60) : IO Unit := do
+/-- Poll only if the last successful poll is older than `ttlSecs`.
+
+    The default is the background poller's own interval, which makes this a *fallback* rather
+    than a second poller: while the queue daemon is up its poller keeps every source fresher
+    than this and nothing here ever fires. What it still covers is the case with no daemon
+    running — a bare `orchestra run`, or a `usage` invocation on a machine that only ever
+    dispatches by hand — where the stored numbers would otherwise be arbitrarily old.
+
+    It is deliberately not shorter. Selection runs on the queue daemon's claim path, which
+    re-resolves every pending entry once a second for as long as the queue is not empty; at the
+    minute-scale TTL this used to carry, that single path spent the whole of the endpoint's
+    budget on its own and the 429 it earned then blinded every other caller for five minutes.
+
+    A no-op when polling is disabled for the backend. -/
+def ensureFresh (cfg : AppConfig) (backend label : String)
+    (ttlSecs : Int := pollIntervalSecs) : IO Unit := do
   unless pollingEnabled cfg backend do return
   let st ← loadState backend label
   let now ← nowEpoch
   let stale : Bool := match st.fetchedEpoch with
     | none   => true
     | some f => decide (now - f > ttlSecs)
-  -- The endpoint meters requests, so a 429 has to actually stop us asking. Without this the
-  -- claim path would retry every minute and stay rate-limited — and therefore blind — instead
-  -- of recovering after one backoff.
+  -- The endpoint meters requests, so a failed poll has to actually stop us asking: `pollAfter`
+  -- is the only gate that holds when `fetchedEpoch` is stale precisely *because* the poll
+  -- failed. Without it a source in that state is re-polled by every caller that passes through.
   let backingOff : Bool := match st.pollAfter with | some p => decide (p > now) | none => false
   if stale && !backingOff then
     try
