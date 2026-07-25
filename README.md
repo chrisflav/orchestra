@@ -468,13 +468,21 @@ granted — orchestra warns about missing `$HOME`-relative paths rather than let
 ## MCP tools
 
 The agent has access to the following tools via the built-in MCP server. `health`, `refresh_token`,
-and `get_pr_comments` are always available; `create_pr` and `comment` must be enabled explicitly by
-adding them to the `tools` list in the task configuration.
+and `get_pr_comments` are always available; `create_pr`, `merge_pr` and `comment` must be enabled
+explicitly by adding them to the `tools` list in the task configuration.
 
 - `health` — check that the MCP server is running
 - `refresh_token` — refresh the GitHub App installation token
 - `get_pr_comments` — fetch review threads for a pull request
 - `create_pr` — create a pull request on the upstream repository
+- `merge_pr` — merge a pull request on the upstream repository, authenticated by the configured
+  PAT. Takes `pr_number`, plus an optional `merge_method` (`merge` | `squash` | `rebase`,
+  default `squash`) and `delete_branch` (default `true`) — the same way the `merger` backend
+  merges. A pull request that is already merged, closed, still a draft, in conflict with its base
+  branch, or held back by branch protection is refused with that reason, for the agent to report
+  back. Grant it deliberately: holding `create_pr` does not imply it, and most tasks have no
+  business merging anything — a review task that should land what it approves is the case it was
+  added for
 - `comment` — post a comment on the issue or pull request the task was launched from.
   Supports four modes:
   - **regular comment**: provide only `body`

@@ -9,7 +9,7 @@ Everything that touches a pull request or a GitHub issue goes through orchestra'
 
 ## Never use `gh` for this
 
-Do **not** run `gh pr create`, `gh pr comment`, `gh pr review`, `gh issue create`,
+Do **not** run `gh pr create`, `gh pr merge`, `gh pr comment`, `gh pr review`, `gh issue create`,
 `gh issue comment`, `gh api`, or any other `gh` command that reads or writes pull requests and
 issues. Do not use `curl` against `api.github.com` either.
 
@@ -43,6 +43,22 @@ create_pr(head: "my-branch", title: "...", body: "...")
 
 Push the branch first. `create_pr` does not push for you, and a PR cannot be opened for a branch
 GitHub has never seen.
+
+## Merging a pull request
+
+```
+merge_pr(pr_number: 123)
+merge_pr(pr_number: 123, merge_method: "rebase", delete_branch: false)
+```
+
+- `pr_number` (required) — the pull request on the **upstream** repository.
+- `merge_method` — `"squash"` (default), `"merge"`, or `"rebase"`.
+- `delete_branch` — delete the head branch afterwards; defaults to true.
+
+Most tasks are not granted this tool, and a refusal means this task is not the one that decides
+whether the pull request lands. When a merge is refused because the pull request is already
+merged, closed, still a draft, conflicting, or blocked by branch protection, the tool says which:
+report that back instead of calling again, since none of those clear up by retrying.
 
 ## Commenting
 

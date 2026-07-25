@@ -536,6 +536,82 @@ def createPullRequestOnRepo (token : String) (repo : Repository)
     "--body", body
   ] ++ labelArgs) (env := #[("GH_TOKEN", some token)])
 
+/-- How a pull request should be merged: the three methods GitHub offers. -/
+inductive MergeMethod where
+  | merge
+  | squash
+  | rebase
+deriving Repr, Inhabited, DecidableEq
+
+/-- Parse a merge method as a tool call spells it. -/
+def MergeMethod.ofString? : String → Option MergeMethod
+  | "merge"  => some .merge
+  | "squash" => some .squash
+  | "rebase" => some .rebase
+  | _        => none
+
+/-- The `gh pr merge` flag selecting this method. -/
+def MergeMethod.flag : MergeMethod → String
+  | .merge  => "--merge"
+  | .squash => "--squash"
+  | .rebase => "--rebase"
+
+/-- Why a pull request cannot be merged as it stands, or `none` when nothing about its state
+    says it can't. The three arguments are `gh pr view`'s `state`, `mergeable` and
+    `mergeStateStatus`; a field that could not be read is passed as `""` and settles nothing.
+
+    This exists for the error text. `gh pr merge` reports every refusal as one sentence about the
+    pull request not being mergeable, which leaves whoever asked for the merge unable to say
+    whether to rebase, wait for a check, or stop trying — and an agent calling `merge_pr` has to
+    report exactly that back. Pure, so the mapping is tested without a network.
+
+    `UNSTABLE` — a failing check the base branch does not require — is deliberately not a blocker:
+    GitHub merges those itself, and refusing here would be stricter than the repository's own
+    rules. Neither is an `UNKNOWN` mergeability, which is GitHub still computing the answer; the
+    merge below settles it either way. -/
+def mergeBlockedReason (state mergeable mergeStateStatus : String) : Option String :=
+  if state == "MERGED" then
+    some "it is already merged"
+  else if state == "CLOSED" then
+    some "it is closed without having been merged; reopen it first"
+  else if mergeable == "CONFLICTING" || mergeStateStatus == "DIRTY" then
+    some "it conflicts with its base branch; rebase it or merge the base into it, push, and try \
+      again"
+  else match mergeStateStatus with
+    | "DRAFT"   => some "it is a draft; mark it ready for review first"
+    | "BLOCKED" => some "the base branch's protection rules block it — a required review is \
+      missing, or a required check is failing or has not run yet"
+    | "BEHIND"  => some "it is behind its base branch, which this repository requires it to be up \
+      to date with; update the branch and push before merging"
+    | _         => none
+
+/-- Merge a pull request on `repo` using a PAT, returning `gh`'s own confirmation.
+
+    The pull request's state is read first so a refusal can say what is wrong with it rather than
+    only that it was refused — see `mergeBlockedReason`. That check is advisory: anything it does
+    not cover is left to GitHub, which is asked to merge and remains the authority on whether it
+    may. -/
+def mergePullRequest (pat : String) (repo : Repository) (number : Nat)
+    (method : MergeMethod) (deleteBranch : Bool) : IO String := do
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let view ← runCmd "gh" #[
+    "pr", "view", toString number,
+    "--repo", repo.toString,
+    "--json", "state,mergeable,mergeStateStatus"
+  ] (env := env)
+  let viewJson := Json.parse view |>.toOption |>.getD Json.null
+  let field (name : String) : String :=
+    viewJson.getObjValAs? String name |>.toOption |>.getD ""
+  if let some why := mergeBlockedReason (field "state") (field "mergeable")
+      (field "mergeStateStatus") then
+    throw (.userError s!"{repo}#{number} was not merged: {why}")
+  let deleteArgs : Array String := if deleteBranch then #["--delete-branch"] else #[]
+  runCmd "gh" (#[
+    "pr", "merge", toString number,
+    "--repo", repo.toString,
+    method.flag
+  ] ++ deleteArgs) (env := env)
+
 /--
 Fetch review threads for a pull request via the GitHub GraphQL API.
 Returns the raw parsed JSON response.

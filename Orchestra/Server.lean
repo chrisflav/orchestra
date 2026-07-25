@@ -17,7 +17,9 @@ structure State where
   fork : Repository
   /-- Optional tools enabled for this run.
       Always-available tools (health, refresh_token, get_pr_comments) are never in this list.
-      Currently the only optional tool is `"create_pr"`. -/
+      The names this server itself understands are `"create_pr"`, `"comment"` and `"merge_pr"`
+      (see `optionalToolDefs`); the rest are the permission groups of
+      `Orchestra.Project.Tools`. -/
   allowedTools : List String
   appId : Nat
   privateKeyPath : String
@@ -153,6 +155,36 @@ private def optionalToolDefs : List (String × Json) := [
         ])
       ]),
       ("required", .arr #["head"])
+    ])
+  ]),
+  ("merge_pr", Json.mkObj [
+    ("name", "merge_pr"),
+    ("description",
+      "Merge a pull request on the upstream repository. Squash-merges it and deletes the head " ++
+      "branch by default, which is what orchestra's own merger does; pass merge_method and " ++
+      "delete_branch to change that.\n\n" ++
+      "Refuses, with the reason, when the pull request is already merged, closed, still a " ++
+      "draft, in conflict with its base branch, or held back by branch protection (a missing " ++
+      "review or a failing required check). Report that reason back rather than calling again — " ++
+      "none of those clear up by retrying."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("pr_number", Json.mkObj [
+          ("type", "integer"),
+          ("description", "Pull request number on the upstream repository.")
+        ]),
+        ("merge_method", Json.mkObj [
+          ("type", "string"),
+          ("enum", Json.arr #["merge", "squash", "rebase"]),
+          ("description", "How to merge (default: squash).")
+        ]),
+        ("delete_branch", Json.mkObj [
+          ("type", "boolean"),
+          ("description", "Delete the head branch after merging (default: true).")
+        ])
+      ]),
+      ("required", .arr #["pr_number"])
     ])
   ]),
   ("comment", Json.mkObj [
@@ -302,6 +334,8 @@ inductive ToolCall where
   /-- Where a `create_pr` call should open its PR. -/
   | createPr (title : String) (body : String) (head : String) (base : String)
              (target : PrTarget)
+  /-- Merge a pull request on the upstream repository. -/
+  | mergePr (prNumber : Nat) (method : GitHub.MergeMethod) (deleteBranch : Bool)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
   | comment (action : CommentAction)
   | getTaskInput
@@ -342,6 +376,23 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
     | some target =>
       if head.isEmpty then .parseError "missing 'head' (branch name)"
       else .createPr title body head base target
+  | "merge_pr" =>
+    match args.getObjVal? "pr_number" |>.toOption with
+    | none => .parseError "missing required argument: pr_number"
+    | some prNumJson =>
+      match prNumJson.getInt? |>.toOption with
+      | none => .parseError "pr_number must be an integer"
+      | some prNumInt =>
+        if prNumInt <= 0 then .parseError "pr_number must be a positive integer"
+        else
+          let methodStr := args.getObjValAs? String "merge_method" |>.toOption |>.getD "squash"
+          match GitHub.MergeMethod.ofString? methodStr with
+          | none =>
+            .parseError s!"invalid 'merge_method' (expected \"merge\", \"squash\" or \"rebase\", \
+              got {repr methodStr})"
+          | some method =>
+            let deleteBranch := args.getObjValAs? Bool "delete_branch" |>.toOption |>.getD true
+            .mergePr prNumInt.toNat method deleteBranch
   | "get_pr_comments" =>
     match args.getObjVal? "pr_number" |>.toOption with
     | none => .parseError "missing required argument: pr_number"
@@ -425,7 +476,13 @@ def parseRequest (msg : Json) : Option Request :=
 
 -- Evaluation
 
-private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
+/-- Evaluate a parsed tool call against the server's state.
+
+    Not private: the permission gates live here, and a call the task was not granted is refused
+    before anything reaches GitHub — which makes the refusals the one part of this worth testing
+    without a network. `tools/list` already hides an ungranted tool, but an agent naming it
+    anyway must be turned away rather than served. -/
+def evalToolCall (state : State) (call : ToolCall) : IO Json := do
   match call with
   | .health =>
     log "tool health"
@@ -479,6 +536,24 @@ private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       catch e =>
         log s!"tool create_pr: error: {e}"
         return toolContent (toString e) (isError := true)
+  | .mergePr prNumber method deleteBranch =>
+    if !state.allowedTools.contains "merge_pr" then
+      log "tool merge_pr: denied (not in allowed tools)"
+      return toolContent "merging pull requests is not enabled for this task" (isError := true)
+    if state.pat.isEmpty then
+      log "tool merge_pr: error: PAT not configured"
+      return toolContent
+        "github.pat not set in config (required to merge on the upstream repository)"
+        (isError := true)
+    log s!"tool merge_pr: {state.upstream}#{prNumber} {method.flag} \
+      delete_branch={deleteBranch}"
+    try
+      let result ← GitHub.mergePullRequest state.pat state.upstream prNumber method deleteBranch
+      log s!"tool merge_pr: ok: {result.trimAscii}"
+      return toolContent result
+    catch e =>
+      log s!"tool merge_pr: error: {e}"
+      return toolContent (toString e) (isError := true)
   | .getPrComments prNumber unresolvedOnly excludeOutdated =>
     log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
       exclude_outdated={excludeOutdated}"

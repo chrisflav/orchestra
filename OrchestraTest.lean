@@ -2,6 +2,7 @@ import OrchestraTest.TestM
 import OrchestraTest.GitHubFormatTest
 import OrchestraTest.ListenerConfigTest
 import OrchestraTest.ServerParseTest
+import OrchestraTest.MergePrTest
 import OrchestraTest.StreamFormatTest
 import OrchestraTest.WorkflowParserTest
 import OrchestraTest.ProjectClaimTest
