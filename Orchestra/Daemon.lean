@@ -335,6 +335,7 @@ its workspace; it will start from a clean checkout."
         fork             := entry.fork
         mode             := entry.mode
         prompt           := entry.prompt
+        goal             := entry.goal
         agent            := entry.agent
         systemPrompt     := entry.systemPrompt
         prependPrompt    := entry.prependPrompt
