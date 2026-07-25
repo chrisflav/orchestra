@@ -19,3 +19,4 @@ import OrchestraTest.ForkResolveTest
 import OrchestraTest.UsageLimitTest
 import OrchestraTest.DashboardTest
 import OrchestraTest.GoalTest
+import OrchestraTest.ConfigApiTest

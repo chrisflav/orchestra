@@ -4,6 +4,7 @@ import Orchestra.TaskStore
 import Orchestra.Queue
 import Orchestra.Project
 import Orchestra.GitHub
+import Orchestra.Utils.Files
 
 open Lean (Json FromJson ToJson)
 
@@ -351,13 +352,34 @@ instance : FromJson ListenerState where
 
 -- Directories
 
-def listenersConfigDir : IO System.FilePath :=
-  return (← Dirs.configBase) / "listeners"
+/-- Optional override for the listener config directory (tests redirect this, as
+    `Project.globalRolesDirOverride` does for roles). -/
+initialize listenersConfigDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
 
-def listenerStateDir : IO System.FilePath :=
-  return (← Dirs.dataBase) / "listeners" / "state"
+def setListenersConfigDirOverride (p : Option System.FilePath) : IO Unit :=
+  listenersConfigDirOverride.set p
+
+def listenersConfigDir : IO System.FilePath := do
+  match ← listenersConfigDirOverride.get with
+  | some p => return p
+  | none   => return (← Dirs.configBase) / "listeners"
+
+/-- Optional override for the listener state directory. Paired with the one above so a test that
+    redirects configs does not leave state behind in the real data dir. -/
+initialize listenerStateDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
+
+def setListenerStateDirOverride (p : Option System.FilePath) : IO Unit :=
+  listenerStateDirOverride.set p
+
+def listenerStateDir : IO System.FilePath := do
+  match ← listenerStateDirOverride.get with
+  | some p => return p
+  | none   => return (← Dirs.dataBase) / "listeners" / "state"
 
 -- Config I/O
+
+def listenerConfigFile (name : String) : IO System.FilePath := do
+  return (← listenersConfigDir) / s!"{name}.json"
 
 def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
   let path := (← listenersConfigDir) / s!"{name}.json"
@@ -391,6 +413,68 @@ def loadAllListenerConfigs : IO (Array ListenerConfig) := do
       | .ok cfg  => configs := configs.push cfg
   return configs
 
+/-! ### Editing a listener config
+
+`loadListenerConfig` hands back a *parsed* config with `{{secret}}` placeholders already expanded
+(`applySecrets`), which is what the daemon needs and exactly what an editor must not have: a
+client that fetched one, changed a field and sent it back would persist the expanded secret into
+a file whose whole point is that it does not contain one.
+
+So the edit path never round-trips through `ListenerConfig`. `loadListenerConfigRaw` returns the
+file as written, placeholders intact, and `saveListenerConfigRaw` stores the text the client
+sent. `validateListenerConfig` type-checks that text — after substitution, so a config that
+legitimately references a secret is judged against the value the daemon will see — without the
+result ever reaching the disk. -/
+
+/-- The listener config file exactly as stored, `{{secret}}` placeholders unexpanded. -/
+def loadListenerConfigRaw (name : String) : IO (Option String) := do
+  let path ← listenerConfigFile name
+  if !(← path.pathExists) then return none
+  return some (← IO.FS.readFile path)
+
+/-- Whether `raw` is a listener config that can be stored under `name`.
+
+    Returns the config as the daemon would read it, so a caller can report what it accepted.
+    Everything that can be wrong is reported as a sentence naming the field, because the only
+    consumer of these is a person who has just typed something wrong. -/
+def validateListenerConfig (name : String) (raw : String) :
+    IO (Except String ListenerConfig) := do
+  match Utils.checkConfigName "listener" name with
+  | .error e => return .error e
+  | .ok _    => pure ()
+  let secrets ← loadSecrets
+  let j ← match Json.parse (applySecrets secrets raw) with
+    | .error e => return .error s!"the body is not valid JSON: {e}"
+    | .ok j    => pure j
+  let cfg ← match (FromJson.fromJson? j : Except String ListenerConfig) with
+    | .error e => return .error s!"the body is not a listener config: {e}"
+    | .ok c    => pure c
+  if cfg.name != name then
+    return .error s!"the config names this listener '{cfg.name}', but it is being stored as \
+'{name}'"
+  if cfg.intervalSeconds == 0 then
+    return .error "'interval_seconds' must be at least 1; a listener polling zero seconds apart \
+would spin against its source as fast as the network allows"
+  return .ok cfg
+
+/-- Store a listener config verbatim. Validation is the caller's business — see
+    `validateListenerConfig`, which the API and the CLI both run first. -/
+def saveListenerConfigRaw (name : String) (raw : String) : IO Unit := do
+  Utils.writeFileAtomically (← listenerConfigFile name) raw
+
+/-- Remove a listener config and the state that belonged to it. `false` when there was none.
+
+    The state goes with the config on purpose: it is a list of event ids already handled, and
+    keeping it would mean a listener re-created under the same name silently ignored every event
+    its predecessor had seen. -/
+def deleteListenerConfig (name : String) : IO Bool := do
+  let path ← listenerConfigFile name
+  if !(← path.pathExists) then return false
+  IO.FS.removeFile path
+  let statePath := (← listenerStateDir) / s!"{name}.json"
+  if ← statePath.pathExists then IO.FS.removeFile statePath
+  return true
+
 -- State I/O
 
 def loadListenerState (name : String) : IO ListenerState := do
@@ -407,7 +491,10 @@ def loadListenerState (name : String) : IO ListenerState := do
 def saveListenerState (name : String) (state : ListenerState) : IO Unit := do
   let dir ← listenerStateDir
   IO.FS.createDirAll dir
-  IO.FS.writeFile (dir / s!"{name}.json") (Lean.Json.compress (ToJson.toJson state))
+  -- Atomic because the daemon reads this file every tick and the API writes it whenever someone
+  -- toggles a listener: a truncate-then-write would let a tick land on an empty file and read it
+  -- as "never checked, nothing processed", which re-queues every event the listener has seen.
+  Utils.writeFileAtomically (dir / s!"{name}.json") (Lean.Json.compress (ToJson.toJson state))
 
 -- Template rendering
 
