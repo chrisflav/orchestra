@@ -66,13 +66,17 @@ services:
       # Drop your key in ./secrets/ and set ORCHESTRA_GITHUB_PRIVATE_KEY_PATH to its path here.
       - ${ORCHESTRA_SECRETS_DIR:-./secrets}:/secrets:ro
 
-  # The web dashboard: `orchestra dashboard serve` over the same /config and /data.
+  # The web console and the HTTP API: `orchestrad dashboard` over the same /config and /data.
   #
   # A separate container rather than a thread inside the daemon, because the two have opposite
   # restart characteristics: the daemon drains for up to `stop_grace_period` on every stop, and
-  # tying a read-only web view to that would make the dashboard unavailable exactly when someone
-  # is trying to look at why a task is stuck. Nothing here dispatches work — it reads the same
-  # state files the daemon writes.
+  # tying the console to that would make it unavailable exactly when someone is trying to look at
+  # why a task is stuck. (`orchestrad serve` runs both in one process, which is the right shape
+  # for a single-host install and the wrong one here.)
+  #
+  # Nothing here dispatches work. It reads the state files the daemon writes, and it writes the
+  # configuration files the daemon reads — listeners, roles and skills — which the daemon picks up
+  # without a restart.
   dashboard:
     # Same build as above so `docker compose build` produces the one image both services use;
     # Compose builds it once and reuses it.
@@ -86,6 +90,7 @@ services:
     # *inside* a container: the default binds loopback, which nothing outside the container can
     # reach. Exposure is controlled by the published port below, not by this.
     command:
+      - orchestrad
       - dashboard
       - --host
       - 0.0.0.0
@@ -118,7 +123,10 @@ services:
     depends_on:
       - orchestra
     volumes:
-      # /config read-only: the dashboard reads config.json for the auth-sources page and must
-      # never write it. /data read-write, because a generated password is persisted there.
-      - ./config:/config:ro
+      # Read-write since taxis #433: the API this container serves is how listeners, roles and
+      # skills are edited, and those live under /config. It still never writes config.json itself
+      # — the entrypoint skips rendering one here precisely because this container is not given
+      # the credentials that would go in it.
+      - ./config:/config
+      # Task history, queue state, and the persisted dashboard secret.
       - ./data:/data
