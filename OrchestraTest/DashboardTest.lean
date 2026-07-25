@@ -3,6 +3,7 @@ import Orchestra
 
 open Orchestra
 open Orchestra.Dashboard
+open Orchestra.Secret (constantTimeEq)
 
 namespace OrchestraTest.Dashboard
 
@@ -58,7 +59,11 @@ def wantsAppShell_distinguishesRoutesFromAssets : Test := do
   TestM.assert (!wantsAppShell "/assets/index-abc123.css") (msg := "a missing stylesheet")
   TestM.assert (!wantsAppShell "/favicon.ico") (msg := "a missing icon")
 
-/-! ## Credential comparison -/
+/-! ## Credential comparison
+
+`constantTimeEq` moved to `Orchestra.Secret` when the CLI became an HTTP client and needed it
+too; it is still the comparison every credential in this module goes through, so it is still
+pinned here. -/
 
 @[test]
 def constantTimeEq_matchesOrdinaryEquality : Test := do
@@ -160,6 +165,30 @@ private def specPaths : Except String (Array String) := do
   let obj ← paths.getObj?
   return obj.toArray.map (·.1)
 
+/-- Every documented `(path, methods)` pair. Only the HTTP verbs are kept: a path item may also
+    carry `parameters` and `summary`, which are not operations. -/
+private def specOperations : Except String (Array (String × Array String)) := do
+  let verbs := #["get", "put", "post", "delete", "patch", "head", "options"]
+  let paths ← (← specJson).getObjVal? "paths"
+  let obj ← paths.getObj?
+  return obj.toArray.map fun (path, item) =>
+    let ops := (item.getObj?.toOption.map (·.toArray.map (·.1))).getD #[]
+    (path, ops.filter verbs.contains)
+
+/-- The paths every one of whose operations declares `"security": []`. -/
+private def specUnsecured : Except String (Array String) := do
+  let paths ← (← specJson).getObjVal? "paths"
+  let obj ← paths.getObj?
+  let mut out : Array String := #[]
+  for (path, item) in obj.toArray do
+    let ops := (item.getObj?.toOption.map (·.toArray)).getD #[]
+    let waives := ops.any fun (_, op) =>
+      match op.getObjVal? "security" |>.toOption with
+      | some (.arr #[]) => true
+      | _               => false
+    if waives then out := out.push path
+  return out
+
 @[test]
 def openApiSpec_isValidAndDescribesEveryRoute : Test := do
   match specPaths with
@@ -167,17 +196,90 @@ def openApiSpec_isValidAndDescribesEveryRoute : Test := do
   | .ok paths =>
     TestM.assert (paths.size > 0) (msg := "the spec documents at least one path")
     -- Every kind the dispatcher serves is documented …
-    for kind in apiKinds do
+    for (kind, _) in apiRoutes do
       let expected := s!"/api/{apiVersion}/{kind}"
       TestM.assert (paths.contains expected)
         (msg := s!"{expected} is served but missing from docs/openapi.json")
     -- … and nothing under the version prefix is documented that is not served.
     let prefix_ := s!"/api/{apiVersion}/"
+    let servedKinds := apiRoutes.map (·.1)
     for path in paths do
       if path.startsWith prefix_ then
         let kind := (path.drop prefix_.length).toString
-        TestM.assert (apiKinds.contains kind)
+        TestM.assert (servedKinds.contains kind)
           (msg := s!"docs/openapi.json documents {path}, which no route serves")
+
+/-- The methods too, not only the paths.
+
+    Writes made this worth checking: a `PUT` that exists and is undocumented is invisible to
+    every client that reads the spec, and a `DELETE` that is documented and does not exist is
+    worse — it is a promise. -/
+@[test]
+def openApiSpec_documentsEveryMethodOfEveryRoute : Test := do
+  match specOperations with
+  | .error e => TestM.fail s!"docs/openapi.json is not parseable JSON: {e}"
+  | .ok documented =>
+    for (kind, methods) in apiRoutes do
+      let path := s!"/api/{apiVersion}/{kind}"
+      let spec := (documented.find? (·.1 == path)).map (·.2) |>.getD #[]
+      for m in methods do
+        TestM.assert (spec.contains m)
+          (msg := s!"{m.toUpper} {path} is served but not documented in docs/openapi.json")
+      for m in spec do
+        TestM.assert (methods.contains m)
+          (msg := s!"docs/openapi.json documents {m.toUpper} {path}, which no route serves")
+
+/-- Nothing under the version prefix may waive authentication.
+
+    The spec is the place this is checkable as data: an operation that opts out of the global
+    security requirement says so with `"security": []`, so the set of uncredentialed operations
+    is exactly readable, and it must be exactly `publicPaths`. -/
+@[test]
+def openApiSpec_waivesAuthenticationOnlyWhereTheServerDoes : Test := do
+  match specUnsecured with
+  | .error e => TestM.fail s!"docs/openapi.json is not parseable JSON: {e}"
+  | .ok unsecured =>
+    for path in unsecured do
+      TestM.assert (publicPaths.contains path)
+        (msg := s!"docs/openapi.json marks {path} as needing no credential, but the server \
+gates it")
+    for path in publicPaths do
+      TestM.assert (unsecured.contains path)
+        (msg := s!"the server serves {path} without a credential, but the spec does not say so")
+
+@[test]
+def publicPaths_containsNothingUnderTheVersionPrefix : Test := do
+  -- The gate in `route` is one check with `publicPaths` as its exemption list, so anything that
+  -- ends up in this array is reachable by anyone who can reach the port. No read belongs here,
+  -- and a write certainly does not.
+  for path in publicPaths do
+    TestM.assert (!path.startsWith s!"/api/{apiVersion}/")
+      (msg := s!"{path} waives authentication and is under the version prefix")
+
+/-! ## The content-type gate
+
+The second of the two locks on a cookie-authenticated write (see `Orchestra.Dashboard`). It is a
+decision about a header string, so it is pinned here rather than argued about in a comment. -/
+
+@[test]
+def isJsonContentType_acceptsJsonAndRejectsFormEncodings : Test := do
+  TestM.assert (isJsonContentType (some "application/json"))
+  TestM.assert (isJsonContentType (some "application/json; charset=utf-8"))
+    (msg := "a charset parameter does not change the type")
+  TestM.assert (isJsonContentType (some "Application/JSON"))
+    (msg := "media types are case-insensitive")
+  TestM.assert (isJsonContentType (some " application/json "))
+    (msg := "surrounding whitespace is not part of the type")
+  TestM.assert (isJsonContentType (some "application/merge-patch+json"))
+    (msg := "the +json structured suffix is JSON")
+  -- The three an HTML form can send. Each of these accepted would be a form-reachable write.
+  TestM.assert (!isJsonContentType (some "application/x-www-form-urlencoded"))
+  TestM.assert (!isJsonContentType (some "multipart/form-data; boundary=x"))
+  TestM.assert (!isJsonContentType (some "text/plain"))
+  TestM.assert (!isJsonContentType (some "text/plain; charset=utf-8"))
+  TestM.assert (!isJsonContentType none) (msg := "no header at all is not a declaration of JSON")
+  TestM.assert (!isJsonContentType (some "application/jsonish"))
+    (msg := "a type that merely starts with the right letters is not JSON")
 
 @[test]
 def openApiSpec_documentsTheAuthenticationSurface : Test := do

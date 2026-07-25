@@ -9,8 +9,10 @@ import Orchestra.Listener
 import Orchestra.Project.Basic
 import Orchestra.Project.Claim
 import Orchestra.Usage
+import Orchestra.Secret
+import Orchestra.Skill
 
-open Lean (Json ToJson)
+open Lean (Json ToJson FromJson)
 open Std.Net
 open Std.Async
 open Std.Http (Request Response Body Chunk Header Status Method)
@@ -21,20 +23,20 @@ open Orchestra.Project (Project Issue IssueStatus Claim
 /-!
 # Orchestra Web Dashboard
 
-`orchestra dashboard` answers five things on one port:
+`orchestrad dashboard` answers six things on one port:
 
   * `GET /api/openapi.json` — the API's own description, uncredentialed.
   * `POST /api/login`, `POST /api/logout`, `GET /api/session` — the authentication surface.
   * `GET /api/v1/<kind>` — the read API: resources and collections, described by that spec.
-  * `GET /sse/v1/<kind>` — the same payloads pushed as Server-Sent Events when they change.
+  * `POST`/`PUT`/`DELETE /api/v1/<kind>` — the write API: orchestra's configuration.
+  * `GET /sse/v1/<kind>` — the read payloads pushed as Server-Sent Events when they change.
   * everything else — the compiled front-end from `--site`, with a single-page-app fallback.
 
 The API is a general one that this repository's front-end happens to be a client of, not a
 set of view models shaped for its pages. That distinction is what the wire conventions and
 the collection envelope below are for: the payloads carry instants rather than rendered
 phrases, `null` rather than `""`, and every list is pageable, so a script or another UI can
-consume them without knowing which page asked first. It is read-only — the only routes that
-are not `GET` are the two that open and close a session.
+consume them without knowing which page asked first.
 
 The transport is `Std.Http`, Lean's HTTP/1.1 server. This module supplies a `Handler` and
 nothing below it: request parsing, header validation, keep-alive, chunked encoding, the
@@ -53,6 +55,31 @@ artifact, so the Docker image builds it in a Node stage and copies it to a fixed
 Adding a page = a Lean `IO Json` builder plus a route arm in `renderApi` (here) + a typed
 client call and a React page under `web/src/pages/`.
 
+## What is writable, and what a write costs
+
+Three resources are configuration, and all three are writable: **listeners** (event sources
+that enqueue work), **roles** (reusable task templates), and **skills** (the Markdown an agent
+is handed). Everything else the API serves — the queue, task history, concerts, projects, the
+authentication sources — is either a record of something that already happened or is owned by
+another system, and is read-only here.
+
+Two properties every write holds to:
+
+  * **A rejected body changes nothing.** Validation runs to completion against the *text the
+    client sent* before anything is opened for writing; the store never sees a half-checked
+    record. See `Listener.validateListenerConfig`, `Project.validateRole` and `Skill.validate`,
+    which live beside the models rather than here so that each rule has one definition rather
+    than one per caller.
+  * **A reader never sees a torn file.** Every write is a write-and-rename
+    (`Utils.writeFileAtomically`), because the process reading these files is not the process
+    writing them: the daemon re-reads listener configs on every tick.
+
+The API stores the raw text it was given rather than a re-serialised record. Listener configs
+are the reason: they are read through `applySecrets`, so a client that fetched a *parsed* config
+and sent it back would write the expanded secret into a file whose entire purpose is not to
+contain one. Storing text also means a field this version does not know about survives an edit
+by a client that does not know about it either.
+
 ## Authentication
 
 One shared secret, presented two ways:
@@ -62,76 +89,79 @@ One shared secret, presented two ways:
     front-end cannot exfiltrate it, and the cookie rides SSE requests automatically — which is
     what lets `EventSource` authenticate without a token in the URL (and therefore out of
     access logs, `Referer` headers and browser history).
-  * **Scripts** send `Authorization: Bearer <secret>` directly.
+  * **Scripts** send `Authorization: Bearer <secret>` directly. This is how `orchestra`, the
+    CLI, talks to this server.
 
-Both comparisons are constant-time. There is no CORS header anywhere: the site and the API
-are the same origin, and a wildcard `Access-Control-Allow-Origin` is incompatible with cookie
-credentials in the first place. Development against Vite's dev server goes through its proxy
-(`web/vite.config.ts`), which keeps that property.
+Both comparisons are constant-time (`Secret.constantTimeEq`). There is no CORS header anywhere:
+the site and the API are the same origin, and a wildcard `Access-Control-Allow-Origin` is
+incompatible with cookie credentials in the first place. Development against Vite's dev server
+goes through its proxy (`web/vite.config.ts`), which keeps that property.
+
+Every route that is not a `GET` requires that credential, including the ones that only read —
+there are none. `POST /api/login` is the single exception, by definition: it is how the
+credential is obtained. `GET /api/session` and `GET /api/openapi.json` are also uncredentialed,
+and both are covered above; neither discloses anything a caller could not learn by trying.
+
+### Cross-site request forgery
+
+A cookie is an *ambient* credential: the browser attaches it to a request the user did not
+knowingly make. That is what makes a write API reachable by cookie a CSRF question, and it does
+not have a one-word answer.
+
+**The first lock is `SameSite=Strict`.** The session cookie carries it, so no request initiated
+from another site carries the cookie at all — not a form post, not an image, not a `fetch`. A
+page on `evil.example` that posts to `DELETE /api/v1/listeners/nightly` reaches this server
+unauthenticated and is answered `401`. That covers the entire classical CSRF surface.
+
+It is worth being precise about what that argument leans on, because "SameSite handles it" is
+usually said too quickly:
+
+  * It is enforced by the *browser*, not by this server. A server cannot verify that the client
+    honoured it. Every currently-supported browser does; a sufficiently old one does not, and
+    against such a client the second lock below is what remains.
+  * `SameSite` is same-*site*, not same-origin: another origin on the same registrable domain
+    would be treated as first-party. In the deployment this is built for the dashboard is the
+    only thing on its origin and it serves no user-supplied HTML, so there is no sibling origin
+    to be attacked from. Behind a reverse proxy that puts other applications on the same domain,
+    that assumption is the operator's to check.
+  * It says nothing about a request the *user's own page* makes, which is XSS, not CSRF. The
+    answer to that is that the secret never reaches JavaScript and the session is `HttpOnly`, so
+    an injected script can act only for as long as it is running in the page.
+
+**The second lock is the content type.** Every write must arrive as `application/json`. An HTML
+form can only send `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`,
+so a form post cannot satisfy this whatever the browser does about cookies. A cross-origin
+`fetch` that sets `Content-Type: application/json` is no longer a CORS *simple* request and is
+preflighted; this server answers no `OPTIONS` and sends no `Access-Control-Allow-*`, so the
+preflight fails and the real request is never sent. The two locks fail independently, which is
+the point of having two.
+
+**A synchroniser token is deliberately absent.** It would add a third lock covering neither more
+nor different ground: with `SameSite=Strict` the attacker cannot obtain a cookie-bearing
+request, and with the content-type gate they cannot form one without a preflight. What it would
+add is a token to mint, store, rotate and get wrong, and a second failure mode (a stale token
+after a restart) for the one client — the browser — that already works. If the cookie ever loses
+`SameSite=Strict` (a deployment that needs cross-site framing, say), that trade changes and the
+token is the thing to add.
+
+**An `Origin` check is also deliberately absent.** Rejecting a write whose `Origin` header names
+a host other than `Host` would be a cheap third lock, and it is what many APIs do. It is left
+out because it is the one of the three that can fail *closed on a correct deployment*: a reverse
+proxy that rewrites `Host` to an internal name — a common and otherwise harmless configuration —
+makes every browser write fail with a header mismatch the operator did not cause and cannot see
+from the front-end. Non-browser clients send no `Origin` at all, so the check would protect
+exactly the case `SameSite` already covers, at the cost of a deployment failure mode. If it is
+ever added, it must be `Origin`-present-and-mismatched, never `Origin`-absent.
 -/
 
 namespace Orchestra.Dashboard
 
-/-! ## Secret resolution -/
+/-! ## Secret resolution
 
-/-- The env var that supplies the dashboard password. -/
-def passwordEnvVar : String := "ORCHESTRA_DASHBOARD_PASSWORD"
+Resolution and comparison of the shared secret live in `Orchestra.Secret`, because the CLI needs
+both and is no longer in the same binary as this module. -/
 
-/-- Where a generated password is persisted, so restarts don't invalidate what the user
-    already wrote down. -/
-private def secretFile : IO System.FilePath := do
-  return (← Dirs.dataBase) / "dashboard.secret"
-
-private def hexDigits : Array Char := "0123456789abcdef".toList.toArray
-
-private def toHex (b : UInt8) : String :=
-  let n := b.toNat
-  String.ofList [hexDigits[n >>> 4]!, hexDigits[n &&& 0xf]!]
-
-/-- `n` bytes of `/dev/urandom`, hex-encoded. -/
-private def randomHex (n : Nat) : IO String := do
-  let bytes ← IO.FS.withFile "/dev/urandom" .read fun h => h.read n.toUSize
-  return String.join (bytes.toList.map toHex)
-
-/-- Resolve the dashboard password, in priority order:
-    1. an explicit `flagPassword` (`--password`),
-    2. `$ORCHESTRA_DASHBOARD_PASSWORD`,
-    3. one previously persisted under the data dir,
-    4. otherwise a freshly generated one (persisted for reuse).
-
-    Returns the password and whether it had to be generated, so the caller can print a
-    generated one prominently and stay quiet about a configured one. -/
-def resolvePassword (flagPassword : Option String := none) : IO (String × Bool) := do
-  if let some p := flagPassword then
-    if !p.trimAscii.isEmpty then return (p.trimAscii.toString, false)
-  if let some p ← IO.getEnv passwordEnvVar then
-    if !p.trimAscii.isEmpty then return (p.trimAscii.toString, false)
-  let path ← secretFile
-  if ← path.pathExists then
-    let p := (← IO.FS.readFile path).trimAscii.toString
-    if !p.isEmpty then return (p, false)
-  let p ← randomHex 24
-  IO.FS.createDirAll (← Dirs.dataBase)
-  -- Created empty with owner-only permissions *before* the secret goes in, so the value is
-  -- never briefly world-readable under a permissive umask.
-  IO.FS.writeFile path ""
-  try
-    let _ ← IO.Process.run { cmd := "chmod", args := #["600", path.toString] }
-  catch _ => pure ()
-  IO.FS.writeFile path (p ++ "\n")
-  return (p, true)
-
-/-- Length-independent byte comparison, so a wrong secret takes the same time to reject
-    whatever its content. Length itself is not hidden — it leaks through the early return —
-    which is the standard trade-off and harmless for a high-entropy secret. -/
-def constantTimeEq (a b : String) : Bool := Id.run do
-  let ab := a.toUTF8
-  let bb := b.toUTF8
-  if ab.size != bb.size then return false
-  let mut diff : UInt8 := 0
-  for i in [0:ab.size] do
-    diff := diff ||| (ab[i]! ^^^ bb[i]!)
-  return diff == 0
+open Orchestra.Secret (constantTimeEq randomHex)
 
 /-! ## Responses -/
 
@@ -665,6 +695,11 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
     let extrasJson : Array Json := (extras.filter (fun (_, v) => ! v.isEmpty)).map
       (fun (k, v) => (Json.arr #[Json.str k, Json.str v])) |>.toArray
     let recent := st.processedIds.toList.reverse.take 50
+    -- The file as stored, `{{secret}}` placeholders intact — this is the document a client edits
+    -- and sends back to `PUT`. Everything above it is derived and is what a *display* wants; a
+    -- round trip through those fields would lose whatever this version does not model and would
+    -- write expanded secrets back into a config that deliberately does not carry any.
+    let config := (← Listener.loadListenerConfigRaw name).bind (Json.parse · |>.toOption)
     return some (Json.mkObj [
       ("name",            c.name),
       ("enabled",         Json.bool st.enabled),
@@ -675,8 +710,86 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
       ("sourceDetail",    srcDetail),
       ("sourceExtras",    Json.arr extrasJson),
       ("action",          actionJson c.action),
-      ("recentEvents",    Json.arr (recent.map Json.str).toArray)
+      ("recentEvents",    Json.arr (recent.map Json.str).toArray),
+      ("config",          config.getD Json.null)
     ])
+
+/-! ### Roles and skills
+
+The other two configuration resources. Neither had a read endpoint before writes existed, for
+the honest reason that nothing displayed them; they are here now because a client cannot edit
+what it cannot fetch.
+
+Roles are the *global* ones (`<config>/roles/`). A project may shadow one by name under its own
+directory, and that copy is the project's — see `Project.loadAllRoles`. -/
+
+private def dispatchJson : Option Project.DispatchPolicy → Json
+  | none   => Json.null
+  | some d =>
+    Json.mkObj [
+      ("trigger",  ToJson.toJson d.trigger),
+      ("max",      ToJson.toJson d.max),
+      ("preClaim", Json.bool d.preClaim)
+    ]
+
+private def roleSummaryJson (r : Project.Role) : Json :=
+  Json.mkObj [
+    ("name",        r.name),
+    ("permissions", Json.arr (r.permissions.map Json.str).toArray),
+    ("backend",     optStr r.backend),
+    ("model",       optStr r.model),
+    ("priority",    ToJson.toJson r.priority),
+    ("readOnly",    Json.bool r.readOnly),
+    ("budgetUsd",   optNum r.budget),
+    ("dispatch",    dispatchJson r.dispatch)
+  ]
+
+private def rolesApi (p : Page) : IO Json := do
+  -- Sorted by name: `loadGlobalRoles` goes through a hash map, so its order is stable within a
+  -- process but says nothing a client could page through.
+  let roles := (← Project.loadGlobalRoles).qsort (fun a b => a.name < b.name)
+  pageOverUnordered p roles fun r => return roleSummaryJson r
+
+private def roleDetailApi (name : String) : IO (Option Json) := do
+  let some raw ← Project.loadGlobalRoleRaw name | return none
+  match Json.parse raw with
+  -- A role file that does not parse still answers, so the API can show the operator the file
+  -- that needs fixing rather than a 404 for something plainly there.
+  | .error e => return some (Json.mkObj [
+      ("name",        name),
+      ("parseError",  Json.str e),
+      ("config",      Json.null)
+    ])
+  | .ok j =>
+    match (FromJson.fromJson? j : Except String Project.Role) with
+    | .error e => return some (Json.mkObj [
+        ("name",       name),
+        ("parseError", Json.str e),
+        ("config",     j)
+      ])
+    | .ok r =>
+      let base := roleSummaryJson r
+      return some (base.mergeObj (Json.mkObj [
+        ("parseError",     Json.null),
+        ("systemPrompt",   optStr r.systemPrompt),
+        ("prependPrompt",  optStr r.prependPrompt),
+        ("promptTemplate", Json.str r.promptTemplate),
+        ("config",         j)
+      ]))
+
+private def skillSummaryJson (s : Skill.Skill) : Json :=
+  Json.mkObj [
+    ("name",        s.name),
+    ("description", optStr s.description),
+    ("updatedAt",   optEpochIso s.updatedAt)
+  ]
+
+private def skillsApi (p : Page) : IO Json := do
+  pageOverUnordered p (← Skill.loadAllSkills) fun s => return skillSummaryJson s
+
+private def skillDetailApi (name : String) : IO (Option Json) := do
+  let some s ← Skill.loadSkill name | return none
+  return some ((skillSummaryJson s).mergeObj (Json.mkObj [("content", Json.str s.content)]))
 
 private def tasksApi (p : Page) : IO Json := do
   return pageOver p (·.createdAt) taskRecJson (← TaskStore.loadAllTasks)
@@ -822,6 +935,8 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
   if kind == "tasks"     then return ← paged tasksApi
   if kind == "listeners" then return ← unpaged listenersApi
   if kind == "projects"  then return ← unpaged projectsApi
+  if kind == "roles"     then return ← unpaged rolesApi
+  if kind == "skills"    then return ← unpaged skillsApi
 
   let detail (prefix_ : String) (f : String → IO (Option Json)) : IO (Option ApiResult) := do
     unless kind.startsWith prefix_ do return none
@@ -834,6 +949,8 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
   if let some r ← detail "projects/"  projectDetailApi  then return r
   if let some r ← detail "concerts/"  concertDetailApi  then return r
   if let some r ← detail "listeners/" listenerDetailApi then return r
+  if let some r ← detail "roles/"     roleDetailApi     then return r
+  if let some r ← detail "skills/"    skillDetailApi    then return r
   if kind.startsWith "tasks/" then
     match natParam q "logLimit" defaultLogLimit maxLogLimit with
     | .error e => return .badRequest e
@@ -843,6 +960,160 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
       | some j => return .ok j
       | none   => return .notFound
   return .notFound
+
+/-! ## Writes
+
+Three resources, one shape each. A listener and a role *are* JSON documents, so the request body
+is that document verbatim — there is no envelope to unwrap and no field to disagree with the
+file. A skill is Markdown, which JSON cannot be, so it arrives wrapped: `{"content": "…"}`.
+
+`POST` to a collection creates and refuses to overwrite (`409`), taking the name from the body.
+`PUT` to a member creates or replaces, taking the name from the path; a body naming a different
+one is a `400` rather than a silent rename, because the two spellings would otherwise disagree
+forever. `DELETE` is `204` and, unlike `PUT`, is not idempotent-by-silence: deleting something
+that is not there is a `404`, since it is the answer to a different question than "it is gone".
+
+Every arm validates the text it was given and only then touches the disk. -/
+
+private inductive WriteResult
+  | created (payload : Json)
+  | ok (payload : Json)
+  | noContent
+  | notFound
+  | badRequest (why : String)
+  | conflict (why : String)
+
+/-- Split an `/api/v1/…` kind into path components, rejecting any component that could name
+    something other than itself.
+
+    The same `safeSegment` the read side uses, applied to every component rather than only the
+    last: a write turns its name into a filename, and `listeners/../../etc/passwd/enabled` must
+    fail on the middle segment, not be trusted because the last one is fine. -/
+private def kindSegments (kind : String) : Option (List String) :=
+  let raw := (kind.splitOn "/").filter (!·.isEmpty)
+  if raw.isEmpty then none else raw.mapM safeSegment
+
+/-- The name a create-by-`POST` body gives itself. Reported as a `400` naming the field, because
+    a body with no name is the commonest way to get this wrong. -/
+private def nameFromBody (what : String) (body : String) : Except String String :=
+  match Json.parse body with
+  | .error e => .error s!"the body is not valid JSON: {e}"
+  | .ok j    =>
+    match j.getObjValAs? String "name" with
+    | .ok n    => .ok n
+    | .error _ => .error s!"the body has no 'name'; a {what} created by POST is named by its body \
+(use PUT to name it by its path instead)"
+
+/-! ### Listeners -/
+
+/-- Store a listener config, creating or replacing. `mustBeNew` is what makes `POST` refuse to
+    overwrite while `PUT` replaces. -/
+private def writeListener (name : String) (body : String) (mustBeNew : Bool) :
+    IO WriteResult := do
+  let existed := (← Listener.loadListenerConfigRaw name).isSome
+  if mustBeNew && existed then
+    return .conflict s!"a listener named '{name}' already exists; PUT it to replace it"
+  match ← Listener.validateListenerConfig name body with
+  | .error e => return .badRequest e
+  | .ok _    =>
+    Listener.saveListenerConfigRaw name body
+    let payload := (← listenerDetailApi name).getD Json.null
+    return if existed then .ok payload else .created payload
+
+private def deleteListener (name : String) : IO WriteResult := do
+  if ← Listener.deleteListenerConfig name then return .noContent else return .notFound
+
+/-- Toggle a listener without editing its config.
+
+    `enabled` lives in the listener's *state* file, not its config, which is why it is a
+    sub-resource rather than a field of the document a `PUT` replaces: turning a listener off is
+    an operational act, and it must not require — or risk — rewriting the configuration. -/
+private def setListenerEnabled (name : String) (body : String) : IO WriteResult := do
+  let some cfg ← Listener.loadListenerConfig name | return .notFound
+  let enabled ← match Json.parse body with
+    | .error e => return .badRequest s!"the body is not valid JSON: {e}"
+    | .ok j    =>
+      match j.getObjValAs? Bool "enabled" with
+      | .ok b    => pure b
+      | .error _ => return .badRequest "expected a JSON body of the form {\"enabled\": true}"
+  let st ← Listener.loadListenerState cfg.name
+  Listener.saveListenerState cfg.name { st with enabled }
+  return .ok ((← listenerDetailApi name).getD Json.null)
+
+/-! ### Roles -/
+
+private def writeRole (name : String) (body : String) (mustBeNew : Bool) : IO WriteResult := do
+  let existed := (← Project.loadGlobalRoleRaw name).isSome
+  if mustBeNew && existed then
+    return .conflict s!"a role named '{name}' already exists; PUT it to replace it"
+  match Project.validateRole name body with
+  | .error e => return .badRequest e
+  | .ok _    =>
+    Project.saveGlobalRoleRaw name body
+    let payload := (← roleDetailApi name).getD Json.null
+    return if existed then .ok payload else .created payload
+
+private def deleteRole (name : String) : IO WriteResult := do
+  if ← Project.deleteGlobalRole name then return .noContent else return .notFound
+
+/-! ### Skills -/
+
+/-- The `content` of a skill write. Markdown cannot be a JSON body, so it is wrapped in one. -/
+private def skillContentFromBody (body : String) : Except String String :=
+  match Json.parse body with
+  | .error e => .error s!"the body is not valid JSON: {e}"
+  | .ok j    =>
+    match j.getObjValAs? String "content" with
+    | .ok c    => .ok c
+    | .error _ => .error "expected a JSON body of the form {\"content\": \"---\\nname: …\"}; \
+a skill is Markdown, so it travels as a string rather than as the body itself"
+
+private def writeSkill (name : String) (body : String) (mustBeNew : Bool) : IO WriteResult := do
+  let existed := (← Skill.loadSkill name).isSome
+  if mustBeNew && existed then
+    return .conflict s!"a skill named '{name}' already exists; PUT it to replace it"
+  let content ← match skillContentFromBody body with
+    | .error e => return .badRequest e
+    | .ok c    => pure c
+  match Skill.validate name content with
+  | .error e => return .badRequest e
+  | .ok _    =>
+    Skill.saveSkill name content
+    let payload := (← skillDetailApi name).getD Json.null
+    return if existed then .ok payload else .created payload
+
+private def deleteSkill (name : String) : IO WriteResult := do
+  if ← Skill.deleteSkill name then return .noContent else return .notFound
+
+/-- Dispatch a non-`GET` `/api/v1/…` request.
+
+    Mirrors `renderApi`'s shape: one function, every route in it, so that the set of writes the
+    server performs can be read in one place and cross-checked against `docs/openapi.json`. A
+    path that exists but not for this method answers `405`, which is reported by the `none` case
+    the caller turns into one — telling a client that `PATCH /api/v1/roles/x` is the wrong verb
+    is more useful than telling it the role does not exist. -/
+private def renderWrite (method : Method) (kind : String) (body : String) :
+    IO (Option WriteResult) := do
+  -- The name comes from the body for a `POST`, so a body that does not carry one is a `400`
+  -- about the body rather than a route that failed to match.
+  let create (what : String) (write : String → String → Bool → IO WriteResult) :
+      IO WriteResult := do
+    match nameFromBody what body with
+    | .error e => return .badRequest e
+    | .ok name => write name body true
+  let some segs := kindSegments kind | return some .notFound
+  match segs, method with
+  | ["listeners"],                  .post   => return some (← create "listener" writeListener)
+  | ["listeners", name],            .put    => return some (← writeListener name body false)
+  | ["listeners", name],            .delete => return some (← deleteListener name)
+  | ["listeners", name, "enabled"], .put    => return some (← setListenerEnabled name body)
+  | ["roles"],                      .post   => return some (← create "role" writeRole)
+  | ["roles", name],                .put    => return some (← writeRole name body false)
+  | ["roles", name],                .delete => return some (← deleteRole name)
+  | ["skills"],                     .post   => return some (← create "skill" writeSkill)
+  | ["skills", name],               .put    => return some (← writeSkill name body false)
+  | ["skills", name],               .delete => return some (← deleteSkill name)
+  | _, _ => return none
 
 /-! ## Server configuration and session state -/
 
@@ -1039,6 +1310,60 @@ private def apiResponse (st : ServeState) (kind : String) (q : Query)
   | .ok (.badRequest e)  => errorResp e .badRequest
   | .error e             => errorResp e .internalServerError
 
+/-- Cap on a write body.
+
+    Generous next to the reads, because one of these resources is prose: a skill is a Markdown
+    document and a role carries a prompt template, and both are written to be read by a model
+    rather than to fit in a field. A quarter of a megabyte is far more than any of them, and far
+    less than a client could use to sit on the server's memory. -/
+private def maxWriteBytes : UInt64 := 262144
+
+/-- Whether a `Content-Type` header value declares JSON.
+
+    The second CSRF lock (see the module docs): an HTML form can only send
+    `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`, so requiring JSON
+    puts every write out of a form's reach whatever the browser does about `SameSite`.
+
+    Parameters after the `;` are ignored — `application/json; charset=utf-8` is JSON — and the
+    `+json` structured suffix is accepted, since a client that labels its body
+    `application/merge-patch+json` is not the one this is defending against.
+
+    Not `private`: this is a security decision about a string, which is exactly the kind of thing
+    `OrchestraTest.Dashboard` pins directly. -/
+def isJsonContentType : Option String → Bool
+  | none   => false
+  | some v =>
+    let ty := ((v.splitOn ";").headD "").trimAscii.toString.toLower
+    ty == "application/json" || (ty.startsWith "application/" && ty.endsWith "+json")
+
+private def jsonContentType (req : Request Body.Stream) : Bool :=
+  isJsonContentType (reqHeader req "content-type")
+
+/-- Answer a `/api/v1/<kind>` write, or `none` when the path is a route this method does not
+    serve — which the caller turns into a `405`.
+
+    A `204` carries no body by definition, which is why it is built here rather than through
+    `jsonResp`: an empty JSON document would be a body, and a client that reads one where the
+    status promised none has been given something to misparse. -/
+private def writeResponse (kind : String) (method : Method) (body : String) :
+    Async (Option (Response Body.Any)) := do
+  -- A writer that throws must still produce a response, for the same reason a reader must: the
+  -- store is a filesystem, and a full disk or a permission change is an ordinary runtime
+  -- condition rather than a bug in the route.
+  match ← (try
+      Except.ok <$> renderWrite method kind body
+    catch e => pure (Except.error (toString e))) with
+  | .error e            => return some (← errorResp e .internalServerError)
+  | .ok none            => return none
+  | .ok (some .noContent) =>
+    return some (← (secured (Response.withStatus .noContent))
+      |>.header! "Cache-Control" "no-store" |>.fromBytes ByteArray.empty)
+  | .ok (some (.created j))    => return some (← jsonResp j .created)
+  | .ok (some (.ok j))         => return some (← jsonResp j .ok)
+  | .ok (some .notFound)       => return some (← notFoundJsonResp)
+  | .ok (some (.badRequest e)) => return some (← errorResp e .badRequest)
+  | .ok (some (.conflict e))   => return some (← errorResp e .conflict)
+
 /-! ## SSE streaming -/
 
 /-- Encode a payload as a single SSE `message` event. -/
@@ -1127,25 +1452,68 @@ def openApiSpec : String := include_str "../docs/openapi.json"
 /-- Where the spec is served, and the prefix everything it describes lives under. -/
 def apiVersion : String := "v1"
 
-/-- Every read the API serves, as the `<kind>` that `renderApi` dispatches on.
+/-- Every route the API serves under the version prefix: the `<kind>` that `renderApi` and
+    `renderWrite` dispatch on, paired with the methods it answers.
 
     Not `private`: the spec cross-check in `OrchestraTest.Dashboard` walks this, which is what
-    keeps `docs/openapi.json` honest. Detail routes appear with their OpenAPI template
-    parameter, since that is how the spec names them. -/
+    keeps `docs/openapi.json` honest — a route added without a spec entry, or a method added to
+    one, fails the suite. Detail routes appear with their OpenAPI template parameter, since that
+    is how the spec names them. -/
+def apiRoutes : Array (String × Array String) :=
+  #[("overview",                 #["get"]),
+    ("queue",                    #["get"]),
+    ("tasks",                    #["get"]),
+    ("tasks/{id}",               #["get"]),
+    ("concerts",                 #["get"]),
+    ("concerts/{id}",            #["get"]),
+    ("listeners",                #["get", "post"]),
+    ("listeners/{name}",         #["get", "put", "delete"]),
+    ("listeners/{name}/enabled", #["put"]),
+    ("roles",                    #["get", "post"]),
+    ("roles/{name}",             #["get", "put", "delete"]),
+    ("skills",                   #["get", "post"]),
+    ("skills/{name}",            #["get", "put", "delete"]),
+    ("projects",                 #["get"]),
+    ("projects/{id}",            #["get"]),
+    ("auth",                     #["get"])]
+
+/-- Every *read* the API serves. This is also exactly the set `/sse/v1/` streams, since a stream
+    is a read repeated. -/
 def apiKinds : Array String :=
-  #["overview", "queue", "tasks", "tasks/{id}", "concerts", "concerts/{id}",
-    "listeners", "listeners/{name}", "projects", "projects/{id}", "auth"]
+  apiRoutes.filterMap fun (kind, methods) => if methods.contains "get" then some kind else none
+
+/-- Every path reachable without a credential. There are four, and there is a reason for each:
+
+      * `/api/login` — how a credential is obtained; gating it would be circular.
+      * `/api/logout` — revoking a session one may no longer hold is not a privileged act.
+      * `/api/session` — a boolean the caller could learn by trying any other endpoint.
+      * `/api/openapi.json` — a client has to be able to discover what it is talking to, and how
+        to authenticate, before it can authenticate.
+
+    A value rather than the shape of four `if`s, so that the gate below can be one check and so
+    that `OrchestraTest.Dashboard` can assert this list is still exactly those four. Nothing
+    under `/api/v1/` is here, and in particular no write is. -/
+def publicPaths : Array String :=
+  #["/api/login", "/api/logout", "/api/session", "/api/openapi.json"]
 
 /-- Everything the dashboard answers, in one place.
 
-    The authentication surface comes first, since `/api/login` has to be reachable by
-    definition. The site is next and is *not* gated: the browser has to be able to load the
-    app shell and its bundle in order to render the login screen that acquires a session at
-    all. Everything the site then asks for — the API and the streams — is gated. -/
+    The credential is required **first**, before any arm runs, with two exemptions: the four
+    `publicPaths`, and the site. The site is exempt because a browser has to load the app shell
+    and its bundle in order to render the login screen that acquires a session at all; it is
+    static build output and discloses nothing about this instance.
+
+    Checking once, up front, is deliberate. The alternative — a check inside each arm — is how a
+    route ends up unauthenticated by omission, and a *write* that reached the disk that way would
+    not be a disclosure bug but a corruption one. -/
 private def route (st : ServeState) (req : Request Body.Stream) : Async (Response Body.Any) := do
   let path := pathOf req.line.uri
   let query := req.line.uri.query
   let method := req.line.method
+
+  let isSite := method == .get && !(path.startsWith "/api/") && !(path.startsWith "/sse/")
+  unless publicPaths.contains path || isSite || (← authenticated st req) do
+    return ← unauthorizedResp
 
   if path == "/api/login" then
     unless method == .post do return ← methodNotAllowedResp
@@ -1168,18 +1536,26 @@ private def route (st : ServeState) (req : Request Body.Stream) : Async (Respons
 
   if let some kind := apiKind s!"/sse/{apiVersion}/" path then
     unless method == .get do return ← methodNotAllowedResp
-    unless ← authenticated st req do return ← unauthorizedResp
     return ← sseResponse st kind query
 
-  if method == .get && !(path.startsWith "/api/") && !(path.startsWith "/sse/") then
+  if isSite then
     if let some root := st.cfg.siteDir then
       return ← serveStatic root path
 
-  unless ← authenticated st req do return ← unauthorizedResp
-  unless method == .get do return ← methodNotAllowedResp
-  match apiKind s!"/api/{apiVersion}/" path with
-  | some kind => apiResponse st kind query
-  | none      => notFoundJsonResp
+  let some kind := apiKind s!"/api/{apiVersion}/" path | return ← notFoundJsonResp
+  if method == .get then return ← apiResponse st kind query
+
+  -- Writes. The credential was already required above, so what is left here is the shape of the
+  -- request rather than the right to make it.
+  unless method == .post || method == .put || method == .delete do
+    return ← methodNotAllowedResp
+  if method == .post || method == .put then
+    unless jsonContentType req do
+      return ← errorResp "writes must be sent as application/json" .unsupportedMediaType
+  let body : String ← req.body.readAll (maximumSize := some maxWriteBytes)
+  match ← writeResponse kind method body with
+  | some resp => return resp
+  | none      => methodNotAllowedResp
 
 /-- The `Std.Http` handler: state plus the routing above. -/
 private structure Dashboard where
@@ -1193,15 +1569,17 @@ private instance : Handler Dashboard where
 
 /-! ## Server -/
 
-/-- Bounds on a single request. Every route is a `GET` or a one-field login, so the defaults
-    for bodies and header counts are far larger than anything legitimate; SSE is what the
-    rest is tuned for.
+/-- Bounds on a single request. Reads are `GET`s and writes are bounded by `maxWriteBytes`,
+    which is what `maxBodySize` is set from; SSE is what the rest is tuned for.
 
     `maxRequests` has to be unlimited: it caps requests per connection, and a browser holding
     an `EventSource` open reuses one connection for as long as the page is open. -/
 private def httpConfig : Std.Http.Config where
   maxRequests := 0
-  maxBodySize := 65536
+  -- Large enough for the biggest thing a write can carry (`maxWriteBytes`): a skill is a
+  -- Markdown document, and rejecting one at the transport layer would produce a dropped
+  -- connection instead of the sentence saying what was too big.
+  maxBodySize := 262144
   maxUriLength := 4096
 
 /-- Start the dashboard server: the JSON API, the SSE streams, and — with `cfg.siteDir` — the
