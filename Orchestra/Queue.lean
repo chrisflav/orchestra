@@ -92,6 +92,9 @@ structure QueueEntry where
   fork          : Repository
   mode          : TaskMode
   prompt        : String
+  /-- Condition the run is held to (mirrors `IOTask.goal`). Set from the bound issue's taxis
+      `goal` field when the entry is built for one, so it survives enqueue → dequeue → run. -/
+  goal          : Option String := none
   agent         : Option String := none
   systemPrompt  : Option String := none
   prependPrompt : Option String := none
@@ -175,6 +178,7 @@ instance : ToJson QueueEntry where
       ("mode",       ToJson.toJson e.mode),
       ("prompt",     e.prompt)
     ]
+    let fields := if let some s := e.goal          then fields ++ [("goal",            Json.str s)]      else fields
     let fields := if let some s := e.agent         then fields ++ [("agent",           Json.str s)]      else fields
     let fields := if let some s := e.systemPrompt  then fields ++ [("system_prompt",   Json.str s)]      else fields
     let fields := if let some s := e.prependPrompt   then fields ++ [("prepend_prompt",   Json.str s)]      else fields
@@ -217,6 +221,7 @@ instance : FromJson QueueEntry where
     let fork         ← j.getObjValAs? Repository "fork"
     let mode         ← j.getObjValAs? TaskMode "mode"
     let prompt       ← j.getObjValAs? String "prompt"
+    let goal          := j.getObjValAs? String "goal"           |>.toOption
     let agent         := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt  := j.getObjValAs? String "system_prompt"  |>.toOption
     let prependPrompt   := j.getObjValAs? String "prepend_prompt"  |>.toOption
@@ -248,7 +253,7 @@ instance : FromJson QueueEntry where
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
     let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
     let listenerName := j.getObjValAs? String "listener_name"    |>.toOption
-    return { id, createdAt, status, upstream, fork, mode, prompt,
+    return { id, createdAt, status, upstream, fork, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,

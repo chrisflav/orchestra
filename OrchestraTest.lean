@@ -18,3 +18,4 @@ import OrchestraTest.GitHubErrorTest
 import OrchestraTest.ForkResolveTest
 import OrchestraTest.UsageLimitTest
 import OrchestraTest.DashboardTest
+import OrchestraTest.GoalTest

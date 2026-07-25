@@ -67,6 +67,21 @@ def claude : AgentDef where
     if let some sid := resume then
       args := args.push "--resume" |>.push sid
     return args
+  goalArgs goal :=
+    -- What `/goal <condition>` does inside a Claude Code session is register one session-scoped
+    -- `Stop` hook of type `prompt` carrying the condition: on every attempt to stop, a second
+    -- model call judges the condition and sends the agent back to work until it holds. That is
+    -- reachable from the command line through `--settings`, which takes a settings JSON string
+    -- as readily as a path, so the goal travels as one argument with no file to write or clean
+    -- up (and none to leak into a second concurrent run's sandbox).
+    --
+    -- Typing the slash command instead is not an option here: headless runs get exactly one
+    -- prompt (`-p`), so `/goal ...` would have to *be* that prompt and there would be no turn
+    -- left to state the task in.
+    let stopHook := Json.mkObj [("type", .str "prompt"), ("prompt", .str goal)]
+    let matcher := Json.mkObj [("matcher", .str ""), ("hooks", Json.arr #[stopHook])]
+    let settings := Json.mkObj [("hooks", Json.mkObj [("Stop", Json.arr #[matcher])])]
+    some #["--settings", settings.compress]
   parseOutputLine := StreamFormat.parseEvent
   extractSessionId _ := pure none
   cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()

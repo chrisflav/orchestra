@@ -42,6 +42,9 @@ structure TaskRecord where
   fork          : Repository
   mode          : TaskMode
   prompt        : String
+  /-- Condition this run was held to (mirrors `IOTask.goal`). Inherited by continuations, so
+      resuming a task keeps the bar it was launched against. -/
+  goal          : Option String := none
   sessionId     : Option String := none
   status        : TaskStatus    := .running
   continuesFrom : Option String := none
@@ -80,6 +83,7 @@ instance : ToJson TaskRecord where
       ("status",     ToJson.toJson r.status)
     ]
     let fields := base
+    let fields := if let some s := r.goal          then fields ++ [("goal",           Json.str s)]      else fields
     let fields := if let some s := r.sessionId     then fields ++ [("session_id",    Json.str s)]      else fields
     let fields := if let some s := r.continuesFrom then fields ++ [("continues_from", Json.str s)]     else fields
     let fields := if let some s := r.series        then fields ++ [("series",         Json.str s)]     else fields
@@ -104,6 +108,7 @@ instance : FromJson TaskRecord where
     let mode         ← j.getObjValAs? TaskMode "mode"
     let prompt       ← j.getObjValAs? String "prompt"
     let status       ← j.getObjValAs? TaskStatus "status"
+    let goal          := j.getObjValAs? String "goal"           |>.toOption
     let sessionId     := j.getObjValAs? String "session_id"     |>.toOption
     let continuesFrom := j.getObjValAs? String "continues_from" |>.toOption
     let series        := j.getObjValAs? String "series"         |>.toOption
@@ -117,7 +122,7 @@ instance : FromJson TaskRecord where
     let projectId     := j.getObjValAs? Taxis.IssueId "project_id" |>.toOption
     let issueId       := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
     let role          := j.getObjValAs? String    "role"       |>.toOption
-    return { id, createdAt, upstream, fork, mode, prompt, status, sessionId,
+    return { id, createdAt, upstream, fork, mode, prompt, goal, status, sessionId,
              continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority,
              projectId, issueId, role }
 

@@ -378,7 +378,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let initialRecord : TaskStore.TaskRecord := {
     id := taskId, createdAt
     upstream := ioTask.upstream, fork := ioTask.fork, mode := ioTask.mode
-    prompt := ioTask.prompt, continuesFrom, series
+    prompt := ioTask.prompt, goal := ioTask.goal, continuesFrom, series
     backend := ioTask.backend, model := ioTask.model, agent := ioTask.agent
     systemPrompt := ioTask.systemPrompt, budget := ioTask.budget
     priority := ioTask.priority
@@ -431,6 +431,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   match ioTask.prependPrompt with
   | some name => IO.println s!"  Prepend prompt: {name}"
   | none      => pure ()
+  match ioTask.goal with
+  | some g => IO.println s!"  Goal:    {g}"
+  | none   => pure ()
   IO.println "  Prompt:"
   for line in ioTask.prompt.splitOn "\n" do
     IO.println s!"    {line}"
@@ -568,7 +571,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
       (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
       (additionalPaths := appConfig.additionalSandboxPaths)
-      (interactiveAgent := interactiveAgent)
+      (interactiveAgent := interactiveAgent) (goal := ioTask.goal)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     lastResultSubtype := result.resultSubtype

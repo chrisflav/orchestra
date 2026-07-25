@@ -7,10 +7,10 @@
    "type": "git",
    "subDir": null,
    "scope": "",
-   "rev": "388642241531548eb45218c091d785aa891dc573",
+   "rev": "0b45830f32f6fc4e8a3448e5811b59913e05db47",
    "name": "Taxis",
    "manifestFile": "lake-manifest.json",
-   "inputRev": "388642241531548eb45218c091d785aa891dc573",
+   "inputRev": "0b45830f32f6fc4e8a3448e5811b59913e05db47",
    "inherited": false,
    "configFile": "lakefile.toml"
   },

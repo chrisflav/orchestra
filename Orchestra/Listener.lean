@@ -820,6 +820,7 @@ def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : P
     , fork
     , mode          := .pr
     , prompt
+    , goal          := Project.goalFor issue?
     , backend       := role.backend
     , model         := role.model
     , systemPrompt  := role.systemPrompt

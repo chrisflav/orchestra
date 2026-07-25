@@ -419,6 +419,10 @@ Fields:
 - `upstream` — upstream repository in `owner/repo` format
 - `fork` — fork repository the agent has write access to
 - `prompt` — instruction sent to the agent
+- `goal` — condition the run is held to: the agent may not stop before it holds, and a second
+  model call decides whether it does. Keep it one short, checkable sentence — it is judged on its
+  own, without the prompt around it. Only the `claude` backend can enforce one today; the others
+  say so on stderr and run without it → [goals](#goals)
 - `tools` — optional tools granted to this task on top of the always-available ones; see
   [MCP tools](#mcp-tools)
 - `mode` — legacy shorthand for `tools`, kept for compatibility: `"fork"` grants nothing, `"pr"`
@@ -770,6 +774,32 @@ orchestra project health <project-id>          # find claims whose task is gone
 [`examples/projects/README.md`](examples/projects/README.md) is the full reference: how orchestra
 concepts map onto taxis, the `taxis` config block, role templates and their prompt variables, the
 dispatch triggers, and how the two dispatchers differ.
+
+### goals
+
+A taxis issue carries a **goal**: one sentence saying what must hold for it to be done. Set it in
+the taxis UI, or through taxis's own tools — orchestra reads it and never invents one.
+
+When a task is launched for an issue that has one — `orchestra spawn --issue`, `orchestra issue
+continue`, or either dispatcher — the goal becomes the task's goal, and the agent is held to it:
+it may not stop before the condition holds, and a second model call, not the agent itself, decides
+whether it does. Every hop preserves it, so a queued task that runs after a daemon restart, or a
+continuation of one that hit a usage limit, is still held to the same bar. `orchestra issue
+continue` re-reads it from the issue, so editing a goal changes what the next attempt is judged
+against.
+
+What the agent is *told* and what it is *judged on* are deliberately different things. The prompt
+is the role template with the issue title, body, comment thread and target rendered into it —
+thousands of words on a busy issue. The goal is the `goal` field alone. Nothing derives one from
+the other, in either direction: a goal assembled out of a prompt would be unjudgeable, and a
+prompt cut down to a goal would starve the agent of context.
+
+Only the `claude` backend can enforce a goal (it is what its `/goal` command does). Give a goal to
+`vibe`, `opencode` or `pi` and the run says so once on stderr and proceeds without it, rather than
+failing or pretending.
+
+A task file can set `goal` directly, for work that has no issue behind it — see
+[task files](#task-files).
 
 ## dashboard
 
