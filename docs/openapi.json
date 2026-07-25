@@ -3,8 +3,8 @@
   "info": {
     "title": "orchestra dashboard API",
     "version": "1.0.0",
-    "summary": "Read-only HTTP API over a running orchestra daemon.",
-    "description": "Everything the daemon knows about its queue, task history, listeners, projects and authentication sources, as JSON. Every read is also available as a Server-Sent Events stream at the same path under `/sse/v1/`, pushed every two seconds and only when the payload has changed.\n\nThe API is read-only: the only routes that are not `GET` are the two that open and close a session. Nothing here enqueues, cancels or reconfigures anything.\n\n## Conventions\n\n- Instants are RFC 3339 in UTC (`2026-07-23T10:04:11Z`) and live in a field named `...At`.\n- Durations are integer seconds, in a field named `...Seconds`.\n- An absent value is `null`, never an empty string.\n- Enumerations are the lower-case names the daemon itself uses.\n- Collections answer in a common envelope (`items`, `total`, `limit`, `offset`) and accept `limit`, `offset` and — where the collection is ordered by time — `since`.\n- A parameter that is malformed, or that the collection cannot honour, is a `400`. Parameters this version does not define are ignored.",
+    "summary": "HTTP API over a running orchestra backend: reads everything it knows, and changes what it is configured with.",
+    "description": "Everything the daemon knows about its queue, task history, listeners, projects and authentication sources, as JSON. Every read is also available as a Server-Sent Events stream at the same path under `/sse/v1/`, pushed every two seconds and only when the payload has changed.\n\nThree resources are configuration and are writable: **listeners**, **roles** and **skills**. Everything else — the queue, task history, concerts, projects, authentication sources — is a record of something that already happened or is owned by another system, and is read-only here. Nothing in this API enqueues or cancels work; that is the daemon's control socket.\n\n## Writing\n\n- Every route that is not a `GET` requires a credential. `POST /api/login` is the only exception, since it is how one is obtained.\n- Every write must be sent as `application/json`. A request without that content type is a `415`. This is the second of the two locks on a cookie-authenticated write: the session cookie is `SameSite=Strict`, so a cross-site request carries no credential, and an HTML form cannot send JSON, so it cannot form the request at all.\n- `POST` to a collection creates and refuses to overwrite (`409`), taking the name from the body. `PUT` to a member creates or replaces, taking the name from the path; a body naming a different one is a `400`.\n- `DELETE` answers `204`, or `404` when there was nothing there.\n- A rejected body changes nothing on disk: validation runs to completion before anything is written, and every write is a write-and-rename, so a reader never sees a partial file.\n- Listener configs and roles are stored **verbatim**, not re-serialised. That is what keeps `{{secret}}` placeholders — and any field a client does not know about — intact across an edit. Fetch the `config` field of a detail response, change it, and `PUT` it back.\n\n## Conventions\n\n- Instants are RFC 3339 in UTC (`2026-07-23T10:04:11Z`) and live in a field named `...At`.\n- Durations are integer seconds, in a field named `...Seconds`.\n- An absent value is `null`, never an empty string.\n- Enumerations are the lower-case names the daemon itself uses.\n- Collections answer in a common envelope (`items`, `total`, `limit`, `offset`) and accept `limit`, `offset` and — where the collection is ordered by time — `since`.\n- A parameter that is malformed, or that the collection cannot honour, is a `400`. Parameters this version does not define are ignored.",
     "license": { "name": "See repository" }
   },
   "servers": [
@@ -16,6 +16,8 @@
     { "name": "queue", "description": "Work waiting, running, and the concerts it belongs to." },
     { "name": "tasks", "description": "Runs that happened, and their logs." },
     { "name": "listeners", "description": "Event sources that enqueue work." },
+    { "name": "roles", "description": "Reusable task templates the dispatcher spawns from." },
+    { "name": "skills", "description": "Markdown handed to every agent this instance launches." },
     { "name": "projects", "description": "Taxis-backed projects and their issue graphs." },
     { "name": "auth", "description": "Configured credentials and their usage limits." }
   ],
@@ -105,6 +107,8 @@
       "post": {
         "tags": ["session"],
         "summary": "Revoke the caller's session",
+        "description": "Reachable without a credential, like `POST /api/login`: revoking a session one may no longer hold is not a privileged act, and requiring a valid one would mean an expired session could not be cleared.",
+        "security": [],
         "operationId": "logout",
         "responses": {
           "200": {
@@ -329,6 +333,23 @@
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
+      },
+      "post": {
+        "tags": ["listeners"],
+        "summary": "Create a listener",
+        "description": "The body is the listener config document itself \u2014 exactly what is stored at `<config>/listeners/<name>.json` \u2014 and the name comes from its `name` field. Refuses to overwrite; `PUT /api/v1/listeners/{name}` replaces.\n\nThe daemon re-reads listener configs on every tick and rescans the directory every fifteen seconds, so a listener created here starts polling without a restart.",
+        "operationId": "createListener",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListenerConfig" } } }
+        },
+        "responses": {
+          "201": { "$ref": "#/components/responses/ListenerWritten" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
       }
     },
     "/api/v1/listeners/{name}": {
@@ -350,6 +371,259 @@
             "description": "The listener.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListenerDetail" } } }
           },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "put": {
+        "tags": ["listeners"],
+        "summary": "Create or replace a listener",
+        "description": "The body is the listener config document itself. Its `name` must equal the path component \u2014 a mismatch is a `400` rather than a silent rename, because the two spellings would otherwise disagree for as long as the file exists.",
+        "operationId": "putListener",
+        "parameters": [{ "$ref": "#/components/parameters/name" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListenerConfig" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/ListenerWritten" },
+          "201": { "$ref": "#/components/responses/ListenerWritten" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      },
+      "delete": {
+        "tags": ["listeners"],
+        "summary": "Delete a listener",
+        "description": "Removes the config and the state that belonged to it. The state is a list of event ids already handled, and keeping it would mean a listener re-created under the same name silently ignored every event its predecessor had seen.\n\nThe daemon's fiber for this listener retires within one tick of its config disappearing.",
+        "operationId": "deleteListener",
+        "parameters": [{ "$ref": "#/components/parameters/name" }],
+        "responses": {
+          "204": { "$ref": "#/components/responses/Deleted" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/listeners/{name}/enabled": {
+      "put": {
+        "tags": ["listeners"],
+        "summary": "Turn a listener on or off",
+        "description": "A sub-resource rather than a field of the config, because `enabled` lives in the listener's *state* file: turning one off is an operational act and must not require \u2014 or risk \u2014 rewriting its configuration. Takes effect on the listener's next tick.",
+        "operationId": "setListenerEnabled",
+        "parameters": [{ "$ref": "#/components/parameters/name" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["enabled"],
+                "properties": { "enabled": { "type": "boolean" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/ListenerWritten" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      }
+    },
+    "/api/v1/roles": {
+      "get": {
+        "tags": ["roles"],
+        "summary": "Global roles",
+        "description": "The roles in `<config>/roles/`. A project may shadow one by name under its own directory; that copy belongs to the project and is not served or written here.\n\nConfiguration rather than events, so this collection has no time order and does not accept `since`.",
+        "operationId": "listRoles",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of roles, ordered by name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Collection" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Role" } }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "tags": ["roles"],
+        "summary": "Create a role",
+        "description": "The body is the role document itself, and the name comes from its `name` field. Refuses to overwrite.\n\n`permissions` is checked against the tool groups the sandbox actually grants (`create_pr`, `comment`, `manage_issues`, `work_issues`, `review_issues`); a typo there is otherwise invisible until a dispatched agent finds itself without the tool it was told to use.",
+        "operationId": "createRole",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RoleConfig" } } }
+        },
+        "responses": {
+          "201": { "$ref": "#/components/responses/RoleWritten" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      }
+    },
+    "/api/v1/roles/{name}": {
+      "get": {
+        "tags": ["roles"],
+        "summary": "One role, with its prompt template and the document behind it",
+        "description": "A role file that exists but does not parse still answers, with `parseError` set and the derived fields absent \u2014 the point of a configuration API is to show the operator the file that needs fixing, not a `404` for something plainly there.",
+        "operationId": "getRole",
+        "parameters": [{ "$ref": "#/components/parameters/name" }],
+        "responses": {
+          "200": {
+            "description": "The role.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RoleDetail" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "put": {
+        "tags": ["roles"],
+        "summary": "Create or replace a role",
+        "description": "The body is the role document itself; its `name` must equal the path component. Takes effect on the dispatcher's next tick \u2014 roles are read per dispatch, not cached.",
+        "operationId": "putRole",
+        "parameters": [{ "$ref": "#/components/parameters/name" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RoleConfig" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/RoleWritten" },
+          "201": { "$ref": "#/components/responses/RoleWritten" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      },
+      "delete": {
+        "tags": ["roles"],
+        "summary": "Delete a global role",
+        "description": "A project-scoped role of the same name is left alone: it shadows the global one rather than extending it, so removing the global file does not remove the role from that project.",
+        "operationId": "deleteRole",
+        "parameters": [{ "$ref": "#/components/parameters/name" }],
+        "responses": {
+          "204": { "$ref": "#/components/responses/Deleted" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/skills": {
+      "get": {
+        "tags": ["skills"],
+        "summary": "Installed skills",
+        "description": "The Markdown documents under `<config>/skills/skills/`, which every agent this instance launches is handed. Ordered by name.",
+        "operationId": "listSkills",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of skills.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/Collection" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Skill" } }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "tags": ["skills"],
+        "summary": "Install a skill",
+        "description": "A skill is Markdown, which a JSON body cannot be, so it travels wrapped: `{\"name\": \"\u2026\", \"content\": \"---\\nname: \u2026\"}`. Refuses to overwrite.",
+        "operationId": "createSkill",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SkillWrite" } } }
+        },
+        "responses": {
+          "201": { "$ref": "#/components/responses/SkillWritten" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      }
+    },
+    "/api/v1/skills/{name}": {
+      "get": {
+        "tags": ["skills"],
+        "summary": "One skill, with its Markdown",
+        "operationId": "getSkill",
+        "parameters": [{ "$ref": "#/components/parameters/name" }],
+        "responses": {
+          "200": {
+            "description": "The skill.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SkillDetail" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "put": {
+        "tags": ["skills"],
+        "summary": "Install or replace a skill",
+        "description": "The `content` must open with a YAML front matter block carrying a `name` matching the path component and a non-empty `description`. Both are required rather than optional: an agent reads the description to decide whether a skill is relevant before it reads the body, so a file without one is loaded and then never used.\n\nTakes effect for tasks launched after the write. A task already running keeps the skills it started with.",
+        "operationId": "putSkill",
+        "parameters": [{ "$ref": "#/components/parameters/name" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SkillWrite" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SkillWritten" },
+          "201": { "$ref": "#/components/responses/SkillWritten" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      },
+      "delete": {
+        "tags": ["skills"],
+        "summary": "Remove a skill",
+        "description": "Removes the whole skill directory, which is the unit the plugin layout defines: a skill's supporting files live beside its `SKILL.md`, and leaving them behind would leave something that is not a skill and not nothing.",
+        "operationId": "deleteSkill",
+        "parameters": [{ "$ref": "#/components/parameters/name" }],
+        "responses": {
+          "204": { "$ref": "#/components/responses/Deleted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
@@ -481,6 +755,13 @@
         "description": "Keep only items at or after this instant. Accepted only by collections ordered by time.",
         "schema": { "type": "string", "format": "date-time" }
       },
+      "name": {
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "description": "Configuration record name. Percent-encode it; a component that could name a path is rejected as not found.",
+        "schema": { "type": "string" }
+      },
       "id": {
         "name": "id",
         "in": "path",
@@ -501,6 +782,29 @@
       "NotFound": {
         "description": "No such resource.",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Conflict": {
+        "description": "A record of that name already exists. `POST` never overwrites; `PUT` does.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "UnsupportedMediaType": {
+        "description": "The write did not declare `application/json`. A deliberate lock, not a parser limitation \u2014 see the write conventions above.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Deleted": {
+        "description": "Deleted. No body, because there is nothing left to describe."
+      },
+      "ListenerWritten": {
+        "description": "The listener as `GET /api/v1/listeners/{name}` would return it.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListenerDetail" } } }
+      },
+      "RoleWritten": {
+        "description": "The role as `GET /api/v1/roles/{name}` would return it.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RoleDetail" } } }
+      },
+      "SkillWritten": {
+        "description": "The skill as `GET /api/v1/skills/{name}` would return it.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SkillDetail" } } }
       }
     },
     "schemas": {
@@ -613,6 +917,113 @@
           "eventCount": { "type": "integer", "description": "Distinct events processed so far." }
         }
       },
+      "ListenerConfig": {
+        "type": "object",
+        "required": ["name", "source", "action"],
+        "description": "A listener config document, exactly as stored at `<config>/listeners/<name>.json`. Stored verbatim rather than re-serialised, so `{{secret}}` placeholders and fields this version does not model both survive an edit; it is validated after secret substitution, which is how the daemon reads it. The `source` union and the `action` template are documented in the repository README under \"Listeners\".",
+        "properties": {
+          "name": { "type": "string", "description": "Must equal the name it is stored under." },
+          "source": { "type": "object", "description": "What to watch. `type` selects the variant: `github-issues`, `github-pr-reviews`, `github-comments`, `github-labels`, `github-label-count`, `shell`, `project-dispatcher`, `label-dispatcher`." },
+          "action": { "type": "object", "description": "The task to enqueue when it fires. `mode` and `prompt_template` are required." },
+          "interval_seconds": { "type": "integer", "minimum": 1, "default": 60, "description": "Poll interval. Zero is rejected: a listener polling zero seconds apart would spin against its source as fast as the network allows." }
+        },
+        "additionalProperties": true
+      },
+      "RoleConfig": {
+        "type": "object",
+        "required": ["name", "permissions", "prompt_template"],
+        "description": "A role document, exactly as stored at `<config>/roles/<name>.json`. Stored verbatim.",
+        "properties": {
+          "name": { "type": "string", "description": "Must equal the name it is stored under." },
+          "permissions": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["create_pr", "comment", "manage_issues", "work_issues", "review_issues"] },
+            "description": "Optional tool groups the agent is granted. The always-available tools are not listed here; naming them grants nothing."
+          },
+          "prompt_template": { "type": "string", "description": "The prompt body. Must not be empty \u2014 a role with nothing to say dispatches an agent with an empty prompt." },
+          "backend": { "type": "string" },
+          "model": { "type": "string" },
+          "system_prompt": { "type": "string" },
+          "prepend_prompt": { "type": "string" },
+          "read_only": { "type": "boolean", "default": false },
+          "priority": { "type": "integer", "default": 10 },
+          "budget": { "type": "number", "description": "Maximum spend in USD." },
+          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" }
+        },
+        "additionalProperties": true
+      },
+      "DispatchPolicy": {
+        "type": "object",
+        "nullable": true,
+        "required": ["trigger", "max", "preClaim"],
+        "description": "When the dispatcher may spawn this role automatically. Absent (`null`) means manual-spawn only.",
+        "properties": {
+          "trigger": { "type": "string", "enum": ["has_open_issues", "has_in_review_issues", "idle", "always"] },
+          "max": { "type": "integer", "description": "Default cap when a dispatcher config omits one. `0` means auto-spawn is opt-in." },
+          "preClaim": { "type": "boolean", "description": "For `has_open_issues` roles: claim the issue at spawn time." }
+        }
+      },
+      "Role": {
+        "type": "object",
+        "required": ["name", "permissions", "backend", "model", "priority", "readOnly", "budgetUsd", "dispatch"],
+        "description": "A global role, as the API renders it.",
+        "properties": {
+          "name": { "type": "string" },
+          "permissions": { "type": "array", "items": { "type": "string" } },
+          "backend": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "priority": { "type": "integer" },
+          "readOnly": { "type": "boolean" },
+          "budgetUsd": { "type": ["number", "null"] },
+          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" }
+        }
+      },
+      "RoleDetail": {
+        "allOf": [
+          { "$ref": "#/components/schemas/Role" },
+          {
+            "type": "object",
+            "properties": {
+              "parseError": { "type": ["string", "null"], "description": "Set when the file exists but is not a role. The derived fields above are then absent and only `name` and `config` are meaningful." },
+              "systemPrompt": { "type": ["string", "null"] },
+              "prependPrompt": { "type": ["string", "null"] },
+              "promptTemplate": { "type": "string" },
+              "config": { "description": "The document as stored. This is what to edit and `PUT` back.", "$ref": "#/components/schemas/RoleConfig" }
+            }
+          }
+        ]
+      },
+      "Skill": {
+        "type": "object",
+        "required": ["name", "description", "updatedAt"],
+        "description": "One skill: a Markdown document handed to every agent this instance launches.",
+        "properties": {
+          "name": { "type": "string", "description": "Directory name under `skills/`, and the front matter's `name`." },
+          "description": { "type": ["string", "null"], "description": "The front matter's `description`. `null` only for a file put there by hand without one." },
+          "updatedAt": { "type": ["string", "null"], "format": "date-time" }
+        }
+      },
+      "SkillDetail": {
+        "allOf": [
+          { "$ref": "#/components/schemas/Skill" },
+          {
+            "type": "object",
+            "required": ["content"],
+            "properties": {
+              "content": { "type": "string", "description": "The whole `SKILL.md`, front matter included." }
+            }
+          }
+        ]
+      },
+      "SkillWrite": {
+        "type": "object",
+        "required": ["content"],
+        "description": "A skill on the way in. Markdown cannot be a JSON body, so it travels wrapped.",
+        "properties": {
+          "name": { "type": "string", "description": "Required by `POST`, which names the skill from the body; ignored by `PUT`, which names it from the path." },
+          "content": { "type": "string", "description": "The whole `SKILL.md`. Must open with a `---` front matter block carrying a `name` matching the path and a non-empty `description`." }
+        }
+      },
       "ListenerDetail": {
         "type": "object",
         "required": ["name", "enabled", "intervalSeconds", "lastCheckedAt", "eventCount", "sourceType", "sourceDetail", "sourceExtras", "action", "recentEvents"],
@@ -634,6 +1045,10 @@
             "type": "array",
             "description": "Ids of the most recently processed events, newest first.",
             "items": { "type": "string" }
+          },
+          "config": {
+            "description": "The document as stored, `{{secret}}` placeholders unexpanded. Everything above it is derived and is what a display wants; this is what to edit and `PUT` back. `null` when the file could not be read.",
+            "$ref": "#/components/schemas/ListenerConfig"
           }
         }
       },
@@ -779,7 +1194,7 @@
     }
   },
   "x-sse": {
-    "description": "Every path under `/api/v1/` is also a Server-Sent Events stream at the same path under `/sse/v1/`, carrying the identical JSON payload in the `data` field of each `message` event. Query parameters mean the same thing on both.\n\nFrames are pushed every two seconds, but only when the payload has changed since the last one, so an idle daemon costs nothing; a `: keep-alive` comment goes out every thirty seconds of silence to survive idle proxies. A stream whose resource disappears, or whose parameters are rejected, is closed rather than left hanging.\n\nAuthenticate with the session cookie or the bearer header, exactly as for the JSON routes.",
+    "description": "Every path under `/api/v1/` that answers a `GET` is also a Server-Sent Events stream at the same path under `/sse/v1/`, carrying the identical JSON payload in the `data` field of each `message` event. Query parameters mean the same thing on both.\n\nFrames are pushed every two seconds, but only when the payload has changed since the last one, so an idle daemon costs nothing; a `: keep-alive` comment goes out every thirty seconds of silence to survive idle proxies. A stream whose resource disappears, or whose parameters are rejected, is closed rather than left hanging.\n\nAuthenticate with the session cookie or the bearer header, exactly as for the JSON routes.",
     "example": "curl -N -H \"Authorization: Bearer $PASSWORD\" http://127.0.0.1:8080/sse/v1/overview"
   }
 }

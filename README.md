@@ -15,6 +15,10 @@ Three pieces carry everything else.
 - **Listeners** poll an event source and enqueue a task whenever something matches →
   [listeners](#listeners)
 
+It ships as two binaries. `orchestrad` is the backend — the queue daemon and the HTTP API — and
+`orchestra` is the client you type at, which reaches the backend over that API. See
+[the two binaries](#the-two-binaries).
+
 ```
  task file      workflow       listener event      role dispatcher
       \             \                /                  /
@@ -97,10 +101,33 @@ In addition, the private key from the GitHub App must be included as a file in t
 ## building
 
 ```
-lake build orchestra
+lake build
 ```
 
-The resulting binary is at `.lake/build/bin/orchestra`.
+Two binaries land in `.lake/build/bin/`: `orchestra` (the CLI) and `orchestrad` (the backend).
+`lake build orchestra` and `lake build orchestrad` build one each.
+
+### the two binaries
+
+`orchestrad` is the half that runs continuously and holds the credentials: the queue daemon that
+dispatches agents, and the HTTP API that everything reads and writes orchestra's configuration
+through.
+
+```
+orchestrad serve                  # the API and the queue daemon, one process
+orchestrad queue                  # the queue daemon alone
+orchestrad dashboard --site web/dist   # the API and the web UI alone
+```
+
+`orchestra` is the client. Its configuration commands — `orchestra config`, `orchestra listener`
+— are HTTP clients of `orchestrad`, so a running daemon picks up a change without a restart and
+there is never a second writer racing it for the same file. Its other commands (`run`,
+`interactive`, `prepare`) execute locally, because what they do is launch a sandbox on the
+machine you are sitting at.
+
+`orchestra queue start` and `orchestra dashboard` still work and still mean what they meant: they
+start `orchestrad`, looked for next to the `orchestra` binary, then at `$ORCHESTRA_SERVER_BIN`,
+then on `PATH`.
 
 ## configuration
 
@@ -530,6 +557,11 @@ needed there. Local edits survive restarts; delete the directory to get the ship
 Anything in `plugin_dirs` in `config.json` is loaded as well — the skills directory is prepended,
 not a replacement.
 
+Skills are also editable through the API, which is the way to change one on a machine you are not
+sitting at — see [configuration over the API](#configuration-over-the-api). A new or edited skill
+applies to tasks launched after the write; a task already running keeps the skills it started
+with.
+
 ## running tasks
 
 ```
@@ -609,7 +641,7 @@ resumes the agent session from where it left off.
 Start a daemon that picks up tasks from a queue:
 
 ```
-orchestra queue start
+orchestrad queue          # or: orchestra queue start, which starts this for you
 ```
 
 Add tasks to the queue:
@@ -672,7 +704,12 @@ The failing script's output is available to the retry prompt as `{{validation_ou
 ## listeners
 
 Listeners poll event sources and automatically enqueue tasks. Listener configs
-are JSON files placed in `~/.config/orchestra/listeners/`.
+are JSON files placed in `~/.config/orchestra/listeners/`, and can equally be written through the
+API — see [configuration over the API](#configuration-over-the-api).
+
+Either way the running daemon picks them up: it re-reads each listener's config on every tick,
+and rescans the directory every fifteen seconds, so a listener added, changed, disabled or
+deleted takes effect without a restart.
 
 Example — respond to issue comments containing a trigger word:
 
@@ -803,23 +840,23 @@ A task file can set `goal` directly, for work that has no issue behind it — se
 
 ## dashboard
 
-A read-only web view of everything above: the queue and concert runs, listeners and when they last
+A web view of everything above: the queue and concert runs, listeners and when they last
 checked, task history with the full structured log of each run, projects with their issue
 dependency graph, and every configured authentication source with the usage limits last reported
 for it. Pages stream updates over Server-Sent Events, so they stay current without a reload.
 
 The UI is a React/TypeScript app under [`web/`](web/), built by Vite; the backend is the Lean
-server behind `orchestra dashboard`, which answers the JSON API, its SSE streams, and — with
+server behind `orchestrad dashboard`, which answers the JSON API, its SSE streams, and — with
 `--site` — the built front-end, all on one port:
 
 ```sh
 cd web && npm ci && npm run build && cd ..
-orchestra dashboard --site web/dist --port 8080
+orchestrad dashboard --site web/dist --port 8080
 ```
 
 `web/dist` is a build artifact and is not tracked, so `npm run build` has to run before
 `--site` has anything to point at. During front-end work `npm run dev` is the better loop: it
-serves the app with hot reload and proxies `/api` and `/sse` through to a `orchestra dashboard`
+serves the app with hot reload and proxies `/api` and `/sse` through to an `orchestrad dashboard`
 running on 8080, which keeps the app same-origin in development exactly as it is in production.
 
 Access is gated by a password. The login screen exchanges it for an `HttpOnly`,
@@ -833,6 +870,9 @@ the login and send `Authorization: Bearer <password>` instead:
 curl -H "Authorization: Bearer $(cat ~/.local/share/orchestra/dashboard.secret)" \
      http://127.0.0.1:8080/api/v1/overview
 ```
+
+The same password is what the `orchestra` CLI authenticates with, so on a single host the two
+halves need no configuration to find each other: both resolve `<data>/dashboard.secret`.
 
 The server binds loopback unless `--host` says otherwise — it is plain HTTP behind that
 password, so anything wider wants TLS in front, plus `--secure-cookie` so the session cookie is
@@ -881,8 +921,87 @@ curl -H "Authorization: Bearer $PASSWORD" \
      "http://127.0.0.1:8080/api/v1/tasks?limit=20&since=2026-07-22T00:00:00Z"
 ```
 
-The API is read-only. Nothing here enqueues, cancels or reconfigures anything: the only routes
-that are not `GET` are the two that open and close a session.
+### writing
+
+Three resources are configuration, and all three are writable: **listeners**, **roles** and
+**skills**. Everything else the API serves is a record of something that already happened, or is
+owned by another system, and stays read-only. Nothing here enqueues or cancels work — that is
+the daemon's control socket, which is not on the network at all.
+
+```sh
+# create or replace a listener; the body is the config document itself
+curl -X PUT -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data @listeners/nightly.json \
+     http://127.0.0.1:8080/api/v1/listeners/nightly
+
+# turn one off without touching its config
+curl -X PUT -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data '{"enabled": false}' \
+     http://127.0.0.1:8080/api/v1/listeners/nightly/enabled
+```
+
+The rules, in full:
+
+- **Every non-`GET` route requires the credential.** `POST /api/login` is the one exception,
+  since it is how the credential is obtained.
+- **Every write must be `Content-Type: application/json`**, or it is a `415`. That is the second
+  of two locks against cross-site forgery: the session cookie is `SameSite=Strict`, so a request
+  from another site carries no credential, and an HTML form cannot send JSON, so it cannot form
+  the request in the first place. The reasoning — including why there is no synchroniser token
+  and no `Origin` check — is written out in the module docs of `Orchestra/Dashboard.lean`.
+- **`POST` to a collection creates** and refuses to overwrite (`409`), naming the record from the
+  body. **`PUT` to a member creates or replaces**, naming it from the path; a body naming a
+  different one is a `400` rather than a silent rename. **`DELETE`** is `204`, or `404` when
+  there was nothing there.
+- **A rejected body changes nothing.** Validation runs to completion before anything is opened
+  for writing, and every write is a write-and-rename, so the daemon never reads a partial or
+  half-checked file.
+- **Documents are stored verbatim**, not re-serialised. That is what keeps `{{secret}}`
+  placeholders — and any field a newer orchestra understands and your client does not — intact
+  across an edit. Fetch the `config` field of a detail response, change it, `PUT` it back.
+
+What a write costs: a listener change takes effect on that listener's next tick, and a listener
+*added* or *deleted* within fifteen seconds, which is how often the daemon rescans the directory.
+A role change takes effect on the dispatcher's next tick, since roles are read per dispatch. A
+skill change applies to tasks launched after it. Nothing here needs a restart.
+
+## configuration over the API
+
+`orchestra config` is the CLI front end to the routes above. It talks to the backend over HTTP
+rather than editing files, so a running daemon sees the change and nothing races it for the file.
+
+```
+orchestra config list   <kind>                 # listeners | roles | skills
+orchestra config show   <kind> <name>          # the document as stored
+orchestra config set    <kind> <name> [file]   # create or replace; '-' or no file reads stdin
+orchestra config remove <kind> <name>
+```
+
+```sh
+orchestra config list roles
+orchestra config set listeners nightly ./nightly.json
+orchestra config show skills orchestra-pull-requests
+echo '{"name":"planner","permissions":["manage_issues"],"prompt_template":"plan"}' \
+  | orchestra config set roles planner
+```
+
+`orchestra listener list|show|enable|disable` are the same requests with a table in front of
+them, and are unchanged in spelling from before there was an API.
+
+Both find the backend at `$ORCHESTRA_API_URL` (default `http://127.0.0.1:8080`) and authenticate
+with the same secret the server uses, resolved from `--api-token`,
+`$ORCHESTRA_DASHBOARD_PASSWORD`, or `<data>/dashboard.secret`. On one host that means no
+configuration at all; pointing the CLI at a remote orchestra means setting both.
+
+Two things are deliberately *not* writable through the API:
+
+- **`config.json`** — it holds the GitHub App private key path, the PAT and the agent OAuth
+  tokens. Exposing a write route for the file that holds every credential the daemon has, gated
+  on one shared secret, trades a large amount of blast radius for a small amount of convenience.
+  Edit it on the host.
+- **Project-scoped role overrides** (`<data>/projects/<id>/roles/`) — the API writes the global
+  role catalogue. A project's own copy shadows a global role rather than extending it, and
+  belongs with the project.
 
 ## other commands
 
@@ -892,8 +1011,12 @@ orchestra cleanup                     # remove all cloned repositories
 orchestra cleanup list                # list clones and their task slots
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
 orchestra usage                       # usage limits of every configured auth source
-orchestra dashboard --site web/dist   # the web dashboard (API, SSE and UI on one port)
+orchestra config list listeners       # read and change configuration through the backend API
 orchestra migrate                     # move ~/.agent/ to the XDG directories
+
+orchestrad serve                      # the backend: HTTP API + queue daemon in one process
+orchestrad queue                      # the queue daemon alone
+orchestrad dashboard --site web/dist  # the API, SSE and UI on one port
 ```
 
 ## container
@@ -939,12 +1062,14 @@ cp .env.example .env      # fill in at least ORCHESTRA_TAXIS_URL and a token
 docker compose up --build
 ```
 
-Two containers come up off the one image: the daemon, and the [dashboard](#dashboard) on
-<http://127.0.0.1:8080> (`docker compose logs dashboard` prints the password it asks for). They are
-separate because the daemon drains in-flight tasks for up to half an hour on every stop, and a
-read-only web view should not be unavailable for that long.
+Two containers come up off the one image, both running `orchestrad`: the daemon, and the
+[dashboard](#dashboard) on <http://127.0.0.1:8080> (`docker compose logs dashboard` prints the
+password it asks for). They are separate because the daemon drains in-flight tasks for up to half
+an hour on every stop, and the web console should not be unavailable for that long.
 
-The daemon container runs `orchestra queue start`; override the command for one-off subcommands
+Both mount `/config` read-write, because the dashboard is where configuration is now written.
+
+The daemon container runs `orchestrad queue`; override the command for one-off subcommands
 against the same volumes:
 
 ```

@@ -1,6 +1,6 @@
 # Running orchestra in Docker
 
-Packages the queue daemon (`orchestra queue start`) with everything it shells out to: `landrun`,
+Packages the queue daemon (`orchestrad queue`) with everything it shells out to: `landrun`,
 `git`, `gh`, `openssl`, the Lean toolchain, and the Claude Code CLI. A second container off the
 same image serves the web dashboard.
 
@@ -25,7 +25,7 @@ Two containers come up: `orchestra` (the queue daemon) and `dashboard` (the web 
 
 | Component | Why |
 | --- | --- |
-| `orchestra` | The binary itself; entrypoint runs `queue start`. |
+| `orchestra` / `orchestrad` | The two binaries: the CLI, and the backend the entrypoint runs (`orchestrad queue` by default). A leading `orchestrad` argument selects it; anything else runs the CLI, which is what `docker compose run --rm orchestra …` relies on. |
 | `landrun` | Every agent launch goes through it (`Orchestra/Sandbox.lean`). No bypass exists. |
 | `git`, `gh` | Cloning, branching, opening and merging PRs. |
 | `openssl` | Signs the GitHub App JWT (`Orchestra/GitHub.lean`). |
@@ -109,7 +109,7 @@ entirely. The entrypoint still checks the key path and fails fast if it is a dir
 
 ## Dashboard
 
-The `dashboard` service runs `orchestra dashboard` off the same image, published on
+The `dashboard` service runs `orchestrad dashboard` off the same image, published on
 `127.0.0.1:8080` by default:
 
 ```sh

@@ -1,6 +1,12 @@
 #!/bin/sh
-# Renders config.json from environment variables, then execs orchestra with whatever arguments
-# the image was given (`queue start` by default — see the Dockerfile's CMD).
+# Renders config.json from environment variables, then execs one of the two orchestra binaries
+# with whatever arguments the image was given (`orchestrad queue` by default — see the
+# Dockerfile's CMD).
+#
+# Which binary: a leading `orchestrad` argument selects the backend (the queue daemon and the HTTP
+# API) and is consumed; anything else runs the CLI. An explicit selector rather than a guess at
+# the subcommand, because `queue` names a command in both — `orchestrad queue` runs the daemon,
+# `orchestra queue add` talks to it — and getting that wrong silently starts the wrong process.
 #
 # A config.json mounted into the image always wins: the generated one only covers the handful of
 # settings worth exposing as environment variables. Anything richer — listeners, agent auth
@@ -14,16 +20,25 @@ CONFIG_DIR="$CONFIG_ROOT/orchestra"
 DATA_DIR="$DATA_ROOT/orchestra"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 
-# The dashboard runs off this same entrypoint but is a *reader*: it dispatches nothing, holds
-# none of the daemon's credentials (see docker-compose.yaml, where its environment is
-# deliberately narrower), and mounts /config read-only. So it must not render config.json —
-# assembled from variables it was not given, that file would be missing the PAT and the agent
-# tokens, and the daemon would then adopt it as authoritative — and it must not try to write
-# anywhere under /config at all.
-IS_DASHBOARD=0
+# The dashboard runs off this same entrypoint but dispatches nothing and holds none of the
+# daemon's credentials (see docker-compose.yaml, where its environment is deliberately narrower).
+# So it must not render config.json: assembled from variables it was not given, that file would be
+# missing the PAT and the agent tokens, and the daemon would then adopt it as authoritative.
+#
+# It does write elsewhere under /config — listeners/, roles/ and skills/ are what its API edits —
+# which is why /config is no longer mounted read-only for it and why it takes ownership below
+# like the daemon does.
+BIN=orchestra
 case "${1:-}" in
-  dashboard) IS_DASHBOARD=1 ;;
+  orchestrad) BIN=orchestrad; shift ;;
 esac
+
+IS_DASHBOARD=0
+if [ "$BIN" = "orchestrad" ]; then
+  case "${1:-}" in
+    dashboard) IS_DASHBOARD=1 ;;
+  esac
+fi
 
 # /config and /data are bind-mounted host directories, and Docker creates a missing bind-mount
 # source as root — so on a fresh checkout they arrive unwritable by the unprivileged user agents
@@ -34,20 +49,19 @@ esac
 # repository under /data on every restart.
 if [ "$(id -u)" = "0" ]; then
   target_uid="$(id -u "$RUN_AS")"
-  if [ "$IS_DASHBOARD" = "1" ]; then
-    # /config is read-only here, so neither the mkdir nor the chown below could succeed on it —
-    # and neither is needed: the daemon's container owns that directory.
-    roots="$DATA_ROOT"
-  else
-    roots="$CONFIG_ROOT $DATA_ROOT"
-  fi
-  for d in $roots; do
+  # Both containers need both roots writable: the dashboard writes configuration through its API,
+  # and the ownership test keeps this O(1) after first start either way.
+  for d in "$CONFIG_ROOT" "$DATA_ROOT"; do
     mkdir -p "$d"
     if [ "$(stat -c %u "$d")" != "$target_uid" ]; then
       echo "[entrypoint] taking ownership of $d for $RUN_AS"
       chown -R "$RUN_AS:$RUN_AS" "$d"
     fi
   done
+  # `$BIN` is re-prefixed so the re-exec goes through the same selection above.
+  if [ "$BIN" = "orchestrad" ]; then
+    exec setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups "$0" orchestrad "$@"
+  fi
   exec setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups "$0" "$@"
 fi
 
@@ -61,7 +75,8 @@ mkdir -p "$DATA_DIR"
 # is self-healing: the auth page re-reads the config on every request, so it fills in as soon
 # as the daemon has written it, without a restart.
 if [ "$IS_DASHBOARD" = "1" ]; then
-  exec orchestra "$@"
+  mkdir -p "$CONFIG_DIR"
+  exec "$BIN" "$@"
 fi
 
 mkdir -p "$CONFIG_DIR"
@@ -146,4 +161,4 @@ if ! landrun $probe_args -- /bin/true >/dev/null 2>&1; then
   echo "[entrypoint] (grep landlock /sys/kernel/security/lsm) and see docker/README.md." >&2
 fi
 
-exec orchestra "$@"
+exec "$BIN" "$@"

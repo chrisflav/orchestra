@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Orchestra.Project.Basic
+import Orchestra.Utils.Files
 
 open Lean (Json FromJson ToJson)
 
@@ -212,6 +213,79 @@ def loadAllRoles (pid : Taxis.IssueId) : IO (Array Role) := do
           if !byName.contains r.name then
             byName := byName.insert r.name r
   return byName.toArray.map (·.2)
+
+/-! ## Editing a role
+
+Roles are stored verbatim, for the same reason listener configs are: a client edits the file it
+was shown, and re-serialising a parsed `Role` would silently drop any field this version does not
+know about and reformat everything else. Unlike listeners, role files are *not* secret-expanded
+on read, so the raw text and the parsed record describe the same thing — the round trip is safe
+either way, and going through the text is simply the one that loses nothing.
+
+Only global roles (`<config>/roles/`) are writable here. A project-scoped override lives under
+that project's data directory and belongs to the project, which the API addresses separately;
+adding a second write path for it before anything asks for one would be guesswork. -/
+
+/-- The global role file exactly as stored. -/
+def loadGlobalRoleRaw (name : String) : IO (Option String) := do
+  Utils.ensureConfigName "role" name
+  let path := (← globalRolesDir) / roleFileName name
+  if !(← path.pathExists) then return none
+  return some (← IO.FS.readFile path)
+
+/-- Every permission token a role's `permissions` may name.
+
+    These are the *optional* tool groups: `create_pr` and `comment` are gated in
+    `Orchestra.Server`, the three issue groups in `Orchestra.Project.Tools`. The always-available
+    tools (health, refresh_token, get_pr_comments) are not listed because naming them grants
+    nothing — they are already there.
+
+    Kept here, beside the field that holds them, so that validating a role does not depend on the
+    MCP server's module: the CLI validates before sending and the API validates before storing,
+    and neither should have to link the tool implementations to do it. -/
+def Role.knownPermissions : List String :=
+  ["create_pr", "comment", "manage_issues", "work_issues", "review_issues"]
+
+/-- Whether `raw` is a role that can be stored under `name`, returning the role it describes.
+
+    `permissions` is checked against the tool names the sandbox actually grants: a typo there is
+    otherwise invisible until a dispatched agent finds itself without the tool it was told to
+    use, hours later and in a log nobody is reading. -/
+def validateRole (name : String) (raw : String)
+    (knownPermissions : List String := Role.knownPermissions) : Except String Role := do
+  Utils.checkConfigName "role" name
+  let j ← match Json.parse raw with
+    | .error e => .error s!"the body is not valid JSON: {e}"
+    | .ok j    => pure j
+  let role ← match (FromJson.fromJson? j : Except String Role) with
+    | .error e => .error s!"the body is not a role: {e}"
+    | .ok r    => pure r
+  if role.name != name then
+    .error s!"the body names this role '{role.name}', but it is being stored as '{name}'"
+  if role.promptTemplate.trimAscii.isEmpty then
+    .error "'prompt_template' is empty; a role with nothing to say dispatches an agent with an \
+empty prompt"
+  let unknown := role.permissions.filter (fun p => !knownPermissions.contains p)
+  unless unknown.isEmpty do
+    .error s!"unknown permission(s) {String.intercalate ", " unknown}; \
+the tools a role may be granted are {String.intercalate ", " knownPermissions}"
+  return role
+
+/-- Store a global role verbatim. Validation is the caller's business — see `validateRole`. -/
+def saveGlobalRoleRaw (name : String) (raw : String) : IO Unit := do
+  Utils.ensureConfigName "role" name
+  Utils.writeFileAtomically ((← globalRolesDir) / roleFileName name) raw
+
+/-- Remove a global role. `false` when there was none of that name.
+
+    A project-scoped role of the same name is left alone: it shadows the global one rather than
+    extending it, so removing the global file does not remove the role from that project. -/
+def deleteGlobalRole (name : String) : IO Bool := do
+  Utils.ensureConfigName "role" name
+  let path := (← globalRolesDir) / roleFileName name
+  if !(← path.pathExists) then return false
+  IO.FS.removeFile path
+  return true
 
 /-! ## Template rendering -/
 

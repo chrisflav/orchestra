@@ -38,7 +38,8 @@ ENV PATH="${ELAN_HOME}/bin:${PATH}"
 RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf \
       | sh -s -- -y --no-modify-path --default-toolchain none
 WORKDIR /src
-COPY lean-toolchain lakefile.lean lake-manifest.json Orchestra.lean Main.lean ./
+COPY lean-toolchain lakefile.lean lake-manifest.json Orchestra.lean ./
+COPY Main.lean Orchestrad.lean ./
 COPY OrchestraTest.lean TestDriver.lean ./
 COPY Orchestra ./Orchestra
 COPY OrchestraTest ./OrchestraTest
@@ -46,8 +47,10 @@ COPY ffi ./ffi
 # Orchestra/Dashboard.lean embeds docs/openapi.json with `include_str`, so the spec is a build
 # input like any source file — the API and the description a client reads ship in one binary.
 COPY docs ./docs
-# `lake build orchestra` (not the bare `lake build`) so this doesn't also compile the test driver.
-RUN lake build orchestra
+# Both binaries: `orchestra` is the CLI, `orchestrad` the backend that runs the queue daemon and
+# the HTTP API. Named explicitly (rather than a bare `lake build`) so this doesn't also compile
+# the test driver.
+RUN lake build orchestra orchestrad
 
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
@@ -79,6 +82,9 @@ COPY skills /opt/orchestra/skills
 
 COPY --from=landrun /out/landrun /usr/local/bin/landrun
 COPY --from=build /src/.lake/build/bin/orchestra /usr/local/bin/orchestra
+# The backend. Both services below run this one; `orchestra` is here for `docker compose run`,
+# and finds this binary as its sibling on PATH when asked to start a daemon.
+COPY --from=build /src/.lake/build/bin/orchestrad /usr/local/bin/orchestrad
 # Served by the `dashboard` service in docker-compose.yaml (`--site`). Baked in at a fixed path
 # for the same reason as the skills above: it must not depend on a bind mount.
 COPY --from=web /web/dist /opt/orchestra/dashboard-site
@@ -144,4 +150,5 @@ RUN rm -f /home/orchestra/.bashrc /home/orchestra/.bash_logout /home/orchestra/.
 USER root
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["queue", "start"]
+# `orchestrad` as the first argument selects the backend binary; see docker/entrypoint.sh.
+CMD ["orchestrad", "queue"]

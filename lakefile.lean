@@ -31,9 +31,19 @@ lean_lib Orchestra
 
 lean_lib OrchestraTest
 
+/-- The client. Everything a person types: one-shot runs, the interactive sandbox, and the
+    commands that read and change orchestra's configuration — which since taxis #433 go over the
+    HTTP API rather than touching the daemon's state directly. -/
 @[default_target]
 lean_exe orchestra where
   root := `Main
+
+/-- The backend. The queue daemon and the HTTP API, in one binary that runs continuously and
+    holds the credentials. Separate from `orchestra` so that neither ships the other's job:
+    see the module docs in `Orchestrad.lean`. -/
+@[default_target]
+lean_exe orchestrad where
+  root := `Orchestrad
 
 lean_exe orchestraTest where
   root := `TestDriver
