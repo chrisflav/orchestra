@@ -116,7 +116,10 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     -- Additional sandbox paths from global app config, merged with the agent-backend's built-in paths.
     (additionalPaths : SandboxPaths := {})
     -- If true, launch the agent in interactive (TUI) mode: inherit stdio and omit -p <prompt>.
-    (interactiveAgent : Bool := false) : IO LaunchResult := do
+    (interactiveAgent : Bool := false)
+    -- Condition the run is held to: the agent must not stop before it holds. Passed to the
+    -- backend on its own, never folded into `prompt` — see `AgentDef.goalArgs`.
+    (goal : Option String := none) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -231,12 +234,28 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- prompt but `--append-system-prompt` is still passed.
   let prompt ← capPromptArg "prompt" prompt
   let systemPrompt ← systemPrompt.mapM (capPromptArg "system prompt")
+  -- The goal rides alongside the built args rather than through them: every backend would
+  -- otherwise need one more parameter it ignores. A backend with no goal mechanism says so by
+  -- returning `none`, and the run proceeds without one — loudly, since a task that asked to be
+  -- held to a condition and silently was not looks exactly like one that met it.
+  --
+  -- Placed ahead of the built args because those end in the prompt, which several backends pass
+  -- as a positional argument; a flag after it is not reliably read as a flag.
+  let goalArgs : Array String ← match goal with
+    | none => pure #[]
+    | some g =>
+      match agentDef.goalArgs g with
+      | some extra => pure extra
+      | none =>
+        IO.eprintln s!"  [sandbox] warning: backend '{agentDef.command}' cannot be held to a \
+goal; running without the goal condition."
+        pure #[]
   let agentArgs :=
     if interactiveAgent then
       agentDef.buildInteractiveArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget
     else
       agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
-  args := args ++ agentArgs
+  args := args ++ goalArgs ++ agentArgs
   if debug then
     let argsStr := String.intercalate " " (args.toList.map shellEscape)
     IO.eprintln s!"[debug] cd {shellEscape repoPath.toString} && landrun {argsStr}"

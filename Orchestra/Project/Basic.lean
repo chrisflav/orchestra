@@ -140,6 +140,11 @@ structure Issue where
   parentId     : Option Taxis.IssueId  := none
   title        : String
   description  : String
+  /-- The condition that decides whether the issue is done, as taxis's own `goal` field. Empty
+      when unset. Kept apart from `description` on purpose: it is what a task launched for this
+      issue is held to (see `Sandbox.launchAgent`'s `goal`), and the description — issue body
+      plus rendered comment thread — is far too long to serve as one. -/
+  goal         : String          := ""
   status       : IssueStatus     := .open
   /-- Per-issue override of the project's default target. -/
   target       : Option RepoTarget := none
@@ -316,6 +321,7 @@ private def toIssue (ids : StatusLabelIds) (projectId : Taxis.IssueId) (raw : Or
     parentId := orchestraParentOf projectId raw
     title := raw.title
     description := human
+    goal := raw.goal
     status := statusOf ids raw.state raw.labels
     target := metaFields.getObjValAs? RepoTarget "target" |>.toOption
     attachedPRs
@@ -401,7 +407,7 @@ def createIssue (projectId : Taxis.IssueId) (title description : String)
     { title, description := desc, parent := some parent, dependencies })
   toIssue ids projectId raw
 
-/-- Update an *existing* issue's title/description/status/target/dependencies.
+/-- Update an *existing* issue's title/description/goal/status/target/dependencies.
 
     Deliberately does **not** write `attachedPRs` — use `attachPR`. An issue's PR set lives in
     taxis artifacts rather than its body, so reconciling it here would make every status patch
@@ -421,6 +427,7 @@ def saveIssue (i : Issue) : IO Unit := do
   let _ ← unwrap (← Orchestra.Taxis.updateIssue cfg i.id
     { title := some i.title
       description := some desc
+      goal := some i.goal
       state := some (stateOf i.status)
       labels := some (labelsFor ids raw.labels i.status)
       dependencies := some i.dependencies })
@@ -847,6 +854,22 @@ explicit upstream/fork at queue time. -/
 
 def effectiveTarget (project : Project) (issue : Issue) : Option RepoTarget :=
   issue.target <|> project.defaultTarget
+
+/-! ## Goal resolution -/
+
+/-- The goal a task launched for `issue?` is held to: the issue's own `goal` field, and nothing
+    else. `none` when no issue is bound or its goal is unset, which is the ordinary case — a task
+    without a goal simply runs to the agent's own idea of done.
+
+    A one-liner, but the single place the mapping lives, so the two spawn paths (`orchestra spawn`
+    and the dispatcher) cannot drift into disagreeing about what a task's goal is. In particular
+    neither may reach for the rendered prompt instead: that is the role template with the issue
+    body and its whole comment thread substituted in, and it is the wrong length and the wrong
+    shape to be judged "met" or "not met". -/
+def goalFor (issue? : Option Issue) : Option String :=
+  match issue? with
+  | some i => if i.goal.isEmpty then none else some i.goal
+  | none   => none
 
 /-! ## Per-project filesystem directory
 

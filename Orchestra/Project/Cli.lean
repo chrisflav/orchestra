@@ -17,7 +17,7 @@ open Orchestra.Project (Project Issue IssueStatus RepoTarget
                         Role RoleTrigger DispatchPolicy
                         loadProject saveProject loadAllProjects createProject
                         loadIssue saveIssue loadIssues childrenOf findIssue createIssue
-                        effectiveTarget
+                        effectiveTarget goalFor
                         loadRole loadAllRoles roleSearchPaths render renderVarsFor)
 
 namespace Orchestra.Project.Cli
@@ -422,6 +422,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     , fork
     , mode          := .pr
     , prompt
+    , goal          := goalFor mIssue
     , backend       := role.backend
     , model         := role.model
     , systemPrompt  := role.systemPrompt
@@ -502,6 +503,10 @@ def issueContinueHandler (p : Parsed) : IO UInt32 := do
     , fork          := prevRecord.fork
     , mode          := prevRecord.mode
     , prompt
+    -- Re-read from the issue rather than inherited from `prevRecord`: a goal edited since the
+    -- first attempt is the bar the continuation should be held to, not the one it was launched
+    -- against.
+    , goal          := goalFor (some issue)
     , continuesFrom := some claim.taskId
     , series        := claim.series
     , backend       := prevRecord.backend

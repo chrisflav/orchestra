@@ -29,6 +29,16 @@ structure AgentDef where
       like `--print` and `--output-format=stream-json`. -/
   buildInteractiveArgs : String → Array String → Option String → Option String → Option String → Option String → Float
                        → Array String
+  /-- Extra command-line args that hold the run to a *goal*: a condition the agent must not stop
+      before it satisfies, judged by a second model call rather than by the agent itself.
+
+      Receives the goal condition on its own — never the task prompt, which carries the issue
+      body and its whole comment thread and would make the judge's job unanswerable.
+
+      `none` for a backend whose CLI has no such mechanism. The caller
+      (`Sandbox.launchAgent`) then says so once and runs without a goal, rather than passing a
+      flag the backend would reject. -/
+  goalArgs : String → Option (Array String) := fun _ => none
   /-- Parse one line of the agent's stdout stream output.
       Returns `none` for events that should be suppressed. -/
   parseOutputLine : String → Option Event

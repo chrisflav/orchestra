@@ -283,6 +283,15 @@ structure IOTask (i o : ResultType) where
       - `pr`   → `["create_pr"]` -/
   mode : TaskMode
   prompt : String
+  /-- Condition the run is held to: the agent must not stop before it holds, and a second model
+      call — not the agent itself — decides whether it does.
+
+      Deliberately not derived from `prompt`. A task launched for an orchestra issue gets the
+      issue's own `goal` field and nothing else; the prompt around it is the role template with
+      the issue body and its comment thread rendered in, which is the wrong thing entirely to
+      judge "is this done?" against. Backends with no goal mechanism ignore it (see
+      `AgentDef.goalArgs`). -/
+  goal : Option String := none
   agent : Option String := none
   systemPrompt : Option String := none
   prependPrompt : Option String := none
@@ -430,6 +439,7 @@ instance : FromJson Task where
     let fork       ← j.getObjValAs? Repository "fork"
     let mode       ← j.getObjValAs? TaskMode "mode"
     let prompt     ← j.getObjValAs? String "prompt"
+    let goal       := j.getObjValAs? String "goal"           |>.toOption
     let agent      := j.getObjValAs? String "agent"          |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
     let prependPrompt := j.getObjValAs? String "prepend_prompt" |>.toOption
@@ -451,7 +461,7 @@ instance : FromJson Task where
     let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
     let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
-    return { i, o, ioTask := { upstream, fork, mode, prompt, agent, systemPrompt, prependPrompt, backend, model,
+    return { i, o, ioTask := { upstream, fork, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,

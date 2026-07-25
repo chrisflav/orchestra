@@ -20,6 +20,7 @@ error.
 | Dependencies | taxis's native issue-dependency graph — no separate plumbing. A dependency holds its dependent back only while it is still open; completed *or* abandoned releases it. |
 | Claim (which task currently holds an issue) | A `session`-kind artifact on the issue (`{task_id, agent, series?, claimed_at}`) — "claimed" means the issue has one. |
 | Attached PR | A `github-pr`-kind artifact on the issue. |
+| Goal | taxis's native `goal` field on the issue — the condition that decides whether it is done. Read as `Issue.goal`; empty when unset. |
 | `RepoTarget` override / reviewer template | Not a native taxis field — encoded as a JSON blob in a trailing ` ```orchestra-meta ` fenced block appended to the issue's description, stripped before a human sees it. |
 
 `o-claimed`/`t-project` are created automatically (if
@@ -137,6 +138,12 @@ role is dispatched onto an issue — `{{issue_id}}`, `{{issue_title}}`, `{{issue
 template. They are the only way an agent sees what an issue asks for and what a reviewer said
 about it — `get_issue` and `list_issue_comments` render both, but a worker has to know to call
 them, and a rejection lives nowhere else now that there is no rejected status.
+
+A role never carries a goal of its own, and none is rendered from the template. When a role is
+dispatched onto an issue whose taxis `goal` is set, that field — on its own, not the prompt the
+template just produced — becomes the task's goal, and the agent is held to it until a second model
+call agrees it holds. The template is what the agent is told; the goal is what it is judged on, and
+neither is derived from the other. See "goals" in the top-level README.
 
 Examples in `roles/`: `implementor.json`, `reviewer.json`, `planner.json`,
 `maintainer.json`. Each ships with `dispatch.max: 0` so auto-spawn is opt-in — set caps in a
