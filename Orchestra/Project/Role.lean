@@ -228,6 +228,7 @@ adding a second write path for it before anything asks for one would be guesswor
 
 /-- The global role file exactly as stored. -/
 def loadGlobalRoleRaw (name : String) : IO (Option String) := do
+  Utils.ensureConfigName "role" name
   let path := (← globalRolesDir) / roleFileName name
   if !(← path.pathExists) then return none
   return some (← IO.FS.readFile path)
@@ -272,6 +273,7 @@ the tools a role may be granted are {String.intercalate ", " knownPermissions}"
 
 /-- Store a global role verbatim. Validation is the caller's business — see `validateRole`. -/
 def saveGlobalRoleRaw (name : String) (raw : String) : IO Unit := do
+  Utils.ensureConfigName "role" name
   Utils.writeFileAtomically ((← globalRolesDir) / roleFileName name) raw
 
 /-- Remove a global role. `false` when there was none of that name.
@@ -279,6 +281,7 @@ def saveGlobalRoleRaw (name : String) (raw : String) : IO Unit := do
     A project-scoped role of the same name is left alone: it shadows the global one rather than
     extending it, so removing the global file does not remove the role from that project. -/
 def deleteGlobalRole (name : String) : IO Bool := do
+  Utils.ensureConfigName "role" name
   let path := (← globalRolesDir) / roleFileName name
   if !(← path.pathExists) then return false
   IO.FS.removeFile path

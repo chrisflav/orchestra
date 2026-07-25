@@ -382,6 +382,7 @@ def listenerConfigFile (name : String) : IO System.FilePath := do
   return (← listenersConfigDir) / s!"{name}.json"
 
 def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
+  Utils.ensureConfigName "listener" name
   let path := (← listenersConfigDir) / s!"{name}.json"
   if !(← path.pathExists) then return none
   let secrets ← loadSecrets
@@ -410,7 +411,13 @@ def loadAllListenerConfigs : IO (Array ListenerConfig) := do
     | .ok j    =>
       match FromJson.fromJson? j (α := ListenerConfig) with
       | .error e => IO.eprintln s!"Warning: failed to load listener config {name}: {e}"
-      | .ok cfg  => configs := configs.push cfg
+      | .ok cfg  =>
+        -- Every caller keys the state file (and the dashboard's detail route) on `cfg.name`, so
+        -- a config claiming a name that cannot be a filename is skipped rather than returned.
+        -- Nothing this API wrote can be in that state; a file placed by hand can.
+        match Utils.checkConfigName "listener" cfg.name with
+        | .error e => IO.eprintln s!"Warning: ignoring listener config {name}: {e}"
+        | .ok _    => configs := configs.push cfg
   return configs
 
 /-! ### Editing a listener config
@@ -428,6 +435,7 @@ result ever reaching the disk. -/
 
 /-- The listener config file exactly as stored, `{{secret}}` placeholders unexpanded. -/
 def loadListenerConfigRaw (name : String) : IO (Option String) := do
+  Utils.ensureConfigName "listener" name
   let path ← listenerConfigFile name
   if !(← path.pathExists) then return none
   return some (← IO.FS.readFile path)
@@ -460,6 +468,7 @@ would spin against its source as fast as the network allows"
 /-- Store a listener config verbatim. Validation is the caller's business — see
     `validateListenerConfig`, which the API and the CLI both run first. -/
 def saveListenerConfigRaw (name : String) (raw : String) : IO Unit := do
+  Utils.ensureConfigName "listener" name
   Utils.writeFileAtomically (← listenerConfigFile name) raw
 
 /-- Remove a listener config and the state that belonged to it. `false` when there was none.
@@ -468,6 +477,7 @@ def saveListenerConfigRaw (name : String) (raw : String) : IO Unit := do
     keeping it would mean a listener re-created under the same name silently ignored every event
     its predecessor had seen. -/
 def deleteListenerConfig (name : String) : IO Bool := do
+  Utils.ensureConfigName "listener" name
   let path ← listenerConfigFile name
   if !(← path.pathExists) then return false
   IO.FS.removeFile path
@@ -478,6 +488,7 @@ def deleteListenerConfig (name : String) : IO Bool := do
 -- State I/O
 
 def loadListenerState (name : String) : IO ListenerState := do
+  Utils.ensureConfigName "listener" name
   let path := (← listenerStateDir) / s!"{name}.json"
   if !(← path.pathExists) then return { lastChecked := "", processedIds := #[] }
   let raw ← IO.FS.readFile path
@@ -489,6 +500,7 @@ def loadListenerState (name : String) : IO ListenerState := do
     | .ok s    => return s
 
 def saveListenerState (name : String) (state : ListenerState) : IO Unit := do
+  Utils.ensureConfigName "listener" name
   let dir ← listenerStateDir
   IO.FS.createDirAll dir
   -- Atomic because the daemon reads this file every tick and the API writes it whenever someone

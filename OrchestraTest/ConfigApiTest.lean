@@ -289,6 +289,95 @@ def aRejectedBodyLeavesTheStoredConfigAlone : Test := do
   TestM.assertEqual raw (some goodListener) (msg := "the good config is still there, untouched")
   TestM.assert stillParses (msg := "and the daemon can still read it")
 
+/-! ### Traversal through a body-supplied name
+
+The path-based routes (`PUT`, `DELETE`, `GET /…/{name}`) run their component through
+`safeSegment`, which is covered in `OrchestraTest.Dashboard`. `POST` does not: it names the
+record from the request **body**, so nothing upstream has decoded or rejected the string, and the
+only thing standing between it and a filename is the resource's own validator.
+
+That gap was real. `Skill.validate` shipped without the name check the other two had, and because
+the front matter check only compares two strings the caller controls, a `POST` of
+`{"name": "../../…", "content": "---\nname: ../../…\n---\n…"}` was accepted and wrote a
+`SKILL.md` outside the skills root. Hence: all three validators, and the stores under them,
+checked here against the same set of names. -/
+
+/-- Names that must never become a path, whichever resource they are offered to. -/
+private def traversalNames : List String :=
+  ["..", ".", "../evil", "../../../../tmp/pwned", "a/b", "/etc/passwd", "a\\b", "",
+   ".hidden", "with\nnewline"]
+
+/-- Whether a rejection came from the shared name check rather than from something incidental.
+
+    Worth distinguishing: a traversing name also trips other rules by accident — `""` fails the
+    front matter comparison, `"a/b"` might fail a parse — so a test that only asserted "rejected"
+    would pass against a validator with no name check at all. This asserts *which* rule fired. -/
+private def isNameRejection (verdict : Option String) : Bool :=
+  match verdict with
+  | none   => false
+  | some e => (e.splitOn "is not a usable").length > 1
+
+@[test]
+def noValidatorAcceptsATraversingName : Test := do
+  for bad in traversalNames do
+    -- The body is otherwise well-formed and self-consistent — including the front matter naming
+    -- itself exactly as the path does, which is what made the skill case slip through.
+    let listener := goodListener.replace "\"name\": \"nightly\"" s!"\"name\": \"{bad}\""
+    TestM.assert (isNameRejection (← listenerVerdict bad listener))
+      (msg := s!"listener named {repr bad} must be rejected as an unusable name")
+    let role := goodRole.replace "\"name\": \"implementor\"" s!"\"name\": \"{bad}\""
+    TestM.assert (isNameRejection (roleVerdict bad role))
+      (msg := s!"role named {repr bad} must be rejected as an unusable name")
+    let skill := s!"---\nname: {bad}\ndescription: traversal probe\n---\n\nbody"
+    TestM.assert (isNameRejection (skillVerdict bad skill))
+      (msg := s!"skill named {repr bad} must be rejected as an unusable name")
+
+@[test]
+def noStoreWritesOutsideItsRootEvenIfAskedDirectly : Test := do
+  -- The backstop under the validators: the save functions refuse the name themselves, so the
+  -- property is one the store holds rather than one every caller is trusted to have established.
+  -- A traversing name here is a bug in a caller, so it throws rather than returning.
+  let escaped ← withTempStores do
+    let root ← Skill.skillsRoot
+    let outside := root / ".." / ".." / "escaped"
+    for bad in ["../../escaped", "../escaped"] do
+      try Skill.saveSkill bad "---\nname: x\ndescription: d\n---\nb" catch _ => pure ()
+      try Listener.saveListenerConfigRaw bad goodListener catch _ => pure ()
+      try Project.saveGlobalRoleRaw bad goodRole catch _ => pure ()
+      try Listener.saveListenerState bad { lastChecked := "", processedIds := #[] }
+      catch _ => pure ()
+    -- Nothing may have appeared above the store roots.
+    (outside / "SKILL.md").pathExists
+  TestM.assert (!escaped) (msg := "no store wrote above its own root")
+
+@[test]
+def loadersRefuseATraversingNameRatherThanStatIt : Test := do
+  -- The existence probe in every writer runs *after* validation, but the loaders refuse the name
+  -- as well, so a `409`-versus-`404` oracle cannot be built out of one even if that order were
+  -- ever reversed.
+  let threw ← withTempStores do
+    let mut all := true
+    for bad in ["../../../etc/passwd", ".."] do
+      let a ← try let _ ← Skill.loadSkill bad; pure false catch _ => pure true
+      let b ← try let _ ← Listener.loadListenerConfigRaw bad; pure false catch _ => pure true
+      let c ← try let _ ← Project.loadGlobalRoleRaw bad; pure false catch _ => pure true
+      all := all && a && b && c
+    return all
+  TestM.assert threw (msg := "every loader refuses to build a path from a traversing name")
+
+@[test]
+def listingsSkipRatherThanThrowOnAnUnusableName : Test := do
+  -- The flip side of the loaders throwing: a stray directory left by hand must not take the
+  -- whole listing down with it.
+  let names ← withTempStores do
+    Skill.saveSkill "good" "---\nname: good\ndescription: d\n---\nb"
+    let root ← Skill.skillsRoot
+    IO.FS.createDirAll (root / ".hidden")
+    IO.FS.writeFile (root / ".hidden" / "SKILL.md") "---\nname: .hidden\ndescription: d\n---\nb"
+    return (← Skill.loadAllSkills).map (·.name)
+  TestM.assertEqual names #["good"]
+    (msg := "the unusable directory is skipped and the listing still answers")
+
 /-! ## Authentication
 
 The gate in `Orchestra.Dashboard.route` is one check with `publicPaths` as its exemption list, so

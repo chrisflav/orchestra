@@ -43,4 +43,24 @@ def checkConfigName (what name : String) : Except String Unit :=
   else .error s!"'{name}' is not a usable {what} name: it must be non-empty, must not begin \
 with '.', and must not contain a path separator or a control character"
 
+/-- `checkConfigName` as a throw, for the store functions themselves to stand on.
+
+    The validators run this and report it as a `400`, which is where a person sees it. This is
+    the backstop underneath them: every function that turns a name into a path calls it, so the
+    property above is one the *store* holds rather than one each caller is trusted to have
+    established. A name that reaches here unchecked is a bug in a caller, which is why it throws
+    rather than returning — there is no sensible way to continue, and a 500 naming the file that
+    was refused beats a file written somewhere nobody was looking.
+
+    This is not hypothetical. The first version of the skill store validated the front matter and
+    forgot this check, and because a `POST` names its record from the request *body* rather than
+    from a path segment, nothing upstream had rejected a traversal either: `{"name": "../../…"}`
+    wrote a `SKILL.md` outside the skills root and answered `201`. Two of the three stores were
+    correct and the third was not, which is exactly the shape of mistake a shared backstop
+    removes. -/
+def ensureConfigName (what name : String) : IO Unit :=
+  match checkConfigName what name with
+  | .ok _    => pure ()
+  | .error e => throw (.userError e)
+
 end Orchestra.Utils

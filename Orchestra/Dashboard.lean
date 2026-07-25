@@ -689,7 +689,10 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
   match ← Listener.loadListenerConfig name with
   | none => return none
   | some c =>
-    let st ← Listener.loadListenerState c.name
+    -- Keyed on the path component rather than the config's own `name`, for the reason spelled
+    -- out at `setListenerEnabled`: they agree for anything this API wrote, and the path is the
+    -- spelling that has been through `safeSegment`.
+    let st ← Listener.loadListenerState name
     let (srcType, srcDetail) := sourceSummary c.source
     let extras := sourceExtras c.source
     let extrasJson : Array Json := (extras.filter (fun (_, v) => ! v.isEmpty)).map
@@ -1006,16 +1009,25 @@ private def nameFromBody (what : String) (body : String) : Except String String 
 
 /-! ### Listeners -/
 
+/-! Validation comes before the existence probe in all three writers below, and the order is
+load-bearing rather than tidy.
+
+The probe builds a path from `name` and stats it. On a `PUT` that name has already been through
+`safeSegment`, but on a `POST` it comes from the request *body* and has been through nothing —
+so probing first would let an authenticated client read `409`-versus-`404` as an oracle for
+whether an arbitrary path exists, without ever sending a body that could be accepted. Rejecting
+the name first means nothing outside the store is ever looked at. -/
+
 /-- Store a listener config, creating or replacing. `mustBeNew` is what makes `POST` refuse to
     overwrite while `PUT` replaces. -/
 private def writeListener (name : String) (body : String) (mustBeNew : Bool) :
     IO WriteResult := do
-  let existed := (← Listener.loadListenerConfigRaw name).isSome
-  if mustBeNew && existed then
-    return .conflict s!"a listener named '{name}' already exists; PUT it to replace it"
   match ← Listener.validateListenerConfig name body with
   | .error e => return .badRequest e
   | .ok _    =>
+    let existed := (← Listener.loadListenerConfigRaw name).isSome
+    if mustBeNew && existed then
+      return .conflict s!"a listener named '{name}' already exists; PUT it to replace it"
     Listener.saveListenerConfigRaw name body
     let payload := (← listenerDetailApi name).getD Json.null
     return if existed then .ok payload else .created payload
@@ -1029,26 +1041,30 @@ private def deleteListener (name : String) : IO WriteResult := do
     sub-resource rather than a field of the document a `PUT` replaces: turning a listener off is
     an operational act, and it must not require — or risk — rewriting the configuration. -/
 private def setListenerEnabled (name : String) (body : String) : IO WriteResult := do
-  let some cfg ← Listener.loadListenerConfig name | return .notFound
+  let some _ ← Listener.loadListenerConfig name | return .notFound
   let enabled ← match Json.parse body with
     | .error e => return .badRequest s!"the body is not valid JSON: {e}"
     | .ok j    =>
       match j.getObjValAs? Bool "enabled" with
       | .ok b    => pure b
       | .error _ => return .badRequest "expected a JSON body of the form {\"enabled\": true}"
-  let st ← Listener.loadListenerState cfg.name
-  Listener.saveListenerState cfg.name { st with enabled }
+  -- Keyed on the path component, not on the loaded config's own `name`. A write through this API
+  -- keeps the two equal, but a file placed by hand need not, and the state file is named by the
+  -- *listener*, not by whatever a config claims to be called — which is also the only spelling
+  -- that has been through `safeSegment`.
+  let st ← Listener.loadListenerState name
+  Listener.saveListenerState name { st with enabled }
   return .ok ((← listenerDetailApi name).getD Json.null)
 
 /-! ### Roles -/
 
 private def writeRole (name : String) (body : String) (mustBeNew : Bool) : IO WriteResult := do
-  let existed := (← Project.loadGlobalRoleRaw name).isSome
-  if mustBeNew && existed then
-    return .conflict s!"a role named '{name}' already exists; PUT it to replace it"
   match Project.validateRole name body with
   | .error e => return .badRequest e
   | .ok _    =>
+    let existed := (← Project.loadGlobalRoleRaw name).isSome
+    if mustBeNew && existed then
+      return .conflict s!"a role named '{name}' already exists; PUT it to replace it"
     Project.saveGlobalRoleRaw name body
     let payload := (← roleDetailApi name).getD Json.null
     return if existed then .ok payload else .created payload
@@ -1069,15 +1085,15 @@ private def skillContentFromBody (body : String) : Except String String :=
 a skill is Markdown, so it travels as a string rather than as the body itself"
 
 private def writeSkill (name : String) (body : String) (mustBeNew : Bool) : IO WriteResult := do
-  let existed := (← Skill.loadSkill name).isSome
-  if mustBeNew && existed then
-    return .conflict s!"a skill named '{name}' already exists; PUT it to replace it"
   let content ← match skillContentFromBody body with
     | .error e => return .badRequest e
     | .ok c    => pure c
   match Skill.validate name content with
   | .error e => return .badRequest e
   | .ok _    =>
+    let existed := (← Skill.loadSkill name).isSome
+    if mustBeNew && existed then
+      return .conflict s!"a skill named '{name}' already exists; PUT it to replace it"
     Skill.saveSkill name content
     let payload := (← skillDetailApi name).getD Json.null
     return if existed then .ok payload else .created payload

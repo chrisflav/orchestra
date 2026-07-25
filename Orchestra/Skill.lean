@@ -112,6 +112,11 @@ def parseFrontMatter (content : String) : Except String (List (String × String)
     different places (a directory listing, and the agent's skill list) where they would then
     disagree forever. -/
 def validate (name : String) (content : String) : Except String Skill := do
+  -- First, and for the same reason the other two stores check it first: `name` becomes a
+  -- directory under `skillsRoot`, and on a `POST` it arrives in the request *body* rather than
+  -- as a path segment, so nothing upstream has decoded and rejected it. The front matter check
+  -- below compares two strings the caller controls, so it establishes nothing about either.
+  Utils.checkConfigName "skill" name
   if content.trimAscii.isEmpty then
     .error "the skill body is empty"
   let fields ← parseFrontMatter content
@@ -136,6 +141,7 @@ private def modifiedEpoch (path : System.FilePath) : IO (Option Int) := do
     front matter still comes back, with whatever could be read of it — the API's job there is to
     show the operator the file that needs fixing, not to hide it. -/
 def loadSkill (name : String) : IO (Option Skill) := do
+  Utils.ensureConfigName "skill" name
   let path ← skillFile name
   if !(← path.pathExists) then return none
   let content ← IO.FS.readFile path
@@ -150,6 +156,10 @@ def loadAllSkills : IO (Array Skill) := do
   if !(← root.pathExists) then return #[]
   let mut names : Array String := #[]
   for entry in ← System.FilePath.readDir root do
+    -- A directory the API could not have created — a dotfile, say, left there by hand — is
+    -- skipped rather than listed. `loadSkill` refuses to build a path from such a name, so
+    -- including it here would turn one stray directory into a listing that throws.
+    if !Utils.validConfigName entry.fileName then continue
     if ← (entry.path / "SKILL.md").pathExists then names := names.push entry.fileName
   let mut out : Array Skill := #[]
   for name in names.qsort (· < ·) do
@@ -161,6 +171,7 @@ def loadAllSkills : IO (Array Skill) := do
 /-- Install or replace a skill. The content is written exactly as given; `validate` is the
     caller's business, and is what the API runs before reaching this. -/
 def saveSkill (name : String) (content : String) : IO Unit := do
+  Utils.ensureConfigName "skill" name
   let manifest := (← pluginDir) / ".claude-plugin" / "plugin.json"
   unless ← manifest.pathExists do
     Utils.writeFileAtomically manifest pluginManifest
@@ -172,6 +183,7 @@ def saveSkill (name : String) (content : String) : IO Unit := do
     skill's supporting files live beside its `SKILL.md`, and leaving them behind would leave an
     empty-looking directory that is not a skill and not nothing. -/
 def deleteSkill (name : String) : IO Bool := do
+  Utils.ensureConfigName "skill" name
   let dir := (← skillsRoot) / name
   if !(← (dir / "SKILL.md").pathExists) then return false
   IO.FS.removeDirAll dir
