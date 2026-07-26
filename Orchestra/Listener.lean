@@ -305,15 +305,24 @@ instance : FromJson ActionConfig where
 
 -- Listener config
 
+/-- What a listener does; *not* what it is called.
+
+    A listener is named by its file: `<config>/listeners/nightly.json` is the listener `nightly`,
+    and that spelling is what keys its state file, its API routes and every line the daemon logs
+    about it. The document used to carry a `name` of its own as well, and the two could disagree
+    — a file placed by hand, or an example copied without renaming it. Everything that *listed*
+    listeners then reported the in-file name while everything that *loaded* one built a path from
+    it, so a mismatched listener was visible everywhere and reachable nowhere: the daemon's
+    supervisor spawned a fiber for it, the fiber re-read its own config by name, found nothing,
+    logged "config is gone" and retired, and fifteen seconds later the scan called it new again.
+    One name, held by the filesystem, is the only version of this that cannot drift. -/
 structure ListenerConfig where
-  name            : String
   source          : SourceConfig
   action          : ActionConfig
   intervalSeconds : Nat := 60
 
 instance : ToJson ListenerConfig where
   toJson l := Json.mkObj [
-    ("name",             l.name),
     ("source",           ToJson.toJson l.source),
     ("action",           ToJson.toJson l.action),
     ("interval_seconds", l.intervalSeconds)
@@ -321,11 +330,10 @@ instance : ToJson ListenerConfig where
 
 instance : FromJson ListenerConfig where
   fromJson? j := do
-    let name            ← j.getObjValAs? String "name"
     let source          ← j.getObjValAs? SourceConfig "source"
     let action          ← j.getObjValAs? ActionConfig "action"
     let intervalSeconds  := j.getObjValAs? Nat "interval_seconds" |>.toOption |>.getD 60
-    return { name, source, action, intervalSeconds }
+    return { source, action, intervalSeconds }
 
 -- Listener state
 
@@ -395,30 +403,81 @@ def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
     | .ok cfg  => return some cfg
 
 
-def loadAllListenerConfigs : IO (Array ListenerConfig) := do
+/-- The name a listener config file gives its listener: its basename without the extension.
+
+    Total on purpose — the caller has already established the `.json` suffix, and a stem that
+    could not be a config name (a dotfile, say) is filtered by `checkConfigName` rather than by
+    failing to be computed. -/
+def listenerNameOfFile (fileName : String) : String :=
+  (System.FilePath.mk fileName).fileStem.getD fileName
+
+/-- Every listener, paired with the name its file gives it.
+
+    Pairs rather than a `name` field on the config: the name belongs to the store, not to the
+    document, and returning it beside the document is what stops a caller from having to decide
+    which of two spellings to trust. -/
+def loadAllListenerConfigs : IO (Array (String × ListenerConfig)) := do
   let dir ← listenersConfigDir
   if !(← dir.pathExists) then return #[]
   let secrets ← loadSecrets
   let entries ← System.FilePath.readDir dir
-  let mut configs : Array ListenerConfig := #[]
+  let mut configs : Array (String × ListenerConfig) := #[]
   for entry in entries do
-    let name := entry.fileName
-    if !name.endsWith ".json" then continue
-    -- skip the state subdirectory entry (it has no .json extension anyway)
+    let file := entry.fileName
+    -- skips the state subdirectory entry (it has no .json extension anyway)
+    if !file.endsWith ".json" then continue
+    let name := listenerNameOfFile file
+    -- The name keys the state file and the dashboard's detail route, so a file whose stem cannot
+    -- be one — a dotfile, say — is skipped rather than returned. Nothing this API wrote can be
+    -- in that state; a file placed by hand can.
+    match Utils.checkConfigName "listener" name with
+    | .error e => IO.eprintln s!"Warning: ignoring listener config {file}: {e}"; continue
+    | .ok _    => pure ()
     let raw := applySecrets secrets (← IO.FS.readFile entry.path)
     match Json.parse raw with
-    | .error e => IO.eprintln s!"Warning: failed to parse listener config {name}: {e}"
+    | .error e => IO.eprintln s!"Warning: failed to parse listener config {file}: {e}"
     | .ok j    =>
       match FromJson.fromJson? j (α := ListenerConfig) with
-      | .error e => IO.eprintln s!"Warning: failed to load listener config {name}: {e}"
-      | .ok cfg  =>
-        -- Every caller keys the state file (and the dashboard's detail route) on `cfg.name`, so
-        -- a config claiming a name that cannot be a filename is skipped rather than returned.
-        -- Nothing this API wrote can be in that state; a file placed by hand can.
-        match Utils.checkConfigName "listener" cfg.name with
-        | .error e => IO.eprintln s!"Warning: ignoring listener config {name}: {e}"
-        | .ok _    => configs := configs.push cfg
+      | .error e => IO.eprintln s!"Warning: failed to load listener config {file}: {e}"
+      | .ok cfg  => configs := configs.push (name, cfg)
   return configs
+
+/-- Move state left under a config's old in-file `name` to the name its file gives it.
+
+    Listeners used to be named by a `name` field inside the document, and their state — the list
+    of event ids already handled — was keyed on that. Now the file names them, so a config whose
+    two spellings disagreed would come back under a name with no state behind it and re-fire
+    every event it had already handled. This renames the state file instead, once: after the move
+    the old path no longer exists, so a later run finds nothing to do and says nothing.
+
+    The daemon runs this at start-up, before any listener polls. It is the only process that
+    writes listener state, which is why it is the only one that migrates it. -/
+def migrateListenerStateNames : IO Unit := do
+  let dir ← listenersConfigDir
+  if !(← dir.pathExists) then return
+  let stateDir ← listenerStateDir
+  for entry in ← System.FilePath.readDir dir do
+    let file := entry.fileName
+    if !file.endsWith ".json" then continue
+    let name := listenerNameOfFile file
+    if (Utils.checkConfigName "listener" name).toOption.isNone then continue
+    -- Read raw and unsubstituted: a legacy name is a plain string, and a config that no longer
+    -- parses still has state worth keeping under the right name.
+    let raw ← IO.FS.readFile entry.path
+    let some legacy := (Json.parse raw).toOption.bind (·.getObjValAs? String "name" |>.toOption)
+      | continue
+    if legacy == name then continue
+    if (Utils.checkConfigName "listener" legacy).toOption.isNone then continue
+    -- The legacy name may be a listener in its own right — `a.json` claiming to be `b` while
+    -- `b.json` sits beside it. That state belongs to `b`, and moving it would hand one
+    -- listener's processed events to another.
+    if ← (dir / s!"{legacy}.json").pathExists then continue
+    let source := stateDir / s!"{legacy}.json"
+    let dest   := stateDir / s!"{name}.json"
+    if !(← source.pathExists) || (← dest.pathExists) then continue
+    IO.FS.rename source dest
+    IO.println s!"Listener '{name}': carried state over from its old name '{legacy}'. \
+A listener is named by its file now; the config's own 'name' field is ignored."
 
 /-! ### Editing a listener config
 
@@ -457,9 +516,14 @@ def validateListenerConfig (name : String) (raw : String) :
   let cfg ← match (FromJson.fromJson? j : Except String ListenerConfig) with
     | .error e => return .error s!"the body is not a listener config: {e}"
     | .ok c    => pure c
-  if cfg.name != name then
-    return .error s!"the config names this listener '{cfg.name}', but it is being stored as \
-'{name}'"
+  -- A listener is named by its file, so `name` is not a field any more and a body that still
+  -- carries one from before is simply ignored — except when the two disagree, which is the one
+  -- case where ignoring it would store the document under a name its author did not intend.
+  if let .ok stale := j.getObjValAs? String "name" then
+    if stale != name then
+      return .error s!"the body carries a legacy 'name' field of '{stale}', but it is being \
+stored as '{name}'. A listener is named by its file; drop the field, or store this under \
+'{stale}'"
   if cfg.intervalSeconds == 0 then
     return .error "'interval_seconds' must be at least 1; a listener polling zero seconds apart \
 would spin against its source as fast as the network allows"

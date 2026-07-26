@@ -1,5 +1,4 @@
 {
-  "name": "github-labels",
   "source": {
     "type": "github-labels",
     "repos": [

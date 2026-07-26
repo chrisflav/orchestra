@@ -657,10 +657,11 @@ private def sourceExtras : Listener.SourceConfig → List (String × String)
       [("authorized users", String.intercalate ", " authU)]
   | _ => []
 
-private def listenerSummaryJson (c : Listener.ListenerConfig) (st : Listener.ListenerState) : Json :=
+private def listenerSummaryJson (name : String) (c : Listener.ListenerConfig)
+    (st : Listener.ListenerState) : Json :=
   let (srcType, _) := sourceSummary c.source
   Json.mkObj [
-    ("name",            c.name),
+    ("name",            name),
     ("enabled",         Json.bool st.enabled),
     ("sourceType",      srcType),
     ("intervalSeconds", ToJson.toJson c.intervalSeconds),
@@ -669,8 +670,8 @@ private def listenerSummaryJson (c : Listener.ListenerConfig) (st : Listener.Lis
   ]
 
 private def listenersApi (p : Page) : IO Json := do
-  pageOverUnordered p (← Listener.loadAllListenerConfigs) fun c => do
-    return listenerSummaryJson c (← Listener.loadListenerState c.name)
+  pageOverUnordered p (← Listener.loadAllListenerConfigs) fun (name, c) => do
+    return listenerSummaryJson name c (← Listener.loadListenerState name)
 
 private def actionJson (a : Listener.ActionConfig) : Json :=
   Json.mkObj [
@@ -689,9 +690,6 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
   match ← Listener.loadListenerConfig name with
   | none => return none
   | some c =>
-    -- Keyed on the path component rather than the config's own `name`, for the reason spelled
-    -- out at `setListenerEnabled`: they agree for anything this API wrote, and the path is the
-    -- spelling that has been through `safeSegment`.
     let st ← Listener.loadListenerState name
     let (srcType, srcDetail) := sourceSummary c.source
     let extras := sourceExtras c.source
@@ -704,7 +702,7 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
     -- write expanded secrets back into a config that deliberately does not carry any.
     let config := (← Listener.loadListenerConfigRaw name).bind (Json.parse · |>.toOption)
     return some (Json.mkObj [
-      ("name",            c.name),
+      ("name",            name),
       ("enabled",         Json.bool st.enabled),
       ("intervalSeconds", ToJson.toJson c.intervalSeconds),
       ("lastCheckedAt",   optNormIso (if st.lastChecked.isEmpty then none else some st.lastChecked)),
@@ -1018,16 +1016,17 @@ so probing first would let an authenticated client read `409`-versus-`404` as an
 whether an arbitrary path exists, without ever sending a body that could be accepted. Rejecting
 the name first means nothing outside the store is ever looked at. -/
 
-/-- Store a listener config, creating or replacing. `mustBeNew` is what makes `POST` refuse to
-    overwrite while `PUT` replaces. -/
-private def writeListener (name : String) (body : String) (mustBeNew : Bool) :
-    IO WriteResult := do
+/-- Store a listener config, creating or replacing.
+
+    No `mustBeNew`, unlike the two writers below it: a listener is named by its file, so `PUT` is
+    the only way to write one and there is no `POST` for it to refuse to overwrite on. The probe
+    is still here, because 201-versus-200 is the difference between having created a listener and
+    having replaced one. -/
+private def writeListener (name : String) (body : String) : IO WriteResult := do
   match ← Listener.validateListenerConfig name body with
   | .error e => return .badRequest e
   | .ok _    =>
     let existed := (← Listener.loadListenerConfigRaw name).isSome
-    if mustBeNew && existed then
-      return .conflict s!"a listener named '{name}' already exists; PUT it to replace it"
     Listener.saveListenerConfigRaw name body
     let payload := (← listenerDetailApi name).getD Json.null
     return if existed then .ok payload else .created payload
@@ -1048,10 +1047,6 @@ private def setListenerEnabled (name : String) (body : String) : IO WriteResult 
       match j.getObjValAs? Bool "enabled" with
       | .ok b    => pure b
       | .error _ => return .badRequest "expected a JSON body of the form {\"enabled\": true}"
-  -- Keyed on the path component, not on the loaded config's own `name`. A write through this API
-  -- keeps the two equal, but a file placed by hand need not, and the state file is named by the
-  -- *listener*, not by whatever a config claims to be called — which is also the only spelling
-  -- that has been through `safeSegment`.
   let st ← Listener.loadListenerState name
   Listener.saveListenerState name { st with enabled }
   return .ok ((← listenerDetailApi name).getD Json.null)
@@ -1119,8 +1114,13 @@ private def renderWrite (method : Method) (kind : String) (body : String) :
     | .ok name => write name body true
   let some segs := kindSegments kind | return some .notFound
   match segs, method with
-  | ["listeners"],                  .post   => return some (← create "listener" writeListener)
-  | ["listeners", name],            .put    => return some (← writeListener name body false)
+  -- A listener has no name of its own to be created by: its file names it. Answered as a
+  -- sentence rather than as a `405`, because such a request is one `PUT` away from working and a
+  -- bare "method not allowed" would not say so.
+  | ["listeners"],                  .post   =>
+    return some (.badRequest "a listener is named by its file, not by its body; create one with \
+PUT /api/v1/listeners/{name}")
+  | ["listeners", name],            .put    => return some (← writeListener name body)
   | ["listeners", name],            .delete => return some (← deleteListener name)
   | ["listeners", name, "enabled"], .put    => return some (← setListenerEnabled name body)
   | ["roles"],                      .post   => return some (← create "role" writeRole)
@@ -1482,7 +1482,7 @@ def apiRoutes : Array (String × Array String) :=
     ("tasks/{id}",               #["get"]),
     ("concerts",                 #["get"]),
     ("concerts/{id}",            #["get"]),
-    ("listeners",                #["get", "post"]),
+    ("listeners",                #["get"]),
     ("listeners/{name}",         #["get", "put", "delete"]),
     ("listeners/{name}/enabled", #["put"]),
     ("roles",                    #["get", "post"]),

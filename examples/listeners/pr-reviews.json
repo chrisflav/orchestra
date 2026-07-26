@@ -1,5 +1,4 @@
 {
-  "name": "pr-reviews",
   "source": {
     "type": "github-pr-reviews",
     "repos": [

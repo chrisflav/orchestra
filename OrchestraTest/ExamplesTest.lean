@@ -14,7 +14,8 @@ namespace OrchestraTest.Examples
     `examples/listeners/auto-dispatcher.json` kept its old string, which
     `loadAllListenerConfigs` reports as a warning and then skips — a dispatcher that silently
     never dispatches. These tests exist so a shipped example that no longer parses fails the
-    build instead.
+    build instead. The listener case also checks that no example carries a `name` field, since
+    an example is the likeliest thing to be copied into a listeners directory unrenamed.
 
     Paths are relative to the package root, which is `lake test`'s working directory. -/
 
@@ -39,7 +40,12 @@ def listenerExamplesParse : Test := do
       | .ok j =>
         match (FromJson.fromJson? j : Except String Listener.ListenerConfig) with
         | .error e => TestM.fail s!"{path}: does not decode as ListenerConfig: {e}"
-        | .ok _ => TestM.assert true
+        | .ok _ =>
+          -- A listener is named by its file. Two of these examples used to carry a `name` that
+          -- disagreed with theirs, so copying one into a listeners directory without renaming it
+          -- produced a listener the daemon could list and never load.
+          TestM.assert (j.getObjVal? "name" |>.toOption |>.isNone)
+            (msg := s!"{path}: carries a 'name' field; a listener is named by its file")
 
 @[test]
 def roleExamplesParse : Test := do

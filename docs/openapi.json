@@ -4,7 +4,7 @@
     "title": "orchestra dashboard API",
     "version": "1.0.0",
     "summary": "HTTP API over a running orchestra backend: reads everything it knows, and changes what it is configured with.",
-    "description": "Everything the daemon knows about its queue, task history, listeners, projects and authentication sources, as JSON. Every read is also available as a Server-Sent Events stream at the same path under `/sse/v1/`, pushed every two seconds and only when the payload has changed.\n\nThree resources are configuration and are writable: **listeners**, **roles** and **skills**. Everything else — the queue, task history, concerts, projects, authentication sources — is a record of something that already happened or is owned by another system, and is read-only here. Nothing in this API enqueues or cancels work; that is the daemon's control socket.\n\n## Writing\n\n- Every route that is not a `GET` requires a credential. `POST /api/login` is the only exception, since it is how one is obtained.\n- Every write must be sent as `application/json`. A request without that content type is a `415`. This is the second of the two locks on a cookie-authenticated write: the session cookie is `SameSite=Strict`, so a cross-site request carries no credential, and an HTML form cannot send JSON, so it cannot form the request at all.\n- `POST` to a collection creates and refuses to overwrite (`409`), taking the name from the body. `PUT` to a member creates or replaces, taking the name from the path; a body naming a different one is a `400`.\n- `DELETE` answers `204`, or `404` when there was nothing there.\n- A rejected body changes nothing on disk: validation runs to completion before anything is written, and every write is a write-and-rename, so a reader never sees a partial file.\n- Listener configs and roles are stored **verbatim**, not re-serialised. That is what keeps `{{secret}}` placeholders — and any field a client does not know about — intact across an edit. Fetch the `config` field of a detail response, change it, and `PUT` it back.\n\n## Conventions\n\n- Instants are RFC 3339 in UTC (`2026-07-23T10:04:11Z`) and live in a field named `...At`.\n- Durations are integer seconds, in a field named `...Seconds`.\n- An absent value is `null`, never an empty string.\n- Enumerations are the lower-case names the daemon itself uses.\n- Collections answer in a common envelope (`items`, `total`, `limit`, `offset`) and accept `limit`, `offset` and — where the collection is ordered by time — `since`.\n- A parameter that is malformed, or that the collection cannot honour, is a `400`. Parameters this version does not define are ignored.",
+    "description": "Everything the daemon knows about its queue, task history, listeners, projects and authentication sources, as JSON. Every read is also available as a Server-Sent Events stream at the same path under `/sse/v1/`, pushed every two seconds and only when the payload has changed.\n\nThree resources are configuration and are writable: **listeners**, **roles** and **skills**. Everything else — the queue, task history, concerts, projects, authentication sources — is a record of something that already happened or is owned by another system, and is read-only here. Nothing in this API enqueues or cancels work; that is the daemon's control socket.\n\n## Writing\n\n- Every route that is not a `GET` requires a credential. `POST /api/login` is the only exception, since it is how one is obtained.\n- Every write must be sent as `application/json`. A request without that content type is a `415`. This is the second of the two locks on a cookie-authenticated write: the session cookie is `SameSite=Strict`, so a cross-site request carries no credential, and an HTML form cannot send JSON, so it cannot form the request at all.\n- `POST` to a collection creates and refuses to overwrite (`409`), taking the name from the body. `PUT` to a member creates or replaces, taking the name from the path; a body naming a different one is a `400`. Listeners are the exception and have no `POST`: a listener config carries no name of its own — its file names it — so `PUT /api/v1/listeners/{name}` is both how one is created and how it is replaced.\n- `DELETE` answers `204`, or `404` when there was nothing there.\n- A rejected body changes nothing on disk: validation runs to completion before anything is written, and every write is a write-and-rename, so a reader never sees a partial file.\n- Listener configs and roles are stored **verbatim**, not re-serialised. That is what keeps `{{secret}}` placeholders — and any field a client does not know about — intact across an edit. Fetch the `config` field of a detail response, change it, and `PUT` it back.\n\n## Conventions\n\n- Instants are RFC 3339 in UTC (`2026-07-23T10:04:11Z`) and live in a field named `...At`.\n- Durations are integer seconds, in a field named `...Seconds`.\n- An absent value is `null`, never an empty string.\n- Enumerations are the lower-case names the daemon itself uses.\n- Collections answer in a common envelope (`items`, `total`, `limit`, `offset`) and accept `limit`, `offset` and — where the collection is ordered by time — `since`.\n- A parameter that is malformed, or that the collection cannot honour, is a `400`. Parameters this version does not define are ignored.",
     "license": { "name": "See repository" }
   },
   "servers": [
@@ -333,23 +333,6 @@
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
-      },
-      "post": {
-        "tags": ["listeners"],
-        "summary": "Create a listener",
-        "description": "The body is the listener config document itself \u2014 exactly what is stored at `<config>/listeners/<name>.json` \u2014 and the name comes from its `name` field. Refuses to overwrite; `PUT /api/v1/listeners/{name}` replaces.\n\nThe daemon re-reads listener configs on every tick and rescans the directory every fifteen seconds, so a listener created here starts polling without a restart.",
-        "operationId": "createListener",
-        "requestBody": {
-          "required": true,
-          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListenerConfig" } } }
-        },
-        "responses": {
-          "201": { "$ref": "#/components/responses/ListenerWritten" },
-          "400": { "$ref": "#/components/responses/BadRequest" },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "409": { "$ref": "#/components/responses/Conflict" },
-          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
-        }
       }
     },
     "/api/v1/listeners/{name}": {
@@ -378,7 +361,7 @@
       "put": {
         "tags": ["listeners"],
         "summary": "Create or replace a listener",
-        "description": "The body is the listener config document itself. Its `name` must equal the path component \u2014 a mismatch is a `400` rather than a silent rename, because the two spellings would otherwise disagree for as long as the file exists.",
+        "description": "The body is the listener config document itself, and the path names it: a listener is `<config>/listeners/<name>.json` and is known by that spelling everywhere. This is also how a listener is created \u2014 there is no `POST` to the collection, because the document has no name of its own to be created by.\n\nThe daemon re-reads listener configs on every tick and rescans the directory every fifteen seconds, so a listener written here starts polling without a restart.\n\nA body still carrying the `name` field listeners used to be identified by is accepted when it agrees with the path and a `400` when it does not: the field is ignored, and silently storing the document under a different name than it claims is how a listener ends up listed under one name and loadable under another.",
         "operationId": "putListener",
         "parameters": [{ "$ref": "#/components/parameters/name" }],
         "requestBody": {
@@ -919,10 +902,9 @@
       },
       "ListenerConfig": {
         "type": "object",
-        "required": ["name", "source", "action"],
-        "description": "A listener config document, exactly as stored at `<config>/listeners/<name>.json`. Stored verbatim rather than re-serialised, so `{{secret}}` placeholders and fields this version does not model both survive an edit; it is validated after secret substitution, which is how the daemon reads it. The `source` union and the `action` template are documented in the repository README under \"Listeners\".",
+        "required": ["source", "action"],
+        "description": "A listener config document, exactly as stored at `<config>/listeners/<name>.json`. It carries no name of its own: the file names the listener, and that spelling keys its state, its routes here and every line the daemon logs about it. Stored verbatim rather than re-serialised, so `{{secret}}` placeholders and fields this version does not model both survive an edit; it is validated after secret substitution, which is how the daemon reads it. The `source` union and the `action` template are documented in the repository README under \"Listeners\".",
         "properties": {
-          "name": { "type": "string", "description": "Must equal the name it is stored under." },
           "source": { "type": "object", "description": "What to watch. `type` selects the variant: `github-issues`, `github-pr-reviews`, `github-comments`, `github-labels`, `github-label-count`, `shell`, `project-dispatcher`, `label-dispatcher`." },
           "action": { "type": "object", "description": "The task to enqueue when it fires. `mode` and `prompt_template` are required." },
           "interval_seconds": { "type": "integer", "minimum": 1, "default": 60, "description": "Poll interval. Zero is rejected: a listener polling zero seconds apart would spin against its source as fast as the network allows." }

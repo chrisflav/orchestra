@@ -714,15 +714,20 @@ Listeners poll event sources and automatically enqueue tasks. Listener configs
 are JSON files placed in `~/.config/orchestra/listeners/`, and can equally be written through the
 API — see [configuration over the API](#configuration-over-the-api).
 
+**A listener is named by its file.** `~/.config/orchestra/listeners/issue-comments.json` is the
+listener `issue-comments`, and that is the name its state, its API routes, `orchestra listener
+enable` and every line the daemon logs about it use. The config document carries no name of its
+own; a `name` field left over from an older version is ignored, and the daemon carries that
+listener's state across to the file's name the first time it starts.
+
 Either way the running daemon picks them up: it re-reads each listener's config on every tick,
 and rescans the directory every fifteen seconds, so a listener added, changed, disabled or
 deleted takes effect without a restart.
 
-Example — respond to issue comments containing a trigger word:
+Example — `issue-comments.json`, responding to issue comments containing a trigger word:
 
 ```json
 {
-  "name": "issue-comments",
   "source": {
     "type": "github-comments",
     "repos": [
@@ -763,7 +768,6 @@ To trigger a multi-step workflow from a listener, replace `prompt_template` with
 
 ```json
 {
-  "name": "issue-workflow",
   "source": {
     "type": "github-issues",
     "repos": [{"upstream": "owner/repo", "fork": "your-org/fork"}],
@@ -959,7 +963,8 @@ The rules, in full:
 - **`POST` to a collection creates** and refuses to overwrite (`409`), naming the record from the
   body. **`PUT` to a member creates or replaces**, naming it from the path; a body naming a
   different one is a `400` rather than a silent rename. **`DELETE`** is `204`, or `404` when
-  there was nothing there.
+  there was nothing there. Listeners have no `POST`: a listener config carries no name of its
+  own, so `PUT /api/v1/listeners/{name}` is how one is created as well as replaced.
 - **A rejected body changes nothing.** Validation runs to completion before anything is opened
   for writing, and every write is a write-and-rename, so the daemon never reads a partial or
   half-checked file.

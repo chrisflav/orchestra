@@ -478,6 +478,12 @@ its workspace; it will start from a clean checkout."
   -- listeners directory holds a handful of small files, an inotify watch would be a second
   -- mechanism to get wrong, and fifteen seconds is far inside the interval of any listener.
   let listenerScanSeconds : Nat := 15
+  -- Before the first fiber polls anything. A listener used to be named by a `name` field inside
+  -- its config and is named by its file now, so one whose two spellings disagreed is about to be
+  -- known by a name with no state behind it — and would re-fire every event it has already
+  -- handled unless its state comes with it.
+  try Listener.migrateListenerStateNames
+  catch e => IO.eprintln s!"Listener state migration failed: {e}"
   let listenerFibers ← IO.mkRef ({} : Std.HashSet String)
   let spawnListener (name : String) : IO Unit := do
     let _listenerTask ← IO.asTask (prio := .dedicated) do
@@ -636,7 +642,7 @@ its workspace; it will start from a clean checkout."
                 let yaml := Listener.renderTemplate rawYaml vars
                 match Workflow.WorkflowProgram.parseYaml yaml with
                 | .error e =>
-                  IO.eprintln s!"  Listener '{liveCfg.name}': workflow parse error: {e}"
+                  IO.eprintln s!"  Listener '{name}': workflow parse error: {e}"
                 | .ok prog =>
                   let upstreamStr :=
                     let r := Listener.renderTemplate liveCfg.action.upstream vars
@@ -671,12 +677,12 @@ its workspace; it will start from a clean checkout."
                       Queue.saveConcertRun { concertRun with status := .failed, finishedAt := some t }
                   pure ()
               catch e =>
-                IO.eprintln s!"  Listener '{liveCfg.name}': failed to load workflow: {e}"
+                IO.eprintln s!"  Listener '{name}': failed to load workflow: {e}"
             else
               -- Single-task mode: enqueue a QueueEntry as before.
               let qentry ← Listener.buildQueueEntry liveCfg.action vars (some name)
               Queue.saveEntry qentry
-              IO.println s!"  Listener '{liveCfg.name}': queued entry {qentry.id}"
+              IO.println s!"  Listener '{name}': queued entry {qentry.id}"
           let newIds := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)
           -- Re-read enabled so a disable issued mid-tick is not overwritten.
@@ -695,15 +701,15 @@ its workspace; it will start from a clean checkout."
       try
         let configs ← Listener.loadAllListenerConfigs
         let known ← listenerFibers.get
-        let fresh := configs.filter (fun c => !known.contains c.name)
+        let fresh := configs.filter (fun (name, _) => !known.contains name)
         if firstScan then
           if !configs.isEmpty then IO.println s!"Loaded {configs.size} listener(s)"
         else if !fresh.isEmpty then
           IO.println s!"Picked up {fresh.size} new listener(s): \
-{String.intercalate ", " (fresh.toList.map (·.name))}"
-        for c in fresh do
-          listenerFibers.modify (·.insert c.name)
-          spawnListener c.name
+{String.intercalate ", " (fresh.toList.map (·.1))}"
+        for (name, _) in fresh do
+          listenerFibers.modify (·.insert name)
+          spawnListener name
       catch e =>
         IO.eprintln s!"  Listener scan failed: {e}"
       firstScan := false

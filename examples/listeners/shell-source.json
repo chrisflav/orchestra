@@ -1,5 +1,4 @@
 {
-  "name": "shell-source",
   "source": {
     "type": "shell",
     "command": "/path/to/your/source-script.sh",

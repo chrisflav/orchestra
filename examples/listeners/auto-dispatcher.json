@@ -1,5 +1,4 @@
 {
-  "name": "demo-dispatcher",
   "source": {
     "type": "project-dispatcher",
     "project_id": 42,

@@ -1,5 +1,4 @@
 {
-  "name": "demo-label-dispatcher",
   "source": {
     "type": "label-dispatcher",
     "label": "agent-ready",

@@ -68,7 +68,7 @@ def validConfigName_acceptsNamesAndRejectsPaths : Test := do
 /-! ## Listener validation -/
 
 private def goodListener : String :=
-  "{\"name\": \"nightly\", \"interval_seconds\": 300,
+  "{\"interval_seconds\": 300,
     \"source\": {\"type\": \"shell\", \"command\": \"echo\", \"args\": [\"hi\"]},
     \"action\": {\"mode\": \"pr\", \"upstream\": \"o/r\", \"fork\": \"o/r\",
                  \"prompt_template\": \"do the thing\"}}"
@@ -82,7 +82,10 @@ private def listenerVerdict (name body : String) : IO (Option String) := do
 @[test]
 def validateListenerConfig_acceptsAWellFormedConfig : Test := do
   TestM.assertEqual (← listenerVerdict "nightly" goodListener) none
-    (msg := "a config that names itself and parses is accepted")
+    (msg := "a config that parses is accepted")
+  TestM.assertEqual (← listenerVerdict "morning" goodListener) none
+    (msg := "and the same document is a different listener under a different name, because the \
+             name is the file's and not the document's")
 
 @[test]
 def validateListenerConfig_rejectsWhatWouldCorruptTheStore : Test := do
@@ -92,9 +95,16 @@ def validateListenerConfig_rejectsWhatWouldCorruptTheStore : Test := do
     (msg := "a body that is not JSON")
   TestM.assert (← listenerVerdict "nightly" "{\"hello\": 1}" |>.map Option.isSome)
     (msg := "valid JSON that is not a listener")
-  TestM.assert
-    (← listenerVerdict "morning" goodListener |>.map Option.isSome)
-    (msg := "a config whose own name disagrees with the one it is stored under")
+  -- Listeners were named by a `name` field once, and a document still carrying one that
+  -- disagrees with the path is the mistake that used to make a listener visible everywhere and
+  -- loadable nowhere. The field is ignored now, so this is the only place left to catch it.
+  let legacyName := goodListener.replace "{\"interval_seconds\"" "{\"name\": \"morning\",
+    \"interval_seconds\""
+  TestM.assert (← listenerVerdict "nightly" legacyName |>.map Option.isSome)
+    (msg := "a body whose legacy 'name' disagrees with the name it is being stored under")
+  TestM.assertEqual (← listenerVerdict "morning" legacyName) none
+    (msg := "but one that agrees is simply ignored, so a config written before the field went \
+             away can still be PUT back unchanged")
   TestM.assert (← listenerVerdict "a/b" goodListener |>.map Option.isSome)
     (msg := "a name that is a path")
   let zeroInterval := goodListener.replace "\"interval_seconds\": 300" "\"interval_seconds\": 0"
@@ -234,6 +244,50 @@ def listenerRoundTrip : Test := do
     (msg := "deleting what is not there is a 404, not a silent success")
 
 @[test]
+def aListenerIsNamedByItsFile : Test := do
+  -- The regression this replaced: the listing named a listener by a `name` field inside the
+  -- document while every loader built a path from it, so a file whose two spellings disagreed was
+  -- listed under one name and loadable under the other. The daemon spawned a fiber for the name
+  -- it had been given, the fiber failed to load its own config, retired, and was picked up as new
+  -- again fifteen seconds later — forever, without ever polling anything.
+  let (listed, byFile, byLegacy) ← withTempStores do
+    let legacyNamed := goodListener.replace "{\"interval_seconds\"" "{\"name\": \"opus-nightly\",
+      \"interval_seconds\""
+    Listener.saveListenerConfigRaw "nightly" legacyNamed
+    let listed ← Listener.loadAllListenerConfigs
+    return (listed.map (·.1), (← Listener.loadListenerConfig "nightly").isSome,
+            (← Listener.loadListenerConfig "opus-nightly").isSome)
+  TestM.assertEqual listed #["nightly"] (msg := "listed under the name its file gives it")
+  TestM.assert byFile (msg := "and loadable under exactly that name")
+  TestM.assert (!byLegacy)
+    (msg := "the name the document claims for itself is not a second identity")
+
+@[test]
+def listenerStateFollowsTheConfigToItsFileName : Test := do
+  -- State is the list of event ids already handled. A listener that came back under a new name
+  -- with no state behind it would re-fire every one of them, so the rename carries it over.
+  let (moved, untouched, quiet) ← withTempStores do
+    let legacyNamed := goodListener.replace "{\"interval_seconds\"" "{\"name\": \"opus-nightly\",
+      \"interval_seconds\""
+    Listener.saveListenerConfigRaw "nightly" legacyNamed
+    Listener.saveListenerState "opus-nightly"
+      { lastChecked := "2026-07-25T00:00:00Z", processedIds := #["17"] }
+    -- A second listener whose file and field already agree: nothing to move, and nothing said.
+    Listener.saveListenerConfigRaw "morning" goodListener
+    Listener.saveListenerState "morning" { lastChecked := "", processedIds := #["4"] }
+    Listener.migrateListenerStateNames
+    let moved ← Listener.loadListenerState "nightly"
+    let untouched ← Listener.loadListenerState "morning"
+    -- Idempotent: the second run has nothing left to find.
+    Listener.migrateListenerStateNames
+    let quiet ← Listener.loadListenerState "nightly"
+    return (moved.processedIds, untouched.processedIds, quiet.processedIds)
+  TestM.assertEqual moved #["17"]
+    (msg := "the state arrived under the name the file gives the listener")
+  TestM.assertEqual untouched #["4"] (msg := "a listener that never disagreed is left alone")
+  TestM.assertEqual quiet #["17"] (msg := "and running the migration again changes nothing")
+
+@[test]
 def roleRoundTrip : Test := do
   let (before, raw, loaded, removed, after) ← withTempStores do
     let before ← Project.loadGlobalRoleRaw "implementor"
@@ -286,9 +340,9 @@ def aRejectedBodyLeavesTheStoredConfigAlone : Test := do
   let (raw, stillParses) ← withTempStores do
     Listener.saveListenerConfigRaw "nightly" goodListener
     -- Exactly what a `PUT` of a broken body does: validate first, and never reach the store.
-    let verdict ← Listener.validateListenerConfig "nightly" "{\"name\": \"nightly\"}"
+    let verdict ← Listener.validateListenerConfig "nightly" "{\"interval_seconds\": 300}"
     if verdict.toOption.isSome then
-      Listener.saveListenerConfigRaw "nightly" "{\"name\": \"nightly\"}"
+      Listener.saveListenerConfigRaw "nightly" "{\"interval_seconds\": 300}"
     let raw ← Listener.loadListenerConfigRaw "nightly"
     return (raw, (← Listener.loadListenerConfig "nightly").isSome)
   TestM.assertEqual raw (some goodListener) (msg := "the good config is still there, untouched")
@@ -299,7 +353,9 @@ def aRejectedBodyLeavesTheStoredConfigAlone : Test := do
 The path-based routes (`PUT`, `DELETE`, `GET /…/{name}`) run their component through
 `safeSegment`, which is covered in `OrchestraTest.Dashboard`. `POST` does not: it names the
 record from the request **body**, so nothing upstream has decoded or rejected the string, and the
-only thing standing between it and a filename is the resource's own validator.
+only thing standing between it and a filename is the resource's own validator. Listeners have no
+`POST` any more — a listener is named by its file — but they are held to the same rule here,
+because the validator is what the path-based routes stand on too.
 
 That gap was real. `Skill.validate` shipped without the name check the other two had, and because
 the front matter check only compares two strings the caller controls, a `POST` of
@@ -327,8 +383,7 @@ def noValidatorAcceptsATraversingName : Test := do
   for bad in traversalNames do
     -- The body is otherwise well-formed and self-consistent — including the front matter naming
     -- itself exactly as the path does, which is what made the skill case slip through.
-    let listener := goodListener.replace "\"name\": \"nightly\"" s!"\"name\": \"{bad}\""
-    TestM.assert (isNameRejection (← listenerVerdict bad listener))
+    TestM.assert (isNameRejection (← listenerVerdict bad goodListener))
       (msg := s!"listener named {repr bad} must be rejected as an unusable name")
     let role := goodRole.replace "\"name\": \"implementor\"" s!"\"name\": \"{bad}\""
     TestM.assert (isNameRejection (roleVerdict bad role))
@@ -400,7 +455,7 @@ def everyWriteRouteRequiresACredential : Test := do
         TestM.assert (!publicPaths.contains path)
           (msg := s!"{m.toUpper} {path} would be reachable without a credential")
   -- A guard on the guard: if `apiRoutes` ever loses its writes, the loop above passes vacuously.
-  TestM.assert (writes ≥ 10)
+  TestM.assert (writes ≥ 9)
     (msg := s!"the write surface is still present ({writes} non-GET routes)")
 
 end OrchestraTest.ConfigApi
