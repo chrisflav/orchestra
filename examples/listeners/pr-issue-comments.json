@@ -1,5 +1,4 @@
 {
-  "name": "pr-issue-comments",
   "source": {
     "type": "github-comments",
     "repos": [

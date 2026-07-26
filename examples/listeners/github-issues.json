@@ -1,5 +1,4 @@
 {
-  "name": "github-issues",
   "source": {
     "type": "github-issues",
     "repos": [

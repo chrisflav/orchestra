@@ -835,13 +835,13 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
     IO.println ""
     IO.println s!"{padRight "LISTENER" 24} {padRight "ON" 4} {padRight "INTERVAL" 9} {padRight "LAST CHECKED" 22} QUEUED"
     IO.println (String.ofList (List.replicate 80 '-'))
-    for cfg in listenerConfigs do
-      let state       ← Listener.loadListenerState cfg.name
+    for (name, cfg) in listenerConfigs do
+      let state       ← Listener.loadListenerState name
       let lastChecked := if state.lastChecked.isEmpty then "never" else state.lastChecked
       let queued      := toString state.processedIds.size ++ " events"
       let interval    := s!"{cfg.intervalSeconds}s"
       let enabled     := if state.enabled then "yes" else "no"
-      IO.println s!"{padRight cfg.name 24} {padRight enabled 4} {padRight interval 9} {padRight lastChecked 22} {queued}"
+      IO.println s!"{padRight name 24} {padRight enabled 4} {padRight interval 9} {padRight lastChecked 22} {queued}"
   return 0
 
 private def queueShutdownHandler (p : Parsed) : IO UInt32 := do

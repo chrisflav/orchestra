@@ -397,7 +397,6 @@ setting `workflow_path`:
 
 ```json
 {
-  "name": "issue-workflow",
   "source": {
     "type": "github-issues",
     "repos": [{"upstream": "owner/repo", "fork": "your-org/fork"}],
