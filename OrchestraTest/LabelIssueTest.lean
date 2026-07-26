@@ -203,6 +203,21 @@ def plan_refusesContradictoryRequests : Test := do
   | .ok _ => TestM.fail "expected adding and removing the same label to be refused"
   | .error e => TestM.assert (e.contains "t-bug") "the refusal names the label"
 
+/-! ## Naming a label in a URL -/
+
+@[test]
+def percentEncode_survivesALabelWithSpaces : Test := do
+  -- `good first issue` is GitHub's own default label, and the name goes into the path of the
+  -- DELETE that removes it. Interpolated raw it was not a path at all.
+  TestM.assertEqual (GitHub.percentEncode "good first issue") "good%20first%20issue"
+    (msg := "spaces are encoded")
+  TestM.assertEqual (GitHub.percentEncode "t-bug") "t-bug"
+    (msg := "an ordinary label passes through untouched")
+  TestM.assertEqual (GitHub.percentEncode "a/b?c#d") "a%2Fb%3Fc%23d"
+    (msg := "characters that would restructure the URL are encoded")
+  TestM.assertEqual (GitHub.percentEncode "priority:高") "priority%3A%E9%AB%98"
+    (msg := "a multi-byte character is encoded byte by byte")
+
 /-! ## Reporting the change -/
 
 @[test]

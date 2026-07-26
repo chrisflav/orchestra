@@ -654,8 +654,11 @@ def addIssueLabels (pat : String) (repo : Repository) (issueNumber : Nat) (label
     `gh api` passes the path it is given through verbatim, and a label name may contain
     characters a path may not — "good first issue" is the usual one. Unreserved characters are
     left alone and every other byte, including the ones a multi-byte character is made of,
-    becomes `%XX`. -/
-private def percentEncode (s : String) : String :=
+    becomes `%XX`.
+
+    Not private: it is the whole of what keeps `good first issue` removable, which is worth a
+    test of its own. -/
+def percentEncode (s : String) : String :=
   String.join <| s.toUTF8.toList.map fun b =>
     let c := Char.ofNat b.toNat
     if c.isAlphanum || c == '-' || c == '_' || c == '.' || c == '~' then
@@ -685,11 +688,13 @@ def listRepoLabels (pat : String) (repo : Repository) : IO (List String) := do
 /-- The names of the labels currently on an issue or pull request.
 
     The issues endpoint serves pull requests too, so a pull request number works here — unlike
-    `gh issue view`, which refuses one. -/
+    `gh issue view`, which refuses one. Paginated: the endpoint serves 30 labels a page, and a
+    label past the first page would be one the caller believes the issue does not carry. -/
 def listIssueLabels (pat : String) (repo : Repository) (issueNumber : Nat) : IO (List String) := do
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
   let out ← runCmd "gh" #[
-    "api", s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels", "-q", ".[].name"
+    "api", "--paginate",
+    s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels", "-q", ".[].name"
   ] (env := env)
   return out.splitOn "\n" |>.map (·.trimAscii.toString) |>.filter (!·.isEmpty)
 
