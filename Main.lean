@@ -523,7 +523,8 @@ private def spawnServerBackground (args : Array String) : IO UInt32 := do
   }
   let _ ← launcher.stdout.readToEnd
   -- The shell's own complaints, kept because they are the only account of a failure that happens
-  -- before the redirect takes effect — an unwritable queue directory leaves no log to read.
+  -- before the redirect takes effect — an unwritable queue directory leaves no log to read, and an
+  -- unwritable log file leaves a readable one whose contents are from some earlier run.
   let launcherErr ← launcher.stderr.readToEnd
   let _ ← launcher.wait
   -- Wait up to 3 seconds for the daemon to write its own PID file
@@ -539,9 +540,12 @@ private def spawnServerBackground (args : Array String) : IO UInt32 := do
     return 0
   else
     IO.eprintln "Queue daemon failed to start. Log output:"
-    let log ← try IO.FS.readFile logFile catch _ =>
-      pure s!"(no log at {logFile}){if launcherErr.trimAscii.isEmpty then "" else s!"\n{launcherErr}"}"
+    let log ← try IO.FS.readFile logFile catch _ => pure s!"(no log at {logFile})"
     IO.eprintln log
+    -- Unconditionally, not just when the log is missing: a log file that exists but cannot be
+    -- appended to still reads back fine, so the redirect's failure would otherwise be reported as
+    -- whatever some earlier run happened to leave there.
+    unless launcherErr.trimAscii.isEmpty do IO.eprintln launcherErr.trimAscii
     return 1
 
 /-- Re-emit a string flag as the pair `orchestrad` expects, or nothing when it was not given. -/
