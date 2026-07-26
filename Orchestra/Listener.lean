@@ -442,43 +442,6 @@ def loadAllListenerConfigs : IO (Array (String × ListenerConfig)) := do
       | .ok cfg  => configs := configs.push (name, cfg)
   return configs
 
-/-- Move state left under a config's old in-file `name` to the name its file gives it.
-
-    Listeners used to be named by a `name` field inside the document, and their state — the list
-    of event ids already handled — was keyed on that. Now the file names them, so a config whose
-    two spellings disagreed would come back under a name with no state behind it and re-fire
-    every event it had already handled. This renames the state file instead, once: after the move
-    the old path no longer exists, so a later run finds nothing to do and says nothing.
-
-    The daemon runs this at start-up, before any listener polls. It is the only process that
-    writes listener state, which is why it is the only one that migrates it. -/
-def migrateListenerStateNames : IO Unit := do
-  let dir ← listenersConfigDir
-  if !(← dir.pathExists) then return
-  let stateDir ← listenerStateDir
-  for entry in ← System.FilePath.readDir dir do
-    let file := entry.fileName
-    if !file.endsWith ".json" then continue
-    let name := listenerNameOfFile file
-    if (Utils.checkConfigName "listener" name).toOption.isNone then continue
-    -- Read raw and unsubstituted: a legacy name is a plain string, and a config that no longer
-    -- parses still has state worth keeping under the right name.
-    let raw ← IO.FS.readFile entry.path
-    let some legacy := (Json.parse raw).toOption.bind (·.getObjValAs? String "name" |>.toOption)
-      | continue
-    if legacy == name then continue
-    if (Utils.checkConfigName "listener" legacy).toOption.isNone then continue
-    -- The legacy name may be a listener in its own right — `a.json` claiming to be `b` while
-    -- `b.json` sits beside it. That state belongs to `b`, and moving it would hand one
-    -- listener's processed events to another.
-    if ← (dir / s!"{legacy}.json").pathExists then continue
-    let source := stateDir / s!"{legacy}.json"
-    let dest   := stateDir / s!"{name}.json"
-    if !(← source.pathExists) || (← dest.pathExists) then continue
-    IO.FS.rename source dest
-    IO.println s!"Listener '{name}': carried state over from its old name '{legacy}'. \
-A listener is named by its file now; the config's own 'name' field is ignored."
-
 /-! ### Editing a listener config
 
 `loadListenerConfig` hands back a *parsed* config with `{{secret}}` placeholders already expanded
@@ -571,6 +534,56 @@ def saveListenerState (name : String) (state : ListenerState) : IO Unit := do
   -- toggles a listener: a truncate-then-write would let a tick land on an empty file and read it
   -- as "never checked, nothing processed", which re-queues every event the listener has seen.
   Utils.writeFileAtomically (dir / s!"{name}.json") (Lean.Json.compress (ToJson.toJson state))
+
+/-- Carry state left under a config's old in-file `name` over to the name its file gives it.
+
+    Listeners used to be named by a `name` field inside the document, and their state — the list
+    of event ids already handled — was keyed on that. Now the file names them, so a config whose
+    two spellings disagreed would come back under a name with no state behind it and re-fire
+    every event it had already handled. This carries the state across instead, once: afterwards
+    nothing is left under the old name, so a later run finds nothing to do and says nothing.
+
+    The daemon runs it at start-up, before any listener polls. It is not the only writer of
+    listener state, which is why the destination is not assumed to be free: `PUT
+    /api/v1/listeners/{name}/enabled` writes one too, and since the CLI/backend split the API can
+    be a process of its own that never runs this. A `disable` issued under the new name before
+    the daemon came up leaves a state file with no history in it, and skipping on its account
+    would abandon the listener's history for good — so that one is filled in, keeping the
+    `enabled` just set. A destination that *has* history belongs to a listener already polling
+    under this name, and is left alone. -/
+def migrateListenerStateNames : IO Unit := do
+  let dir ← listenersConfigDir
+  if !(← dir.pathExists) then return
+  let stateDir ← listenerStateDir
+  for entry in ← System.FilePath.readDir dir do
+    let file := entry.fileName
+    if !file.endsWith ".json" then continue
+    let name := listenerNameOfFile file
+    if (Utils.checkConfigName "listener" name).toOption.isNone then continue
+    -- Read raw and unsubstituted: a legacy name is a plain string, and a config that no longer
+    -- parses still has state worth keeping under the right name.
+    let raw ← IO.FS.readFile entry.path
+    let some legacy := (Json.parse raw).toOption.bind (·.getObjValAs? String "name" |>.toOption)
+      | continue
+    if legacy == name then continue
+    if (Utils.checkConfigName "listener" legacy).toOption.isNone then continue
+    -- The legacy name may be a listener in its own right — `a.json` claiming to be `b` while
+    -- `b.json` sits beside it. That state belongs to `b`, and moving it would hand one
+    -- listener's processed events to another.
+    if ← (dir / s!"{legacy}.json").pathExists then continue
+    let source := stateDir / s!"{legacy}.json"
+    let dest   := stateDir / s!"{name}.json"
+    if !(← source.pathExists) then continue
+    if ← dest.pathExists then
+      let standing ← loadListenerState name
+      if !standing.lastChecked.isEmpty || !standing.processedIds.isEmpty then continue
+      let carried ← loadListenerState legacy
+      saveListenerState name { carried with enabled := standing.enabled }
+      IO.FS.removeFile source
+    else
+      IO.FS.rename source dest
+    IO.println s!"Listener '{name}': carried state over from its old name '{legacy}'. \
+A listener is named by its file now; the config's own 'name' field is ignored."
 
 -- Template rendering
 

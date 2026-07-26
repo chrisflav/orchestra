@@ -288,6 +288,42 @@ def listenerStateFollowsTheConfigToItsFileName : Test := do
   TestM.assertEqual quiet #["17"] (msg := "and running the migration again changes nothing")
 
 @[test]
+def listenerStateSurvivesADisableIssuedBeforeTheMigrationRan : Test := do
+  -- The API writes a state file the moment someone toggles `enabled`, and since the CLI/backend
+  -- split it can be a process of its own that never runs the migration. So `orchestra listener
+  -- disable nightly` between the upgrade and the daemon's restart leaves a state file with no
+  -- history in it under exactly the name the history is about to move to. Abandoning the history
+  -- on its account is the thing this migration exists to prevent.
+  let (carried, stillDisabled, kept, keptEnabled) ← withTempStores do
+    let legacyNamed := goodListener.replace "{\"interval_seconds\"" "{\"name\": \"opus-nightly\",
+      \"interval_seconds\""
+    Listener.saveListenerConfigRaw "nightly" legacyNamed
+    Listener.saveListenerState "opus-nightly"
+      { lastChecked := "2026-07-25T00:00:00Z", processedIds := #["17"] }
+    -- Exactly what `PUT /api/v1/listeners/nightly/enabled` writes against no prior state.
+    Listener.saveListenerState "nightly" { lastChecked := "", processedIds := #[], enabled := false }
+    -- A second listener whose destination has been polling under its own name: that history is
+    -- someone else's, and the migration must not write over it.
+    let otherLegacy := goodListener.replace "{\"interval_seconds\"" "{\"name\": \"opus-morning\",
+      \"interval_seconds\""
+    Listener.saveListenerConfigRaw "morning" otherLegacy
+    Listener.saveListenerState "opus-morning" { lastChecked := "", processedIds := #["1"] }
+    Listener.saveListenerState "morning"
+      { lastChecked := "2026-07-26T00:00:00Z", processedIds := #["9"], enabled := true }
+    Listener.migrateListenerStateNames
+    let carried ← Listener.loadListenerState "nightly"
+    let kept    ← Listener.loadListenerState "morning"
+    return (carried.processedIds, carried.enabled, kept.processedIds, kept.enabled)
+  TestM.assertEqual carried #["17"]
+    (msg := "the history moved into the state file the disable had already created")
+  TestM.assertEqual stillDisabled false
+    (msg := "and the disable that created it still stands — the history came, the flag stayed")
+  TestM.assertEqual kept #["9"]
+    (msg := "a destination with history of its own belongs to a listener already polling \
+             under that name, and is left alone")
+  TestM.assertEqual keptEnabled true (msg := "including its enabled flag")
+
+@[test]
 def roleRoundTrip : Test := do
   let (before, raw, loaded, removed, after) ← withTempStores do
     let before ← Project.loadGlobalRoleRaw "implementor"
