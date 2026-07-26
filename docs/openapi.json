@@ -470,7 +470,7 @@
       "post": {
         "tags": ["roles"],
         "summary": "Create a role",
-        "description": "The body is the role document itself, and the name comes from its `name` field. Refuses to overwrite.\n\n`permissions` is checked against the tool groups the sandbox actually grants (`create_pr`, `comment`, `manage_issues`, `work_issues`, `review_issues`); a typo there is otherwise invisible until a dispatched agent finds itself without the tool it was told to use.",
+        "description": "The body is the role document itself, and the name comes from its `name` field. Refuses to overwrite.\n\n`permissions` is checked against the tool groups the sandbox actually grants (`create_pr`, `comment`, `label_issue`, `manage_issues`, `work_issues`, `review_issues`); a typo there is otherwise invisible until a dispatched agent finds itself without the tool it was told to use.",
         "operationId": "createRole",
         "requestBody": {
           "required": true,
@@ -937,7 +937,7 @@
           "name": { "type": "string", "description": "Must equal the name it is stored under." },
           "permissions": {
             "type": "array",
-            "items": { "type": "string", "enum": ["create_pr", "comment", "manage_issues", "work_issues", "review_issues"] },
+            "items": { "type": "string", "enum": ["create_pr", "comment", "label_issue", "manage_issues", "work_issues", "review_issues"] },
             "description": "Optional tool groups the agent is granted. The always-available tools are not listed here; naming them grants nothing."
           },
           "prompt_template": { "type": "string", "description": "The prompt body. Must not be empty \u2014 a role with nothing to say dispatches an agent with an empty prompt." },

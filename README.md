@@ -499,8 +499,8 @@ granted — orchestra warns about missing `$HOME`-relative paths rather than let
 ## MCP tools
 
 The agent has access to the following tools via the built-in MCP server. `health`, `refresh_token`,
-and `get_pr_comments` are always available; `create_pr`, `merge_pr` and `comment` must be enabled
-explicitly by adding them to the `tools` list in the task configuration.
+and `get_pr_comments` are always available; `create_pr`, `merge_pr`, `label_issue` and `comment`
+must be enabled explicitly by adding them to the `tools` list in the task configuration.
 
 - `health` — check that the MCP server is running
 - `refresh_token` — refresh the GitHub App installation token
@@ -514,6 +514,13 @@ explicitly by adding them to the `tools` list in the task configuration.
   back. Grant it deliberately: holding `create_pr` does not imply it, and most tasks have no
   business merging anything — a review task that should land what it approves is the case it was
   added for
+- `label_issue` — add and remove labels on an issue or pull request of the upstream repository:
+  the triage tool. Takes `issue_number` plus `add` and/or `remove`, each a list of label names.
+  Only labels the repository already defines can be applied — an unknown name is refused with the
+  list of labels that do exist, rather than creating one — and names are matched
+  case-insensitively. An addition the issue already carries and a removal it does not are reported
+  and skipped, so calling twice changes nothing. Unlike `comment`, it can label any issue, not
+  only the one the task was launched from
 - `comment` — post a comment on the issue or pull request the task was launched from.
   Supports four modes:
   - **regular comment**: provide only `body`

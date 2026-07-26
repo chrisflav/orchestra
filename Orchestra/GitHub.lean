@@ -649,13 +649,144 @@ def addIssueLabels (pat : String) (repo : Repository) (issueNumber : Nat) (label
       "--input", "-"
     ] (input := payload.compress) (env := env)
 
+/-- Percent-encode a string for use as a single URL path segment.
+
+    `gh api` passes the path it is given through verbatim, and a label name may contain
+    characters a path may not — "good first issue" is the usual one. Unreserved characters are
+    left alone and every other byte, including the ones a multi-byte character is made of,
+    becomes `%XX`.
+
+    Not private: it is the whole of what keeps `good first issue` removable, which is worth a
+    test of its own. -/
+def percentEncode (s : String) : String :=
+  String.join <| s.toUTF8.toList.map fun b =>
+    let c := Char.ofNat b.toNat
+    if c.isAlphanum || c == '-' || c == '_' || c == '.' || c == '~' then
+      c.toString
+    else
+      let digits := Nat.toDigits 16 b.toNat
+      let padded := if digits.length == 1 then '0' :: digits else digits
+      "%" ++ String.ofList (padded.map Char.toUpper)
+
 /-- Remove a label from a GitHub issue or pull request. -/
 def removeIssueLabel (pat : String) (repo : Repository) (issueNumber : Nat) (label : String) : IO Unit := do
   let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
   let _ ← runCmd "gh" #[
     "api", "--method", "DELETE",
-    s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels/{label}"
+    s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels/{percentEncode label}"
   ] (env := env)
+
+/-- The names of the labels a repository defines. The limit is far above what a project's label
+    vocabulary runs to; a repository past it would have names beyond it treated as unknown. -/
+def listRepoLabels (pat : String) (repo : Repository) : IO (List String) := do
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let out ← runCmd "gh" #[
+    "label", "list", "--repo", repo.toString, "--limit", "500", "--json", "name", "-q", ".[].name"
+  ] (env := env)
+  return out.splitOn "\n" |>.map (·.trimAscii.toString) |>.filter (!·.isEmpty)
+
+/-- The names of the labels currently on an issue or pull request.
+
+    The issues endpoint serves pull requests too, so a pull request number works here — unlike
+    `gh issue view`, which refuses one. Paginated: the endpoint serves 30 labels a page, and a
+    label past the first page would be one the caller believes the issue does not carry. -/
+def listIssueLabels (pat : String) (repo : Repository) (issueNumber : Nat) : IO (List String) := do
+  let env := if pat.isEmpty then #[] else #[("GH_TOKEN", some pat)]
+  let out ← runCmd "gh" #[
+    "api", "--paginate",
+    s!"/repos/{repo.owner}/{repo.name}/issues/{issueNumber}/labels", "-q", ".[].name"
+  ] (env := env)
+  return out.splitOn "\n" |>.map (·.trimAscii.toString) |>.filter (!·.isEmpty)
+
+/-- What relabelling an issue actually changes, once the labels it already carries are taken
+    into account. `add` and `remove` are the calls that will be made; the other two fields are
+    the requests that turned out to be nothing to do, kept so they can be reported rather than
+    silently dropped. -/
+structure LabelChange where
+  /-- Labels to add, spelled as the repository spells them. None is already on the issue. -/
+  add : List String := []
+  /-- Labels to remove, spelled as the repository spells them. All are on the issue. -/
+  remove : List String := []
+  /-- Requested additions the issue already carried. -/
+  alreadyPresent : List String := []
+  /-- Requested removals the issue did not carry. -/
+  notPresent : List String := []
+deriving Repr, Inhabited, DecidableEq
+
+private def dedup (xs : List String) : List String :=
+  xs.foldl (fun acc x => if acc.contains x then acc else acc ++ [x]) []
+
+/-- Work out which label calls a relabelling request actually needs, or why it cannot be served.
+    `known` is the repository's labels, `current` the ones already on the issue.
+
+    Names are matched case-insensitively and answered in the repository's spelling, because an
+    agent asking for `T-Feature` means the `t-feature` the repository defines and GitHub would
+    create a second label rather than say so.
+
+    A name the repository does not define is an error, not a label to create: the point of
+    triage is to sort into the vocabulary a project already has, and `create_pr`'s label
+    auto-creation exists for labels the *configuration* names, not ones an agent invented. Pure,
+    so the whole mapping is tested without a network. -/
+def planLabelChange (known current add remove : List String) : Except String LabelChange :=
+  let canon? (name : String) : Option String :=
+    known.find? (·.toLower == name.toLower)
+  let unknown := dedup ((add ++ remove).filter (canon? · |>.isNone))
+  if !unknown.isEmpty then
+    let names := String.intercalate ", " unknown
+    let vocabulary :=
+      if known.isEmpty then "the repository defines no labels at all"
+      else s!"the repository defines: {String.intercalate ", " known}"
+    .error s!"no such label: {names} — {vocabulary}"
+  else
+    let canonAdd := dedup (add.filterMap canon?)
+    let canonRemove := dedup (remove.filterMap canon?)
+    let contradictory := canonAdd.filter canonRemove.contains
+    if !contradictory.isEmpty then
+      .error s!"asked to both add and remove {String.intercalate ", " contradictory}"
+    else
+      let present (label : String) : Bool := current.any (·.toLower == label.toLower)
+      .ok {
+        add            := canonAdd.filter (!present ·)
+        remove         := canonRemove.filter present
+        alreadyPresent := canonAdd.filter present
+        notPresent     := canonRemove.filter (!present ·)
+      }
+
+/-- One line saying what the relabelling did, for whoever asked for it. `subject` names the
+    issue, e.g. `owner/repo#12`. -/
+def LabelChange.summary (change : LabelChange) (subject : String) : String :=
+  let added := String.intercalate ", " change.add
+  let removed := String.intercalate ", " change.remove
+  let had := String.intercalate ", " change.alreadyPresent
+  let lacked := String.intercalate ", " change.notPresent
+  let done :=
+    (if change.add.isEmpty then [] else [s!"added {added}"]) ++
+    (if change.remove.isEmpty then [] else [s!"removed {removed}"])
+  let notes :=
+    (if change.alreadyPresent.isEmpty then [] else [s!"already had {had}"]) ++
+    (if change.notPresent.isEmpty then [] else [s!"did not have {lacked}"])
+  let head :=
+    if done.isEmpty then s!"{subject}: nothing to change"
+    else s!"{subject}: {String.intercalate "; " done}"
+  if notes.isEmpty then head else s!"{head} (it {String.intercalate "; " notes})"
+
+/-- Add and remove labels on an issue or pull request of `repo`, reporting what changed.
+
+    Both label sets are resolved against the repository's own labels and against the ones the
+    issue already carries before anything is written — see `planLabelChange`. A removal the
+    issue does not need is skipped rather than sent, since GitHub answers a `DELETE` for an
+    absent label with a 404 that would fail the whole call over a label that is already gone. -/
+def setIssueLabels (pat : String) (repo : Repository) (issueNumber : Nat)
+    (add remove : List String) : IO LabelChange := do
+  let known ← listRepoLabels pat repo
+  let current ← listIssueLabels pat repo issueNumber
+  match planLabelChange known current add remove with
+  | .error why => throw (.userError s!"{repo}#{issueNumber} was not relabelled: {why}")
+  | .ok change =>
+    addIssueLabels pat repo issueNumber change.add
+    for label in change.remove do
+      removeIssueLabel pat repo issueNumber label
+    return change
 
 /-- Post a comment on an issue or pull request. -/
 def createIssueComment (pat : String) (upstream : Repository) (issueNumber : Nat) (body : String) : IO String := do

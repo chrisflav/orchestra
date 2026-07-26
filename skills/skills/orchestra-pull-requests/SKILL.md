@@ -10,8 +10,8 @@ Everything that touches a pull request or a GitHub issue goes through orchestra'
 ## Never use `gh` for this
 
 Do **not** run `gh pr create`, `gh pr merge`, `gh pr comment`, `gh pr review`, `gh issue create`,
-`gh issue comment`, `gh api`, or any other `gh` command that reads or writes pull requests and
-issues. Do not use `curl` against `api.github.com` either.
+`gh issue comment`, `gh issue edit`, `gh label`, `gh api`, or any other `gh` command that reads or
+writes pull requests and issues. Do not use `curl` against `api.github.com` either.
 
 `gh` is authenticated in the sandbox for **git transport only** — cloning, fetching, pushing.
 Using it for PRs or issues bypasses the credential the task was given:
@@ -59,6 +59,26 @@ Most tasks are not granted this tool, and a refusal means this task is not the o
 whether the pull request lands. When a merge is refused because the pull request is already
 merged, closed, still a draft, conflicting, or blocked by branch protection, the tool says which:
 report that back instead of calling again, since none of those clear up by retrying.
+
+## Labelling (triage)
+
+```
+label_issue(issue_number: 42, add: ["t-bug"])
+label_issue(issue_number: 42, add: ["t-bug"], remove: ["needs-triage"])
+```
+
+- `issue_number` (required) — an issue **or** pull request on the upstream repository; they share
+  one numbering. This is the one tool here that is not restricted to the issue the task was
+  launched from.
+- `add` / `remove` — lists of label names. Give at least one label between them.
+
+Only labels the repository already defines can be applied. An unknown name is refused, and the
+refusal lists the labels that do exist — pick one of those rather than asking again; the tool
+will not create a label for you. Spelling is matched case-insensitively, so `T-Bug` finds
+`t-bug`.
+
+Adding a label the issue already has, or removing one it does not, is reported and skipped
+rather than failing, so a repeated call is harmless.
 
 ## Commenting
 
