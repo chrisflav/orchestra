@@ -235,16 +235,20 @@ def loadGlobalRoleRaw (name : String) : IO (Option String) := do
 
 /-- Every permission token a role's `permissions` may name.
 
-    These are the *optional* tool groups: `create_pr` and `comment` are gated in
+    These are the *optional* tool groups: `create_pr`, `comment` and `label_issue` are gated in
     `Orchestra.Server`, the three issue groups in `Orchestra.Project.Tools`. The always-available
     tools (health, refresh_token, get_pr_comments) are not listed because naming them grants
     nothing — they are already there.
+
+    `merge_pr` is deliberately absent: a role is a template dispatched at whatever issue comes
+    along, and landing a pull request is not something to grant a whole class of tasks. A task
+    file may still ask for it by name.
 
     Kept here, beside the field that holds them, so that validating a role does not depend on the
     MCP server's module: the CLI validates before sending and the API validates before storing,
     and neither should have to link the tool implementations to do it. -/
 def Role.knownPermissions : List String :=
-  ["create_pr", "comment", "manage_issues", "work_issues", "review_issues"]
+  ["create_pr", "comment", "label_issue", "manage_issues", "work_issues", "review_issues"]
 
 /-- Whether `raw` is a role that can be stored under `name`, returning the role it describes.
 

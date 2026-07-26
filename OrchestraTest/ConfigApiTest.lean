@@ -136,9 +136,14 @@ def validateRole_rejectsWhatWouldDispatchAnAgentWrong : Test := do
 def roleKnownPermissions_isTheOptionalToolSet : Test := do
   -- Pinned because the check above is only as good as this list: a tool group added to the MCP
   -- server and not added here is one no role may name.
-  for p in ["create_pr", "comment", "manage_issues", "work_issues", "review_issues"] do
+  for p in ["create_pr", "comment", "label_issue", "manage_issues", "work_issues",
+            "review_issues"] do
     TestM.assert (Project.Role.knownPermissions.contains p) (msg := s!"{p} is grantable")
-  TestM.assertEqual Project.Role.knownPermissions.length 5
+  -- `merge_pr` is not here on purpose: a role dispatched at whatever issue comes along is not
+  -- the thing to hand a merge button to. Only a task file may name it.
+  TestM.assert (!Project.Role.knownPermissions.contains "merge_pr")
+    (msg := "merge_pr is not grantable by role")
+  TestM.assertEqual Project.Role.knownPermissions.length 6
     (msg := "no permission has been added without deciding what it means for a role")
 
 /-! ## Skill validation

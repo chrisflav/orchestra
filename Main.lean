@@ -1337,7 +1337,8 @@ private def dashboardCmd : Cmd := `[Cli|
 
 -- All optional tool permission tokens recognised by --tools.
 private def allOptionalTools : List String :=
-  ["create_pr", "merge_pr", "comment", "manage_issues", "work_issues", "review_issues"]
+  ["create_pr", "merge_pr", "label_issue", "comment", "manage_issues", "work_issues",
+   "review_issues"]
 
 private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let upstreamStr := p.flag! "upstream" |>.as! String

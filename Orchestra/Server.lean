@@ -17,8 +17,8 @@ structure State where
   fork : Repository
   /-- Optional tools enabled for this run.
       Always-available tools (health, refresh_token, get_pr_comments) are never in this list.
-      The names this server itself understands are `"create_pr"`, `"comment"` and `"merge_pr"`
-      (see `optionalToolDefs`); the rest are the permission groups of
+      The names this server itself understands are `"create_pr"`, `"merge_pr"`, `"label_issue"`
+      and `"comment"` (see `optionalToolDefs`); the rest are the permission groups of
       `Orchestra.Project.Tools`. -/
   allowedTools : List String
   appId : Nat
@@ -187,6 +187,40 @@ private def optionalToolDefs : List (String × Json) := [
       ("required", .arr #["pr_number"])
     ])
   ]),
+  ("label_issue", Json.mkObj [
+    ("name", "label_issue"),
+    ("description",
+      "Add and remove labels on an issue or pull request of the upstream repository — the " ++
+      "triage tool. Give the number and at least one label in add or remove; both may be " ++
+      "given at once.\n\n" ++
+      "Only labels the repository already defines can be applied: an unknown name is refused " ++
+      "with the list of labels that do exist, rather than inventing one. Names are matched " ++
+      "case-insensitively. An addition the issue already carries and a removal it does not are " ++
+      "reported and skipped, so a repeated call changes nothing.\n\n" ++
+      "Any issue or pull request may be labelled, not only the one this task was launched " ++
+      "from — unlike comment."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("issue_number", Json.mkObj [
+          ("type", "integer"),
+          ("description",
+            "Issue or pull request number on the upstream repository (they share one numbering).")
+        ]),
+        ("add", Json.mkObj [
+          ("type", "array"),
+          ("items", Json.mkObj [("type", "string")]),
+          ("description", "Labels to add. Must already exist on the repository.")
+        ]),
+        ("remove", Json.mkObj [
+          ("type", "array"),
+          ("items", Json.mkObj [("type", "string")]),
+          ("description", "Labels to remove.")
+        ])
+      ]),
+      ("required", .arr #["issue_number"])
+    ])
+  ]),
   ("comment", Json.mkObj [
     ("name", "comment"),
     ("description",
@@ -336,6 +370,8 @@ inductive ToolCall where
              (target : PrTarget)
   /-- Merge a pull request on the upstream repository. -/
   | mergePr (prNumber : Nat) (method : GitHub.MergeMethod) (deleteBranch : Bool)
+  /-- Add and remove labels on an issue or pull request of the upstream repository. -/
+  | labelIssue (issueNumber : Nat) (add : List String) (remove : List String)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
   | comment (action : CommentAction)
   | getTaskInput
@@ -354,6 +390,24 @@ inductive Request where
   | unknown (id : Json) (method : String)
 
 -- Parsing
+
+/-- Read one of `label_issue`'s label lists. An absent list is empty; anything that is not an
+    array of non-empty strings is an error rather than a silently dropped label, since a triage
+    agent told its call succeeded would report a label it never applied. -/
+private def parseLabelList (args : Json) (key : String) : Except String (List String) :=
+  match args.getObjVal? key |>.toOption with
+  | none => .ok []
+  | some j =>
+    match j.getArr? |>.toOption with
+    | none => .error s!"'{key}' must be an array of label names"
+    | some items =>
+      items.toList.foldlM (init := []) fun acc item =>
+        match item.getStr? |>.toOption with
+        | none => .error s!"'{key}' must contain only strings"
+        | some s =>
+          let trimmed := s.trimAscii.toString
+          if trimmed.isEmpty then .error s!"'{key}' must not contain an empty label name"
+          else .ok (acc ++ [trimmed])
 
 def parseToolCall (name : String) (args : Json) : ToolCall :=
   match name with
@@ -393,6 +447,24 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
           | some method =>
             let deleteBranch := args.getObjValAs? Bool "delete_branch" |>.toOption |>.getD true
             .mergePr prNumInt.toNat method deleteBranch
+  | "label_issue" =>
+    match args.getObjVal? "issue_number" |>.toOption with
+    | none => .parseError "missing required argument: issue_number"
+    | some numJson =>
+      match numJson.getInt? |>.toOption with
+      | none => .parseError "issue_number must be an integer"
+      | some numInt =>
+        if numInt <= 0 then .parseError "issue_number must be a positive integer"
+        else
+          match parseLabelList args "add" with
+          | .error e => .parseError e
+          | .ok add =>
+            match parseLabelList args "remove" with
+            | .error e => .parseError e
+            | .ok remove =>
+              if add.isEmpty && remove.isEmpty then
+                .parseError "nothing to do: give at least one label in 'add' or 'remove'"
+              else .labelIssue numInt.toNat add remove
   | "get_pr_comments" =>
     match args.getObjVal? "pr_number" |>.toOption with
     | none => .parseError "missing required argument: pr_number"
@@ -553,6 +625,25 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       return toolContent result
     catch e =>
       log s!"tool merge_pr: error: {e}"
+      return toolContent (toString e) (isError := true)
+  | .labelIssue issueNumber add remove =>
+    if !state.allowedTools.contains "label_issue" then
+      log "tool label_issue: denied (not in allowed tools)"
+      return toolContent "labelling issues is not enabled for this task" (isError := true)
+    if state.pat.isEmpty then
+      log "tool label_issue: error: PAT not configured"
+      return toolContent
+        "github.pat not set in config (required to label on the upstream repository)"
+        (isError := true)
+    log s!"tool label_issue: {state.upstream}#{issueNumber} \
+      add=[{String.intercalate ", " add}] remove=[{String.intercalate ", " remove}]"
+    try
+      let change ← GitHub.setIssueLabels state.pat state.upstream issueNumber add remove
+      let summary := change.summary s!"{state.upstream}#{issueNumber}"
+      log s!"tool label_issue: ok: {summary}"
+      return toolContent summary
+    catch e =>
+      log s!"tool label_issue: error: {e}"
       return toolContent (toString e) (isError := true)
   | .getPrComments prNumber unresolvedOnly excludeOutdated =>
     log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
