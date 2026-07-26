@@ -519,9 +519,12 @@ private def spawnServerBackground (args : Array String) : IO UInt32 := do
     args := #["-c", shellCmd]
     stdin := .null
     stdout := .piped
-    stderr := .null
+    stderr := .piped
   }
   let _ ← launcher.stdout.readToEnd
+  -- The shell's own complaints, kept because they are the only account of a failure that happens
+  -- before the redirect takes effect — an unwritable queue directory leaves no log to read.
+  let launcherErr ← launcher.stderr.readToEnd
   let _ ← launcher.wait
   -- Wait up to 3 seconds for the daemon to write its own PID file
   let rec waitForDaemon : Nat → IO Bool
@@ -536,7 +539,8 @@ private def spawnServerBackground (args : Array String) : IO UInt32 := do
     return 0
   else
     IO.eprintln "Queue daemon failed to start. Log output:"
-    let log ← try IO.FS.readFile logFile catch _ => pure "(log file not found)"
+    let log ← try IO.FS.readFile logFile catch _ =>
+      pure s!"(no log at {logFile}){if launcherErr.trimAscii.isEmpty then "" else s!"\n{launcherErr}"}"
     IO.eprintln log
     return 1
 

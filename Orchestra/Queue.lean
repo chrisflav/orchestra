@@ -493,6 +493,13 @@ def ownPid : IO UInt32 := do
   | pid :: _ => return (pid.toNat?.getD 0).toUInt32
   | _        => return 0
 
+/-- Process names a live daemon can be running under.
+
+    `orchestrad` is the backend binary that holds the queue; `orchestra` is there because a daemon
+    started before the CLI/backend split still runs under the old name, and an upgraded client must
+    not conclude that such a daemon is dead and start a second one beside it. -/
+private def daemonProcessNames : Array String := #["orchestrad", "orchestra"]
+
 /-- Return true if a daemon process with the stored PID is still alive.
 
     "The PID is in `/proc`" is not sufficient on its own, for two reasons:
@@ -515,7 +522,7 @@ def daemonRunning : IO Bool := do
     let comm ← try some <$> IO.FS.readFile s!"/proc/{pid}/comm" catch _ => pure none
     match comm with
     | none => return true
-    | some c => return c.trimAscii.toString == "orchestra"
+    | some c => return daemonProcessNames.contains c.trimAscii.toString
 
 -- Cascade cancellation
 
