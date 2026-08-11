@@ -533,12 +533,22 @@ structure DeployConfig where
   /-- Path to a kubeconfig for the previews cluster. Held by the daemon and never by an agent:
       this is the credential that makes the whole feature safe to expose as a tool. -/
   kubeconfig : String
-  /-- Namespace previews are created in. Its quota, limit range and network policies are set up
-      by `container/previews-vm/modules/k3s.nix`; nothing in orchestra creates or checks them. -/
+  /-- Context to select within that kubeconfig. `none` uses its current-context, which is right
+      for a kubeconfig written for this one job and wrong for a multi-cluster one — there, the
+      cluster orchestra deploys to would otherwise be whichever `kubectl` was last pointed at. -/
+  context : Option String := none
+  /-- Namespace previews are created in. Its quota, limit range, RBAC and network policies are
+      set up by `container/previews-vm/modules/k3s.nix`; nothing in orchestra creates or checks
+      them. -/
   ns : String := "previews"
   /-- Deployments are reachable at `<name>.<base_domain>`, which needs a wildcard DNS record
       pointing at the cluster's ingress. -/
   baseDomain : String
+  /-- `ingressClassName` on every Ingress created. `none` leaves the field off and relies on the
+      cluster having a default ingress controller — true of k3s with Traefik, and quietly false
+      on a cluster with several classes and no default, where nothing claims the Ingress and the
+      preview answers nothing at a URL that was reported as ready. -/
+  ingressClass : Option String := none
   /-- RuntimeClass every preview pod is scheduled with. Empty disables it, which means previews
       share the node's kernel — sensible only where that is someone else's problem, and never
       for compose files nobody has read. -/
@@ -563,6 +573,8 @@ instance : FromJson DeployConfig where
     -- it answers on.
     let kubeconfig ← j.getObjValAs? String "kubeconfig"
     let baseDomain ← j.getObjValAs? String "base_domain"
+    let context := j.getObjValAs? String "context" |>.toOption
+    let ingressClass := j.getObjValAs? String "ingress_class" |>.toOption
     let ns := j.getObjValAs? String "namespace" |>.toOption |>.getD "previews"
     let runtimeClass := j.getObjValAs? String "runtime_class" |>.toOption |>.getD "kata"
     let image := j.getObjValAs? String "image" |>.toOption |>.getD "docker:28-dind"
@@ -571,8 +583,8 @@ instance : FromJson DeployConfig where
     let cpuLimit := j.getObjValAs? String "cpu_limit" |>.toOption |>.getD "2"
     let memoryLimit := j.getObjValAs? String "memory_limit" |>.toOption |>.getD "4Gi"
     let kubectl := j.getObjValAs? String "kubectl" |>.toOption |>.getD "kubectl"
-    return { kubeconfig, ns, baseDomain, runtimeClass, image, ttlMinutes, buildTimeoutMinutes,
-             cpuLimit, memoryLimit, kubectl }
+    return { kubeconfig, context, ns, baseDomain, ingressClass, runtimeClass, image, ttlMinutes,
+             buildTimeoutMinutes, cpuLimit, memoryLimit, kubectl }
 
 structure AppConfig where
   appId : Nat

@@ -1070,12 +1070,49 @@ Containers, a `previews` namespace with a quota, and network policies that let a
 the internet but not the daemon, the LAN, or another preview. Its README covers the build, the
 nested-virtualisation prerequisite, and how to check the isolation is real rather than assumed.
 
+### talking to the cluster
+
+There is **no orchestra-specific agent on the previews side**. The protocol is the Kubernetes
+API: orchestra shells out to `kubectl` and the whole surface is `apply`, `wait`, `exec`, `cp`,
+`get`, and a `delete` by label. `exec` and `cp` stream through the API server to the kubelet, so
+port 6443 is the only thing the daemon needs — no SSH, no docker socket, no second service.
+
+That makes the target interchangeable. Any cluster works if it has a `kata` RuntimeClass, an
+ingress controller, and a sandbox image carrying `sh`, `tar` and `timeout`; the VM in
+`container/previews-vm/` is one such cluster, not a requirement. `kubectl` ships in orchestra's
+Docker image for this reason.
+
+**Use a scoped credential, not `k3s.yaml`.** The kubeconfig k3s writes is
+`O=system:masters, CN=system:admin` — cluster-admin, and `exec` into any pod on the node. The
+previews VM therefore also creates a `orchestra-deployer` ServiceAccount whose namespaced Role
+grants exactly the verbs above and nothing else, plus a helper that emits a kubeconfig for it:
+
+```
+incus exec nixvm -- previews-kubeconfig https://previews.example.com:6443 > previews.kubeconfig
+```
+
+That credential can list and destroy previews and exec into them, and cannot read a node, a
+namespace, or a secret outside `previews`. If it leaks, what it costs you is previews, which are
+disposable by construction.
+
+Exposing the API server to a network is otherwise unremarkable — it is mutually-authenticated
+TLS, which is how every hosted Kubernetes works. Three things to get right when you do:
+
+- put `previews.k3s.tlsSans` on the name you will reach it by, or certificate verification fails;
+- prefer a private path (WireGuard, Tailscale, a source-IP allowlist) over a public endpoint;
+- **add the new endpoint to `previews.k3s.extraEgressExcept`.** The egress policy carves out
+  RFC1918, so while the API server is on a private address a preview cannot reach it. Move it to
+  a public one and it falls back inside `0.0.0.0/0` — reachable from inside the sandboxes it
+  schedules. Unauthenticated, but not a door to leave open.
+
 Point orchestra at it with a `deploy` section in `config.json`:
 
 ```json
 "deploy": {
   "kubeconfig": "/etc/orchestra/previews.kubeconfig",
+  "context": "previews",
   "base_domain": "previews.example.com",
+  "ingress_class": "traefik",
   "namespace": "previews",
   "runtime_class": "kata",
   "image": "docker:28-dind",
@@ -1091,6 +1128,11 @@ Only `kubeconfig` and `base_domain` are required; `base_domain` needs a wildcard
 pointing at the cluster's ingress. Without the section the feature is off and the tools say so
 rather than half-working. The kubeconfig is held by the daemon and never reaches an agent — it is
 the credential that makes exposing this as a tool safe.
+
+`context` matters only for a kubeconfig holding more than one cluster, where the current-context
+would otherwise decide where previews land. `ingress_class` matters on a cluster with several
+ingress controllers and no default: leave it unset and nothing claims the Ingress, which looks
+like a preview that came up healthy and answers nothing.
 
 `memory_limit` is charged to the namespace quota as a *request* as well as a limit — Kubernetes
 copies limits into requests when requests are absent, and a Kata sandbox holds its guest's RAM for

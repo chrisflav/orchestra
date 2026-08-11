@@ -133,10 +133,38 @@ go with it.
 
 ## What drives it
 
-`Orchestra.Deploy`, over the API server, holding a kubeconfig the agent never sees — see
-[preview deployments](../../README.md#preview-deployments) in the main README for the `deploy`
-config section, the tools and the CLI. Deployments are created with an expiry annotation and the
-daemon sweeps what has passed it; `orchestra deploy gc` does the same by hand.
+`Orchestra.Deploy`, over the API server and nothing else — there is no orchestra agent on this
+box. See [preview deployments](../../README.md#preview-deployments) in the main README for the
+`deploy` config section, the tools and the CLI. Deployments are created with an expiry annotation
+and the daemon sweeps what has passed it; `orchestra deploy gc` does the same by hand.
+
+### the credential orchestra should hold
+
+Not `/etc/rancher/k3s/k3s.yaml`. That one is `O=system:masters, CN=system:admin` — cluster-admin,
+and `exec` into any pod on the node. Fine to have here, wrong to put on the machine holding
+orchestra's other credentials, and worse to put on a network.
+
+This configuration creates an `orchestra-deployer` ServiceAccount in the `previews` namespace
+whose Role grants exactly what the deployer issues — get/list/watch/create/patch/delete on pods,
+services and ingresses, and `create` on `pods/exec` — and a non-expiring token for it. Emit a
+kubeconfig for that account with:
+
+```sh
+incus exec nixvm -- previews-kubeconfig https://10.0.100.50:6443 > previews.kubeconfig
+```
+
+Check what you got:
+
+```sh
+kubectl --kubeconfig previews.kubeconfig auth whoami
+# system:serviceaccount:previews:orchestra-deployer
+kubectl --kubeconfig previews.kubeconfig get nodes
+# Error from server (Forbidden)
+```
+
+Reaching it from another machine also needs that address in `previews.k3s.tlsSans`, and — if the
+address is public rather than private — in `previews.k3s.extraEgressExcept`, or previews can
+reach the API server that schedules them.
 
 ## What is deliberately not here
 

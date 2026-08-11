@@ -202,6 +202,23 @@ def ingressRoutesTheHostname : Test := do
   TestM.assertEqual host (some s!"{name}.previews.example.com")
 
 @[test]
+def ingressClassIsOmittedUnlessAsked : Test := do
+  let ing := ingressManifest cfg (deploymentName (spec "org" "repo" "main")) "2026-01-01T00:00:00Z"
+  let class? := (do (← ing.getObjVal? "spec").getObjValAs? String "ingressClassName") |>.toOption
+  -- Omitted means "whatever the default controller is", which is right on k3s and the only
+  -- sensible guess elsewhere. Naming a class that does not exist would strand the Ingress.
+  TestM.assertEqual class? none
+
+@[test]
+def ingressClassIsSetWhenConfigured : Test := do
+  let cfg' := { cfg with ingressClass := some "traefik" }
+  let ing := ingressManifest cfg' (deploymentName (spec "org" "repo" "main")) "2026-01-01T00:00:00Z"
+  let class? := (do (← ing.getObjVal? "spec").getObjValAs? String "ingressClassName") |>.toOption
+  -- On a cluster with several ingress classes and no default, an Ingress nobody claims is a
+  -- preview that reports ready and answers nothing.
+  TestM.assertEqual class? (some "traefik")
+
+@[test]
 def serviceTargetsTheDeclaredPort : Test := do
   let s := { spec "org" "repo" "main" with port := 8080 }
   let svc := serviceManifest cfg s (deploymentName s) "2026-01-01T00:00:00Z"
@@ -242,6 +259,8 @@ def configParsesWithDefaults : Test := do
     TestM.assertEqual c.ns "previews"
     TestM.assertEqual c.runtimeClass "kata" (msg := "isolation must not be off by default")
     TestM.assertEqual c.ttlMinutes 240
+    TestM.assertEqual c.context none (msg := "an unset context means the kubeconfig's own")
+    TestM.assertEqual c.ingressClass none
 
 @[test]
 def configOverridesDefaults : Test := do
@@ -254,6 +273,18 @@ def configOverridesDefaults : Test := do
     TestM.assertEqual c.runtimeClass ""
     TestM.assertEqual c.ttlMinutes 30
     TestM.assertEqual c.memoryLimit "8Gi"
+
+@[test]
+def configTakesAContextAndIngressClass : Test := do
+  let raw := r#"{"kubeconfig": "/k", "base_domain": "d", "context": "previews",
+                 "ingress_class": "traefik"}"#
+  match Json.parse raw >>= FromJson.fromJson? (α := DeployConfig) with
+  | .error e => TestM.fail s!"deploy config parse: {e}"
+  | .ok c =>
+    -- Both exist for the same reason: pointing orchestra at a cluster it does not own, where
+    -- the kubeconfig holds more than one context and the ingress controller is not the default.
+    TestM.assertEqual c.context (some "previews")
+    TestM.assertEqual c.ingressClass (some "traefik")
 
 @[test]
 def configNeedsAClusterAndADomain : Test := do

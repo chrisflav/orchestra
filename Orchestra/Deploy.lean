@@ -266,7 +266,11 @@ def ingressManifest (cfg : DeployConfig) (name : String) (expiresAt : String) : 
     [ ("apiVersion", .str "networking.k8s.io/v1")
     , ("kind", .str "Ingress")
     , ("metadata", objectMeta cfg name [(expiresAnnotation, expiresAt)])
-    , ("spec", Json.mkObj
+    , ("spec", Json.mkObj <|
+        (match cfg.ingressClass with
+         | some c => [("ingressClassName", Json.str c)]
+         | none => [])
+        ++
         [ ("rules", .arr #[Json.mkObj
             [ ("host", .str s!"{name}.{cfg.baseDomain}")
             , ("http", Json.mkObj
@@ -343,7 +347,12 @@ private def failure (what : String) (r : CmdResult) : String :=
 
 private def kubectl (cfg : DeployConfig) (args : Array String) (input : Option String := none) :
     IO CmdResult :=
-  run cfg.kubectl (#["--kubeconfig", cfg.kubeconfig, "-n", cfg.ns] ++ args) input
+  -- `--context` only when configured: naming one that a single-cluster kubeconfig does not
+  -- contain is an error, so an unset context has to mean "whatever this file says" rather than
+  -- a guess at a name.
+  let base := #["--kubeconfig", cfg.kubeconfig, "-n", cfg.ns]
+    ++ (match cfg.context with | some c => #["--context", c] | none => #[])
+  run cfg.kubectl (base ++ args) input
 
 /-- `kubectl exec` into a deployment's pod. Every command that touches the compose project goes
     through here, which is the reason the pod needs no network path back to us.

@@ -38,6 +38,57 @@ let
   '';
 
   containerdDir = "/var/lib/rancher/k3s/agent/etc/containerd";
+
+  serviceAccount = "orchestra-deployer";
+  tokenSecret = "orchestra-deployer-token";
+
+  # Emits a kubeconfig for the scoped ServiceAccount, which is the credential orchestra should
+  # hold. The one k3s writes at /etc/rancher/k3s/k3s.yaml is `O=system:masters, CN=system:admin`
+  # — cluster-admin, and `exec` into any pod on the node. That is an acceptable thing to have on
+  # this box and an unacceptable thing to put on the machine holding orchestra's other
+  # credentials, let alone across a network.
+  #
+  # Run it here, copy the output to the orchestra host, point `deploy.kubeconfig` at it:
+  #
+  #     incus exec nixvm -- previews-kubeconfig https://previews.example.com:6443 > previews.kubeconfig
+  previewsKubeconfig = pkgs.writeShellApplication {
+    name = "previews-kubeconfig";
+    runtimeInputs = [ config.services.k3s.package ];
+    text = ''
+      server="''${1:-${cfg.defaultApiServer}}"
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+      ca=$(k3s kubectl -n ${cfg.namespace} get secret ${tokenSecret} -o jsonpath='{.data.ca\.crt}')
+      token=$(k3s kubectl -n ${cfg.namespace} get secret ${tokenSecret} \
+        -o jsonpath='{.data.token}' | base64 -d)
+
+      if [ -z "$ca" ] || [ -z "$token" ]; then
+        echo "the ${tokenSecret} secret has no token yet — is k3s finished starting?" >&2
+        exit 1
+      fi
+
+      cat <<EOF
+      apiVersion: v1
+      kind: Config
+      clusters:
+        - name: previews
+          cluster:
+            server: $server
+            certificate-authority-data: $ca
+      users:
+        - name: ${serviceAccount}
+          user:
+            token: $token
+      contexts:
+        - name: previews
+          context:
+            cluster: previews
+            user: ${serviceAccount}
+            namespace: ${cfg.namespace}
+      current-context: previews
+      EOF
+    '';
+  };
 in
 {
   options.previews.k3s = {
@@ -55,6 +106,35 @@ in
         Extra names to put in the API server certificate. Needed for whatever address the
         deployer reaches the cluster on — without it, a kubeconfig pointing at anything other
         than this VM's own IP fails certificate verification.
+      '';
+    };
+
+    defaultApiServer = lib.mkOption {
+      type = lib.types.str;
+      default =
+        let host = if cfg.tlsSans == [ ] then config.networking.hostName else builtins.head cfg.tlsSans;
+        in "https://${host}:6443";
+      defaultText = lib.literalExpression "\"https://\${first tlsSan or hostname}:6443\"";
+      description = ''
+        The API server address {command}`previews-kubeconfig` writes into the kubeconfig it emits
+        when called without an argument. It has to be an address the *deployer* can reach and
+        that the certificate covers, which is why it follows {option}`tlsSans`.
+      '';
+    };
+
+    extraEgressExcept = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "203.0.113.10/32" ];
+      description = ''
+        Extra CIDRs to subtract from what a preview may reach, on top of the private ranges.
+
+        Needed exactly once, and it is easy to miss: the egress policy carves out RFC1918, so
+        while the API server is on a private address a preview cannot reach it. Move that
+        endpoint to a public address — which is what exposing the cluster to an external
+        orchestra means — and it falls back inside `0.0.0.0/0`, reachable from inside the very
+        sandboxes it schedules. Unauthenticated, but not a door worth leaving open. Put the
+        public address here at the same time as exposing it.
       '';
     };
 
@@ -122,6 +202,85 @@ in
             spec.hard = cfg.quota;
           }
 
+          # The credential orchestra holds, and the whole of what it may do.
+          #
+          # Everything below is namespaced: no cluster role, nothing about nodes, nothing outside
+          # this namespace. The verbs are exactly what `Orchestra.Deploy` issues — `apply` needs
+          # get/create/patch, `wait` needs watch, teardown deletes by label, and `pods/exec` is
+          # what carries `kubectl cp` as well as every command run inside a sandbox. It ends at
+          # `exec` into a preview, which is a thing the holder can already do by deploying one.
+          {
+            apiVersion = "v1";
+            kind = "ServiceAccount";
+            metadata = {
+              name = serviceAccount;
+              namespace = cfg.namespace;
+            };
+          }
+
+          {
+            apiVersion = "rbac.authorization.k8s.io/v1";
+            kind = "Role";
+            metadata = {
+              name = serviceAccount;
+              namespace = cfg.namespace;
+            };
+            rules = [
+              {
+                apiGroups = [ "" ];
+                resources = [ "pods" "services" ];
+                verbs = [ "get" "list" "watch" "create" "patch" "delete" ];
+              }
+              {
+                apiGroups = [ "" ];
+                resources = [ "pods/exec" ];
+                verbs = [ "create" ];
+              }
+              {
+                apiGroups = [ "networking.k8s.io" ];
+                resources = [ "ingresses" ];
+                verbs = [ "get" "list" "watch" "create" "patch" "delete" ];
+              }
+            ];
+          }
+
+          {
+            apiVersion = "rbac.authorization.k8s.io/v1";
+            kind = "RoleBinding";
+            metadata = {
+              name = serviceAccount;
+              namespace = cfg.namespace;
+            };
+            roleRef = {
+              apiGroup = "rbac.authorization.k8s.io";
+              kind = "Role";
+              name = serviceAccount;
+            };
+            subjects = [
+              {
+                kind = "ServiceAccount";
+                name = serviceAccount;
+                namespace = cfg.namespace;
+              }
+            ];
+          }
+
+          # A token that does not expire, requested explicitly because Kubernetes stopped minting
+          # them for ServiceAccounts in 1.24. The alternative — a projected, bound token — rotates,
+          # and orchestra reads a kubeconfig file once and would not notice. A long-lived
+          # credential scoped to this namespace is the better of the two failure modes: what it
+          # can do if it leaks is destroy previews, which are disposable by construction.
+          {
+            apiVersion = "v1";
+            kind = "Secret";
+            metadata = {
+              name = tokenSecret;
+              namespace = cfg.namespace;
+              annotations."kubernetes.io/service-account.name" = serviceAccount;
+            };
+            type = "kubernetes.io/service-account-token";
+          }
+
           # Every container gets a limit whether the compose file asked for one or not: without
           # this, a pod with no limits is quota-rejected, and the deployer would have to inject
           # limits into user-authored compose.
@@ -172,7 +331,7 @@ in
                           "172.16.0.0/12"
                           "192.168.0.0/16"
                           "169.254.0.0/16" # link-local, i.e. cloud metadata endpoints
-                        ];
+                        ] ++ cfg.extraEgressExcept;
                       };
                     }
                   ];
@@ -229,6 +388,8 @@ in
     # containerd execs `containerd-shim-kata-v2` by name off its own PATH — this is what makes
     # the runtime handler above resolve to anything.
     systemd.services.k3s.path = [ config.previews.kata.package ];
+
+    environment.systemPackages = [ previewsKubeconfig ];
 
     systemd.tmpfiles.settings."10-k3s-kata" = {
       ${containerdDir}.d.mode = "0700";
