@@ -1080,6 +1080,7 @@ Point orchestra at it with a `deploy` section in `config.json`:
   "runtime_class": "kata",
   "image": "docker:28-dind",
   "ttl_minutes": 240,
+  "build_timeout_minutes": 30,
   "cpu_limit": "2",
   "memory_limit": "4Gi",
   "kubectl": "kubectl"
@@ -1091,10 +1092,19 @@ pointing at the cluster's ingress. Without the section the feature is off and th
 rather than half-working. The kubeconfig is held by the daemon and never reaches an agent — it is
 the credential that makes exposing this as a tool safe.
 
-Every preview carries its own expiry, written onto the pod when it is created, and
-`orchestra deploy gc` removes whatever has passed it. Reading the schedule off the pods rather
-than from orchestra's own state is deliberate: the daemon that created a preview is often not the
-one that outlives it, and a preview whose pull request was forgotten is the normal case.
+`memory_limit` is charged to the namespace quota as a *request* as well as a limit — Kubernetes
+copies limits into requests when requests are absent, and a Kata sandbox holds its guest's RAM for
+as long as it runs anyway — so it, not `count/pods`, is what sets how many previews fit.
+
+Every preview carries its own expiry, written onto the pod when it is created. The daemon sweeps
+what has passed it every five minutes, and `orchestra deploy gc` does the same on demand. Reading
+the schedule off the pods rather than from orchestra's own state is deliberate: the daemon that
+created a preview is often not the one that outlives it, and a preview whose pull request was
+forgotten is the normal case.
+
+A build that never finishes is an expected input rather than an accident, since nobody reads the
+compose file first — `build_timeout_minutes` bounds it, and the timeout is enforced inside the
+sandbox so the runaway is killed rather than merely abandoned.
 
 The same operations are available from the command line, which is what you want at the moment an
 agent has left something behind:

@@ -131,12 +131,18 @@ sandbox sizing (`default_vcpus = 1`, `default_memory = 2048` in the package's
 file — do not hand-write one, or the store paths for qemu, the guest kernel and the guest image
 go with it.
 
+## What drives it
+
+`Orchestra.Deploy`, over the API server, holding a kubeconfig the agent never sees — see
+[preview deployments](../../README.md#preview-deployments) in the main README for the `deploy`
+config section, the tools and the CLI. Deployments are created with an expiry annotation and the
+daemon sweeps what has passed it; `orchestra deploy gc` does the same by hand.
+
 ## What is deliberately not here
 
-- **The deployer.** Nothing yet turns a pull request into a pod running its compose project.
-  That is orchestra's side of the line, and it talks to this cluster over the API server.
 - **DNS and TLS for preview hostnames.** Traefik is running; wildcard DNS, certificates and the
-  hostname scheme are not configured.
-- **Garbage collection and TTLs.** The quota bounds how much can exist at once; nothing yet
-  deletes a preview when its pull request closes.
+  hostname scheme are not configured. Until they are, a preview is reachable by pointing at the
+  node with a `Host` header.
 - **Authentication in front of previews.** An unlisted URL is not access control.
+- **Deletion on pull-request close.** Previews expire on a timer; nothing yet reacts to the pull
+  request itself being closed or merged.

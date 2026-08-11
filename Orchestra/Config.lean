@@ -545,8 +545,12 @@ structure DeployConfig where
   runtimeClass : String := "kata"
   /-- Image providing the Docker daemon and the compose plugin inside the sandbox. -/
   image : String := "docker:28-dind"
-  /-- How long a preview lives before the sweeper removes it. -/
+  /-- How long a preview lives before the daemon's sweeper removes it. -/
   ttlMinutes : Nat := 240
+  /-- Ceiling on one preview's build. The compose file is hostile by assumption, so a build that
+      never finishes is an expected input rather than an accident: without a bound it holds the
+      agent's tool call, and the queue slot behind it, for as long as the sandbox lives. -/
+  buildTimeoutMinutes : Nat := 30
   cpuLimit : String := "2"
   memoryLimit : String := "4Gi"
   /-- The `kubectl` binary — a path, when the daemon's PATH is minimal. -/
@@ -563,10 +567,11 @@ instance : FromJson DeployConfig where
     let runtimeClass := j.getObjValAs? String "runtime_class" |>.toOption |>.getD "kata"
     let image := j.getObjValAs? String "image" |>.toOption |>.getD "docker:28-dind"
     let ttlMinutes := j.getObjValAs? Nat "ttl_minutes" |>.toOption |>.getD 240
+    let buildTimeoutMinutes := j.getObjValAs? Nat "build_timeout_minutes" |>.toOption |>.getD 30
     let cpuLimit := j.getObjValAs? String "cpu_limit" |>.toOption |>.getD "2"
     let memoryLimit := j.getObjValAs? String "memory_limit" |>.toOption |>.getD "4Gi"
     let kubectl := j.getObjValAs? String "kubectl" |>.toOption |>.getD "kubectl"
-    return { kubeconfig, ns, baseDomain, runtimeClass, image, ttlMinutes,
+    return { kubeconfig, ns, baseDomain, runtimeClass, image, ttlMinutes, buildTimeoutMinutes,
              cpuLimit, memoryLimit, kubectl }
 
 structure AppConfig where

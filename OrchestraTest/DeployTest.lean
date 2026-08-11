@@ -84,6 +84,50 @@ def urlUsesTheName : Test := do
   let name := deploymentName (spec "org" "repo" "main")
   TestM.assertEqual (deploymentUrl cfg name) s!"https://{name}.previews.example.com"
 
+@[test]
+def nameSurvivesAnUnsluggableRepo : Test := do
+  -- Nothing in "日本語" survives the slug, and `-<hash>` is not a DNS label. The hash still
+  -- identifies the deployment; only the readable half is lost.
+  let name := deploymentName (spec "org" "日本語" "ブランチ")
+  TestM.assert (!name.startsWith "-") s!"name must not start with a dash, got {name}"
+  TestM.assert (name.all fun c => (c.isAlpha && c.isLower) || c.isDigit || c == '-')
+    s!"name must still be a DNS label, got {name}"
+
+/-! ## Refs
+
+The ref is an agent-authored string handed to `git`, and `git archive`'s `--output` overwrites
+whatever path it is given — on the daemon's own filesystem, which is the machine the sandbox
+exists to protect. -/
+
+@[test]
+def rejectsRefsThatGitWouldReadAsOptions : Test := do
+  for hostile in ["--output=/home/orchestra/.ssh/authorized_keys", "-o/tmp/x", "--exec=sh",
+                  "--remote=git://elsewhere/repo"] do
+    match validateRef hostile with
+    | .ok r => TestM.fail s!"ref {repr hostile} should be refused, got {repr r}"
+    | .error _ => TestM.assert true
+
+@[test]
+def rejectsRefsWithShellOrPathTricks : Test := do
+  for hostile in ["main; rm -rf /", "main$(id)", "../../etc/passwd", "a..b", "main branch", ""] do
+    match validateRef hostile with
+    | .ok r => TestM.fail s!"ref {repr hostile} should be refused, got {repr r}"
+    | .error _ => TestM.assert true
+
+@[test]
+def acceptsOrdinaryRefs : Test := do
+  for good in ["main", "feature/some-branch", "v1.2.3", "release_2026",
+               "9eb8e1c34686d907885fa77ac59aed4daf79a111"] do
+    match validateRef good with
+    | .ok r => TestM.assertEqual r good
+    | .error e => TestM.fail s!"ref {repr good} should be accepted: {e}"
+
+@[test]
+def trimsSurroundingWhitespace : Test := do
+  match validateRef "  main  " with
+  | .ok r => TestM.assertEqual r "main"
+  | .error e => TestM.fail s!"a padded ref should be accepted: {e}"
+
 /-! ## Manifests -/
 
 private def podOf (c : DeployConfig) (s : Spec) : Json :=
@@ -102,6 +146,35 @@ def emptyRuntimeClassOmitsTheField : Test := do
   let pod := podOf { cfg with runtimeClass := "" } (spec "org" "repo" "main")
   let rc := (do (← pod.getObjVal? "spec").getObjValAs? String "runtimeClassName") |>.toOption
   TestM.assertEqual rc none
+
+@[test]
+def podStatesItsRequests : Test := do
+  let pod := podOf cfg (spec "org" "repo" "main")
+  let requests :=
+    (do
+      let sp ← pod.getObjVal? "spec"
+      let containers ← sp.getObjValAs? (Array Json) "containers"
+      let first ← containers[0]?.getDM (throw "no containers")
+      let resources ← first.getObjVal? "resources"
+      let req ← resources.getObjVal? "requests"
+      req.getObjValAs? String "memory") |>.toOption
+  -- Not decoration: Kubernetes copies limits into requests when requests are absent, so the
+  -- namespace LimitRange's defaults never apply to these pods and the quota is charged the full
+  -- limit either way. Stating it is the difference between a capacity that can be reasoned about
+  -- and one discovered when a deploy is rejected.
+  TestM.assertEqual requests (some "4Gi")
+
+@[test]
+def podCarriesItsRepository : Test := do
+  let s := spec "org" "repo" "main"
+  let pod := podManifest cfg s (deploymentName s) "2026-01-01T00:00:00Z"
+  let repo :=
+    (do
+      let md ← pod.getObjVal? "metadata"
+      let ann ← md.getObjVal? "annotations"
+      ann.getObjValAs? String "orchestra.dev/repository") |>.toOption
+  -- This is what stops one task destroying another repository's preview, or reading its logs.
+  TestM.assertEqual repo (some "org/repo")
 
 @[test]
 def podCarriesItsExpiry : Test := do
@@ -231,6 +304,14 @@ def rejectsDeployPreviewWithoutRef : Test := do
   match Server.parseToolCall "deploy_preview" (Json.mkObj []) with
   | .parseError _ => TestM.assert true
   | _ => TestM.fail "deploy_preview without a ref should not parse"
+
+@[test]
+def rejectsHostileRefsAtTheToolBoundary : Test := do
+  -- The same check as `validateRef`, enforced before any process is started with the value.
+  match Server.parseToolCall "deploy_preview"
+      (Json.mkObj [("ref", .str "--output=/home/orchestra/.ssh/authorized_keys")]) with
+  | .parseError _ => TestM.assert true
+  | _ => TestM.fail "a ref git would read as an option should not parse"
 
 @[test]
 def rejectsUnusablePorts : Test := do

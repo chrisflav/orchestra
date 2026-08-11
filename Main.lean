@@ -1459,7 +1459,18 @@ private def printDeployment (d : Deploy.Deployment) : IO Unit :=
 
 private def deployHandler (p : Parsed) : IO UInt32 := do
   let cfg ← deployConfig p
-  let ref := p.positionalArg! "ref" |>.as! String
+  -- `--ref` exists because `Cli` resolves subcommands off the first positional token, so a branch
+  -- actually named `list`, `logs`, `destroy` or `gc` can never be reached positionally.
+  let refArg := match p.flag? "ref" |>.map (·.as! String) with
+    | some r => some r
+    | none => (p.variableArgsAs? String |>.getD #[])[0]?
+  let some rawRef := refArg
+    | IO.eprintln "no ref given: pass one positionally, or with --ref for a branch named like a \
+        subcommand"
+      return 1
+  let ref ← match Deploy.validateRef rawRef with
+    | .ok r => pure r
+    | .error e => IO.eprintln e; return 1
   let repoPath := p.flag? "repo" |>.map (·.as! String) |>.getD "."
   let upstream ← match p.flag? "upstream" |>.map (·.as! String) with
     | some s => IO.ofExcept (Repository.parse s)
@@ -1556,6 +1567,7 @@ because what is deployed is a `git archive` of it rather than the working tree."
 
   FLAGS:
     c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    ref       : String; "Ref to deploy, for a branch named like a subcommand (list, logs, destroy, gc)"
     repo      : String; "Repository clone to export the ref from (default: .)"
     upstream  : String; "Repository in 'owner/repo' form, used to name the deployment"
     compose   : String; "Compose file relative to the repository root (default: docker-compose.yaml)"
@@ -1563,7 +1575,7 @@ because what is deployed is a `git archive` of it rather than the working tree."
     pr        : Nat;    "Pull request number this preview belongs to"
 
   ARGS:
-    ref : String; "Branch, tag or commit to deploy"
+    ...ref : String; "Branch, tag or commit to deploy"
 
   SUBCOMMANDS:
     deployListCmd;

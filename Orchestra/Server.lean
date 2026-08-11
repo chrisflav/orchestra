@@ -616,15 +616,18 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
     match args.getObjValAs? String "ref" |>.toOption with
     | none => .parseError "missing required argument: ref"
     | some ref =>
-      if ref.trim.isEmpty then .parseError "'ref' must not be empty"
-      else
+      -- Validated here rather than only where it is used, so a ref that git would read as an
+      -- option is refused before any process is started with it.
+      match Deploy.validateRef ref with
+      | .error e => .parseError e
+      | .ok ref =>
         let composeFile := args.getObjValAs? String "compose_file" |>.toOption
           |>.getD "docker-compose.yaml"
         let port := args.getObjValAs? Nat "port" |>.toOption |>.getD 80
         if port == 0 || port > 65535 then
           .parseError "'port' must be between 1 and 65535"
         else
-          .deployPreview ref.trim composeFile port (args.getObjValAs? Nat "pr_number" |>.toOption)
+          .deployPreview ref composeFile port (args.getObjValAs? Nat "pr_number" |>.toOption)
   | "destroy_preview" =>
     match args.getObjValAs? String "name" |>.toOption with
     | none => .parseError "missing required argument: name"
@@ -869,13 +872,21 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
           -- follows the link from, and it is what makes a second run replace the first.
         , prNumber := prNumber <|> state.issueNumber }
       log s!"tool deploy_preview: {state.upstream} ref={ref} compose={composeFile} port={port}"
-      match ← Deploy.create cfg spec with
-      | .error e =>
-        log s!"tool deploy_preview: error: {e.take 200}"
-        return toolContent e (isError := true)
-      | .ok deployment =>
-        log s!"tool deploy_preview: ok: {deployment.url}"
-        return toolContent (Lean.toJson deployment).compress
+      -- Wrapped like every other tool that touches the outside world: `Deploy` shells out, and a
+      -- `kubectl` that is not on the daemon's PATH throws rather than returning an error. Without
+      -- this the exception unwinds past the JSON-RPC layer, which drops the agent's connection
+      -- with no response at all instead of telling it what is wrong.
+      try
+        match ← Deploy.create cfg spec with
+        | .error e =>
+          log s!"tool deploy_preview: error: {e.take 200}"
+          return toolContent e (isError := true)
+        | .ok deployment =>
+          log s!"tool deploy_preview: ok: {deployment.url}"
+          return toolContent (Lean.toJson deployment).compress
+      catch e =>
+        log s!"tool deploy_preview: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .destroyPreview name =>
     match state.deploy with
     | none =>
@@ -887,9 +898,15 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         log "tool destroy_preview: denied (not in allowed tools)"
         return toolContent "deploying previews is not enabled for this task" (isError := true)
       log s!"tool destroy_preview: {name}"
-      match ← Deploy.destroy cfg name with
-      | .error e => return toolContent e (isError := true)
-      | .ok () => return toolContent s!"deployment {name} removed"
+      try
+        -- Scoped to this task's repository: `list_deployments` shows the whole namespace, and
+        -- without the check a task could tear down an unrelated pull request's preview.
+        match ← Deploy.destroy cfg name (owner := some state.upstream) with
+        | .error e => return toolContent e (isError := true)
+        | .ok () => return toolContent s!"deployment {name} removed"
+      catch e =>
+        log s!"tool destroy_preview: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .listDeployments =>
     match state.deploy with
     | none =>
@@ -900,10 +917,14 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       if !state.allowedTools.contains "deploy" then
         log "tool list_deployments: denied (not in allowed tools)"
         return toolContent "deploying previews is not enabled for this task" (isError := true)
-      match ← Deploy.list cfg with
-      | .error e => return toolContent e (isError := true)
-      | .ok deployments =>
-        return toolContent (Json.arr (deployments.map Lean.toJson)).compress
+      try
+        match ← Deploy.list cfg with
+        | .error e => return toolContent e (isError := true)
+        | .ok deployments =>
+          return toolContent (Json.arr (deployments.map Lean.toJson)).compress
+      catch e =>
+        log s!"tool list_deployments: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .deploymentLogs name tailLines =>
     match state.deploy with
     | none =>
@@ -914,9 +935,15 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       if !state.allowedTools.contains "deploy" then
         log "tool deployment_logs: denied (not in allowed tools)"
         return toolContent "deploying previews is not enabled for this task" (isError := true)
-      match ← Deploy.logs cfg name tailLines with
-      | .error e => return toolContent e (isError := true)
-      | .ok out => return toolContent out
+      try
+        -- Same scoping as destroy, and for a sharper reason: these are the logs of another
+        -- project's compose services, environment and all.
+        match ← Deploy.logs cfg name tailLines (owner := some state.upstream) with
+        | .error e => return toolContent e (isError := true)
+        | .ok out => return toolContent out
+      catch e =>
+        log s!"tool deployment_logs: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .project call =>
     let env : Project.Tools.Env :=
       { claimManager  := state.claimManager

@@ -45,17 +45,23 @@
   previews.k3s = {
     tlsSans = [ "10.0.100.50" ];
 
-    # Sized for this VM: 8 vCPU, 16 GiB, 100 GiB disk. The binding constraint is guest RAM — a
-    # Kata sandbox takes its memory limit (2 GiB by default here) out of the VM's 16 GiB and
-    # gives none of it back while it runs, so the ceiling is roughly five concurrent previews
-    # with headroom for k3s itself. `count/pods` is the honest expression of that; the memory
-    # numbers stop one preview from eating the budget alone.
+    # Sized for this VM: 8 vCPU, 16 GiB, 100 GiB disk.
+    #
+    # The binding constraint is guest RAM. A Kata sandbox takes its memory limit out of the VM's
+    # 16 GiB and gives none of it back while it runs, and orchestra asks for 4 GiB per preview by
+    # default (`deploy.memory_limit`), stated as both request and limit — Kubernetes copies
+    # limits into requests anyway, so the LimitRange defaults never apply to these pods and the
+    # quota is charged the full amount either way.
+    #
+    # 12 GiB of requests is therefore three concurrent previews, leaving 4 GiB for k3s and the
+    # system. `count/pods` is set to match rather than to a larger number that memory would never
+    # let you reach: a quota that rejects at a limit nobody can predict is worse than a low one.
     quota = {
-      "requests.cpu" = "4";
-      "requests.memory" = "8Gi";
-      "limits.cpu" = "8";
+      "requests.cpu" = "6";
+      "requests.memory" = "12Gi";
+      "limits.cpu" = "6";
       "limits.memory" = "12Gi";
-      "count/pods" = "10";
+      "count/pods" = "3";
     };
   };
 }

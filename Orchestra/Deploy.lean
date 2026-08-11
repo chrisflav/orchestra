@@ -128,11 +128,45 @@ def deploymentName (spec : Spec) : String :=
   let clipped := match base.getLast? with
     | some '-' => base.dropLast
     | _ => base
-  s!"{String.mk clipped}-{shortHash identity}"
+  -- A repository and ref made entirely of characters the slug drops — every non-Latin script,
+  -- for one — leave nothing behind, and `-<hash>` is not a DNS label. The hash still identifies
+  -- the deployment; only the human-readable half is gone, which is the correct thing to lose.
+  let stem := if clipped.isEmpty then "preview" else String.mk clipped
+  s!"{stem}-{shortHash identity}"
 
 /-- Hostname a deployment answers on. -/
 def deploymentUrl (cfg : DeployConfig) (name : String) : String :=
   s!"https://{name}.{cfg.baseDomain}"
+
+/-! ## Refs
+
+The ref arrives as a tool argument written by an agent, and it is handed to `git`, so it is
+checked before it is used rather than trusted because it usually looks like a branch name. -/
+
+private def isRefChar (c : Char) : Bool :=
+  c.isAlphanum || c == '/' || c == '.' || c == '_' || c == '-'
+
+/-- Accept a ref, or say why not.
+
+    An allowlist rather than a denylist: what a legal branch, tag or commit id may contain is a
+    short and well-known set, and everything outside it is either an attempt at an option or a
+    typo. The leading dash is called out separately because that is the one that turns a ref into
+    a `git` flag — a ref of `--output=…` makes `git archive` write its tarball wherever it is
+    pointed, on the daemon's own filesystem. -/
+def validateRef (ref : String) : Except String String :=
+  let trimmed := ref.trim
+  if trimmed.isEmpty then
+    .error "ref must not be empty"
+  else if trimmed.startsWith "-" then
+    .error s!"ref {repr trimmed} must not start with a dash: git would read it as an option"
+  else if !trimmed.all isRefChar then
+    .error s!"ref {repr trimmed} contains characters that are not allowed in a branch, tag or \
+      commit id (letters, digits, and / . _ - only)"
+  else if (trimmed.splitOn "..").length > 1 then
+    -- `a..b` is a range to git, not a ref, and `..` in a path is the other thing nobody means.
+    .error s!"ref {repr trimmed} must not contain '..'"
+  else
+    .ok trimmed
 
 /-! ## Time -/
 
@@ -187,8 +221,18 @@ def podManifest (cfg : DeployConfig) (spec : Spec) (name : String) (expiresAt : 
         -- is both simpler and one less thing listening.
         Json.mkObj [("name", .str "DOCKER_TLS_CERTDIR"), ("value", .str "")] ])
     , ("ports", .arr #[Json.mkObj [("containerPort", toJson spec.port)]])
+      -- Requests are stated rather than left to default, and they are equal to the limits on
+      -- purpose. Kubernetes copies limits into requests when requests are absent, so the
+      -- namespace's LimitRange defaults never apply here and the quota is charged the full
+      -- limit either way — writing it down is the difference between a capacity that can be
+      -- reasoned about and one discovered when the third preview is rejected. Equal is also the
+      -- truth for memory: a Kata sandbox takes its guest's RAM for as long as it runs and gives
+      -- none of it back.
     , ("resources", Json.mkObj
         [ ("limits", Json.mkObj
+            [ ("cpu", .str cfg.cpuLimit)
+            , ("memory", .str cfg.memoryLimit) ])
+        , ("requests", Json.mkObj
             [ ("cpu", .str cfg.cpuLimit)
             , ("memory", .str cfg.memoryLimit) ]) ]) ]
   let podSpec := Json.mkObj <|
@@ -270,10 +314,25 @@ private def run (cmd : String) (args : Array String) (input : Option String := n
       h.putStr s
       h.flush
       pure child'
+  -- Both pipes are drained at once, and that is not a refinement: reading one to EOF before
+  -- touching the other deadlocks as soon as the *other* fills its 64 KiB buffer. `docker compose
+  -- up --build` writes BuildKit's progress to stderr, so every build past a trivial one hits
+  -- that — the child blocks writing stderr, we block reading stdout, and nobody moves. A small
+  -- demo project stays under the buffer and hides it, which is exactly how this got shipped.
+  let stderrTask ← IO.asTask child.stderr.readToEnd
   let stdout ← child.stdout.readToEnd
-  let stderr ← child.stderr.readToEnd
+  let stderr ← match ← IO.wait stderrTask with
+    | .ok s => pure s
+    | .error e => pure s!"(could not read stderr: {e})"
   let exitCode ← child.wait
   return { exitCode, stdout, stderr }
+
+/-- Single-quote a string for `sh -c`. Every value interpolated into a shell command inside the
+    sandbox goes through this — not because the shell is a boundary worth defending (it is the
+    sandbox's own), but because a compose path with a space in it otherwise becomes a different
+    command and a baffling error. -/
+private def shQuote (s : String) : String :=
+  "'" ++ s.replace "'" "'\\''" ++ "'"
 
 private def failure (what : String) (r : CmdResult) : String :=
   let detail :=
@@ -287,21 +346,68 @@ private def kubectl (cfg : DeployConfig) (args : Array String) (input : Option S
   run cfg.kubectl (#["--kubeconfig", cfg.kubeconfig, "-n", cfg.ns] ++ args) input
 
 /-- `kubectl exec` into a deployment's pod. Every command that touches the compose project goes
-    through here, which is the reason the pod needs no network path back to us. -/
-private def execIn (cfg : DeployConfig) (name : String) (script : String) : IO CmdResult :=
-  kubectl cfg #["exec", name, "--", "sh", "-c", script]
+    through here, which is the reason the pod needs no network path back to us.
+
+    Everything is run under busybox `timeout`, because the compose file is hostile by assumption:
+    a `RUN sleep infinity` in an unread Dockerfile would otherwise hang this call, and with it the
+    agent's tool call and the queue slot behind it, for as long as the sandbox's own TTL. Bounding
+    it inside the sandbox rather than here also means the runaway is killed rather than merely
+    abandoned. -/
+private def execIn (cfg : DeployConfig) (name : String) (script : String)
+    (timeoutSeconds : Nat) : IO CmdResult :=
+  kubectl cfg #["exec", name, "--", "timeout", "-s", "KILL", toString timeoutSeconds,
+                "sh", "-c", script]
 
 /-! ## Operations -/
+
+/-- The repository a deployment was created for, from the annotation `create` wrote. `none` when
+    the deployment does not exist or predates the annotation. -/
+private def repositoryOf (cfg : DeployConfig) (name : String) : IO (Option String) := do
+  -- `-o json` rather than a jsonpath: the annotation key contains both a dot and a slash, which
+  -- jsonpath needs escaped in a way that is easy to get subtly wrong and silently returns empty.
+  let r ← kubectl cfg #["get", "pod", name, "-o", "json"]
+  if r.exitCode != 0 then return none
+  match Json.parse r.stdout with
+  | .error _ => return none
+  | .ok j =>
+    return (do
+      let md ← j.getObjVal? "metadata"
+      let ann ← md.getObjVal? "annotations"
+      ann.getObjValAs? String repoAnnotation) |>.toOption
+
+/-- Refuse to touch a deployment belonging to a different repository.
+
+    Previews from unrelated pull requests share one namespace, and `list_deployments` hands every
+    name to whoever asks. Without this, a task working on one repository can tear down another's
+    preview, or read its logs — which are the logs of a compose project whose environment is
+    nobody else's business. `none` means the caller has no repository to check against (the CLI,
+    driven by a person who can see the whole cluster anyway) and skips the check. -/
+private def checkOwner (cfg : DeployConfig) (name : String) (expected : Option Repository) :
+    IO (Except String Unit) := do
+  match expected with
+  | none => return .ok ()
+  | some repo =>
+    match ← repositoryOf cfg name with
+    -- An unannotated or absent deployment is not claimed by anyone. `destroy` is idempotent on a
+    -- name that does not exist, and refusing here would turn "already gone" into an error.
+    | none => return .ok ()
+    | some owner =>
+      if owner == repo.toString then return .ok ()
+      else return .error s!"deployment {name} belongs to {owner}, not {repo.toString}"
 
 /-- Remove a deployment and everything belonging to it. Idempotent: deleting what is not there
     is success, because the caller's intent — that nothing of that name be running — is
     satisfied either way. -/
-def destroy (cfg : DeployConfig) (name : String) : IO (Except String Unit) := do
-  let r ← kubectl cfg
-    #["delete", "pod,service,ingress", "-l", s!"{deploymentLabel}={name}", "--ignore-not-found"]
-  if r.exitCode != 0 then
-    return .error (failure s!"deleting deployment {name}" r)
-  return .ok ()
+def destroy (cfg : DeployConfig) (name : String) (owner : Option Repository := none) :
+    IO (Except String Unit) := do
+  match ← checkOwner cfg name owner with
+  | .error e => return .error e
+  | .ok () =>
+    let r ← kubectl cfg
+      #["delete", "pod,service,ingress", "-l", s!"{deploymentLabel}={name}", "--ignore-not-found"]
+    if r.exitCode != 0 then
+      return .error (failure s!"deleting deployment {name}" r)
+    return .ok ()
 
 private def podPhase (cfg : DeployConfig) (name : String) : IO (Option String) := do
   let r ← kubectl cfg #["get", "pod", name, "-o", "jsonpath={.status.phase}"]
@@ -370,14 +476,32 @@ def gc (cfg : DeployConfig) : IO (Except String (Array String)) := do
 
     `git archive` rather than a copy of the working tree: it produces exactly the committed state
     of that ref, with no build output, no `.git`, and nothing the agent left lying around
-    uncommitted. -/
+    uncommitted.
+
+    The ref reaches this from a tool argument, so it is treated as hostile all the way down.
+    `validateRef` rejects anything that could be read as an option, `--end-of-options` stops git
+    from looking for one anyway, and what is finally handed to `git archive` is the resolved
+    commit id rather than the caller's string at all. Any one of the three would do; the reason
+    for all three is that the thing being protected is the daemon's own filesystem — `git
+    archive`'s `--output` happily overwrites whatever path it is given, and it wins over an
+    earlier `-o`. -/
 private def exportSource (spec : Spec) (dir : System.FilePath) : IO (Except String System.FilePath) := do
-  let tarball := dir / "source.tar"
-  let r ← run "git"
-    #["-C", spec.sourcePath.toString, "archive", "--format=tar", "-o", tarball.toString, spec.ref]
-  if r.exitCode != 0 then
-    return .error (failure s!"exporting {spec.ref} from {spec.sourcePath}" r)
-  return .ok tarball
+  match validateRef spec.ref with
+  | .error e => return .error e
+  | .ok ref =>
+    let resolve ← run "git"
+      #["-C", spec.sourcePath.toString, "rev-parse", "--verify", "--end-of-options",
+        ref ++ "^{commit}"]
+    if resolve.exitCode != 0 then
+      return .error (failure s!"resolving {ref} in {spec.sourcePath}" resolve)
+    let commit := resolve.stdout.trim
+    let tarball := dir / "source.tar"
+    let r ← run "git"
+      #["-C", spec.sourcePath.toString, "archive", "--format=tar", "-o", tarball.toString,
+        "--end-of-options", commit]
+    if r.exitCode != 0 then
+      return .error (failure s!"exporting {ref} ({commit}) from {spec.sourcePath}" r)
+    return .ok tarball
 
 /-- Create or replace a preview.
 
@@ -385,7 +509,7 @@ private def exportSource (spec : Spec) (dir : System.FilePath) : IO (Except Stri
     same code path as a first deploy and cannot half-apply onto a sandbox in an unknown state.
     The cost is that a preview blinks out for the length of a rebuild, which for something a
     human opens on a link is the right trade. -/
-def create (cfg : DeployConfig) (spec : Spec) (timeoutSeconds : Nat := 600) :
+def create (cfg : DeployConfig) (spec : Spec) (startTimeoutSeconds : Nat := 600) :
     IO (Except String Deployment) := do
   let name := deploymentName spec
   let now ← nowSeconds
@@ -402,6 +526,19 @@ def create (cfg : DeployConfig) (spec : Spec) (timeoutSeconds : Nat := 600) :
     | .ok p => pure p
 
   let cleanup : IO Unit := IO.FS.removeDirAll tmp
+  -- Failures below fall into two kinds, and they are cleaned up differently on purpose.
+  --
+  -- Plumbing failures — the sandbox not starting, dockerd not coming up, the copy or the unpack
+  -- going wrong — leave nothing worth looking at, so the pod goes with them. Leaving it would
+  -- pin a multi-gigabyte Kata guest against the namespace quota until someone noticed, and the
+  -- next `deploy_preview` in the namespace would be the one that failed for it.
+  --
+  -- A failed `docker compose up` is the other kind: the build output *is* the answer, and it is
+  -- inside the sandbox. That one stays, and says so.
+  let abandon (msg : String) : IO (Except String Deployment) := do
+    cleanup
+    let _ ← destroy cfg name
+    return .error msg
 
   -- 2. Replace whatever was there.
   match ← destroy cfg name with
@@ -412,47 +549,45 @@ def create (cfg : DeployConfig) (spec : Spec) (timeoutSeconds : Nat := 600) :
   let applyResult ← kubectl cfg #["apply", "-f", "-"]
     (input := (manifests cfg spec name expiresAt).compress)
   if applyResult.exitCode != 0 then
-    cleanup
-    return .error (failure "creating the deployment" applyResult)
+    return ← abandon (failure "creating the deployment" applyResult)
 
   let waitResult ← kubectl cfg
-    #["wait", "--for=condition=Ready", s!"pod/{name}", s!"--timeout={timeoutSeconds}s"]
+    #["wait", "--for=condition=Ready", s!"pod/{name}", s!"--timeout={startTimeoutSeconds}s"]
   if waitResult.exitCode != 0 then
-    cleanup
-    return .error <|
-      failure s!"waiting for the sandbox of {name} to start" waitResult ++
-      s!"\n\nThe pod is left in place for inspection; call destroy_preview with name \
-        {repr name} when you are done with it."
+    return ← abandon (failure s!"waiting for the sandbox of {name} to start" waitResult)
 
   -- 4. Wait for the Docker daemon inside the sandbox. dind is ready when it says so and not when
   --    the pod is: the container is Running from the moment the entrypoint execs, which is well
   --    before the daemon accepts connections.
   let dockerReady ← execIn cfg name
     "for i in $(seq 1 60); do docker info >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
+    (timeoutSeconds := 180)
   if dockerReady.exitCode != 0 then
-    cleanup
-    return .error (failure s!"the Docker daemon in {name} did not come up" dockerReady)
+    return ← abandon (failure s!"the Docker daemon in {name} did not come up" dockerReady)
 
   -- 5. The source, over the same exec channel. `kubectl cp` rather than a stream through this
   --    process: a tar is binary, and Lean's strings are not.
-  let mkdir ← execIn cfg name "mkdir -p /workspace"
+  let mkdir ← execIn cfg name "mkdir -p /workspace" (timeoutSeconds := 60)
   if mkdir.exitCode != 0 then
-    cleanup
-    return .error (failure s!"preparing /workspace in {name}" mkdir)
+    return ← abandon (failure s!"preparing /workspace in {name}" mkdir)
 
   let cpResult ← kubectl cfg
     #["cp", tarball.toString, s!"{cfg.ns}/{name}:/workspace/source.tar"]
   cleanup
   if cpResult.exitCode != 0 then
+    let _ ← destroy cfg name
     return .error (failure s!"copying the source into {name}" cpResult)
 
   let untar ← execIn cfg name "cd /workspace && tar xf source.tar && rm source.tar"
+    (timeoutSeconds := 300)
   if untar.exitCode != 0 then
+    let _ ← destroy cfg name
     return .error (failure s!"unpacking the source in {name}" untar)
 
   -- 6. Hand over to the repository's own compose file, unread.
   let up ← execIn cfg name
-    s!"cd /workspace && docker compose -f {spec.composeFile} -p preview up -d --build"
+    s!"cd /workspace && docker compose -f {shQuote spec.composeFile} -p preview up -d --build"
+    (timeoutSeconds := cfg.buildTimeoutMinutes * 60)
   if up.exitCode != 0 then
     return .error <|
       failure "docker compose up" up ++
@@ -463,11 +598,16 @@ def create (cfg : DeployConfig) (spec : Spec) (timeoutSeconds : Nat := 600) :
   return .ok { name, url := deploymentUrl cfg name, status := phase, expiresAt }
 
 /-- Logs from a deployment's compose project, for an agent explaining why a preview is broken. -/
-def logs (cfg : DeployConfig) (name : String) (tailLines : Nat := 200) :
-    IO (Except String String) := do
-  let r ← execIn cfg name s!"cd /workspace && docker compose -p preview logs --tail={tailLines}"
-  if r.exitCode != 0 then
-    return .error (failure s!"reading logs from {name}" r)
-  return .ok r.stdout
+def logs (cfg : DeployConfig) (name : String) (tailLines : Nat := 200)
+    (owner : Option Repository := none) : IO (Except String String) := do
+  match ← checkOwner cfg name owner with
+  | .error e => return .error e
+  | .ok () =>
+    let r ← execIn cfg name
+      s!"cd /workspace && docker compose -p preview logs --tail={tailLines}"
+      (timeoutSeconds := 120)
+    if r.exitCode != 0 then
+      return .error (failure s!"reading logs from {name}" r)
+    return .ok r.stdout
 
 end Orchestra.Deploy

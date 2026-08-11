@@ -3,6 +3,7 @@ import Orchestra.Concert
 import Orchestra.ConcertManager
 import Orchestra.Config
 import Orchestra.DaemonRequest
+import Orchestra.Deploy
 import Orchestra.GitHub
 import Orchestra.Listener
 import Orchestra.Project
@@ -461,6 +462,28 @@ its workspace; it will start from a clean checkout."
         -- idle daemon makes a handful of requests an hour. Shared with `ensureFresh`'s default
         -- TTL, which is what keeps this the only path that polls while the daemon is up.
         for _ in List.range Usage.pollIntervalSecs.toNat do
+          if ← shutdownToken.isCancelled then break
+          IO.sleep 1000
+  -- Preview sweeper: remove deployments whose expiry has passed.
+  --
+  -- Every preview is created with a TTL, and something has to believe it. The schedule is read
+  -- off the pods' own annotations rather than from any state here, so a preview created by a
+  -- previous daemon still expires on time and a restart does not lose track of anything. Without
+  -- this fiber previews accumulate until the namespace quota rejects the next one — and the
+  -- deploy that fails is not the abandoned one, it is whoever asked next.
+  if let some deployCfg := appConfig.deploy then
+    let _sweeperTask ← IO.asTask (prio := .dedicated) do
+      while !(← shutdownToken.isCancelled) do
+        try
+          match ← Deploy.gc deployCfg with
+          | .error e => IO.eprintln s!"[deploy] sweep failed: {e}"
+          | .ok removed =>
+            for name in removed do
+              IO.println s!"  [deploy] {name} expired and was removed"
+        catch e => IO.eprintln s!"[deploy] sweep failed: {e}"
+        -- Five minutes, like the usage poller: a preview overstaying its welcome by a few
+        -- minutes costs nothing, and an idle daemon should not be listing pods every second.
+        for _ in List.range 300 do
           if ← shutdownToken.isCancelled then break
           IO.sleep 1000
   -- Listeners: one fiber each, and the *set* of them is rescanned rather than fixed at
