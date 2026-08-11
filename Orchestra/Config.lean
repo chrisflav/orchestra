@@ -521,6 +521,71 @@ instance : FromJson QueueConfig where
     let parallelPerRepo := j.getObjValAs? Nat "parallel_per_repo" |>.toOption |>.getD 1
     return { parallel := max 1 parallel, parallelPerRepo := max 1 parallelPerRepo }
 
+/-- Where and how preview deployments run, from the `deploy` object in `config.json`.
+
+    Lives here rather than in `Orchestra.Deploy` for the same reason `QueueConfig` does: it is
+    read out of `config.json` by whoever loads the configuration, and `Orchestra.Deploy` imports
+    this module to get `Repository`.
+
+    Absent means the feature is off — `deploy_preview` then refuses with "not configured"
+    instead of half-working against a cluster nobody has pointed it at. -/
+structure DeployConfig where
+  /-- Path to a kubeconfig for the previews cluster. Held by the daemon and never by an agent:
+      this is the credential that makes the whole feature safe to expose as a tool. -/
+  kubeconfig : String
+  /-- Context to select within that kubeconfig. `none` uses its current-context, which is right
+      for a kubeconfig written for this one job and wrong for a multi-cluster one — there, the
+      cluster orchestra deploys to would otherwise be whichever `kubectl` was last pointed at. -/
+  context : Option String := none
+  /-- Namespace previews are created in. Its quota, limit range, RBAC and network policies are
+      set up by `container/previews-vm/modules/k3s.nix`; nothing in orchestra creates or checks
+      them. -/
+  ns : String := "previews"
+  /-- Deployments are reachable at `<name>.<base_domain>`, which needs a wildcard DNS record
+      pointing at the cluster's ingress. -/
+  baseDomain : String
+  /-- `ingressClassName` on every Ingress created. `none` leaves the field off and relies on the
+      cluster having a default ingress controller — true of k3s with Traefik, and quietly false
+      on a cluster with several classes and no default, where nothing claims the Ingress and the
+      preview answers nothing at a URL that was reported as ready. -/
+  ingressClass : Option String := none
+  /-- RuntimeClass every preview pod is scheduled with. Empty disables it, which means previews
+      share the node's kernel — sensible only where that is someone else's problem, and never
+      for compose files nobody has read. -/
+  runtimeClass : String := "kata"
+  /-- Image providing the Docker daemon and the compose plugin inside the sandbox. -/
+  image : String := "docker:28-dind"
+  /-- How long a preview lives before the daemon's sweeper removes it. -/
+  ttlMinutes : Nat := 240
+  /-- Ceiling on one preview's build. The compose file is hostile by assumption, so a build that
+      never finishes is an expected input rather than an accident: without a bound it holds the
+      agent's tool call, and the queue slot behind it, for as long as the sandbox lives. -/
+  buildTimeoutMinutes : Nat := 30
+  cpuLimit : String := "2"
+  memoryLimit : String := "4Gi"
+  /-- The `kubectl` binary — a path, when the daemon's PATH is minimal. -/
+  kubectl : String := "kubectl"
+deriving Repr, Inhabited
+
+instance : FromJson DeployConfig where
+  fromJson? j := do
+    -- Only the two that cannot be guessed are required: where the cluster is, and what hostnames
+    -- it answers on.
+    let kubeconfig ← j.getObjValAs? String "kubeconfig"
+    let baseDomain ← j.getObjValAs? String "base_domain"
+    let context := j.getObjValAs? String "context" |>.toOption
+    let ingressClass := j.getObjValAs? String "ingress_class" |>.toOption
+    let ns := j.getObjValAs? String "namespace" |>.toOption |>.getD "previews"
+    let runtimeClass := j.getObjValAs? String "runtime_class" |>.toOption |>.getD "kata"
+    let image := j.getObjValAs? String "image" |>.toOption |>.getD "docker:28-dind"
+    let ttlMinutes := j.getObjValAs? Nat "ttl_minutes" |>.toOption |>.getD 240
+    let buildTimeoutMinutes := j.getObjValAs? Nat "build_timeout_minutes" |>.toOption |>.getD 30
+    let cpuLimit := j.getObjValAs? String "cpu_limit" |>.toOption |>.getD "2"
+    let memoryLimit := j.getObjValAs? String "memory_limit" |>.toOption |>.getD "4Gi"
+    let kubectl := j.getObjValAs? String "kubectl" |>.toOption |>.getD "kubectl"
+    return { kubeconfig, context, ns, baseDomain, ingressClass, runtimeClass, image, ttlMinutes,
+             buildTimeoutMinutes, cpuLimit, memoryLimit, kubectl }
+
 structure AppConfig where
   appId : Nat
   privateKeyPath : String
@@ -558,6 +623,9 @@ structure AppConfig where
   taxis : Option Taxis.Config := none
   /-- Queue daemon concurrency. Read only by `orchestra queue start`. -/
   queue : QueueConfig := {}
+  /-- Previews cluster backing `deploy_preview` (`Orchestra.Deploy`). `none` disables the
+      deployment tools entirely. -/
+  deploy : Option DeployConfig := none
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -581,9 +649,10 @@ instance : FromJson AppConfig where
     let taxis := j.getObjValAs? Taxis.Config "taxis" |>.toOption
     let queue := j.getObjValAs? QueueConfig "queue" |>.toOption |>.getD {}
     let defaultOrganization := j.getObjValAs? String "default_organization" |>.toOption
+    let deploy := j.getObjValAs? DeployConfig "deploy" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs, additionalSandboxPaths, taxis, queue, defaultOrganization }
+             agentAuthConfigs, additionalSandboxPaths, taxis, queue, defaultOrganization, deploy }
 
 structure TaskFile where
   tasks : Array Task

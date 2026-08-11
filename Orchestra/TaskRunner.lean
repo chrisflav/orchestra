@@ -504,6 +504,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     enqueueMerger   := some (enqueueMergerImpl appConfig)
     enqueueReviewer := some enqueueReviewerImpl
     prLabels  := ioTask.prLabels
+    deploy    := appConfig.deploy
+    -- The clone `deploy_preview` exports from. The sandbox never fetches its own source, so
+    -- without this the tool has nothing to deploy and says so.
+    repoPath  := some repoPath
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"

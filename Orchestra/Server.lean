@@ -2,6 +2,7 @@ import Lean.Data.Json
 import Std.Internal.UV.TCP
 import Std.Net
 import Orchestra.Config
+import Orchestra.Deploy
 import Orchestra.GitHub
 import Orchestra.Project.Tools
 
@@ -58,6 +59,12 @@ structure State where
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
   prLabels : List String := []
+  /-- Previews cluster backing the `deploy` tool group. `none` — the default, and the case
+      outside the daemon — makes those tools refuse with "not configured". -/
+  deploy : Option DeployConfig := none
+  /-- The task's clone. `deploy_preview` exports the ref from here with `git archive` rather
+      than letting the sandbox fetch it, which is what keeps every credential out of the pod. -/
+  repoPath : Option System.FilePath := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -292,6 +299,88 @@ private def optionalToolDefs : List (String × Json) := [
       ("required", .arr #["body"])
     ])
   ]),
+  -- The four deployment tools share one permission label, `deploy`: a task that may create a
+  -- preview may also destroy, list and read the logs of one. Splitting them would mean a task
+  -- able to start a sandbox but not to clean it up.
+  ("deploy", Json.mkObj [
+    ("name", "deploy_preview"),
+    ("description",
+      "Deploy this repository's docker-compose project as a preview environment and return a " ++
+      "URL a human can open. The compose file is used as-is: it runs in a sandbox with its own " ++
+      "kernel on a separate machine, so nothing about it needs to be restricted. Building " ++
+      "happens inside that sandbox and can take a few minutes. Re-deploying the same pull " ++
+      "request replaces its preview rather than creating a second one. Every preview expires " ++
+      "on its own — do not rely on one being there tomorrow."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("ref", Json.mkObj [
+          ("type", "string"),
+          ("description",
+            "Branch or commit to deploy. It must be committed in the task's clone — the " ++
+            "sandbox is given an export of that ref, not a checkout of your working tree, so " ++
+            "uncommitted changes are not deployed.")
+        ]),
+        ("compose_file", Json.mkObj [
+          ("type", "string"),
+          ("description", "Compose file relative to the repository root (default: docker-compose.yaml).")
+        ]),
+        ("port", Json.mkObj [
+          ("type", "integer"),
+          ("description",
+            "The port the compose project publishes that the preview URL should route to " ++
+            "(default: 80).")
+        ]),
+        ("pr_number", Json.mkObj [
+          ("type", "integer"),
+          ("description",
+            "Pull request this preview belongs to. Defaults to the issue or PR the task was " ++
+            "launched from; it decides which previews replace each other.")
+        ])
+      ]),
+      ("required", .arr #["ref"])
+    ])
+  ]),
+  ("deploy", Json.mkObj [
+    ("name", "destroy_preview"),
+    ("description",
+      "Remove a preview deployment and everything belonging to it. Removing one that is " ++
+      "already gone succeeds."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("name", Json.mkObj [
+          ("type", "string"),
+          ("description", "Deployment name, as returned by deploy_preview or list_deployments.")
+        ])
+      ]),
+      ("required", .arr #["name"])
+    ])
+  ]),
+  ("deploy", Json.mkObj [
+    ("name", "list_deployments"),
+    ("description",
+      "List every preview deployment currently running on the previews cluster, with its URL, " ++
+      "status and expiry."),
+    ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
+  ]),
+  ("deploy", Json.mkObj [
+    ("name", "deployment_logs"),
+    ("description",
+      "Read the compose project's logs from inside a preview's sandbox. This is how to find " ++
+      "out why a deployment that came up is not serving what you expected."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("name", Json.mkObj [("type", "string"), ("description", "Deployment name.")]),
+        ("tail", Json.mkObj [
+          ("type", "integer"),
+          ("description", "Lines to read from the end of each service's log (default: 200).")
+        ])
+      ]),
+      ("required", .arr #["name"])
+    ])
+  ]),
 ]
 
 private def ioToolDefs (inputType outputType : ResultType) : Array Json :=
@@ -376,6 +465,11 @@ inductive ToolCall where
   | comment (action : CommentAction)
   | getTaskInput
   | submitTaskOutput (value : Json)
+  /-- Deploy a ref's compose project as a preview environment. -/
+  | deployPreview (ref : String) (composeFile : String) (port : Nat) (prNumber : Option Nat)
+  | destroyPreview (name : String)
+  | listDeployments
+  | deploymentLogs (name : String) (tailLines : Nat)
   /-- A project / issue tool from `Orchestra.Project.Tools`. -/
   | project (call : Project.Tools.ProjectTool)
   | unknown (name : String)
@@ -518,6 +612,35 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
             .parseError "'reply_to_comment_id' and 'path'/'line' are mutually exclusive"
           | none, some _, none   => .parseError "'path' requires 'line'"
           | none, none, some _   => .parseError "'line' requires 'path'"
+  | "deploy_preview" =>
+    match args.getObjValAs? String "ref" |>.toOption with
+    | none => .parseError "missing required argument: ref"
+    | some ref =>
+      -- Validated here rather than only where it is used, so a ref that git would read as an
+      -- option is refused before any process is started with it.
+      match Deploy.validateRef ref with
+      | .error e => .parseError e
+      | .ok ref =>
+        let composeFile := args.getObjValAs? String "compose_file" |>.toOption
+          |>.getD "docker-compose.yaml"
+        let port := args.getObjValAs? Nat "port" |>.toOption |>.getD 80
+        if port == 0 || port > 65535 then
+          .parseError "'port' must be between 1 and 65535"
+        else
+          .deployPreview ref composeFile port (args.getObjValAs? Nat "pr_number" |>.toOption)
+  | "destroy_preview" =>
+    match args.getObjValAs? String "name" |>.toOption with
+    | none => .parseError "missing required argument: name"
+    | some name =>
+      if name.trim.isEmpty then .parseError "'name' must not be empty"
+      else .destroyPreview name.trim
+  | "list_deployments" => .listDeployments
+  | "deployment_logs" =>
+    match args.getObjValAs? String "name" |>.toOption with
+    | none => .parseError "missing required argument: name"
+    | some name =>
+      if name.trim.isEmpty then .parseError "'name' must not be empty"
+      else .deploymentLogs name.trim (args.getObjValAs? Nat "tail" |>.toOption |>.getD 200)
   | "get_task_input" => .getTaskInput
   | "submit_task_output" =>
     match args.getObjVal? "value" with
@@ -722,6 +845,105 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       return toolContent "output recorded"
     | none =>
       return toolContent "output submission not available for this task" (isError := true)
+  | .deployPreview ref composeFile port prNumber =>
+    match state.deploy, state.repoPath with
+    | none, _ =>
+      log "tool deploy_preview: denied (deploy not configured)"
+      return toolContent
+        "preview deployments are not configured: no \"deploy\" section in config.json"
+        (isError := true)
+    | _, none =>
+      -- Outside the daemon there is no clone to export from, and the sandbox is never allowed to
+      -- fetch one itself. Better to say so than to deploy an empty tree.
+      log "tool deploy_preview: no repository path on this task"
+      return toolContent
+        "this task has no clone to deploy from" (isError := true)
+    | some cfg, some repoPath =>
+      if !state.allowedTools.contains "deploy" then
+        log "tool deploy_preview: denied (not in allowed tools)"
+        return toolContent "deploying previews is not enabled for this task" (isError := true)
+      let spec : Deploy.Spec :=
+        { repo := state.upstream
+        , ref
+        , sourcePath := repoPath
+        , composeFile
+        , port
+          -- The PR the task was launched from is the right default: it is what a reviewer
+          -- follows the link from, and it is what makes a second run replace the first.
+        , prNumber := prNumber <|> state.issueNumber }
+      log s!"tool deploy_preview: {state.upstream} ref={ref} compose={composeFile} port={port}"
+      -- Wrapped like every other tool that touches the outside world: `Deploy` shells out, and a
+      -- `kubectl` that is not on the daemon's PATH throws rather than returning an error. Without
+      -- this the exception unwinds past the JSON-RPC layer, which drops the agent's connection
+      -- with no response at all instead of telling it what is wrong.
+      try
+        match ← Deploy.create cfg spec with
+        | .error e =>
+          log s!"tool deploy_preview: error: {e.take 200}"
+          return toolContent e (isError := true)
+        | .ok deployment =>
+          log s!"tool deploy_preview: ok: {deployment.url}"
+          return toolContent (Lean.toJson deployment).compress
+      catch e =>
+        log s!"tool deploy_preview: error: {e}"
+        return toolContent (toString e) (isError := true)
+  | .destroyPreview name =>
+    match state.deploy with
+    | none =>
+      return toolContent
+        "preview deployments are not configured: no \"deploy\" section in config.json"
+        (isError := true)
+    | some cfg =>
+      if !state.allowedTools.contains "deploy" then
+        log "tool destroy_preview: denied (not in allowed tools)"
+        return toolContent "deploying previews is not enabled for this task" (isError := true)
+      log s!"tool destroy_preview: {name}"
+      try
+        -- Scoped to this task's repository: `list_deployments` shows the whole namespace, and
+        -- without the check a task could tear down an unrelated pull request's preview.
+        match ← Deploy.destroy cfg name (owner := some state.upstream) with
+        | .error e => return toolContent e (isError := true)
+        | .ok () => return toolContent s!"deployment {name} removed"
+      catch e =>
+        log s!"tool destroy_preview: error: {e}"
+        return toolContent (toString e) (isError := true)
+  | .listDeployments =>
+    match state.deploy with
+    | none =>
+      return toolContent
+        "preview deployments are not configured: no \"deploy\" section in config.json"
+        (isError := true)
+    | some cfg =>
+      if !state.allowedTools.contains "deploy" then
+        log "tool list_deployments: denied (not in allowed tools)"
+        return toolContent "deploying previews is not enabled for this task" (isError := true)
+      try
+        match ← Deploy.list cfg with
+        | .error e => return toolContent e (isError := true)
+        | .ok deployments =>
+          return toolContent (Json.arr (deployments.map Lean.toJson)).compress
+      catch e =>
+        log s!"tool list_deployments: error: {e}"
+        return toolContent (toString e) (isError := true)
+  | .deploymentLogs name tailLines =>
+    match state.deploy with
+    | none =>
+      return toolContent
+        "preview deployments are not configured: no \"deploy\" section in config.json"
+        (isError := true)
+    | some cfg =>
+      if !state.allowedTools.contains "deploy" then
+        log "tool deployment_logs: denied (not in allowed tools)"
+        return toolContent "deploying previews is not enabled for this task" (isError := true)
+      try
+        -- Same scoping as destroy, and for a sharper reason: these are the logs of another
+        -- project's compose services, environment and all.
+        match ← Deploy.logs cfg name tailLines (owner := some state.upstream) with
+        | .error e => return toolContent e (isError := true)
+        | .ok out => return toolContent out
+      catch e =>
+        log s!"tool deployment_logs: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .project call =>
     let env : Project.Tools.Env :=
       { claimManager  := state.claimManager

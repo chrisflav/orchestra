@@ -76,6 +76,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code
 
+# kubectl: the whole of how orchestra talks to the previews cluster (`Orchestra.Deploy`). There
+# is no orchestra-specific agent on that side — the protocol is the Kubernetes API — so this
+# binary is the transport, and without it the `deploy` tools throw on a missing executable in a
+# container that otherwise looks fully configured. Harmless when no `deploy` section exists.
+# Pinned to a release rather than tracking latest: kubectl supports one minor version of skew
+# either side of the server, so an unpinned client eventually drifts past the cluster.
+ARG KUBECTL_VERSION=v1.34.1
+RUN curl -fsSLo /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/$(dpkg --print-architecture)/kubectl" \
+    && chmod +x /usr/local/bin/kubectl
+
 # Skills shipped with orchestra, seeded into /config on first start by the entrypoint. Baked in
 # at a fixed path because /config is a bind mount and starts empty.
 COPY skills /opt/orchestra/skills

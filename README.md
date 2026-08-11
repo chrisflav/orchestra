@@ -531,6 +531,20 @@ must be enabled explicitly by adding them to the `tools` list in the task config
   The `comment` tool requires the task to carry an `issue_number` (set automatically by the
   listener when triggered from an issue or pull request).
 
+One more group, `deploy`, appears when a `deploy` section is configured (see
+[preview deployments](#preview-deployments)). Granting it grants all four of its tools, because a
+task that may start a preview must be able to clean one up:
+
+- `deploy_preview` — build and run a ref's `docker-compose.yaml` on the previews cluster and
+  return the URL. The compose file is used **as-is**: nothing validates or rewrites it, because
+  it runs in a sandbox with its own kernel on a machine holding none of orchestra's credentials.
+  The ref must be committed — what is deployed is a `git archive` of it out of the task's clone,
+  not the working tree, which is also how the sandbox is spared ever holding a token
+- `destroy_preview` — remove a preview and everything belonging to it
+- `list_deployments` — every preview currently running, with status and expiry
+- `deployment_logs` — the compose project's logs from inside the sandbox, for working out why a
+  preview that came up is not serving what was expected
+
 Three more tool groups — `manage_issues`, `work_issues`, `review_issues` — are available when a
 task carries them in its `tools` list, backing orchestra's project/issue/claim workflow (a taxis
 issue tracker instance, not local files — see [`examples/projects/README.md`](examples/projects/README.md)
@@ -1031,6 +1045,120 @@ orchestrad queue                      # the queue daemon alone
 orchestrad dashboard --site web/dist  # the API, SSE and UI on one port
 ```
 
+## preview deployments
+
+A preview is a pull request's own `docker-compose.yaml`, built and running behind a URL a human
+can open. The point of the design is what it does *not* do: the compose file is never inspected.
+It may ask for `privileged: true`, a socket mount, host networking — anything. That is affordable
+because of where it runs, not because of what it is allowed to say.
+
+Three properties carry the whole thing, and they are worth stating plainly because everything
+else follows from them:
+
+- **Each preview is a VM.** Pods are scheduled with `runtimeClassName: kata`, so a preview gets
+  its own kernel rather than sharing the node's.
+- **The cluster holds nothing.** It runs on a separate machine from the daemon — no GitHub App
+  key, no PAT, no agent tokens, no clones. A preview that escapes its sandbox lands somewhere
+  worthless.
+- **The sandbox never holds a credential.** It cannot clone the repository and is not asked to:
+  orchestra exports the ref from the clone it already has with `git archive` and copies the tree
+  in. Building happens inside the sandbox, because an arbitrary `RUN` line is arbitrary code and
+  building it on the daemon's host would hand it the machine the sandbox exists to protect.
+
+The cluster is `container/previews-vm/` — a NixOS incus VM running single-node k3s with Kata
+Containers, a `previews` namespace with a quota, and network policies that let a preview reach
+the internet but not the daemon, the LAN, or another preview. Its README covers the build, the
+nested-virtualisation prerequisite, and how to check the isolation is real rather than assumed.
+
+### talking to the cluster
+
+There is **no orchestra-specific agent on the previews side**. The protocol is the Kubernetes
+API: orchestra shells out to `kubectl` and the whole surface is `apply`, `wait`, `exec`, `cp`,
+`get`, and a `delete` by label. `exec` and `cp` stream through the API server to the kubelet, so
+port 6443 is the only thing the daemon needs — no SSH, no docker socket, no second service.
+
+That makes the target interchangeable. Any cluster works if it has a `kata` RuntimeClass, an
+ingress controller, and a sandbox image carrying `sh`, `tar` and `timeout`; the VM in
+`container/previews-vm/` is one such cluster, not a requirement. `kubectl` ships in orchestra's
+Docker image for this reason.
+
+**Use a scoped credential, not `k3s.yaml`.** The kubeconfig k3s writes is
+`O=system:masters, CN=system:admin` — cluster-admin, and `exec` into any pod on the node. The
+previews VM therefore also creates a `orchestra-deployer` ServiceAccount whose namespaced Role
+grants exactly the verbs above and nothing else, plus a helper that emits a kubeconfig for it:
+
+```
+incus exec nixvm -- previews-kubeconfig https://previews.example.com:6443 > previews.kubeconfig
+```
+
+That credential can list and destroy previews and exec into them, and cannot read a node, a
+namespace, or a secret outside `previews`. If it leaks, what it costs you is previews, which are
+disposable by construction.
+
+Exposing the API server to a network is otherwise unremarkable — it is mutually-authenticated
+TLS, which is how every hosted Kubernetes works. Three things to get right when you do:
+
+- put `previews.k3s.tlsSans` on the name you will reach it by, or certificate verification fails;
+- prefer a private path (WireGuard, Tailscale, a source-IP allowlist) over a public endpoint;
+- **add the new endpoint to `previews.k3s.extraEgressExcept`.** The egress policy carves out
+  RFC1918, so while the API server is on a private address a preview cannot reach it. Move it to
+  a public one and it falls back inside `0.0.0.0/0` — reachable from inside the sandboxes it
+  schedules. Unauthenticated, but not a door to leave open.
+
+Point orchestra at it with a `deploy` section in `config.json`:
+
+```json
+"deploy": {
+  "kubeconfig": "/etc/orchestra/previews.kubeconfig",
+  "context": "previews",
+  "base_domain": "previews.example.com",
+  "ingress_class": "traefik",
+  "namespace": "previews",
+  "runtime_class": "kata",
+  "image": "docker:28-dind",
+  "ttl_minutes": 240,
+  "build_timeout_minutes": 30,
+  "cpu_limit": "2",
+  "memory_limit": "4Gi",
+  "kubectl": "kubectl"
+}
+```
+
+Only `kubeconfig` and `base_domain` are required; `base_domain` needs a wildcard DNS record
+pointing at the cluster's ingress. Without the section the feature is off and the tools say so
+rather than half-working. The kubeconfig is held by the daemon and never reaches an agent — it is
+the credential that makes exposing this as a tool safe.
+
+`context` matters only for a kubeconfig holding more than one cluster, where the current-context
+would otherwise decide where previews land. `ingress_class` matters on a cluster with several
+ingress controllers and no default: leave it unset and nothing claims the Ingress, which looks
+like a preview that came up healthy and answers nothing.
+
+`memory_limit` is charged to the namespace quota as a *request* as well as a limit — Kubernetes
+copies limits into requests when requests are absent, and a Kata sandbox holds its guest's RAM for
+as long as it runs anyway — so it, not `count/pods`, is what sets how many previews fit.
+
+Every preview carries its own expiry, written onto the pod when it is created. The daemon sweeps
+what has passed it every five minutes, and `orchestra deploy gc` does the same on demand. Reading
+the schedule off the pods rather than from orchestra's own state is deliberate: the daemon that
+created a preview is often not the one that outlives it, and a preview whose pull request was
+forgotten is the normal case.
+
+A build that never finishes is an expected input rather than an accident, since nobody reads the
+compose file first — `build_timeout_minutes` bounds it, and the timeout is enforced inside the
+sandbox so the runaway is killed rather than merely abandoned.
+
+The same operations are available from the command line, which is what you want at the moment an
+agent has left something behind:
+
+```
+orchestra deploy <ref> --repo <clone> --pr 42 --port 8080
+orchestra deploy list
+orchestra deploy logs <name> --tail 100
+orchestra deploy destroy <name>
+orchestra deploy gc
+```
+
 ## container
 
 The `container/` directory contains a NixOS image definition for incus. It
@@ -1062,6 +1190,18 @@ user:
 ```
 incus exec my-orchestra -- su orchestra
 ```
+
+### the previews VM
+
+`container/previews-vm/` is a second, separate machine: a NixOS incus **VM** running single-node
+k3s where every pod is a lightweight VM of its own (Kata Containers). It is the deployment target
+for preview environments — arbitrary Dockerfiles and compose files out of pull requests, built
+and run without being read first — and it deliberately holds none of orchestra's credentials, so
+that a preview escaping its sandbox lands on a machine worth nothing.
+
+It needs nested virtualisation on the incus host. See
+[`container/previews-vm/README.md`](container/previews-vm/README.md) for the build, the host
+prerequisite and how to check the isolation is real.
 
 ## docker
 

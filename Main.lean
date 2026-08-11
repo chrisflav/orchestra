@@ -8,6 +8,7 @@ import Orchestra.Concert
 import Orchestra.ConcertManager
 import Orchestra.Config
 import Orchestra.DaemonRequest
+import Orchestra.Deploy
 import Orchestra.Dirs
 import Orchestra.GitHub
 import Orchestra.Listener
@@ -1438,6 +1439,151 @@ private def interactiveCmd : Cmd := `[Cli|
     auth_mode   : String; "How to pick among --auth_sources: ordered (default) or distribute"
 ]
 
+/-! ## Preview deployments
+
+The same operations the `deploy` MCP tool group exposes to an agent, for a person: mostly to see
+what is running and to remove something that should not be, which is exactly what one wants at
+the moment an agent has left a preview behind. `gc` is here rather than on a timer inside the
+daemon because it is safe to run from anywhere and reads its schedule off the pods themselves. -/
+
+private def deployConfig (p : Parsed) : IO DeployConfig := do
+  let configPath := p.flag? "config" |>.map (·.as! String)
+  let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  match appConfig.deploy with
+  | some cfg => return cfg
+  | none => throw (.userError
+      "no \"deploy\" section in config.json — see the previews cluster docs in README.md")
+
+private def printDeployment (d : Deploy.Deployment) : IO Unit :=
+  IO.println s!"{d.name}  {d.status}  expires {d.expiresAt}  {d.url}"
+
+private def deployHandler (p : Parsed) : IO UInt32 := do
+  let cfg ← deployConfig p
+  -- `--ref` exists because `Cli` resolves subcommands off the first positional token, so a branch
+  -- actually named `list`, `logs`, `destroy` or `gc` can never be reached positionally.
+  let refArg := match p.flag? "ref" |>.map (·.as! String) with
+    | some r => some r
+    | none => (p.variableArgsAs? String |>.getD #[])[0]?
+  let some rawRef := refArg
+    | IO.eprintln "no ref given: pass one positionally, or with --ref for a branch named like a \
+        subcommand"
+      return 1
+  let ref ← match Deploy.validateRef rawRef with
+    | .ok r => pure r
+    | .error e => IO.eprintln e; return 1
+  let repoPath := p.flag? "repo" |>.map (·.as! String) |>.getD "."
+  let upstream ← match p.flag? "upstream" |>.map (·.as! String) with
+    | some s => IO.ofExcept (Repository.parse s)
+    | none =>
+      -- Only ever used to name the deployment, so a placeholder derived from the directory is
+      -- honest rather than a demand for a flag nobody deploying by hand cares about.
+      pure { owner := "local", name := (System.FilePath.mk repoPath).fileName.getD "repo" }
+  let spec : Deploy.Spec :=
+    { repo := upstream
+    , ref
+    , sourcePath := repoPath
+    , composeFile := p.flag? "compose" |>.map (·.as! String) |>.getD "docker-compose.yaml"
+    , port := p.flag? "port" |>.map (·.as! Nat) |>.getD 80
+    , prNumber := p.flag? "pr" |>.map (·.as! Nat) }
+  match ← Deploy.create cfg spec with
+  | .error e => IO.eprintln e; return 1
+  | .ok d => printDeployment d; return 0
+
+private def deployListHandler (p : Parsed) : IO UInt32 := do
+  let cfg ← deployConfig p
+  match ← Deploy.list cfg with
+  | .error e => IO.eprintln e; return 1
+  | .ok ds =>
+    if ds.isEmpty then IO.println "No deployments." else ds.forM printDeployment
+    return 0
+
+private def deployDestroyHandler (p : Parsed) : IO UInt32 := do
+  let cfg ← deployConfig p
+  let name := p.positionalArg! "name" |>.as! String
+  match ← Deploy.destroy cfg name with
+  | .error e => IO.eprintln e; return 1
+  | .ok () => IO.println s!"{name} removed"; return 0
+
+private def deployLogsHandler (p : Parsed) : IO UInt32 := do
+  let cfg ← deployConfig p
+  let name := p.positionalArg! "name" |>.as! String
+  match ← Deploy.logs cfg name (p.flag? "tail" |>.map (·.as! Nat) |>.getD 200) with
+  | .error e => IO.eprintln e; return 1
+  | .ok out => IO.println out; return 0
+
+private def deployGcHandler (p : Parsed) : IO UInt32 := do
+  let cfg ← deployConfig p
+  match ← Deploy.gc cfg with
+  | .error e => IO.eprintln e; return 1
+  | .ok removed =>
+    if removed.isEmpty then IO.println "Nothing expired."
+    else for name in removed do IO.println s!"{name} expired and removed"
+    return 0
+
+private def deployListCmd : Cmd := `[Cli|
+  list VIA deployListHandler; ["0.1.0"]
+  "List preview deployments on the previews cluster."
+
+  FLAGS:
+    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+]
+
+private def deployDestroyCmd : Cmd := `[Cli|
+  destroy VIA deployDestroyHandler; ["0.1.0"]
+  "Remove a preview deployment. Removing one that is already gone succeeds."
+
+  FLAGS:
+    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+
+  ARGS:
+    name : String; "Deployment name"
+]
+
+private def deployLogsCmd : Cmd := `[Cli|
+  logs VIA deployLogsHandler; ["0.1.0"]
+  "Read the compose project's logs from inside a preview's sandbox."
+
+  FLAGS:
+    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    tail      : Nat;    "Lines from the end of each service's log (default: 200)"
+
+  ARGS:
+    name : String; "Deployment name"
+]
+
+private def deployGcCmd : Cmd := `[Cli|
+  gc VIA deployGcHandler; ["0.1.0"]
+  "Remove every preview whose expiry has passed. Safe to run repeatedly, and from anywhere."
+
+  FLAGS:
+    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+]
+
+private def deployCmd : Cmd := `[Cli|
+  deploy VIA deployHandler; ["0.1.0"]
+  "Deploy a ref's docker-compose project to the previews cluster and print its URL. \
+The compose file is run as-is inside a sandbox with its own kernel; the ref must be committed, \
+because what is deployed is a `git archive` of it rather than the working tree."
+
+  FLAGS:
+    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    ref       : String; "Ref to deploy, for a branch named like a subcommand (list, logs, destroy, gc)"
+    repo      : String; "Repository clone to export the ref from (default: .)"
+    upstream  : String; "Repository in 'owner/repo' form, used to name the deployment"
+    compose   : String; "Compose file relative to the repository root (default: docker-compose.yaml)"
+    port      : Nat;    "Port the compose project publishes to route to (default: 80)"
+    pr        : Nat;    "Pull request number this preview belongs to"
+
+  ARGS:
+    ...ref : String; "Branch, tag or commit to deploy"
+
+  SUBCOMMANDS:
+    deployListCmd;
+    deployDestroyCmd;
+    deployLogsCmd;
+    deployGcCmd
+]
+
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
   IO.eprintln "Use a subcommand. Try 'orchestra --help'."
   return 1
@@ -1466,6 +1612,7 @@ def orchestraCmd : Cmd := `[Cli|
     rolesCmd;
     usageCmd;
     migrateCmd;
+    deployCmd;
     dashboardCmd
 ]
 
