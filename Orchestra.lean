@@ -31,5 +31,6 @@ import Orchestra.WorkflowParser
 import Orchestra.Secret
 import Orchestra.Skill
 import Orchestra.Daemon
+import Orchestra.Deploy
 import Orchestra.Client
 import Orchestra.Utils.Streams

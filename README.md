@@ -531,6 +531,20 @@ must be enabled explicitly by adding them to the `tools` list in the task config
   The `comment` tool requires the task to carry an `issue_number` (set automatically by the
   listener when triggered from an issue or pull request).
 
+One more group, `deploy`, appears when a `deploy` section is configured (see
+[preview deployments](#preview-deployments)). Granting it grants all four of its tools, because a
+task that may start a preview must be able to clean one up:
+
+- `deploy_preview` — build and run a ref's `docker-compose.yaml` on the previews cluster and
+  return the URL. The compose file is used **as-is**: nothing validates or rewrites it, because
+  it runs in a sandbox with its own kernel on a machine holding none of orchestra's credentials.
+  The ref must be committed — what is deployed is a `git archive` of it out of the task's clone,
+  not the working tree, which is also how the sandbox is spared ever holding a token
+- `destroy_preview` — remove a preview and everything belonging to it
+- `list_deployments` — every preview currently running, with status and expiry
+- `deployment_logs` — the compose project's logs from inside the sandbox, for working out why a
+  preview that came up is not serving what was expected
+
 Three more tool groups — `manage_issues`, `work_issues`, `review_issues` — are available when a
 task carries them in its `tools` list, backing orchestra's project/issue/claim workflow (a taxis
 issue tracker instance, not local files — see [`examples/projects/README.md`](examples/projects/README.md)
@@ -1031,6 +1045,68 @@ orchestrad queue                      # the queue daemon alone
 orchestrad dashboard --site web/dist  # the API, SSE and UI on one port
 ```
 
+## preview deployments
+
+A preview is a pull request's own `docker-compose.yaml`, built and running behind a URL a human
+can open. The point of the design is what it does *not* do: the compose file is never inspected.
+It may ask for `privileged: true`, a socket mount, host networking — anything. That is affordable
+because of where it runs, not because of what it is allowed to say.
+
+Three properties carry the whole thing, and they are worth stating plainly because everything
+else follows from them:
+
+- **Each preview is a VM.** Pods are scheduled with `runtimeClassName: kata`, so a preview gets
+  its own kernel rather than sharing the node's.
+- **The cluster holds nothing.** It runs on a separate machine from the daemon — no GitHub App
+  key, no PAT, no agent tokens, no clones. A preview that escapes its sandbox lands somewhere
+  worthless.
+- **The sandbox never holds a credential.** It cannot clone the repository and is not asked to:
+  orchestra exports the ref from the clone it already has with `git archive` and copies the tree
+  in. Building happens inside the sandbox, because an arbitrary `RUN` line is arbitrary code and
+  building it on the daemon's host would hand it the machine the sandbox exists to protect.
+
+The cluster is `container/previews-vm/` — a NixOS incus VM running single-node k3s with Kata
+Containers, a `previews` namespace with a quota, and network policies that let a preview reach
+the internet but not the daemon, the LAN, or another preview. Its README covers the build, the
+nested-virtualisation prerequisite, and how to check the isolation is real rather than assumed.
+
+Point orchestra at it with a `deploy` section in `config.json`:
+
+```json
+"deploy": {
+  "kubeconfig": "/etc/orchestra/previews.kubeconfig",
+  "base_domain": "previews.example.com",
+  "namespace": "previews",
+  "runtime_class": "kata",
+  "image": "docker:28-dind",
+  "ttl_minutes": 240,
+  "cpu_limit": "2",
+  "memory_limit": "4Gi",
+  "kubectl": "kubectl"
+}
+```
+
+Only `kubeconfig` and `base_domain` are required; `base_domain` needs a wildcard DNS record
+pointing at the cluster's ingress. Without the section the feature is off and the tools say so
+rather than half-working. The kubeconfig is held by the daemon and never reaches an agent — it is
+the credential that makes exposing this as a tool safe.
+
+Every preview carries its own expiry, written onto the pod when it is created, and
+`orchestra deploy gc` removes whatever has passed it. Reading the schedule off the pods rather
+than from orchestra's own state is deliberate: the daemon that created a preview is often not the
+one that outlives it, and a preview whose pull request was forgotten is the normal case.
+
+The same operations are available from the command line, which is what you want at the moment an
+agent has left something behind:
+
+```
+orchestra deploy <ref> --repo <clone> --pr 42 --port 8080
+orchestra deploy list
+orchestra deploy logs <name> --tail 100
+orchestra deploy destroy <name>
+orchestra deploy gc
+```
+
 ## container
 
 The `container/` directory contains a NixOS image definition for incus. It
@@ -1062,6 +1138,18 @@ user:
 ```
 incus exec my-orchestra -- su orchestra
 ```
+
+### the previews VM
+
+`container/previews-vm/` is a second, separate machine: a NixOS incus **VM** running single-node
+k3s where every pod is a lightweight VM of its own (Kata Containers). It is the deployment target
+for preview environments — arbitrary Dockerfiles and compose files out of pull requests, built
+and run without being read first — and it deliberately holds none of orchestra's credentials, so
+that a preview escaping its sandbox lands on a machine worth nothing.
+
+It needs nested virtualisation on the incus host. See
+[`container/previews-vm/README.md`](container/previews-vm/README.md) for the build, the host
+prerequisite and how to check the isolation is real.
 
 ## docker
 
