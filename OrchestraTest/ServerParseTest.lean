@@ -141,8 +141,8 @@ def parseToolCall_getPrComments_nonInteger : Test := do
 def parseToolCall_comment_issue : Test := do
   let args := Json.mkObj [("body", .str "Hello!")]
   match parseToolCall "comment" args with
-  | .comment (.issue body) => TestM.assertEqual body "Hello!" (msg := "body")
-  | _ => TestM.fail "expected .comment (.issue ...)"
+  | .comment (.issue body) .upstream => TestM.assertEqual body "Hello!" (msg := "body")
+  | _ => TestM.fail "expected .comment (.issue ...) .upstream"
 
 @[test]
 def parseToolCall_comment_missingBody : Test := do
@@ -163,10 +163,10 @@ def parseToolCall_comment_emptyBody : Test := do
 def parseToolCall_comment_review : Test := do
   let args := Json.mkObj [("body", .str "LGTM"), ("review", .bool true)]
   match parseToolCall "comment" args with
-  | .comment (.review body inlineComments) =>
+  | .comment (.review body inlineComments) .upstream =>
     TestM.assertEqual body "LGTM"           (msg := "body")
     TestM.assertEqual inlineComments.size 0 (msg := "no inline comments")
-  | _ => TestM.fail "expected .comment (.review ...)"
+  | _ => TestM.fail "expected .comment (.review ...) .upstream"
 
 @[test]
 def parseToolCall_comment_reviewWithInline : Test := do
@@ -182,7 +182,7 @@ def parseToolCall_comment_reviewWithInline : Test := do
     ("inline_comments", .arr #[item])
   ]
   match parseToolCall "comment" args with
-  | .comment (.review body inlineComments) =>
+  | .comment (.review body inlineComments) .upstream =>
     TestM.assertEqual body "Review body"    (msg := "body")
     TestM.assertEqual inlineComments.size 1 (msg := "inline comment count")
     match inlineComments[0]? with
@@ -192,7 +192,7 @@ def parseToolCall_comment_reviewWithInline : Test := do
       TestM.assertEqual ic.line 10             (msg := "inline line")
       TestM.assertEqual ic.body "Fix this"     (msg := "inline body")
       TestM.assertEqual ic.side "LEFT"         (msg := "inline side")
-  | _ => TestM.fail "expected .comment (.review ...) with inline"
+  | _ => TestM.fail "expected .comment (.review ...) .upstream with inline"
 
 @[test]
 def parseToolCall_comment_reviewWithInline_defaultSide : Test := do
@@ -207,11 +207,11 @@ def parseToolCall_comment_reviewWithInline_defaultSide : Test := do
     ("inline_comments", .arr #[item])
   ]
   match parseToolCall "comment" args with
-  | .comment (.review _ inlineComments) =>
+  | .comment (.review _ inlineComments) .upstream =>
     match inlineComments[0]? with
     | none => TestM.fail "no inline comment"
     | some ic => TestM.assertEqual ic.side "RIGHT" (msg := "default side")
-  | _ => TestM.fail "expected .comment (.review ...)"
+  | _ => TestM.fail "expected .comment (.review ...) .upstream"
 
 @[test]
 def parseToolCall_comment_reviewMutualExclusion_replyId : Test := do
@@ -245,10 +245,10 @@ def parseToolCall_comment_replyInline : Test := do
     ("reply_to_comment_id", .num ⟨99, 0⟩)
   ]
   match parseToolCall "comment" args with
-  | .comment (.replyInline body cid) =>
+  | .comment (.replyInline body cid) .upstream =>
     TestM.assertEqual body "Got it" (msg := "body")
     TestM.assertEqual cid  99       (msg := "comment id")
-  | _ => TestM.fail "expected .comment (.replyInline ...)"
+  | _ => TestM.fail "expected .comment (.replyInline ...) .upstream"
 
 @[test]
 def parseToolCall_comment_replyInline_withPath : Test := do
@@ -272,12 +272,12 @@ def parseToolCall_comment_newInline : Test := do
     ("side", .str "LEFT")
   ]
   match parseToolCall "comment" args with
-  | .comment (.newInline ic) =>
+  | .comment (.newInline ic) .upstream =>
     TestM.assertEqual ic.body "Fix here" (msg := "body")
     TestM.assertEqual ic.path "Foo.lean" (msg := "path")
     TestM.assertEqual ic.line 42         (msg := "line")
     TestM.assertEqual ic.side "LEFT"     (msg := "side")
-  | _ => TestM.fail "expected .comment (.newInline ...)"
+  | _ => TestM.fail "expected .comment (.newInline ...) .upstream"
 
 @[test]
 def parseToolCall_comment_newInline_defaultSide : Test := do
@@ -287,9 +287,9 @@ def parseToolCall_comment_newInline_defaultSide : Test := do
     ("line", .num ⟨1, 0⟩)
   ]
   match parseToolCall "comment" args with
-  | .comment (.newInline ic) =>
+  | .comment (.newInline ic) .upstream =>
     TestM.assertEqual ic.side "RIGHT" (msg := "default side RIGHT")
-  | _ => TestM.fail "expected .comment (.newInline ...)"
+  | _ => TestM.fail "expected .comment (.newInline ...) .upstream"
 
 @[test]
 def parseToolCall_comment_pathWithoutLine : Test := do
@@ -304,6 +304,36 @@ def parseToolCall_comment_lineWithoutPath : Test := do
   match parseToolCall "comment" args with
   | .parseError _ => TestM.assert true
   | _ => TestM.fail "expected .parseError: line without path"
+
+-- parseToolCall: comment — target parameter
+
+@[test]
+def parseToolCall_comment_targetUpstreamExplicit : Test := do
+  let args := Json.mkObj [("body", .str "hi"), ("target", .str "upstream")]
+  match parseToolCall "comment" args with
+  | .comment (.issue _) .upstream => TestM.assert true
+  | _ => TestM.fail "expected .comment ... .upstream"
+
+@[test]
+def parseToolCall_comment_targetFork : Test := do
+  let args := Json.mkObj [("body", .str "hi"), ("target", .str "fork")]
+  match parseToolCall "comment" args with
+  | .comment (.issue _) .fork => TestM.assert true
+  | _ => TestM.fail "expected .comment ... .fork"
+
+@[test]
+def parseToolCall_comment_targetInvalid : Test := do
+  let args := Json.mkObj [("body", .str "hi"), ("target", .str "bad")]
+  match parseToolCall "comment" args with
+  | .parseError _ => TestM.assert true
+  | _ => TestM.fail "expected .parseError for invalid target"
+
+@[test]
+def parseToolCall_comment_targetFork_review : Test := do
+  let args := Json.mkObj [("body", .str "LGTM"), ("review", .bool true), ("target", .str "fork")]
+  match parseToolCall "comment" args with
+  | .comment (.review _ _) .fork => TestM.assert true
+  | _ => TestM.fail "expected .comment (.review ...) .fork"
 
 -- parseRequest
 
