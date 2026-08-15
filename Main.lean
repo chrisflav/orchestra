@@ -1040,9 +1040,22 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
     let createdAt ← TaskStore.currentIso8601
     -- Unfinished tasks: continue from their partial session (taskId).
     -- Cancelled tasks: keep the original continuesFrom (they never ran).
-    let continuesFrom := match entry.status with
-      | .unfinished => entry.taskId
-      | _           => entry.continuesFrom
+    --
+    -- Only from a run that recorded a session, though. A daemon killed mid-task leaves its
+    -- entry `unfinished` with a task id but no session id — nothing was resumable, because
+    -- nothing was written. Continuing from it anyway would still hand the retry its
+    -- predecessor's workspace, since slot reuse keys off `continuesFrom` and not off the
+    -- session: the agent would open a brand-new conversation on top of the dead run's
+    -- uncommitted edits. With nothing to resume, a clean checkout is the honest start.
+    let continuesFrom ← match entry.status with
+      | .unfinished =>
+        match entry.taskId with
+        | none     => pure none
+        | some tid =>
+          match ← TaskStore.loadTask tid with
+          | some r => pure (if r.sessionId.isSome then some tid else none)
+          | none   => pure none
+      | _           => pure entry.continuesFrom
     let newEntry : Queue.QueueEntry := {
       id, createdAt
       upstream     := entry.upstream

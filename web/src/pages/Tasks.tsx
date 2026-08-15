@@ -53,6 +53,11 @@ export function TaskDetail() {
               { key: "Status", value: <Status status={data.status} /> },
               { key: "Fork", value: data.fork, data: true },
               { key: "Started", value: <Time iso={data.createdAt} />, data: true },
+              // Only when the two differ: a queue entry and the run it became are numbered
+              // separately, and the run's id is what names its log, its session and its record.
+              ...(data.taskId !== null && data.taskId !== data.id
+                ? [{ key: "Run", value: data.taskId, data: true }]
+                : []),
               { key: "Log events", value: data.logTotal, data: true },
             ]}
           />
@@ -67,7 +72,21 @@ export function TaskDetail() {
             title="Log"
             meta={data.logTruncated ? `last ${data.log.length} of ${data.logTotal}` : undefined}
           >
-            <LogView events={data.log} total={data.logTotal} truncated={data.logTruncated} />
+            <LogView
+              events={data.log}
+              total={data.logTotal}
+              truncated={data.logTruncated}
+              // Nothing to show means three different things, and only the status separates
+              // them: a run whose log is missing, one that has not been picked up yet, and an
+              // entry that reached a terminal status without ever starting one.
+              empty={
+                data.taskId !== null
+                  ? "This task has no log file."
+                  : data.status === "pending"
+                    ? "Waiting for a worker. The trace appears here as the agent runs."
+                    : "This entry never started a run, so there is no trace."
+              }
+            />
           </Section>
         </>
       )}

@@ -176,6 +176,12 @@ export interface LogEvent {
 
 export interface TaskDetail {
   id: string;
+  /**
+   * The run `log` was read under. A queue entry and the task it becomes carry separate ids, so
+   * an entry addressed by its own id resolves to this one; `null` means the entry has no run —
+   * still queued, or failed before it started — and so has no trace.
+   */
+  taskId: string | null;
   status: TaskStatus | QueueStatus;
   fork: string;
   createdAt: string;
