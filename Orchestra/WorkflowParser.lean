@@ -30,6 +30,14 @@ private def mappingLookup (pairs : Array (Node × Node)) (key : String) : Option
 
 private def strTrim (s : String) : String := s.trimAscii.toString
 
+/-- YAML scalars reach us as strings, so a budget written `budget: 100` or `budget: 100.0`
+    is parsed as JSON to get the float. Anything unparseable is dropped, which leaves the
+    step on the 4.0 USD default rather than failing the whole workflow. -/
+private def parseBudget (s : String) : Option Float :=
+  match Lean.Json.parse (strTrim s) with
+  | .ok (.num n) => some n.toFloat
+  | _            => none
+
 private partial def parseResultType (s : String) : Except String ResultType :=
   let s' := strTrim s
   if s'.startsWith "list " then
@@ -90,6 +98,8 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
   let prompt   ← nodeAsString (← orError (mappingLookup pairs "prompt") "task missing 'prompt'")
   let agent    := (mappingLookup pairs "agent").bind   (nodeAsString · |>.toOption)
   let model    := (mappingLookup pairs "model").bind   (nodeAsString · |>.toOption)
+  let budget   := (mappingLookup pairs "budget").bind  (nodeAsString · |>.toOption)
+                  |>.bind parseBudget
   let context  := (mappingLookup pairs "context").bind (nodeAsString · |>.toOption)
   let readOnly :=
     (mappingLookup pairs "read-only").bind (nodeAsString · |>.toOption)
@@ -126,7 +136,7 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
         outPairs.toList.mapM fun (k, v) => do
           let name ← nodeAsString k
           parseOutputSpec name v
-  return { agent, model, prompt, readOnly, input, output, context, upstream, fork,
+  return { agent, model, budget, prompt, readOnly, input, output, context, upstream, fork,
            systemPrompt, prependPrompt, backend, issueNumber, triageAddLabels, triageRemoveLabels }
 
 private def parseWriteAction (node : Node) : Except String StepAction := do

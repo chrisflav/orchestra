@@ -38,6 +38,41 @@ def sequenceYamlParse : Test := do
       | _ => TestM.fail "review: expected task action"
     | _ => TestM.fail "expected exactly 3 steps"
 
+/-- `budget` on a step reaches the `TaskSpec`; an unset or unparseable one stays `none`,
+    which leaves the step on `TaskRunner`'s 4.0 USD default. -/
+@[test]
+def budgetYamlParse : Test := do
+  let yaml := "name: budgets
+upstream: acme/widgets
+fork: acme/widgets
+
+steps:
+  whole:
+    task:
+      prompt: \"a\"
+      budget: 100
+  fractional:
+    task:
+      prompt: \"b\"
+      budget: 2.5
+  unset:
+    task:
+      prompt: \"c\"
+  bogus:
+    task:
+      prompt: \"d\"
+      budget: lots
+"
+  match WorkflowProgram.parseYaml yaml with
+  | .error e => TestM.fail s!"parse failed: {e}"
+  | .ok prog =>
+    TestM.assertEqual prog.steps.length 4 "step count"
+    let budgets := prog.steps.map fun step =>
+      match step.action with
+      | .task spec => spec.budget
+      | _          => none
+    TestM.assert (budgets == [some 100.0, some 2.5, none, none]) s!"budgets: got {budgets}"
+
 @[test]
 def conditionalsYamlParse : Test := do
   let yaml ← IO.FS.readFile "examples/concerts/conditionals.yaml"

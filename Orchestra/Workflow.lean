@@ -42,6 +42,8 @@ structure OutputSpec where
 structure TaskSpec where
   agent         : Option String   := none
   model         : Option String   := none
+  /-- Maximum spend in USD for this step. Defaults to 4.0 if not set. -/
+  budget        : Option Float    := none
   prompt        : String
   readOnly      : Bool            := false
   input         : List VarRef     := []
@@ -166,7 +168,8 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
     let ioTask : IOTask .unit .unit := {
       upstream, fork, mode := .fork
       prompt := spec.prompt ++ inputSection
-      agent := spec.agent, model := spec.model, readOnly := spec.readOnly
+      agent := spec.agent, model := spec.model, budget := spec.budget
+      readOnly := spec.readOnly
       systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt
       backend := spec.backend
       issueNumber := spec.issueNumber
@@ -180,7 +183,8 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
     let ioTask : IOTask .unit (.mapping mappingFields) := {
       upstream, fork, mode := .fork
       prompt := spec.prompt ++ inputSection ++ outInstr
-      agent := spec.agent, model := spec.model, readOnly := spec.readOnly
+      agent := spec.agent, model := spec.model, budget := spec.budget
+      readOnly := spec.readOnly
       systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt
       backend := spec.backend
       issueNumber := spec.issueNumber

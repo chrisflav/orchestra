@@ -56,6 +56,7 @@ steps:
     task:
       agent: claude        # optional backend agent name
       model: sonnet        # optional model override
+      budget: 25           # optional max spend in USD (default: 4.0)
       read-only: true      # mount repo read-only (default: false)
       prompt: "Implement feature X."
 
