@@ -148,10 +148,13 @@ export function LogView({
   events,
   total,
   truncated,
+  started = true,
 }: {
   events: LogEvent[];
   total: number;
   truncated: boolean;
+  /** Whether an agent has picked this up yet. An empty log means different things either side. */
+  started?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
@@ -163,7 +166,11 @@ export function LogView({
 
   if (events.length === 0) {
     return (
-      <p className="empty">This task has no log file.</p>
+      <p className="empty">
+        {started
+          ? "This task has no log file."
+          : "Waiting for a worker. The trace appears here as the agent runs."}
+      </p>
     );
   }
 

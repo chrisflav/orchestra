@@ -53,6 +53,11 @@ export function TaskDetail() {
               { key: "Status", value: <Status status={data.status} /> },
               { key: "Fork", value: data.fork, data: true },
               { key: "Started", value: <Time iso={data.createdAt} />, data: true },
+              // Only when the two differ: a queue entry and the run it became are numbered
+              // separately, and the run's id is what names its log, its session and its record.
+              ...(data.taskId !== null && data.taskId !== data.id
+                ? [{ key: "Run", value: data.taskId, data: true }]
+                : []),
               { key: "Log events", value: data.logTotal, data: true },
             ]}
           />
@@ -67,7 +72,12 @@ export function TaskDetail() {
             title="Log"
             meta={data.logTruncated ? `last ${data.log.length} of ${data.logTotal}` : undefined}
           >
-            <LogView events={data.log} total={data.logTotal} truncated={data.logTruncated} />
+            <LogView
+              events={data.log}
+              total={data.logTotal}
+              truncated={data.logTruncated}
+              started={data.taskId !== null}
+            />
           </Section>
         </>
       )}

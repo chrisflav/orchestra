@@ -328,6 +328,15 @@ its workspace; it will start from a clean checkout."
         status
         taskId     := taskId.orElse (fun _ => cur.taskId)
         outputJson := outputJson.orElse (fun _ => cur.outputJson) }
+    -- Record which task this entry became as soon as the task exists, rather than when it ends.
+    -- The entry is the only handle the queue, the concert steps and the overview have on a run,
+    -- and everything that wants the run itself — the dashboard's log above all — has to get
+    -- there through this field. Writing it at `finish` meant a task was linkable only once it
+    -- was over: for the whole time an agent was working, its trace was reachable by nothing on
+    -- screen. Re-read-then-write like `finish`, for the same reason.
+    let announce (taskId : String) : IO Unit := do
+      let cur := (← Queue.loadEntry entry.id).getD entry
+      Queue.saveEntry { cur with taskId := some taskId }
     let task : Task := {
       i := entry.inputType, o := entry.outputType
       ioTask := {
@@ -388,6 +397,7 @@ its workspace; it will start from a clean checkout."
         (cancelToken := some taskToken) (interactive := false)
         (slotOverride := some { slot, occupant := some entry.id, resumeFrom })
         (preresolvedAuth := authSource)
+        (onStart := announce)
       removeToken
       -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
       -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.

@@ -862,14 +862,31 @@ private def projectDetailApi (id : String) : IO (Option Json) := do
       ("issues",  Json.arr nodes)
     ])
 
+/-- How many validation retries a log is followed across. Each retry writes its own file, and
+    the loop below stops at the first one that is absent, so this is only a bound on a run that
+    somehow left a gap — not a limit anyone configures against. -/
+private def maxLogAttempts : Nat := 100
+
 /-- Parse the per-task structured JSONL log, keeping only the last `limit` events. Returns the
-    kept events and the total number present, so a caller can tell a tail from the whole. -/
+    kept events and the total number present, so a caller can tell a tail from the whole.
+
+    A run retried after a failed validation writes each attempt to its own file (`<id>.log`,
+    then `<id>.retry1.log`, …), so the attempts are read in order and concatenated. Reading only
+    the first would show a trace that stops dead the moment a retry begins, which is
+    indistinguishable on screen from an agent that has stopped. -/
 private def loadTaskLog (fork : Repository) (id : String) (limit : Nat)
     : IO (Array Json × Nat) := do
-  let path := (← Dirs.dataBase) / "logs" / fork.toString / s!"{id}.log"
-  if !(← path.pathExists) then return (#[], 0)
-  let raw ← IO.FS.readFile path
-  let lines := (raw.splitOn "\n").filter (!·.trimAscii.isEmpty)
+  let dir := (← Dirs.dataBase) / "logs" / fork.toString
+  let readLines (path : System.FilePath) : IO (List String) := do
+    let raw ← IO.FS.readFile path
+    return (raw.splitOn "\n").filter (!·.trimAscii.isEmpty)
+  let base := dir / s!"{id}.log"
+  if !(← base.pathExists) then return (#[], 0)
+  let mut lines ← readLines base
+  for attempt in [1:maxLogAttempts] do
+    let path := dir / s!"{id}.retry{attempt}.log"
+    if !(← path.pathExists) then break
+    lines := lines ++ (← readLines path)
   let total := lines.length
   let kept := if total ≤ limit then lines else lines.drop (total - limit)
   let mut out : Array Json := #[]
@@ -879,23 +896,33 @@ private def loadTaskLog (fork : Repository) (id : String) (limit : Nat)
     | .error _ => out := out.push (Json.mkObj [("type", "unknown"), ("event_type", "parse_error")])
   return (out, total)
 
+/-- One task, addressed by either of the two ids it answers to.
+
+    A queue entry and the task it becomes are numbered separately (see the TODO in
+    `TaskRunner.runIOTask`), and the log is written under the *task's* id — so an entry read by
+    its own id has to be followed to its run before the log can be found. `taskId` reports where
+    that landed: it is the entry's own id when the caller already named a task record, and null
+    for an entry that has not started, which is exactly when there is no trace to read yet. -/
 private def taskDetailApi (id : String) (logLimit : Nat) : IO (Option Json) := do
   let record  ← TaskStore.loadTask id
   let entries ← Queue.loadAllEntries
   let qEntry  := entries.find? (·.id == id)
-  let infoOpt : Option (Repository × String × String × String) :=
+  let infoOpt : Option (Repository × String × String × String × Option String) :=
     match record with
-    | some r => some (r.fork, tStText r.status, r.createdAt, r.prompt)
+    | some r => some (r.fork, tStText r.status, r.createdAt, r.prompt, some r.id)
     | none =>
       match qEntry with
-      | some q => some (q.fork, qStText q.status, q.createdAt, q.prompt)
+      | some q => some (q.fork, qStText q.status, q.createdAt, q.prompt, q.taskId)
       | none   => none
   match infoOpt with
   | none => return none
-  | some (fork, st, createdAt, prompt) =>
-    let (log, total) ← loadTaskLog fork id logLimit
+  | some (fork, st, createdAt, prompt, taskId) =>
+    let (log, total) ← match taskId with
+      | some tid => loadTaskLog fork tid logLimit
+      | none     => pure (#[], 0)
     return some (Json.mkObj [
       ("id",           id),
+      ("taskId",       optStr taskId),
       ("status",       st),
       ("fork",         fork.toString),
       ("createdAt",    normIso createdAt),

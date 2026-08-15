@@ -859,9 +859,13 @@
       },
       "TaskDetail": {
         "type": "object",
-        "required": ["id", "status", "fork", "createdAt", "prompt", "log", "logTotal", "logLimit", "logTruncated"],
+        "required": ["id", "taskId", "status", "fork", "createdAt", "prompt", "log", "logTotal", "logLimit", "logTruncated"],
         "properties": {
           "id": { "type": "string" },
+          "taskId": {
+            "type": ["string", "null"],
+            "description": "The run the log was read under. A queue entry and the task it becomes are numbered separately, so this is the entry's own id when the id names a task and null for an entry that has not started yet."
+          },
           "status": { "type": "string" },
           "fork": { "type": "string" },
           "createdAt": { "type": "string", "format": "date-time" },

@@ -365,6 +365,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- source that runs, and so a task is not re-judged against a limit that appeared in the
     -- milliseconds since — which would surface as a failed entry rather than a retryable one.
     (preresolvedAuth : Option String := none)
+    -- Called with the generated task ID the moment the run is recorded, before any of the work
+    -- starts. The ID is otherwise only returned when the run is over, which is too late for a
+    -- caller that has to point at the run *while* it is happening — the queue daemon writes it
+    -- onto the entry from here so the dashboard can find the log a running agent is filling.
+    (onStart : String → IO Unit := fun _ => pure ())
     : IO ((String × TaskStore.TaskStatus) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
@@ -387,6 +392,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     role      := ioTask.role
   }
   TaskStore.saveTask initialRecord
+  onStart taskId
   -- If this task was pre-claimed (daemon wrote the claim with the queue-entry
   -- ID before we ran), retag the claim with the real generated taskId so that
   -- ownership checks in attach_pr / split_issue pass.
@@ -680,10 +686,12 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (interactiveAgent : Bool := false)
     (slotOverride : Option Repo.SlotAssignment := none)
     (preresolvedAuth : Option String := none)
+    (onStart : String → IO Unit := fun _ => pure ())
     : IO (String × TaskStore.TaskStatus × Option Lean.Json) := do
   let ((taskId, status), _, outputJson) ←
     runIOTask appConfig task.ioTask idx debug default
       continuesFrom series cancelToken interactive interactiveAgent slotOverride preresolvedAuth
+      onStart
   return (taskId, status, outputJson)
 
 end Orchestra.TaskRunner
