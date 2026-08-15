@@ -178,8 +178,8 @@ export interface TaskDetail {
   id: string;
   /**
    * The run `log` was read under. A queue entry and the task it becomes carry separate ids, so
-   * an entry addressed by its own id resolves to this one; `null` means the entry has not
-   * started and there is no trace yet.
+   * an entry addressed by its own id resolves to this one; `null` means the entry has no run —
+   * still queued, or failed before it started — and so has no trace.
    */
   taskId: string | null;
   status: TaskStatus | QueueStatus;

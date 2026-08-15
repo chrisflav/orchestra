@@ -76,7 +76,16 @@ export function TaskDetail() {
               events={data.log}
               total={data.logTotal}
               truncated={data.logTruncated}
-              started={data.taskId !== null}
+              // Nothing to show means three different things, and only the status separates
+              // them: a run whose log is missing, one that has not been picked up yet, and an
+              // entry that reached a terminal status without ever starting one.
+              empty={
+                data.taskId !== null
+                  ? "This task has no log file."
+                  : data.status === "pending"
+                    ? "Waiting for a worker. The trace appears here as the agent runs."
+                    : "This entry never started a run, so there is no trace."
+              }
             />
           </Section>
         </>

@@ -862,9 +862,12 @@ private def projectDetailApi (id : String) : IO (Option Json) := do
       ("issues",  Json.arr nodes)
     ])
 
-/-- How many validation retries a log is followed across. Each retry writes its own file, and
-    the loop below stops at the first one that is absent, so this is only a bound on a run that
-    somehow left a gap — not a limit anyone configures against. -/
+/-- How many attempts a log is followed across: the first, plus this many validation retries.
+
+    A hard ceiling, not a guess at the usual case — a repository whose `validation.max_retries`
+    reaches it would have its last attempts left out. It is set well above any retry count that
+    makes sense (each attempt is a full agent run) so that this is a bound on a runaway config
+    rather than one anybody tunes against. -/
 private def maxLogAttempts : Nat := 100
 
 /-- Parse the per-task structured JSONL log, keeping only the last `limit` events. Returns the
@@ -882,11 +885,14 @@ private def loadTaskLog (fork : Repository) (id : String) (limit : Nat)
     return (raw.splitOn "\n").filter (!·.trimAscii.isEmpty)
   let base := dir / s!"{id}.log"
   if !(← base.pathExists) then return (#[], 0)
-  let mut lines ← readLines base
+  -- Joined once at the end rather than appended to per attempt: this runs on every SSE tick,
+  -- and `++` would recopy the whole run's log for each retry it has been through.
+  let mut attempts : Array (List String) := #[← readLines base]
   for attempt in [1:maxLogAttempts] do
     let path := dir / s!"{id}.retry{attempt}.log"
     if !(← path.pathExists) then break
-    lines := lines ++ (← readLines path)
+    attempts := attempts.push (← readLines path)
+  let lines := attempts.toList.flatten
   let total := lines.length
   let kept := if total ≤ limit then lines else lines.drop (total - limit)
   let mut out : Array Json := #[]
@@ -901,8 +907,9 @@ private def loadTaskLog (fork : Repository) (id : String) (limit : Nat)
     A queue entry and the task it becomes are numbered separately (see the TODO in
     `TaskRunner.runIOTask`), and the log is written under the *task's* id — so an entry read by
     its own id has to be followed to its run before the log can be found. `taskId` reports where
-    that landed: it is the entry's own id when the caller already named a task record, and null
-    for an entry that has not started, which is exactly when there is no trace to read yet. -/
+    that landed: the record's own id when the caller named a task, the entry's run when it named
+    an entry that has one, and null for an entry with no run — one still waiting for a worker, or
+    one that failed before it could start. Either way, null means there is no trace to read. -/
 private def taskDetailApi (id : String) (logLimit : Nat) : IO (Option Json) := do
   let record  ← TaskStore.loadTask id
   let entries ← Queue.loadAllEntries

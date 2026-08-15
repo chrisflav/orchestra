@@ -334,9 +334,14 @@ its workspace; it will start from a clean checkout."
     -- there through this field. Writing it at `finish` meant a task was linkable only once it
     -- was over: for the whole time an agent was working, its trace was reachable by nothing on
     -- screen. Re-read-then-write like `finish`, for the same reason.
+    -- Only on a successful re-read, and only this one field, which is where it parts company
+    -- with `finish`. `entry` is the *pre-claim* snapshot: `claimNextEntry` writes `running` and
+    -- the slot to disk but hands the worker the original, so falling back to it here would put
+    -- a running entry back as pending and slotless — free for another worker to claim and run a
+    -- second time. `finish` can afford the fallback because it always writes `status` itself.
     let announce (taskId : String) : IO Unit := do
-      let cur := (← Queue.loadEntry entry.id).getD entry
-      Queue.saveEntry { cur with taskId := some taskId }
+      if let some cur ← Queue.loadEntry entry.id then
+        Queue.saveEntry { cur with taskId := some taskId }
     let task : Task := {
       i := entry.inputType, o := entry.outputType
       ioTask := {
