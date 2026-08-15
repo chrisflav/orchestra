@@ -59,10 +59,15 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha
+            # Bare 40-character commit sha (the default `sha-` prefix and short form are both
+            # suppressed), so the tag is exactly what `git rev-parse HEAD` prints and the
+            # deployment can pin a revision without a lookup table. The NixOS module that runs
+            # this image pins by that tag; see the summary step below.
+            type=sha,format=long,prefix=
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           # The repository root, matching `build.context: ..` in docker/docker-compose.yaml —
@@ -77,3 +82,22 @@ jobs:
           # build), which is where all the time goes — the runtime stage is just apt.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The deployment pins a revision by hand (see the NixOS module), so put the line to
+      # paste somewhere it can be copied from instead of reconstructed.
+      - name: Summarise
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "To deploy, set in \`orchestra.nix\`:"
+            echo
+            echo '```nix'
+            echo '  rev = "${{ github.sha }}";'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
