@@ -113,4 +113,97 @@ def openDependencyBlocksCandidacy : Test := do
   TestM.assertEqual (ids (dispatchCandidates released trigger)) [20]
     (msg := "and runs once 21 is completed")
 
+/-! ## Open issues per labelled root
+
+    An unbound role is placed per labelled root, so bounding it by "the open issues in scope"
+    means the ones that root owns (`openIssuesByRoot`). -/
+
+private def countFor (all : Array Taxis.Issue) (root : Int64) : Nat :=
+  (openIssuesByRoot all trigger).getD root 0
+
+@[test]
+def aRootCountsItselfAndItsSubtree : Test := do
+  let lone := #[mk 9 (labels := #[trigger])]
+  TestM.assertEqual (countFor lone 9) 1
+    (msg := "a labelled issue with nothing under it is one open issue, not none")
+  let subtree := #[mk 9 (labels := #[trigger]), mk 20 (parent := some 9),
+                   mk 21 (parent := some 20), mk 50]
+  TestM.assertEqual (countFor subtree 9) 3
+    (msg := "the root plus its descendants; the unlabelled issue elsewhere is not in scope")
+
+/-- Only open issues count: a completed child is work that has happened, and an agent dispatched
+    for it would find nothing to do. -/
+@[test]
+def closedIssuesDoNotCount : Test := do
+  let all := #[mk 9 (labels := #[trigger]),
+               mk 20 (parent := some 9) (state := .completed),
+               mk 21 (parent := some 9) (state := .closed),
+               mk 22 (parent := some 9)]
+  TestM.assertEqual (countFor all 9) 2 (msg := "the root and its one still-open child")
+
+/-- Nested roots partition the set rather than each counting the whole subtree below them: an
+    issue belongs to the nearest root above it, which is the one whose agents would pick it up. -/
+@[test]
+def nestedRootsSplitTheirSubtrees : Test := do
+  let all := #[mk 1 (labels := #[trigger]),
+               mk 2 (parent := some 1),
+               mk 3 (parent := some 1) (labels := #[trigger]),
+               mk 4 (parent := some 3),
+               mk 5 (parent := some 3)]
+  TestM.assertEqual (countFor all 1) 2 (msg := "the outer root and the child it still owns")
+  TestM.assertEqual (countFor all 3) 3 (msg := "the inner root and its own two children")
+
+/-- A labelled ancestor that has closed is not a root any more, so what is under it belongs to
+    the next root still standing — otherwise those issues would be counted against a root nobody
+    dispatches to, and the root that does get agents would look emptier than it is. -/
+@[test]
+def aClosedRootHandsItsWorkUpwards : Test := do
+  let all := #[mk 1 (labels := #[trigger]),
+               mk 3 (parent := some 1) (labels := #[trigger]) (state := .completed),
+               mk 4 (parent := some 3),
+               mk 5 (parent := some 3)]
+  TestM.assertEqual (countFor all 1) 3 (msg := "the open root, counting the closed root's children")
+  TestM.assertEqual (countFor all 3) 0 (msg := "a completed issue roots nothing")
+
+/-! ## `exclude_root_issues`: the label marks the epic, not the work
+
+    Same two functions, told that an issue carrying the label *directly* is a container by
+    convention rather than a unit of work. -/
+
+@[test]
+def excludedRootsAreNotDispatchedOnto : Test := do
+  let leafOnly := #[mk 9 (labels := #[trigger])]
+  TestM.assert (dispatchCandidates leafOnly trigger (excludeRoots := true)).isEmpty
+    "a labelled issue with nothing under it is an epic waiting to be decomposed, not work"
+  let withChildren := #[mk 9 (labels := #[trigger]), mk 20 (parent := some 9),
+                        mk 21 (parent := some 9)]
+  TestM.assertEqual (ids (dispatchCandidates withChildren trigger (excludeRoots := true)))
+    [20, 21] (msg := "what inherited the label is still the work")
+
+/-- The root leaves the count as well, so the bound matches what can be dispatched. A nested root
+    is excluded from its parent's count too: it is a root wherever it sits. -/
+@[test]
+def excludedRootsAreNotCounted : Test := do
+  let all := #[mk 1 (labels := #[trigger]),
+               mk 2 (parent := some 1),
+               mk 3 (parent := some 1) (labels := #[trigger]),
+               mk 4 (parent := some 3)]
+  TestM.assertEqual ((openIssuesByRoot all trigger (excludeRoots := true)).getD 1 0) 1
+    (msg := "the outer root counts its one plain child, not itself and not the inner root")
+  TestM.assertEqual ((openIssuesByRoot all trigger (excludeRoots := true)).getD 3 0) 1
+    (msg := "the inner root counts its own child only")
+
+/-- A root with nothing under it counts zero here, which is a real answer and not a gap in the
+    map. What keeps one agent on it to plan is the floor in `Listener.capToAvailable`, not this. -/
+@[test]
+def anEmptyExcludedRootCountsZero : Test := do
+  let all := #[mk 9 (labels := #[trigger])]
+  TestM.assert (openIssuesByRoot all trigger (excludeRoots := true)).isEmpty
+    "nothing is counted against a root whose subtree is empty"
+
+@[test]
+def rootCountingTerminatesOnCycles : Test := do
+  let all := #[mk 1 (parent := some 2), mk 2 (parent := some 1)]
+  TestM.assert (openIssuesByRoot all trigger).isEmpty "a cycle with no label has no roots"
+
 end OrchestraTest.DispatchCandidates

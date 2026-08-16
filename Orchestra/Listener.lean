@@ -63,8 +63,21 @@ inductive SourceConfig where
       With no project behind these issues there is no `defaultTarget` to inherit, so each issue's
       repository and branch are read off `repository` / `github-branch` artifacts on it or an
       ancestor (`Project.artifactTarget`). An issue missing either is reported and skipped —
-      dispatching an agent at a guessed repository is worse than not dispatching. -/
-  | labelDispatcher   (label : String) (caps : List (String × Nat))
+      dispatching an agent at a guessed repository is worse than not dispatching.
+
+      `limitUnclaimed` bounds the caps of roles that do **not** pre-claim by the work in scope,
+      and takes the issues an agent is already on out of the tick's selection, so a cap of three
+      against one open issue dispatches one agent rather than three onto the same piece of work —
+      see `limitBoundCaps` / `limitUnboundCaps` for the cap rule and why pre-claiming roles keep
+      theirs, and `unattendedIssues` for the selection half. Off by default: it lowers configured
+      caps, which is not something to start doing to an existing listener without being asked.
+
+      `excludeRoots` says the labelled issues are epics rather than units of work: they leave the
+      workable set and the per-root counts, and only what inherited the label is dispatched onto
+      (`Project.dispatchCandidates`, `Project.openIssuesByRoot`). They stay roots — an unbound
+      role is still placed on them — and a root carrying a pull request is still reviewed. -/
+  | labelDispatcher   (label : String) (caps : List (String × Nat)) (limitUnclaimed : Bool)
+                      (excludeRoots : Bool)
   /-- Fires whenever the number of open issues or pull requests with the given
       labels on a repository is strictly below `max`.  Emits at most one task per
       tick; the tick is skipped while a task from this listener is already pending
@@ -112,11 +125,13 @@ instance : ToJson SourceConfig where
                     ("project_id", ToJson.toJson pid),
                     ("caps", Json.mkObj
                        (caps.map (fun (n, c) => (n, Json.num c))))]
-    | .labelDispatcher label caps =>
+    | .labelDispatcher label caps limitUnclaimed excludeRoots =>
         Json.mkObj [("type", "label-dispatcher"),
                     ("label", Json.str label),
                     ("caps", Json.mkObj
-                       (caps.map (fun (n, c) => (n, Json.num c))))]
+                       (caps.map (fun (n, c) => (n, Json.num c)))),
+                    ("limit_unclaimed_to_open_issues", Json.bool limitUnclaimed),
+                    ("exclude_root_issues", Json.bool excludeRoots)]
     | .githubLabelCount repos labels max kind =>
         Json.mkObj [("type", "github-label-count"),
                     ("repos", ToJson.toJson repos),
@@ -179,7 +194,11 @@ instance : FromJson SourceConfig where
         let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
         let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
           v.getNat?.toOption.map (k, ·)
-        return .labelDispatcher label caps
+        let limitUnclaimed :=
+          j.getObjValAs? Bool "limit_unclaimed_to_open_issues" |>.toOption |>.getD false
+        let excludeRoots :=
+          j.getObjValAs? Bool "exclude_root_issues" |>.toOption |>.getD false
+        return .labelDispatcher label caps limitUnclaimed excludeRoots
     | "github-label-count" =>
         let repos  ← parseRepos j
         let labels  := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
@@ -868,6 +887,78 @@ def unboundActiveByRole (entries : Array Queue.QueueEntry) (root : Taxis.IssueId
       active := active.insert r ((active.getD r 0) + 1)
   return active
 
+/-! ### Bounding the roles that do not pre-claim
+
+A role that pre-claims cannot be dispatched twice onto one issue: the second dispatch takes the
+daemon's claim mutex, finds the issue already claimed and is dropped, so its cap is really a cap
+on *concurrent issues* and the tracker enforces it. Nothing arbitrates for a role that does not
+pre-claim. A reviewer is handed whatever is awaiting review — including, on the next tick, the
+issue a reviewer is already on — and an `always` role is handed no issue at all and picks its own.
+Against one open issue, a cap of three is then three agents doing the same piece of work.
+
+`limit_unclaimed_to_open_issues` bounds those caps by the work actually in scope. The two halves
+below are the arithmetic, kept pure and separate because the bound differs with the binding: an
+issue-bound role draws from the label-wide candidate set, an unbound one from the issues its own
+root owns. -/
+
+/-- A cap lowered to the work available to it.
+
+    Never lowered below 1: at zero the trigger's own verdict (`noWorkableIssue`,
+    `nothingToReview`) already says why nothing was dispatched, and that is a better log line than
+    a cap of zero, which `dispatcherDecisions` reports as "auto-dispatch is off". A configured cap
+    of zero stays zero — that one really is off. -/
+def capToAvailable (cap available : Nat) : Nat := min cap (max 1 available)
+
+/-- `caps` for issue-bound roles, each lowered to the issues its trigger may draw from.
+
+    Roles that pre-claim keep their cap: the claim is what stops two of them meeting on one issue,
+    and it does so per issue rather than per tick. `idle` roles keep theirs too — they are bound
+    to nothing and are not dispatched by this dispatcher anyway. -/
+def limitBoundCaps (roles : Array Project.Role) (caps : List (String × Nat))
+    (workable reviewable : Nat) : List (String × Nat) :=
+  caps.map fun (name, cap) =>
+    match (roles.find? (·.name == name)).bind (·.dispatch) with
+    | none   => (name, cap)
+    | some d =>
+      if d.preClaim then (name, cap)
+      else match d.trigger with
+        | .hasOpenIssues     => (name, capToAvailable cap workable)
+        | .hasInReviewIssues => (name, capToAvailable cap reviewable)
+        | .idle | .always    => (name, cap)
+
+/-- `caps` for unbound roles at one root, each lowered to the open issues that root owns
+    (`Project.LabelDispatchSets.openUnder`). Unbound roles never pre-claim — there is no issue at
+    spawn time to claim — so the limit applies to all of them.
+
+    Counted over the open issues in scope rather than the dispatch candidates, because an unbound
+    role picks its own work and is not held to the leaf rule: a decomposed container can still
+    need planning or carry a pull request of its own, and a dependency-blocked issue can still be
+    the thing to look at. The cost is that a container counts as one issue like anything else, so
+    a deep tree bounds higher than the work at its leaves. -/
+def limitUnboundCaps (caps : List (String × Nat)) (openUnderRoot : Nat) : List (String × Nat) :=
+  caps.map fun (name, cap) => (name, capToAvailable cap openUnderRoot)
+
+/-- Those of `issues` that no active queue entry is already bound to.
+
+    The cap says how many agents may run; this says which issues are still worth offering them.
+    `dispatcherDecisions` keeps two roles off one issue within a tick (`taken`), but that array is
+    fresh every tick, and for a role that does not pre-claim nothing outlives the tick — so the
+    issue an agent is already on is offered again on the next one. Applied to the candidate sets
+    and not to the tally the caps are counted against: an agent at work is still one agent. -/
+def unattendedIssues (issues : Array Project.Issue) (activeEntries : Array Queue.QueueEntry) :
+    Array Project.Issue :=
+  let busy := activeEntries.filterMap (·.issueId.map (·.val))
+  issues.filter fun i => !busy.contains i.id.val
+
+/-- The caps a limit actually lowered, as (role, configured, effective). Reported by the caller
+    rather than applied silently: a cap that does not do what the config file says is exactly the
+    thing to say out loud. -/
+def loweredCaps (before after : List (String × Nat)) : List (String × Nat × Nat) :=
+  before.filterMap fun (name, cap) =>
+    match after.lookup name with
+    | some cap' => if cap' < cap then some (name, cap, cap') else none
+    | none      => none
+
 /-! ## Review routing
 
 An open issue carrying a pull request belongs to exactly one role, and which one is derived
@@ -1281,8 +1372,8 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
         | none     => baseVars
       ("", vars), none)
 
-  | .labelDispatcher label caps => do
-    let some sets ← Project.issuesWithLabel label
+  | .labelDispatcher label caps limitUnclaimed excludeRoots => do
+    let some sets ← Project.issuesWithLabel label excludeRoots
       | IO.eprintln s!"[dispatcher] label '{label}' does not exist on the taxis instance; \
           skipping"; return (#[], none)
     let gaps := sets.gaps
@@ -1306,15 +1397,21 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let (issues, reviewable) := splitForDispatch issues classified
     let reworking := classified.filter (·.2 == .changesRequested) |>.size
     let roles ← Project.loadGlobalRoles
+    -- Named in the tick's own line rather than once at startup: "nothing workable" on a tracker
+    -- whose only labelled issue is the root is otherwise indistinguishable from a broken config.
+    let rootNote :=
+      if excludeRoots then
+        s!", {sets.roots.size} labelled root(s) held back as epics by exclude_root_issues"
+      else ""
     IO.println s!"[dispatcher] label '{label}': {issues.size} workable \
       (of which {reworking} sent back for changes), {sets.reviewable.size} with a PR attached \
       of which {reviewable.size} await a reviewer, \
-      {gaps.size} skipped for want of a target; roles available: \
+      {gaps.size} skipped for want of a target{rootNote}; roles available: \
       {String.intercalate ", " (roles.map (·.name)).toList}"
     -- Roles that bind an issue and roles that don't are dispatched by different rules here, so
     -- they are counted and decided separately. An `always` role has no issue to bind, so it is
     -- scoped to a labelled root instead (one spawn set per root) — see below.
-    let (boundCaps, unboundCaps) := splitCapsByBinding roles caps
+    let (configuredBound, unboundCaps) := splitCapsByBinding roles caps
     -- Cap counting is scoped to the labelled set, so the caps bound concurrent work *on labelled
     -- issues* rather than colliding with per-project dispatchers running the same role names.
     let labelled : Array Taxis.IssueId := issues.map (·.id) ++ reviewable.map (·.id)
@@ -1326,8 +1423,30 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       if !labelled.contains eIid then continue
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
+    -- Bound roles that do not pre-claim draw from the label-wide candidate sets, so that is what
+    -- their cap is lowered to — the sets *before* the busy issues come out of them, since the
+    -- agents on those are exactly the ones the cap is counting. Unbound roles are lowered per
+    -- root, below, where the root is known.
+    let boundCaps :=
+      if limitUnclaimed then limitBoundCaps roles configuredBound issues.size reviewable.size
+      else configuredBound
+    for (n, cap, cap') in loweredCaps configuredBound boundCaps do
+      IO.println s!"[dispatcher] cap for '{n}' lowered from {cap} to {cap'} by \
+        limit_unclaimed_to_open_issues: it does not pre-claim, so it is bounded by the issues in \
+        scope for its trigger (counted above)"
+    -- An issue an agent is already on is out of this tick's selection, so the cap is spent on
+    -- work nobody is doing (`unattendedIssues`). Under the limit only: it lowers what would
+    -- otherwise dispatch, which is the option's whole business.
+    let free (is : Array Project.Issue) : Array Project.Issue :=
+      if limitUnclaimed then unattendedIssues is activeEntries else is
+    let (freeIssues, freeReviewable) := (free issues, free reviewable)
+    let held := (issues.size - freeIssues.size) + (reviewable.size - freeReviewable.size)
+    if held > 0 then
+      IO.println s!"[dispatcher] {held} issue(s) left out of this tick's selection by \
+        limit_unclaimed_to_open_issues: an agent is on them already"
     let input : DispatcherInput :=
-      { activeByRole := active, issues, reviewable, caps := boundCaps, roles }
+      { activeByRole := active, issues := freeIssues, reviewable := freeReviewable
+      , caps := boundCaps, roles }
     let decisions := dispatcherDecisions input
     if decisions.isEmpty then
       IO.println "[dispatcher] no roles named in caps, so nothing to check"
@@ -1366,9 +1485,19 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           ({String.intercalate ", " (unboundCaps.map (·.1))}) but no open issue carries the label \
           directly, so there is no root to scope them to; not dispatched"
       for (root, target) in sets.roots do
+        -- Per root, because the cap is: filling one root's cap leaves the others alone, and the
+        -- work that bounds it is the work that root owns. A root counts itself, so this is never
+        -- zero — a root with an empty subtree still gets the one agent that would plan it.
+        let openHere := sets.openUnder root.id
+        let rootCaps := if limitUnclaimed then limitUnboundCaps unboundCaps openHere
+                        else unboundCaps
+        for (n, cap, cap') in loweredCaps unboundCaps rootCaps do
+          IO.println s!"[dispatcher] root {root.id.toString}: cap for '{n}' lowered from {cap} \
+            to {cap'} by limit_unclaimed_to_open_issues: it claims nothing at spawn, and this \
+            root has {openHere} open issue(s) in scope"
         let rootInput : DispatcherInput :=
           { activeByRole := unboundActiveByRole allEntries root.id
-          , issues := #[], reviewable := #[], caps := unboundCaps, roles }
+          , issues := #[], reviewable := #[], caps := rootCaps, roles }
         for d in dispatcherDecisions rootInput do
           IO.println s!"[dispatcher] root {root.id.toString} \"{root.title}\": {renderDecision d}"
         for s in dispatcherTick rootInput do

@@ -757,6 +757,13 @@ Fields:
 - `source.repos` — list of `{"upstream": "...", "fork": "..."}` pairs
 - `source.trigger` — only events whose body contains this string are processed
 - `source.authorized_users` — list of GitHub logins that may trigger the listener; empty means allow everyone
+- `source.limit_unclaimed_to_open_issues` — `label-dispatcher` only: bound the caps of roles that
+  do not pre-claim an issue by the work in scope, and skip issues an agent is already on, so one
+  open issue dispatches one agent rather than a capful of them onto the same work
+  ([`examples/projects/README.md`](examples/projects/README.md))
+- `source.exclude_root_issues` — `label-dispatcher` only: treat the labelled issues as epics —
+  neither dispatched onto nor counted as work, while still rooting their subtree — so only what
+  inherited the label is worked
 - `action.prompt_template` — template rendered with event variables (e.g. `{{upstream}}`, `{{fork}}`, `{{issue_number}}`, `{{body}}`, `{{author}}`)
 - `action.workflow_path` — path to a `.yaml` workflow file; when set the listener starts a concert instead of enqueueing a single task
 - `action.auth_sources` / `action.auth_mode` — candidate authentication sources for the tasks this

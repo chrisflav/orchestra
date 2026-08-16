@@ -284,7 +284,9 @@ Two rules decide what gets dispatched:
   the children are the work. Open dependencies mean it is waiting on something else. Both
   conditions count *open* only: a completed or abandoned child or dependency releases it, since
   abandoning is the decision that the work will not happen and stranding everything downstream
-  would be worse.
+  would be worse. The labelled issue itself is workable like any other unless
+  [`exclude_root_issues`](#exclude_root_issues-the-label-marks-the-epic-not-the-work) says the
+  label marks an epic.
 
 Together these give the usual flow: label the project, a planner decomposes it, implementors pick
 up the leaves. A labelled issue with no children yet is itself a leaf, so it dispatches until it
@@ -334,7 +336,9 @@ Four things differ from a bound role in this dispatcher:
 - **Nothing is pre-claimed.** `pre_claim` is ignored (there is no issue at spawn time), and the
   agent claims what it works through `claim_issue`, which takes the daemon's claim mutex. That
   is what keeps two maintainers on one root — or a maintainer and an implementor — off the same
-  issue.
+  issue. It keeps them off each other's work, though, not out of each other's way: a cap of two
+  against a root with one open issue is one maintainer working and one with nothing left to
+  claim, which is what `limit_unclaimed_to_open_issues` below is for.
 
 If the label exists but no *open* issue carries it directly, unbound roles have no root to scope
 to and are reported rather than silently skipped:
@@ -350,6 +354,140 @@ stand in for it. Use a `project-dispatcher`, or `always`.
 Carrying `t-project` does not exempt an issue from dispatch. Trackers apply that label broadly,
 including to leaves that are perfectly good units of work, so it cannot be used to tell containers
 from work — having children is what does that.
+
+### `limit_unclaimed_to_open_issues`: caps bounded by the work in scope
+
+A cap says how many agents of a role may run at once. For a role that **pre-claims**, that is
+also a cap on issues: the second dispatch onto an issue takes the daemon's claim mutex, finds it
+claimed and is dropped, so three implementors are three different issues or fewer.
+
+Nothing arbitrates for a role that does **not** pre-claim. A reviewer is handed whatever awaits
+review — including, next tick, the issue a reviewer is already on. An `always` role is handed no
+issue at all and picks its own. Against a single open issue, `"maintainer": 3` is three agents
+doing the same piece of work; the claim protocol stops them corrupting each other, but two of the
+three had nothing to do from the moment they were dispatched.
+
+Setting this bounds those caps by the work actually in scope:
+
+```json
+{
+  "source": {
+    "type": "label-dispatcher",
+    "label": "agent-ready",
+    "caps": { "maintainer": 3 },
+    "limit_unclaimed_to_open_issues": true
+  },
+  "interval_seconds": 30
+}
+```
+
+One open labelled issue now dispatches one maintainer; the cap of three applies again once there
+are three issues to spread over. What each role is bounded by follows its binding:
+
+| Role | Bounded by |
+| --- | --- |
+| `always` (unbound) | open issues in scope under **its own root**, counting the root unless `exclude_root_issues` is set |
+| `has_in_review_issues` | issues awaiting a reviewer this tick |
+| `has_open_issues` with `pre_claim: false` | workable issues this tick |
+| anything with `pre_claim: true` | nothing — its claim already bounds it |
+
+Counted per root for unbound roles, because that is the scope their caps are counted in already:
+filling one root's cap leaves the others alone, and nesting is resolved nearest-first, so an issue
+belongs to the closest root above it rather than to every root above it.
+
+"Open issues in scope" is the raw count — every open issue that inherits the label from that root,
+the root itself included. It is deliberately *not* the dispatch-candidate count: an unbound role
+picks its own work and is not held to the leaf rule, so a decomposed container (which may carry a
+pull request of its own) and a dependency-blocked issue both count. The `t-project` label is not
+consulted anywhere in this — nothing in the dispatcher treats a container differently for carrying
+it. The cost is that a deep tree bounds higher than the work at its leaves: a root with two
+containers over five leaves counts 8, not 5. Bound roles are bounded by their own candidate sets,
+so they do not have this slack. `exclude_root_issues` below takes at least the roots back out.
+
+The same setting also takes **issues an agent is already on** out of the tick's selection. Bounding
+the count is not on its own enough for a bound role: an issue is handed to a reviewer, and next
+tick — nothing having claimed it — the same issue is the first one the next reviewer is offered.
+The within-tick bookkeeping that keeps two roles apart does not outlive the tick, so what does it
+here is the queue: an issue with a pending or running entry bound to it is skipped, and the cap is
+spent on work nobody is doing. Note that this applies to the candidate sets, so a pre-claiming role
+skips those issues too — where it previously dispatched and had the claim reject it a moment later.
+
+The caps themselves are still counted against *all* the work in scope, not what is left of it: an
+agent at work is one agent, and subtracting its issue from the bound as well would stop the second
+reviewer from ever reaching the second issue.
+
+Two properties worth knowing:
+
+- **A root counts itself**, so its bound is never zero. A labelled root with an empty subtree
+  still gets the one maintainer that would plan it — which is the case you enabled an `always`
+  role for, and lowering it to zero would deadlock the tree permanently.
+- **An empty candidate set does not lower a cap to zero** either. A cap of zero reads as
+  "auto-dispatch is off for this role", and that is not what happened; the floor is one, so the
+  trigger's own verdict (`skip: nothing awaiting review`) is what lands in the log.
+
+Every cap the limit lowers is reported, once per tick, naming the configured value and the
+effective one:
+
+```
+[dispatcher] root 42: cap for 'maintainer' lowered from 3 to 1 by limit_unclaimed_to_open_issues:
+  it claims nothing at spawn, and this root has 1 open issue(s) in scope
+[dispatcher] 2 issue(s) left out of this tick's selection by limit_unclaimed_to_open_issues:
+  an agent is on them already
+```
+
+It defaults to off: it lowers caps that are already written down in a config file, which is not
+something to start doing to an existing listener unasked.
+
+### `exclude_root_issues`: the label marks the epic, not the work
+
+By default a labelled issue is in scope *and* is a candidate like any other, so labelling a single
+issue and having an implementor work it is a complete configuration. The other way to use the
+label is to put it on the epic and let the tree below it be the work — and there the default bites
+twice. A freshly created epic has no children, so it is a leaf, so it is dispatched as work before
+anyone has decomposed it; and once it does have children it still counts toward the bound that
+`limit_unclaimed_to_open_issues` computes, inflating it by one per root.
+
+Setting this says the labelled issues are epics:
+
+```json
+{
+  "source": {
+    "type": "label-dispatcher",
+    "label": "agent-ready",
+    "caps": { "implementor": 2, "maintainer": 1 },
+    "exclude_root_issues": true,
+    "limit_unclaimed_to_open_issues": true
+  },
+  "interval_seconds": 30
+}
+```
+
+An issue carrying the label **directly** is then:
+
+- **not workable** — it leaves the candidate set, so no bound role is dispatched onto it, and only
+  issues that *inherited* the label are worked;
+- **not counted** — it is out of its own per-root count, and out of any outer root's count too: an
+  issue carrying the label is a root wherever it sits, and something that is not work for its own
+  agents is not work for its parent's either.
+
+Two things it deliberately does not change:
+
+- **A root is still a root.** Unbound (`always`) roles are still placed on it, one set per root —
+  that is what a maintainer is for on an epic, and removing the scope would leave nothing to plan
+  the subtree. An epic with an empty subtree now counts zero rather than one, and the floor
+  described above is what keeps that one maintainer on it.
+- **A root's pull request is still reviewed.** `reviewable` is untouched: a PR that exists needs
+  reviewing whoever opened it, and an epic carrying one of its own is exactly the case that set
+  was widened to containers for.
+
+The tick's line says how many roots were held back, so a tracker whose only labelled issue is an
+epic does not just report "0 workable" and leave you guessing:
+
+```
+[dispatcher] label 'agent-ready': 0 workable (of which 0 sent back for changes), 0 with a PR
+  attached of which 0 await a reviewer, 0 skipped for want of a target, 1 labelled root(s) held
+  back as epics by exclude_root_issues; roles available: implementor, maintainer
+```
 
 ### What an agent may modify
 

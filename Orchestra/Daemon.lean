@@ -570,7 +570,7 @@ its workspace; it will start from a clean checkout."
                   Queue.saveEntry entry
                   IO.println s!"  Listener '{name}': dispatched {roleName} → {entry.id}"
               continue
-            | .labelDispatcher label _ =>
+            | .labelDispatcher label .. =>
               -- Same shape as the branch above, but the project and target come from the event
               -- rather than the listener config: this source spans projects, and each issue's
               -- target was resolved from its taxis artifacts at poll time

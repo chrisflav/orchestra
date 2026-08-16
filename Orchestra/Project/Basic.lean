@@ -658,9 +658,16 @@ everything with a dependency blocks forever. The two functions below are the sam
 two shapes the callers hold. -/
 
 /-- The workable subset of `all`, over raw taxis issues — used by the label-dispatcher, which
-    lists the whole tracker and so knows the state of every child and dependency. -/
-def dispatchCandidates (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Taxis.LabelId) :
-    Array Orchestra.Taxis.Issue :=
+    lists the whole tracker and so knows the state of every child and dependency.
+
+    `excludeRoots` drops the issues carrying `label` *directly* — the roots — from the answer,
+    leaving only what inherited it. For a tree where the label marks the epic rather than the
+    work, that is the difference between "this subtree is in scope" and "this issue is a unit of
+    work": the root is a leaf on the day it is created, and without this it is dispatched as work
+    before it is ever decomposed. It is opt-in because the opposite tree is just as common, and
+    there labelling one issue and having it worked is the whole point. -/
+def dispatchCandidates (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Taxis.LabelId)
+    (excludeRoots : Bool := false) : Array Orchestra.Taxis.Issue :=
   let openIds : Std.HashMap Int64 Unit :=
     Std.HashMap.ofList (all.toList.filterMap fun i =>
       match i.state with | .open => some (i.id.val, ()) | _ => none)
@@ -670,6 +677,7 @@ def dispatchCandidates (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Ta
       | .open => i.parent.map (·.val, ())
       | _ => none)
   (inScopeOpenIssues all label).filter fun i =>
+    !(excludeRoots && i.labels.contains label) &&
     !hasOpenChildren.contains i.id.val &&
     i.dependencies.all (fun d => !openIds.contains d.val)
 
@@ -692,6 +700,47 @@ def workableIssues (all : Array Issue) : Array Issue :=
     !hasOpenChildren.contains i.id.val &&
     i.dependencies.all (fun d => !openIds.contains d.val)
 
+/-- How many open in-scope issues each labelled root owns, keyed by the root's id.
+
+    An issue is counted against its **nearest open labelled ancestor-or-self**, so nested roots
+    partition the in-scope set instead of each counting the whole subtree below it, and the total
+    over all roots is exactly `inScopeOpenIssues`. Nearest-wins is the same rule the project
+    anchor uses, and open-ness is what keeps the tally aligned with `LabelDispatchSets.roots`: a
+    labelled but completed ancestor is no longer a root, so its descendants belong to whichever
+    root is still standing above them.
+
+    A root counts itself unless `excludeRoots` says the label marks the epic rather than the work
+    (the same option `dispatchCandidates` takes, and it has to be the same on both or the bound
+    would count issues no agent can be given). Without it no root's answer is zero, so a root with
+    nothing under it is one issue — the case where exactly one agent should be planning it. With
+    it, an empty root counts zero, and the floor in `Listener.capToAvailable` is what still leaves
+    that one agent there to plan.
+
+    Nested roots are excluded from each other's counts too, not just from their own: an issue
+    carrying the label is a root wherever it sits, and if it is not work for its own agents it is
+    not work for its parent's either.
+
+    Pure, so the arithmetic that bounds unclaimed dispatch is testable without a tracker. -/
+def openIssuesByRoot (all : Array Orchestra.Taxis.Issue) (label : Orchestra.Taxis.LabelId)
+    (excludeRoots : Bool := false) : Std.HashMap Int64 Nat := Id.run do
+  let byId : Std.HashMap Int64 Orchestra.Taxis.Issue :=
+    Std.HashMap.ofList (all.toList.map fun i => (i.id.val, i))
+  let rec nearestRoot (i : Orchestra.Taxis.Issue) : Nat → Option Int64
+    | 0 => none
+    | fuel + 1 =>
+      if i.state == .open && i.labels.contains label then some i.id.val
+      else match i.parent with
+        | none => none
+        | some p => match byId.get? p.val with
+          | some parent => nearestRoot parent fuel
+          | none => none
+  let mut counts : Std.HashMap Int64 Nat := {}
+  for i in inScopeOpenIssues all label do
+    if excludeRoots && i.labels.contains label then continue
+    if let some root := nearestRoot i all.size then
+      counts := counts.insert root ((counts.getD root 0) + 1)
+  return counts
+
 /-- Every issue carrying `labelName`, regardless of project — the issue set the
     project-independent dispatcher works from. `none` means no such label exists on the tracker
     (distinct from "the label exists and nothing carries it", which is `some #[]`); the label is
@@ -701,7 +750,13 @@ def workableIssues (all : Array Issue) : Array Issue :=
     `projectId` on each returned issue is the ancestor carrying the `repository` artifact, so
     issues from different projects can appear side by side; issues whose target can't be resolved
     are omitted along with the reason, for the caller to report — every exclusion is reported,
-    since an issue that silently never dispatches gives you nothing to debug. -/
+    since an issue that silently never dispatches gives you nothing to debug.
+
+    `excludeRoots` takes the labelled issues themselves out of `work` and out of the per-root
+    counts, for trees where the label marks the epic rather than a unit of work. It does not touch
+    `roots` — a root that is not work is still the scope an unbound role is placed in — nor
+    `reviewable`: a pull request that exists needs reviewing whoever opened it, and a root
+    carrying one is the case `reviewable` was widened to containers for in the first place. -/
 structure LabelDispatchSets where
   /-- Leaves: what a worker role may be dispatched onto. -/
   work       : Array (Issue × RepoTarget)
@@ -721,8 +776,22 @@ structure LabelDispatchSets where
       and may sit well above the label. A maintainer scoped there would be planning across
       subtrees nobody labelled. -/
   roots      : Array (Issue × RepoTarget)
+  /-- Open in-scope issues owned by each root (`openIssuesByRoot`), keyed by the root's issue id.
+      How much work a root actually has is what bounds the unbound roles dispatched onto it when
+      the listener asks for that; it is computed here because it needs the whole tracker, which
+      only this function holds. -/
+  openByRoot : Std.HashMap Int64 Nat
 
-def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
+/-- Open in-scope issues under `root`, counting the root itself unless the sets were built with
+    `excludeRoots`. Zero for an id no issue is counted against — a root whose subtree is empty
+    under that option, or an id that is not a root of this set at all. Left as a plain count with
+    no floor of its own: `Listener.capToAvailable` is the one place that decides what a cap of
+    zero work should mean, and two of those would disagree eventually. -/
+def LabelDispatchSets.openUnder (s : LabelDispatchSets) (root : Taxis.IssueId) : Nat :=
+  s.openByRoot.getD root.val 0
+
+def issuesWithLabel (labelName : String) (excludeRoots : Bool := false) :
+    IO (Option LabelDispatchSets) := do
   let cfg ← Orchestra.Taxis.getConfig
   let labels ← unwrap (← Orchestra.Taxis.listLabels cfg)
   let some label := labels.find? (·.name == labelName) | return none
@@ -730,7 +799,7 @@ def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
   -- deciding whether an issue is in scope needs its ancestors, and deciding whether it is a leaf
   -- needs everyone else's parent pointers. One list call plus in-memory work.
   let all ← unwrap (← Orchestra.Taxis.listIssues cfg)
-  let workIds := (dispatchCandidates all label.id).map (·.id.val)
+  let workIds := (dispatchCandidates all label.id excludeRoots).map (·.id.val)
   let mut work : Array (Issue × RepoTarget) := #[]
   let mut reviewable : Array (Issue × RepoTarget) := #[]
   let mut gaps : Array (Taxis.IssueId × TargetGap) := #[]
@@ -750,7 +819,9 @@ def issuesWithLabel (labelName : String) : IO (Option LabelDispatchSets) := do
         if workIds.contains raw.id.val then work := work.push (issue, at'.target)
         if !issue.attachedPRs.isEmpty then reviewable := reviewable.push (issue, at'.target)
         if raw.labels.contains label.id then roots := roots.push (issue, at'.target)
-  return some { work, reviewable, gaps, roots }
+  return some
+    { work, reviewable, gaps, roots
+    , openByRoot := openIssuesByRoot all label.id excludeRoots }
 
 /-! ## Comments
 
