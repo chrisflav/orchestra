@@ -638,9 +638,11 @@ private def sourceSummary : Listener.SourceConfig → (String × String)
   | .projectDispatcher pid caps       =>
       let cs := String.intercalate ", " (caps.map (fun (n,c) => s!"{n}={c}"))
       ("project-dispatcher", s!"project={pid.toString} caps=[{cs}]")
-  | .labelDispatcher label caps       =>
+  | .labelDispatcher label caps limitUnclaimed excludeRoots =>
       let cs := String.intercalate ", " (caps.map (fun (n,c) => s!"{n}={c}"))
-      ("label-dispatcher", s!"label={label} caps=[{cs}]")
+      let lim := if limitUnclaimed then " limit=open-issues" else ""
+      let exc := if excludeRoots then " roots=excluded" else ""
+      ("label-dispatcher", s!"label={label} caps=[{cs}]{lim}{exc}")
   | .githubLabelCount repos labels max kind =>
       let r := String.intercalate ", " (repos.map (·.upstream.toString))
       ("github-label-count", s!"{r} kind={kind} max={max} labels=[{String.intercalate "," labels}]")
