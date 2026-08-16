@@ -1308,9 +1308,19 @@ private def usageHandler (p : Parsed) : IO UInt32 := do
     -- question the per-source list only implies, and exercises the same resolver the daemon
     -- uses at claim time.
     if p.hasFlag "select" then
+      -- Resolved the way a task that names no source is, so the answer is the config's rather
+      -- than this command's: a configured pool decides both the candidates and the mode. Listing
+      -- every source under a mode of its own would report a dispatch that cannot happen —
+      -- `default_auth_source` may name a subset, and it carries its own `default_auth_mode`.
+      let (pooled, configMode) := Usage.resolutionFor appConfig backend [] none .ordered
+      -- `--auth_mode` still overrides, which is what makes it a simulation: it answers "and if I
+      -- set distribute?" without having to edit the config to find out.
       let mode := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
-        |>.getD .ordered
-      match ← Usage.select backend labels mode model with
+        |>.getD configMode
+      -- Empty means the config has nothing to choose between — the legacy flat-token install.
+      -- Falling back to every known label keeps the line informative there.
+      let candidates := if pooled.isEmpty then labels else pooled
+      match ← Usage.select backend candidates mode model with
       | .ok label => IO.println s!"  → would select: {label} ({mode.toString})"
       | .error e  => IO.println s!"  → would select: nothing ({e})"
   return 0
