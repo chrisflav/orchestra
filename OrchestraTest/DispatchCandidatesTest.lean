@@ -201,6 +201,19 @@ def anEmptyExcludedRootCountsZero : Test := do
   TestM.assert (openIssuesByRoot all trigger (excludeRoots := true)).isEmpty
     "nothing is counted against a root whose subtree is empty"
 
+/-- The counts do not have to add up to the in-scope set. Scope is inherited from a labelled
+    ancestor whatever state it is in, but only an *open* one is a root, so an issue under a
+    completed epic is still dispatched onto and belongs to no root's tally. Nothing is placed
+    against a root that does not exist, so there is nothing there to bound. -/
+@[test]
+def anIssueUnderACompletedEpicIsInScopeButUncounted : Test := do
+  let all := #[mk 1 (labels := #[trigger]) (state := .completed),
+               mk 2 (parent := some 1)]
+  TestM.assertEqual (ids (dispatchCandidates all trigger)) [2]
+    (msg := "still work: the label is inherited regardless of the epic's state")
+  TestM.assert (openIssuesByRoot all trigger).isEmpty
+    "no open labelled ancestor, so no root owns it"
+
 @[test]
 def rootCountingTerminatesOnCycles : Test := do
   let all := #[mk 1 (parent := some 2), mk 2 (parent := some 1)]

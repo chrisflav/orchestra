@@ -703,11 +703,15 @@ def workableIssues (all : Array Issue) : Array Issue :=
 /-- How many open in-scope issues each labelled root owns, keyed by the root's id.
 
     An issue is counted against its **nearest open labelled ancestor-or-self**, so nested roots
-    partition the in-scope set instead of each counting the whole subtree below it, and the total
-    over all roots is exactly `inScopeOpenIssues`. Nearest-wins is the same rule the project
-    anchor uses, and open-ness is what keeps the tally aligned with `LabelDispatchSets.roots`: a
-    labelled but completed ancestor is no longer a root, so its descendants belong to whichever
-    root is still standing above them.
+    partition the in-scope set instead of each counting the whole subtree below it. Nearest-wins
+    is the same rule the project anchor uses, and open-ness is what keeps the tally aligned with
+    `LabelDispatchSets.roots`: a labelled but completed ancestor is no longer a root, so its
+    descendants belong to whichever root is still standing above them.
+
+    The counts therefore need not add up to `inScopeOpenIssues`. Scope is inherited from a
+    labelled ancestor in any state, so an issue whose only labelled ancestor has completed is
+    still in scope and still dispatched onto, but belongs to no root's tally — which is right,
+    since no root exists there for an unbound role to be placed on either.
 
     A root counts itself unless `excludeRoots` says the label marks the epic rather than the work
     (the same option `dispatchCandidates` takes, and it has to be the same on both or the bound

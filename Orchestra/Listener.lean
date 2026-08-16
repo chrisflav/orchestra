@@ -1399,9 +1399,12 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let roles ← Project.loadGlobalRoles
     -- Named in the tick's own line rather than once at startup: "nothing workable" on a tracker
     -- whose only labelled issue is the root is otherwise indistinguishable from a broken config.
+    -- Says what the option did, not what it prevented: a root with children was never workable
+    -- anyway, so claiming each one as work held back would overstate it.
     let rootNote :=
       if excludeRoots then
-        s!", {sets.roots.size} labelled root(s) held back as epics by exclude_root_issues"
+        s!", {sets.roots.size} labelled root(s) treated as epics by exclude_root_issues \
+          (neither dispatched onto nor counted)"
       else ""
     IO.println s!"[dispatcher] label '{label}': {issues.size} workable \
       (of which {reworking} sent back for changes), {sets.reviewable.size} with a PR attached \

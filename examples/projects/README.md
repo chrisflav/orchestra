@@ -480,13 +480,14 @@ Two things it deliberately does not change:
   reviewing whoever opened it, and an epic carrying one of its own is exactly the case that set
   was widened to containers for.
 
-The tick's line says how many roots were held back, so a tracker whose only labelled issue is an
-epic does not just report "0 workable" and leave you guessing:
+The tick's line says how many roots were treated this way, so a tracker whose only labelled issue
+is an epic does not just report "0 workable" and leave you guessing:
 
 ```
 [dispatcher] label 'agent-ready': 0 workable (of which 0 sent back for changes), 0 with a PR
-  attached of which 0 await a reviewer, 0 skipped for want of a target, 1 labelled root(s) held
-  back as epics by exclude_root_issues; roles available: implementor, maintainer
+  attached of which 0 await a reviewer, 0 skipped for want of a target, 1 labelled root(s) treated
+  as epics by exclude_root_issues (neither dispatched onto nor counted); roles available:
+  implementor, maintainer
 ```
 
 ### What an agent may modify
