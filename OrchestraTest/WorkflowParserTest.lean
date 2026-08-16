@@ -1,4 +1,5 @@
 import OrchestraTest.TestM
+import Orchestra.Project.Role
 import Orchestra.WorkflowParser
 
 open Orchestra
@@ -72,6 +73,119 @@ steps:
       | .task spec => spec.budget
       | _          => none
     TestM.assert (budgets == [some 100.0, some 2.5, none, none]) s!"budgets: got {budgets}"
+
+/-- `tools` on a step reaches the `TaskSpec`. A step that names none stays `none`, which is what
+    sends `resolveTools` back to `mode` — always `fork` in a concert, so no tools. -/
+@[test]
+def toolsYamlParse : Test := do
+  let yaml := "name: tools
+upstream: acme/widgets
+fork: acme/widgets
+
+steps:
+  reviewer:
+    task:
+      prompt: \"a\"
+      issue-number: 12
+      tools:
+        - comment
+  worker:
+    task:
+      prompt: \"b\"
+      tools:
+        - create_pr
+        - work_issues
+  unset:
+    task:
+      prompt: \"c\"
+  empty:
+    task:
+      prompt: \"d\"
+      tools: []
+"
+  match WorkflowProgram.parseYaml yaml with
+  | .error e => TestM.fail s!"parse failed: {e}"
+  | .ok prog =>
+    TestM.assertEqual prog.steps.length 4 "step count"
+    let tools := prog.steps.map fun step =>
+      match step.action with
+      | .task spec => spec.tools
+      | _          => none
+    TestM.assert
+      (tools == [some ["comment"], some ["create_pr", "work_issues"], none, some []])
+      s!"tools: got {tools}"
+
+/-- A tool name that is not in `TaskSpec.knownTools` fails the workflow rather than being
+    dropped. A dropped one is invisible until the agent reaches for a tool it was never given. -/
+@[test]
+def unknownToolYamlParse : Test := do
+  let yaml := "name: tools
+upstream: acme/widgets
+fork: acme/widgets
+
+steps:
+  reviewer:
+    task:
+      prompt: \"a\"
+      tools:
+        - post_review
+"
+  match WorkflowProgram.parseYaml yaml with
+  | .ok _    => TestM.fail "expected an unknown tool to fail the parse"
+  | .error e =>
+    TestM.assert ((e.splitOn "post_review").length == 2) s!"error names the tool: {e}"
+    TestM.assert ((e.splitOn "comment").length == 2) s!"error lists the known tools: {e}"
+
+/-- `knownTools` is the role permission set plus `merge_pr`. Pinned because the two lists are
+    written out separately: a permission group added to one and not the other turns a workflow
+    that names it into a parse failure. -/
+@[test]
+def knownToolsMatchesRolePermissions : Test := do
+  let expected := Project.Role.knownPermissions ++ ["merge_pr"]
+  TestM.assert
+    (TaskSpec.knownTools.all expected.contains && expected.all TaskSpec.knownTools.contains)
+    s!"knownTools {TaskSpec.knownTools} vs role permissions + merge_pr {expected}"
+
+/-- `issue-number` is rejected rather than dropped when it is not a number. The YAML is
+    template-rendered before it is parsed and an unknown `{{...}}` survives that pass, so a
+    dropped one is a step that runs and then cannot reach its issue. -/
+@[test]
+def unrenderedIssueNumberYamlParse : Test := do
+  let yaml := "name: tools
+upstream: acme/widgets
+fork: acme/widgets
+
+steps:
+  poster:
+    task:
+      prompt: \"a\"
+      issue-number: {{pr_number}}
+      tools:
+        - comment
+"
+  match WorkflowProgram.parseYaml yaml with
+  | .ok _    => TestM.fail "expected an unrendered issue-number to fail the parse"
+  | .error e => TestM.assert ((e.splitOn "issue-number").length ≥ 2) s!"error names the field: {e}"
+
+/-- `comment` posts to the step's own `issue-number` and takes no target argument, so the one
+    without the other is refused. -/
+@[test]
+def commentWithoutIssueNumberYamlParse : Test := do
+  let yaml := "name: tools
+upstream: acme/widgets
+fork: acme/widgets
+
+steps:
+  poster:
+    task:
+      prompt: \"a\"
+      tools:
+        - comment
+"
+  match WorkflowProgram.parseYaml yaml with
+  | .ok _    => TestM.fail "expected 'comment' without issue-number to fail the parse"
+  | .error e =>
+    TestM.assert ((e.splitOn "issue-number").length ≥ 2) s!"error names the field: {e}"
 
 @[test]
 def conditionalsYamlParse : Test := do

@@ -60,6 +60,10 @@ steps:
       read-only: true      # mount repo read-only (default: false)
       prompt: "Implement feature X."
 
+      # Optional MCP tools for this step (default: none). See below.
+      tools:
+        - create_pr
+
       # Override the program-level repository for this step only:
       upstream: other-owner/other-repo
       fork: your-org/other-fork
@@ -204,6 +208,53 @@ MCP tools to the agent running that step:
 - **`submit_task_output`** — available when the step's output type is non-unit.
   Accepts a `value` field conforming to the output type's JSON schema. The
   agent must call this tool exactly once before finishing.
+
+Both are derived from `input` / `output` and are not affected by `tools`.
+
+### MCP tools for GitHub and issues
+
+Everything else a step can reach — opening a pull request, posting a review,
+labelling, the orchestra issue tools — is opt-in per step:
+
+```yaml
+steps:
+  post-review:
+    task:
+      prompt: "Post the review on the pull request."
+      issue-number: 12
+      tools:
+        - comment
+```
+
+| Name | Grants |
+|------|--------|
+| `create_pr` | `create_pr` |
+| `merge_pr` | `merge_pr` |
+| `comment` | `comment` — needs `issue-number` on the step too, since that is the issue or PR it posts to |
+| `label_issue` | `label_issue` |
+| `manage_issues` | the orchestra project/issue tools — but see below |
+| `work_issues` | `claim_issue`, `split_issue`, `attach_pr`, … |
+| `review_issues` | `list_issues_in_review`, `decide_issue`, … |
+
+`comment` needs `issue-number` on the same step, since that is the issue or
+pull request it posts to; asking for one without the other is refused at parse
+time.
+
+`manage_issues` is only half useful to a step. Its read tools (`list_issues`,
+`get_issue`) work, but `create_issue` and `update_issue` are scoped by
+`refuseOutsideScope` to the project or issue the task is attached to — and a
+workflow step is attached to neither, since `TaskSpec` has no way to name one.
+Both therefore fail at runtime. `work_issues` and `review_issues` are unaffected:
+they take the project id as a tool argument.
+
+`health`, `refresh_token` and `get_pr_comments` are always available; naming them
+grants nothing. A name outside the table fails the workflow at parse time rather
+than being dropped — a tool that is silently missing surfaces much later, as an
+agent that cannot do what its prompt told it to.
+
+A step that sets no `tools` falls back to the task's `mode`, which a concert
+always fixes at `fork` — that is, to none of the above. That was every concert
+step's behaviour before this field existed.
 
 ## example workflows
 

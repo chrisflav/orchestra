@@ -44,6 +44,17 @@ structure TaskSpec where
   model         : Option String   := none
   /-- Maximum spend in USD for this step. Defaults to 4.0 if not set. -/
   budget        : Option Float    := none
+  /-- Optional MCP tools to enable for this step, beyond the always-available ones
+      (`health`, `refresh_token`, `get_pr_comments`) and the `get_task_input` /
+      `submit_task_output` pair, which a step gets from its declared `input` / `output`
+      regardless of what is named here.
+
+      When absent, `TaskRunner.resolveTools` falls back to `mode` — which a concert always fixes
+      at `fork`, so the step gets no tools at all. That fallback is the only behaviour a step
+      could have before this field existed, and it remains what a step that names no tools gets.
+
+      Validated against `knownTools` when the workflow is parsed. -/
+  tools         : Option (List String) := none
   prompt        : String
   readOnly      : Bool            := false
   input         : List VarRef     := []
@@ -63,6 +74,23 @@ structure TaskSpec where
   /-- Labels to remove from the issue or PR when using the `triage` backend. -/
   triageRemoveLabels : List String := []
   deriving Repr
+
+/-- The tool names a step's `tools` field may ask for: the optional MCP tools and the project
+    permission groups, which is what `Server.toolsList` filters on.
+
+    The always-available tools (`health`, `refresh_token`, `get_pr_comments`) are left out
+    because naming one grants nothing — they are already there.
+
+    This is `Project.Role.knownPermissions` plus `merge_pr`. A role is a template dispatched at
+    whatever issue comes along, so it may not land a pull request; a workflow step is written for
+    one job, and naming the step that merges is a decision the author has already made.
+
+    Kept beside the field it validates, so the parser does not have to link the MCP server or the
+    project tooling to reject a typo — which is the point of validating at all. An unknown name
+    is otherwise invisible until the agent finds itself without the tool it was told to use. -/
+def TaskSpec.knownTools : List String :=
+  ["create_pr", "merge_pr", "comment", "label_issue",
+   "manage_issues", "work_issues", "review_issues"]
 
 /-- Specifies that a step iterates over a list. -/
 structure ForClause where
@@ -169,6 +197,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       upstream, fork, mode := .fork
       prompt := spec.prompt ++ inputSection
       agent := spec.agent, model := spec.model, budget := spec.budget
+      tools := spec.tools
       readOnly := spec.readOnly
       systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt
       backend := spec.backend
@@ -184,6 +213,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       upstream, fork, mode := .fork
       prompt := spec.prompt ++ inputSection ++ outInstr
       agent := spec.agent, model := spec.model, budget := spec.budget
+      tools := spec.tools
       readOnly := spec.readOnly
       systemPrompt := spec.systemPrompt, prependPrompt := spec.prependPrompt
       backend := spec.backend
