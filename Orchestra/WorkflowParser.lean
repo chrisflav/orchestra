@@ -111,8 +111,24 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
   let systemPrompt  := (mappingLookup pairs "system-prompt").bind  (nodeAsString · |>.toOption)
   let prependPrompt := (mappingLookup pairs "prepend-prompt").bind (nodeAsString · |>.toOption)
   let backend       := (mappingLookup pairs "backend").bind        (nodeAsString · |>.toOption)
-  let issueNumber   := (mappingLookup pairs "issue-number").bind   (nodeAsString · |>.toOption)
-                       |>.bind (·.toNat?)
+  -- A workflow's YAML is template-rendered before it is parsed, and an unknown `{{...}}` is left
+  -- standing. Dropping what does not parse would turn `issue-number: {{pr_number}}` against a
+  -- listener that exports no `pr_number` into a step that runs to completion and then cannot
+  -- reach the issue it was written for.
+  let issueNumber ← match mappingLookup pairs "issue-number" with
+    | none      => pure none
+    | some node =>
+        -- Not `nodeAsString`'s error: an unrendered `{{issue_number}}` is a nested flow mapping
+        -- to YAML, so the failure that actually shows up here reads "expected scalar, got
+        -- mapping" and names neither the field nor the placeholder that caused it.
+        match nodeAsString node with
+        | .error _  => .error "issue-number must be a number; the value is not even a scalar, \
+                               which is what an unrendered '{{...}}' placeholder looks like to \
+                               the YAML parser"
+        | .ok raw   =>
+          match (strTrim raw).toNat? with
+          | some n => .ok (some n)
+          | none   => .error s!"issue-number must be a number, got '{strTrim raw}'"
   let tools ← match mappingLookup pairs "tools" with
     | none      => pure none
     | some node => do
@@ -122,6 +138,12 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
         | some bad => .error s!"unknown tool '{bad}'; known tools are \
                                {", ".intercalate TaskSpec.knownTools}"
         | none     => pure (some names)
+  -- `comment` posts to the issue the task was launched from and nothing else, and a step is only
+  -- ever launched from the `issue-number` it names. Granting one without the other is a step that
+  -- writes a whole report and then has nowhere to put it.
+  if (tools.getD []).contains "comment" && issueNumber.isNone then
+    .error "the 'comment' tool needs 'issue-number' on the same step: it posts to that issue or \
+            pull request and takes no target of its own"
   let triageAddLabels ← match mappingLookup pairs "triage-add" with
     | none      => pure []
     | some node => do

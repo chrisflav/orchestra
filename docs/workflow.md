@@ -232,9 +232,20 @@ steps:
 | `merge_pr` | `merge_pr` |
 | `comment` | `comment` — needs `issue-number` on the step too, since that is the issue or PR it posts to |
 | `label_issue` | `label_issue` |
-| `manage_issues` | the orchestra project/issue tools (`list_issues`, `get_issue`, `create_issue`, …) |
+| `manage_issues` | the orchestra project/issue tools — but see below |
 | `work_issues` | `claim_issue`, `split_issue`, `attach_pr`, … |
 | `review_issues` | `list_issues_in_review`, `decide_issue`, … |
+
+`comment` needs `issue-number` on the same step, since that is the issue or
+pull request it posts to; asking for one without the other is refused at parse
+time.
+
+`manage_issues` is only half useful to a step. Its read tools (`list_issues`,
+`get_issue`) work, but `create_issue` and `update_issue` are scoped by
+`refuseOutsideScope` to the project or issue the task is attached to — and a
+workflow step is attached to neither, since `TaskSpec` has no way to name one.
+Both therefore fail at runtime. `work_issues` and `review_issues` are unaffected:
+they take the project id as a tool argument.
 
 `health`, `refresh_token` and `get_pr_comments` are always available; naming them
 grants nothing. A name outside the table fails the workflow at parse time rather
