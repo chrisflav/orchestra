@@ -113,6 +113,15 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
   let backend       := (mappingLookup pairs "backend").bind        (nodeAsString · |>.toOption)
   let issueNumber   := (mappingLookup pairs "issue-number").bind   (nodeAsString · |>.toOption)
                        |>.bind (·.toNat?)
+  let tools ← match mappingLookup pairs "tools" with
+    | none      => pure none
+    | some node => do
+        let items ← nodeAsSeq node
+        let names ← items.toList.mapM fun item => return strTrim (← nodeAsString item)
+        match names.find? (!TaskSpec.knownTools.contains ·) with
+        | some bad => .error s!"unknown tool '{bad}'; known tools are \
+                               {", ".intercalate TaskSpec.knownTools}"
+        | none     => pure (some names)
   let triageAddLabels ← match mappingLookup pairs "triage-add" with
     | none      => pure []
     | some node => do
@@ -136,7 +145,7 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
         outPairs.toList.mapM fun (k, v) => do
           let name ← nodeAsString k
           parseOutputSpec name v
-  return { agent, model, budget, prompt, readOnly, input, output, context, upstream, fork,
+  return { agent, model, budget, tools, prompt, readOnly, input, output, context, upstream, fork,
            systemPrompt, prependPrompt, backend, issueNumber, triageAddLabels, triageRemoveLabels }
 
 private def parseWriteAction (node : Node) : Except String StepAction := do

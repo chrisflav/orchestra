@@ -73,6 +73,68 @@ steps:
       | _          => none
     TestM.assert (budgets == [some 100.0, some 2.5, none, none]) s!"budgets: got {budgets}"
 
+/-- `tools` on a step reaches the `TaskSpec`. A step that names none stays `none`, which is what
+    sends `resolveTools` back to `mode` — always `fork` in a concert, so no tools. -/
+@[test]
+def toolsYamlParse : Test := do
+  let yaml := "name: tools
+upstream: acme/widgets
+fork: acme/widgets
+
+steps:
+  reviewer:
+    task:
+      prompt: \"a\"
+      issue-number: 12
+      tools:
+        - comment
+  worker:
+    task:
+      prompt: \"b\"
+      tools:
+        - create_pr
+        - work_issues
+  unset:
+    task:
+      prompt: \"c\"
+  empty:
+    task:
+      prompt: \"d\"
+      tools: []
+"
+  match WorkflowProgram.parseYaml yaml with
+  | .error e => TestM.fail s!"parse failed: {e}"
+  | .ok prog =>
+    TestM.assertEqual prog.steps.length 4 "step count"
+    let tools := prog.steps.map fun step =>
+      match step.action with
+      | .task spec => spec.tools
+      | _          => none
+    TestM.assert
+      (tools == [some ["comment"], some ["create_pr", "work_issues"], none, some []])
+      s!"tools: got {tools}"
+
+/-- A tool name that is not in `TaskSpec.knownTools` fails the workflow rather than being
+    dropped. A dropped one is invisible until the agent reaches for a tool it was never given. -/
+@[test]
+def unknownToolYamlParse : Test := do
+  let yaml := "name: tools
+upstream: acme/widgets
+fork: acme/widgets
+
+steps:
+  reviewer:
+    task:
+      prompt: \"a\"
+      tools:
+        - post_review
+"
+  match WorkflowProgram.parseYaml yaml with
+  | .ok _    => TestM.fail "expected an unknown tool to fail the parse"
+  | .error e =>
+    TestM.assert ((e.splitOn "post_review").length == 2) s!"error names the tool: {e}"
+    TestM.assert ((e.splitOn "comment").length == 2) s!"error lists the known tools: {e}"
+
 @[test]
 def conditionalsYamlParse : Test := do
   let yaml ← IO.FS.readFile "examples/concerts/conditionals.yaml"
