@@ -294,7 +294,9 @@ Exactly one of `oauth_token` or `api_key` must be present per source.
 
 The `default_auth_source` field selects which source is used when a task does
 not specify one. When omitted and only one source is configured, that source
-is selected automatically.
+is selected automatically. It also accepts a *list*, which pools the accounts
+it names instead of pinning one — see
+[defaulting to several sources](#defaulting-to-several-sources).
 
 To select a specific source in a task, set the `auth_source` field:
 
@@ -346,6 +348,41 @@ workers cannot all read the same pre-dispatch state and pick the same account.
 
 `auth_sources` takes precedence over `auth_source`; either can be omitted, in
 which case `default_auth_source` applies as before.
+
+### defaulting to several sources
+
+Naming candidates per task only reaches the paths that have somewhere to write
+them. Two do not: a role dispatched by a `label-dispatcher` or
+`project-dispatcher` listener is built from the role template, which has no
+auth fields, and a concert step is built from its own YAML, which has none
+either. Both arrive at resolution naming nothing, so both take whatever
+`default_auth_source` says — and a single label there means every dispatched
+agent and every workflow step runs on one account while the others idle.
+
+Give the field a list to pool them instead:
+
+```json
+{
+  "name": "claude",
+  "auth_sources": [
+    { "label": "work",     "oauth_token": "sk-ant-oat-..." },
+    { "label": "personal", "oauth_token": "sk-ant-oat-..." }
+  ],
+  "default_auth_source": ["work", "personal"],
+  "default_auth_mode": "distribute"
+}
+```
+
+`default_auth_mode` takes the same two values as a task's `auth_mode` and means
+the same things; it applies only to the pool, and only when the pool holds more
+than one label. It is a separate field because the mode has to travel with the
+candidates: a task that names nothing carries `auth_mode: ordered`, the
+default, and walking a pool in `ordered` picks the first account every time —
+exactly the pinning the pool exists to undo.
+
+The narrower forms still win. A task's own `auth_sources` beats the pool, a
+task's `auth_source` pins past it, and a `default_auth_source` written as a
+plain string keeps pinning as it always did.
 
 **Which source a task runs on is decided when it starts, not when it is
 queued.** An entry can sit in the queue for hours, and the account that was

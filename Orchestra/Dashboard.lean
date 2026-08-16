@@ -536,15 +536,21 @@ private def authApi (configPath : Option System.FilePath) : IO Json := do
   | .ok cfg =>
     let backends ← cfg.agentAuthConfigs.mapM fun a => do
       let sources ← a.authSources.mapM fun src => do
-        -- `Usage.candidatesFor`: an explicit default, or the sole source when there is
-        -- exactly one. Marking it matters because it is what a task that names no source gets.
-        let isDefault := match a.defaultAuthSource with
-          | some d => d == src.label
-          | none   => a.authSources.size == 1
+        -- `Usage.resolutionFor`: the configured default(s), or the sole source when there is
+        -- exactly one. Marking it matters because it is what a task that names no source gets —
+        -- and with a pool configured that is every member of the pool, not one of them.
+        let isDefault := if a.defaultAuthSources.isEmpty
+          then a.authSources.size == 1
+          else a.defaultAuthSources.contains src.label
         authSourceJson a.name src isDefault now
+      -- Joined rather than sent as an array: the field is a caption on the Auth page, and
+      -- widening its type would be a breaking change to `AuthBackend` in the web client.
+      let defaultSource :=
+        if a.defaultAuthSources.isEmpty then none
+        else some (", ".intercalate a.defaultAuthSources)
       return Json.mkObj [
         ("name",          a.name),
-        ("defaultSource", optStr a.defaultAuthSource),
+        ("defaultSource", optStr defaultSource),
         ("sources",       Json.arr sources)
       ]
     return Json.mkObj [("configError", Json.null), ("backends", Json.arr backends)]

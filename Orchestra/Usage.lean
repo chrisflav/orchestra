@@ -865,27 +865,40 @@ def ensureFresh (cfg : AppConfig) (backend label : String)
 
 The single entry point every running mode shares. -/
 
-/-- The labels a task may run on, in preference order.
+/-- The labels a task may run on, in preference order, and the mode that picks between them.
 
     Three ways to say it, narrowest first:
-    * `authSources` — an explicit candidate list, the only form that can fail over;
+    * `authSources` — an explicit candidate list, the only form a task can fail over on;
     * `authSource` — a single forced label (the pre-existing field, still honoured);
     * neither — the backend's `default_auth_source`, or its sole source if it has exactly one.
 
-    An empty result means the config has nothing to choose between, which happens on the legacy
-    flat-token config that predates named sources. `resolveLabel` reports that as "no label",
-    not as an error, so those installs keep working untouched. -/
-def candidatesFor (cfg : AppConfig) (backend : String) (authSources : List String)
-    (authSource : Option String) : List String :=
-  if !authSources.isEmpty then authSources
+    The mode travels with the candidates rather than always coming from the task, because the two
+    are chosen together. A task that brings its own list brings its own mode; a task that brings
+    nothing takes both from the config — and must, since the paths that arrive here with nothing
+    named are exactly the ones with no field to write a mode in (a dispatched role, a concert
+    step). Handing a configured pool to the task's mode would walk it in `ordered`, the default,
+    which means always the first account: the pinning a pool exists to undo.
+
+    An empty candidate list means the config has nothing to choose between, which happens on the
+    legacy flat-token config that predates named sources. `resolveLabel` reports that as "no
+    label", not as an error, so those installs keep working untouched. -/
+def resolutionFor (cfg : AppConfig) (backend : String) (authSources : List String)
+    (authSource : Option String) (mode : AuthMode) : List String × AuthMode :=
+  if !authSources.isEmpty then (authSources, mode)
   else match authSource with
-    | some l => [l]
+    | some l => ([l], mode)
     | none   =>
       match cfg.agentAuthConfigs.find? (·.name == backend) with
-      | none   => []
-      | some a => match a.defaultAuthSource with
-        | some d => [d]
-        | none   => if a.authSources.size == 1 then [a.authSources[0]!.label] else []
+      | none   => ([], mode)
+      | some a =>
+        if !a.defaultAuthSources.isEmpty then (a.defaultAuthSources, a.defaultAuthMode)
+        else if a.authSources.size == 1 then ([a.authSources[0]!.label], mode)
+        else ([], mode)
+
+/-- The candidates alone, for callers with no mode of their own to offer. -/
+def candidatesFor (cfg : AppConfig) (backend : String) (authSources : List String)
+    (authSource : Option String) : List String :=
+  (resolutionFor cfg backend authSources authSource .ordered).1
 
 /-- Pick the authentication source a task should run on, refreshing usage data first.
 
@@ -899,7 +912,7 @@ def candidatesFor (cfg : AppConfig) (backend : String) (authSources : List Strin
 def resolveLabel (cfg : AppConfig) (backend : String) (authSources : List String)
     (authSource : Option String) (mode : AuthMode) (model : Option String)
     : IO (Except String (Option String)) := do
-  let candidates := candidatesFor cfg backend authSources authSource
+  let (candidates, mode) := resolutionFor cfg backend authSources authSource mode
   if candidates.isEmpty then return .ok none
   for label in candidates do
     ensureFresh cfg backend label

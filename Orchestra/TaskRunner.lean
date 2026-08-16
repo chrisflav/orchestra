@@ -302,15 +302,24 @@ def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
     let label ← match requestedLabel with
       | some l => pure l
       | none   =>
-        match agentAuth.defaultAuthSource with
-        | some d => pure d
-        | none   =>
+        match agentAuth.defaultAuthSources with
+        | [d] => pure d
+        | []  =>
           if agentAuth.authSources.size == 1 then
             pure agentAuth.authSources[0]!.label
           else
             throw (.userError
               s!"Multiple auth sources configured for backend '{backendName}'. \
                  Specify one via the 'auth_source' field.")
+        -- A pool has to be chosen from against live usage, which is `Usage.resolveLabel`'s job
+        -- and happens before this is called (`selectAuthSource`). Reaching here with one
+        -- unresolved means a launch path skipped that; taking the head would silently pin every
+        -- such task to one account, which is the bug the pool was added to fix.
+        | _   =>
+          throw (.userError
+            s!"Backend '{backendName}' pools {agentAuth.defaultAuthSources.length} default auth \
+               sources; one must be resolved (Usage.resolveLabel) before its environment is \
+               built.")
     -- Validate label uniqueness (warn on duplicates)
     let dupeCount := agentAuth.authSources.filter (fun s => s.label == label) |>.size
     if dupeCount > 1 then

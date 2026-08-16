@@ -397,9 +397,20 @@ structure AgentAuthConfig where
   name : String
   /-- Available authentication sources for this backend. Labels must be unique. -/
   authSources : Array AuthSource := #[]
-  /-- Label of the default authentication source.
-      If absent and exactly one source is configured, that source is used automatically. -/
-  defaultAuthSource : Option String := none
+  /-- The sources a task that names none of its own runs on.
+
+      Written as a single label to pin one account, or as a list to pool several. A pool is what
+      lets accounts be kept level without every listener, role and workflow step naming them
+      itself — which matters because several dispatch paths have no field to name them in:
+      `Listener.buildRoleEntry` sets no candidates on a dispatched role, and a concert step's
+      YAML has nowhere to write them. Both arrive here with nothing named and take the pool.
+
+      Empty means "not configured": with exactly one source configured that source is used
+      anyway, and with several the task is asked to name one. -/
+  defaultAuthSources : List String := []
+  /-- How to choose among `defaultAuthSources` when it holds more than one.
+      Ignored when it holds zero or one, which is every config that predates the pool. -/
+  defaultAuthMode : AuthMode := .ordered
   /-- Additional TCP ports the agent is allowed to connect to inside the sandbox.
       Appended to the ports the agent backend already opens (MCP server port + 443). -/
   extraPorts : Array Nat := #[]
@@ -417,10 +428,17 @@ instance : FromJson AgentAuthConfig where
   fromJson? j := do
     let name             ← j.getObjValAs? String "name"
     let authSources       := j.getObjValAs? (Array AuthSource) "auth_sources" |>.toOption |>.getD #[]
-    let defaultAuthSource := j.getObjValAs? String "default_auth_source" |>.toOption
+    -- One key, two spellings: a bare string is the pre-pool syntax and still pins, a list pools.
+    -- Kept as one key so there is no second field to disagree with the first about what the
+    -- default is.
+    let defaultAuthSources :=
+      match j.getObjValAs? String "default_auth_source" |>.toOption with
+      | some s => [s]
+      | none   => j.getObjValAs? (List String) "default_auth_source" |>.toOption |>.getD []
+    let defaultAuthMode   := j.getObjValAs? AuthMode "default_auth_mode" |>.toOption |>.getD .ordered
     let extraPorts        := j.getObjValAs? (Array Nat) "extra_ports" |>.toOption |>.getD #[]
     let pollUsage         := j.getObjValAs? Bool "poll_usage" |>.toOption |>.getD true
-    return { name, authSources, defaultAuthSource, extraPorts, pollUsage }
+    return { name, authSources, defaultAuthSources, defaultAuthMode, extraPorts, pollUsage }
 
 structure Task where
   /-- The input type of this task. -/

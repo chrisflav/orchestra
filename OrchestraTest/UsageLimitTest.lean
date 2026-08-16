@@ -492,18 +492,19 @@ def chooseFrom_noSourcesConfiguredIsItsOwnMessage : Test := do
 
 Which labels a task is allowed to run on, given the three ways config can express it. -/
 
-private def cfgWithSources (labels : List String) (dflt : Option String := none)
-    (pollUsage : Bool := true) : AppConfig :=
+private def cfgWithSources (labels : List String) (dflt : List String := [])
+    (dfltMode : AuthMode := .ordered) (pollUsage : Bool := true) : AppConfig :=
   { appId := 1, privateKeyPath := ""
     agentAuthConfigs := #[{
       name := "claude"
-      defaultAuthSource := dflt
+      defaultAuthSources := dflt
+      defaultAuthMode := dfltMode
       pollUsage
       authSources := labels.toArray.map fun l => { label := l, kind := .oauthToken "t" } }] }
 
 @[test]
 def candidatesFor_explicitListWins : Test := do
-  let cfg := cfgWithSources ["a", "b", "c"] (dflt := some "a")
+  let cfg := cfgWithSources ["a", "b", "c"] (dflt := ["a"])
   TestM.assertEqual (candidatesFor cfg "claude" ["b", "c"] (some "a")) ["b", "c"]
     (msg := "auth_sources beats both auth_source and the configured default")
 
@@ -517,10 +518,46 @@ def candidatesFor_singleForcedLabelIsStillChecked : Test := do
 
 @[test]
 def candidatesFor_fallsBackToConfiguredDefaults : Test := do
-  TestM.assertEqual (candidatesFor (cfgWithSources ["a", "b"] (dflt := some "b")) "claude" [] none)
+  TestM.assertEqual (candidatesFor (cfgWithSources ["a", "b"] (dflt := ["b"])) "claude" [] none)
     ["b"] (msg := "default_auth_source")
   TestM.assertEqual (candidatesFor (cfgWithSources ["only"]) "claude" [] none) ["only"]
     (msg := "a sole source needs no naming")
+
+/-! ### The configured pool
+
+A task that names nothing takes both the candidates and the mode from config. This is the only
+way several dispatch paths can reach more than one account: `Listener.buildRoleEntry` writes no
+candidates onto a dispatched role, and a concert step's YAML has no field to write them in. -/
+
+@[test]
+def resolutionFor_poolIsWalkedInTheConfiguredMode : Test := do
+  let cfg := cfgWithSources ["a", "b"] (dflt := ["a", "b"]) (dfltMode := .distribute)
+  let (candidates, mode) := resolutionFor cfg "claude" [] none .ordered
+  TestM.assertEqual candidates ["a", "b"] (msg := "a pooled default offers every member")
+  -- The task's own `.ordered` must not win here: it is the default every path that names
+  -- nothing carries, and under it `chooseFrom` takes the head every time — one account.
+  TestM.assertEqual (mode == .distribute) true
+    (msg := "the mode comes from the config the pool came from, not from the task")
+
+@[test]
+def resolutionFor_aTaskThatNamesItsOwnListKeepsItsOwnMode : Test := do
+  let cfg := cfgWithSources ["a", "b"] (dflt := ["a", "b"]) (dfltMode := .distribute)
+  let (candidates, mode) := resolutionFor cfg "claude" ["b", "a"] none .ordered
+  TestM.assertEqual candidates ["b", "a"] (msg := "an explicit list still wins over the pool")
+  TestM.assertEqual (mode == .ordered) true
+    (msg := "a task that brings its own list brings its own mode")
+
+@[test]
+def resolutionFor_pinningStillPins : Test := do
+  -- `"default_auth_source": "houyi"` parses to a one-element pool, so the pre-pool config keeps
+  -- resolving to exactly that source whatever mode sits beside it.
+  let cfg := cfgWithSources ["a", "b"] (dflt := ["b"]) (dfltMode := .distribute)
+  TestM.assertEqual (candidatesFor cfg "claude" [] none) ["b"]
+    (msg := "a single configured default is still a pin, not a pool")
+  -- And an explicitly pinned task is never widened to the pool.
+  let pooled := cfgWithSources ["a", "b"] (dflt := ["a", "b"]) (dfltMode := .distribute)
+  TestM.assertEqual (candidatesFor pooled "claude" [] (some "a")) ["a"]
+    (msg := "auth_source beats the pool")
 
 @[test]
 def candidatesFor_legacyConfigHasNothingToChooseBetween : Test := do
@@ -533,6 +570,40 @@ def candidatesFor_legacyConfigHasNothingToChooseBetween : Test := do
   -- guessing, and `resolveAuthEnv` produces its "specify one" error.
   TestM.assertEqual (candidatesFor (cfgWithSources ["a", "b"]) "claude" [] none) []
     (msg := "ambiguous config is left to the existing error path")
+
+/-! ## Spelling the default
+
+One key carries both forms, so there is no second field to disagree with the first about what a
+task that names nothing gets. -/
+
+private def parseAuthConfig (json : String) : Except String AgentAuthConfig := do
+  Lean.FromJson.fromJson? (← Lean.Json.parse json)
+
+@[test]
+def defaultAuthSource_stringStillParsesAsAPin : Test := do
+  match parseAuthConfig "{\"name\":\"claude\",\"default_auth_source\":\"houyi\",\
+                          \"auth_sources\":[]}" with
+  | .error e => TestM.fail s!"fromJson: {e}"
+  | .ok a =>
+    TestM.assertEqual a.defaultAuthSources ["houyi"] (msg := "a bare string is a one-source pool")
+    TestM.assertEqual (a.defaultAuthMode == .ordered) true (msg := "and the mode is irrelevant")
+
+@[test]
+def defaultAuthSource_listParsesAsAPool : Test := do
+  match parseAuthConfig "{\"name\":\"claude\",\"default_auth_source\":[\"contact\",\"houyi\"],\
+                          \"default_auth_mode\":\"distribute\",\"auth_sources\":[]}" with
+  | .error e => TestM.fail s!"fromJson: {e}"
+  | .ok a =>
+    TestM.assertEqual a.defaultAuthSources ["contact", "houyi"] (msg := "both sources pooled")
+    TestM.assertEqual (a.defaultAuthMode == .distribute) true (msg := "default_auth_mode read")
+
+@[test]
+def defaultAuthSource_absentIsEmpty : Test := do
+  match parseAuthConfig "{\"name\":\"claude\",\"auth_sources\":[]}" with
+  | .error e => TestM.fail s!"fromJson: {e}"
+  | .ok a =>
+    -- Nothing configured, so the sole-source rule decides and an ambiguous config still errors.
+    TestM.assert a.defaultAuthSources.isEmpty (msg := "no default configured")
 
 /-! ## Opt-out of polling
 
