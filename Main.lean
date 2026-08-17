@@ -1308,9 +1308,19 @@ private def usageHandler (p : Parsed) : IO UInt32 := do
     -- question the per-source list only implies, and exercises the same resolver the daemon
     -- uses at claim time.
     if p.hasFlag "select" then
-      let mode := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
-        |>.getD .ordered
-      match ← Usage.select backend labels mode model with
+      -- Resolved the way a task that names no source is, so the answer is the config's rather
+      -- than this command's: a configured pool decides both the candidates and the mode. Listing
+      -- every source under a mode of its own would report a dispatch that cannot happen —
+      -- `default_auth_source` may name a subset, and it carries its own `default_auth_mode`.
+      -- `--auth_mode` still overrides, which is what makes it a simulation: it answers "and if I
+      -- set distribute?" without having to edit the config to find out. Absent, the config's own
+      -- mode is what gets reported.
+      let flagMode := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
+      let (pooled, mode) := Usage.resolutionFor appConfig backend [] none flagMode
+      -- Empty means the config has nothing to choose between — the legacy flat-token install.
+      -- Falling back to every known label keeps the line informative there.
+      let candidates := if pooled.isEmpty then labels else pooled
+      match ← Usage.select backend candidates mode model with
       | .ok label => IO.println s!"  → would select: {label} ({mode.toString})"
       | .error e  => IO.println s!"  → would select: nothing ({e})"
   return 0
@@ -1373,8 +1383,9 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let authSource  := p.flag? "auth_source" |>.map (·.as! String)
   let authSources := (p.flag? "auth_sources" |>.map (·.as! String)).map
     (fun s => (s.splitOn ",").map (·.trimAscii.toString) |>.filter (!·.isEmpty)) |>.getD []
+  -- Left as `none` when the flag is absent, so an interactive run takes the backend's
+  -- `default_auth_mode` like every other path rather than forcing `ordered` onto a pool.
   let authMode    := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
-    |>.getD .ordered
   let upstream ← IO.ofExcept (Repository.parse upstreamStr)
   let fork     ← IO.ofExcept (Repository.parse forkStr)
   let allowedTools : List String := match toolsStr with
