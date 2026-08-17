@@ -312,8 +312,12 @@ structure IOTask (i o : ResultType) where
       about to launch, not fixed when it is queued: an entry can wait hours for a slot, and the
       source that was free when it was created may be exhausted by the time it runs. -/
   authSources : List String := []
-  /-- How to choose among `authSources`. Ignored when fewer than two are configured. -/
-  authMode : AuthMode := .ordered
+  /-- How to choose among the candidates. Ignored when fewer than two are in play.
+
+      `none` means the task did not say, and the backend's `default_auth_mode` decides — which is
+      the only way a pooled default gets walked in the mode it was configured with. Absent is
+      therefore not the same as `ordered`, and the two must stay distinguishable. -/
+  authMode : Option AuthMode := none
   /-- Optional tools to enable beyond the always-available ones (health, refresh_token,
       get_pr_comments): `"create_pr"`, `"merge_pr"`, `"label_issue"`, `"comment"`, and the
       project/issue permission groups.
@@ -431,11 +435,21 @@ instance : FromJson AgentAuthConfig where
     -- One key, two spellings: a bare string is the pre-pool syntax and still pins, a list pools.
     -- Kept as one key so there is no second field to disagree with the first about what the
     -- default is.
-    let defaultAuthSources :=
-      match j.getObjValAs? String "default_auth_source" |>.toOption with
-      | some s => [s]
-      | none   => j.getObjValAs? (List String) "default_auth_source" |>.toOption |>.getD []
-    let defaultAuthMode   := j.getObjValAs? AuthMode "default_auth_mode" |>.toOption |>.getD .ordered
+    --
+    -- Absent is fine; present-and-unreadable is not. Both of these decide which account real
+    -- work runs on, and the failure is silent in the direction that hurts: a swallowed
+    -- `"distributed"` leaves the pool walking in `ordered`, i.e. pinned to its first member —
+    -- exactly what the pool was configured to stop — with nothing in the logs to say so.
+    let defaultAuthSources ← match j.getObjVal? "default_auth_source" with
+      | .error _ => pure []
+      | .ok v    => match (FromJson.fromJson? v : Except String String) with
+        | .ok s    => pure [s]
+        | .error _ => match (FromJson.fromJson? v : Except String (List String)) with
+          | .ok ls   => pure ls
+          | .error _ => throw s!"default_auth_source must be a label or a list of labels, got {v}"
+    let defaultAuthMode ← match j.getObjVal? "default_auth_mode" with
+      | .error _ => pure AuthMode.ordered
+      | .ok v    => (FromJson.fromJson? v : Except String AuthMode)
     let extraPorts        := j.getObjValAs? (Array Nat) "extra_ports" |>.toOption |>.getD #[]
     let pollUsage         := j.getObjValAs? Bool "poll_usage" |>.toOption |>.getD true
     return { name, authSources, defaultAuthSources, defaultAuthMode, extraPorts, pollUsage }
@@ -467,7 +481,7 @@ instance : FromJson Task where
     let memory     := j.getObjValAs? MemoryMode "memory"     |>.toOption |>.getD .both
     let authSource := j.getObjValAs? String "auth_source"    |>.toOption
     let authSources := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
-    let authMode   := j.getObjValAs? AuthMode "auth_mode"    |>.toOption |>.getD .ordered
+    let authMode   := j.getObjValAs? AuthMode "auth_mode"    |>.toOption
     let tools      := j.getObjValAs? (List String) "tools"   |>.toOption
     let readOnly   := j.getObjValAs? Bool "read_only"        |>.toOption |>.getD false
     let series      := j.getObjValAs? String "series"          |>.toOption
@@ -594,7 +608,14 @@ instance : FromJson AppConfig where
     let anthropicBaseUrl := j.getObjValAs? String "anthropic_base_url" |>.toOption
     let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
     let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
-    let agentAuthConfigs := j.getObjValAs? (Array AgentAuthConfig) "agents" |>.toOption |>.getD #[]
+    -- Strict when present. Swallowing the error here drops the whole `agents` block, and the
+    -- backends then fall through to the legacy flat token fields — which on a config that
+    -- defines `agents` means no credentials at all, reported as "no auth sources configured"
+    -- with no mention of the key that failed to parse. Absent stays absent: that is the legacy
+    -- flat-token install, which is a supported config and not a mistake.
+    let agentAuthConfigs ← match j.getObjVal? "agents" with
+      | .error _ => pure #[]
+      | .ok v    => (FromJson.fromJson? v : Except String (Array AgentAuthConfig))
     let additionalSandboxPaths := j.getObjValAs? SandboxPaths "additional_sandbox_paths" |>.toOption |>.getD {}
     let taxis := j.getObjValAs? Taxis.Config "taxis" |>.toOption
     let queue := j.getObjValAs? QueueConfig "queue" |>.toOption |>.getD {}

@@ -492,6 +492,12 @@ def chooseFrom_noSourcesConfiguredIsItsOwnMessage : Test := do
 
 Which labels a task is allowed to run on, given the three ways config can express it. -/
 
+/-- The candidates `resolutionFor` yields, dropping the mode. Most of these tests are about
+    which labels are offered, and the production callers all want both halves. -/
+private def candidatesFor (cfg : AppConfig) (backend : String) (authSources : List String)
+    (authSource : Option String) : List String :=
+  (resolutionFor cfg backend authSources authSource none).1
+
 private def cfgWithSources (labels : List String) (dflt : List String := [])
     (dfltMode : AuthMode := .ordered) (pollUsage : Bool := true) : AppConfig :=
   { appId := 1, privateKeyPath := ""
@@ -532,20 +538,46 @@ candidates onto a dispatched role, and a concert step's YAML has no field to wri
 @[test]
 def resolutionFor_poolIsWalkedInTheConfiguredMode : Test := do
   let cfg := cfgWithSources ["a", "b"] (dflt := ["a", "b"]) (dfltMode := .distribute)
-  let (candidates, mode) := resolutionFor cfg "claude" [] none .ordered
+  let (candidates, mode) := resolutionFor cfg "claude" [] none none
   TestM.assertEqual candidates ["a", "b"] (msg := "a pooled default offers every member")
-  -- The task's own `.ordered` must not win here: it is the default every path that names
-  -- nothing carries, and under it `chooseFrom` takes the head every time — one account.
+  -- A task that names no mode must not be read as asking for `ordered`: that is what every
+  -- path with no auth field to fill carries, and under it `chooseFrom` takes the head every
+  -- time — one account.
   TestM.assertEqual (mode == .distribute) true
     (msg := "the mode comes from the config the pool came from, not from the task")
 
 @[test]
 def resolutionFor_aTaskThatNamesItsOwnListKeepsItsOwnMode : Test := do
   let cfg := cfgWithSources ["a", "b"] (dflt := ["a", "b"]) (dfltMode := .distribute)
-  let (candidates, mode) := resolutionFor cfg "claude" ["b", "a"] none .ordered
+  let (candidates, mode) := resolutionFor cfg "claude" ["b", "a"] none (some .ordered)
   TestM.assertEqual candidates ["b", "a"] (msg := "an explicit list still wins over the pool")
   TestM.assertEqual (mode == .ordered) true
     (msg := "a task that brings its own list brings its own mode")
+
+@[test]
+def resolutionFor_anExplicitModeSurvivesTheConfiguredPool : Test := do
+  -- `auth_mode` without `auth_sources` is a real combination: a listener action can set one and
+  -- not the other, and `orchestra interactive --auth_mode` sets only the mode. The pool supplies
+  -- the candidates there, but the mode the operator asked for is still the mode.
+  let cfg := cfgWithSources ["a", "b"] (dflt := ["a", "b"]) (dfltMode := .ordered)
+  let (candidates, mode) := resolutionFor cfg "claude" [] none (some .distribute)
+  TestM.assertEqual candidates ["a", "b"] (msg := "still the pool's candidates")
+  TestM.assertEqual (mode == .distribute) true
+    (msg := "an explicitly named mode is not discarded by the pool")
+
+@[test]
+def resolutionFor_poolDropsLabelsTheBackendDoesNotConfigure : Test := do
+  -- A typo'd pool member would otherwise *win* under distribute: nothing has been recorded
+  -- against it, so it reads as the least-consumed source, and the task then dies in
+  -- `resolveAuthEnv` against a source that does not exist instead of using the healthy one.
+  let cfg := cfgWithSources ["work"] (dflt := ["work", "personl"]) (dfltMode := .distribute)
+  TestM.assertEqual (candidatesFor cfg "claude" [] none) ["work"]
+    (msg := "an unconfigured label is dropped from the pool")
+  -- All of them unknown is not a pool at all; resolution declines and the existing error path
+  -- reports it, rather than dispatching onto a label with no credentials behind it.
+  let allBad := cfgWithSources ["work", "play"] (dflt := ["nope", "nada"])
+  TestM.assertEqual (candidatesFor allBad "claude" [] none) []
+    (msg := "a wholly unconfigured pool resolves to nothing")
 
 @[test]
 def resolutionFor_pinningStillPins : Test := do
@@ -596,6 +628,21 @@ def defaultAuthSource_listParsesAsAPool : Test := do
   | .ok a =>
     TestM.assertEqual a.defaultAuthSources ["contact", "houyi"] (msg := "both sources pooled")
     TestM.assertEqual (a.defaultAuthMode == .distribute) true (msg := "default_auth_mode read")
+
+@[test]
+def defaultAuthSource_malformedIsRejected : Test := do
+  -- Swallowing this would leave the pool walking in `ordered` — pinned to its first member,
+  -- which is the failure the pool exists to prevent — with nothing in the logs to say so.
+  match parseAuthConfig "{\"name\":\"claude\",\"default_auth_source\":[\"a\",\"b\"],\
+                          \"default_auth_mode\":\"distributed\",\"auth_sources\":[]}" with
+  | .ok _    => TestM.fail "a misspelled default_auth_mode should not parse as ordered"
+  | .error _ => TestM.assert true (msg := "typo in default_auth_mode is reported")
+
+@[test]
+def defaultAuthSource_malformedSourceIsRejected : Test := do
+  match parseAuthConfig "{\"name\":\"claude\",\"default_auth_source\":7,\"auth_sources\":[]}" with
+  | .ok _    => TestM.fail "a non-label default_auth_source should not parse as absent"
+  | .error _ => TestM.assert true (msg := "malformed default_auth_source is reported")
 
 @[test]
 def defaultAuthSource_absentIsEmpty : Test := do

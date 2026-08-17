@@ -125,8 +125,9 @@ structure QueueEntry where
       for hours, and the source that was free when a listener queued it may be exhausted by the
       time a worker is ready for it. -/
   authSources   : List String := []
-  /-- How to choose among `authSources`. -/
-  authMode      : AuthMode := .ordered
+  /-- How to choose among the candidates. Absent defers to the backend's `default_auth_mode`,
+      which is what a pooled `default_auth_source` is walked with. -/
+  authMode      : Option AuthMode := none
   /-- Optional tools to enable beyond the always-available ones.
       When absent, allowed tools are derived from `mode` for backwards compatibility. -/
   tools         : Option (List String) := none
@@ -192,7 +193,7 @@ instance : ToJson QueueEntry where
     let fields := fields ++ [("memory", ToJson.toJson e.memory)]
     let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
     let fields := if !e.authSources.isEmpty        then fields ++ [("auth_sources",    ToJson.toJson e.authSources)] else fields
-    let fields := if e.authMode != .ordered        then fields ++ [("auth_mode",       ToJson.toJson e.authMode)]    else fields
+    let fields := if let some m := e.authMode      then fields ++ [("auth_mode",       ToJson.toJson m)]             else fields
     let fields := if let some t := e.tools         then fields ++ [("tools",           ToJson.toJson t)] else fields
     let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
     let fields := if e.priority != 10              then fields ++ [("priority",         Json.num e.priority)]           else fields
@@ -235,7 +236,7 @@ instance : FromJson QueueEntry where
     let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
     let authSource    := j.getObjValAs? String "auth_source" |>.toOption
     let authSources   := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
-    let authMode      := j.getObjValAs? AuthMode "auth_mode" |>.toOption |>.getD .ordered
+    let authMode      := j.getObjValAs? AuthMode "auth_mode" |>.toOption
     let tools         := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority       := j.getObjValAs? Nat        "priority"         |>.toOption |>.getD 10

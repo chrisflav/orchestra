@@ -374,15 +374,22 @@ Give the field a list to pool them instead:
 ```
 
 `default_auth_mode` takes the same two values as a task's `auth_mode` and means
-the same things; it applies only to the pool, and only when the pool holds more
-than one label. It is a separate field because the mode has to travel with the
-candidates: a task that names nothing carries `auth_mode: ordered`, the
-default, and walking a pool in `ordered` picks the first account every time —
-exactly the pinning the pool exists to undo.
+the same things. It is what the pool is walked with when the task says nothing —
+which is the point, since a task that names no mode must not be read as asking
+for `ordered`, and walking a pool in `ordered` picks the first account every
+time. A task that *does* set `auth_mode` still gets it, with or without
+candidates of its own.
 
-The narrower forms still win. A task's own `auth_sources` beats the pool, a
-task's `auth_source` pins past it, and a `default_auth_source` written as a
-plain string keeps pinning as it always did.
+The narrower forms win. A task's own `auth_sources` beats the pool, a task's
+`auth_source` pins past it, and a `default_auth_source` written as a plain
+string keeps pinning as it always did.
+
+A pool label that is not among the backend's `auth_sources` is dropped. Under
+`distribute` an unknown label would otherwise be *preferred* — nothing has been
+recorded against it, so it looks like the least-consumed account — and the task
+would then fail against a source that has no credentials behind it. Both keys
+are parsed strictly when present: a misspelled `default_auth_mode` fails config
+load rather than quietly reverting the pool to `ordered`.
 
 **Which source a task runs on is decided when it starts, not when it is
 queued.** An entry can sit in the queue for hours, and the account that was
