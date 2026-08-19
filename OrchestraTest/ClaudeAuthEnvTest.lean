@@ -40,6 +40,27 @@ def apiKeySource_getsNoPlan : Test := do
     (msg := "and no tier either")
 
 @[test]
+def legacyFlatToken_getsThePlanToo : Test := do
+  -- A config that predates `agents` never reaches `envVarsOfAuthSource`: `resolveAuthEnv` serves
+  -- it from the flat fields instead. `claude_token` there is the same kind of credential with
+  -- the same missing plan, so it must not be the one path still refused Fable.
+  let cfg : AppConfig := { appId := 0, privateKeyPath := "", claudeToken := some "sk-ant-oat-x" }
+  let env ← TaskRunner.resolveAuthEnv cfg AgentDef.claude "claude" none
+  TestM.assert (env.contains ("CLAUDE_CODE_OAUTH_TOKEN", some "sk-ant-oat-x"))
+    (msg := "the flat token is still passed")
+  TestM.assert (env.contains ("CLAUDE_CODE_SUBSCRIPTION_TYPE", some "max"))
+    (msg := "and carries the plan like a configured source")
+
+@[test]
+def legacyFlatConfig_withNoTokenSaysNothingAboutAPlan : Test := do
+  -- The same flat branch serves an API-key-only config, and every other backend besides. A plan
+  -- with no subscription behind it would be a claim about nothing.
+  let cfg : AppConfig := { appId := 0, privateKeyPath := "", anthropicApiKey := some "k" }
+  let env ← TaskRunner.resolveAuthEnv cfg AgentDef.claude "claude" none
+  TestM.assert (!env.any (·.1 == "CLAUDE_CODE_SUBSCRIPTION_TYPE"))
+    (msg := "no token, no plan")
+
+@[test]
 def apiKeySource_stillCarriesItsBaseUrl : Test := do
   -- The plan variables are additions to the OAuth arm alone; the API-key arm is untouched.
   let env := claudeEnv { label := "local", kind := .apiKey "k" (some "http://127.0.0.1:8080") }

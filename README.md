@@ -463,6 +463,10 @@ judge model-scoped limits, `--cached` to skip polling, `--select` to also show
 which source a task queued now would be dispatched to, and `--auth_mode` to
 simulate `distribute` instead of `ordered`.
 
+System prompts can be placed in `~/.config/orchestra/prompts/`. The file
+`~/.config/orchestra/prompts/default.md` is loaded automatically; named prompts can be
+referenced via the `system_prompt` field in a task file.
+
 ### the plan a setup-token cannot state
 
 Claude Code checks a model's entitlement against the subscription it is
@@ -478,18 +482,15 @@ token Fable perfectly well — it is the client refusing, in the plan's name.
 In that mode the client reads the plan and the rate-limit tier from
 `CLAUDE_CODE_SUBSCRIPTION_TYPE` and `CLAUDE_CODE_RATE_LIMIT_TIER` instead of
 from a profile, precisely because there is no profile to read. So orchestra
-sets both beside every `oauth_token` it passes: `max` and
-`default_claude_max_20x`, the plan its accounts are on. Nothing to configure,
-and nothing granted by it — every request is still authorised and priced by the
-server against the token, so the value can only make the client's local guess
-right or wrong. API-key sources get neither: they bill an organisation per
-token and have no subscription to describe.
+sets both beside every OAuth token it passes — an `oauth_token` source or the
+legacy flat `claude_token`: `max` and `default_claude_max_20x`, the plan its
+accounts are on. Nothing to configure, and nothing granted by it — every
+request is still authorised and priced by the server against the token, so the
+value can only make the client's local guess right or wrong. API-key sources
+get neither: they bill an organisation per token and have no subscription to
+describe.
 
 [fable-issue]: https://github.com/anthropics/claude-code/issues/79597
-
-System prompts can be placed in `~/.config/orchestra/prompts/`. The file
-`~/.config/orchestra/prompts/default.md` is loaded automatically; named prompts can be
-referenced via the `system_prompt` field in a task file.
 
 ## task files
 
