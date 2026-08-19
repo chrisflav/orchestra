@@ -463,6 +463,30 @@ judge model-scoped limits, `--cached` to skip polling, `--select` to also show
 which source a task queued now would be dispatched to, and `--auth_mode` to
 simulate `distribute` instead of `ordered`.
 
+### the plan a setup-token cannot state
+
+Claude Code checks a model's entitlement against the subscription it is
+holding, and it learns that subscription from the account profile it fetches at
+`/login`. A long-lived `claude setup-token` — which is what an `oauth_token`
+source carries — has inference scope and nothing else, so that profile is never
+fetched and the client ends up holding no plan at all. Checks that cannot
+confirm the subscription covers a model then fail closed: a Max account is told
+that Fable, a standard part of that plan, requires usage credits
+([anthropics/claude-code#79597][fable-issue]). The server grants the very same
+token Fable perfectly well — it is the client refusing, in the plan's name.
+
+In that mode the client reads the plan and the rate-limit tier from
+`CLAUDE_CODE_SUBSCRIPTION_TYPE` and `CLAUDE_CODE_RATE_LIMIT_TIER` instead of
+from a profile, precisely because there is no profile to read. So orchestra
+sets both beside every `oauth_token` it passes: `max` and
+`default_claude_max_20x`, the plan its accounts are on. Nothing to configure,
+and nothing granted by it — every request is still authorised and priced by the
+server against the token, so the value can only make the client's local guess
+right or wrong. API-key sources get neither: they bill an organisation per
+token and have no subscription to describe.
+
+[fable-issue]: https://github.com/anthropics/claude-code/issues/79597
+
 System prompts can be placed in `~/.config/orchestra/prompts/`. The file
 `~/.config/orchestra/prompts/default.md` is loaded automatically; named prompts can be
 referenced via the `system_prompt` field in a task file.
