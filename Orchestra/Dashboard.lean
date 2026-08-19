@@ -429,8 +429,8 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     ("status",         qStText e.status),
     ("createdAt",      normIso e.createdAt),
     ("priority",       ToJson.toJson e.priority),
-    ("upstream",       e.upstream.toString),
-    ("fork",           e.fork.toString),
+    ("upstream",       optStr (e.repo.map (·.upstream.toString))),
+    ("fork",           optStr (e.repo.map (·.fork.toString))),
     ("prompt",         e.prompt),
     ("series",         optStr e.series),
     ("backend",        optStr e.backend),
@@ -445,8 +445,8 @@ private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
     ("id",            r.id),
     ("status",        tStText r.status),
     ("createdAt",     normIso r.createdAt),
-    ("upstream",      r.upstream.toString),
-    ("fork",          r.fork.toString),
+    ("upstream",      optStr (r.repo.map (·.upstream.toString))),
+    ("fork",          optStr (r.repo.map (·.fork.toString))),
     ("prompt",        r.prompt),
     ("series",        optStr r.series),
     ("backend",       optStr r.backend),
@@ -885,9 +885,9 @@ private def maxLogAttempts : Nat := 100
     then `<id>.retry1.log`, …), so the attempts are read in order and concatenated. Reading only
     the first would show a trace that stops dead the moment a retry begins, which is
     indistinguishable on screen from an agent that has stopped. -/
-private def loadTaskLog (fork : Repository) (id : String) (limit : Nat)
+private def loadTaskLog (repo : Option RepoPair) (id : String) (limit : Nat)
     : IO (Array Json × Nat) := do
-  let dir := (← Dirs.dataBase) / "logs" / fork.toString
+  let dir := (← Dirs.dataBase) / "logs" / repoLogDir repo
   let readLines (path : System.FilePath) : IO (List String) := do
     let raw ← IO.FS.readFile path
     return (raw.splitOn "\n").filter (!·.trimAscii.isEmpty)
@@ -922,24 +922,24 @@ private def taskDetailApi (id : String) (logLimit : Nat) : IO (Option Json) := d
   let record  ← TaskStore.loadTask id
   let entries ← Queue.loadAllEntries
   let qEntry  := entries.find? (·.id == id)
-  let infoOpt : Option (Repository × String × String × String × Option String) :=
+  let infoOpt : Option (Option RepoPair × String × String × String × Option String) :=
     match record with
-    | some r => some (r.fork, tStText r.status, r.createdAt, r.prompt, some r.id)
+    | some r => some (r.repo, tStText r.status, r.createdAt, r.prompt, some r.id)
     | none =>
       match qEntry with
-      | some q => some (q.fork, qStText q.status, q.createdAt, q.prompt, q.taskId)
+      | some q => some (q.repo, qStText q.status, q.createdAt, q.prompt, q.taskId)
       | none   => none
   match infoOpt with
   | none => return none
-  | some (fork, st, createdAt, prompt, taskId) =>
+  | some (repo, st, createdAt, prompt, taskId) =>
     let (log, total) ← match taskId with
-      | some tid => loadTaskLog fork tid logLimit
+      | some tid => loadTaskLog repo tid logLimit
       | none     => pure (#[], 0)
     return some (Json.mkObj [
       ("id",           id),
       ("taskId",       optStr taskId),
       ("status",       st),
-      ("fork",         fork.toString),
+      ("fork",         Json.str (repoLabel repo)),
       ("createdAt",    normIso createdAt),
       ("prompt",       prompt),
       ("log",          Json.arr log),

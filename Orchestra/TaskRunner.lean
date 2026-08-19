@@ -48,7 +48,7 @@ def enqueueMergerImpl (appConfig : AppConfig) (pid : Taxis.IssueId) (iid : Taxis
     let entry : Queue.QueueEntry :=
       { id, createdAt
       -- Both sides are the PR's repo: the merger works directly in it, never in a fork.
-      , upstream := pr.repo, fork := pr.repo
+      , repo := some { upstream := pr.repo, fork := pr.repo }
       , mode := .pr
       , prompt := s!"merge {pr.repo}#{pr.number}"
       , backend := some "merger"
@@ -81,7 +81,7 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
       -- `review_issues`/`comment`/`get_pr_comments` below and no `create_pr`, so it never pushes
       -- anything. It needs a readable checkout, which the PR's own repo already is. Forking to
       -- give it one would create a repository per reviewed upstream for nothing.
-      , upstream := pr.repo, fork := pr.repo
+      , repo := some { upstream := pr.repo, fork := pr.repo }
       , mode := .pr
       , prompt := renderReviewerPrompt tmpl.promptTemplate pr iid
       , backend := tmpl.backend
@@ -181,17 +181,19 @@ private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
 private def runTriage {i o : ResultType} (pat : String) (ioTask : IOTask i o)
     (initialRecord : TaskStore.TaskRecord) : IO Unit := do
   IO.println "  [triage] label backend"
+  let some repo := ioTask.repo
+    | throw (.userError "triage task has no repository; it labels an issue on the upstream one")
   let some issueNumber := ioTask.issueNumber
     | throw (.userError "triage task missing issue_number")
   let addLabels    := ioTask.triageAddLabels
   let removeLabels := ioTask.triageRemoveLabels
   if !addLabels.isEmpty then
-    IO.println s!"  [triage] adding labels {addLabels} to {ioTask.upstream}#{issueNumber}"
-    GitHub.addIssueLabels pat ioTask.upstream issueNumber addLabels
+    IO.println s!"  [triage] adding labels {addLabels} to {repo.upstream}#{issueNumber}"
+    GitHub.addIssueLabels pat repo.upstream issueNumber addLabels
   for label in removeLabels do
-    IO.println s!"  [triage] removing label '{label}' from {ioTask.upstream}#{issueNumber}"
+    IO.println s!"  [triage] removing label '{label}' from {repo.upstream}#{issueNumber}"
     try
-      GitHub.removeIssueLabel pat ioTask.upstream issueNumber label
+      GitHub.removeIssueLabel pat repo.upstream issueNumber label
     catch e =>
       IO.eprintln s!"  [triage] failed to remove label '{label}': {e}"
   TaskStore.saveTask { initialRecord with status := .completed }
@@ -228,17 +230,23 @@ private def sanitizeProjectName (upstream : Repository) : String :=
   s!"{upstream.owner}-{upstream.name}"
 
 /-- Return the active memory directories for the given mode and upstream repo.
-    Creates the directories if they do not yet exist. -/
-private def resolveMemoryDirs (mode : MemoryMode) (upstream : Repository) : IO (Array String) := do
+    Creates the directories if they do not yet exist.
+
+    A repository-independent task has no upstream to name a per-project directory after, so it
+    only ever gets the global one — `project` resolves to nothing for it and `both` to the global
+    directory alone. Global memory is the right home for what such a task learns anyway: it is
+    work that spans projects rather than belonging to one. -/
+private def resolveMemoryDirs (mode : MemoryMode) (upstream : Option Repository)
+    : IO (Array String) := do
   let memBase    := (← Dirs.dataBase) / "memory"
   let globalDir  := memBase
-  let projectDir := memBase / sanitizeProjectName upstream
+  let projectDir := upstream.map (memBase / sanitizeProjectName ·)
   let dirs : Array System.FilePath :=
     match mode with
     | .none    => #[]
     | .global  => #[globalDir]
-    | .project => #[projectDir]
-    | .both    => #[globalDir, projectDir]
+    | .project => projectDir.toArray
+    | .both    => #[globalDir] ++ projectDir.toArray
   for dir in dirs do
     IO.FS.createDirAll dir
   return dirs.map (·.toString)
@@ -281,6 +289,22 @@ private def resolveTools (mode : TaskMode) (tools : Option (List String)) :
   | none    => match mode with
     | .pr   => (["create_pr"], true)
     | .fork => ([], true)
+
+/-- Drop the tools that act on a repository from a repository-independent task's list, naming
+    each one it removes.
+
+    Loud rather than silent: a task file that asks for `create_pr` and names no repository has
+    said two contradictory things, and the one that wins decides whether the run can deliver
+    anything at all. The MCP server refuses these calls too — this is what keeps them out of the
+    tool list the agent plans against in the first place. -/
+private def withoutRepoScopedTools (repo : Option RepoPair) (tools : List String)
+    : IO (List String) := do
+  if repo.isSome then return tools
+  let (dropped, kept) := tools.partition Server.repoScopedTools.contains
+  unless dropped.isEmpty do
+    IO.eprintln s!"  Warning: this task has no repository, so {", ".intercalate dropped} \
+{if dropped.length == 1 then "is" else "are"} not granted — there is no repository to act on."
+  return kept
 
 /-- Resolve the authentication environment variables for a given backend and optional auth source label.
     If the task specifies an auth source label (or a default is configured), looks it up in the
@@ -380,7 +404,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- onto the entry from here so the dashboard can find the log a running agent is filling.
     (onStart : String → IO Unit := fun _ => pure ())
     : IO ((String × TaskStore.TaskStatus) × Option o.Type × Option Lean.Json) := do
-  IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
+  IO.println s!"=== Task {idx}: {repoLabel ioTask.repo} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
   -- one ID at enqueue time and the task gets a second ID here at run time,
@@ -391,7 +415,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let createdAt ← TaskStore.currentIso8601
   let initialRecord : TaskStore.TaskRecord := {
     id := taskId, createdAt
-    upstream := ioTask.upstream, fork := ioTask.fork, mode := ioTask.mode
+    repo := ioTask.repo, mode := ioTask.mode
     prompt := ioTask.prompt, goal := ioTask.goal, continuesFrom, series
     backend := ioTask.backend, model := ioTask.model, agent := ioTask.agent
     systemPrompt := ioTask.systemPrompt, budget := ioTask.budget
@@ -452,37 +476,70 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   IO.println "  Prompt:"
   for line in ioTask.prompt.splitOn "\n" do
     IO.println s!"    {line}"
-  -- 1. Create GitHub App token
+  -- 1. Create GitHub App token.
+  --
+  -- Which installation depends on what the task has to reach. One with a repository looks up the
+  -- installation on its fork's owner; one without has no owner to look up, so it falls back to
+  -- the configured `installation_id` and then to `default_organization` — the org orchestra
+  -- already works in. A repository-independent task with neither runs with no GitHub credentials
+  -- at all rather than refusing to start: its work may be entirely on the issue tracker, and
+  -- failing over a token it would never use is the wrong trade.
   IO.println "  Creating GitHub App token..."
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let forkOwner := ioTask.fork.owner
-  let installationId ← match appConfig.installationId with
-    | some id => pure id
-    | none => GitHub.getInstallationId jwt forkOwner
-  let token ← GitHub.createInstallationToken jwt installationId
+  let installationId : Option Nat ← match appConfig.installationId with
+    | some id => pure (some id)
+    | none    =>
+      match ioTask.repo with
+      | some repo => some <$> GitHub.getInstallationId jwt repo.fork.owner
+      | none      =>
+        match appConfig.defaultOrganization with
+        | some org => some <$> GitHub.getInstallationId jwt org
+        | none     => pure none
+  let token ← match installationId with
+    | some id => GitHub.createInstallationToken jwt id
+    | none    => pure ""
   -- Deliberately no `GitHub.setupGhAuth` here. That writes the token to
   -- `~/.config/gh/hosts.yml`, which every concurrently running task shares, so under
   -- `--parallel > 1` the last task to authenticate supplies the credentials for all of them.
   -- The token is threaded explicitly instead: into `git`/`gh` through `Repo`, and into the
   -- sandbox through `Sandbox.launchAgent`'s `GH_TOKEN`.
-  IO.println "  Token ready"
+  if token.isEmpty then
+    IO.println "  No GitHub App installation for this task; running without a token"
+  else
+    IO.println "  Token ready"
   -- Triage: add/remove labels on an issue or PR. Purely a GitHub API call, so it runs before
   -- any repository work — it needs no checkout, and provisioning a clone slot for it would
   -- mean a full `git clone` plus fetch to change a label.
   if ioTask.backend == some "triage" then
     runTriage appConfig.pat ioTask initialRecord
     return ((taskId, ← finalStatusOf taskId), none, none)
-  -- 2. Prepare the task slot, or clone / update the shared repo when running outside the queue
-  let repoPath ← match slotOverride with
-    | some assign =>
-      IO.println s!"Preparing slot {assign.slot} for {ioTask.fork}..."
-      let p ← Repo.ensureSlot ioTask.fork ioTask.upstream assign (token := some token)
+  -- Checked before anything is provisioned: the merger needs a checkout of the pull request's
+  -- own repository, so a repository-independent one cannot be served by the scratch workspace
+  -- below and should say so rather than have one created for it.
+  if ioTask.backend == some "merger" && ioTask.repo.isNone then
+    throw (.userError "merger task has no repository; it merges a pull request on one")
+  -- 2. Prepare the workspace: the task slot, or the shared repo clone when running outside the
+  -- queue — and for a repository-independent task, an empty scratch directory in place of either.
+  let repoPath ← match ioTask.repo, slotOverride with
+    | some repo, some assign =>
+      IO.println s!"Preparing slot {assign.slot} for {repo.fork}..."
+      let p ← Repo.ensureSlot repo.fork repo.upstream assign (token := some token)
       IO.println s!"  Slot at {p}"
       pure p
-    | none   =>
-      IO.println s!"Cloning/updating {ioTask.fork}..."
-      let p ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive (token := some token)
+    | some repo, none =>
+      IO.println s!"Cloning/updating {repo.fork}..."
+      let p ← Repo.ensureCloned repo.fork repo.upstream interactive (token := some token)
       IO.println s!"  Repo at {p}"
+      pure p
+    | none, some assign =>
+      IO.println s!"Preparing workspace slot {assign.slot} (no repository)..."
+      let p ← Repo.ensureWorkspace assign
+      IO.println s!"  Workspace at {p}"
+      pure p
+    | none, none =>
+      IO.println "Preparing the scratch workspace (no repository)..."
+      let p ← Repo.ensureAdhocWorkspace (occupant := some taskId)
+      IO.println s!"  Workspace at {p}"
       pure p
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
   -- clone setup with all other backends but skips the MCP server and agent.
@@ -491,15 +548,19 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     return ((taskId, ← finalStatusOf taskId), none, none)
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
-  let (allowedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
-  if usingModeFallback then
+  let (requestedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
+  -- Only when the fallback actually granted something. `mode` is optional now, so every task
+  -- that writes neither field lands on `fork` — and warning about a deprecated field the task
+  -- never wrote, to say it was read as "grant nothing", is noise on every repository-independent
+  -- run. `pr` is the case that carries meaning and is worth migrating.
+  if usingModeFallback && !requestedTools.isEmpty then
     IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
-      Use 'tools' instead (e.g. {repr allowedTools}) and optionally 'read_only: true/false'."
+      Use 'tools' instead (e.g. {repr requestedTools}) and optionally 'read_only: true/false'."
+  let allowedTools ← withoutRepoScopedTools ioTask.repo requestedTools
   let inputJson := some (ResultType.valueToJson i input)
   let outputRef ← IO.mkRef (none : Option Lean.Json)
   let serverState : Server.State := {
-    upstream := ioTask.upstream
-    fork := ioTask.fork
+    repo := ioTask.repo
     allowedTools
     appId := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
@@ -528,7 +589,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
   let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
   -- 5a. Resolve memory directories and amend system prompt
-  let memoryDirs ← resolveMemoryDirs ioTask.memory ioTask.upstream
+  let memoryDirs ← resolveMemoryDirs ioTask.memory (ioTask.repo.map (·.upstream))
   let systemPrompt :=
     match baseSystemPrompt, memorySystemPrompt memoryDirs with
     | none,    none    => none
@@ -578,7 +639,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       else pure none
     let taskLogFile : Option System.FilePath ← do
       let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-      pure (some ((← Dirs.dataBase) / "logs" / ioTask.fork.toString / s!"{taskId}{suffix}.log"))
+      pure (some ((← Dirs.dataBase) / "logs" / repoLogDir ioTask.repo / s!"{taskId}{suffix}.log"))
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
       (debug := debug) (pluginDirs := ← defaultPluginDirs appConfig) (memoryDirs := memoryDirs)
       (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)

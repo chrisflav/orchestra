@@ -80,6 +80,60 @@ instance : FromJson Repository where
     let s ← FromJson.fromJson? (α := String) j
     Repository.parse s |>.mapError id
 
+/-- The repositories a task works on: the upstream it targets, and the fork it pushes to.
+
+    The two halves are never separable. An agent holding a fork it can push to but no upstream to
+    open the pull request against — or the reverse — is not a state anything downstream knows what
+    to do with, so they travel as one value and a task either has the pair or has no repository at
+    all. `Option RepoPair` is the only spelling of "no repository"; `parseRepoPair?` is how that is
+    read out of a config. -/
+structure RepoPair where
+  upstream : Repository
+  fork     : Repository
+deriving BEq, Repr, Inhabited
+
+/-- Read the `upstream`/`fork` pair out of the object `j`.
+
+    Both keys or neither. Absent means the task is repository-independent: it runs in a scratch
+    workspace with nothing checked out. That is worth saying explicitly rather than inferring from
+    half a pair — reading a lone `upstream` as "no repository" would send a task that was written
+    to open a pull request into an empty directory, and the failure would surface far from the key
+    that caused it. -/
+def parseRepoPair? (j : Json) : Except String (Option RepoPair) :=
+  match j.getObjVal? "upstream", j.getObjVal? "fork" with
+  | .error _, .error _ => .ok none
+  | .ok u,    .ok f    => do
+    let upstream ← FromJson.fromJson? (α := Repository) u
+    let fork     ← FromJson.fromJson? (α := Repository) f
+    return some { upstream, fork }
+  | .ok _,    .error _ =>
+    .error "'upstream' is set but 'fork' is not; a task names both repositories or neither"
+  | .error _, .ok _    =>
+    .error "'fork' is set but 'upstream' is not; a task names both repositories or neither"
+
+/-- The `upstream`/`fork` JSON fields of a repository pair, and nothing at all when there is none
+    — which is what `parseRepoPair?` reads back as a repository-independent task. -/
+def repoPairFields (repo : Option RepoPair) : List (String × Json) :=
+  match repo with
+  | some p => [("upstream", ToJson.toJson p.upstream), ("fork", ToJson.toJson p.fork)]
+  | none   => []
+
+/-- How a task's repository is named in listings and logs. -/
+def repoLabel (repo : Option RepoPair) : String :=
+  match repo with
+  | some p => p.fork.toString
+  | none   => "(no repository)"
+
+/-- Where a task's per-run logs live, relative to `<data>/logs`.
+
+    A repository's own `owner/repo` — two path components — or one fixed name for every
+    repository-independent task. That name carries no `/`, so it sits at a level no repository's
+    log directory can reach and the two cannot collide. -/
+def repoLogDir (repo : Option RepoPair) : String :=
+  match repo with
+  | some p => p.fork.toString
+  | none   => "no-repository"
+
 inductive TaskMode where
   | fork
   | pr
@@ -275,13 +329,19 @@ instance : FromJson AuthMode where
 
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
-  upstream : Repository
-  fork : Repository
+  /-- The repositories this task works on, or `none` for a **repository-independent** task.
+
+      Such a task runs in the sandbox like any other, but with nothing checked out: instead of a
+      clone slot it gets an empty scratch workspace, and every tool that acts on a repository is
+      withheld from it. It is the shape meta-work takes — coordinating issues across projects on
+      the taxis tracker, maintenance that belongs to no single repository — where cloning one
+      repository would mean picking an arbitrary one of the several the task is about. -/
+  repo : Option RepoPair
   /-- Legacy mode field (deprecated). Use `tools` instead.
       If `tools` is absent, this field is used to derive the allowed tools:
       - `fork` → no tools
       - `pr`   → `["create_pr"]` -/
-  mode : TaskMode
+  mode : TaskMode := .fork
   prompt : String
   /-- Condition the run is held to: the agent must not stop before it holds, and a second model
       call — not the agent itself — decides whether it does.
@@ -467,9 +527,12 @@ instance : FromJson Task where
   fromJson? j := do
     let i          := j.getObjValAs? ResultType "input_type"  |>.toOption |>.getD .unit
     let o          := j.getObjValAs? ResultType "output_type" |>.toOption |>.getD .unit
-    let upstream   ← j.getObjValAs? Repository "upstream"
-    let fork       ← j.getObjValAs? Repository "fork"
-    let mode       ← j.getObjValAs? TaskMode "mode"
+    let repo       ← parseRepoPair? j
+    -- Optional rather than required: `mode` is the deprecated spelling of a task's tools, a
+    -- repository-independent task has no meaningful answer for it, and the documented task-file
+    -- example never carried it. `fork` — grant nothing — is the safe reading, and `tools`
+    -- overrides it wherever it is set.
+    let mode       := j.getObjValAs? TaskMode "mode" |>.toOption |>.getD .fork
     let prompt     ← j.getObjValAs? String "prompt"
     let goal       := j.getObjValAs? String "goal"           |>.toOption
     let agent      := j.getObjValAs? String "agent"          |>.toOption
@@ -493,7 +556,7 @@ instance : FromJson Task where
     let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
     let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
-    return { i, o, ioTask := { upstream, fork, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
+    return { i, o, ioTask := { repo, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,

@@ -2,6 +2,7 @@ import { Empty, List, Row } from "../components/List";
 import { PageHead, Section } from "../components/Page";
 import { Status } from "../components/Status";
 import { Time } from "../components/Time";
+import { repoLabel } from "../format";
 import { useLiveData } from "../useLiveData";
 
 /**
@@ -83,7 +84,7 @@ export function Queue() {
                 title={e.prompt}
                 end={<Status status={e.status} />}
                 meta={[
-                  e.fork,
+                  repoLabel(e.fork),
                   <Time key="t" iso={e.createdAt} />,
                   `priority ${e.priority}`,
                   e.series ? `series ${e.series}` : "",

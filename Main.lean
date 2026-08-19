@@ -148,11 +148,11 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
   let token ← GitHub.createInstallationToken jwt installationId
   GitHub.setupGhAuth token
   let serverState : Server.State := {
-    upstream, fork
+    repo := some { upstream, fork }
+    installationId := some installationId
     allowedTools := if allowPR then ["create_pr"] else []
     appId := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
-    installationId
     pat := appConfig.pat
   }
   let (port, _shutdown) ← Server.start serverState
@@ -186,13 +186,18 @@ private def cleanupHandler (_ : Parsed) : IO UInt32 := do
 
 private def cleanupListHandler (_ : Parsed) : IO UInt32 := do
   let clones ← Repo.listClones
-  if clones.isEmpty then
-    IO.println "No repository clones found."
+  let workspaces ← Repo.listWorkspaces
+  if clones.isEmpty && workspaces.isEmpty then
+    IO.println "No repository clones or workspaces found."
     return (0 : UInt32)
   for (mainPath, slots) in clones do
     IO.println s!"  {mainPath}"
     for slot in slots do
       IO.println s!"    slot: {slot}"
+  -- Listed alongside the clones because `cleanup` removes both, and a workspace holding a
+  -- repository-independent task's scratch files is exactly as much disk as a slot.
+  for workspace in workspaces do
+    IO.println s!"  {workspace} (no repository)"
   return (0 : UInt32)
 
 private def tasksHandler (p : Parsed) : IO UInt32 := do
@@ -218,7 +223,7 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
       | some run => run.id
       | none     => ""
     let seriesLabel := r.series.getD ""
-    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork.toString 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
+    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight (repoLabel r.repo) 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 private def taskShowHandler (p : Parsed) : IO UInt32 := do
@@ -235,8 +240,11 @@ private def taskShowHandler (p : Parsed) : IO UInt32 := do
     IO.println s!"ID:             {r.id}"
     IO.println s!"Created:        {r.createdAt}"
     IO.println s!"Status:         {status}"
-    IO.println s!"Fork:           {r.fork}"
-    IO.println s!"Upstream:       {r.upstream}"
+    match r.repo with
+    | some repo =>
+      IO.println s!"Fork:           {repo.fork}"
+      IO.println s!"Upstream:       {repo.upstream}"
+    | none => IO.println "Repository:     none (repository-independent)"
     IO.println s!"Mode:           {mode}"
     IO.println s!"Series:         {r.series.getD "-"}"
     IO.println s!"Continues from: {r.continuesFrom.getD "-"}"
@@ -295,8 +303,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
   let task : Task := {
     i := .unit, o := .unit
     ioTask := {
-      upstream      := prevRecord.upstream
-      fork          := prevRecord.fork
+      repo          := prevRecord.repo
       mode          := prevRecord.mode
       prompt
       goal          := prevRecord.goal
@@ -361,8 +368,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
     let createdAt ← TaskStore.currentIso8601
     let entry : Queue.QueueEntry := {
       id, createdAt
-      upstream      := prevRecord.upstream
-      fork          := prevRecord.fork
+      repo          := prevRecord.repo
       mode          := prevRecord.mode
       prompt        := promptText
       goal          := prevRecord.goal
@@ -429,8 +435,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       let createdAt ← TaskStore.currentIso8601
       let entry : Queue.QueueEntry := {
         id, createdAt
-        upstream      := task.ioTask.upstream
-        fork          := task.ioTask.fork
+        repo          := task.ioTask.repo
         mode          := task.ioTask.mode
         prompt        := task.ioTask.prompt
         goal          := task.ioTask.goal
@@ -607,7 +612,7 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
       | .unfinished => "unfinished" | .cancelled => "cancelled"
     let concertLabel := e.concertId.getD ""
     let seriesLabel := e.series.getD ""
-    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork.toString 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
+    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight (repoLabel e.repo) 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 /-! ## Configuration, over the API
@@ -826,7 +831,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
       let status := if e.status == .running then "running" else "pending"
       let concertLabel := e.concertId.getD ""
       let seriesLabel := e.series.getD ""
-      IO.println s!"{padRight e.id 16} {padRight e.fork.toString 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
+      IO.println s!"{padRight e.id 16} {padRight (repoLabel e.repo) 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
   -- Listener status
   let listenerConfigs ← Listener.loadAllListenerConfigs
   if !listenerConfigs.isEmpty then
@@ -913,12 +918,12 @@ private def prepareCmd : Cmd := `[Cli|
 
 private def cleanupListCmd : Cmd := `[Cli|
   list VIA cleanupListHandler; ["0.1.0"]
-  "List all repository clones and their task slots."
+  "List all repository clones and their task slots, plus the scratch workspaces repository-independent tasks run in."
 ]
 
 private def cleanupCmd : Cmd := `[Cli|
   cleanup VIA cleanupHandler; ["0.1.0"]
-  "Manage cloned repositories. Without a subcommand, removes all clones and task slots."
+  "Manage cloned repositories. Without a subcommand, removes all clones, task slots and scratch workspaces."
 
   SUBCOMMANDS:
     cleanupListCmd
@@ -1058,8 +1063,7 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
       | _           => pure entry.continuesFrom
     let newEntry : Queue.QueueEntry := {
       id, createdAt
-      upstream     := entry.upstream
-      fork         := entry.fork
+      repo         := entry.repo
       mode         := entry.mode
       prompt       := entry.prompt
       goal         := entry.goal
@@ -1372,8 +1376,8 @@ private def allOptionalTools : List String :=
    "review_issues"]
 
 private def interactiveHandler (p : Parsed) : IO UInt32 := do
-  let upstreamStr := p.flag! "upstream" |>.as! String
-  let forkStr     := p.flag! "fork"     |>.as! String
+  let upstreamStr := p.flag? "upstream" |>.map (·.as! String)
+  let forkStr     := p.flag? "fork"     |>.map (·.as! String)
   let toolsStr    := p.flag? "tools"    |>.map (·.as! String)
   let backend     := p.flag? "backend"  |>.map (·.as! String)
   let model       := p.flag? "model"    |>.map (·.as! String)
@@ -1386,28 +1390,53 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   -- Left as `none` when the flag is absent, so an interactive run takes the backend's
   -- `default_auth_mode` like every other path rather than forcing `ordered` onto a pool.
   let authMode    := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
-  let upstream ← IO.ofExcept (Repository.parse upstreamStr)
-  let fork     ← IO.ofExcept (Repository.parse forkStr)
-  let allowedTools : List String := match toolsStr with
+  -- Both flags or neither, as everywhere else: with neither, this is a repository-independent
+  -- session — a sandbox with the tracker tools and an empty workspace, which is how you get a
+  -- look at what a repository-independent task sees.
+  let repo : Option RepoPair ← match upstreamStr, forkStr with
+    | none, none => pure none
+    | some u, some f =>
+      pure (some { upstream := ← IO.ofExcept (Repository.parse u)
+                 , fork     := ← IO.ofExcept (Repository.parse f) })
+    | _, _ => throw (.userError "--upstream and --fork are given together or not at all")
+  let requested : List String := match toolsStr with
     | none | some "all" => allOptionalTools
     | some s => s.splitOn ","
+  -- The repository-scoped tools are not offered to a session that has no repository; the MCP
+  -- server refuses them anyway, and `--tools all` should not read as a promise it cannot keep.
+  let allowedTools :=
+    if repo.isSome then requested else requested.filter (!Server.repoScopedTools.contains ·)
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let installationId ← match appConfig.installationId with
-    | some id => pure id
-    | none    => GitHub.getInstallationId jwt fork.owner
-  let token ← GitHub.createInstallationToken jwt installationId
-  GitHub.setupGhAuth token
-  IO.println s!"Cloning/updating {fork}..."
-  let repoPath ← Repo.ensureCloned fork upstream
-  IO.println s!"  Repo at {repoPath}"
+  let installationId : Option Nat ← match appConfig.installationId with
+    | some id => pure (some id)
+    | none    =>
+      match repo, appConfig.defaultOrganization with
+      | some r, _      => some <$> GitHub.getInstallationId jwt r.fork.owner
+      | none,   some o => some <$> GitHub.getInstallationId jwt o
+      | none,   none   => pure none
+  let token ← match installationId with
+    | some id => GitHub.createInstallationToken jwt id
+    | none    => pure ""
+  unless token.isEmpty do GitHub.setupGhAuth token
+  let repoPath ← match repo with
+    | some r =>
+      IO.println s!"Cloning/updating {r.fork}..."
+      let p ← Repo.ensureCloned r.fork r.upstream
+      IO.println s!"  Repo at {p}"
+      pure p
+    | none =>
+      IO.println "Preparing the scratch workspace (no repository)..."
+      let p ← Repo.ensureAdhocWorkspace
+      IO.println s!"  Workspace at {p}"
+      pure p
   let backendName := backend.getD "claude"
   let serverState : Server.State := {
-    upstream, fork
+    repo
+    installationId
     allowedTools
     appId          := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
-    installationId
     pat            := appConfig.pat
     agentBackend   := backendName
   }
@@ -1451,8 +1480,8 @@ private def interactiveCmd : Cmd := `[Cli|
   FLAGS:
     c, config   : String; "Path to config file (default: ~/.agent/config.json)"
     d, debug;             "Print the landrun command before executing it"
-    upstream    : String; "Upstream repository in 'owner/repo' format"
-    fork        : String; "Fork repository in 'owner/repo' format"
+    upstream    : String; "Upstream repository in 'owner/repo' format (omit with --fork for a session with no repository)"
+    fork        : String; "Fork repository in 'owner/repo' format (given together with --upstream, or not at all)"
     tools       : String; "Comma-separated optional tools to enable, or 'all' (default: all)"
     backend     : String; "Agent backend: claude (default), vibe, opencode, pi"
     model       : String; "Model override passed to the agent"

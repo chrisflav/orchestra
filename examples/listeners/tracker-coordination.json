@@ -1,0 +1,14 @@
+{
+  "source": {
+    "type": "shell",
+    "command": "/path/to/your/needs-coordination.sh",
+    "args": []
+  },
+  "action": {
+    "prompt_template": "Cross-project coordination is needed.\n\n{{output}}\n\nGo through the tracker: close issues that duplicate work already merged elsewhere, and open a coordination issue for anything blocked on another project. Explain each change in a comment on the issue it affects.",
+    "tools": ["manage_issues"],
+    "series": "tracker-coordination",
+    "budget": 6.0
+  },
+  "interval_seconds": 3600
+}

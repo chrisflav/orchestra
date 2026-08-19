@@ -23,12 +23,12 @@ the calling agent can report.
 /-! ## Permission gating -/
 
 private def state (tools : List String) (pat : String := "pat") : State :=
-  { upstream := { owner := "up", name := "repo" }
-  , fork     := { owner := "fork", name := "repo" }
+  { repo     := some { upstream := { owner := "up",   name := "repo" }
+                     , fork     := { owner := "fork", name := "repo" } }
   , allowedTools := tools
   , appId := 0
   , privateKeyPath := ""
-  , installationId := 0
+  , installationId := some 0
   , pat }
 
 /-- Extract the inner `text` payload from a tool-content JSON envelope. -/

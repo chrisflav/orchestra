@@ -60,8 +60,7 @@ mutual
           id            := stepKey
           createdAt
           status        := .pending
-          upstream      := spec.upstream
-          fork          := spec.fork
+          repo          := spec.repo
           mode          := spec.mode
           prompt        := spec.prompt
           agent         := spec.agent

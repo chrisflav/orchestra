@@ -279,16 +279,16 @@ def run (cfg : Config) : IO UInt32 := do
         resolveAuth     := resolveEntryAuth
       }
       let allEntries ← Queue.loadAllEntries
-      let some claim ← Queue.claimDecision ctx allEntries Repo.slotOccupant | return none
+      let some claim ← Queue.claimDecision ctx allEntries Repo.poolOccupant | return none
       let e := claim.entry
-      let occupied := slotMap.getD e.fork.toString #[]
+      let occupied := slotMap.getD e.slotKey #[]
       let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
       -- Record the resolved source on the entry, so `orchestra queue list` and any later
       -- continuation show which account actually ran it.
       Queue.saveEntry { e with
         status := .running, slot := some claim.slot
         authSource := claim.authSource.orElse fun _ => e.authSource }
-      activeSlots.modify (fun m => m.insert e.fork.toString (occupied.push claim.slot))
+      activeSlots.modify (fun m => m.insert e.slotKey (occupied.push claim.slot))
       totalActive.modify (· + 1)
       if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
       if e.continuesFrom.isSome && claim.resumeFrom.isNone then
@@ -301,8 +301,8 @@ its workspace; it will start from a clean checkout."
   let releaseEntry (entry : Queue.QueueEntry) (slot : Nat) : IO Unit := do
     claimMutex.lock
     try
-      let occupied := (← activeSlots.get).getD entry.fork.toString #[]
-      activeSlots.modify (fun m => m.insert entry.fork.toString (occupied.filter (· != slot)))
+      let occupied := (← activeSlots.get).getD entry.slotKey #[]
+      activeSlots.modify (fun m => m.insert entry.slotKey (occupied.filter (· != slot)))
       totalActive.modify (fun t => if t > 0 then t - 1 else 0)
       if !TaskRunner.backendIsParallelSafe entry.backend then exclusiveActive.set false
     finally
@@ -345,8 +345,7 @@ its workspace; it will start from a clean checkout."
     let task : Task := {
       i := entry.inputType, o := entry.outputType
       ioTask := {
-        upstream         := entry.upstream
-        fork             := entry.fork
+        repo             := entry.repo
         mode             := entry.mode
         prompt           := entry.prompt
         goal             := entry.goal
@@ -667,8 +666,13 @@ its workspace; it will start from a clean checkout."
                     let r := Listener.renderTemplate liveCfg.action.fork vars
                     if r.isEmpty then vars.find? (·.1 == "fork") |>.map (·.2) |>.getD ""
                     else r
-                  let upstream := Repository.parse upstreamStr |>.toOption
-                  let fork     := Repository.parse forkStr     |>.toOption
+                  -- The listener's own repositories win where it names them, and the workflow
+                  -- keeps its own where it does not. `orElse` rather than a plain assignment
+                  -- because a listener that names none is now a listener with none to give: it
+                  -- would otherwise overwrite the workflow's repositories with nothing and turn
+                  -- every step repository-independent.
+                  let upstream := (Repository.parse upstreamStr).toOption <|> prog.upstream
+                  let fork     := (Repository.parse forkStr).toOption     <|> prog.fork
                   let prog := { prog with upstream, fork }
                   let jsonVars := vars.map fun (k, v) => (k, Lean.Json.str v)
                   let concert := Workflow.WorkflowProgram.toConcert prog jsonVars

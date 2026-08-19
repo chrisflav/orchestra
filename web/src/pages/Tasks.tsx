@@ -4,6 +4,7 @@ import { LogView } from "../components/LogView";
 import { Facts, LivePage, Section } from "../components/Page";
 import { Status } from "../components/Status";
 import { Time } from "../components/Time";
+import { repoLabel } from "../format";
 
 export function Tasks() {
   return (
@@ -21,7 +22,7 @@ export function Tasks() {
                 end={<Status status={t.status} />}
                 meta={[
                   t.id,
-                  t.fork,
+                  repoLabel(t.fork),
                   <Time key="t" iso={t.createdAt} />,
                   t.series ? `series ${t.series}` : "",
                 ]}

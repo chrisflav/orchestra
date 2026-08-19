@@ -207,8 +207,13 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   for p in extraPorts do
     args := args.push "--connect-tcp" |>.push (toString p)
     args := args.push "--bind-tcp" |>.push (toString p)
-  -- Environment variables for the sandboxed command
-  args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
+  -- Environment variables for the sandboxed command.
+  --
+  -- An empty token is left unset rather than exported empty: that is what a task with no GitHub
+  -- App installation behind it gets, and `gh` treats `GH_TOKEN=` as a credential it must use,
+  -- failing every call with an authentication error instead of saying it has none.
+  if !ghToken.isEmpty then
+    args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
   args := args.push "--env" |>.push "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"
   -- Pass through inherited env vars by name
   for name in ["SHELL", "PATH", "HOME", "USER", "TERM"] do
