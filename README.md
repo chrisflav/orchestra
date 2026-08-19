@@ -560,8 +560,10 @@ What such a task gets, and what it does not:
   that could draw that line. Anything meant to outlive a run belongs in a memory directory.
 - **The project, issue and task tools** — `manage_issues`, `work_issues`, `review_issues`,
   `get_task_input`, `submit_task_output`, `health`. This is what the task is for.
-- **No `create_pr`, `merge_pr`, `label_issue`, `comment` or `get_pr_comments`.** Asking for one in
-  `tools` is reported on stderr and dropped, and the MCP server refuses the call as well.
+- **No `create_pr`, `merge_pr`, `label_issue` or `comment`.** Asking for one in `tools` is reported
+  on stderr and dropped, and the MCP server refuses the call as well. `get_pr_comments`, which no
+  task has to ask for, is simply not offered — nor is `refresh_token` when there is no
+  installation behind it.
 - **No per-project memory.** There is no upstream to name a directory after, so `memory: "project"`
   resolves to nothing and `"both"` to the global directory alone — which is the right home for
   what work spanning projects learns anyway.

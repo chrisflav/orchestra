@@ -150,6 +150,18 @@ instance : ToJson TaskMode where
     | .fork => "fork"
     | .pr => "pr"
 
+/-- Read the deprecated `mode` field out of the object `j`.
+
+    Absent reads as `fork` — grant nothing — which is what a task that writes neither `mode` nor
+    `tools` has always got, and the only answer a repository-independent task could have. Present
+    but unreadable is still an error: `"mode": "PR"` swallowed as `fork` would leave a task that
+    was written to open a pull request holding no tools at all, and, because the deprecation
+    warning only fires when the fallback grants something, nothing on the way would say so. -/
+def parseTaskMode? (j : Json) : Except String TaskMode :=
+  match j.getObjVal? "mode" with
+  | .error _ => .ok .fork
+  | .ok v    => FromJson.fromJson? v
+
 /-- Controls which memory directories are made available to the agent.
     - `none`    – no memory directories
     - `global`  – global memory only (`<data>/memory/`)
@@ -332,10 +344,17 @@ structure IOTask (i o : ResultType) where
   /-- The repositories this task works on, or `none` for a **repository-independent** task.
 
       Such a task runs in the sandbox like any other, but with nothing checked out: instead of a
-      clone slot it gets an empty scratch workspace, and every tool that acts on a repository is
-      withheld from it. It is the shape meta-work takes — coordinating issues across projects on
-      the taxis tracker, maintenance that belongs to no single repository — where cloning one
-      repository would mean picking an arbitrary one of the several the task is about. -/
+      clone slot it gets an empty scratch workspace, and the tools that name a repository —
+      `create_pr`, `merge_pr`, `label_issue`, `comment`, `get_pr_comments` — are withheld. It is
+      the shape meta-work takes: coordinating issues across projects on the taxis tracker,
+      maintenance that belongs to no single repository, where cloning one repository would mean
+      picking an arbitrary one of the several the task is about.
+
+      Withholding those tools is a guardrail, not an isolation boundary. Where the config names an
+      installation the task still holds a GitHub App token in its sandbox, and a task granted
+      `review_issues` can still approve an issue, which queues a merger against whatever pull
+      request that issue carries. What it cannot do is act on a repository *this task* named,
+      because it named none. -/
   repo : Option RepoPair
   /-- Legacy mode field (deprecated). Use `tools` instead.
       If `tools` is absent, this field is used to derive the allowed tools:
@@ -528,11 +547,7 @@ instance : FromJson Task where
     let i          := j.getObjValAs? ResultType "input_type"  |>.toOption |>.getD .unit
     let o          := j.getObjValAs? ResultType "output_type" |>.toOption |>.getD .unit
     let repo       ← parseRepoPair? j
-    -- Optional rather than required: `mode` is the deprecated spelling of a task's tools, a
-    -- repository-independent task has no meaningful answer for it, and the documented task-file
-    -- example never carried it. `fork` — grant nothing — is the safe reading, and `tools`
-    -- overrides it wherever it is set.
-    let mode       := j.getObjValAs? TaskMode "mode" |>.toOption |>.getD .fork
+    let mode       ← parseTaskMode? j
     let prompt     ← j.getObjValAs? String "prompt"
     let goal       := j.getObjValAs? String "goal"           |>.toOption
     let agent      := j.getObjValAs? String "agent"          |>.toOption

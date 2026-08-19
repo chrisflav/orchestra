@@ -67,6 +67,19 @@ def halfAPairIsRejected : Test := do
       TestM.assert ((e.splitOn "both repositories").length == 2)
         (msg := s!"{name}: the error should say a task names both or neither, got {e}")
 
+@[test]
+def aMalformedModeIsStillRejected : Test := do
+  -- `mode` became optional so that a task with no repository need not answer for it. Optional is
+  -- not the same as ignored: `"PR"` read as `fork` would leave a task that was written to open a
+  -- pull request holding no tools, and the deprecation warning does not fire for `fork`, so
+  -- nothing on the way would say why.
+  for bad in [Json.str "PR", Json.str "", Json.num 1, Json.null] do
+    let j := Json.mkObj [("upstream", "up/widget"), ("fork", "me/widget"), ("prompt", "x"),
+                         ("mode", bad)]
+    match (FromJson.fromJson? j : Except String Task) with
+    | .ok t    => TestM.fail s!"'mode': {bad.compress} was accepted as {repr t.ioTask.mode}"
+    | .error _ => TestM.assert true
+
 /-! ## Surviving the hops -/
 
 private def entryWithout : Queue.QueueEntry :=
@@ -152,6 +165,31 @@ def aContinuationAsksForTheWorkspaceItsPredecessorLeft : Test := do
   let got ← Queue.claimDecision ctx #[pred, cont] occupant
   TestM.assertEqual (got.map (·.slot)) (some 3) (msg := "back to the predecessor's workspace")
   TestM.assertEqual (got.bind (·.resumeFrom)) (some "0001") (msg := "and it is kept, not emptied")
+
+/-! ## The scratch workspace -/
+
+@[test]
+def aWorkspaceIsEmptiedBetweenTasksAndKeptForAContinuation : Test := do
+  -- The whole point of the occupant marker, on the path that has no slot record to consult: an
+  -- unrelated run finds the directory and empties it, and the run continuing the task that left
+  -- it gets the files back. Exercised through the ad-hoc workspace because that is the one
+  -- `orchestra run` and `orchestra interactive` share.
+  let scratch ← Repo.ensureAdhocWorkspace (occupant := some "task-1")
+  IO.FS.writeFile (scratch / "notes.md") "half-finished"
+  -- A continuation of `task-1` keeps what `task-1` wrote.
+  let resumed ← Repo.ensureAdhocWorkspace (occupant := some "task-2") (resumeFrom := some "task-1")
+  TestM.assert (← (resumed / "notes.md").pathExists)
+    (msg := "a continuation finds the files its session refers to")
+  -- An unrelated run does not.
+  let fresh ← Repo.ensureAdhocWorkspace (occupant := some "task-3")
+  TestM.assert (!(← (fresh / "notes.md").pathExists))
+    (msg := "an unrelated task starts in an empty directory")
+  -- Nor does a continuation whose predecessor's files are gone: `task-3` holds it now.
+  IO.FS.writeFile (fresh / "other.md") "someone else's"
+  let stale ← Repo.ensureAdhocWorkspace (occupant := some "task-4") (resumeFrom := some "task-1")
+  TestM.assert (!(← (stale / "other.md").pathExists))
+    (msg := "a continuation is not resumed onto a tree its predecessor never left")
+  IO.FS.removeDirAll stale
 
 /-! ## Listeners -/
 

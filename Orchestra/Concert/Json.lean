@@ -35,7 +35,7 @@ instance {i o : ResultType} : ToJson (IOTask i o) where
 instance {i o : ResultType} : FromJson (IOTask i o) where
   fromJson? j := do
     let repo         ← parseRepoPair? j
-    let mode          := j.getObjValAs? TaskMode "mode" |>.toOption |>.getD .fork
+    let mode         ← parseTaskMode? j
     let prompt       ← j.getObjValAs? String "prompt"
     let agent        := j.getObjValAs? String "agent" |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption

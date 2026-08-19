@@ -299,10 +299,10 @@ instance : FromJson ActionConfig where
   fromJson? j := do
     let upstream       := j.getObjValAs? String "upstream" |>.toOption |>.getD ""
     let fork           := j.getObjValAs? String "fork"     |>.toOption |>.getD ""
-    -- Optional, like everywhere else `mode` is read: it is the deprecated spelling of a task's
-    -- tools, and a listener that queues repository-independent tasks has no answer for it.
-    -- `fork` — grant nothing — is what an absent one has always meant.
-    let mode           := j.getObjValAs? TaskMode "mode" |>.toOption |>.getD .fork
+    -- Absent is fine — a listener that queues repository-independent tasks has no answer for a
+    -- field that is the deprecated spelling of a task's tools. Unreadable is not; see
+    -- `parseTaskMode?`.
+    let mode           ← parseTaskMode? j
     let promptTemplate ← j.getObjValAs? String "prompt_template"
     let series       := j.getObjValAs? String "series"        |>.toOption
     let backend      := j.getObjValAs? String "backend"       |>.toOption

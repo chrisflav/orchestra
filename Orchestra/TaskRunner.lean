@@ -538,7 +538,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       pure p
     | none, none =>
       IO.println "Preparing the scratch workspace (no repository)..."
-      let p ← Repo.ensureAdhocWorkspace (occupant := some taskId)
+      -- `continuesFrom` rather than nothing: outside the queue there is no slot record to look a
+      -- predecessor's workspace up by, but there is only one workspace, and the task this run
+      -- continues is exactly the occupant its files would be under. Without it every
+      -- `orchestra continue` on a repository-independent task would restore the conversation onto
+      -- a directory that had just been emptied.
+      let p ← Repo.ensureAdhocWorkspace (occupant := some taskId) (resumeFrom := continuesFrom)
       IO.println s!"  Workspace at {p}"
       pure p
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +

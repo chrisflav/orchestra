@@ -939,7 +939,7 @@ private def taskDetailApi (id : String) (logLimit : Nat) : IO (Option Json) := d
       ("id",           id),
       ("taskId",       optStr taskId),
       ("status",       st),
-      ("fork",         Json.str (repoLabel repo)),
+      ("fork",         optStr (repo.map (·.fork.toString))),
       ("createdAt",    normIso createdAt),
       ("prompt",       prompt),
       ("log",          Json.arr log),

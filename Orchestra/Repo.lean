@@ -459,16 +459,17 @@ private def workspaceSlotName (slot : Nat) : String := s!"slot-{slot}"
 
 /-- Directory name of the workspace a run outside the queue uses.
 
-    Kept apart from the numbered slots the daemon pools, in the same way that a CLI run works in
-    the shared cache clone rather than in a slot: preparing a workspace *empties* it, so sharing
-    a name with the daemon would let `orchestra run` delete the files out from under a task the
-    daemon is in the middle of. Two concurrent CLI runs still share it, which is exactly what
-    two concurrent CLI runs on one repository already do to the cache clone. -/
-private def adhocWorkspaceName : String := "adhoc"
+    Kept apart from the numbered slots the daemon pools, the way a CLI run works in the shared
+    cache clone rather than in one of them: preparing a workspace *empties* it, so sharing a name
+    with the daemon would let `orchestra run` delete the files out from under a task the daemon is
+    in the middle of.
 
-/-- Path of workspace slot `slot`. -/
-def workspacePath (slot : Nat) : IO System.FilePath :=
-  return (← workspaceBase) / workspaceSlotName slot
+    Two runs outside the queue do still share it, and this is where the analogy with the cache
+    clone stops: `ensureCloned` leaves an existing checkout in place, while this deletes one. A
+    second `orchestra run` or `orchestra interactive` with no repository, started while the first
+    is still going, takes the directory and empties it. Nothing guards that — running several at
+    once is what the queue is for, and there each gets a pooled slot of its own. -/
+private def adhocWorkspaceName : String := "adhoc"
 
 /-- File recording which task's files currently sit in the workspace named `name`.
 
@@ -543,10 +544,19 @@ refers to."
 def ensureWorkspace (assign : SlotAssignment) : IO System.FilePath :=
   prepareWorkspace (workspaceSlotName assign.slot) assign
 
-/-- Ensure the workspace for a repository-independent run outside the queue exists and is empty.
-    See `adhocWorkspaceName` for why it is not one of the pooled slots. -/
-def ensureAdhocWorkspace (occupant : Option String := none) : IO System.FilePath :=
-  prepareWorkspace adhocWorkspaceName { slot := 0, occupant }
+/-- Ensure the workspace for a repository-independent run outside the queue exists, and empty it
+    unless `resumeFrom` names the task whose files are still in it.
+
+    `resumeFrom` is what makes `orchestra continue` on a repository-independent task work: the
+    resumed agent's session describes files it wrote, and without it every continuation would wake
+    up to an emptied directory. It is checked against the recorded occupant like the pooled path's
+    is, so a continuation whose files were taken by an unrelated run in between is told so rather
+    than resumed onto somebody else's.
+
+    See `adhocWorkspaceName` for why this is not one of the pooled slots. -/
+def ensureAdhocWorkspace (occupant : Option String := none)
+    (resumeFrom : Option String := none) : IO System.FilePath :=
+  prepareWorkspace adhocWorkspaceName { slot := 0, occupant, resumeFrom }
 
 /-- Every scratch workspace that currently exists, in name order. -/
 def listWorkspaces : IO (Array System.FilePath) := do

@@ -103,7 +103,7 @@ instance : FromJson TaskRecord where
     let id           ← j.getObjValAs? String "id"
     let createdAt    ← j.getObjValAs? String "created_at"
     let repo         ← parseRepoPair? j
-    let mode          := j.getObjValAs? TaskMode "mode" |>.toOption |>.getD .fork
+    let mode         ← parseTaskMode? j
     let prompt       ← j.getObjValAs? String "prompt"
     let status       ← j.getObjValAs? TaskStatus "status"
     let goal          := j.getObjValAs? String "goal"           |>.toOption

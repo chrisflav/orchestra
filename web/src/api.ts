@@ -185,7 +185,8 @@ export interface TaskDetail {
    */
   taskId: string | null;
   status: TaskStatus | QueueStatus;
-  fork: string;
+  /** Null for a repository-independent run, which ran in a scratch workspace. */
+  fork: string | null;
   createdAt: string;
   prompt: string;
   /** The trailing `logLimit` events of the run's log, oldest first. */

@@ -228,7 +228,7 @@ instance : FromJson QueueEntry where
     let createdAt    ← j.getObjValAs? String "created_at"
     let status       ← j.getObjValAs? QueueStatus "status"
     let repo         ← parseRepoPair? j
-    let mode          := j.getObjValAs? TaskMode "mode" |>.toOption |>.getD .fork
+    let mode         ← parseTaskMode? j
     let prompt       ← j.getObjValAs? String "prompt"
     let goal          := j.getObjValAs? String "goal"           |>.toOption
     let agent         := j.getObjValAs? String "agent"          |>.toOption

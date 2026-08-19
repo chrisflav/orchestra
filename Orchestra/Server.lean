@@ -15,10 +15,12 @@ namespace Orchestra.Server
 structure State where
   /-- Repositories the running task works on, or `none` for a repository-independent task.
 
-      Every tool that acts on a repository — `create_pr`, `merge_pr`, `label_issue`, `comment`,
+      Every tool that names a repository — `create_pr`, `merge_pr`, `label_issue`, `comment`,
       `get_pr_comments` — is withheld when this is `none`, both from `tools/list` and from
-      `evalToolCall`. What is left is what such a task is for: the taxis project and issue tools,
-      and the typed task input/output. -/
+      `evalToolCall`, since there is no repository for them to act on. What is left is what such a
+      task is for: the taxis project and issue tools, and the typed task input/output. Those
+      reach GitHub in their own right — approving an issue queues a merger — so this gates the
+      tools that would need a repository named here, not everything that can touch one. -/
   repo : Option RepoPair
   /-- Optional tools enabled for this run.
       Always-available tools (health, refresh_token, get_pr_comments) are never in this list.
