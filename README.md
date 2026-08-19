@@ -55,7 +55,8 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
 - **Usage-limit awareness.** Every Claude subscription limit is tracked — session, weekly, and
   the weekly limits scoped to one model family — so work is routed to an account that can still
   run it instead of into a wall. Several accounts can back one listener, used in order or
-  balanced across → [usage limits](#usage-limits)
+  balanced across, and what each one has spent is kept window by window and graphed →
+  [usage limits](#usage-limits)
 - **Listeners** that poll GitHub issues, comments, pull request reviews, labels, or an arbitrary
   shell command, and enqueue a task — or a whole workflow — when something matches.
 - **An autonomous project pipeline.** Projects and issues live in a
@@ -435,6 +436,21 @@ rate-limited is recorded immediately, before anything else can be dispatched to
 that source. Both write to `<data>/usage/<backend>/<label>.json`, which is
 shared across processes — a limit `orchestra run` discovers in a terminal stops
 the daemon from dispatching to that source too.
+
+Every poll is also kept, so the account's past is readable and not only its
+present. It is kept one record per *window* rather than one per poll: a session
+window and a weekly total are counters that fill and then reset, so the peak
+reading inside one is what that session or that week consumed. The records live
+in `<data>/usage/<backend>/<label>.history.json`, they are what the
+[dashboard's](#dashboard) usage graphs are drawn from, and they are bounded —
+240 windows per series, nothing older than six months.
+
+A window is identified by the reset time every poll inside it reports, so a new
+reset time is a new window; where nothing reports one, utilisation that dropped
+is what marks the rollover. Only polls are recorded. An observed hit knows that
+a limit was reached but not where its counter stood, so folding one in would
+invent a reading rather than keep one — the poll that follows it reports the
+real number.
 
 API-key sources have no subscription window to poll (they bill per token
 against an organisation), so they are always considered available until a run
@@ -945,6 +961,14 @@ The **Auth** page is the one to open when the queue has pending work but nothing
 names the limit that is binding on each source and when it lifts — the same data as
 [`orchestra usage`](#usage-limits), read from the usage store rather than polled, so opening the
 page costs nothing.
+
+It also draws where each source has been: a bar per session window and a bar per week, so a
+week that ran hot, an account that is always the one at 100%, or a load that is not being
+spread the way the pool was meant to spread it are visible as a shape rather than assembled
+from a single percentage. The axis is the limit itself and never the data's own range — half
+height is half a window spent, in every chart on the page — and the bar still filling is drawn
+lighter, because its number is not final. That history has its own endpoint, `/api/v1/usage`,
+so it is readable by anything else too.
 
 ### the API
 

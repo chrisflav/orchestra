@@ -39,6 +39,7 @@ OS processes, and a limit one of them discovers has to stop the other.
 import Lean.Data.Json
 import Orchestra.Config
 import Orchestra.Dirs
+import Orchestra.Utils.Files
 import Orchestra.Utils.Http
 import Std.Time
 
@@ -395,11 +396,13 @@ instance : FromJson SourceState where
 def usageDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "usage"
 
+/-- A label as a filename. Labels come from config and are used as filenames, so anything that
+    could escape the directory is flattened rather than trusted. -/
+private def safeLabel (label : String) : String :=
+  label.map fun c => if c.isAlphanum || c == '-' || c == '_' then c else '_'
+
 private def statePath (backend label : String) : IO System.FilePath := do
-  -- Labels come from config and are used as filenames; anything that could escape the directory
-  -- is flattened rather than trusted.
-  let safe := label.map fun c => if c.isAlphanum || c == '-' || c == '_' then c else '_'
-  return (← usageDir) / backend / s!"{safe}.json"
+  return (← usageDir) / backend / s!"{safeLabel label}.json"
 
 def loadState (backend label : String) : IO SourceState := do
   let path ← statePath backend label
@@ -417,6 +420,186 @@ def saveState (s : SourceState) : IO Unit := do
 
 private def modifyState (backend label : String) (f : SourceState → SourceState) : IO Unit := do
   saveState (f (← loadState backend label))
+
+/-! ## History
+
+A poll answers "how much is left", and that is the only question it answers. "How much did
+yesterday cost", "is this week heavier than the last three", "did that concert eat a whole
+session window" are questions about the past, and the past has to be kept somewhere to be
+asked about.
+
+What is kept is one record per *window* rather than one per poll. The session and weekly limits
+are counters that fill and then reset, so the window is the unit that carries meaning: the peak
+a closed session window reached is what that session consumed, and the peak of a week is what
+that week did. Rolling polls up as they arrive is also what keeps the file small enough to read
+on every dashboard tick — a poll every five minutes is eight thousand samples a month, and the
+same month is a few hundred windows.
+
+Only polls are recorded. An observed hit (`markLimited`) establishes that *a* limit was reached
+but neither which counter reached it nor where that counter stood, so folding it in would
+invent a reading rather than record one; the poll that follows it reports the real number. -/
+
+/-- One session or weekly window, rolled up from every poll that landed inside it. -/
+structure Window where
+  kind        : LimitKind
+  /-- The model family a scoped window applies to; `none` for one that applies to everything. -/
+  scope       : Option String := none
+  /-- The reset time every poll inside this window reported, in epoch seconds. Absent when
+      nothing reported one, which is what `continuesWindow` then has to work around. -/
+  resetEpoch  : Option Int := none
+  /-- The first poll that landed in this window, and the last. Not the window's own bounds: a
+      window is only ever seen through the polls that caught it. -/
+  startEpoch  : Int := 0
+  lastEpoch   : Int := 0
+  /-- The highest reading. Utilisation only climbs inside a window, so this is what the window
+      consumed — and it is the number that survives the reset, which the next poll reports as a
+      fresh low. -/
+  peakPercent : Nat := 0
+  /-- The most recent reading. On the window still open, this is where it stands now. -/
+  lastPercent : Nat := 0
+  /-- How many polls this window was built from. One is a glimpse of a window rather than a
+      measurement of it, and a reader is entitled to say so. -/
+  samples     : Nat := 0
+deriving Repr, Inhabited
+
+instance : ToJson Window where
+  toJson w :=
+    let fields : List (String × Json) := [
+      ("kind",         ToJson.toJson w.kind),
+      ("start_epoch",  Json.num w.startEpoch),
+      ("last_epoch",   Json.num w.lastEpoch),
+      ("peak_percent", Json.num w.peakPercent),
+      ("last_percent", Json.num w.lastPercent),
+      ("samples",      Json.num w.samples)
+    ]
+    let fields := if let some r := w.resetEpoch then fields ++ [("reset_epoch", Json.num r)]
+                  else fields
+    let fields := if let some sc := w.scope then fields ++ [("scope", Json.str sc)] else fields
+    Json.mkObj fields
+
+instance : FromJson Window where
+  fromJson? j := do
+    let _ ← j.getObj?
+    let kind := (j.getObjValAs? LimitKind "kind").toOption.getD (.other "unknown")
+    let scope := (j.getObjValAs? String "scope").toOption
+    let resetEpoch := (j.getObjValAs? Int "reset_epoch").toOption
+    let startEpoch := (j.getObjValAs? Int "start_epoch").toOption.getD 0
+    let lastEpoch := (j.getObjValAs? Int "last_epoch").toOption.getD startEpoch
+    let peakPercent := (j.getObjValAs? Nat "peak_percent").toOption.getD 0
+    let lastPercent := (j.getObjValAs? Nat "last_percent").toOption.getD peakPercent
+    let samples := (j.getObjValAs? Nat "samples").toOption.getD 0
+    return { kind, scope, resetEpoch, startEpoch, lastEpoch, peakPercent, lastPercent, samples }
+
+/-- Nominal length of a window. Used only to decide whether two polls that reported no reset
+    time can have been inside the same one. -/
+def windowLengthSecs : LimitKind → Int
+  | .session => 5 * 3600
+  | _        => 7 * 86400
+
+/-- Whether a limit polled at `now` is another reading of `w`, or the first reading of the
+    window after it.
+
+    The reset time settles it whenever both sides have one: every poll inside a window reports
+    the same one, and a different one is by definition a different window. Without it the shape
+    of the counter has to serve — utilisation that dropped has reset — with the nominal window
+    length as a backstop, so a poll resuming after a day of downtime is not welded onto the
+    window it left. -/
+private def continuesWindow (w : Window) (l : Limit) (resetEpoch : Option Int) (now : Int)
+    : Bool :=
+  if w.kind != l.kind || w.scope != l.scopeModel then false
+  else match w.resetEpoch, resetEpoch with
+    | some a, some b => a == b
+    | _,      _      =>
+      decide (l.percent ≥ w.lastPercent) && decide (now - w.lastEpoch ≤ windowLengthSecs l.kind)
+
+private def openWindow (l : Limit) (resetEpoch : Option Int) (now : Int) : Window :=
+  { kind := l.kind, scope := l.scopeModel, resetEpoch
+    startEpoch := now, lastEpoch := now
+    peakPercent := l.percent, lastPercent := l.percent, samples := 1 }
+
+/-- Fold one poll's limits into the recorded windows: into the window each limit continues, and
+    as a new entry where it starts one.
+
+    Pure, so the cases that decide whether a graph is right — a window rolling over, a poll
+    arriving after a gap, a source that reports no reset time at all — are reachable from a test
+    without a clock or a network. -/
+def recordWindows (windows : Array Window) (limits : Array Limit) (now : Int)
+    : Array Window := Id.run do
+  let mut out := windows
+  for l in limits do
+    let resetEpoch := l.resetsAt.bind parseIso8601
+    -- The open window of a series is the *last* one recorded for it: polls arrive in order, so
+    -- everything before it is closed.
+    let mut latest : Option Nat := none
+    for i in [0:out.size] do
+      let w := out[i]!
+      if w.kind == l.kind && w.scope == l.scopeModel then latest := some i
+    match latest with
+    | some i =>
+      let w := out[i]!
+      if continuesWindow w l resetEpoch now then
+        out := out.set! i { w with
+          lastEpoch := now
+          lastPercent := l.percent
+          peakPercent := max w.peakPercent l.percent
+          -- A window whose first poll carried no reset time keeps the one a later poll brings.
+          resetEpoch := resetEpoch.orElse fun _ => w.resetEpoch
+          samples := w.samples + 1 }
+      else
+        out := out.push (openWindow l resetEpoch now)
+    | none => out := out.push (openWindow l resetEpoch now)
+  return out
+
+/-- How many windows of one series — a kind, and a model scope where it has one — are kept.
+    Two hundred and forty session windows is a couple of months of continuous use. -/
+def maxWindowsPerSeries : Nat := 240
+
+/-- How far back history is kept at all, whatever the count. -/
+def historyRetentionSecs : Int := 180 * 86400
+
+/-- Drop what is too old, then what is too much — newest first, per series.
+
+    Capping per series rather than over the whole file is what stops a session window every five
+    hours from evicting the weekly history the second graph is drawn from. -/
+def pruneWindows (windows : Array Window) (now : Int) : Array Window := Id.run do
+  let fresh := windows.filter fun w => decide (now - w.lastEpoch ≤ historyRetentionSecs)
+  let mut kept : Array Window := #[]
+  for w in fresh.reverse do
+    let seen := (kept.filter fun k => k.kind == w.kind && k.scope == w.scope).size
+    if seen < maxWindowsPerSeries then kept := kept.push w
+  return kept.reverse
+
+private def historyPath (backend label : String) : IO System.FilePath := do
+  return (← usageDir) / backend / s!"{safeLabel label}.history.json"
+
+/-- The recorded windows for one source, oldest first.
+
+    Unreadable history is empty history: it is a record of the past, nothing about the present
+    depends on it, and a monitor that refused to run because a graph's data file was corrupt
+    would have its priorities backwards. -/
+def loadHistory (backend label : String) : IO (Array Window) := do
+  let path ← historyPath backend label
+  if !(← path.pathExists) then return #[]
+  match Json.parse (← IO.FS.readFile path) with
+  | .error _ => return #[]
+  | .ok j    => return (j.getObjValAs? (Array Window) "windows").toOption.getD #[]
+
+/-- Wrapped in an object rather than written as a bare array, so a later version can add a
+    field beside `windows` without every reader of this file having to change.
+
+    Written through a rename, unlike the state file beside it: the dashboard re-reads this one
+    on every tick of an open page, and a reader that caught a half-written file would find it
+    unparseable — which `loadHistory` treats as no history at all, and the next poll would then
+    write that emptiness back as the truth. -/
+def saveHistory (backend label : String) (windows : Array Window) : IO Unit := do
+  let path ← historyPath backend label
+  Utils.writeFileAtomically path (Json.compress (Json.mkObj [("windows", ToJson.toJson windows)]))
+
+/-- Fold one poll's limits into the stored history. Called on every successful poll, and by
+    nothing else. -/
+def recordPoll (backend label : String) (limits : Array Limit) (now : Int) : IO Unit := do
+  let windows ← loadHistory backend label
+  saveHistory backend label (pruneWindows (recordWindows windows limits now) now)
 
 /-! ## Availability
 
@@ -798,6 +981,12 @@ def refresh (cfg : AppConfig) (backend label : String) : IO (Except String Bool)
       saveState { st with
         limits, fetchedEpoch := some now, lastError := none, pollAfter := none
         block := if stillBlocked then st.block else none }
+      -- History is a nicety and monitoring is not, so a history file that cannot be written
+      -- reports itself and leaves the poll — which has already been stored — successful.
+      try
+        recordPoll backend label limits now
+      catch e =>
+        IO.eprintln s!"[usage] {backend}/{label}: could not record history: {e}"
       return .ok true
 
 /-- Every label configured for `backend`. -/

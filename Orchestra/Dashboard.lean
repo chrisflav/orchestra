@@ -571,6 +571,89 @@ private def authCounts (configPath : Option System.FilePath) : IO (Nat × Nat) :
     return (free, total)
   catch _ => return (0, 0)
 
+-- Usage history
+--
+-- The same store, read for the other question. `auth` answers "what is left right now"; this
+-- answers "what has been spent, window by window" — the peak each session window reached and
+-- the peak each week reached, which are the two graphs the dashboard draws.
+--
+-- Windows come back oldest first, because that is the order a graph is drawn in, and the tail
+-- is what a response carries: the recent windows are the ones anyone reads, and the store keeps
+-- far more of them than a page has pixels for.
+
+/-- How many windows per series a response carries when `windows` is absent, and the ceiling
+    whatever it asks for. Sixty session windows is around a fortnight of continuous use; sixty
+    weeks is longer than the store keeps. -/
+private def defaultWindowCount : Nat := 60
+
+private def maxWindowCount : Nat := 240
+
+/-- One rolled-up window.
+
+    `peakPercent` is what the window consumed and `percent` is where it last stood; on a closed
+    window the two agree, and on the one still open they say how much of it is already gone.
+    `open` is that distinction, computed against the reset time the window reported rather than
+    left for a client to guess from timestamps. -/
+private def usageWindowJson (now : Int) (w : Usage.Window) : Json :=
+  let stillOpen := match w.resetEpoch with
+    | some r => r > now
+    | none   => now - w.lastEpoch ≤ Usage.windowLengthSecs w.kind
+  Json.mkObj [
+    ("kind",        w.kind.toString),
+    ("scope",       optStr w.scope),
+    ("startedAt",   Json.str (isoOfEpoch w.startEpoch)),
+    ("updatedAt",   Json.str (isoOfEpoch w.lastEpoch)),
+    ("resetsAt",    optEpochIso w.resetEpoch),
+    ("peakPercent", ToJson.toJson w.peakPercent),
+    ("percent",     ToJson.toJson w.lastPercent),
+    -- How many polls saw this window. One is a glimpse of it rather than a measurement, which
+    -- is a thing a reader may want to say next to a bar.
+    ("samples",     ToJson.toJson w.samples),
+    ("open",        Json.bool stillOpen)
+  ]
+
+/-- The recorded history of one source, split into the series a reader asks about separately.
+
+    `other` exists so that nothing recorded is unreachable: the poller keeps limit kinds it has
+    never heard of rather than dropping them, and a graph that only knows two of them must not
+    be the reason the rest cannot be read. -/
+private def usageSourceJson (backend : String) (src : AuthSource) (count : Nat) (now : Int)
+    : IO Json := do
+  let windows ← Usage.loadHistory backend src.label
+  let tail (p : Usage.Window → Bool) : Array Json :=
+    let kept := windows.filter p
+    (kept.toList.drop (kept.size - min count kept.size)).toArray.map (usageWindowJson now)
+  let isWeekly (w : Usage.Window) := w.kind == .weeklyAll || w.kind == .weeklyScoped
+  return Json.mkObj [
+    ("label",    src.label),
+    ("backend",  backend),
+    ("kind",     match src.kind with | .oauthToken _ => "oauth" | .apiKey _ _ => "api-key"),
+    -- An API-key source bills per token against an organisation: it has no subscription window,
+    -- so empty history on one is the expected state rather than a gap.
+    ("pollable", Json.bool (match src.kind with | .oauthToken _ => true | .apiKey _ _ => false)),
+    ("sessions", Json.arr (tail fun w => w.kind == .session)),
+    ("weeks",    Json.arr (tail isWeekly)),
+    ("other",    Json.arr (tail fun w => !(w.kind == .session || isWeekly w)))
+  ]
+
+/-- Every configured source with what its usage has looked like over time.
+
+    Kept apart from `auth` rather than folded into it, because the two answer different
+    questions at different rates: `auth` is the current verdict and changes with every poll,
+    while this is a log that only grows. A client that wants one does not pay for the other. -/
+private def usageApi (configPath : Option System.FilePath) (count : Nat) : IO Json := do
+  let now ← Usage.nowEpoch
+  let cfg ← try
+      pure (Except.ok (← loadAppConfig configPath))
+    catch e => pure (Except.error (toString e))
+  match cfg with
+  | .error e => return Json.mkObj [("configError", Json.str e), ("backends", Json.arr #[])]
+  | .ok cfg =>
+    let backends ← cfg.agentAuthConfigs.mapM fun a => do
+      let sources ← a.authSources.mapM fun src => usageSourceJson a.name src count now
+      return Json.mkObj [("name", a.name), ("sources", Json.arr sources)]
+    return Json.mkObj [("configError", Json.null), ("backends", Json.arr backends)]
+
 /-- The configured taxis instance, if there is one.
 
     Projects live in taxis and are its business to display, so the dashboard links out rather
@@ -973,6 +1056,12 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
 
   if kind == "overview"  then return ← plain (overviewApi configPath)
   if kind == "auth"      then return ← plain (authApi configPath)
+  if kind == "usage"     then
+    -- Not a collection — there is no envelope and no offset — so `limit` is refused like
+    -- everywhere else, and the one thing this endpoint can be asked to bound has its own name.
+    match natParam q "windows" defaultWindowCount maxWindowCount with
+    | .error e => return .badRequest e
+    | .ok n    => return ← plain (usageApi configPath n)
   if kind == "queue"     then return ← paged queueApi
   if kind == "concerts"  then return ← paged concertsApi
   if kind == "tasks"     then return ← paged tasksApi
@@ -1533,7 +1622,8 @@ def apiRoutes : Array (String × Array String) :=
     ("skills/{name}",            #["get", "put", "delete"]),
     ("projects",                 #["get"]),
     ("projects/{id}",            #["get"]),
-    ("auth",                     #["get"])]
+    ("auth",                     #["get"]),
+    ("usage",                    #["get"])]
 
 /-- Every *read* the API serves. This is also exactly the set `/sse/v1/` streams, since a stream
     is a read repeated. -/
