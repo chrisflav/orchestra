@@ -292,11 +292,20 @@ def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
     : IO (Array (String × Option String)) := do
   match appConfig.agentAuthConfigs.find? (fun c => c.name == backendName) with
   | none =>
-    -- No per-agent auth configured: use legacy flat fields for backward compatibility
+    -- No per-agent auth configured: use legacy flat fields for backward compatibility.
+    -- `claude_token` here is the same kind of credential an `oauth_token` source holds — a
+    -- `setup-token` — and carries the same gap: no profile, so no plan, so a Fable run refused
+    -- for want of usage credits (see `AgentDef.claude.envVarsOfAuthSource`). It gets the same
+    -- two variables, and only when there is a token for them to describe.
+    let plan : Array (String × Option String) :=
+      if appConfig.claudeToken.isSome then
+        #[("CLAUDE_CODE_SUBSCRIPTION_TYPE", some "max"),
+          ("CLAUDE_CODE_RATE_LIMIT_TIER",   some "default_claude_max_20x")]
+      else #[]
     return #[("ANTHROPIC_API_KEY",       appConfig.anthropicApiKey),
              ("ANTHROPIC_BASE_URL",      appConfig.anthropicBaseUrl),
              ("ANTHROPIC_AUTH_TOKEN",    appConfig.anthropicAuthToken),
-             ("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)]
+             ("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)] ++ plan
   | some agentAuth =>
     -- Determine which label to use
     let label ← match requestedLabel with
