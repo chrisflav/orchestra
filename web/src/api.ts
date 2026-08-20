@@ -278,6 +278,53 @@ export interface CancelResult {
 }
 
 /**
+ * One session or weekly limit window, rolled up from every poll that landed inside it.
+ *
+ * `peakPercent` is what the window consumed — utilisation only climbs inside a window — and
+ * `percent` is where it last stood, so on a closed window the two agree and on the open one
+ * they say how much of it is already gone.
+ */
+export interface UsageWindow {
+  kind: string;
+  /** Model family a scoped window applies to. */
+  scope: string | null;
+  /** The first poll that landed in this window, not the window's own start. */
+  startedAt: string;
+  updatedAt: string;
+  resetsAt: string | null;
+  peakPercent: number;
+  percent: number;
+  /** How many polls saw this window. One is a glimpse of it, not a measurement. */
+  samples: number;
+  /** Whether this is the window still filling: the newest of its series, not yet past its reset. */
+  open: boolean;
+}
+
+export interface UsageHistorySource {
+  label: string;
+  backend: string;
+  kind: "oauth" | "api-key";
+  /** False for API-key sources, which have no subscription window to accumulate history in. */
+  pollable: boolean;
+  /** Session windows, oldest first — the order a graph is drawn in. */
+  sessions: UsageWindow[];
+  /** Weekly windows, account-wide and model-scoped alike, oldest first. */
+  weeks: UsageWindow[];
+  /** Any other kind upstream reported, so nothing recorded is unreachable. */
+  other: UsageWindow[];
+}
+
+export interface UsageHistoryBackend {
+  name: string;
+  sources: UsageHistorySource[];
+}
+
+export interface UsageHistory {
+  configError: string | null;
+  backends: UsageHistoryBackend[];
+}
+
+/**
  * Maps each endpoint to the payload it returns. Detail endpoints take a path component, so
  * they are spelled as template literal types — that is what makes `useLiveData("tasks/" + id)`
  * resolve to `TaskDetail` rather than to `unknown`.
@@ -290,6 +337,7 @@ export interface Endpoints {
   tasks: Collection<TaskRecord>;
   projects: Collection<ProjectSummary>;
   auth: AuthView;
+  usage: UsageHistory;
 }
 
 export type DetailEndpoint =
@@ -345,6 +393,8 @@ export interface QueryParams {
   since?: string;
   /** Only on a task detail. */
   logLimit?: number;
+  /** Only on usage history: how many windows to return per series (a kind and a model scope). */
+  windows?: number;
 }
 
 export function apiUrl(endpoint: string, query?: QueryParams): string {

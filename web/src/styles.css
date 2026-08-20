@@ -972,6 +972,95 @@ a.row:hover .row-title {
   background: var(--perc);
 }
 
+/* Usage history.
+
+   A bar per limit window on a fixed 0–100 axis: the axis is the limit, never the data's own
+   range, so half height means half a window spent on every source and in every week. The
+   ceiling is a dashed hairline rather than a gridded frame — a bar touching it is the window
+   that ran out, and that is the only reference line the shape needs. */
+
+.charts {
+  display: grid;
+  /* Two across at page width, one on a phone. Wide enough that a chart's caption — the counts
+     that replace a label on every bar — sits on the same line as its title; a source that also
+     reports model-scoped weekly limits has four of these, and three columns crushed the titles
+     into a stack of single words. */
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: 22px 32px;
+  margin-top: 18px;
+}
+.chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  /* The caption drops below the title rather than squeezing it, in the narrow case the line
+     above cannot rule out. */
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  margin-bottom: 10px;
+}
+.chart-title {
+  font-size: 13px;
+  color: var(--mute);
+  white-space: nowrap;
+}
+.chart-note {
+  font-family: var(--data);
+  font-size: 11.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.chart-plot {
+  display: flex;
+  align-items: flex-end;
+  /* Spread rather than packed: the axis below says the right-hand end is now, so the newest
+     window has to sit there. With enough windows to fill the row this does nothing; with five
+     it is what keeps the labels bracketing the bars they describe. */
+  justify-content: space-between;
+  gap: 2px;
+  height: 64px;
+  border-top: 1px dashed var(--rule-soft);
+  border-bottom: 1px solid var(--rule);
+}
+.chart-col {
+  flex: 1 1 0;
+  /* Capped so that a handful of windows read as a handful of windows rather than as slabs. */
+  max-width: 40px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+.chart-bar {
+  width: 100%;
+  border-radius: 3px 3px 0 0;
+  background: var(--strings);
+}
+.chart-bar.warn {
+  background: var(--brass);
+}
+.chart-bar.crit {
+  background: var(--perc);
+}
+/* The window still filling. Drawn lighter, because its number is not final and a bar the same
+   weight as the closed ones would claim it is. */
+.chart-bar.open {
+  opacity: 0.55;
+}
+.chart-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 6px;
+  font-family: var(--data);
+  font-size: 11px;
+  color: var(--faint);
+}
+.chart-empty {
+  font-size: 13px;
+  color: var(--faint);
+  padding: 6px 0;
+}
+
 /* ============================================================
    Sign in
    ============================================================ */

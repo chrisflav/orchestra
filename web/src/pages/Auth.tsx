@@ -1,7 +1,10 @@
-import type { AuthSource, UsageLimit } from "../api";
+import type { AuthSource, UsageHistory, UsageHistorySource, UsageLimit, UsageWindow } from "../api";
+import type { Bar } from "../components/Chart";
+import { Bars } from "../components/Chart";
 import { LivePage, Section } from "../components/Page";
 import { Status } from "../components/Status";
-import { sinceTime, untilTime } from "../format";
+import { relativeTime, sinceTime, untilTime } from "../format";
+import { useLiveData } from "../useLiveData";
 
 const SEVERITY: Record<string, string> = {
   normal: "",
@@ -41,7 +44,91 @@ function Limit({ limit }: { limit: UsageLimit }) {
   );
 }
 
-function Source({ source }: { source: AuthSource }) {
+/**
+ * A window as a bar.
+ *
+ * The peak is what the window consumed: utilisation only climbs inside one, so the highest
+ * reading is the whole of it. The exact instants go in the hover line rather than under the
+ * bars — sixty of them would be a wall of text where the shape is the thing being read.
+ */
+function barsOf(windows: UsageWindow[]): Bar[] {
+  return windows.map((window) => ({
+    // Keyed by the series as well as the instant: one poll opens every window it reports at the
+    // same `startedAt`, so a kind and a scope are both part of what makes a window itself.
+    key: `${window.kind}:${window.scope ?? "*"}:${window.startedAt}`,
+    value: window.peakPercent,
+    ...(window.open ? { open: true } : {}),
+    title: [
+      window.startedAt,
+      `peak ${window.peakPercent}%`,
+      window.open ? "still filling" : null,
+      // A window built from one poll is a glimpse of it rather than a measurement, and the
+      // bar cannot say so on its own.
+      `${window.samples} ${window.samples === 1 ? "poll" : "polls"}`,
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  }));
+}
+
+/** The ends of the time axis. The open window is "now", which is what it is. */
+function axisOf(windows: UsageWindow[]): [string, string] | undefined {
+  const first = windows[0];
+  const last = windows[windows.length - 1];
+  if (first === undefined || last === undefined) return undefined;
+  return [relativeTime(first.startedAt), last.open ? "now" : relativeTime(last.updatedAt)];
+}
+
+function Chart({ title, windows, empty }: { title: string; windows: UsageWindow[]; empty: string }) {
+  return <Bars title={title} bars={barsOf(windows)} empty={empty} axis={axisOf(windows)} />;
+}
+
+/**
+ * What this source has spent, window by window.
+ *
+ * Two graphs because a subscription is two counters: the session window is the one that
+ * decides whether the next task starts, and the weekly total is the one that decides whether
+ * the rest of the week does. A weekly limit scoped to a model family is a third counter and
+ * gets its own graph rather than being averaged into the account's.
+ */
+function History({ history }: { history: UsageHistorySource }) {
+  const scopes = [...new Set(history.weeks.map((week) => week.scope))];
+  return (
+    <div className="charts">
+      <Chart
+        title="usage per session"
+        windows={history.sessions}
+        empty="Nothing recorded yet. A window opens the first time this source is polled."
+      />
+      {scopes.length === 0 ? (
+        <Chart
+          title="usage per week"
+          windows={[]}
+          empty="Nothing recorded yet. A window opens the first time this source is polled."
+        />
+      ) : (
+        scopes.map((scope) => (
+          <Chart
+            // `null` is the account-wide window, which is not the same series as a limit
+            // scoped to a model family that happens to be named with an empty string.
+            key={scope === null ? "*" : `scope:${scope}`}
+            title={scope === null ? "usage per week" : `usage per week · ${scope}`}
+            windows={history.weeks.filter((week) => week.scope === scope)}
+            empty="No weeks recorded yet."
+          />
+        ))
+      )}
+    </div>
+  );
+}
+
+function Source({
+  source,
+  history,
+}: {
+  source: AuthSource;
+  history: UsageHistorySource | undefined;
+}) {
   // The API sends instants; the phrasing is this page's business, which is what keeps
   // "4m ago" true four minutes after the frame that carried it arrived.
   const notes = [
@@ -87,6 +174,13 @@ function Source({ source }: { source: AuthSource }) {
         </p>
       )}
 
+      {/*
+        Only for a source that has a subscription to spend: an API-key source bills per token
+        and has no window to fill, so an empty pair of graphs on one would be inviting the
+        reader to look for data that will never exist.
+      */}
+      {source.pollable && history !== undefined && <History history={history} />}
+
       <div className="source-foot">
         {notes.join(" · ")}
         {source.lastError && (
@@ -97,7 +191,23 @@ function Source({ source }: { source: AuthSource }) {
   );
 }
 
+/** The recorded history of one source, by the pair of names that identifies it. */
+function historyOf(
+  history: UsageHistory | null,
+  backend: string,
+  label: string,
+): UsageHistorySource | undefined {
+  return history?.backends
+    .find((entry) => entry.name === backend)
+    ?.sources.find((source) => source.label === label);
+}
+
 export function Auth() {
+  // History rides its own endpoint, and so its own stream: `auth` is the current verdict and
+  // changes with every poll, while this is a log that only ever grows. Read here rather than
+  // inside the render callback below, which runs conditionally — a hook cannot.
+  const history = useLiveData("usage");
+
   return (
     <LivePage endpoint="auth" title="Auth">
       {(data) => {
@@ -141,7 +251,13 @@ export function Auth() {
                 }`}
               >
                 {backend.sources.length > 0 ? (
-                  backend.sources.map((source) => <Source key={source.label} source={source} />)
+                  backend.sources.map((source) => (
+                    <Source
+                      key={source.label}
+                      source={source}
+                      history={historyOf(history.data, backend.name, source.label)}
+                    />
+                  ))
                 ) : (
                   <p className="empty">This backend has no sources.</p>
                 )}

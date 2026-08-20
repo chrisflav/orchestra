@@ -19,7 +19,7 @@
     { "name": "roles", "description": "Reusable task templates the dispatcher spawns from." },
     { "name": "skills", "description": "Markdown handed to every agent this instance launches." },
     { "name": "projects", "description": "Taxis-backed projects and their issue graphs." },
-    { "name": "auth", "description": "Configured credentials and their usage limits." }
+    { "name": "auth", "description": "Configured credentials, the usage limits they are under, and what they have spent." }
   ],
   "paths": {
     "/api/openapi.json": {
@@ -753,6 +753,31 @@
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
+    },
+    "/api/v1/usage": {
+      "get": {
+        "tags": ["auth"],
+        "summary": "What each authentication source has spent, window by window",
+        "description": "The history behind `/api/v1/auth`. Every poll is rolled up into the limit window it landed in, so a source reports one record per session window and one per week rather than one per poll: `peakPercent` is what that window consumed, and `open` marks the window still filling.\n\nOnly polls are recorded, and a window is only ever seen through the polls that caught it — `samples` says how many did. A source that is not polled (an API key, or a backend with `poll_usage: false`) has no history, which is an absence rather than a gap.",
+        "operationId": "getUsage",
+        "parameters": [
+          {
+            "name": "windows",
+            "in": "query",
+            "description": "How many of the most recent windows to return per series — a kind, and a model scope where it has one. Values above the maximum are clamped to it rather than rejected.",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 0, "maximum": 240, "default": 60 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The history.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UsageHistory" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
     }
   },
   "components": {
@@ -1193,6 +1218,51 @@
         "properties": {
           "configError": { "type": ["string", "null"], "description": "Set instead of `backends` when the config could not be read." },
           "backends": { "type": "array", "items": { "$ref": "#/components/schemas/AuthBackend" } }
+        }
+      },
+      "UsageWindow": {
+        "type": "object",
+        "description": "One session or weekly limit window, rolled up from every poll that landed inside it.",
+        "required": ["kind", "scope", "startedAt", "updatedAt", "resetsAt", "peakPercent", "percent", "samples", "open"],
+        "properties": {
+          "kind": { "type": "string", "description": "`session`, `weekly_all`, `weekly_scoped`, or whatever else upstream reports." },
+          "scope": { "type": ["string", "null"], "description": "Model family a scoped window applies to." },
+          "startedAt": { "type": "string", "format": "date-time", "description": "The first poll that landed in this window — not the window's own start, which is only ever seen through the polls that caught it." },
+          "updatedAt": { "type": "string", "format": "date-time", "description": "The last poll that landed in it." },
+          "resetsAt": { "type": ["string", "null"], "format": "date-time", "description": "When the window resets, as every poll inside it reported." },
+          "peakPercent": { "type": "integer", "minimum": 0, "description": "The highest reading. Utilisation only climbs inside a window, so this is what the window consumed." },
+          "percent": { "type": "integer", "minimum": 0, "description": "The most recent reading. Usually equal to `peakPercent` on a closed window, though a poll that read low leaves it below." },
+          "samples": { "type": "integer", "minimum": 0, "description": "How many polls saw this window. One is a glimpse of it rather than a measurement." },
+          "open": { "type": "boolean", "description": "Whether this is the window still filling: the newest of its series, and not yet past its reset." }
+        }
+      },
+      "UsageHistorySource": {
+        "type": "object",
+        "required": ["label", "backend", "kind", "pollable", "sessions", "weeks", "other"],
+        "properties": {
+          "label": { "type": "string" },
+          "backend": { "type": "string" },
+          "kind": { "type": "string", "enum": ["oauth", "api-key"] },
+          "pollable": { "type": "boolean", "description": "False for API-key sources, which have no subscription window and so never accumulate history." },
+          "sessions": { "type": "array", "description": "Session windows, oldest first.", "items": { "$ref": "#/components/schemas/UsageWindow" } },
+          "weeks": { "type": "array", "description": "Weekly windows, both account-wide and model-scoped, oldest first.", "items": { "$ref": "#/components/schemas/UsageWindow" } },
+          "other": { "type": "array", "description": "Windows of any other kind upstream reported, so that nothing recorded is unreachable.", "items": { "$ref": "#/components/schemas/UsageWindow" } }
+        }
+      },
+      "UsageHistoryBackend": {
+        "type": "object",
+        "required": ["name", "sources"],
+        "properties": {
+          "name": { "type": "string" },
+          "sources": { "type": "array", "items": { "$ref": "#/components/schemas/UsageHistorySource" } }
+        }
+      },
+      "UsageHistory": {
+        "type": "object",
+        "required": ["configError", "backends"],
+        "properties": {
+          "configError": { "type": ["string", "null"], "description": "Set instead of `backends` when the config could not be read." },
+          "backends": { "type": "array", "items": { "$ref": "#/components/schemas/UsageHistoryBackend" } }
         }
       },
       "OverviewCounts": {
