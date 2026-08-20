@@ -288,7 +288,7 @@ export interface UsageWindow {
   percent: number;
   /** How many polls saw this window. One is a glimpse of it, not a measurement. */
   samples: number;
-  /** Whether this is the window still filling. */
+  /** Whether this is the window still filling: the newest of its series, not yet past its reset. */
   open: boolean;
 }
 
@@ -385,7 +385,7 @@ export interface QueryParams {
   since?: string;
   /** Only on a task detail. */
   logLimit?: number;
-  /** Only on usage history: how many windows per series to return. */
+  /** Only on usage history: how many windows to return per series (a kind and a model scope). */
   windows?: number;
 }
 

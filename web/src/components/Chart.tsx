@@ -53,15 +53,18 @@ export function Bars({
   }
 
   const peak = bars.reduce((worst, bar) => Math.max(worst, bar.value), 0);
-  const latest = bars[bars.length - 1]?.value ?? 0;
+  // The newest bar, named for what it is. Every bar is a window's consumption, so this is what
+  // the most recent window has cost — not where the source stands right now, which is the
+  // limit tracks' job and would be a different number on the window still filling.
+  const newest = bars[bars.length - 1]?.value ?? 0;
 
   return (
     <div className="chart">
       <div className="chart-head">
         <span className="chart-title">{title}</span>
         <span className="chart-note">
-          {bars.length} {bars.length === 1 ? "window" : "windows"} · highest {peak}% · latest{" "}
-          {latest}%
+          {bars.length} {bars.length === 1 ? "window" : "windows"} · highest {peak}% · newest{" "}
+          {newest}%
         </span>
       </div>
       {/*
@@ -71,12 +74,14 @@ export function Bars({
       <div
         className="chart-plot"
         role="img"
-        aria-label={`${title}: ${bars.length} windows, highest ${peak} percent, latest ${latest} percent`}
+        aria-label={`${title}: ${bars.length} windows, highest ${peak} percent, newest ${newest} percent`}
       >
         {bars.map((bar) => (
           <div className="chart-col" key={bar.key} title={bar.title}>
             <div
-              className={`chart-bar ${fillOf(bar.value)}${bar.open ? " open" : ""}`}
+              className={["chart-bar", fillOf(bar.value), bar.open ? "open" : ""]
+                .filter(Boolean)
+                .join(" ")}
               // Clamped, never rescaled: a reading over 100% is still a full bar, and a
               // window with almost nothing in it keeps a hairline so that "polled and quiet"
               // does not look like "never polled".

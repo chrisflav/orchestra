@@ -53,7 +53,9 @@ function Limit({ limit }: { limit: UsageLimit }) {
  */
 function barsOf(windows: UsageWindow[]): Bar[] {
   return windows.map((window) => ({
-    key: `${window.startedAt}:${window.scope ?? ""}`,
+    // Keyed by the series as well as the instant: one poll opens every window it reports at the
+    // same `startedAt`, so a kind and a scope are both part of what makes a window itself.
+    key: `${window.kind}:${window.scope ?? "*"}:${window.startedAt}`,
     value: window.peakPercent,
     ...(window.open ? { open: true } : {}),
     title: [
@@ -96,18 +98,20 @@ function History({ history }: { history: UsageHistorySource }) {
       <Chart
         title="usage per session"
         windows={history.sessions}
-        empty="No session windows recorded yet. The first poll opens one."
+        empty="Nothing recorded yet. A window opens the first time this source is polled."
       />
       {scopes.length === 0 ? (
         <Chart
           title="usage per week"
           windows={[]}
-          empty="No weeks recorded yet. The first poll opens one."
+          empty="Nothing recorded yet. A window opens the first time this source is polled."
         />
       ) : (
         scopes.map((scope) => (
           <Chart
-            key={scope ?? ""}
+            // `null` is the account-wide window, which is not the same series as a limit
+            // scoped to a model family that happens to be named with an empty string.
+            key={scope === null ? "*" : `scope:${scope}`}
             title={scope === null ? "usage per week" : `usage per week · ${scope}`}
             windows={history.weeks.filter((week) => week.scope === scope)}
             empty="No weeks recorded yet."

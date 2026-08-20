@@ -581,21 +581,27 @@ private def authCounts (configPath : Option System.FilePath) : IO (Nat × Nat) :
 -- is what a response carries: the recent windows are the ones anyone reads, and the store keeps
 -- far more of them than a page has pixels for.
 
-/-- How many windows per series a response carries when `windows` is absent, and the ceiling
+/-- How many windows *per series* a response carries when `windows` is absent, and the ceiling
     whatever it asks for. Sixty session windows is around a fortnight of continuous use; sixty
     weeks is longer than the store keeps. -/
 private def defaultWindowCount : Nat := 60
 
 private def maxWindowCount : Nat := 240
 
-/-- One rolled-up window.
+/-- One rolled-up window. `isLatest` says whether it is the newest of its series, which is what
+    `open` is mostly a question about.
 
     `peakPercent` is what the window consumed and `percent` is where it last stood; on a closed
-    window the two agree, and on the one still open they say how much of it is already gone.
-    `open` is that distinction, computed against the reset time the window reported rather than
-    left for a client to guess from timestamps. -/
-private def usageWindowJson (now : Int) (w : Usage.Window) : Json :=
-  let stillOpen := match w.resetEpoch with
+    window the two usually agree, and on the one still open they say how much of it is already
+    gone.
+
+    Open means "still filling", and that is a fact about the series rather than about the window
+    alone: only the newest window of a series can be the one filling. Deciding it from the
+    window's own timestamps — as this did — reads a *closed* window that reported no reset time
+    as open for a whole nominal window length after its successor had already started, which for
+    a weekly window is a week of two bars both claiming to be the current one. -/
+private def usageWindowJson (now : Int) (isLatest : Bool) (w : Usage.Window) : Json :=
+  let stillOpen := isLatest && match w.resetEpoch with
     | some r => r > now
     | none   => now - w.lastEpoch ≤ Usage.windowLengthSecs w.kind
   Json.mkObj [
@@ -620,9 +626,19 @@ private def usageWindowJson (now : Int) (w : Usage.Window) : Json :=
 private def usageSourceJson (backend : String) (src : AuthSource) (count : Nat) (now : Int)
     : IO Json := do
   let windows ← Usage.loadHistory backend src.label
-  let tail (p : Usage.Window → Bool) : Array Json :=
-    let kept := windows.filter p
-    (kept.toList.drop (kept.size - min count kept.size)).toArray.map (usageWindowJson now)
+  -- Walked newest first, which settles both things this has to get right. `count` bounds each
+  -- *series* — a kind, and a model scope where it has one — rather than the array they are
+  -- merged into: `weeks` carries the account-wide window alongside every model-scoped one, and
+  -- one budget shared between series that roll over at different rates would return an
+  -- arbitrary split of them, undoing at the boundary exactly what `Usage.pruneWindows` is
+  -- careful to do in the store. The first window of a series is also the only one that can
+  -- still be open, which is what `usageWindowJson` needs told.
+  let tail (p : Usage.Window → Bool) : Array Json := Id.run do
+    let mut taken : Array (Usage.Window × Bool) := #[]
+    for w in (windows.filter p).reverse do
+      let seen := (taken.filter fun (k, _) => k.kind == w.kind && k.scope == w.scope).size
+      if seen < count then taken := taken.push (w, seen == 0)
+    return taken.reverse.map fun (w, isLatest) => usageWindowJson now isLatest w
   let isWeekly (w : Usage.Window) := w.kind == .weeklyAll || w.kind == .weeklyScoped
   return Json.mkObj [
     ("label",    src.label),

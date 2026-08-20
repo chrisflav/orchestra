@@ -711,7 +711,7 @@
           {
             "name": "windows",
             "in": "query",
-            "description": "How many of the most recent windows to return per series.",
+            "description": "How many of the most recent windows to return per series — a kind, and a model scope where it has one. Values above the maximum are clamped to it rather than rejected.",
             "required": false,
             "schema": { "type": "integer", "minimum": 0, "maximum": 240, "default": 60 }
           }
@@ -1178,9 +1178,9 @@
           "updatedAt": { "type": "string", "format": "date-time", "description": "The last poll that landed in it." },
           "resetsAt": { "type": ["string", "null"], "format": "date-time", "description": "When the window resets, as every poll inside it reported." },
           "peakPercent": { "type": "integer", "minimum": 0, "description": "The highest reading. Utilisation only climbs inside a window, so this is what the window consumed." },
-          "percent": { "type": "integer", "minimum": 0, "description": "The most recent reading. Equal to `peakPercent` on a closed window." },
+          "percent": { "type": "integer", "minimum": 0, "description": "The most recent reading. Usually equal to `peakPercent` on a closed window, though a poll that read low leaves it below." },
           "samples": { "type": "integer", "minimum": 0, "description": "How many polls saw this window. One is a glimpse of it rather than a measurement." },
-          "open": { "type": "boolean", "description": "Whether this is the window still filling." }
+          "open": { "type": "boolean", "description": "Whether this is the window still filling: the newest of its series, and not yet past its reset." }
         }
       },
       "UsageHistorySource": {

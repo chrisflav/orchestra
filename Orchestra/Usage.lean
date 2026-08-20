@@ -496,6 +496,14 @@ def windowLengthSecs : LimitKind → Int
   | .session => 5 * 3600
   | _        => 7 * 86400
 
+/-- How far two reported reset times may differ and still describe the same window.
+
+    A rollover moves the reset time by a whole window — five hours, or seven days — so a minute
+    of tolerance cannot swallow one. What it does buy is a soft failure: a source whose reset
+    time is re-anchored by a second or two would otherwise start a fresh window on every poll,
+    and the history would quietly become one sample per record, which is not history at all. -/
+def resetDriftSecs : Nat := 60
+
 /-- Whether a limit polled at `now` is another reading of `w`, or the first reading of the
     window after it.
 
@@ -508,7 +516,7 @@ private def continuesWindow (w : Window) (l : Limit) (resetEpoch : Option Int) (
     : Bool :=
   if w.kind != l.kind || w.scope != l.scopeModel then false
   else match w.resetEpoch, resetEpoch with
-    | some a, some b => a == b
+    | some a, some b => decide ((a - b).natAbs ≤ resetDriftSecs)
     | _,      _      =>
       decide (l.percent ≥ w.lastPercent) && decide (now - w.lastEpoch ≤ windowLengthSecs l.kind)
 
@@ -562,7 +570,12 @@ def historyRetentionSecs : Int := 180 * 86400
     Capping per series rather than over the whole file is what stops a session window every five
     hours from evicting the weekly history the second graph is drawn from. -/
 def pruneWindows (windows : Array Window) (now : Int) : Array Window := Id.run do
-  let fresh := windows.filter fun w => decide (now - w.lastEpoch ≤ historyRetentionSecs)
+  let aged := windows.filter fun w => decide (now - w.lastEpoch ≤ historyRetentionSecs)
+  -- An age filter that drops *everything* is evidence about the clock, not about the data. A
+  -- container that polls once before NTP has stepped it would otherwise delete six months of
+  -- history in a single atomic write, and the correction afterwards would not bring it back.
+  -- The count cap below still bounds the file, so keeping it costs nothing.
+  let fresh := if aged.isEmpty then windows else aged
   let mut kept : Array Window := #[]
   for w in fresh.reverse do
     let seen := (kept.filter fun k => k.kind == w.kind && k.scope == w.scope).size
@@ -596,9 +609,20 @@ def saveHistory (backend label : String) (windows : Array Window) : IO Unit := d
   Utils.writeFileAtomically path (Json.compress (Json.mkObj [("windows", ToJson.toJson windows)]))
 
 /-- Fold one poll's limits into the stored history. Called on every successful poll, and by
-    nothing else. -/
+    nothing else.
+
+    Load, fold, save, unserialised — like the state file beside it. Two polls for the same
+    source that interleave lose one of the two readings: the window survives either way, and
+    what it costs is a `samples` tick and, at worst, a peak that only the losing poll saw. A
+    lock on a path three processes reach would cost more than that. -/
 def recordPoll (backend label : String) (limits : Array Limit) (now : Int) : IO Unit := do
   let windows ← loadHistory backend label
+  -- A file that exists and read as nothing is one this is about to replace with a single
+  -- window. That is the right thing to do — history that cannot be read is not history — but
+  -- it is not a thing to do silently, and the poll path is the only place it can be said
+  -- without a reader repeating it on every dashboard tick.
+  if windows.isEmpty && (← (← historyPath backend label).pathExists) then
+    IO.eprintln s!"[usage] {backend}/{label}: history was unreadable or empty; starting again"
   saveHistory backend label (pruneWindows (recordWindows windows limits now) now)
 
 /-! ## Availability

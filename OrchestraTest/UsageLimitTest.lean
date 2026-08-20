@@ -817,6 +817,31 @@ def recordWindows_learnsAResetTimeLate : Test := do
   TestM.assertEqual known[0]!.resetEpoch (parseIso8601 reset1)
 
 @[test]
+def recordWindows_toleratesAReanchoredResetTime : Test := do
+  -- A rollover moves the reset by a whole window; a second or two of movement is the same
+  -- window re-anchored. Read strictly, the second reading would start a new record — and a
+  -- source that drifted on every poll would leave a history of one-sample windows, which is
+  -- not a history of anything.
+  let history := recordWindows #[] #[sessionAt 40 (some "2026-07-24T04:00:00Z")] t0
+  let same    := recordWindows history #[sessionAt 44 (some "2026-07-24T04:00:30Z")] t1
+  TestM.assertEqual same.size 1 (msg := "thirty seconds of drift is the same window")
+  TestM.assertEqual same[0]!.peakPercent 44
+  -- And the tolerance is nowhere near wide enough to swallow a real one.
+  let rolled := recordWindows same #[sessionAt 5 (some "2026-07-24T09:00:00Z")] (t1 + 3600)
+  TestM.assertEqual rolled.size 2 (msg := "five hours later is the next window")
+
+@[test]
+def pruneWindows_doesNotBelieveAClockThatWouldDropEverything : Test := do
+  -- A container that polls once before NTP has stepped it reports a `now` months ahead. Taken
+  -- at face value that empties the file in one write, and the correction afterwards does not
+  -- bring it back.
+  let windows := #[
+    ({ kind := .session, startEpoch := t0, lastEpoch := t0, peakPercent := 61 } : Window),
+    ({ kind := .weeklyAll, startEpoch := t0, lastEpoch := t1, peakPercent := 80 } : Window)]
+  let kept := pruneWindows windows (t0 + 10 * historyRetentionSecs)
+  TestM.assertEqual kept.size 2 (msg := "an age filter that drops everything is not believed")
+
+@[test]
 def pruneWindows_dropsWhatIsTooOld : Test := do
   let old : Window := { kind := .session, startEpoch := t0, lastEpoch := t0, peakPercent := 50 }
   let recent : Window := { old with startEpoch := t0 + 1, lastEpoch := t0 + 1 }

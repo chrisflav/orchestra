@@ -973,7 +973,11 @@ a.row:hover .row-title {
 
 .charts {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  /* Two across at page width, one on a phone. Wide enough that a chart's caption — the counts
+     that replace a label on every bar — sits on the same line as its title; a source that also
+     reports model-scoped weekly limits has four of these, and three columns crushed the titles
+     into a stack of single words. */
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
   gap: 22px 32px;
   margin-top: 18px;
 }
@@ -981,12 +985,16 @@ a.row:hover .row-title {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 12px;
+  /* The caption drops below the title rather than squeezing it, in the narrow case the line
+     above cannot rule out. */
+  flex-wrap: wrap;
+  gap: 2px 12px;
   margin-bottom: 10px;
 }
 .chart-title {
   font-size: 13px;
   color: var(--mute);
+  white-space: nowrap;
 }
 .chart-note {
   font-family: var(--data);
