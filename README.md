@@ -618,10 +618,12 @@ configuration.
   idempotent — a name the organisation already uses is refused rather than handed back, so a push
   never lands in a repository the task did not just create. Authenticated by the organisation's own
   GitHub App installation, which needs the `Administration: read and write` permission. The result
-  carries a token to push with, scoped to the new repository alone: the task's own token — and any
-  fresh one from `refresh_token` — is minted for the *fork owner's* installation, which is a
-  different account whenever the App can push to the target directly, and does not reach the new
-  repository at all. Grant it deliberately, like `merge_pr`
+  carries a token to push with, scoped to the new repository alone and expiring in an hour like
+  every installation token — the agent is told to pass it to the one command that pushes rather
+  than export it, since `GH_TOKEN` is what authenticates its work on its own fork. A token from
+  `refresh_token` is minted for the *fork owner's* installation, so it reaches the new repository
+  when the fork lives in `default_organization` and not when the App could push to the target
+  directly and the fork is that target. Grant it deliberately, like `merge_pr`
 - `comment` — post a comment on the issue or pull request the task was launched from.
   Supports four modes:
   - **regular comment**: provide only `body`

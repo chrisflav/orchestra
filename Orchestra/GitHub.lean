@@ -459,14 +459,15 @@ def repoNameError? (name : String) : Option String :=
     none
 
 /-- Create repository `name` in organisation `org`, returning it together with a token that can
-    push to it.
+    push to it — or, when the repository was made but the token could not be minted, the reason.
 
     The push token is the reason this mints two. Creating a repository is an org-level act, so the
     request needs the organisation installation's full scope; what comes back is scoped to the one
     new repository, because it is handed to the agent and a token good for the whole fork
-    organisation would reach every other task's fork sitting in it. It is also the only token that
-    reaches the new repository at all: a task's own `refresh_token` mints for the *fork owner's*
-    installation, which is a different account whenever the App could push to the target directly.
+    organisation would reach every other task's fork sitting in it. It is also the only token the
+    caller is sure to have: a task's own installation token is minted for the *fork owner's*
+    account, which is this organisation when the task works on a fork of its target but not when
+    the App could push to that target directly.
 
     Unlike forking, this is **not** idempotent: a name the organisation already uses is a 422,
     reported as GitHub explained it rather than resolved to the existing repository. Which
@@ -477,7 +478,8 @@ def repoNameError? (name : String) : Option String :=
     the authority on what it just made. A response that does not identify the repository is an
     error. -/
 def createRepoInOrg (appId : Nat) (privateKeyPath : String) (org name : String)
-    (description : String) (isPrivate autoInit : Bool) : IO (Repository × String) := do
+    (description : String) (isPrivate autoInit : Bool) :
+    IO (Repository × Except String String) := do
   let (jwt, instId) ← orgInstallation appId privateKeyPath org
     s!"cannot create '{name}' in '{org}'"
   let token ← createInstallationToken jwt instId
@@ -519,8 +521,16 @@ def createRepoInOrg (appId : Nat) (privateKeyPath : String) (org name : String)
   -- Scoped to the repository GitHub says it made, not to the one that was asked for: those are
   -- the same name in every case anyone has seen, and where they are not, the token has to match
   -- the repository the caller is being handed.
-  let pushToken ← createInstallationToken jwt instId [repo.name]
-  return (repo, pushToken)
+  --
+  -- Caught rather than thrown, because by this line the repository exists. A caller told only
+  -- "creating failed" retries under the same name, meets the 422, and reads it as somebody else's
+  -- repository — leaving an orphan in the organisation on every attempt and never learning that
+  -- the first one was its own. The repository comes back either way; the token is the part that
+  -- may be missing.
+  try
+    return (repo, .ok (← createInstallationToken jwt instId [repo.name]))
+  catch e =>
+    return (repo, .error (toString e))
 
 /-- The decision half of `resolveFork`, over an injected `probe` and `mkFork`. Split out so the
     branch table below can be exercised against stubs, without a network:
