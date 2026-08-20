@@ -617,9 +617,11 @@ configuration.
   orchestra's to write to, and the tool refuses when none is set. Unlike forking it is not
   idempotent — a name the organisation already uses is refused rather than handed back, so a push
   never lands in a repository the task did not just create. Authenticated by the organisation's own
-  GitHub App installation, which needs the `Administration: read and write` permission; push to the
-  new repository with a token from `refresh_token`, since the task's own token is scoped to the
-  repositories it was launched against. Grant it deliberately, like `merge_pr`
+  GitHub App installation, which needs the `Administration: read and write` permission. The result
+  carries a token to push with, scoped to the new repository alone: the task's own token — and any
+  fresh one from `refresh_token` — is minted for the *fork owner's* installation, which is a
+  different account whenever the App can push to the target directly, and does not reach the new
+  repository at all. Grant it deliberately, like `merge_pr`
 - `comment` — post a comment on the issue or pull request the task was launched from.
   Supports four modes:
   - **regular comment**: provide only `body`

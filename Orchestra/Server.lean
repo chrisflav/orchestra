@@ -243,8 +243,9 @@ private def optionalToolDefs : List (String × Json) := [
       "Not idempotent, unlike forking: a name the organisation already uses is refused rather " ++
       "than handed back, so nothing is pushed to a repository other than the one just made. " ++
       "Pick another name or work on the existing repository.\n\n" ++
-      "Push to it with a token from refresh_token; the one the task started with is scoped to " ++
-      "the repositories it was launched against and does not reach this one."),
+      "The result carries a GitHub token scoped to the new repository — push with that one. " ++
+      "Neither the token the task started with nor a fresh one from refresh_token reaches it: " ++
+      "both are minted for the repositories the task was launched against."),
     ("inputSchema", Json.mkObj [
       ("type", "object"),
       ("properties", Json.mkObj [
@@ -732,17 +733,18 @@ created in; there is no other destination this tool will use)"
     | some org =>
       log s!"tool create_repository: {org}/{name} private={isPrivate} auto_init={autoInit}"
       try
-        -- The task's own installation token is scoped to the repositories it was launched
-        -- against, so creating in the organisation needs the organisation's installation.
-        let token ← GitHub.orgInstallationToken state.appId state.privateKeyPath org
-          s!"cannot create '{name}' in '{org}'"
-        let repo ← GitHub.createRepoInOrg token org name description isPrivate autoInit
+        -- Two tokens, both the organisation installation's: the task's own reaches only the
+        -- repositories it was launched against, and the one handed back below is narrowed to the
+        -- new repository. Neither is ever logged — the log line names the repository, not the
+        -- credential.
+        let (repo, pushToken) ← GitHub.createRepoInOrg state.appId state.privateKeyPath org
+          name description isPrivate autoInit
         let visibility := if isPrivate then "private" else "public"
         let contents := if autoInit then "initialised with a README commit" else "empty"
         log s!"tool create_repository: ok: {repo}"
         return toolContent s!"created {repo} ({visibility}, {contents})\n\
           https://github.com/{repo}\n\
-          Push to it with a token from refresh_token."
+          Push to it with this token, which reaches this repository and no other: {pushToken}"
       catch e =>
         log s!"tool create_repository: error: {e}"
         return toolContent (toString e) (isError := true)
