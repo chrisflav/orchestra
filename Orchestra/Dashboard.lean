@@ -1171,7 +1171,16 @@ private def deleteSkill (name : String) : IO WriteResult := do
       * `409` with a status — it exists and is not running. Cancelling a finished task is not a
         failure to cancel; it is a request that no longer applies, and saying which status it is
         in is what tells a stale page from a mistyped id.
-      * `409` about the daemon — nothing is running anything, or the socket did not answer.
+      * `409` about the daemon — the socket refused the connection or did not answer.
+
+    Whether a daemon is up is established by connecting, and deliberately not by
+    `Queue.daemonRunning`. That predicate answers "should this process start a daemon", not "is
+    one reachable from here": it reads a pid file and then *excludes its own pid*, which is what
+    lets a restarted container ignore its own stale file — and which makes it answer `false`
+    under `orchestrad serve`, where the daemon is this very process, and again under the compose
+    deployment, where both containers are PID 1 in their own namespaces and neither can see the
+    other's `/proc`. The socket is the thing that is actually shared, so opening it is the
+    question worth asking.
 
     Nothing here stamps a status. The worker running the task writes `cancelled` onto the entry
     as it lands, and a second writer would race it; what comes back is the pair of ids the
@@ -1182,27 +1191,31 @@ private def cancelEntry (id : String) : IO WriteResult := do
     | return .notFound
   unless entry.status == .running do
     return .conflict s!"entry {entry.id} is {qStText entry.status}, not running"
-  unless ← Queue.daemonRunning do
-    return .conflict "the queue daemon is not running, so nothing is running to cancel"
   let request := Json.mkObj [("type", Json.str "cancel"), ("id", Json.str entry.id)]
   let reply : Except String String ← try
       let conn ← Orchestra.Utils.UnixSocket.Connection.connect (← Queue.socketFile)
-      conn.sendLine request.compress
-      let line ← conn.recvLine
+      -- The round trip is its own `try` so that the descriptor is closed on the way out of a
+      -- failure as well as a success. A daemon that dies mid-request throws here, and a handler
+      -- that leaks a descriptor per attempt is a server that stops answering eventually.
+      let answer : Except String String ← try
+          conn.sendLine request.compress
+          Except.ok <$> conn.recvLine
+        catch e => pure (Except.error (toString e))
       conn.close
-      pure (Except.ok line)
+      pure answer
     catch e => pure (Except.error (toString e))
   match reply with
-  -- The daemon was there a moment ago and is not answering now: it stopped between the two,
-  -- or the socket file outlived it. Either way the request did not happen.
+  -- Nothing is listening on the socket, or something was and stopped mid-request. Either way
+  -- the request did not happen, and it is the daemon that is missing rather than this server.
   | .error e => return .conflict s!"could not reach the queue daemon: {e}"
   | .ok line =>
     match Json.parse line with
     | .error _ => return .conflict "the queue daemon answered with something that is not JSON"
     | .ok j =>
       -- The daemon is the only process that knows whether it holds a token for this entry. An
-      -- entry the queue calls `running` that it is not running is exactly what is left behind by
-      -- a daemon that died mid-task, so its "no" is reported rather than smoothed over.
+      -- entry the queue calls `running` that it is not running is what a daemon that died
+      -- mid-task leaves behind — and, for the width of one write, what a task that is at that
+      -- moment finishing looks like. Its "no" is reported rather than smoothed over.
       if let .ok msg := j.getObjValAs? String "error" then
         return .conflict s!"the queue daemon refused the request: {msg}"
       return .ok (Json.mkObj [
