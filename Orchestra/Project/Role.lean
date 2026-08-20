@@ -240,9 +240,10 @@ def loadGlobalRoleRaw (name : String) : IO (Option String) := do
     tools (health, refresh_token, get_pr_comments) are not listed because naming them grants
     nothing — they are already there.
 
-    `merge_pr` is deliberately absent: a role is a template dispatched at whatever issue comes
-    along, and landing a pull request is not something to grant a whole class of tasks. A task
-    file may still ask for it by name.
+    `merge_pr` and `create_repository` are deliberately absent: a role is a template dispatched
+    at whatever issue comes along, and neither landing a pull request nor creating a repository
+    is something to grant a whole class of tasks. A task file or workflow step may still ask for
+    either by name.
 
     Kept here, beside the field that holds them, so that validating a role does not depend on the
     MCP server's module: the CLI validates before sending and the API validates before storing,

@@ -165,6 +165,9 @@ unset, the task is skipped rather than dispatched at a repository it cannot push
 whenever the dispatcher works on repositories the App is not directly installed on. The App must be
 installed on `default_organization` with permission to create repositories.
 
+It is also the destination of the `create_repository` MCP tool, which is the only way an agent
+creates a repository from scratch rather than by forking — and the only owner that tool will use.
+
 **The target must be readable by the App.** A task's token is minted for the *fork's* installation,
 and that token is what fetches the upstream. Public targets are fine. A private target the App is
 not installed on cannot be fetched — and cannot be forked in the first place — so such a task is
@@ -584,8 +587,9 @@ granted — orchestra warns about missing `$HOME`-relative paths rather than let
 ## MCP tools
 
 The agent has access to the following tools via the built-in MCP server. `health`, `refresh_token`,
-and `get_pr_comments` are always available; `create_pr`, `merge_pr`, `label_issue` and `comment`
-must be enabled explicitly by adding them to the `tools` list in the task configuration.
+and `get_pr_comments` are always available; `create_pr`, `merge_pr`, `label_issue`, `comment` and
+`create_repository` must be enabled explicitly by adding them to the `tools` list in the task
+configuration.
 
 - `health` — check that the MCP server is running
 - `refresh_token` — refresh the GitHub App installation token
@@ -606,6 +610,16 @@ must be enabled explicitly by adding them to the `tools` list in the task config
   case-insensitively. An addition the issue already carries and a removal it does not are reported
   and skipped, so calling twice changes nothing. Unlike `comment`, it can label any issue, not
   only the one the task was launched from
+- `create_repository` — create a new repository in `default_organization`, the organisation tasks
+  are forked into. Takes `name` plus optional `description`, `private` (default `true`) and
+  `auto_init` (default `false`, i.e. an empty repository ready for a first push). The owner is not
+  an argument: the configured organisation is the one place the operator has already agreed is
+  orchestra's to write to, and the tool refuses when none is set. Unlike forking it is not
+  idempotent — a name the organisation already uses is refused rather than handed back, so a push
+  never lands in a repository the task did not just create. Authenticated by the organisation's own
+  GitHub App installation, which needs the `Administration: read and write` permission; push to the
+  new repository with a token from `refresh_token`, since the task's own token is scoped to the
+  repositories it was launched against. Grant it deliberately, like `merge_pr`
 - `comment` — post a comment on the issue or pull request the task was launched from.
   Supports four modes:
   - **regular comment**: provide only `body`

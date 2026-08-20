@@ -17,9 +17,9 @@ structure State where
   fork : Repository
   /-- Optional tools enabled for this run.
       Always-available tools (health, refresh_token, get_pr_comments) are never in this list.
-      The names this server itself understands are `"create_pr"`, `"merge_pr"`, `"label_issue"`
-      and `"comment"` (see `optionalToolDefs`); the rest are the permission groups of
-      `Orchestra.Project.Tools`. -/
+      The names this server itself understands are `"create_pr"`, `"merge_pr"`, `"label_issue"`,
+      `"comment"` and `"create_repository"` (see `optionalToolDefs`); the rest are the permission
+      groups of `Orchestra.Project.Tools`. -/
   allowedTools : List String
   appId : Nat
   privateKeyPath : String
@@ -58,6 +58,15 @@ structure State where
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
   prLabels : List String := []
+  /-- The organisation `create_repository` creates repositories in: `default_organization` from
+      the config, the same org tasks are forked into.
+
+      Deliberately the only destination the tool offers. An agent that could name the owner could
+      create repositories anywhere the App is installed, including under the accounts it is
+      working on; the configured fork org is the one place the operator has already agreed is
+      orchestra's to write to. `none` — no `default_organization` — means the tool has nowhere to
+      create anything and refuses. -/
+  defaultOrganization : Option String := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -221,6 +230,46 @@ private def optionalToolDefs : List (String × Json) := [
       ("required", .arr #["issue_number"])
     ])
   ]),
+  ("create_repository", Json.mkObj [
+    ("name", "create_repository"),
+    ("description",
+      "Create a new GitHub repository in orchestra's configured organisation (the one tasks " ++
+      "are forked into). Only `name` is required.\n\n" ++
+      "The owner is not yours to choose: the repository is always created in that organisation, " ++
+      "and the tool refuses when none is configured. It is created **private** unless you pass " ++
+      "private=false, and with no commits unless you pass auto_init=true — an empty repository " ++
+      "accepts a push of any history, whereas an auto-initialised one already has a README " ++
+      "commit that a local history would have to be reconciled with.\n\n" ++
+      "Not idempotent, unlike forking: a name the organisation already uses is refused rather " ++
+      "than handed back, so nothing is pushed to a repository other than the one just made. " ++
+      "Pick another name or work on the existing repository.\n\n" ++
+      "Push to it with a token from refresh_token; the one the task started with is scoped to " ++
+      "the repositories it was launched against and does not reach this one."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("name", Json.mkObj [
+          ("type", "string"),
+          ("description",
+            "Repository name, without an owner. Letters, digits, '-', '_' and '.' only.")
+        ]),
+        ("description", Json.mkObj [
+          ("type", "string"),
+          ("description", "Repository description (default: empty).")
+        ]),
+        ("private", Json.mkObj [
+          ("type", "boolean"),
+          ("description", "Create it private (default: true).")
+        ]),
+        ("auto_init", Json.mkObj [
+          ("type", "boolean"),
+          ("description",
+            "Create an initial commit with a README (default: false, i.e. an empty repository).")
+        ])
+      ]),
+      ("required", .arr #["name"])
+    ])
+  ]),
   ("comment", Json.mkObj [
     ("name", "comment"),
     ("description",
@@ -322,7 +371,14 @@ Call this tool exactly once when the task is complete."),
       ]]
   inputTool ++ outputTool
 
-private def toolsList (state : State) : Json :=
+/-- The `tools/list` answer for `state`: the always-available tools, plus every optional one the
+    task was granted.
+
+    Not private, for the same reason `evalToolCall` is not: a tool is offered under one name and
+    gated under another, in two lists written out separately, and a disagreement between them
+    leaves a tool that is listed and always refused — or granted and never offered. That is worth
+    a test, and the test needs no network. -/
+def toolsList (state : State) : Json :=
   let optional := optionalToolDefs.filterMap fun entry =>
     if state.allowedTools.contains entry.1 then some entry.2 else none
   -- Deduped by name: a tool may be listed under more than one permission group (an issue's
@@ -372,6 +428,8 @@ inductive ToolCall where
   | mergePr (prNumber : Nat) (method : GitHub.MergeMethod) (deleteBranch : Bool)
   /-- Add and remove labels on an issue or pull request of the upstream repository. -/
   | labelIssue (issueNumber : Nat) (add : List String) (remove : List String)
+  /-- Create a repository in the configured `default_organization`. -/
+  | createRepository (name : String) (description : String) (isPrivate : Bool) (autoInit : Bool)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
   | comment (action : CommentAction)
   | getTaskInput
@@ -465,6 +523,21 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
               if add.isEmpty && remove.isEmpty then
                 .parseError "nothing to do: give at least one label in 'add' or 'remove'"
               else .labelIssue numInt.toNat add remove
+  | "create_repository" =>
+    match args.getObjValAs? String "name" |>.toOption with
+    | none => .parseError "missing required argument: name"
+    | some rawName =>
+      let name := rawName.trimAscii.toString
+      match GitHub.repoNameError? name with
+      | some e => .parseError e
+      | none =>
+        let description := args.getObjValAs? String "description" |>.toOption |>.getD ""
+        -- Both default to the cautious answer: a repository that is private and empty can be
+        -- opened up or filled in afterwards, while neither publishing nor an unwanted initial
+        -- commit can be taken back from a caller that simply omitted the argument.
+        let isPrivate := args.getObjValAs? Bool "private"   |>.toOption |>.getD true
+        let autoInit  := args.getObjValAs? Bool "auto_init" |>.toOption |>.getD false
+        .createRepository name description isPrivate autoInit
   | "get_pr_comments" =>
     match args.getObjVal? "pr_number" |>.toOption with
     | none => .parseError "missing required argument: pr_number"
@@ -645,6 +718,34 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     catch e =>
       log s!"tool label_issue: error: {e}"
       return toolContent (toString e) (isError := true)
+  | .createRepository name description isPrivate autoInit =>
+    if !state.allowedTools.contains "create_repository" then
+      log "tool create_repository: denied (not in allowed tools)"
+      return toolContent "creating repositories is not enabled for this task" (isError := true)
+    match state.defaultOrganization with
+    | none =>
+      log "tool create_repository: no default_organization configured"
+      return toolContent
+        "default_organization not set in config (it names the organisation repositories are \
+created in; there is no other destination this tool will use)"
+        (isError := true)
+    | some org =>
+      log s!"tool create_repository: {org}/{name} private={isPrivate} auto_init={autoInit}"
+      try
+        -- The task's own installation token is scoped to the repositories it was launched
+        -- against, so creating in the organisation needs the organisation's installation.
+        let token ← GitHub.orgInstallationToken state.appId state.privateKeyPath org
+          s!"cannot create '{name}' in '{org}'"
+        let repo ← GitHub.createRepoInOrg token org name description isPrivate autoInit
+        let visibility := if isPrivate then "private" else "public"
+        let contents := if autoInit then "initialised with a README commit" else "empty"
+        log s!"tool create_repository: ok: {repo}"
+        return toolContent s!"created {repo} ({visibility}, {contents})\n\
+          https://github.com/{repo}\n\
+          Push to it with a token from refresh_token."
+      catch e =>
+        log s!"tool create_repository: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .getPrComments prNumber unresolvedOnly excludeOutdated =>
     log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
       exclude_outdated={excludeOutdated}"

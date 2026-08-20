@@ -336,6 +336,21 @@ def probeWriteAccessRetrying (appConfig : AppConfig) (target : Repository)
       pause := pause * 2
   return result
 
+/-- Mint an installation token for the GitHub App on `org`.
+
+    The token an ordinary task carries is the *repository's* installation token, which is scoped
+    to repositories that already exist. Creating one in an organisation is an org-level act, so it
+    needs the org's own installation — the same one `forkRepo` authenticates as. An App that is
+    not installed there cannot create anything, and saying so is more use than the 404 GitHub
+    would answer with. -/
+def orgInstallationToken (appId : Nat) (privateKeyPath : String) (org : String)
+    (what : String) : IO String := do
+  let jwt ← createJWT appId privateKeyPath
+  let some instId ← getInstallationId? jwt org
+    | throw (.userError s!"{what}: the GitHub App is not installed on '{org}', so it cannot \
+        create repositories there")
+  createInstallationToken jwt instId
+
 /-- Fork `target` into organisation `org`, returning the fork GitHub says it created.
 
     Authenticates as `org`'s own installation — the one with permission to create repositories
@@ -350,11 +365,8 @@ def probeWriteAccessRetrying (appConfig : AppConfig) (target : Repository)
     guessed path. A response that does not identify the fork is an error, which `resolveFork` turns
     into a skip; that is the safe direction to fail in. -/
 def forkRepo (appConfig : AppConfig) (target : Repository) (org : String) : IO Repository := do
-  let jwt ← createJWT appConfig.appId appConfig.privateKeyPath
-  let some instId ← getInstallationId? jwt org
-    | throw (.userError s!"cannot fork {target} into '{org}': the GitHub App is not installed on \
-        '{org}', so it cannot create repositories there")
-  let token ← createInstallationToken jwt instId
+  let token ← orgInstallationToken appConfig.appId appConfig.privateKeyPath org
+    s!"cannot fork {target} into '{org}'"
   let reqBody := Json.mkObj
     [("organization", Json.str org), ("name", Json.str target.name)] |>.compress
   let (status, respBody) ← curlWithStatus #[
@@ -387,6 +399,79 @@ def forkRepo (appConfig : AppConfig) (target : Repository) (org : String) : IO R
     IO.sleep 1000
   -- The POST succeeded, so the fork will appear; return it rather than failing on a slow copy.
   return fork
+
+/-- Why GitHub will not accept `name` as a repository name, or `none` when it will.
+
+    GitHub itself normalises a name it half-accepts — spaces become hyphens, and the repository
+    that comes back is then not the one that was asked for — so a name that is not already in the
+    accepted alphabet is refused here rather than silently renamed there. The alphabet is ASCII
+    letters, digits, `-`, `_` and `.`; the length limit and the two reserved names (`.` and `..`,
+    which are path segments, not repositories) are GitHub's own.
+
+    Pure, and public, because it is the half of `create_repository` worth testing without a
+    network. -/
+def repoNameError? (name : String) : Option String :=
+  if name.isEmpty then
+    some "'name' must not be empty"
+  else if name.length > 100 then
+    some "'name' must be at most 100 characters"
+  else if name == "." || name == ".." then
+    some s!"{repr name} is not a repository name"
+  else if name.any (fun c => !(c.isAlphanum || c == '-' || c == '_' || c == '.')) then
+    some s!"{repr name} is not a valid repository name: GitHub accepts only letters, digits, \
+      '-', '_' and '.'"
+  else
+    none
+
+/-- Create repository `name` in organisation `org`, returning the repository GitHub says it
+    created.
+
+    `token` must be `org`'s installation token — see `orgInstallationToken`.
+
+    Unlike forking, this is **not** idempotent: a name the organisation already uses is a 422,
+    reported with that in the message rather than resolving to the existing repository. Which
+    repository an agent's next push goes to is not a question to answer by guessing.
+
+    The name is read back out of the response for the same reason `forkRepo` reads its fork back:
+    the created repository is what a caller will push to, and GitHub — which normalises names — is
+    the authority on what it just made. A response that does not identify the repository is an
+    error. -/
+def createRepoInOrg (token : String) (org name : String) (description : String)
+    (isPrivate autoInit : Bool) : IO Repository := do
+  let reqBody := Json.mkObj
+    [ ("name", Json.str name)
+    , ("description", Json.str description)
+    , ("private", Json.bool isPrivate)
+    , ("auto_init", Json.bool autoInit) ] |>.compress
+  let (status, respBody) ← curlWithStatus #[
+    "-X", "POST",
+    "-H", s!"Authorization: Bearer {token}",
+    "-H", "Accept: application/vnd.github+json",
+    "-d", reqBody,
+    s!"https://api.github.com/orgs/{org}/repos" ]
+  if status < 200 || status >= 300 then
+    -- 422 is overwhelmingly "name already exists on this account", and an agent that reads only
+    -- the status would retry it forever; 403 is the App holding no `administration: write`.
+    let hint :=
+      if status == 422 then
+        s!"\n  A 422 here usually means '{org}' already has a repository by that name. Pick \
+another name, or work on the repository that is already there."
+      else if status == 403 then
+        s!"\n  A 403 here means the GitHub App's installation on '{org}' lacks the \
+'Administration: read and write' repository permission, which creating a repository needs."
+      else ""
+    throw (.userError s!"creating '{org}/{name}' failed: GitHub answered HTTP {status}\n  \
+      {githubErrorDetail respBody}{hint}")
+  let .ok respJson := Json.parse respBody
+    | throw (.userError s!"creating '{org}/{name}': GitHub answered HTTP {status} with a body \
+        that is not JSON, so the repository cannot be identified")
+  let .ok fullName := respJson.getObjValAs? String "full_name"
+    | throw (.userError s!"creating '{org}/{name}': the response carries no 'full_name', so the \
+        repository cannot be identified\n  {githubErrorDetail respBody}")
+  let .ok repo := Repository.parse fullName
+    | throw (.userError s!"creating '{org}/{name}': GitHub named the repository {repr fullName}, \
+        which is not an 'owner/repo'")
+  return repo
 
 /-- The decision half of `resolveFork`, over an injected `probe` and `mkFork`. Split out so the
     branch table below can be exercised against stubs, without a network:

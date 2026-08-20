@@ -136,15 +136,16 @@ steps:
     TestM.assert ((e.splitOn "post_review").length == 2) s!"error names the tool: {e}"
     TestM.assert ((e.splitOn "comment").length == 2) s!"error lists the known tools: {e}"
 
-/-- `knownTools` is the role permission set plus `merge_pr`. Pinned because the two lists are
-    written out separately: a permission group added to one and not the other turns a workflow
-    that names it into a parse failure. -/
+/-- `knownTools` is the role permission set plus the two tools a role may not carry: `merge_pr`
+    and `create_repository`. Pinned because the lists are written out separately: a permission
+    group added to one and not the other turns a workflow that names it into a parse failure. -/
 @[test]
 def knownToolsMatchesRolePermissions : Test := do
-  let expected := Project.Role.knownPermissions ++ ["merge_pr"]
+  let expected := Project.Role.knownPermissions ++ ["merge_pr", "create_repository"]
   TestM.assert
     (TaskSpec.knownTools.all expected.contains && expected.all TaskSpec.knownTools.contains)
-    s!"knownTools {TaskSpec.knownTools} vs role permissions + merge_pr {expected}"
+    s!"knownTools {TaskSpec.knownTools} vs role permissions + merge_pr, create_repository \
+      {expected}"
 
 /-- `issue-number` is rejected rather than dropped when it is not a number. The YAML is
     template-rendered before it is parsed and an unknown `{{...}}` survives that pass, so a
