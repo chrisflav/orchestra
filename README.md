@@ -932,10 +932,11 @@ checked, task history with the full structured log of each run, projects with th
 dependency graph, and every configured authentication source with the usage limits last reported
 for it. Pages stream updates over Server-Sent Events, so they stay current without a reload.
 
-It reads, with one exception: **Queue** carries a *Cancel running* button, which stops every task
-the daemon is running without a shell — the same thing `orchestra queue cancel` does. It asks
-first, counting the tasks it is about to stop, and the queue itself is untouched: pending entries
-start as slots free up, and each cancelled entry lands as `cancelled` and can be retried.
+It reads, with one exception: a running task's page carries a *Cancel* button beside its status,
+which stops that one run without a shell. It asks before it does anything, and it is per task,
+not per batch — everything else the daemon is running carries on. The queue itself is untouched:
+pending entries start as slots free up, and the cancelled entry lands as `cancelled`, which
+[`orchestra queue retry`](#queue-mode) re-enqueues.
 
 The UI is a React/TypeScript app under [`web/`](web/), built by Vite; the backend is the Lean
 server behind `orchestrad dashboard`, which answers the JSON API, its SSE streams, and — with
@@ -1021,24 +1022,31 @@ owned by another system, and stays read-only. Nothing here enqueues work — tha
 control socket, which is not on the network at all.
 
 One route is an action rather than a document, and it is the only one: `POST
-/api/v1/queue/cancel` stops the tasks the daemon is currently running. It writes no file; it
-forwards one argument-less message to that same control socket, which is what
-[`orchestra queue cancel`](#queue-mode) sends. The socket stays off the network — this route is
-the only thing on the HTTP side that speaks to it, and it takes the credential like every other
-non-`GET`.
+/api/v1/queue/{id}/cancel` stops the one running task that id names. It writes no file; it
+forwards a single message naming the entry to that same control socket, which is where
+[`orchestra queue cancel`](#queue-mode) sends its own. The socket stays off the network — this
+route is the only thing on the HTTP side that speaks to it, and it takes the credential like
+every other non-`GET`.
+
+The id may be a queue entry's id or the id of the run it became; both are ids this API hands out
+for the same piece of work, and the server resolves either.
 
 ```sh
-# stop everything that is running; the queue carries on with what is pending
+# stop one run; everything else the daemon is running carries on
 curl -X POST -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
      --data '{}' \
-     http://127.0.0.1:8080/api/v1/queue/cancel
-# → {"cancelled":2,"ids":["20260819-...","20260819-..."]}
+     http://127.0.0.1:8080/api/v1/queue/20260819-a3f1/cancel
+# → {"id":"20260819-a3f1","taskId":"t20260819T1004"}
 ```
 
-A `409` there is a statement about the daemon and not about the server answering: it is not
-running, or it stopped between the check and the message. Cancelled entries land as `cancelled`,
-which `orchestra queue retry` re-enqueues, and the pending ones behind them start as slots free
-up — cancelling stops the runs, not the queue.
+`404` means no entry and no run carries that id. `409` means it exists and is not running — the
+message names the status it is in — or that the daemon is not running or did not answer, which
+is a statement about the daemon rather than about the server answering. The cancelled entry
+lands as `cancelled`, which `orchestra queue retry` re-enqueues, and the pending entries behind
+it start as slots free up: cancelling stops a run, not the queue.
+
+There is no unaddressed spelling of this route. Stopping *everything* is `orchestra queue cancel`
+over the control socket, where the person typing it is on the host already.
 
 ```sh
 # create or replace a listener; the body is the config document itself

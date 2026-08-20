@@ -30,7 +30,7 @@ open Orchestra.Project (Project Issue IssueStatus Claim
   * `POST /api/login`, `POST /api/logout`, `GET /api/session` — the authentication surface.
   * `GET /api/v1/<kind>` — the read API: resources and collections, described by that spec.
   * `POST`/`PUT`/`DELETE /api/v1/<kind>` — the write API: orchestra's configuration, plus the
-    one action that is not configuration at all (`POST /api/v1/queue/cancel`).
+    one action that is not configuration at all (`POST /api/v1/queue/{id}/cancel`).
   * `GET /sse/v1/<kind>` — the read payloads pushed as Server-Sent Events when they change.
   * everything else — the compiled front-end from `--site`, with a single-page-app fallback.
 
@@ -65,14 +65,15 @@ is handed). Everything else the API serves — the queue, task history, concerts
 authentication sources — is either a record of something that already happened or is owned by
 another system, and is read-only here.
 
-One route writes no file and configures nothing: `POST /api/v1/queue/cancel` asks the daemon to
-stop the tasks it is currently running. It is on the API because the cancellation tokens are held
-by the process that launched those sandboxes and by nothing else — an operator watching the queue
-from this dashboard would otherwise have to reach a shell to stop it. What travels is one
-argument-less message over the daemon's unix socket; the socket stays off the network, and this
-route is the only thing on the HTTP side that speaks to it. Nothing here stamps a status: the
-worker that is running the task is the one that writes `cancelled` onto its entry, and a second
-writer would race it.
+One route writes no file and configures nothing: `POST /api/v1/queue/{id}/cancel` asks the
+daemon to stop the one task that id names. It is on the API because the cancellation tokens are
+held by the process that launched that sandbox and by nothing else — an operator watching a run
+from this dashboard would otherwise have to reach a shell to stop it. What travels is one message
+over the daemon's unix socket, naming the entry; the socket stays off the network, and this route
+is the only thing on the HTTP side that speaks to it. It stops one task rather than all of them
+because that is the decision the person looking at the page is making: the other three runs on
+this host are not part of it. Nothing here stamps a status: the worker running the task is the one
+that writes `cancelled` onto its entry, and a second writer would race it.
 
 Two properties every write holds to:
 
@@ -1151,7 +1152,12 @@ private def deleteSkill (name : String) : IO WriteResult := do
 
 /-! ### Running work -/
 
-/-- Ask the queue daemon to cancel every task it is currently running.
+/-- Ask the queue daemon to cancel the one task `id` names.
+
+    `id` is a queue entry's id or the id of the run it became, because both are ids the rest of
+    this API hands out for the same piece of work — the queue lists entries, the task history
+    lists runs, and either can be the id in the URL a person is looking at. Resolving the two
+    here is what lets the daemon's table be keyed by one of them alone.
 
     The daemon is reached over its control socket rather than through the queue directory,
     because a running task is not a file: it is a sandbox with a cancellation token, and only the
@@ -1159,38 +1165,49 @@ private def deleteSkill (name : String) : IO WriteResult := do
     be separate processes (they are in the compose deployment), so the socket is the way there
     even when they are not.
 
-    Answers `409` rather than `500` when the daemon is not up. That is not an error on this
-    server's part, and it is the ordinary case for a dashboard that outlives a stopped daemon:
-    the request conflicts with the state of the thing it addresses, which is what `409` says.
+    Three answers that are not success, and each is a different fact:
 
-    The count is read *before* the message is sent. Afterwards those entries are no longer
-    running, and a reply of `0` for a request that stopped four tasks would be a lie about the
-    only thing the caller asked. It is a report of what was cancelled, not a promise about what
-    each entry's status now is — the workers write that themselves, as they land. -/
-private def cancelRunning : IO WriteResult := do
+      * `404` — no entry and no run carries this id.
+      * `409` with a status — it exists and is not running. Cancelling a finished task is not a
+        failure to cancel; it is a request that no longer applies, and saying which status it is
+        in is what tells a stale page from a mistyped id.
+      * `409` about the daemon — nothing is running anything, or the socket did not answer.
+
+    Nothing here stamps a status. The worker running the task writes `cancelled` onto the entry
+    as it lands, and a second writer would race it; what comes back is the pair of ids the
+    request resolved to, so a caller can tell which run it just stopped. -/
+private def cancelEntry (id : String) : IO WriteResult := do
+  let entries ← Queue.loadAllEntries
+  let some entry := entries.find? (fun e => e.id == id || e.taskId == some id)
+    | return .notFound
+  unless entry.status == .running do
+    return .conflict s!"entry {entry.id} is {qStText entry.status}, not running"
   unless ← Queue.daemonRunning do
     return .conflict "the queue daemon is not running, so nothing is running to cancel"
-  let running := (← Queue.loadAllEntries).filter (·.status == .running)
+  let request := Json.mkObj [("type", Json.str "cancel"), ("id", Json.str entry.id)]
   let reply : Except String String ← try
       let conn ← Orchestra.Utils.UnixSocket.Connection.connect (← Queue.socketFile)
-      conn.sendLine (Json.mkObj [("type", Json.str "cancel")]).compress
+      conn.sendLine request.compress
       let line ← conn.recvLine
       conn.close
       pure (Except.ok line)
     catch e => pure (Except.error (toString e))
   match reply with
   -- The daemon was there a moment ago and is not answering now: it stopped between the two,
-  -- or the socket file outlived it. Either way the caller's request did not happen.
+  -- or the socket file outlived it. Either way the request did not happen.
   | .error e => return .conflict s!"could not reach the queue daemon: {e}"
   | .ok line =>
     match Json.parse line with
     | .error _ => return .conflict "the queue daemon answered with something that is not JSON"
     | .ok j =>
+      -- The daemon is the only process that knows whether it holds a token for this entry. An
+      -- entry the queue calls `running` that it is not running is exactly what is left behind by
+      -- a daemon that died mid-task, so its "no" is reported rather than smoothed over.
       if let .ok msg := j.getObjValAs? String "error" then
         return .conflict s!"the queue daemon refused the request: {msg}"
       return .ok (Json.mkObj [
-        ("cancelled", ToJson.toJson running.size),
-        ("ids",       Json.arr (running.map (fun e => Json.str e.id)))
+        ("id",     Json.str entry.id),
+        ("taskId", optStr entry.taskId)
       ])
 
 /-- Dispatch a non-`GET` `/api/v1/…` request.
@@ -1226,9 +1243,10 @@ PUT /api/v1/listeners/{name}")
   | ["skills"],                     .post   => return some (← create "skill" writeSkill)
   | ["skills", name],               .put    => return some (← writeSkill name body false)
   | ["skills", name],               .delete => return some (← deleteSkill name)
-  -- Not a resource: an action on the running queue, which is why it is a `POST` to a verb
-  -- rather than a `PUT` to a thing. The body carries nothing — there is no argument to give.
-  | ["queue", "cancel"],            .post   => return some (← cancelRunning)
+  -- Not a resource: an action on one running entry, which is why it is a `POST` to a verb
+  -- under it rather than a `PUT` to a thing. The body carries nothing — the entry is named by
+  -- the path, and there is no second argument to give.
+  | ["queue", id, "cancel"],        .post   => return some (← cancelEntry id)
   | _, _ => return none
 
 /-! ## Server configuration and session state -/
@@ -1578,7 +1596,7 @@ def apiVersion : String := "v1"
 def apiRoutes : Array (String × Array String) :=
   #[("overview",                 #["get"]),
     ("queue",                    #["get"]),
-    ("queue/cancel",             #["post"]),
+    ("queue/{id}/cancel",        #["post"]),
     ("tasks",                    #["get"]),
     ("tasks/{id}",               #["get"]),
     ("concerts",                 #["get"]),

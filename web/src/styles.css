@@ -574,9 +574,6 @@ a.figure:hover {
   align-items: baseline;
   justify-content: space-between;
   gap: 14px;
-  /* A section that carries a control as well as a count can outgrow one line on a narrow
-     screen; wrapping there beats a squeezed button. */
-  flex-wrap: wrap;
   margin-bottom: 10px;
 }
 .section-title {
@@ -584,14 +581,6 @@ a.figure:hover {
 }
 .section-meta {
   color: var(--faint);
-}
-/* The count and the control that acts on the same list, held together at the end of the head
-   so the two never drift apart when one of them is absent. */
-.section-end {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex: none;
 }
 
 /* ============================================================
@@ -747,6 +736,14 @@ a.row:hover .row-title {
 .fact-value.data {
   font-family: var(--data);
   font-size: 12.5px;
+}
+/* A fact whose value carries a control beside it. Wrapping rather than shrinking, so a narrow
+   column drops the button under the status instead of squeezing both. */
+.fact-inline {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 /* ============================================================
@@ -1078,10 +1075,10 @@ a.row:hover .row-title {
 
 /* ============================================================
    Cancelling — the one control on a page of readouts.
-   It sits at the end of the section it acts on and stays quiet
-   until it is armed: a page that is mostly numbers should not
-   be led by a red button, and the weight belongs on the
-   confirmation rather than on the invitation.
+   It sits beside the status it acts on and stays quiet until it
+   is armed: a page that is mostly a log should not be led by a
+   red button, and the weight belongs on the confirmation rather
+   than on the invitation.
    ============================================================ */
 
 .cancel {

@@ -1,9 +1,7 @@
-import { CancelRunning } from "../components/CancelRunning";
 import { Empty, List, Row } from "../components/List";
 import { PageHead, Section } from "../components/Page";
 import { Status } from "../components/Status";
 import { Time } from "../components/Time";
-import { useOverview } from "../overview";
 import { useLiveData } from "../useLiveData";
 
 /**
@@ -17,17 +15,10 @@ import { useLiveData } from "../useLiveData";
  * Two subscriptions rather than one, because the API has two collections here rather than one
  * endpoint shaped for this page. That is the trade the resource-shaped API makes: a page that
  * shows two things asks for two things, and each is independently pageable.
- *
- * The running count behind the cancel button comes from the shared `overview` subscription
- * rather than from the entries below it. `overview` counts the whole queue; `entries` is a
- * page of it, so on a long queue the two disagree, and the number in a confirmation that stops
- * work has to be the real one.
  */
 export function Queue() {
   const entries = useLiveData("queue");
   const concerts = useLiveData("concerts");
-  const overview = useOverview();
-  const running = overview.data?.counts.running ?? 0;
 
   const error = entries.error ?? concerts.error;
   if (error !== null) {
@@ -80,11 +71,7 @@ export function Queue() {
         </List>
       </Section>
 
-      <Section
-        title="Entries"
-        meta={shown(entries.data.items.length, entries.data.total)}
-        action={<CancelRunning running={running} />}
-      >
+      <Section title="Entries" meta={shown(entries.data.items.length, entries.data.total)}>
         <List>
           {entries.data.items.length === 0 ? (
             <Empty>The queue is empty.</Empty>

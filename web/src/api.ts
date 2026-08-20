@@ -269,12 +269,12 @@ export interface AuthView {
   backends: AuthBackend[];
 }
 
-/** What `POST /api/v1/queue/cancel` reports back. */
+/** What `POST /api/v1/queue/{id}/cancel` reports back: the work the id resolved to. */
 export interface CancelResult {
-  /** How many entries were running when the request reached the server. */
-  cancelled: number;
-  /** Their queue ids. */
-  ids: string[];
+  /** The queue entry that was cancelled. */
+  id: string;
+  /** The run it became, if it had started one. */
+  taskId: string | null;
 }
 
 /**
@@ -404,15 +404,20 @@ export async function logout(): Promise<void> {
 }
 
 /**
- * Ask the daemon to stop every task it is currently running.
+ * Ask the daemon to stop one running task, named by its queue entry id or by the id of the run
+ * it became — the server resolves either.
  *
- * The only call in this file that changes anything. It takes no arguments — the daemon cancels
- * the set it is running, not a task named here — and it leaves the queue alone: what is pending
- * stays pending and starts as slots free up. A `409` means the daemon is not reachable, which is
- * the one failure a caller is expected to show rather than treat as a bug.
+ * The only call in this file that changes anything, and it changes exactly one task: nothing
+ * else the daemon is running is affected, and the queue is left alone, so what is pending starts
+ * as slots free up. The URL is built here rather than by `apiUrl`, which percent-encodes
+ * everything after the first slash as a single component and would swallow the `/cancel`.
+ *
+ * A `404` means no entry and no run carries that id; a `409` means it is not running, or the
+ * daemon is not. Both are answers to show, not bugs to swallow.
  */
-export async function cancelRunningTasks(): Promise<CancelResult> {
-  const response = await postJson(apiUrl("queue/cancel"), {});
+export async function cancelTask(id: string): Promise<CancelResult> {
+  const path = `/api/${API_VERSION}/queue/${encodeURIComponent(id)}/cancel`;
+  const response = await postJson(path, {});
   if (response.status === 401) throw new UnauthorizedError();
   if (!response.ok) throw new ApiError(response.status, await readError(response));
   return (await response.json()) as CancelResult;

@@ -30,25 +30,19 @@ export function PageHead({
 export function Section({
   title,
   meta,
-  action,
   children,
 }: {
   title: string;
   // Explicitly `| undefined`: callers pass a conditional, and `exactOptionalPropertyTypes`
   // distinguishes "absent" from "present and undefined".
   meta?: string | undefined;
-  /** A control that acts on what this section lists, set at its end beside the meta. */
-  action?: ReactNode;
   children: ReactNode;
 }) {
   return (
     <section className="section">
       <div className="section-head">
         <h2 className="section-title">{title}</h2>
-        <span className="section-end">
-          {meta !== undefined && <span className="section-meta">{meta}</span>}
-          {action}
-        </span>
+        {meta !== undefined && <span className="section-meta">{meta}</span>}
       </div>
       {children}
     </section>

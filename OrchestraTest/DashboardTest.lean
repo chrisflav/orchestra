@@ -259,18 +259,22 @@ def publicPaths_containsNothingUnderTheVersionPrefix : Test := do
 /-! ## Cancelling
 
 The one route under the version prefix that changes something outside the configuration store:
-it reaches the daemon and stops the tasks it is running. Two facts about its shape are worth
-pinning, because both are load-bearing and neither is visible from the route arm alone. -/
+it reaches the daemon and stops one running task. Three facts about its shape are worth pinning,
+because each is load-bearing and none is visible from the route arm alone. -/
 
 @[test]
-def queueCancel_isAPostAndNothingElse : Test := do
-  let methods := (apiRoutes.find? (·.1 == "queue/cancel")).map (·.2) |>.getD #[]
+def queueCancel_isAPostOnOneEntry : Test := do
+  let methods := (apiRoutes.find? (·.1 == "queue/{id}/cancel")).map (·.2) |>.getD #[]
   -- No `GET`: a link, an image, a prefetch or a browser's own back-forward cache must never be
   -- able to stop an agent, and "it is a POST" is what makes the content-type lock apply at all.
   TestM.assertEqual methods #["post"] (msg := "cancelling is a POST, and only a POST")
+  -- The id is in the path. A cancel that took its target from the body would be one typo away
+  -- from a cancel that took no target at all, and this route has no all-of-them spelling.
+  TestM.assert (!apiRoutes.any (·.1 == "queue/cancel"))
+    (msg := "there is no unaddressed cancel; every one of them names its entry")
   -- `apiKinds` is exactly the set `/sse/v1/` streams. An action has nothing to subscribe to,
   -- and it is derived rather than listed, so this holds only as long as it serves no `GET`.
-  TestM.assert (!apiKinds.contains "queue/cancel")
+  TestM.assert (!apiKinds.contains "queue/{id}/cancel")
     (msg := "cancelling is not a read, so it is not a stream either")
 
 /-! ## The content-type gate
