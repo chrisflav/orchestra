@@ -739,7 +739,7 @@ Inspect and control the daemon:
 ```
 orchestra queue                # show queued entries
 orchestra queue status         # daemon status and running tasks
-orchestra queue cancel         # cancel the running task, keep the daemon going
+orchestra queue cancel         # cancel the running tasks, keep the daemon going
 orchestra queue shutdown       # stop after the current task (--force cancels it)
 ```
 
@@ -932,6 +932,11 @@ checked, task history with the full structured log of each run, projects with th
 dependency graph, and every configured authentication source with the usage limits last reported
 for it. Pages stream updates over Server-Sent Events, so they stay current without a reload.
 
+It reads, with one exception: **Queue** carries a *Cancel running* button, which stops every task
+the daemon is running without a shell — the same thing `orchestra queue cancel` does. It asks
+first, counting the tasks it is about to stop, and the queue itself is untouched: pending entries
+start as slots free up, and each cancelled entry lands as `cancelled` and can be retried.
+
 The UI is a React/TypeScript app under [`web/`](web/), built by Vite; the backend is the Lean
 server behind `orchestrad dashboard`, which answers the JSON API, its SSE streams, and — with
 `--site` — the built front-end, all on one port:
@@ -1012,8 +1017,28 @@ curl -H "Authorization: Bearer $PASSWORD" \
 
 Three resources are configuration, and all three are writable: **listeners**, **roles** and
 **skills**. Everything else the API serves is a record of something that already happened, or is
-owned by another system, and stays read-only. Nothing here enqueues or cancels work — that is
-the daemon's control socket, which is not on the network at all.
+owned by another system, and stays read-only. Nothing here enqueues work — that is the daemon's
+control socket, which is not on the network at all.
+
+One route is an action rather than a document, and it is the only one: `POST
+/api/v1/queue/cancel` stops the tasks the daemon is currently running. It writes no file; it
+forwards one argument-less message to that same control socket, which is what
+[`orchestra queue cancel`](#queue-mode) sends. The socket stays off the network — this route is
+the only thing on the HTTP side that speaks to it, and it takes the credential like every other
+non-`GET`.
+
+```sh
+# stop everything that is running; the queue carries on with what is pending
+curl -X POST -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data '{}' \
+     http://127.0.0.1:8080/api/v1/queue/cancel
+# → {"cancelled":2,"ids":["20260819-...","20260819-..."]}
+```
+
+A `409` there is a statement about the daemon and not about the server answering: it is not
+running, or it stopped between the check and the message. Cancelled entries land as `cancelled`,
+which `orchestra queue retry` re-enqueues, and the pending ones behind them start as slots free
+up — cancelling stops the runs, not the queue.
 
 ```sh
 # create or replace a listener; the body is the config document itself

@@ -4,7 +4,7 @@
     "title": "orchestra dashboard API",
     "version": "1.0.0",
     "summary": "HTTP API over a running orchestra backend: reads everything it knows, and changes what it is configured with.",
-    "description": "Everything the daemon knows about its queue, task history, listeners, projects and authentication sources, as JSON. Every read is also available as a Server-Sent Events stream at the same path under `/sse/v1/`, pushed every two seconds and only when the payload has changed.\n\nThree resources are configuration and are writable: **listeners**, **roles** and **skills**. Everything else — the queue, task history, concerts, projects, authentication sources — is a record of something that already happened or is owned by another system, and is read-only here. Nothing in this API enqueues or cancels work; that is the daemon's control socket.\n\n## Writing\n\n- Every route that is not a `GET` requires a credential. `POST /api/login` is the only exception, since it is how one is obtained.\n- Every write must be sent as `application/json`. A request without that content type is a `415`. This is the second of the two locks on a cookie-authenticated write: the session cookie is `SameSite=Strict`, so a cross-site request carries no credential, and an HTML form cannot send JSON, so it cannot form the request at all.\n- `POST` to a collection creates and refuses to overwrite (`409`), taking the name from the body. `PUT` to a member creates or replaces, taking the name from the path; a body naming a different one is a `400`. Listeners are the exception and have no `POST`: a listener config carries no name of its own — its file names it — so `PUT /api/v1/listeners/{name}` is both how one is created and how it is replaced.\n- `DELETE` answers `204`, or `404` when there was nothing there.\n- A rejected body changes nothing on disk: validation runs to completion before anything is written, and every write is a write-and-rename, so a reader never sees a partial file.\n- Listener configs and roles are stored **verbatim**, not re-serialised. That is what keeps `{{secret}}` placeholders — and any field a client does not know about — intact across an edit. Fetch the `config` field of a detail response, change it, and `PUT` it back.\n\n## Conventions\n\n- Instants are RFC 3339 in UTC (`2026-07-23T10:04:11Z`) and live in a field named `...At`.\n- Durations are integer seconds, in a field named `...Seconds`.\n- An absent value is `null`, never an empty string.\n- Enumerations are the lower-case names the daemon itself uses.\n- Collections answer in a common envelope (`items`, `total`, `limit`, `offset`) and accept `limit`, `offset` and — where the collection is ordered by time — `since`.\n- A parameter that is malformed, or that the collection cannot honour, is a `400`. Parameters this version does not define are ignored.",
+    "description": "Everything the daemon knows about its queue, task history, listeners, projects and authentication sources, as JSON. Every read is also available as a Server-Sent Events stream at the same path under `/sse/v1/`, pushed every two seconds and only when the payload has changed.\n\nThree resources are configuration and are writable: **listeners**, **roles** and **skills**. Everything else — the queue, task history, concerts, projects, authentication sources — is a record of something that already happened or is owned by another system, and is read-only here. Nothing in this API enqueues work; that is the daemon's control socket. The one exception is `POST /api/v1/queue/cancel`, which stops the tasks the daemon is running \u2014 it writes nothing, and forwards a single argument-less message to that socket, which stays off the network itself.\n\n## Writing\n\n- Every route that is not a `GET` requires a credential. `POST /api/login` is the only exception, since it is how one is obtained.\n- Every write must be sent as `application/json`. A request without that content type is a `415`. This is the second of the two locks on a cookie-authenticated write: the session cookie is `SameSite=Strict`, so a cross-site request carries no credential, and an HTML form cannot send JSON, so it cannot form the request at all.\n- `POST` to a collection creates and refuses to overwrite (`409`), taking the name from the body. `PUT` to a member creates or replaces, taking the name from the path; a body naming a different one is a `400`. Listeners are the exception and have no `POST`: a listener config carries no name of its own — its file names it — so `PUT /api/v1/listeners/{name}` is both how one is created and how it is replaced.\n- `DELETE` answers `204`, or `404` when there was nothing there.\n- A rejected body changes nothing on disk: validation runs to completion before anything is written, and every write is a write-and-rename, so a reader never sees a partial file.\n- Listener configs and roles are stored **verbatim**, not re-serialised. That is what keeps `{{secret}}` placeholders — and any field a client does not know about — intact across an edit. Fetch the `config` field of a detail response, change it, and `PUT` it back.\n\n## Conventions\n\n- Instants are RFC 3339 in UTC (`2026-07-23T10:04:11Z`) and live in a field named `...At`.\n- Durations are integer seconds, in a field named `...Seconds`.\n- An absent value is `null`, never an empty string.\n- Enumerations are the lower-case names the daemon itself uses.\n- Collections answer in a common envelope (`items`, `total`, `limit`, `offset`) and accept `limit`, `offset` and — where the collection is ordered by time — `since`.\n- A parameter that is malformed, or that the collection cannot honour, is a `400`. Parameters this version does not define are ignored.",
     "license": { "name": "See repository" }
   },
   "servers": [
@@ -174,6 +174,49 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/queue/cancel": {
+      "post": {
+        "tags": ["queue"],
+        "summary": "Cancel the running tasks",
+        "description": "Asks the queue daemon to stop every task it is currently running. The queue itself is untouched: pending entries stay pending and the daemon carries straight on with them, and each cancelled entry lands as `cancelled`, which `orchestra queue retry` re-enqueues.\n\nThe request carries no arguments — the body is an empty JSON object — because the daemon cancels the set it is running rather than one named task; only it holds those cancellation tokens. `409` if the daemon is not running or cannot be reached, which is a statement about the daemon and not about this server.\n\nThe reported ids are the entries that were running when the request was made. What each one's status becomes is written by the worker that was running it, as it lands.",
+        "operationId": "cancelRunningTasks",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "additionalProperties": false }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The daemon accepted the request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["cancelled", "ids"],
+                  "properties": {
+                    "cancelled": { "type": "integer", "description": "How many entries were running when the request was made." },
+                    "ids": { "type": "array", "items": { "type": "string" }, "description": "Their queue ids." }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": {
+            "description": "The queue daemon is not running, or did not accept the request.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
         }
       }
     },

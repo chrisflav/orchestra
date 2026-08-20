@@ -269,6 +269,14 @@ export interface AuthView {
   backends: AuthBackend[];
 }
 
+/** What `POST /api/v1/queue/cancel` reports back. */
+export interface CancelResult {
+  /** How many entries were running when the request reached the server. */
+  cancelled: number;
+  /** Their queue ids. */
+  ids: string[];
+}
+
 /**
  * Maps each endpoint to the payload it returns. Detail endpoints take a path component, so
  * they are spelled as template literal types — that is what makes `useLiveData("tasks/" + id)`
@@ -393,6 +401,21 @@ export async function login(password: string): Promise<boolean> {
 /** Drop the session, server-side and in the browser. */
 export async function logout(): Promise<void> {
   await postJson("/api/logout");
+}
+
+/**
+ * Ask the daemon to stop every task it is currently running.
+ *
+ * The only call in this file that changes anything. It takes no arguments — the daemon cancels
+ * the set it is running, not a task named here — and it leaves the queue alone: what is pending
+ * stays pending and starts as slots free up. A `409` means the daemon is not reachable, which is
+ * the one failure a caller is expected to show rather than treat as a bug.
+ */
+export async function cancelRunningTasks(): Promise<CancelResult> {
+  const response = await postJson(apiUrl("queue/cancel"), {});
+  if (response.status === 401) throw new UnauthorizedError();
+  if (!response.ok) throw new ApiError(response.status, await readError(response));
+  return (await response.json()) as CancelResult;
 }
 
 /** Whether the browser currently holds a valid session. */
