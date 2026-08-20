@@ -232,6 +232,7 @@ steps:
 | `merge_pr` | `merge_pr` |
 | `comment` | `comment` — needs `issue-number` on the step too, since that is the issue or PR it posts to |
 | `label_issue` | `label_issue` |
+| `create_repository` | `create_repository` — creates in `default_organization`, so the config must set one |
 | `manage_issues` | the orchestra project/issue tools — but see below |
 | `work_issues` | `claim_issue`, `split_issue`, `attach_pr`, … |
 | `review_issues` | `list_issues_in_review`, `decide_issue`, … |

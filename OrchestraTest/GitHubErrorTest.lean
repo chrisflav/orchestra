@@ -81,6 +81,30 @@ def errorDetail_fallsBackToTheRawBody : Test := do
     (msg := "JSON without a message field is kept")
 
 @[test]
+def errorDetail_keepsTheValidationErrorsBehindTheSentence : Test := do
+  -- A 422 says nothing in `message`: "Repository creation failed." is the same sentence whether
+  -- the name is taken, malformed, or forbidden by the organisation's policy, and the difference
+  -- is the whole question for a caller deciding whether to rename and try again.
+  let taken := "{\"message\":\"Repository creation failed.\",\"errors\":[{\"resource\":\
+\"Repository\",\"code\":\"custom\",\"field\":\"name\",\"message\":\"name already exists on this \
+account\"}]}"
+  TestM.assertEqual (GitHub.githubErrorDetail taken)
+    "Repository creation failed. (name already exists on this account)"
+    (msg := "the reason is appended to the sentence")
+  -- `message` is optional on an entry; `code` is not, and names the failure well enough.
+  let coded := "{\"message\":\"Validation Failed\",\"errors\":[{\"resource\":\"Repository\",\
+\"field\":\"name\",\"code\":\"already_exists\"}]}"
+  TestM.assertEqual (GitHub.githubErrorDetail coded) "Validation Failed (already_exists)"
+    (msg := "an entry with no message falls back to its code")
+  -- Several at once, and the ordinary no-`errors` case is unchanged.
+  let two := "{\"message\":\"Validation Failed\",\"errors\":[{\"code\":\"missing_field\"},\
+{\"code\":\"invalid\"}]}"
+  TestM.assertEqual (GitHub.githubErrorDetail two) "Validation Failed (missing_field; invalid)"
+    (msg := "every entry is kept")
+  TestM.assertEqual (GitHub.githubErrorDetail "{\"message\":\"Not Found\",\"errors\":[]}")
+    "Not Found" (msg := "an empty errors array adds nothing")
+
+@[test]
 def errorDetail_saysSoWhenThereIsNoBody : Test := do
   -- Distinguishable from "a body we could not read": a 401 with no body at all is itself a
   -- clue, and an empty string in the log looks like the old bug.

@@ -154,6 +154,7 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
     privateKeyPath := appConfig.privateKeyPath
     installationId
     pat := appConfig.pat
+    defaultOrganization := appConfig.defaultOrganization
   }
   let (port, _shutdown) ← Server.start serverState
   IO.println s!"MCP server listening on port {port}"
@@ -1368,8 +1369,8 @@ private def dashboardCmd : Cmd := `[Cli|
 
 -- All optional tool permission tokens recognised by --tools.
 private def allOptionalTools : List String :=
-  ["create_pr", "merge_pr", "label_issue", "comment", "manage_issues", "work_issues",
-   "review_issues"]
+  ["create_pr", "merge_pr", "label_issue", "comment", "create_repository",
+   "manage_issues", "work_issues", "review_issues"]
 
 private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let upstreamStr := p.flag! "upstream" |>.as! String
@@ -1410,6 +1411,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     installationId
     pat            := appConfig.pat
     agentBackend   := backendName
+    defaultOrganization := appConfig.defaultOrganization
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"

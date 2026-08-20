@@ -319,8 +319,8 @@ structure IOTask (i o : ResultType) where
       therefore not the same as `ordered`, and the two must stay distinguishable. -/
   authMode : Option AuthMode := none
   /-- Optional tools to enable beyond the always-available ones (health, refresh_token,
-      get_pr_comments): `"create_pr"`, `"merge_pr"`, `"label_issue"`, `"comment"`, and the
-      project/issue permission groups.
+      get_pr_comments): `"create_pr"`, `"merge_pr"`, `"label_issue"`, `"comment"`,
+      `"create_repository"`, and the project/issue permission groups.
       When absent, the allowed tools are derived from `mode` for backwards compatibility. -/
   tools : Option (List String) := none
   /-- If true, the project folder is mounted read-only in the sandbox.
