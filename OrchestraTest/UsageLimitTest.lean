@@ -722,3 +722,162 @@ def rateLimitEvent_withoutAResetTimeIsStillAnEvent : Test := do
   match StreamFormat.parseEvent r#"{"type":"rate_limit_event"}"# with
   | some (.rateLimit none) => TestM.assert true
   | _ => TestM.fail "expected a rateLimit event with no reset time"
+
+/-! ## History
+
+The graphs on the dashboard are drawn from windows rolled up out of polls, so the rules that
+decide where one window ends and the next begins are what decides whether a graph is true.
+`recordWindows` is pure, which is what makes every one of those rules reachable here: a window
+rolling over, a poll landing after a gap in polling, a source that reports no reset time at all.
+-/
+
+private def sessionAt (percent : Nat) (resetsAt : Option String := none) : Limit :=
+  { kind := .session, group := "session", percent, resetsAt }
+
+private def weeklyAt (percent : Nat) (resetsAt : Option String := none) : Limit :=
+  { kind := .weeklyAll, group := "weekly", percent, resetsAt }
+
+/-- Two instants an hour apart, and the reset time of the window they are both inside. -/
+private def t0 : Int := 1784851200                 -- 2026-07-24T00:00:00Z
+private def t1 : Int := t0 + 3600
+private def reset1 : String := "2026-07-24T04:00:00Z"
+private def reset2 : String := "2026-07-24T09:00:00Z"
+
+@[test]
+def recordWindows_foldsASecondPollIntoTheWindowItIsIn : Test := do
+  let first := recordWindows #[] #[sessionAt 12 (some reset1)] t0
+  let both  := recordWindows first #[sessionAt 31 (some reset1)] t1
+  TestM.assertEqual both.size 1 (msg := "the same reset time is the same window, not a new one")
+  let w := both[0]!
+  TestM.assertEqual w.startEpoch t0 (msg := "the window still starts at the first poll")
+  TestM.assertEqual w.lastEpoch t1
+  TestM.assertEqual w.peakPercent 31 (msg := "the peak is what the window has consumed")
+  TestM.assertEqual w.lastPercent 31
+  TestM.assertEqual w.samples 2
+
+@[test]
+def recordWindows_aNewResetTimeIsANewWindow : Test := do
+  -- The whole point of the graph: the window that just closed keeps the peak it reached, and
+  -- the reading that comes back low belongs to the next one rather than erasing it.
+  let history := recordWindows #[] #[sessionAt 88 (some reset1)] t0
+  let rolled  := recordWindows history #[sessionAt 3 (some reset2)] t1
+  TestM.assertEqual rolled.size 2 (msg := "a different reset time starts a window")
+  TestM.assertEqual rolled[0]!.peakPercent 88 (msg := "the closed window keeps its peak")
+  TestM.assertEqual rolled[1]!.peakPercent 3
+  TestM.assertEqual rolled[1]!.startEpoch t1
+
+@[test]
+def recordWindows_keepsTheSeriesApart : Test := do
+  -- Session and weekly limits arrive in the same poll and are separate counters; a weekly
+  -- reading must never land in the session window's record.
+  let one := recordWindows #[] #[sessionAt 12 (some reset1), weeklyAt 40] t0
+  TestM.assertEqual one.size 2 (msg := "one window per series")
+  let two := recordWindows one #[sessionAt 20 (some reset1), weeklyAt 41] t1
+  TestM.assertEqual two.size 2 (msg := "both continue rather than duplicating")
+  TestM.assertEqual two[0]!.kind LimitKind.session
+  TestM.assertEqual two[0]!.lastPercent 20
+  TestM.assertEqual two[1]!.kind LimitKind.weeklyAll
+  TestM.assertEqual two[1]!.lastPercent 41
+
+@[test]
+def recordWindows_scopeIsPartOfTheSeries : Test := do
+  -- A weekly limit scoped to one model family is a different counter from the account-wide
+  -- one, and the two would otherwise be folded together by kind.
+  let opusWeek : Limit := { kind := .weeklyScoped, percent := 100, scopeModel := some "Opus" }
+  let out := recordWindows #[] #[weeklyAt 40, opusWeek] t0
+  TestM.assertEqual out.size 2 (msg := "scoped and unscoped are separate windows")
+  TestM.assertEqual out[1]!.scope (some "Opus")
+
+@[test]
+def recordWindows_withoutAResetTimeReadsTheCounter : Test := do
+  -- Nothing reported a reset time, so the shape of the counter is all there is to go on:
+  -- utilisation that dropped has reset, and that is where the next window starts.
+  let history := recordWindows #[] #[sessionAt 61] t0
+  let same    := recordWindows history #[sessionAt 74] t1
+  TestM.assertEqual same.size 1 (msg := "a reading that climbed is the same window")
+  let rolled  := recordWindows same #[sessionAt 2] (t1 + 3600)
+  TestM.assertEqual rolled.size 2 (msg := "a reading that dropped is the next window")
+  TestM.assertEqual rolled[0]!.peakPercent 74
+
+@[test]
+def recordWindows_withoutAResetTimeDoesNotBridgeAGap : Test := do
+  -- The daemon was down for two days. A session window is five hours wide, so the poll that
+  -- comes back cannot be another reading of the one it left, however plausible its number.
+  let history := recordWindows #[] #[sessionAt 20] t0
+  let later   := recordWindows history #[sessionAt 22] (t0 + 2 * 86400)
+  TestM.assertEqual later.size 2 (msg := "a gap longer than the window starts a new one")
+
+@[test]
+def recordWindows_learnsAResetTimeLate : Test := do
+  -- The first poll of a window came back without one; the second brought it. The window keeps
+  -- it, so everything after is matched on the reset time rather than on the counter's shape.
+  let history := recordWindows #[] #[sessionAt 20] t0
+  let known   := recordWindows history #[sessionAt 24 (some reset1)] t1
+  TestM.assertEqual known.size 1
+  TestM.assertEqual known[0]!.resetEpoch (parseIso8601 reset1)
+
+@[test]
+def recordWindows_toleratesAReanchoredResetTime : Test := do
+  -- A rollover moves the reset by a whole window; a second or two of movement is the same
+  -- window re-anchored. Read strictly, the second reading would start a new record — and a
+  -- source that drifted on every poll would leave a history of one-sample windows, which is
+  -- not a history of anything.
+  let history := recordWindows #[] #[sessionAt 40 (some "2026-07-24T04:00:00Z")] t0
+  let same    := recordWindows history #[sessionAt 44 (some "2026-07-24T04:00:30Z")] t1
+  TestM.assertEqual same.size 1 (msg := "thirty seconds of drift is the same window")
+  TestM.assertEqual same[0]!.peakPercent 44
+  -- And the tolerance is nowhere near wide enough to swallow a real one.
+  let rolled := recordWindows same #[sessionAt 5 (some "2026-07-24T09:00:00Z")] (t1 + 3600)
+  TestM.assertEqual rolled.size 2 (msg := "five hours later is the next window")
+
+@[test]
+def pruneWindows_doesNotBelieveAClockThatWouldDropEverything : Test := do
+  -- A container that polls once before NTP has stepped it reports a `now` months ahead. Taken
+  -- at face value that empties the file in one write, and the correction afterwards does not
+  -- bring it back.
+  let windows := #[
+    ({ kind := .session, startEpoch := t0, lastEpoch := t0, peakPercent := 61 } : Window),
+    ({ kind := .weeklyAll, startEpoch := t0, lastEpoch := t1, peakPercent := 80 } : Window)]
+  let kept := pruneWindows windows (t0 + 10 * historyRetentionSecs)
+  TestM.assertEqual kept.size 2 (msg := "an age filter that drops everything is not believed")
+
+@[test]
+def pruneWindows_dropsWhatIsTooOld : Test := do
+  let old : Window := { kind := .session, startEpoch := t0, lastEpoch := t0, peakPercent := 50 }
+  let recent : Window := { old with startEpoch := t0 + 1, lastEpoch := t0 + 1 }
+  let kept := pruneWindows #[old, recent] (t0 + historyRetentionSecs + 1)
+  TestM.assertEqual kept.size 1 (msg := "the window that fell out of retention is dropped")
+  TestM.assertEqual kept[0]!.lastEpoch (t0 + 1)
+
+@[test]
+def pruneWindows_capsEachSeriesSeparately : Test := do
+  -- A session window every five hours must not be able to evict the weekly history: the two
+  -- feed different graphs, and the busier one would otherwise starve the other.
+  let sessions := (Array.range (maxWindowsPerSeries + 20)).map fun (i : Nat) =>
+    ({ kind := .session, startEpoch := t0 + (↑i : Int), lastEpoch := t0 + (↑i : Int) } : Window)
+  let week : Window := { kind := .weeklyAll, startEpoch := t0, lastEpoch := t0, peakPercent := 77 }
+  let kept := pruneWindows (#[week] ++ sessions) t0
+  TestM.assertEqual (kept.filter (·.kind == .session)).size maxWindowsPerSeries
+    (msg := "the busy series is capped")
+  TestM.assertEqual (kept.filter (·.kind == .weeklyAll)).size 1
+    (msg := "the quiet series survives it")
+  -- Newest kept, oldest dropped, and still in order.
+  TestM.assertEqual kept[kept.size - 1]!.lastEpoch (t0 + (maxWindowsPerSeries : Int) + 19)
+    (msg := "the most recent window is the last one")
+
+@[test]
+def window_roundTripsThroughJson : Test := do
+  let w : Window := {
+    kind := .weeklyScoped, scope := some "Opus", resetEpoch := some 1784867400
+    startEpoch := t0, lastEpoch := t1, peakPercent := 100, lastPercent := 100, samples := 9 }
+  match Lean.FromJson.fromJson? (α := Window) (Lean.ToJson.toJson w) with
+  | .error e => TestM.fail s!"a stored window did not read back: {e}"
+  | .ok back =>
+    TestM.assertEqual back.kind w.kind
+    TestM.assertEqual back.scope w.scope
+    TestM.assertEqual back.resetEpoch w.resetEpoch
+    TestM.assertEqual back.startEpoch w.startEpoch
+    TestM.assertEqual back.lastEpoch w.lastEpoch
+    TestM.assertEqual back.peakPercent w.peakPercent
+    TestM.assertEqual back.lastPercent w.lastPercent
+    TestM.assertEqual back.samples w.samples
