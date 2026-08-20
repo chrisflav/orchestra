@@ -737,6 +737,14 @@ a.row:hover .row-title {
   font-family: var(--data);
   font-size: 12.5px;
 }
+/* A fact whose value carries a control beside it. Wrapping rather than shrinking, so a narrow
+   column drops the button under the status instead of squeezing both. */
+.fact-inline {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
 
 /* ============================================================
    Panels — only where content genuinely needs a container
@@ -1152,6 +1160,61 @@ a.row:hover .row-title {
   position: fixed;
   top: 16px;
   right: 16px;
+}
+
+/* ============================================================
+   Cancelling — the one control on a page of readouts.
+   It sits beside the status it acts on and stays quiet until it
+   is armed: a page that is mostly a log should not be led by a
+   red button, and the weight belongs on the confirmation rather
+   than on the invitation.
+   ============================================================ */
+
+.cancel {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.cancel-button {
+  font-family: var(--data);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 5px 9px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: none;
+  color: var(--mute);
+  cursor: pointer;
+}
+.cancel-button:hover:not(:disabled) {
+  background: var(--sunken);
+  color: var(--text);
+}
+.cancel-button.danger:hover:not(:disabled),
+.cancel-button.danger:focus-visible {
+  border-color: var(--perc);
+  background: color-mix(in srgb, var(--perc) 9%, transparent);
+  color: var(--perc);
+}
+.cancel-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.cancel-ask,
+.cancel-note {
+  font-size: 12.5px;
+  color: var(--mute);
+}
+/* The question, not the button, is what has to be read before the second click. */
+.cancel-ask {
+  color: var(--text);
+}
+.cancel-note.bad {
+  color: var(--perc);
 }
 
 /* ============================================================

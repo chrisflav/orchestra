@@ -56,13 +56,25 @@ structure Config where
   /-- Maximum tasks running at once on any one repository. -/
   parallelPerRepo : Option Nat := none
 
+/-- A task the daemon is running right now, together with the handle that stops it.
+
+    `tokenId` is the daemon's own key for the row, allocated at claim time under the claim mutex
+    (see `claimNextEntry`). `entryId` is the queue entry's id, which is what a client that wants
+    to stop *one* task has: entries are what the queue, the concert steps and the dashboard all
+    name a run by. Cancelling by that id rather than by the token id is what keeps this table an
+    implementation detail of the daemon rather than something a caller has to have been told. -/
+structure ActiveTask where
+  tokenId : Nat
+  entryId : String
+  token   : Std.CancellationToken
+
 def handleSocketRequest
     (conn             : Utils.UnixSocket.Connection)
     (appConfig        : Orchestra.AppConfig)
     (concertMgr       : ConcertManager.ConcertManager)
     (debug            : Bool)
     (shutdownToken    : Std.CancellationToken)
-    (activeTaskTokens : Std.Mutex (Array (Nat × Std.CancellationToken)))
+    (activeTaskTokens : Std.Mutex (Array ActiveTask))
     : IO Unit := do
   try
     let line ← conn.recvLine
@@ -112,16 +124,30 @@ def handleSocketRequest
           match result with
           | .ok id   => pure (.withId id)
           | .error e => pure (.error e)
-        | .cancel =>
-          let pairs ← activeTaskTokens.atomically (·.get)
-          for (_, token) in pairs do
-            token.cancel .cancel
-          pure DaemonRequest.DaemonResponse.ok
+        | .cancel id =>
+          let actives ← activeTaskTokens.atomically (·.get)
+          match id with
+          -- No id: every running task, which is what `orchestra queue cancel` has always meant
+          -- and what a second termination signal does.
+          | none =>
+            for a in actives do
+              a.token.cancel .cancel
+            pure DaemonRequest.DaemonResponse.ok
+          -- One named task. An id that names nothing running is reported rather than passed
+          -- over in silence: to the caller, "cancelled" and "was never running" are different
+          -- answers, and only this process can tell them apart.
+          | some entryId =>
+            match actives.find? (·.entryId == entryId) with
+            | some a =>
+              a.token.cancel .cancel
+              pure (DaemonRequest.DaemonResponse.withId entryId)
+            | none =>
+              pure (DaemonRequest.DaemonResponse.error s!"no running task with id {entryId}")
         | .shutdown force =>
           if force then
-            let pairs ← activeTaskTokens.atomically (·.get)
-            for (_, token) in pairs do
-              token.cancel .cancel
+            let actives ← activeTaskTokens.atomically (·.get)
+            for a in actives do
+              a.token.cancel .cancel
           shutdownToken.cancel .shutdown
           pure DaemonRequest.DaemonResponse.ok
         | .claimIssue pid iid taskId agent series =>
@@ -162,8 +188,9 @@ def run (cfg : Config) : IO UInt32 := do
     cfg.parallelPerRepo.getD appConfig.queue.parallelPerRepo
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
-  -- Map of (id → cancel token) for all currently running tasks (one per worker).
-  let activeTaskTokens ← Std.Mutex.new (Array.empty : Array (Nat × Std.CancellationToken))
+  -- Every task running right now and the token that stops it (one row per worker), which is
+  -- what a `cancel` off the control socket reaches — for one entry, or for all of them.
+  let activeTaskTokens ← Std.Mutex.new (Array.empty : Array ActiveTask)
   let nextTokenId ← IO.mkRef (0 : Nat)
   -- Mutex serialising the "find next pending + mark running" claim operation.
   let claimMutex ← Std.BaseMutex.new
@@ -213,9 +240,9 @@ def run (cfg : Config) : IO UInt32 := do
       -- once that they are willing to wait, and then changed their mind.
       if n > 1 then
         IO.println "Second termination signal; cancelling in-flight tasks."
-        let pairs ← activeTaskTokens.atomically (·.get)
-        for (_, token) in pairs do
-          token.cancel .cancel
+        let actives ← activeTaskTokens.atomically (·.get)
+        for a in actives do
+          a.token.cancel .cancel
         break
       IO.sleep 200
   -- Helper: atomically claim the next pending entry, marking it as running.
@@ -315,9 +342,10 @@ its workspace; it will start from a clean checkout."
   let runEntryBody (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
       (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
     let taskToken ← Std.CancellationToken.new
-    activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
+    let active : ActiveTask := { tokenId, entryId := entry.id, token := taskToken }
+    activeTaskTokens.atomically (·.modify (·.push active))
     let removeToken : IO Unit :=
-      activeTaskTokens.atomically (·.modify (·.filter (·.1 != tokenId)))
+      activeTaskTokens.atomically (·.modify (·.filter (·.tokenId != tokenId)))
     -- Terminal writes go through here rather than saving the claim-time snapshot: a socket
     -- `cancel`, a listener, or a cascade from another worker can rewrite this entry's file
     -- while the task runs, and writing the stale snapshot back would silently revert it.

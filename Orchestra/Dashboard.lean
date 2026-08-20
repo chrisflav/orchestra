@@ -11,6 +11,7 @@ import Orchestra.Project.Claim
 import Orchestra.Usage
 import Orchestra.Secret
 import Orchestra.Skill
+import Orchestra.Utils.UnixSocket
 
 open Lean (Json ToJson FromJson)
 open Std.Net
@@ -28,7 +29,8 @@ open Orchestra.Project (Project Issue IssueStatus Claim
   * `GET /api/openapi.json` — the API's own description, uncredentialed.
   * `POST /api/login`, `POST /api/logout`, `GET /api/session` — the authentication surface.
   * `GET /api/v1/<kind>` — the read API: resources and collections, described by that spec.
-  * `POST`/`PUT`/`DELETE /api/v1/<kind>` — the write API: orchestra's configuration.
+  * `POST`/`PUT`/`DELETE /api/v1/<kind>` — the write API: orchestra's configuration, plus the
+    one action that is not configuration at all (`POST /api/v1/queue/{id}/cancel`).
   * `GET /sse/v1/<kind>` — the read payloads pushed as Server-Sent Events when they change.
   * everything else — the compiled front-end from `--site`, with a single-page-app fallback.
 
@@ -62,6 +64,16 @@ that enqueue work), **roles** (reusable task templates), and **skills** (the Mar
 is handed). Everything else the API serves — the queue, task history, concerts, projects, the
 authentication sources — is either a record of something that already happened or is owned by
 another system, and is read-only here.
+
+One route writes no file and configures nothing: `POST /api/v1/queue/{id}/cancel` asks the
+daemon to stop the one task that id names. It is on the API because the cancellation tokens are
+held by the process that launched that sandbox and by nothing else — an operator watching a run
+from this dashboard would otherwise have to reach a shell to stop it. What travels is one message
+over the daemon's unix socket, naming the entry; the socket stays off the network, and this route
+is the only thing on the HTTP side that speaks to it. It stops one task rather than all of them
+because that is the decision the person looking at the page is making: the other three runs on
+this host are not part of it. Nothing here stamps a status: the worker running the task is the one
+that writes `cancelled` onto its entry, and a second writer would race it.
 
 Two properties every write holds to:
 
@@ -1243,6 +1255,79 @@ private def writeSkill (name : String) (body : String) (mustBeNew : Bool) : IO W
 private def deleteSkill (name : String) : IO WriteResult := do
   if ← Skill.deleteSkill name then return .noContent else return .notFound
 
+/-! ### Running work -/
+
+/-- Ask the queue daemon to cancel the one task `id` names.
+
+    `id` is a queue entry's id or the id of the run it became, because both are ids the rest of
+    this API hands out for the same piece of work — the queue lists entries, the task history
+    lists runs, and either can be the id in the URL a person is looking at. Resolving the two
+    here is what lets the daemon's table be keyed by one of them alone.
+
+    The daemon is reached over its control socket rather than through the queue directory,
+    because a running task is not a file: it is a sandbox with a cancellation token, and only the
+    process that started it holds that token. `orchestrad dashboard` and `orchestrad queue` may
+    be separate processes (they are in the compose deployment), so the socket is the way there
+    even when they are not.
+
+    Three answers that are not success, and each is a different fact:
+
+      * `404` — no entry and no run carries this id.
+      * `409` with a status — it exists and is not running. Cancelling a finished task is not a
+        failure to cancel; it is a request that no longer applies, and saying which status it is
+        in is what tells a stale page from a mistyped id.
+      * `409` about the daemon — the socket refused the connection or did not answer.
+
+    Whether a daemon is up is established by connecting, and deliberately not by
+    `Queue.daemonRunning`. That predicate answers "should this process start a daemon", not "is
+    one reachable from here": it reads a pid file and then *excludes its own pid*, which is what
+    lets a restarted container ignore its own stale file — and which makes it answer `false`
+    under `orchestrad serve`, where the daemon is this very process, and again under the compose
+    deployment, where both containers are PID 1 in their own namespaces and neither can see the
+    other's `/proc`. The socket is the thing that is actually shared, so opening it is the
+    question worth asking.
+
+    Nothing here stamps a status. The worker running the task writes `cancelled` onto the entry
+    as it lands, and a second writer would race it; what comes back is the pair of ids the
+    request resolved to, so a caller can tell which run it just stopped. -/
+private def cancelEntry (id : String) : IO WriteResult := do
+  let entries ← Queue.loadAllEntries
+  let some entry := entries.find? (fun e => e.id == id || e.taskId == some id)
+    | return .notFound
+  unless entry.status == .running do
+    return .conflict s!"entry {entry.id} is {qStText entry.status}, not running"
+  let request := Json.mkObj [("type", Json.str "cancel"), ("id", Json.str entry.id)]
+  let reply : Except String String ← try
+      let conn ← Orchestra.Utils.UnixSocket.Connection.connect (← Queue.socketFile)
+      -- The round trip is its own `try` so that the descriptor is closed on the way out of a
+      -- failure as well as a success. A daemon that dies mid-request throws here, and a handler
+      -- that leaks a descriptor per attempt is a server that stops answering eventually.
+      let answer : Except String String ← try
+          conn.sendLine request.compress
+          Except.ok <$> conn.recvLine
+        catch e => pure (Except.error (toString e))
+      conn.close
+      pure answer
+    catch e => pure (Except.error (toString e))
+  match reply with
+  -- Nothing is listening on the socket, or something was and stopped mid-request. Either way
+  -- the request did not happen, and it is the daemon that is missing rather than this server.
+  | .error e => return .conflict s!"could not reach the queue daemon: {e}"
+  | .ok line =>
+    match Json.parse line with
+    | .error _ => return .conflict "the queue daemon answered with something that is not JSON"
+    | .ok j =>
+      -- The daemon is the only process that knows whether it holds a token for this entry. An
+      -- entry the queue calls `running` that it is not running is what a daemon that died
+      -- mid-task leaves behind — and, for the width of one write, what a task that is at that
+      -- moment finishing looks like. Its "no" is reported rather than smoothed over.
+      if let .ok msg := j.getObjValAs? String "error" then
+        return .conflict s!"the queue daemon refused the request: {msg}"
+      return .ok (Json.mkObj [
+        ("id",     Json.str entry.id),
+        ("taskId", optStr entry.taskId)
+      ])
+
 /-- Dispatch a non-`GET` `/api/v1/…` request.
 
     Mirrors `renderApi`'s shape: one function, every route in it, so that the set of writes the
@@ -1276,6 +1361,10 @@ PUT /api/v1/listeners/{name}")
   | ["skills"],                     .post   => return some (← create "skill" writeSkill)
   | ["skills", name],               .put    => return some (← writeSkill name body false)
   | ["skills", name],               .delete => return some (← deleteSkill name)
+  -- Not a resource: an action on one running entry, which is why it is a `POST` to a verb
+  -- under it rather than a `PUT` to a thing. The body carries nothing — the entry is named by
+  -- the path, and there is no second argument to give.
+  | ["queue", id, "cancel"],        .post   => return some (← cancelEntry id)
   | _, _ => return none
 
 /-! ## Server configuration and session state -/
@@ -1625,6 +1714,7 @@ def apiVersion : String := "v1"
 def apiRoutes : Array (String × Array String) :=
   #[("overview",                 #["get"]),
     ("queue",                    #["get"]),
+    ("queue/{id}/cancel",        #["post"]),
     ("tasks",                    #["get"]),
     ("tasks/{id}",               #["get"]),
     ("concerts",                 #["get"]),

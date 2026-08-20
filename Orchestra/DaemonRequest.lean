@@ -14,8 +14,13 @@ inductive DaemonRequest where
   | addConcert (workflowFile : String)
                (vars         : Option Json   := none)
                (configPath   : Option String := none)
-  /-- Cancel all currently running tasks. -/
-  | cancel
+  /-- Cancel a running task by its queue-entry id, or every running task when no id is given.
+
+      One inductive rather than two because the daemon does the same thing in both cases — it
+      cancels tokens it holds — and because an absent `id` is what the wire format already meant
+      before there was one: `orchestra queue cancel` sends `{"type": "cancel"}` and keeps
+      working unchanged. -/
+  | cancel     (id : Option String := none)
   /-- Shut down the daemon, optionally cancelling running tasks first. -/
   | shutdown   (force : Bool := false)
   /-- Acquire the orchestra-project claim on `issueId` for `taskId`.
@@ -37,7 +42,9 @@ instance : FromJson DaemonRequest where
       let vars    := j.getObjVal?   "vars"        |>.toOption
       let cfgPath := j.getObjValAs? String "config_path" |>.toOption
       return .addConcert wf vars cfgPath
-    | "cancel"   => return .cancel
+    | "cancel"   =>
+      let id := j.getObjValAs? String "id" |>.toOption
+      return .cancel id
     | "shutdown" =>
       let force := j.getObjValAs? Bool "force" |>.toOption |>.getD false
       return .shutdown force

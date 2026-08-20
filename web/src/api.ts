@@ -269,6 +269,14 @@ export interface AuthView {
   backends: AuthBackend[];
 }
 
+/** What `POST /api/v1/queue/{id}/cancel` reports back: the work the id resolved to. */
+export interface CancelResult {
+  /** The queue entry that was cancelled. */
+  id: string;
+  /** The run it became, if it had started one. */
+  taskId: string | null;
+}
+
 /**
  * One session or weekly limit window, rolled up from every poll that landed inside it.
  *
@@ -443,6 +451,26 @@ export async function login(password: string): Promise<boolean> {
 /** Drop the session, server-side and in the browser. */
 export async function logout(): Promise<void> {
   await postJson("/api/logout");
+}
+
+/**
+ * Ask the daemon to stop one running task, named by its queue entry id or by the id of the run
+ * it became — the server resolves either.
+ *
+ * The only call in this file that changes anything, and it changes exactly one task: nothing
+ * else the daemon is running is affected, and the queue is left alone, so what is pending starts
+ * as slots free up. The URL is built here rather than by `apiUrl`, which percent-encodes
+ * everything after the first slash as a single component and would swallow the `/cancel`.
+ *
+ * A `404` means no entry and no run carries that id; a `409` means it is not running, or the
+ * daemon is not. Both are answers to show, not bugs to swallow.
+ */
+export async function cancelTask(id: string): Promise<CancelResult> {
+  const path = `/api/${API_VERSION}/queue/${encodeURIComponent(id)}/cancel`;
+  const response = await postJson(path, {});
+  if (response.status === 401) throw new UnauthorizedError();
+  if (!response.ok) throw new ApiError(response.status, await readError(response));
+  return (await response.json()) as CancelResult;
 }
 
 /** Whether the browser currently holds a valid session. */
