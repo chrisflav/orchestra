@@ -23,11 +23,11 @@ def claude : AgentDef where
     --            container starts empty, so nothing could cache anything at all.
     homeRwx := [".elan", ".cache"]
   }
-  setupMcp port _ _ := do
+  setupMcp mcp _ _ := do
     let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
       ("agent", Json.mkObj [
         ("command", .str "nc"),
-        ("args", .arr #[.str "127.0.0.1", .str (toString port)])
+        ("args", .arr #[.str mcp.host, .str (toString mcp.port)])
       ])
     ])]
     let ts ← uniqueToken

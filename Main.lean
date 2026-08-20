@@ -1433,13 +1433,19 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   if let some label := resolved then
     IO.println s!"  Auth source: {label}"
     Usage.markUsed backendName label
+  let execBackend ← match ← Exec.resolve appConfig.execution with
+    | .ok b => pure b
+    | .error e =>
+      IO.eprintln s!"Cannot launch the agent: {e}"
+      shutdown
+      return 1
   IO.println "  Launching agent..."
   let result ← Sandbox.launchAgent agentDef repoPath "" port token
     (debug := debug) (pluginDirs := appConfig.pluginDirs)
     (model := model) (budget := budget)
     (extraEnv := apiKeyEnv) (extraPorts := extraPorts)
     (additionalPaths := appConfig.additionalSandboxPaths)
-    (interactiveAgent := true)
+    (interactiveAgent := true) (exec := execBackend)
   IO.println s!"  Agent exited with code {result.exitCode}"
   shutdown
   return if result.exitCode == 0 then 0 else 1

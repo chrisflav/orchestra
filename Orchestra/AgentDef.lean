@@ -1,5 +1,6 @@
 import Orchestra.StreamFormat
 import Orchestra.Config
+import Orchestra.Exec.Spec
 import Lean.Data.Json
 
 open Lean (Json)
@@ -14,10 +15,16 @@ structure AgentDef where
   /-- Filesystem paths the agent needs inside the sandbox. -/
   sandboxPaths : SandboxPaths
   /-- Set up agent-specific infrastructure before launch (e.g., write MCP config files).
-      Receives the MCP server port, optional model override, and optional appended system prompt.
-      Returns a context string (passed to buildArgs, extractSessionId, and cleanup)
-      and any extra sandbox env vars. -/
-  setupMcp : UInt16 → Option String → Option String → IO (String × Array (String × Option String))
+      Receives the address the agent should reach the MCP server at, an optional model override,
+      and an optional appended system prompt. Returns a context string (passed to buildArgs,
+      extractSessionId, and cleanup) and any extra sandbox env vars.
+
+      The address is an `Exec.McpEndpoint`, not a port, because where the server is depends on
+      where the agent is: loopback while it runs on this machine, something routable as soon as an
+      execution backend moves it. A backend that hard-codes `127.0.0.1` here fails silently when
+      that happens — the agent starts, finds no tools, and does the task without them. -/
+  setupMcp : Exec.McpEndpoint → Option String → Option String
+           → IO (String × Array (String × Option String))
   /-- Build command-line args for a specific invocation.
       Receives: context string from setupMcp, plugin directories, sub-agent name,
       model override, appended system prompt, session ID to resume, budget in USD,

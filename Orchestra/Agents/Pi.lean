@@ -119,12 +119,12 @@ def pi : AgentDef where
   -- Configure MCP connectivity via pi-mcp-adapter.  Writes ~/.pi/agent/mcp.json
   -- with a stdio MCP server pointing at the Orchestra MCP server on the given port.
   -- Saves any existing mcp.json so cleanup can restore it.
-  setupMcp port _model _systemPrompt := do
+  setupMcp mcp _model _systemPrompt := do
     let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
       ("orchestra", Json.mkObj [
         ("transport", .str "stdio"),
         ("command", .str "nc"),
-        ("args", .arr #[.str "127.0.0.1", .str (toString port)])
+        ("args", .arr #[.str mcp.host, .str (toString mcp.port)])
       ])
     ])]
     match ← IO.getEnv "HOME" with

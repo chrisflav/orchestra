@@ -531,6 +531,39 @@ instance : FromJson SandboxPaths where
     let homeRwx := j.getObjValAs? (List String) "home_rwx" |>.toOption |>.getD []
     return { rox, ro, rw, homeRox, homeRw, homeRwx }
 
+/-- Which execution backend runs this instance's agents, from the `execution` object in
+    `config.json`.
+
+    ```json
+    "execution": { "backend": "landrun" }
+    ```
+
+    The default is `landrun`, which is what orchestra has always done and what the README's
+    sandboxing section describes. `local` runs the agent unconfined and is only for machines
+    without Landlock — see `Orchestra.Exec.Local`. `docs/execution.md` covers how a backend that
+    runs the agent somewhere else entirely (a container, a Kubernetes pod) plugs in here. -/
+structure ExecutionConfig where
+  /-- Name of the backend, as `Orchestra.Exec.ofName?` knows it. -/
+  backend : String := "landrun"
+  /-- Whatever else that backend needs, passed through uninterpreted.
+
+      Backend-specific settings live here rather than as fields of this structure so that adding
+      one — a namespace, an image, a service account — is a change to the backend that reads it
+      and to nothing else. The two backends that ship today read nothing. -/
+  options : Json := Json.null
+
+instance : Repr ExecutionConfig where
+  reprPrec c _ := Std.Format.text s!"\{ backend := {c.backend}, options := {c.options.compress} }"
+
+instance : Inhabited ExecutionConfig where
+  default := {}
+
+instance : FromJson ExecutionConfig where
+  fromJson? j := do
+    let backend := j.getObjValAs? String "backend" |>.toOption |>.getD "landrun"
+    let options := j.getObjVal? "options" |>.toOption |>.getD Json.null
+    return { backend, options }
+
 /-- Queue daemon concurrency, from the `queue` object in `config.json`.
 
     Both default to 1, which is the serial behaviour the daemon had before parallel mode
@@ -590,6 +623,8 @@ structure AppConfig where
   taxis : Option Taxis.Config := none
   /-- Queue daemon concurrency. Read only by `orchestra queue start`. -/
   queue : QueueConfig := {}
+  /-- Which execution backend runs this instance's agents. -/
+  execution : ExecutionConfig := {}
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -619,10 +654,12 @@ instance : FromJson AppConfig where
     let additionalSandboxPaths := j.getObjValAs? SandboxPaths "additional_sandbox_paths" |>.toOption |>.getD {}
     let taxis := j.getObjValAs? Taxis.Config "taxis" |>.toOption
     let queue := j.getObjValAs? QueueConfig "queue" |>.toOption |>.getD {}
+    let execution := j.getObjValAs? ExecutionConfig "execution" |>.toOption |>.getD {}
     let defaultOrganization := j.getObjValAs? String "default_organization" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs, additionalSandboxPaths, taxis, queue, defaultOrganization }
+             agentAuthConfigs, additionalSandboxPaths, taxis, queue, execution,
+             defaultOrganization }
 
 structure TaskFile where
   tasks : Array Task

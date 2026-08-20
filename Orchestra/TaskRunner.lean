@@ -5,6 +5,7 @@ import Orchestra.Agents.Opencode
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
 import Orchestra.GitHub
+import Orchestra.Exec
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.Sandbox
@@ -498,7 +499,23 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   if ioTask.backend == some "merger" then
     runMerger token ioTask repoPath initialRecord
     return ((taskId, ← finalStatusOf taskId), none, none)
-  -- 3. Start MCP server (runs in this process, outside the sandbox)
+  -- 3. Resolve the execution backend the agent will run under.
+  --
+  -- Here rather than at the top of the function because the two agent-less backends above never
+  -- launch anything: a machine that can still merge and triage should not have those tasks fail
+  -- over a sandbox they do not use. Resolved once for the whole retry loop, and checked
+  -- (`Backend.preflight`) while doing it, so a missing `landrun` is one line naming the task
+  -- rather than three attempts at `could not execute external process`.
+  let execBackend ← match ← Exec.resolve appConfig.execution with
+    | .ok b => pure b
+    | .error e =>
+      -- Recorded and then thrown, rather than returned as a failed status: this is a setup
+      -- failure like a clone that cannot be created or a token that cannot be minted, and those
+      -- all leave through the same door. The queue daemon's handler is what releases the issue
+      -- claim this task is holding, and a task that returned normally would keep it.
+      TaskStore.saveTask { initialRecord with status := .failed }
+      throw (IO.userError s!"cannot run the agent: {e}")
+  -- 4. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
   let (allowedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
   if usingModeFallback then
@@ -531,12 +548,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"
-  -- 4. Run init hook and load per-repository config
+  -- 5. Run init hook and load per-repository config
   RepoConfig.runInitIfNeeded repoPath
   let repoConfig ← RepoConfig.loadRepoConfig repoPath
-  -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
+  -- 6. Validation loop: before.sh → agent → validation.sh, retry on failure
   let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
-  -- 5a. Resolve memory directories and amend system prompt
+  -- 6a. Resolve memory directories and amend system prompt
   let memoryDirs ← resolveMemoryDirs ioTask.memory ioTask.upstream
   let systemPrompt :=
     match baseSystemPrompt, memorySystemPrompt memoryDirs with
@@ -544,7 +561,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     | some sp, none    => some sp
     | none,    some mp => some mp
     | some sp, some mp => some (sp ++ "\n\n" ++ mp)
-  -- 5b. Load prepend prompt and apply to task prompt
+  -- 6b. Load prepend prompt and apply to task prompt
   let prependPrompt ← loadPrependPrompt ioTask.prependPrompt
   let baseTaskPrompt :=
     match prependPrompt with
@@ -595,7 +612,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
       (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
       (additionalPaths := appConfig.additionalSandboxPaths)
-      (interactiveAgent := interactiveAgent) (goal := ioTask.goal)
+      (interactiveAgent := interactiveAgent) (goal := ioTask.goal) (exec := execBackend)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     lastResultSubtype := result.resultSubtype
@@ -630,10 +647,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       IO.println s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
     else
       IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
-  -- 6. Run after hook and shut down MCP server
+  -- 7. Run after hook and shut down MCP server
   RepoConfig.runHook repoPath "after.sh"
   shutdown
-  -- 7. Persist final task state
+  -- 8. Persist final task state
   --
   -- A usage limit is checked before the result subtype, not after: the CLI reports the limit
   -- *as* an error result, so consulting the subtype first would classify every limited run as

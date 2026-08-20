@@ -63,11 +63,11 @@ def opencode : AgentDef where
     homeRwx := [".elan", ".cache"]
     extraPorts := [4096]
   }
-  setupMcp port _ _ := do
+  setupMcp mcp _ _ := do
     let mcpConfig := Json.mkObj [("mcp", Json.mkObj [
       ("agent", Json.mkObj [
         ("type", .str "local"),
-        ("command", .arr #[.str "nc", .str "127.0.0.1", .str (toString port)]),
+        ("command", .arr #[.str "nc", .str mcp.host, .str (toString mcp.port)]),
         ("enabled", .bool true)
       ])
     ])]

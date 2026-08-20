@@ -77,13 +77,13 @@ private def vibeExtractSessionId (vibeHome : String) : IO (Option String) := do
 
 /-- Produce a config.toml for the temp VIBE_HOME by injecting the MCP server and optional
     model override into the user's existing config. -/
-private def vibeConfigToml (serverPort : UInt16) (model : Option String) (base : String) : String :=
+private def vibeConfigToml (mcp : Exec.McpEndpoint) (model : Option String) (base : String) : String :=
   let mcpEntry :=
     "[[mcp_servers]]\n" ++
     "name = \"agent\"\n" ++
     "transport = \"stdio\"\n" ++
     "command = \"nc\"\n" ++
-    s!"args = [\"127.0.0.1\", \"{serverPort}\"]\n"
+    s!"args = [\"{mcp.host}\", \"{mcp.port}\"]\n"
   let withMcp := base.replace "mcp_servers = []" mcpEntry
   match model with
   | none => withMcp
@@ -109,7 +109,7 @@ def vibe : AgentDef where
     homeRw  := [".gitconfig", ".config/gh", ".config/git"]
     homeRwx := [".elan", ".cache"]
   }
-  setupMcp port model systemPrompt := do
+  setupMcp mcp model systemPrompt := do
     let ts ← uniqueToken
     let vibeHome := s!"/tmp/agent-vibe-{ts}"
     let vibeHomePath := System.FilePath.mk vibeHome
@@ -122,7 +122,7 @@ def vibe : AgentDef where
         let src := System.FilePath.mk h / ".vibe" / "config.toml"
         if ← src.pathExists then IO.FS.readFile src else pure ""
       | none => pure ""
-    IO.FS.writeFile (vibeHomePath / "config.toml") (vibeConfigToml port model baseConfig)
+    IO.FS.writeFile (vibeHomePath / "config.toml") (vibeConfigToml mcp model baseConfig)
     -- If a system prompt is provided, write a custom agent profile and prompt file
     if let some sp := systemPrompt then
       IO.FS.createDir (vibeHomePath / "agents")

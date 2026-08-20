@@ -10,6 +10,7 @@ import OrchestraTest.ProjectClaimTest
 import OrchestraTest.ProjectFieldsTest
 import OrchestraTest.ProjectMetaTest
 import OrchestraTest.ExamplesTest
+import OrchestraTest.ExecTest
 import OrchestraTest.LabelDispatcherTest
 import OrchestraTest.DispatchCandidatesTest
 import OrchestraTest.ProjectToolsTest

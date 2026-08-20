@@ -30,7 +30,7 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
           clone + GitHub App token + per-repo hooks
                              │
                              ▼
-              landrun sandbox ──── agent backend
+            execution backend ──── agent backend
                              │           │
                              └► MCP server ◄┘
                               (GitHub + issues)
@@ -40,7 +40,9 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
 
 - **Sandboxed runs.** Every agent runs under landrun: write access to its own clone and `/tmp`,
   read+execute on the toolchain, outbound TCP to HTTPS and the MCP port, nothing else. A task can
-  mount its clone read-only, which is what review tasks use.
+  mount its clone read-only, which is what review tasks use. What a task may do is described apart
+  from how that is enforced, so another execution model — a container, a cluster — is a backend
+  rather than a rewrite → [the execution model](docs/execution.md)
 - **Credentials the agent never sees.** A GitHub App installation token is minted per task and
   handed to `gh` for git transport only. The personal access token used for upstream pull
   requests, reviews and comments stays in the MCP server process.
@@ -202,6 +204,9 @@ cache directory:
 
 TCP ports beyond HTTPS and the MCP server are opened per backend, via `extra_ports` on that
 backend's entry in the `agents` array — for a local model server, for instance.
+
+The `execution` block chooses what runs the agent — `landrun` (the default) or `local`, which does
+not confine it at all. See [other execution backends](#other-execution-backends).
 
 The `queue` block sets how many tasks the daemon runs at once. Both keys default
 to `1`, which is the serial behaviour, and `orchestra queue start --parallel N` /
@@ -580,6 +585,27 @@ involved, so this works inside the Docker image as well. A task's agent gets:
 `orchestra run --debug` prints the exact landrun invocation before executing it, which is the
 quickest way to find out why an agent cannot see a path. A path that does not exist cannot be
 granted — orchestra warns about missing `$HOME`-relative paths rather than letting the agent hang.
+
+### other execution backends
+
+What an agent is allowed to do and how that is enforced are two separate things: a task's needs
+are described once, as a backend-neutral spec, and an *execution backend* renders it. `landrun` is
+the default and the one described above. `local` runs the agent with no confinement at all, for
+machines without Landlock — an agent under it can read and write everything the daemon can,
+orchestra's own credentials included, so it is opt-in and says so on every launch.
+
+```json
+{
+  "execution": {
+    "backend": "landrun"
+  }
+}
+```
+
+An unknown name, or a backend that cannot run on this machine, fails the task at the start with
+one line saying which — before the clone and the token, and without burning the retry budget.
+[docs/execution.md](docs/execution.md) describes the interface and what adding a backend that runs
+agents elsewhere (a container, a Kubernetes pod) involves.
 
 ## MCP tools
 
