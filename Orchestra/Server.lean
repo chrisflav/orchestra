@@ -244,9 +244,9 @@ private def optionalToolDefs : List (String × Json) := [
       "than handed back, so nothing is pushed to a repository other than the one just made. " ++
       "Pick another name or work on the existing repository.\n\n" ++
       "The result carries a GitHub token that reaches the new repository and nothing else, and " ++
-      "says how to use it. Pass it to the single command that pushes rather than exporting it: " ++
-      "GH_TOKEN is what authenticates your work on the task's own fork, and this token cannot " ++
-      "reach that. It expires in an hour, like every installation token."),
+      "gives the push command to use it in. Do not export it as GH_TOKEN: that variable is what " ++
+      "authenticates your work on the task's own fork, and this token cannot reach that. It " ++
+      "expires in an hour, like every installation token."),
     ("inputSchema", Json.mkObj [
       ("type", "object"),
       ("properties", Json.mkObj [
@@ -742,23 +742,30 @@ created in; there is no other destination this tool will use)"
           name description isPrivate autoInit
         let visibility := if isPrivate then "private" else "public"
         let contents := if autoInit then "initialised with a README commit" else "empty"
-        log s!"tool create_repository: ok: {repo}"
-        -- Given per command rather than exported. `GH_TOKEN` is how the sandbox supplies the
-        -- task's own credentials, and `Repo`'s git helpers read every push and fetch from it, so
-        -- an agent that exports this one has swapped a whole-fork token for a token good for one
-        -- repository — and the push of its actual work then 403s.
+        -- The push token is carried, not thrown, so its failure would otherwise reach the agent
+        -- and nothing else; an operator asked why the agent got no token needs the reason here.
+        -- Neither token is ever logged: these lines name the repository, not the credential.
+        match pushToken with
+        | .ok _    => log s!"tool create_repository: ok: {repo}"
+        | .error e => log s!"tool create_repository: created {repo}, but minting its push token \
+            failed: {e}"
+        -- The token goes in the URL rather than into `GH_TOKEN`. Exporting `GH_TOKEN` is how the
+        -- sandbox supplies the task's *own* credentials, and `Repo`'s helpers authenticate every
+        -- push and fetch from it, so an agent that overwrites it with a token good for one
+        -- repository loses the one that pushes its actual work. The URL form also needs no
+        -- credential helper, which only the task's own clone is configured with.
         let credential := match pushToken with
           | .ok t =>
-            s!"Push with this token, which reaches this repository and no other. Give it to the \
-              one command that needs it — `GH_TOKEN={t} git push ...` — rather than exporting it, \
-              since GH_TOKEN is what authenticates your work on {state.fork} and this token \
-              cannot reach that. Like every installation token it expires in an hour; \
-              refresh_token mints a fresh one for {state.fork.owner}, which reaches this \
-              repository only if that is the same account as {org}."
+            s!"Push with this token, which reaches this repository and no other:\n  \
+              git push https://x-access-token:{t}@github.com/{repo} HEAD:main\n\
+              Do not export it as GH_TOKEN — that is what authenticates your work on \
+              {state.fork}, and this token cannot reach that. Like every installation token it \
+              expires in an hour; refresh_token mints the task's own, which reaches this \
+              repository only if that installation covers {org}."
           | .error e =>
             s!"The repository exists, but no push token could be minted for it: {e}\n\
-              Do not create it again — it is there. refresh_token mints a token for \
-              {state.fork.owner}, which reaches it if that is the same account as {org}."
+              Do not create it again — it is there. refresh_token mints the task's own token, \
+              which reaches it only if that installation covers {org}."
         return toolContent s!"created {repo} ({visibility}, {contents})\n\
           https://github.com/{repo}\n{credential}"
       catch e =>

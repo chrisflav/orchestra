@@ -619,11 +619,12 @@ configuration.
   never lands in a repository the task did not just create. Authenticated by the organisation's own
   GitHub App installation, which needs the `Administration: read and write` permission. The result
   carries a token to push with, scoped to the new repository alone and expiring in an hour like
-  every installation token — the agent is told to pass it to the one command that pushes rather
-  than export it, since `GH_TOKEN` is what authenticates its work on its own fork. A token from
-  `refresh_token` is minted for the *fork owner's* installation, so it reaches the new repository
-  when the fork lives in `default_organization` and not when the App could push to the target
-  directly and the fork is that target. Grant it deliberately, like `merge_pr`
+  every installation token — the agent is given it as a remote URL to use once, not as a `GH_TOKEN`
+  to export, since that variable is what authenticates its work on its own fork. A token from
+  `refresh_token` is minted for whichever installation the task runs under, so it reaches the new
+  repository only when that installation covers `default_organization` — which is the case when
+  the task works on a fork, and not when the App could push to the target directly. Grant it
+  deliberately, like `merge_pr`
 - `comment` — post a comment on the issue or pull request the task was launched from.
   Supports four modes:
   - **regular comment**: provide only `body`

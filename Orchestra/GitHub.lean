@@ -465,9 +465,9 @@ def repoNameError? (name : String) : Option String :=
     request needs the organisation installation's full scope; what comes back is scoped to the one
     new repository, because it is handed to the agent and a token good for the whole fork
     organisation would reach every other task's fork sitting in it. It is also the only token the
-    caller is sure to have: a task's own installation token is minted for the *fork owner's*
-    account, which is this organisation when the task works on a fork of its target but not when
-    the App could push to that target directly.
+    caller is sure to have: a task's own installation token is minted for whichever installation
+    the task was launched under — `github_app.installation_id` when the config pins one, the fork
+    owner's otherwise — and that reaches this repository only when it happens to cover `org`.
 
     Unlike forking, this is **not** idempotent: a name the organisation already uses is a 422,
     reported as GitHub explained it rather than resolved to the existing repository. Which
@@ -509,15 +509,19 @@ def createRepoInOrg (appId : Nat) (privateKeyPath : String) (org name : String)
       else ""
     throw (.userError s!"creating '{org}/{name}' failed: GitHub answered HTTP {status}\n  \
       {githubErrorDetail respBody}{hint}")
+  -- Each of these follows a 2xx, so the repository was made and only its name is in doubt. Every
+  -- message says so: a caller told a flat "creating failed" retries under the same name, meets the
+  -- 422, and reads its own repository as somebody else's.
+  let created := s!"the repository was created — check '{org}' for '{name}' before retrying"
   let .ok respJson := Json.parse respBody
     | throw (.userError s!"creating '{org}/{name}': GitHub answered HTTP {status} with a body \
-        that is not JSON, so the repository cannot be identified")
+        that is not JSON, so the repository cannot be identified, but {created}")
   let .ok fullName := respJson.getObjValAs? String "full_name"
     | throw (.userError s!"creating '{org}/{name}': the response carries no 'full_name', so the \
-        repository cannot be identified\n  {githubErrorDetail respBody}")
+        repository cannot be identified, but {created}\n  {githubErrorDetail respBody}")
   let .ok repo := Repository.parse fullName
     | throw (.userError s!"creating '{org}/{name}': GitHub named the repository {repr fullName}, \
-        which is not an 'owner/repo'")
+        which is not an 'owner/repo'; {created}")
   -- Scoped to the repository GitHub says it made, not to the one that was asked for: those are
   -- the same name in every case anyone has seen, and where they are not, the token has to match
   -- the repository the caller is being handed.
