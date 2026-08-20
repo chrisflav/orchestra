@@ -87,7 +87,29 @@ def claude : AgentDef where
   cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()
   isUsageLimitError := stdUsageLimitError
   envVarsOfAuthSource src := match src.kind with
-    | .oauthToken token => #[("CLAUDE_CODE_OAUTH_TOKEN", token)]
+    -- The plan travels with the token, because the token cannot state it for itself.
+    --
+    -- Claude Code checks a model's entitlement against the subscription it is holding, and it
+    -- learns that subscription from the account profile it fetches when a person runs `/login`.
+    -- A long-lived `claude setup-token` — which is what an `oauth_token` source carries — has
+    -- inference scope and nothing else, so that profile is never fetched and the client ends up
+    -- holding no plan at all. A check that cannot confirm the subscription covers a model then
+    -- fails closed, which is how a Max account gets told that Fable, a standard part of that
+    -- plan, requires usage credits (anthropics/claude-code#79597). The server grants the very
+    -- same token Fable perfectly well; it is the client refusing, in the plan's name.
+    --
+    -- In this mode the client reads the plan and the rate-limit tier from the environment
+    -- instead of from a profile, precisely because there is no profile to read — so saying it
+    -- here is the whole fix.
+    --
+    -- Fixed rather than configurable: every account orchestra runs an `oauth_token` on is a Max
+    -- 20x subscription, and this is a fact about them, not a preference. It also grants nothing.
+    -- Each request is still authorised and priced by the server against the token, so the value
+    -- can only make the client's local guess right or wrong — never buy access to anything. If
+    -- an account on some other plan is ever configured here, this is the line to revisit.
+    | .oauthToken token => #[("CLAUDE_CODE_OAUTH_TOKEN", token),
+                             ("CLAUDE_CODE_SUBSCRIPTION_TYPE", "max"),
+                             ("CLAUDE_CODE_RATE_LIMIT_TIER", "default_claude_max_20x")]
     | .apiKey key baseUrl =>
       let vars := #[("ANTHROPIC_API_KEY", key)]
       match baseUrl with
