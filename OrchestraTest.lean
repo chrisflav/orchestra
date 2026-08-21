@@ -7,6 +7,7 @@ import OrchestraTest.CreateRepositoryTest
 import OrchestraTest.LabelIssueTest
 import OrchestraTest.StreamFormatTest
 import OrchestraTest.StreamArgsTest
+import OrchestraTest.InteractiveWireTest
 import OrchestraTest.WorkflowParserTest
 import OrchestraTest.ProjectClaimTest
 import OrchestraTest.ProjectFieldsTest
