@@ -137,11 +137,11 @@ sessions reads as a list of conversations rather than of ids.
 One envelope per line, `seq` monotone from 1:
 
 ```json
-{"seq":12,"at":"…","kind":"user","text":"add a test for the retry path"}
-{"seq":13,"at":"…","kind":"turnStarted","turn":3}
-{"seq":14,"at":"…","kind":"agent","event":{"type":"assistant","item":{"type":"text","text":"…"}}}
-{"seq":15,"at":"…","kind":"turnEnded","turn":3,"subtype":"success","costUsd":0.02,"durationSeconds":12}
-{"seq":16,"at":"…","kind":"notice","level":"error","message":"the agent exited unexpectedly"}
+{"seq":12,"occurredAt":"…","kind":"user","text":"add a test for the retry path"}
+{"seq":13,"occurredAt":"…","kind":"turnStarted","turn":3}
+{"seq":14,"occurredAt":"…","kind":"agent","event":{"type":"assistant","item":{"type":"text","text":"…"}}}
+{"seq":15,"occurredAt":"…","kind":"turnEnded","turn":3,"subtype":"success","costUsd":0.02,"durationSeconds":12}
+{"seq":16,"occurredAt":"…","kind":"notice","level":"error","message":"the agent exited unexpectedly"}
 ```
 
 `kind: "agent"` wraps a `StreamFormat.Event` unchanged, so a client that can already render a
