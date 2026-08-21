@@ -1927,9 +1927,16 @@ and neither misses one. -/
     finds nothing costs one read of a file that has not changed. -/
 private def transcriptIntervalMs : Std.Time.Millisecond.Offset := 300
 
-/-- Keep-alive after this many quiet ticks — about thirty seconds at the interval above, which
-    is under the idle timeout of every proxy worth naming. -/
-private def transcriptKeepAliveTicks : Nat := 100
+/-- Keep-alive after this many quiet ticks — six seconds at the interval above.
+
+    Chosen against the server rather than against a proxy, because the server is the stricter of
+    the two: `Std.Http`'s `lingeringTimeout` closes a connection ten seconds after the last byte
+    moves in either direction, whatever a proxy in front of it would have tolerated. A quiet
+    conversation writes nothing at all, so anything above ten seconds here is a stream that drops
+    on every pause in the conversation — which is most of a chat. Measured, not assumed: a
+    transcript stream fed an event a second stays up indefinitely, and the same stream left quiet
+    was closed at ten seconds exactly. -/
+private def transcriptKeepAliveTicks : Nat := 20
 
 /-- One SSE frame carrying its own `id`, so a reconnect can say where it got to. -/
 private def sseFrameWithId (seq : Nat) (payload : String) : String :=
