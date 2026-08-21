@@ -13,6 +13,14 @@ on:
       - ".github/workflows/app.yml"
   # So an APK can be built on demand, without a push.
   workflow_dispatch:
+    inputs:
+      publish:
+        description: >-
+          Attach the APK to the `android-latest` prerelease, so it can be installed from a plain
+          link rather than downloaded from this run. Off by default: it writes to the
+          repository's releases, which a CI run should not do unless it was asked to.
+        type: boolean
+        default: false
 
 defaults:
   run:
@@ -106,12 +114,6 @@ jobs:
 
       - run: npm ci
 
-      # The repository tracks the PNGs the Linux bundles use; macOS wants an `.icns` and
-      # Windows an `.ico`, which this derives from the same master rather than committing three
-      # copies of one drawing.
-      - name: Generate the icon set
-        run: npx tauri icon src-tauri/icons/icon.png
-
       # Unsigned. Signing and notarisation are release-time concerns and want secrets this
       # workflow deliberately does not have.
       - name: Build the bundle
@@ -137,6 +139,10 @@ jobs:
   android:
     needs: check
     runs-on: ubuntu-latest
+    # Only the publish step below needs this, and only when it is asked for; the rest of the
+    # job reads.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
@@ -165,9 +171,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # One per ABI a phone can have. The universal APK below carries all four, so it
-          # installs on a handset and on an emulator alike.
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          # `aarch64` is every Android handset made in roughly the last decade. `x86_64` is
+          # what an emulator runs on a development machine, and it is here so that adding it
+          # to the build below is a one-word change rather than a toolchain change.
+          targets: aarch64-linux-android,x86_64-linux-android
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -176,17 +183,23 @@ jobs:
 
       - run: npm ci
 
-      - name: Generate the icon set
-        run: npx tauri icon src-tauri/icons/icon.png
-
       # `android init` writes the Gradle project under `src-tauri/gen/android`, which is not
       # tracked: it is generated from `tauri.conf.json` and the icons, and regenerating it is
       # cheaper than reviewing a diff of it.
       - name: Generate the Android project
         run: npx tauri android init
 
+      # `--target aarch64` rather than the default, which builds every ABI into one universal
+      # APK: that came to 165 MB, most of it architectures the phone installing it cannot run.
+      # An emulator build is `--target aarch64 x86_64`.
       - name: Build the APK
-        run: npx tauri android build --apk --debug
+        run: npx tauri android build --apk --debug --target aarch64
+
+      # The exact directory Gradle writes into has moved between Tauri versions, and a glob
+      # that silently matches nothing is how an empty artifact happens. This puts the real
+      # layout in the log next to the upload that depends on it.
+      - name: What was built
+        run: find src-tauri/gen/android/app/build/outputs -name '*.apk' -exec ls -lh {} +
 
       - uses: actions/upload-artifact@v4
         with:
@@ -194,3 +207,23 @@ jobs:
           path: app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 14
+
+      # An Actions artifact is a zip you can only fetch while signed in to GitHub, from a
+      # desktop — which is the wrong shape for a file whose whole purpose is to be opened on a
+      # phone. Asked for explicitly, the same APK also goes to a prerelease, where it is a
+      # plain link.
+      - name: Publish it as a prerelease
+        if: inputs.publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-latest
+          name: orchestra for Android (debug)
+          prerelease: true
+          # One moving tag rather than a release per build: this is the current debug APK, not
+          # a version anybody should pin to.
+          body: >-
+            A debug build of the orchestra app, signed with Gradle's debug keystore — which is
+            what makes it installable without a signing identity, and what makes it not a Play
+            Store build. arm64 only. Built from
+            ${{ github.sha }}.
+          files: app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk

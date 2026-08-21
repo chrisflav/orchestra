@@ -56,10 +56,18 @@ rustup target add aarch64-linux-android armv7-linux-androideabi \
 costs less than reviewing a diff of it.
 
 **Not building it yourself:** the `android` job in CI produces a debug APK on every push that
-touches `app/`, and on demand through *Run workflow*. Download it from the run's artifacts as
-`orchestra-app-android-apk`. It is signed with Gradle's debug keystore, which is what makes it
-installable on a handset without a signing identity — a release APK needs a keystore this
-repository deliberately does not hold.
+touches `app/`, and on demand through *Run workflow*. Two ways to get it:
+
+- the run's artifacts, as `orchestra-app-android-apk` — a zip, and GitHub only serves it to a
+  signed-in browser, which usually means fetching it on a desktop and moving it across;
+- *Run workflow* with **publish** ticked, which also attaches it to the `android-latest`
+  prerelease. A release asset is a plain link, so that is the one to use when the phone is where
+  you want to open it.
+
+It is arm64 only (`--target aarch64`), which is every handset made in roughly the last decade —
+an emulator wants `--target aarch64 x86_64`. It is signed with Gradle's debug keystore, which is
+what makes it installable without a signing identity, and what makes it not a Play Store build:
+the phone will ask you to allow installing from that source.
 
 For a desktop bundle:
 

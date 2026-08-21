@@ -289,12 +289,22 @@ network.
 The Android toolchain is not a small thing to install, and every piece of it — the SDK, the NDK,
 Google's Maven repository — lives on hosts that a locked-down development environment may not be
 allowed to reach. So the APK is built in CI, by the `android` job in
-[`.github/workflows/app.yml`](../.github/workflows/app.yml), and downloaded from that run's
-artifacts as `orchestra-app-android-apk`.
+[`.github/workflows/app.yml`](../.github/workflows/app.yml).
 
-It is a **debug** APK, signed with the debug keystore Gradle generates, because that is the build
-that installs on a handset without a signing identity. Installing it means allowing your phone to
-install from that source; it is not, and cannot be, a Play Store build.
+Two ways out of that job, and they are not equivalent. The run's **artifact**
+(`orchestra-app-android-apk`) is a zip GitHub serves only to a signed-in browser — fine from a
+desktop, awkward for a file whose entire purpose is to be opened on a phone. Running the workflow
+with **publish** ticked also attaches the APK to the `android-latest` prerelease, where it is a
+plain link. That is off by default, because a CI run should not write to a repository's releases
+unless it was asked to.
+
+It is a **debug** APK, arm64 only, signed with the debug keystore Gradle generates — which is
+what makes it installable on a handset without a signing identity. Installing it means allowing
+your phone to install from that source; it is not, and cannot be, a Play Store build.
+
+Size is why it is one architecture. The default builds every ABI into one universal APK, and with
+unstripped debug Rust libraries for four of them that came to 165 MB — most of it code the phone
+installing it cannot execute. One ABI is about a quarter of that.
 
 Locally, with a JDK, the SDK and the NDK in place (`NDK_HOME` set):
 
