@@ -94,34 +94,23 @@ The agent will not see what was cut — check whether a prompt template is expan
 unbounded."
   return truncatePrompt s
 
-def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : String)
-    (serverPort : UInt16)
-    (ghToken : String)
-    (debug : Bool := false)
+/-- The `landrun` command line, up to and including the agent's own executable name: every path
+    rule, every port, and every environment variable, but nothing about what the agent is being
+    asked to do.
+
+    Extracted because there are now three ways to launch an agent — headless, TUI, and the
+    bidirectional stream an interactive session holds open — and the sandbox they run in must be
+    the same one. Copied instead of shared, the path list or the port rules would drift between
+    them, and a sandbox that differs by launch mode is a sandbox nobody can reason about. -/
+private def sandboxArgs (agentDef : AgentDef) (repoPath : System.FilePath)
+    (serverPort : UInt16) (ghToken : String)
+    (agentEnv : Array (String × Option String))
     (extraEnv : Array (String × Option String) := #[])
     (pluginDirs : Array String := #[])
     (memoryDirs : Array String := #[])
-    (subAgent : Option String := none)
-    (model : Option String := none)
-    (systemPrompt : Option String := none)
-    (resume : Option String := none)
-    (budget : Float := 4.0)
-    (cancelToken : Option Std.CancellationToken := none)
-    (debugLogFile : Option System.FilePath := none)
-    (logFile : Option System.FilePath := none)
-    -- If true, mount the project repository read-only in the sandbox.
     (readOnly : Bool := false)
-    -- Additional TCP ports to allow, beyond what the agent backend already opens.
     (extraPorts : Array Nat := #[])
-    -- Additional sandbox paths from global app config, merged with the agent-backend's built-in paths.
-    (additionalPaths : SandboxPaths := {})
-    -- If true, launch the agent in interactive (TUI) mode: inherit stdio and omit -p <prompt>.
-    (interactiveAgent : Bool := false)
-    -- Condition the run is held to: the agent must not stop before it holds. Passed to the
-    -- backend on its own, never folded into `prompt` — see `AgentDef.goalArgs`.
-    (goal : Option String := none) : IO LaunchResult := do
-  -- Run agent-specific MCP setup (writes config files, returns extra env vars)
-  let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
+    (additionalPaths : SandboxPaths := {}) : IO (Array String) := do
   let paths := agentDef.sandboxPaths
   let mut args : Array String := #[]
   -- Repo access: read-only or read-write depending on the task's readOnly flag
@@ -223,9 +212,47 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     match v with
     | some val => args := args.push "--env" |>.push s!"{k}={val}"
     | none => pure ()
-  -- Separator and the actual command with its args
+  -- Separator and the actual command; what follows is the agent's own args, which the caller
+  -- appends according to how it is launching.
   args := args.push "--"
   args := args.push agentDef.command
+  return args
+
+/--
+Launch the coding agent inside a landrun sandbox.
+The agent backend's setupMcp hook runs before launch to configure MCP connectivity.
+Returns a LaunchResult with exit code, session ID, and usage-limit flag.
+-/
+def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : String)
+    (serverPort : UInt16)
+    (ghToken : String)
+    (debug : Bool := false)
+    (extraEnv : Array (String × Option String) := #[])
+    (pluginDirs : Array String := #[])
+    (memoryDirs : Array String := #[])
+    (subAgent : Option String := none)
+    (model : Option String := none)
+    (systemPrompt : Option String := none)
+    (resume : Option String := none)
+    (budget : Float := 4.0)
+    (cancelToken : Option Std.CancellationToken := none)
+    (debugLogFile : Option System.FilePath := none)
+    (logFile : Option System.FilePath := none)
+    -- If true, mount the project repository read-only in the sandbox.
+    (readOnly : Bool := false)
+    -- Additional TCP ports to allow, beyond what the agent backend already opens.
+    (extraPorts : Array Nat := #[])
+    -- Additional sandbox paths from global app config, merged with the agent-backend's built-in paths.
+    (additionalPaths : SandboxPaths := {})
+    -- If true, launch the agent in interactive (TUI) mode: inherit stdio and omit -p <prompt>.
+    (interactiveAgent : Bool := false)
+    -- Condition the run is held to: the agent must not stop before it holds. Passed to the
+    -- backend on its own, never folded into `prompt` — see `AgentDef.goalArgs`.
+    (goal : Option String := none) : IO LaunchResult := do
+  -- Run agent-specific MCP setup (writes config files, returns extra env vars)
+  let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
+  let mut args ← sandboxArgs agentDef repoPath serverPort ghToken agentEnv extraEnv
+    pluginDirs memoryDirs readOnly extraPorts additionalPaths
   -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
   let allPluginDirs := pluginDirs ++ memoryDirs
   -- Enforced here rather than where the prompts are built: every backend and every caller
@@ -441,5 +468,137 @@ goal; running without the goal condition."
   agentDef.cleanup mcpContext
   return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype, resultText,
            rateLimitReset }
+
+/-! ## Streaming mode
+
+The third way to launch an agent, alongside headless and TUI: one process that stays up across
+many turns, reading each as a JSON line on stdin and streaming its events back on stdout. It is
+what an interactive session holds — the sandbox, the clone, the MCP server and the credentials
+are acquired once and kept, and a turn costs a line on a pipe rather than a process start.
+
+Unlike the other two, this one does not block until the agent exits. It hands back a handle, and
+the caller decides when the conversation is over. -/
+
+/-- A live agent process: turns go in, events come out, and it stays up in between. -/
+structure StreamingSession where
+  private child : IO.Process.Child
+    { stdin := .piped, stdout := .piped, stderr := .piped : IO.Process.StdioConfig }
+  /-- Serialises writes to stdin. Two turns posted at once — one from the CLI, one from a
+      dashboard — would otherwise interleave halfway through a JSON line and give the agent
+      neither of them. -/
+  private stdinLock : Std.BaseMutex
+  /-- Everything the process has said on stderr. Read at the end of a turn, because that is
+      where an API-key run reports a usage limit; a subscription run reports it in the stream
+      instead, which is why `AgentDef.isUsageLimitError` is shown both. -/
+  private stderrRef : IO.Ref String
+  /-- The task draining stdout. It finishes when the agent closes it, which is how a caller
+      learns the process is gone without waiting on it. -/
+  pump : _root_.Task (Except IO.Error Unit)
+  /-- Handed back to `AgentDef.cleanup` at teardown. -/
+  mcpContext : String
+  private agentDef : AgentDef
+
+namespace StreamingSession
+
+/-- Write one line to the agent's stdin, under the lock. -/
+def sendLine (s : StreamingSession) (line : String) : IO Unit := do
+  s.stdinLock.lock
+  try
+    s.child.stdin.putStrLn line
+    s.child.stdin.flush
+  finally s.stdinLock.unlock
+
+/-- What the agent has written to stderr so far. -/
+def stderrSoFar (s : StreamingSession) : IO String := s.stderrRef.get
+
+/-- Whether the agent process has closed its output, which it does when it exits. -/
+def hasExited (s : StreamingSession) : IO Bool := IO.hasFinished s.pump
+
+/-- Stop the process and release what the backend set up for it.
+
+    `SIGTERM` first, so the CLI can flush what it was writing and end its session cleanly, and
+    `SIGKILL` only for one that does not go. Both through `kill`, as the cancel path already
+    does — there is no signal-sending primitive in `IO.Process`. -/
+def shutdown (s : StreamingSession) : IO Unit := do
+  let signal (sig : String) : IO Unit := do
+    try
+      let killer ← IO.Process.spawn {
+        cmd := "kill", args := #[sig, toString s.child.pid]
+        stdin := .null, stdout := .null, stderr := .null
+      }
+      let _ ← killer.wait
+    catch _ => pure ()
+  signal "-TERM"
+  -- Closing stdin is the other half of asking it to stop: a CLI reading turns from a pipe ends
+  -- its loop on EOF, and one that has already gone does not care.
+  try s.child.stdin.flush catch _ => pure ()
+  let _ ← IO.wait s.pump
+  unless ← hasExited s do signal "-KILL"
+  let _ ← try s.child.wait catch _ => pure 0
+  s.agentDef.cleanup s.mcpContext
+
+end StreamingSession
+
+/-- Launch the agent in bidirectional streaming mode and hand back the live process.
+
+    `opts.mcpContext` is filled in here from the backend's own `setupMcp`; whatever the caller
+    put there is replaced. Everything else in `opts` is the caller's.
+
+    Answers `none` when the backend has no streaming mode — the caller is expected to say so
+    rather than quietly launch something else. -/
+def launchStreaming (agentDef : AgentDef) (repoPath : System.FilePath)
+    (serverPort : UInt16) (ghToken : String)
+    (opts : StreamOptions)
+    (onEvent : StreamFormat.Event → IO Unit)
+    (debug : Bool := false)
+    (extraEnv : Array (String × Option String) := #[])
+    (pluginDirs : Array String := #[])
+    (memoryDirs : Array String := #[])
+    (readOnly : Bool := false)
+    (extraPorts : Array Nat := #[])
+    (additionalPaths : SandboxPaths := {}) : IO (Option StreamingSession) := do
+  let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort opts.model opts.systemPrompt
+  -- Capped for the same reason as everywhere else: it is one `execve` argument, and the limit
+  -- belongs to `execve` rather than to any one caller.
+  let systemPrompt ← opts.systemPrompt.mapM (capPromptArg "system prompt")
+  let opts := { opts with
+    mcpContext, systemPrompt
+    -- Memory dirs reach the agent as plugin dirs, as they do on every other path.
+    pluginDirs := opts.pluginDirs ++ memoryDirs }
+  let some agentArgs := agentDef.buildStreamArgs opts | do
+    agentDef.cleanup mcpContext
+    return none
+  let mut args ← sandboxArgs agentDef repoPath serverPort ghToken agentEnv extraEnv
+    pluginDirs memoryDirs readOnly extraPorts additionalPaths
+  args := args ++ agentArgs
+  if debug then
+    let argsStr := String.intercalate " " (args.toList.map shellEscape)
+    IO.eprintln s!"[debug] cd {shellEscape repoPath.toString} && landrun {argsStr}"
+  let child ← IO.Process.spawn {
+    cmd := "landrun"
+    args
+    cwd := repoPath
+    stdin := .piped, stdout := .piped, stderr := .piped
+  }
+  let stderrRef ← IO.mkRef ""
+  -- One line can carry several events, and each is delivered in the order the agent emitted it.
+  -- A throw from `onEvent` ends the pump, which is what closing the transcript file underneath
+  -- it would look like; the process is then still alive but unheard, and `hasExited` says so.
+  let pump ← IO.asTask (prio := .dedicated) do
+    let err ← IO.getStderr
+    repeat do
+      let line ← child.stdout.getLine
+      if line.isEmpty then return
+      if debug then
+        err.putStrLn s!"[raw] {line.trimAscii}"
+        err.flush
+      for event in agentDef.parseOutputLine line do
+        onEvent event
+  let _errTask ← IO.asTask (prio := .dedicated) do
+    repeat do
+      let line ← child.stderr.getLine
+      if line.isEmpty then return
+      stderrRef.modify (· ++ line)
+  return some { child, stdinLock := ← Std.BaseMutex.new, stderrRef, pump, mcpContext, agentDef }
 
 end Orchestra.Sandbox
