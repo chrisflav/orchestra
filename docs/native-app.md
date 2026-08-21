@@ -253,6 +253,68 @@ Linux needs `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-d
 Phases 1–4 are what makes it a client. 5 is what makes it *this* client rather than the
 dashboard in a window.
 
+## the phone
+
+Phase 6, in the state described below: the targets are configured, the interface is laid out for
+a handset, and the two places the core has to behave differently on a phone are handled. What has
+*not* happened is a build — see "getting an APK".
+
+**Layout.** Nothing is hidden on a small screen. Every destination, every status and the switcher
+are all still there, because the reason to hold orchestra on a phone is that something is wrong
+and you are not at the desk where the other client lives. What changes is what a finger needs:
+44px targets, 16px text fields (below that, iOS zooms the page on focus and leaves it zoomed),
+the switcher hard right on the first row where a thumb reaches it, its menu spanning the width,
+and the chat compose box sticky at the bottom, measured in `dvh` — which is the difference
+between it sitting above the keyboard and behind it. `viewport-fit=cover` puts the page under the
+notch, so every edge that meets one is padded by `env(safe-area-inset-*)` rather than by a
+guessed number. Pull-to-refresh is disabled: it would reload the bundle and drop every stream
+mid-conversation.
+
+**Where the secrets go.** There is no keychain to speak of on Android, and the crate that reads
+one does not build for it. The fallback in `secrets.rs` is the app's own data directory, which on
+a phone is already private to the app — mode `0600` on top of that. The Backends screen says
+which store is in use, so this is never assumed away.
+
+**Which roots TLS trusts.** This is the one place mobile is not merely the desktop with bigger
+buttons. On the desktop the app verifies against the operating system's own store, which is what
+makes a company CA that is already installed there work with no second place to put it. Android
+keeps its trust store behind the Java APIs, where the Rust side cannot read it — so the two
+mobile targets carry Mozilla's roots with them instead. The consequence, stated plainly: **a
+backend whose certificate is signed by a private CA works from the desktop app and not from the
+phone.** There, the answer is a publicly-rooted certificate, or `allowInsecureTls` on your own
+network.
+
+### getting an APK
+
+The Android toolchain is not a small thing to install, and every piece of it — the SDK, the NDK,
+Google's Maven repository — lives on hosts that a locked-down development environment may not be
+allowed to reach. So the APK is built in CI, by the `android` job in
+[`.github/workflows/app.yml`](../.github/workflows/app.yml), and downloaded from that run's
+artifacts as `orchestra-app-android-apk`.
+
+It is a **debug** APK, signed with the debug keystore Gradle generates, because that is the build
+that installs on a handset without a signing identity. Installing it means allowing your phone to
+install from that source; it is not, and cannot be, a Play Store build.
+
+Locally, with a JDK, the SDK and the NDK in place (`NDK_HOME` set):
+
+```sh
+cd app
+npm install
+npm run android:init     # writes the Gradle project under src-tauri/gen/android
+npm run android:apk      # a debug APK under gen/android/app/build/outputs/apk/
+npm run android:dev      # or run it on a device or emulator, with hot reload
+```
+
+`gen/` is generated from `tauri.conf.json` and the icons and is not tracked: regenerating it is
+cheaper than reviewing a diff of it, and it is the Tauri CLI's output rather than anyone's
+source. iOS is the same shape (`npm run ios:init`) and needs a Mac and Xcode, which is why no CI
+job builds it.
+
+**Signing** — a release APK or AAB, and an `.ipa` — needs a keystore and an Apple developer
+identity, which are release-time secrets this repository does not hold. That is deliberate and
+the reason CI stops at a debug build.
+
 ## deliberately not in scope
 
 - **Running orchestra.** The app manages backends; it does not start a daemon, hold a queue, or

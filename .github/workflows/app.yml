@@ -4,8 +4,6 @@ name: App CI
 # its own workflow, and one that only runs when something under `app/` moved.
 on:
   push:
-    branches:
-      - master
     paths:
       - "app/**"
       - ".github/workflows/app.yml"
@@ -13,6 +11,7 @@ on:
     paths:
       - "app/**"
       - ".github/workflows/app.yml"
+  # So an APK can be built on demand, without a push.
   workflow_dispatch:
 
 defaults:
@@ -127,3 +126,71 @@ jobs:
             app/src-tauri/target/release/bundle/**/*.msi
           if-no-files-found: warn
           retention-days: 7
+
+  # The phone. This is also where an APK comes from: the Android SDK, the NDK and Google's
+  # Maven repository are all on hosts a development container may not be allowed to reach,
+  # and a runner is.
+  #
+  # A *debug* APK, signed with the debug keystore Gradle generates, because that is the one
+  # that installs on a handset without a signing identity. A release APK would need a keystore
+  # this workflow deliberately does not hold — see `docs/native-app.md` on signing.
+  android:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      # `NDK_HOME` is what the Tauri CLI looks for, and it is not what the SDK sets. Exported
+      # once here rather than repeated on each step below, so the version appears twice in this
+      # file instead of four times.
+      - name: Install the NDK
+        run: |
+          sdkmanager --install "ndk;$NDK_VERSION" "platforms;android-34" "build-tools;34.0.0"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+        env:
+          NDK_VERSION: "27.0.12077973"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # One per ABI a phone can have. The universal APK below carries all four, so it
+          # installs on a handset and on an emulator alike.
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+          key: android
+
+      - run: npm ci
+
+      - name: Generate the icon set
+        run: npx tauri icon src-tauri/icons/icon.png
+
+      # `android init` writes the Gradle project under `src-tauri/gen/android`, which is not
+      # tracked: it is generated from `tauri.conf.json` and the icons, and regenerating it is
+      # cheaper than reviewing a diff of it.
+      - name: Generate the Android project
+        run: npx tauri android init
+
+      - name: Build the APK
+        run: npx tauri android build --apk --debug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orchestra-app-android-apk
+          path: app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14

@@ -8,7 +8,12 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "android:init": "tauri android init",
+    "android:dev": "tauri android dev",
+    "android:apk": "tauri android build --apk --debug",
+    "ios:init": "tauri ios init",
+    "ios:dev": "tauri ios dev"
   },
   "dependencies": {
     "@fontsource-variable/ibm-plex-sans": "^5.3.0",

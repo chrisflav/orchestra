@@ -1774,25 +1774,106 @@ a.row:hover .row-title {
   gap: 8px;
 }
 
-/* ── narrow windows and phones ──────────────────────────────────────────────────────────── */
+/* ── the phone ──────────────────────────────────────────────────────────────────────────────
+ *
+ * The same app, not a smaller one. Nothing is hidden at this width: every destination, every
+ * status and the switcher are all still here, because the reason to hold orchestra on a phone
+ * is that something is wrong and you are not at the desk where the other client lives.
+ *
+ * The dashboard's own block above already stacks the rows, wraps the bar and unwraps the log
+ * lines — that work is done and is not repeated here. What is left is what a *finger* needs
+ * and a pointer does not, plus the two pieces of chrome the dashboard has no equivalent of.
+ * `viewport-fit=cover` puts the page under the notch and the home indicator, so every edge
+ * that meets them is padded by the inset itself rather than by a guessed number.
+ * ───────────────────────────────────────────────────────────────────────────────────────── */
 
-@media (max-width: 640px) {
+html {
+  /* A phone browser inflating type on rotate resizes half this interface and none of the
+     rest. These sizes are already chosen for a small screen. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  /* A grey flash on every tap reads as a web page. Focus rings stay — they are what keyboard
+     and switch-control users navigate by. */
+  -webkit-tap-highlight-color: transparent;
+  /* Pull-to-refresh would reload the bundle and drop every stream mid-conversation. */
+  overscroll-behavior-y: contain;
+}
+
+@media (max-width: 760px) {
+  /* The insets, on the three edges that touch them. */
   .topbar-inner {
-    height: auto;
-    flex-wrap: wrap;
-    gap: 10px;
-    padding: 10px 14px;
+    padding: max(10px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 10px
+      max(16px, env(safe-area-inset-left));
   }
-  .nav {
-    order: 3;
-    width: 100%;
+  .page {
+    padding-left: max(16px, env(safe-area-inset-left));
+    padding-right: max(16px, env(safe-area-inset-right));
+    padding-bottom: calc(72px + env(safe-area-inset-bottom));
   }
+
+  /* The switcher goes hard right on the first row, which is the half of a phone screen a
+     thumb reaches without moving the hand holding it, and its menu spans the width rather
+     than hanging off the edge of the control that opened it. */
   .switcher {
+    /* The switcher takes the free space, not the theme toggle: which backend you are about to
+       act on is the thing worth anchoring to the edge a thumb starts from. */
     margin-left: auto;
+    order: 2;
+  }
+  /* Order matters here rather than merely tidying: the nav is `order: 3` with a full-width
+     basis, so anything left at the default order lands on a third row of its own. */
+  .topbar-end {
+    margin-left: 0;
+    order: 2;
+  }
+  .switcher-button {
+    height: 36px;
+    padding: 0 12px;
   }
   .switcher-menu {
-    left: auto;
+    left: 0;
     right: 0;
+    min-width: 0;
+  }
+  .switcher-item {
+    padding: 12px 10px;
+  }
+  /* ⌘1…9 is not a thing you can press here. */
+  .switcher-item-key {
+    display: none;
+  }
+
+  .nav-link {
+    min-height: 40px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* 44px is the smallest target a finger hits reliably, and every control this app has is one
+     of these four. */
+  .button,
+  .cancel-button,
+  .chat-start button,
+  .chat-actions button {
+    min-height: 44px;
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  /* Anything under 16px makes iOS zoom the page the moment the field is focused, and leave it
+     zoomed. */
+  .field-input,
+  .chat-start input,
+  .chat-compose textarea {
+    font-size: 16px;
+    min-height: 44px;
+  }
+
+  .page-head-end {
+    flex-wrap: wrap;
   }
   .backend-row {
     flex-wrap: wrap;
@@ -1801,5 +1882,22 @@ a.row:hover .row-title {
     width: 100%;
     justify-content: flex-start;
     padding-left: 21px;
+  }
+
+  /* The conversation gets the screen, and the box you type in stays on it. `dvh` rather than
+     `vh` is the difference between the compose box sitting above the keyboard and behind it. */
+  .chat-transcript {
+    max-height: 58dvh;
+  }
+  .chat-compose {
+    position: sticky;
+    bottom: 0;
+    z-index: 10;
+    background: var(--page);
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--rule-soft);
+  }
+  .chat-compose textarea {
+    min-height: 76px;
   }
 }

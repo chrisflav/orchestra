@@ -28,7 +28,26 @@ url = "2"
 [dependencies.reqwest]
 version = "0.12"
 default-features = false
-features = ["json", "stream", "rustls-tls-native-roots", "http2"]
+features = ["json", "stream", "http2"]
+
+# Which roots TLS is verified against, and it differs by platform.
+#
+# On the desktop the operating system's own store is the right answer: a company CA that is
+# already trusted there is trusted here too, with no second place to install it. On a phone it
+# is not available — Android keeps its trust store behind the Java APIs, and the crate that
+# reads a Unix one finds nothing there — so those two targets carry Mozilla's roots with them
+# instead. The consequence is worth stating plainly: a backend whose certificate is signed by a
+# private CA is reachable from the desktop app and not from the phone, where the answer is a
+# publicly-rooted certificate or, on your own network, `allowInsecureTls`.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["rustls-tls-native-roots"]
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["rustls-tls-webpki-roots"]
 
 # The keychain is per platform and has no meaning on mobile, where the app's own data directory
 # is already private to it. `secrets.rs` falls back to that directory anywhere the crate is

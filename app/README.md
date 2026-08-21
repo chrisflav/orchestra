@@ -30,7 +30,38 @@ the password it was started with — `--password`, `$ORCHESTRA_DASHBOARD_PASSWOR
 `<data>/dashboard.secret` on that host. Nothing is stored until the address and the password
 have both been proved to work.
 
-For a bundle:
+## the phone
+
+Android and iOS are the same codebase and the same core; what differs is the toolchain that
+builds them and where the secrets end up. `docs/native-app.md` has the detail — including the one
+behaviour that is genuinely different on a phone, which trust roots TLS is verified against.
+
+```sh
+npm run android:init     # writes the Gradle project under src-tauri/gen/android
+npm run android:dev      # on a device or emulator, with hot reload
+npm run android:apk      # a debug APK under gen/android/app/build/outputs/apk/
+npm run ios:init         # the Xcode project; needs a Mac
+npm run ios:dev
+```
+
+This needs a JDK, the Android SDK (platform 34, build-tools 34) and the NDK, with `NDK_HOME`
+pointing at it, plus the four Rust targets:
+
+```sh
+rustup target add aarch64-linux-android armv7-linux-androideabi \
+                  i686-linux-android x86_64-linux-android
+```
+
+`gen/` is not tracked. It is generated from `tauri.conf.json` and the icons, so regenerating it
+costs less than reviewing a diff of it.
+
+**Not building it yourself:** the `android` job in CI produces a debug APK on every push that
+touches `app/`, and on demand through *Run workflow*. Download it from the run's artifacts as
+`orchestra-app-android-apk`. It is signed with Gradle's debug keystore, which is what makes it
+installable on a handset without a signing identity — a release APK needs a keystore this
+repository deliberately does not hold.
+
+For a desktop bundle:
 
 ```sh
 npm run tauri build    # .dmg / .msi / .deb, .rpm, .AppImage, for the host platform
