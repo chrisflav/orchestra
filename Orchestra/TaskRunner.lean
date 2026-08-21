@@ -218,7 +218,7 @@ def backendIsParallelSafe (backend : Option String) : Bool :=
     exists (`Dirs.skillsDir`). The skills tell an agent to reach for the MCP tools rather than
     `gh` for anything touching pull requests or taxis issues, which it has no way to know
     otherwise. Silently skipped when not installed. -/
-private def defaultPluginDirs (appConfig : AppConfig) : IO (Array String) := do
+def defaultPluginDirs (appConfig : AppConfig) : IO (Array String) := do
   let skills ← Dirs.skillsDir
   if ← skills.pathExists then
     return #[skills.toString] ++ appConfig.pluginDirs
