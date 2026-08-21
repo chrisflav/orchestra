@@ -73,9 +73,12 @@ def partialMessagesAreOptOut : Test := do
 
 @[test]
 def theBudgetBoundsTheWholeSession : Test := do
-  let args := streamArgs { mcpContext := "m", budget := 20.0 }
-  TestM.assert (args.contains "--max-budget-usd")
-    (msg := "a conversation still has a ceiling")
+  -- The value, not just the flag: asserting only that `--max-budget-usd` appears passes just
+  -- as well if the builder hard-codes a number and ignores what it was given, which is the one
+  -- way this could go wrong that matters.
+  let args := streamArgs { mcpContext := "m", budget := 7.5 }
+  TestM.assert (hasPair args "--max-budget-usd" s!"{(7.5 : Float)}")
+    (msg := s!"the caller's ceiling is the one passed; got {args}")
 
 @[test]
 def backendsWithoutAStreamingModeSaySoRatherThanSubstitute : Test := do
