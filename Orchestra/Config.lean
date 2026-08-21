@@ -398,8 +398,8 @@ structure IOTask (i o : ResultType) where
       therefore not the same as `ordered`, and the two must stay distinguishable. -/
   authMode : Option AuthMode := none
   /-- Optional tools to enable beyond the always-available ones (health, refresh_token,
-      get_pr_comments): `"create_pr"`, `"merge_pr"`, `"label_issue"`, `"comment"`, and the
-      project/issue permission groups.
+      get_pr_comments): `"create_pr"`, `"merge_pr"`, `"label_issue"`, `"comment"`,
+      `"create_repository"`, and the project/issue permission groups.
       When absent, the allowed tools are derived from `mode` for backwards compatibility. -/
   tools : Option (List String) := none
   /-- If true, the project folder is mounted read-only in the sandbox.
@@ -631,6 +631,28 @@ instance : FromJson QueueConfig where
     let parallelPerRepo := j.getObjValAs? Nat "parallel_per_repo" |>.toOption |>.getD 1
     return { parallel := max 1 parallel, parallelPerRepo := max 1 parallelPerRepo }
 
+/-- What bounds interactive sessions: the `interactive` block in `config.json`.
+
+    Both are capacity, not access. A session pins a clone slot and an agent process for as long
+    as it lives, and an abandoned browser tab should not hold either forever. Spelled like the
+    `queue` block above, which bounds the same resources for tasks.
+
+    Zero is allowed here, unlike the queue's limits, and means what it says: a daemon that will
+    not hold interactive sessions at all. -/
+structure InteractiveConfig where
+  /-- Sessions that may be up at once, across all repositories. -/
+  maxSessions : Nat := 2
+  /-- How long a session may sit without a turn before the daemon closes it. -/
+  idleTimeoutSeconds : Nat := 1800
+deriving Repr, Inhabited
+
+instance : FromJson InteractiveConfig where
+  fromJson? j := do
+    let maxSessions := j.getObjValAs? Nat "max_sessions" |>.toOption |>.getD 2
+    let idleTimeoutSeconds :=
+      j.getObjValAs? Nat "idle_timeout_seconds" |>.toOption |>.getD 1800
+    return { maxSessions, idleTimeoutSeconds }
+
 structure AppConfig where
   appId : Nat
   privateKeyPath : String
@@ -668,6 +690,8 @@ structure AppConfig where
   taxis : Option Taxis.Config := none
   /-- Queue daemon concurrency. Read only by `orchestra queue start`. -/
   queue : QueueConfig := {}
+  /-- What bounds interactive sessions. -/
+  interactive : InteractiveConfig := {}
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -697,10 +721,12 @@ instance : FromJson AppConfig where
     let additionalSandboxPaths := j.getObjValAs? SandboxPaths "additional_sandbox_paths" |>.toOption |>.getD {}
     let taxis := j.getObjValAs? Taxis.Config "taxis" |>.toOption
     let queue := j.getObjValAs? QueueConfig "queue" |>.toOption |>.getD {}
+    let interactive := j.getObjValAs? InteractiveConfig "interactive" |>.toOption |>.getD {}
     let defaultOrganization := j.getObjValAs? String "default_organization" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs, additionalSandboxPaths, taxis, queue, defaultOrganization }
+             agentAuthConfigs, additionalSandboxPaths, taxis, queue, interactive,
+             defaultOrganization }
 
 structure TaskFile where
   tasks : Array Task

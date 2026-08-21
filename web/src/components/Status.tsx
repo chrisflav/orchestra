@@ -22,6 +22,11 @@ const SECTION: Record<string, Section> = {
   cancelled: "rest",
   unfinished: "rest",
   abandoned: "rest",
+  // Interactive sessions. `idle` is a session up and waiting for someone to type, which is
+  // waiting in the same sense `pending` is; `ended` finished, and `starting` is on its way.
+  starting: "pending",
+  idle: "pending",
+  ended: "done",
 };
 
 export function sectionOf(status: string): Section {

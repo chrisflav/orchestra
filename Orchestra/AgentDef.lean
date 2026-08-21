@@ -7,6 +7,35 @@ open Orchestra.StreamFormat
 
 namespace Orchestra
 
+/-- Everything a bidirectional streaming invocation needs to know.
+
+    A structure rather than eight more positional parameters, because that is what the two
+    existing builders already cost to read: `buildArgs` takes six `Option String`s in a row, and
+    which one is the system prompt is a matter of counting commas. Nothing here is shared with
+    those two, so the new field can be spelled the better way without touching them. -/
+structure StreamOptions where
+  /-- The context string `setupMcp` returned — for most backends, the MCP config path. -/
+  mcpContext : String
+  pluginDirs : Array String := #[]
+  subAgent : Option String := none
+  model : Option String := none
+  systemPrompt : Option String := none
+  /-- Resume a session this backend created earlier. Set when a dead session is revived; the
+      agent picks up the conversation rather than starting one. -/
+  resume : Option String := none
+  /-- Assign the session id up front rather than reading it back out of the stream.
+
+      Worth doing because the alternative only works if the process lives long enough to say
+      it: a crash before the first event leaves a session with no id, and so no way to resume
+      the conversation it had already started. Ignored by a backend whose CLI cannot be told
+      what to call a session. -/
+  sessionId : Option String := none
+  /-- Maximum spend, in USD, for the whole session — not for one turn. -/
+  budget : Float := 20.0
+  /-- Ask for partial message chunks as they arrive, for a client that renders text as it is
+      typed. Off by default: it multiplies the volume of the transcript several times over. -/
+  partialMessages : Bool := false
+
 /-- Describes how to invoke and communicate with a specific coding agent backend. -/
 structure AgentDef where
   /-- The executable name (e.g., "claude"). -/
@@ -29,6 +58,14 @@ structure AgentDef where
       like `--print` and `--output-format=stream-json`. -/
   buildInteractiveArgs : String → Array String → Option String → Option String → Option String → Option String → Float
                        → Array String
+  /-- Build command-line args for a **bidirectional streaming** invocation: one process that
+      reads user turns from stdin as they arrive and streams its events on stdout, rather than
+      one process per prompt.
+
+      `none` — the default — for a backend whose CLI has no such mode. That is not a detail to
+      paper over: a caller that asks such a backend to host an interactive session is told so
+      and refused, rather than silently given something else. -/
+  buildStreamArgs : StreamOptions → Option (Array String) := fun _ => none
   /-- Extra command-line args that hold the run to a *goal*: a condition the agent must not stop
       before it satisfies, judged by a second model call rather than by the agent itself.
 
@@ -39,9 +76,12 @@ structure AgentDef where
       (`Sandbox.launchAgent`) then says so once and runs without a goal, rather than passing a
       flag the backend would reject. -/
   goalArgs : String → Option (Array String) := fun _ => none
-  /-- Parse one line of the agent's stdout stream output.
-      Returns `none` for events that should be suppressed. -/
-  parseOutputLine : String → Option Event
+  /-- Parse one line of the agent's stdout stream output into the events it carries.
+
+      An array because one line is not one event: an assistant message carries a list of content
+      items, and rendering only one of them loses the rest. An empty array is a line with
+      nothing to show — one that does not parse, or one that is deliberately suppressed. -/
+  parseOutputLine : String → Array Event
   /-- Try to extract the session ID after the run.
       Used for agents that don't emit the session ID in the output stream.
       Receives the context string from setupMcp. -/

@@ -58,7 +58,8 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
 - **Usage-limit awareness.** Every Claude subscription limit is tracked — session, weekly, and
   the weekly limits scoped to one model family — so work is routed to an account that can still
   run it instead of into a wall. Several accounts can back one listener, used in order or
-  balanced across → [usage limits](#usage-limits)
+  balanced across, and what each one has spent is kept window by window and graphed →
+  [usage limits](#usage-limits)
 - **Listeners** that poll GitHub issues, comments, pull request reviews, labels, or an arbitrary
   shell command, and enqueue a task — or a whole workflow — when something matches.
 - **An autonomous project pipeline.** Projects and issues live in a
@@ -69,6 +70,9 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
   validation fails.
 - **Recorded history.** Every run is stored, can be grouped into a named series, and resumed with
   a follow-up prompt.
+- **Chat sessions the backend holds.** A conversation with an agent, in the same sandbox a task
+  gets, reachable over the API from the CLI, the dashboard or a phone — and still running after
+  the client that started it goes away → [interactive sessions](#interactive-sessions)
 
 ## prerequisites
 
@@ -124,9 +128,9 @@ orchestrad dashboard --site web/dist   # the API and the web UI alone
 
 `orchestra` is the client. Its configuration commands — `orchestra config`, `orchestra listener`
 — are HTTP clients of `orchestrad`, so a running daemon picks up a change without a restart and
-there is never a second writer racing it for the same file. Its other commands (`run`,
-`interactive`, `prepare`) execute locally, because what they do is launch a sandbox on the
-machine you are sitting at.
+there is never a second writer racing it for the same file. `orchestra chat` is one too: the
+session it talks to runs on the backend. Its other commands (`run`, `interactive`, `prepare`)
+execute locally, because what they do is launch a sandbox on the machine you are sitting at.
 
 `orchestra queue start` and `orchestra dashboard` still work and still mean what they meant: they
 start `orchestrad`, looked for next to the `orchestra` binary, then at `$ORCHESTRA_SERVER_BIN`,
@@ -166,6 +170,9 @@ fork is what the agent pushes to. If the App cannot push to a target and `defaul
 unset, the task is skipped rather than dispatched at a repository it cannot push to — so set this
 whenever the dispatcher works on repositories the App is not directly installed on. The App must be
 installed on `default_organization` with permission to create repositories.
+
+It is also the destination of the `create_repository` MCP tool, which is the only way an agent
+creates a repository from scratch rather than by forking — and the only owner that tool will use.
 
 **The target must be readable by the App.** A task's token is minted for the *fork's* installation,
 and that token is what fetches the upstream. Public targets are fine. A private target the App is
@@ -443,6 +450,21 @@ that source. Both write to `<data>/usage/<backend>/<label>.json`, which is
 shared across processes — a limit `orchestra run` discovers in a terminal stops
 the daemon from dispatching to that source too.
 
+Every poll is also kept, so the account's past is readable and not only its
+present. It is kept one record per *window* rather than one per poll: a session
+window and a weekly total are counters that fill and then reset, so the peak
+reading inside one is what that session or that week consumed. The records live
+in `<data>/usage/<backend>/<label>.history.json`, they are what the
+[dashboard's](#dashboard) usage graphs are drawn from, and they are bounded —
+240 windows per series, nothing older than six months.
+
+A window is identified by the reset time every poll inside it reports, so a new
+reset time is a new window; where nothing reports one, utilisation that dropped
+is what marks the rollover. Only polls are recorded. An observed hit knows that
+a limit was reached but not where its counter stood, so folding one in would
+invent a reading rather than keep one — the poll that follows it reports the
+real number.
+
 API-key sources have no subscription window to poll (they bill per token
 against an organisation), so they are always considered available until a run
 proves otherwise.
@@ -473,6 +495,31 @@ simulate `distribute` instead of `ordered`.
 System prompts can be placed in `~/.config/orchestra/prompts/`. The file
 `~/.config/orchestra/prompts/default.md` is loaded automatically; named prompts can be
 referenced via the `system_prompt` field in a task file.
+
+### the plan a setup-token cannot state
+
+Claude Code checks a model's entitlement against the subscription it is
+holding, and it learns that subscription from the account profile it fetches at
+`/login`. A long-lived `claude setup-token` — which is what an `oauth_token`
+source carries — has inference scope and nothing else, so that profile is never
+fetched and the client ends up holding no plan at all. Checks that cannot
+confirm the subscription covers a model then fail closed: a Max account is told
+that Fable, a standard part of that plan, requires usage credits
+([anthropics/claude-code#79597][fable-issue]). The server grants the very same
+token Fable perfectly well — it is the client refusing, in the plan's name.
+
+In that mode the client reads the plan and the rate-limit tier from
+`CLAUDE_CODE_SUBSCRIPTION_TYPE` and `CLAUDE_CODE_RATE_LIMIT_TIER` instead of
+from a profile, precisely because there is no profile to read. So orchestra
+sets both beside every OAuth token it passes — an `oauth_token` source or the
+legacy flat `claude_token`: `max` and `default_claude_max_20x`, the plan its
+accounts are on. Nothing to configure, and nothing granted by it — every
+request is still authorised and priced by the server against the token, so the
+value can only make the client's local guess right or wrong. API-key sources
+get neither: they bill an organisation per token and have no subscription to
+describe.
+
+[fable-issue]: https://github.com/anthropics/claude-code/issues/79597
 
 ## task files
 
@@ -604,8 +651,9 @@ granted — orchestra warns about missing `$HOME`-relative paths rather than let
 ## MCP tools
 
 The agent has access to the following tools via the built-in MCP server. `health`, `refresh_token`,
-and `get_pr_comments` are always available; `create_pr`, `merge_pr`, `label_issue` and `comment`
-must be enabled explicitly by adding them to the `tools` list in the task configuration.
+and `get_pr_comments` are always available; `create_pr`, `merge_pr`, `label_issue`, `comment` and
+`create_repository` must be enabled explicitly by adding them to the `tools` list in the task
+configuration.
 
 - `health` — check that the MCP server is running
 - `refresh_token` — refresh the GitHub App installation token
@@ -626,6 +674,21 @@ must be enabled explicitly by adding them to the `tools` list in the task config
   case-insensitively. An addition the issue already carries and a removal it does not are reported
   and skipped, so calling twice changes nothing. Unlike `comment`, it can label any issue, not
   only the one the task was launched from
+- `create_repository` — create a new repository in `default_organization`, the organisation tasks
+  are forked into. Takes `name` plus optional `description`, `private` (default `true`) and
+  `auto_init` (default `false`, i.e. an empty repository ready for a first push). The owner is not
+  an argument: the configured organisation is the one place the operator has already agreed is
+  orchestra's to write to, and the tool refuses when none is set. Unlike forking it is not
+  idempotent — a name the organisation already uses is refused rather than handed back, so a push
+  never lands in a repository the task did not just create. Authenticated by the organisation's own
+  GitHub App installation, which needs the `Administration: read and write` permission. The result
+  carries a token to push with, scoped to the new repository alone and expiring in an hour like
+  every installation token — the agent is given it as a remote URL to use once, not as a `GH_TOKEN`
+  to export, since that variable is what authenticates its work on its own fork. A token from
+  `refresh_token` is minted for whichever installation the task runs under, so it reaches the new
+  repository only when that installation covers `default_organization` — which is the case when
+  the task works on a fork, and not when the App could push to the target directly. Grant it
+  deliberately, like `merge_pr`
 - `comment` — post a comment on the issue or pull request the task was launched from.
   Supports four modes:
   - **regular comment**: provide only `body`
@@ -713,6 +776,10 @@ tools, and none of the ones that act on a repository.
 orchestra interactive
 ```
 
+That one is local: it hands *this* terminal to the agent. For the same conversation held by the
+backend instead — reachable from the dashboard or a phone, and still there after you close the
+terminal — see [interactive sessions](#interactive-sessions).
+
 ## concert workflows
 
 Workflows are YAML files that describe a multi-step agent program. Steps run
@@ -783,7 +850,7 @@ Inspect and control the daemon:
 ```
 orchestra queue                # show queued entries
 orchestra queue status         # daemon status and running tasks
-orchestra queue cancel         # cancel the running task, keep the daemon going
+orchestra queue cancel         # cancel the running tasks, keep the daemon going
 orchestra queue shutdown       # stop after the current task (--force cancels it)
 ```
 
@@ -980,6 +1047,12 @@ checked, task history with the full structured log of each run, projects with th
 dependency graph, and every configured authentication source with the usage limits last reported
 for it. Pages stream updates over Server-Sent Events, so they stay current without a reload.
 
+It reads, with one exception: a running task's page carries a *Cancel* button beside its status,
+which stops that one run without a shell. It asks before it does anything, and it is per task,
+not per batch — everything else the daemon is running carries on. The queue itself is untouched:
+pending entries start as slots free up, and the cancelled entry lands as `cancelled`, which
+[`orchestra queue retry`](#queue-mode) re-enqueues.
+
 The UI is a React/TypeScript app under [`web/`](web/), built by Vite; the backend is the Lean
 server behind `orchestrad dashboard`, which answers the JSON API, its SSE streams, and — with
 `--site` — the built front-end, all on one port:
@@ -1018,6 +1091,14 @@ The **Auth** page is the one to open when the queue has pending work but nothing
 names the limit that is binding on each source and when it lifts — the same data as
 [`orchestra usage`](#usage-limits), read from the usage store rather than polled, so opening the
 page costs nothing.
+
+It also draws where each source has been: a bar per session window and a bar per week, so a
+week that ran hot, an account that is always the one at 100%, or a load that is not being
+spread the way the pool was meant to spread it are visible as a shape rather than assembled
+from a single percentage. The axis is the limit itself and never the data's own range — half
+height is half a window spent, in every chart on the page — and the bar still filling is drawn
+lighter, because its number is not final. That history has its own endpoint, `/api/v1/usage`,
+so it is readable by anything else too.
 
 ### the API
 
@@ -1060,8 +1141,39 @@ curl -H "Authorization: Bearer $PASSWORD" \
 
 Three resources are configuration, and all three are writable: **listeners**, **roles** and
 **skills**. Everything else the API serves is a record of something that already happened, or is
-owned by another system, and stays read-only. Nothing here enqueues or cancels work — that is
-the daemon's control socket, which is not on the network at all.
+owned by another system, and stays read-only. Nothing here enqueues a *task* — the queue is fed
+over the daemon's control socket, which is not on the network at all.
+
+Some routes are actions rather than documents. None of them writes a file; each forwards a single
+message to that same control socket, which is where the CLI sends its own. `POST
+/api/v1/queue/{id}/cancel` stops the one running task that id names, and the five
+[interactive session](#interactive-sessions) routes start, drive and end a chat. That second set
+is the one place this API starts an agent — see the note at the end of that section.
+
+Taking the cancel route as the pattern for all of them: it forwards a message naming the entry to
+the socket, which is where [`orchestra queue cancel`](#queue-mode) sends its own. The socket
+stays off the network; these routes are the only things on the HTTP side that speak to it, and
+each takes the credential like every other non-`GET`.
+
+The id may be a queue entry's id or the id of the run it became; both are ids this API hands out
+for the same piece of work, and the server resolves either.
+
+```sh
+# stop one run; everything else the daemon is running carries on
+curl -X POST -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data '{}' \
+     http://127.0.0.1:8080/api/v1/queue/20260819-a3f1/cancel
+# → {"id":"20260819-a3f1","taskId":"t20260819T1004"}
+```
+
+`404` means no entry and no run carries that id. `409` means it exists and is not running — the
+message names the status it is in — or that the daemon is not running or did not answer, which
+is a statement about the daemon rather than about the server answering. The cancelled entry
+lands as `cancelled`, which `orchestra queue retry` re-enqueues, and the pending entries behind
+it start as slots free up: cancelling stops a run, not the queue.
+
+There is no unaddressed spelling of this route. Stopping *everything* is `orchestra queue cancel`
+over the control socket, where the person typing it is on the host already.
 
 ```sh
 # create or replace a listener; the body is the config document itself
@@ -1100,6 +1212,99 @@ What a write costs: a listener change takes effect on that listener's next tick,
 *added* or *deleted* within fifteen seconds, which is how often the daemon rescans the directory.
 A role change takes effect on the dispatcher's next tick, since roles are read per dispatch. A
 skill change applies to tasks launched after it. Nothing here needs a restart.
+
+## interactive sessions
+
+A **session** is a conversation with an agent, held open by the daemon and reachable over the
+API. `orchestra chat` talks to one, the dashboard shows one, and a phone can too — all three are
+clients of the same five routes, and nothing in the server is specific to any of them.
+
+This is the third shape orchestra runs an agent in. A [task](#task-files) is one prompt in and
+one run out; [`orchestra interactive`](#running-tasks) is a real conversation but strictly local,
+because it hands your terminal to the agent's own TUI. A session is that conversation without the
+terminal: the agent runs on the backend, in the same sandbox with the same credentials and the
+same MCP tools a task would get, and it stays up between turns rather than being relaunched for
+each one — the clone slot, the MCP server and the process are acquired once and kept, so a second
+turn costs a line on a pipe.
+
+```sh
+orchestra chat --upstream owner/repo --fork your-org/repo
+```
+
+Type a turn, press enter, watch it work. The other three spellings:
+
+```
+orchestra chat --list              # every session, running and finished
+orchestra chat --session <id>      # pick one back up, transcript and all
+orchestra chat --end <id>          # end it and release what it holds
+```
+
+Detaching and ending are different, and only one of them can be undone. `/quit`, Ctrl-D and
+closing the terminal all leave the session running on the backend; `--end` is how you end it.
+That is what makes it worth having a session rather than a TUI: you can start one at a desk,
+close the laptop, and pick the same conversation up from the dashboard.
+
+Only backends whose CLI can read turns from standard input can host a session, which today means
+`claude`. Asking for another is refused when the session is created, in a message naming it —
+never quietly substituted, because a backend that answers the first turn and exits looks exactly
+like a session that ended on its own.
+
+Two limits bound them, in an `interactive` block in `config.json`:
+
+```json
+{ "interactive": { "max_sessions": 2, "idle_timeout_seconds": 1800 } }
+```
+
+They are capacity, not access. A session pins a clone slot — one of the same slots the queue
+claims from, so a task can never take it and reset the working tree mid-conversation — and an
+abandoned browser tab should not hold one forever. `max_sessions` of `0` means a daemon that will
+not hold sessions at all.
+
+### over HTTP
+
+```sh
+# start one
+ID=$(curl -sX POST -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data '{"upstream":"owner/repo","fork":"your-org/repo"}' \
+     http://127.0.0.1:8080/api/v1/interactive | jq -r .id)
+
+# say something
+curl -X POST -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data '{"text":"why does the queue stall when nothing is running?"}' \
+     http://127.0.0.1:8080/api/v1/interactive/$ID/messages
+
+# watch it answer
+curl -N -H "Authorization: Bearer $PASSWORD" \
+     "http://127.0.0.1:8080/sse/v1/interactive/$ID/events?after=0"
+```
+
+`POST /api/v1/interactive/{id}/interrupt` abandons the turn in flight without ending the session,
+and `DELETE /api/v1/interactive/{id}` ends it.
+
+The transcript is the one stream in this API that is not a whole document re-read. A conversation
+only grows, so re-sending all of it every time a word is added is quadratic in its length. It
+carries a cursor instead: every frame holds only what follows the last one, and its `id` is the
+last sequence number in it, so a browser reconnecting with `Last-Event-ID` — or anything else
+passing the same number as `?after=` — resumes exactly where it dropped, with nothing seen twice
+and nothing missed.
+
+Reads come off `<data>/interactive/<id>/`, where the daemon writes the session record and an
+append-only transcript. Writes go the other way, forwarded to the daemon's control socket,
+because a session is a live process and only the daemon holds one. That split is why the reads
+answer identically whether the API and the daemon are one process or the two containers the
+[compose deployment](docker/README.md) runs.
+
+### what this changes
+
+`POST /api/v1/interactive` is the first route in this API that **starts an agent**. Everything
+before it read state or edited configuration. It is gated by the same shared secret, the same
+session cookie and the same `Content-Type: application/json` rule as every other write, and by
+nothing else — so a credential that could read the dashboard can now also start an agent with a
+repository, credentials and tools. On a loopback bind that is the same person who could already
+type `orchestra interactive`; on a wider one it is worth knowing before you set `--host`.
+
+The full design — the session lifecycle, what happens on a crash or a daemon restart, and the
+schemas — is in [`docs/interactive.md`](docs/interactive.md).
 
 ## configuration over the API
 
@@ -1145,6 +1350,7 @@ Two things are deliberately *not* writable through the API:
 orchestra prepare <upstream> <fork>   # clone the fork and configure remotes
 orchestra cleanup                     # remove all cloned repositories
 orchestra cleanup list                # list clones and their task slots
+orchestra chat --upstream <u> --fork <f>   # talk to an agent the backend holds open
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
 orchestra usage                       # usage limits of every configured auth source
 orchestra config list listeners       # read and change configuration through the backend API

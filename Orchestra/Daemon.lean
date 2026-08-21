@@ -7,6 +7,7 @@ import Orchestra.GitHub
 import Orchestra.Listener
 import Orchestra.Project
 import Orchestra.Queue
+import Orchestra.Interactive
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.TaskRunner
@@ -56,13 +57,26 @@ structure Config where
   /-- Maximum tasks running at once on any one repository. -/
   parallelPerRepo : Option Nat := none
 
+/-- A task the daemon is running right now, together with the handle that stops it.
+
+    `tokenId` is the daemon's own key for the row, allocated at claim time under the claim mutex
+    (see `claimNextEntry`). `entryId` is the queue entry's id, which is what a client that wants
+    to stop *one* task has: entries are what the queue, the concert steps and the dashboard all
+    name a run by. Cancelling by that id rather than by the token id is what keeps this table an
+    implementation detail of the daemon rather than something a caller has to have been told. -/
+structure ActiveTask where
+  tokenId : Nat
+  entryId : String
+  token   : Std.CancellationToken
+
 def handleSocketRequest
     (conn             : Utils.UnixSocket.Connection)
     (appConfig        : Orchestra.AppConfig)
     (concertMgr       : ConcertManager.ConcertManager)
     (debug            : Bool)
     (shutdownToken    : Std.CancellationToken)
-    (activeTaskTokens : Std.Mutex (Array (Nat × Std.CancellationToken)))
+    (activeTaskTokens : Std.Mutex (Array ActiveTask))
+    (interactive      : Interactive.Manager)
     : IO Unit := do
   try
     let line ← conn.recvLine
@@ -112,18 +126,51 @@ def handleSocketRequest
           match result with
           | .ok id   => pure (.withId id)
           | .error e => pure (.error e)
-        | .cancel =>
-          let pairs ← activeTaskTokens.atomically (·.get)
-          for (_, token) in pairs do
-            token.cancel .cancel
-          pure DaemonRequest.DaemonResponse.ok
+        | .cancel id =>
+          let actives ← activeTaskTokens.atomically (·.get)
+          match id with
+          -- No id: every running task, which is what `orchestra queue cancel` has always meant
+          -- and what a second termination signal does.
+          | none =>
+            for a in actives do
+              a.token.cancel .cancel
+            pure DaemonRequest.DaemonResponse.ok
+          -- One named task. An id that names nothing running is reported rather than passed
+          -- over in silence: to the caller, "cancelled" and "was never running" are different
+          -- answers, and only this process can tell them apart.
+          | some entryId =>
+            match actives.find? (·.entryId == entryId) with
+            | some a =>
+              a.token.cancel .cancel
+              pure (DaemonRequest.DaemonResponse.withId entryId)
+            | none =>
+              pure (DaemonRequest.DaemonResponse.error s!"no running task with id {entryId}")
         | .shutdown force =>
           if force then
-            let pairs ← activeTaskTokens.atomically (·.get)
-            for (_, token) in pairs do
-              token.cancel .cancel
+            let actives ← activeTaskTokens.atomically (·.get)
+            for a in actives do
+              a.token.cancel .cancel
           shutdownToken.cancel .shutdown
           pure DaemonRequest.DaemonResponse.ok
+        -- The four interactive verbs. Each answers the id it acted on, or a sentence saying why
+        -- it could not — the HTTP route in front of them turns that sentence into a status, in
+        -- exactly the way `POST /api/v1/queue/{id}/cancel` already does.
+        | .interactiveStart spec =>
+          match ← interactive.start appConfig spec debug with
+          | .ok record => pure (.withId record.id)
+          | .error e   => pure (.error e)
+        | .interactiveMessage id text =>
+          match ← interactive.send id text with
+          | .ok seq  => pure (.withId (toString seq))
+          | .error e => pure (.error e)
+        | .interactiveInterrupt id =>
+          match ← interactive.interrupt id with
+          | .ok ()   => pure (.withId id)
+          | .error e => pure (.error e)
+        | .interactiveEnd id =>
+          match ← interactive.close id with
+          | .ok ()   => pure (.withId id)
+          | .error e => pure (.error e)
         | .claimIssue pid iid taskId agent series =>
           let now ← TaskStore.currentIso8601
           match ← Project.tryClaim TaskRunner.globalClaimManager pid iid taskId agent now series with
@@ -162,8 +209,9 @@ def run (cfg : Config) : IO UInt32 := do
     cfg.parallelPerRepo.getD appConfig.queue.parallelPerRepo
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
-  -- Map of (id → cancel token) for all currently running tasks (one per worker).
-  let activeTaskTokens ← Std.Mutex.new (Array.empty : Array (Nat × Std.CancellationToken))
+  -- Every task running right now and the token that stops it (one row per worker), which is
+  -- what a `cancel` off the control socket reaches — for one entry, or for all of them.
+  let activeTaskTokens ← Std.Mutex.new (Array.empty : Array ActiveTask)
   let nextTokenId ← IO.mkRef (0 : Nat)
   -- Mutex serialising the "find next pending + mark running" claim operation.
   let claimMutex ← Std.BaseMutex.new
@@ -176,6 +224,36 @@ def run (cfg : Config) : IO UInt32 := do
   let exclusiveActive ← IO.mkRef false
   -- Concert manager: handles suspended concert fibers waiting for task results.
   let concertMgr ← ConcertManager.new
+  -- Interactive sessions. Their clone slots come out of the same table the queue claims from,
+  -- through the two closures below, so a session and a task can never be handed the same slot.
+  -- Reserving through `claimMutex` — the mutex the claim path already holds — is what makes
+  -- that true rather than merely likely.
+  --
+  -- A session's slot is *not* counted in `totalActive`: that number bounds how many agents are
+  -- working at once, and a session waiting for someone to type is not working. The per-repo
+  -- limit is a different question — it bounds how many working trees a repository has — and a
+  -- session holds one of those for as long as it lives, so it is counted there.
+  let reserveInteractiveSlot (fork : Repository) : IO (Option Nat) := do
+    claimMutex.lock
+    try
+      let occupied := (← activeSlots.get).getD fork.toString #[]
+      let some (slot, _) := Queue.chooseSlot occupied parallelLimitPerRepo none | return none
+      activeSlots.modify (fun m => m.insert fork.toString (occupied.push slot))
+      return some slot
+    finally claimMutex.unlock
+  let releaseInteractiveSlot (fork : Repository) (slot : Nat) : IO Unit := do
+    claimMutex.lock
+    try
+      let occupied := (← activeSlots.get).getD fork.toString #[]
+      activeSlots.modify (fun m => m.insert fork.toString (occupied.filter (· != slot)))
+    finally claimMutex.unlock
+  let interactive ← Interactive.Manager.new
+    { maxSessions        := appConfig.interactive.maxSessions
+      idleTimeoutSeconds := appConfig.interactive.idleTimeoutSeconds }
+    reserveInteractiveSlot releaseInteractiveSlot
+  -- Sessions on disk describe agent processes that died with the last daemon. Closed before
+  -- anything can read them, so a client never attaches to a conversation that will not answer.
+  Interactive.reconcile
   -- Socket server: receives control requests (add_task, add_concert, cancel, shutdown).
   let socketPath ← Queue.socketFile
   try Utils.UnixSocket.Server.unlink socketPath catch _ => pure ()
@@ -188,6 +266,7 @@ def run (cfg : Config) : IO UInt32 := do
         let conn ← server.accept
         let _h ← IO.asTask (prio := .dedicated) do
           handleSocketRequest conn appConfig concertMgr cfg.debug shutdownToken activeTaskTokens
+            interactive
     catch _ => pure ()
   -- Signal watcher: turns SIGTERM/SIGINT into the same graceful drain as `queue shutdown`.
   -- Needed because the daemon is PID 1 in the container image, where `docker stop` is the way in
@@ -213,9 +292,9 @@ def run (cfg : Config) : IO UInt32 := do
       -- once that they are willing to wait, and then changed their mind.
       if n > 1 then
         IO.println "Second termination signal; cancelling in-flight tasks."
-        let pairs ← activeTaskTokens.atomically (·.get)
-        for (_, token) in pairs do
-          token.cancel .cancel
+        let actives ← activeTaskTokens.atomically (·.get)
+        for a in actives do
+          a.token.cancel .cancel
         break
       IO.sleep 200
   -- Helper: atomically claim the next pending entry, marking it as running.
@@ -315,9 +394,10 @@ its workspace; it will start from a clean checkout."
   let runEntryBody (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
       (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
     let taskToken ← Std.CancellationToken.new
-    activeTaskTokens.atomically (·.modify (·.push (tokenId, taskToken)))
+    let active : ActiveTask := { tokenId, entryId := entry.id, token := taskToken }
+    activeTaskTokens.atomically (·.modify (·.push active))
     let removeToken : IO Unit :=
-      activeTaskTokens.atomically (·.modify (·.filter (·.1 != tokenId)))
+      activeTaskTokens.atomically (·.modify (·.filter (·.tokenId != tokenId)))
     -- Terminal writes go through here rather than saving the claim-time snapshot: a socket
     -- `cancel`, a listener, or a cascade from another worker can rewrite this entry's file
     -- while the task runs, and writing the stale snapshot back would silently revert it.
@@ -736,6 +816,17 @@ its workspace; it will start from a clean checkout."
       for _ in List.range listenerScanSeconds do
         if ← shutdownToken.isCancelled then break
         IO.sleep 1000
+  -- Interactive reaper: closes sessions whose agent has gone and sessions that have sat too
+  -- long without a turn. Its own fiber rather than a step in the worker loop, because a worker
+  -- blocks for as long as the task it is running and a session waiting to be reaped is holding
+  -- a clone slot the queue could otherwise claim.
+  let _interactiveReaper ← IO.asTask (prio := .dedicated) do
+    while !(← shutdownToken.isCancelled) do
+      try interactive.reap
+      catch e => IO.eprintln s!"  Interactive reaper error: {e}"
+      for _ in List.range 30 do
+        if ← shutdownToken.isCancelled then break
+        IO.sleep 1000
   -- Queue worker loop: claim and run one entry at a time.
   -- Spawning parallelLimit copies of this loop enables parallel execution.
   let workerLoop : IO Unit := do
@@ -767,6 +858,10 @@ its workspace; it will start from a clean checkout."
     for t in workerTasks do
       let _ ← IO.wait t
   finally
+    -- Before the socket goes: a session outlives the worker loop, and a daemon that exited
+    -- without closing one leaves an agent process holding a clone slot with nothing left to
+    -- talk to it, and a record on disk that `reconcile` will have to close on the way back up.
+    try interactive.closeAll catch e => IO.eprintln s!"  Closing sessions failed: {e}"
     match ← socketServerRef.get with
     | some s => try s.close catch _ => pure ()
     | none   => pure ()

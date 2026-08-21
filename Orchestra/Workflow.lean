@@ -81,15 +81,17 @@ structure TaskSpec where
     The always-available tools (`health`, `refresh_token`, `get_pr_comments`) are left out
     because naming one grants nothing — they are already there.
 
-    This is `Project.Role.knownPermissions` plus `merge_pr`. A role is a template dispatched at
-    whatever issue comes along, so it may not land a pull request; a workflow step is written for
-    one job, and naming the step that merges is a decision the author has already made.
+    This is `Project.Role.knownPermissions` plus `merge_pr` and `create_repository`. A role is a
+    template dispatched at whatever issue comes along, so it may neither land a pull request nor
+    create a repository; a workflow step is written for one job, and naming the step that merges
+    — or the step that creates the repository the rest of the workflow fills — is a decision the
+    author has already made.
 
     Kept beside the field it validates, so the parser does not have to link the MCP server or the
     project tooling to reject a typo — which is the point of validating at all. An unknown name
     is otherwise invisible until the agent finds itself without the tool it was told to use. -/
 def TaskSpec.knownTools : List String :=
-  ["create_pr", "merge_pr", "comment", "label_issue",
+  ["create_pr", "merge_pr", "comment", "label_issue", "create_repository",
    "manage_issues", "work_issues", "review_issues"]
 
 /-- Specifies that a step iterates over a list. -/

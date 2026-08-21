@@ -272,6 +272,136 @@ export interface AuthView {
   backends: AuthBackend[];
 }
 
+/** What `POST /api/v1/queue/{id}/cancel` reports back: the work the id resolved to. */
+export interface CancelResult {
+  /** The queue entry that was cancelled. */
+  id: string;
+  /** The run it became, if it had started one. */
+  taskId: string | null;
+}
+
+/**
+ * One session or weekly limit window, rolled up from every poll that landed inside it.
+ *
+ * `peakPercent` is what the window consumed — utilisation only climbs inside a window — and
+ * `percent` is where it last stood, so on a closed window the two agree and on the open one
+ * they say how much of it is already gone.
+ */
+export interface UsageWindow {
+  kind: string;
+  /** Model family a scoped window applies to. */
+  scope: string | null;
+  /** The first poll that landed in this window, not the window's own start. */
+  startedAt: string;
+  updatedAt: string;
+  resetsAt: string | null;
+  peakPercent: number;
+  percent: number;
+  /** How many polls saw this window. One is a glimpse of it, not a measurement. */
+  samples: number;
+  /** Whether this is the window still filling: the newest of its series, not yet past its reset. */
+  open: boolean;
+}
+
+export interface UsageHistorySource {
+  label: string;
+  backend: string;
+  kind: "oauth" | "api-key";
+  /** False for API-key sources, which have no subscription window to accumulate history in. */
+  pollable: boolean;
+  /** Session windows, oldest first — the order a graph is drawn in. */
+  sessions: UsageWindow[];
+  /** Weekly windows, account-wide and model-scoped alike, oldest first. */
+  weeks: UsageWindow[];
+  /** Any other kind upstream reported, so nothing recorded is unreachable. */
+  other: UsageWindow[];
+}
+
+export interface UsageHistoryBackend {
+  name: string;
+  sources: UsageHistorySource[];
+}
+
+export interface UsageHistory {
+  configError: string | null;
+  backends: UsageHistoryBackend[];
+}
+
+
+/* ── Interactive sessions ───────────────────────────────────────────────────────────────── */
+
+export type SessionStatus = "starting" | "idle" | "running" | "ended" | "failed";
+
+export interface SessionSummary {
+  id: string;
+  status: SessionStatus;
+  createdAt: string;
+  lastActivityAt: string;
+  endedAt: string | null;
+  upstream: string;
+  fork: string;
+  backend: string;
+  model: string | null;
+  turnCount: number;
+  costUsd: number;
+  /** The last seq in the transcript. A client that has read this far is current. */
+  lastEventSeq: number;
+  title: string | null;
+  error: string | null;
+}
+
+export interface SessionDetail extends SessionSummary {
+  budget: number;
+  slot: number;
+  agentSessionId: string | null;
+  resumedFrom: string | null;
+}
+
+/**
+ * One line of a transcript. `kind` says what happened and the rest of the fields depend on it,
+ * which is why they are all optional here: narrowing on `kind` is the only safe way to read one.
+ */
+export interface TranscriptEvent {
+  seq: number;
+  occurredAt: string;
+  kind: "user" | "agent" | "turnStarted" | "turnEnded" | "notice";
+  /** `user`. */
+  text?: string;
+  /** `agent`: a stream event, the same shape `LogView` already renders. */
+  event?: LogEvent;
+  /** `turnStarted`, `turnEnded`. */
+  turn?: number;
+  /** `turnEnded`. */
+  subtype?: string;
+  costUsd?: number | null;
+  durationSeconds?: number | null;
+  /** `notice`. */
+  level?: "info" | "warning" | "error";
+  message?: string;
+}
+
+/** A page of a transcript. Not a `Collection`: a cursor is not an offset. */
+export interface Transcript {
+  items: TranscriptEvent[];
+  /** How many events follow the cursor in total, before the window. */
+  total: number;
+  limit: number;
+  /** The cursor this answered. */
+  after: number;
+}
+
+/** What starting a session asks for. Only the two repositories are required. */
+export interface SessionRequest {
+  upstream: string;
+  fork: string;
+  backend?: string;
+  model?: string;
+  budget?: number;
+  tools?: string[];
+  systemPrompt?: string;
+  resumeFrom?: string;
+}
+
 /**
  * Maps each endpoint to the payload it returns. Detail endpoints take a path component, so
  * they are spelled as template literal types — that is what makes `useLiveData("tasks/" + id)`
@@ -285,13 +415,16 @@ export interface Endpoints {
   tasks: Collection<TaskRecord>;
   projects: Collection<ProjectSummary>;
   auth: AuthView;
+  usage: UsageHistory;
+  interactive: Collection<SessionSummary>;
 }
 
 export type DetailEndpoint =
   | `tasks/${string}`
   | `concerts/${string}`
   | `listeners/${string}`
-  | `projects/${string}`;
+  | `projects/${string}`
+  | `interactive/${string}`;
 
 export type Endpoint = keyof Endpoints | DetailEndpoint;
 
@@ -306,7 +439,9 @@ export type PayloadOf<E extends Endpoint> = E extends keyof Endpoints
         ? ListenerDetail
         : E extends `projects/${string}`
           ? ProjectDetail
-          : never;
+          : E extends `interactive/${string}`
+            ? SessionDetail
+            : never;
 
 /** The version prefix every read lives under. See `docs/openapi.json`. */
 export const API_VERSION = "v1";
@@ -340,6 +475,8 @@ export interface QueryParams {
   since?: string;
   /** Only on a task detail. */
   logLimit?: number;
+  /** Only on usage history: how many windows to return per series (a kind and a model scope). */
+  windows?: number;
 }
 
 export function apiUrl(endpoint: string, query?: QueryParams): string {
@@ -396,6 +533,89 @@ export async function login(password: string): Promise<boolean> {
 /** Drop the session, server-side and in the browser. */
 export async function logout(): Promise<void> {
   await postJson("/api/logout");
+}
+
+/**
+ * Ask the daemon to stop one running task, named by its queue entry id or by the id of the run
+ * it became — the server resolves either.
+ *
+ * The only call in this file that changes anything, and it changes exactly one task: nothing
+ * else the daemon is running is affected, and the queue is left alone, so what is pending starts
+ * as slots free up. The URL is built here rather than by `apiUrl`, which percent-encodes
+ * everything after the first slash as a single component and would swallow the `/cancel`.
+ *
+ * A `404` means no entry and no run carries that id; a `409` means it is not running, or the
+ * daemon is not. Both are answers to show, not bugs to swallow.
+ */
+export async function cancelTask(id: string): Promise<CancelResult> {
+  const path = `/api/${API_VERSION}/queue/${encodeURIComponent(id)}/cancel`;
+  const response = await postJson(path, {});
+  if (response.status === 401) throw new UnauthorizedError();
+  if (!response.ok) throw new ApiError(response.status, await readError(response));
+  return (await response.json()) as CancelResult;
+}
+
+
+/* ── Interactive sessions ───────────────────────────────────────────────────────────────── */
+
+/**
+ * The transcript's URLs are built here rather than by `apiUrl`, which percent-encodes everything
+ * after the first slash as a single component and would swallow the `/events` — the same reason
+ * `cancelTask` builds its own.
+ */
+function transcriptPath(kind: "api" | "sse", id: string, after: number): string {
+  return `/${kind}/${API_VERSION}/interactive/${encodeURIComponent(id)}/events?after=${after}`;
+}
+
+export function transcriptUrl(id: string, after: number): string {
+  return transcriptPath("api", id, after);
+}
+
+export function transcriptStreamUrl(id: string, after: number): string {
+  return transcriptPath("sse", id, after);
+}
+
+async function sessionCall(path: string, method: string, body?: unknown): Promise<Response> {
+  const response = await fetch(path, {
+    method,
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  if (response.status === 401) throw new UnauthorizedError();
+  if (!response.ok) throw new ApiError(response.status, await readError(response));
+  return response;
+}
+
+/**
+ * Start a session: the daemon clones the repository, mints a token, starts an MCP server and
+ * launches an agent that stays up across turns.
+ *
+ * The one call in this file that starts an agent. A `409` means the daemon is unreachable, or is
+ * already holding as many sessions as it is configured to; a `400` names a backend that cannot
+ * host one. Both are answers to show.
+ */
+export async function startSession(request: SessionRequest): Promise<SessionDetail> {
+  const path = `/api/${API_VERSION}/interactive`;
+  return (await (await sessionCall(path, "POST", request)).json()) as SessionDetail;
+}
+
+/** Post a turn. Answers the seq it was written at, so a reader knows where it landed. */
+export async function sendTurn(id: string, text: string): Promise<{ id: string; seq: number }> {
+  const path = `/api/${API_VERSION}/interactive/${encodeURIComponent(id)}/messages`;
+  return (await (await sessionCall(path, "POST", { text })).json()) as { id: string; seq: number };
+}
+
+/** Abandon the turn in flight. The session, the clone and the conversation all survive. */
+export async function interruptSession(id: string): Promise<void> {
+  const path = `/api/${API_VERSION}/interactive/${encodeURIComponent(id)}/interrupt`;
+  await sessionCall(path, "POST", {});
+}
+
+/** End a session and release the clone slot, the MCP server and the process. */
+export async function endSession(id: string): Promise<void> {
+  const path = `/api/${API_VERSION}/interactive/${encodeURIComponent(id)}`;
+  await sessionCall(path, "DELETE");
 }
 
 /** Whether the browser currently holds a valid session. */

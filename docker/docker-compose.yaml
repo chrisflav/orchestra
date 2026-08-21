@@ -76,7 +76,9 @@ services:
   #
   # Nothing here dispatches work. It reads the state files the daemon writes, and it writes the
   # configuration files the daemon reads — listeners, roles and skills — which the daemon picks up
-  # without a restart.
+  # without a restart. It can also ask the daemon to cancel one running task, which travels over
+  # the daemon's control socket in /data rather than over any port: that is why the two share
+  # /data and why cancelling works across the container boundary at all.
   dashboard:
     # Same build as above so `docker compose build` produces the one image both services use;
     # Compose builds it once and reuses it.

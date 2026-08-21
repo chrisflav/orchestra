@@ -737,6 +737,14 @@ a.row:hover .row-title {
   font-family: var(--data);
   font-size: 12.5px;
 }
+/* A fact whose value carries a control beside it. Wrapping rather than shrinking, so a narrow
+   column drops the button under the status instead of squeezing both. */
+.fact-inline {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
 
 /* ============================================================
    Panels — only where content genuinely needs a container
@@ -964,6 +972,95 @@ a.row:hover .row-title {
   background: var(--perc);
 }
 
+/* Usage history.
+
+   A bar per limit window on a fixed 0–100 axis: the axis is the limit, never the data's own
+   range, so half height means half a window spent on every source and in every week. The
+   ceiling is a dashed hairline rather than a gridded frame — a bar touching it is the window
+   that ran out, and that is the only reference line the shape needs. */
+
+.charts {
+  display: grid;
+  /* Two across at page width, one on a phone. Wide enough that a chart's caption — the counts
+     that replace a label on every bar — sits on the same line as its title; a source that also
+     reports model-scoped weekly limits has four of these, and three columns crushed the titles
+     into a stack of single words. */
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: 22px 32px;
+  margin-top: 18px;
+}
+.chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  /* The caption drops below the title rather than squeezing it, in the narrow case the line
+     above cannot rule out. */
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  margin-bottom: 10px;
+}
+.chart-title {
+  font-size: 13px;
+  color: var(--mute);
+  white-space: nowrap;
+}
+.chart-note {
+  font-family: var(--data);
+  font-size: 11.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.chart-plot {
+  display: flex;
+  align-items: flex-end;
+  /* Spread rather than packed: the axis below says the right-hand end is now, so the newest
+     window has to sit there. With enough windows to fill the row this does nothing; with five
+     it is what keeps the labels bracketing the bars they describe. */
+  justify-content: space-between;
+  gap: 2px;
+  height: 64px;
+  border-top: 1px dashed var(--rule-soft);
+  border-bottom: 1px solid var(--rule);
+}
+.chart-col {
+  flex: 1 1 0;
+  /* Capped so that a handful of windows read as a handful of windows rather than as slabs. */
+  max-width: 40px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+.chart-bar {
+  width: 100%;
+  border-radius: 3px 3px 0 0;
+  background: var(--strings);
+}
+.chart-bar.warn {
+  background: var(--brass);
+}
+.chart-bar.crit {
+  background: var(--perc);
+}
+/* The window still filling. Drawn lighter, because its number is not final and a bar the same
+   weight as the closed ones would claim it is. */
+.chart-bar.open {
+  opacity: 0.55;
+}
+.chart-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 6px;
+  font-family: var(--data);
+  font-size: 11px;
+  color: var(--faint);
+}
+.chart-empty {
+  font-size: 13px;
+  color: var(--faint);
+  padding: 6px 0;
+}
+
 /* ============================================================
    Sign in
    ============================================================ */
@@ -1066,6 +1163,61 @@ a.row:hover .row-title {
 }
 
 /* ============================================================
+   Cancelling — the one control on a page of readouts.
+   It sits beside the status it acts on and stays quiet until it
+   is armed: a page that is mostly a log should not be led by a
+   red button, and the weight belongs on the confirmation rather
+   than on the invitation.
+   ============================================================ */
+
+.cancel {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.cancel-button {
+  font-family: var(--data);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 5px 9px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: none;
+  color: var(--mute);
+  cursor: pointer;
+}
+.cancel-button:hover:not(:disabled) {
+  background: var(--sunken);
+  color: var(--text);
+}
+.cancel-button.danger:hover:not(:disabled),
+.cancel-button.danger:focus-visible {
+  border-color: var(--perc);
+  background: color-mix(in srgb, var(--perc) 9%, transparent);
+  color: var(--perc);
+}
+.cancel-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.cancel-ask,
+.cancel-note {
+  font-size: 12.5px;
+  color: var(--mute);
+}
+/* The question, not the button, is what has to be read before the second click. */
+.cancel-ask {
+  color: var(--text);
+}
+.cancel-note.bad {
+  color: var(--perc);
+}
+
+/* ============================================================
    Narrow screens
    ============================================================ */
 
@@ -1142,4 +1294,135 @@ a.row:hover .row-title {
   .limit-track {
     width: 30%;
   }
+}
+
+/* Chat.
+ *
+ * The one page that talks back, so it is the one page with a text field on it. Everything
+ * about it borrows: the transcript is `LogView` for the agent's own output, the same
+ * component a task page uses, and the controls take their shape from the login form, which
+ * is the only other place this console asks for typing.
+ *
+ * What is new is only what the agent's stream cannot say — what the person typed, and what
+ * the daemon did — and each of those gets exactly one visual device. A turn is set flush
+ * against a strings-coloured rule on the left, because it is the one thing on the page a
+ * human wrote; a notice is small and takes its colour from the section vocabulary. */
+.chat-start,
+.chat-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 0;
+}
+.chat-start {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.chat-start input,
+.chat-compose textarea {
+  font-family: var(--data);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  padding: 11px 13px;
+}
+.chat-start input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.chat-compose textarea {
+  font-family: var(--ui);
+  resize: vertical;
+  width: 100%;
+  box-sizing: border-box;
+}
+.chat-start input:focus,
+.chat-compose textarea:focus {
+  outline: none;
+  border-color: var(--strings);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--strings) 16%, transparent);
+}
+.chat-compose textarea:disabled {
+  background: var(--sunken);
+  color: var(--mute);
+}
+.chat-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.chat-start button,
+.chat-actions button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 10px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  background: var(--raised);
+  color: var(--text);
+  cursor: pointer;
+}
+/* The affirmative action on each form is the filled one; the rest are outlines, so a page
+   with three buttons on it still has one obvious thing to press. */
+.chat-start button,
+.chat-actions button[type="submit"] {
+  border-color: transparent;
+  background: var(--strings);
+  color: #ffffff;
+}
+.chat-start button:hover:not(:disabled),
+.chat-actions button:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+.chat-start button:disabled,
+.chat-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.chat-actions .chat-end {
+  margin-left: auto;
+  color: var(--perc);
+}
+.chat-error {
+  font-size: 13px;
+  color: var(--perc);
+  padding-bottom: 12px;
+}
+.chat-transcript {
+  display: flex;
+  flex-direction: column;
+  /* The conversation is the scroll region, not each block inside it. */
+  max-height: 640px;
+  overflow-y: auto;
+}
+/* A log drawn inside someone else's scroll region flows rather than scrolling itself. */
+.log-flow {
+  max-height: none;
+  overflow-y: visible;
+}
+.chat-turn {
+  font-family: var(--ui);
+  font-size: 15px;
+  color: var(--text);
+  margin: 18px 0 10px;
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--strings);
+  white-space: pre-wrap;
+}
+.chat-turn-end,
+.chat-notice {
+  font-family: var(--data);
+  font-size: 12px;
+  color: var(--faint);
+  margin: 8px 0;
+}
+.chat-notice-warning {
+  color: var(--brass);
+}
+.chat-notice-error {
+  color: var(--perc);
 }

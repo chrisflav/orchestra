@@ -23,6 +23,9 @@ import Orchestra.Sandbox
 import Orchestra.Dashboard
 import Orchestra.Server
 import Orchestra.StreamFormat
+import Orchestra.Interactive.Wire
+import Orchestra.Interactive.Store
+import Orchestra.Interactive
 import Orchestra.TaskRunner
 import Orchestra.TaskStore
 import Orchestra.Usage

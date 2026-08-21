@@ -1,4 +1,5 @@
 import { useParams } from "react-router-dom";
+import { CancelTask } from "../components/CancelTask";
 import { Empty, List, Row } from "../components/List";
 import { LogView } from "../components/LogView";
 import { Facts, LivePage, Section } from "../components/Page";
@@ -51,7 +52,18 @@ export function TaskDetail() {
         <>
           <Facts
             items={[
-              { key: "Status", value: <Status status={data.status} /> },
+              {
+                key: "Status",
+                // The one control on the page, and it sits here rather than in a toolbar
+                // because "running" is the fact it acts on: it appears the moment that word
+                // does and goes when it does. A task that is not running has nothing to stop.
+                value: (
+                  <span className="fact-inline">
+                    <Status status={data.status} />
+                    {data.status === "running" && <CancelTask id={data.id} />}
+                  </span>
+                ),
+              },
               { key: "Fork", value: repoLabel(data.fork), data: true },
               { key: "Started", value: <Time iso={data.createdAt} />, data: true },
               // Only when the two differ: a queue entry and the run it became are numbered

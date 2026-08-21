@@ -220,7 +220,7 @@ def backendIsParallelSafe (backend : Option String) : Bool :=
     exists (`Dirs.skillsDir`). The skills tell an agent to reach for the MCP tools rather than
     `gh` for anything touching pull requests or taxis issues, which it has no way to know
     otherwise. Silently skipped when not installed. -/
-private def defaultPluginDirs (appConfig : AppConfig) : IO (Array String) := do
+def defaultPluginDirs (appConfig : AppConfig) : IO (Array String) := do
   let skills ← Dirs.skillsDir
   if ← skills.pathExists then
     return #[skills.toString] ++ appConfig.pluginDirs
@@ -316,11 +316,20 @@ def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
     : IO (Array (String × Option String)) := do
   match appConfig.agentAuthConfigs.find? (fun c => c.name == backendName) with
   | none =>
-    -- No per-agent auth configured: use legacy flat fields for backward compatibility
+    -- No per-agent auth configured: use legacy flat fields for backward compatibility.
+    -- `claude_token` here is the same kind of credential an `oauth_token` source holds — a
+    -- `setup-token` — and carries the same gap: no profile, so no plan, so a Fable run refused
+    -- for want of usage credits (see `AgentDef.claude.envVarsOfAuthSource`). It gets the same
+    -- two variables, and only when there is a token for them to describe.
+    let plan : Array (String × Option String) :=
+      if appConfig.claudeToken.isSome then
+        #[("CLAUDE_CODE_SUBSCRIPTION_TYPE", some "max"),
+          ("CLAUDE_CODE_RATE_LIMIT_TIER",   some "default_claude_max_20x")]
+      else #[]
     return #[("ANTHROPIC_API_KEY",       appConfig.anthropicApiKey),
              ("ANTHROPIC_BASE_URL",      appConfig.anthropicBaseUrl),
              ("ANTHROPIC_AUTH_TOKEN",    appConfig.anthropicAuthToken),
-             ("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)]
+             ("CLAUDE_CODE_OAUTH_TOKEN", appConfig.claudeToken)] ++ plan
   | some agentAuth =>
     -- Determine which label to use
     let label ← match requestedLabel with
@@ -585,6 +594,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     enqueueMerger   := some (enqueueMergerImpl appConfig)
     enqueueReviewer := some enqueueReviewerImpl
     prLabels  := ioTask.prLabels
+    defaultOrganization := appConfig.defaultOrganization
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"

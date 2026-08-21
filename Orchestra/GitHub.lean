@@ -112,6 +112,12 @@ private def curlWithStatus (args : Array String) : IO (Nat × String) := do
     the useful sentence; anything else (an HTML error page from a proxy, say) is passed through
     truncated rather than dropped, since the point of this is to stop discarding evidence.
 
+    A validation failure (422) puts *nothing* specific in `message` — it says "Repository creation
+    failed." or "Validation Failed" and files the actual reason under `errors`, one object per
+    thing wrong. Those are appended, because the top-level sentence alone cannot tell a name
+    collision from a name the organisation's policy forbids, and a caller told only the former
+    renames and retries forever.
+
     Not private: exercised directly by `OrchestraTest.GitHubError`. -/
 def githubErrorDetail (body : String) : String :=
   let trimmed := body.trimAscii.toString
@@ -119,7 +125,17 @@ def githubErrorDetail (body : String) : String :=
   else match Json.parse trimmed with
     | .ok j =>
       match j.getObjValAs? String "message" with
-      | .ok m => m
+      | .ok m =>
+        -- Each entry is `{"resource":…, "field":…, "code":…, "message":…}`, but only `code` is
+        -- always there; `message` is the readable one when GitHub supplies it, and `code` names
+        -- the failure otherwise ("already_exists", "invalid", "custom").
+        let details := match j.getObjVal? "errors" |>.toOption |>.bind (·.getArr? |>.toOption) with
+          | none      => []
+          | some errs => errs.toList.filterMap fun e =>
+              match e.getObjValAs? String "message" |>.toOption with
+              | some msg => some msg
+              | none     => e.getObjValAs? String "code" |>.toOption
+        if details.isEmpty then m else m ++ " (" ++ String.intercalate "; " details ++ ")"
       | .error _ => (trimmed.take 2000).toString
     | .error _ => (trimmed.take 2000).toString
 
@@ -143,13 +159,14 @@ on the account owning the repository."
     they carry the JWT. Neither is the body of a *successful* response, since for the token
     endpoint that is the credential itself — only error bodies are quoted, and those carry no
     secret. -/
-private def githubAppApi (what : String) (jwt : String) (method : String) (url : String) :
-    IO String := do
-  let (status, body) ← curlWithStatus #[
+private def githubAppApi (what : String) (jwt : String) (method : String) (url : String)
+    (reqBody : Option String := none) : IO String := do
+  let (status, body) ← curlWithStatus (#[
     "-X", method,
     "-H", s!"Authorization: Bearer {jwt}",
-    "-H", "Accept: application/vnd.github+json",
-    url ]
+    "-H", "Accept: application/vnd.github+json" ]
+    ++ (match reqBody with | none => #[] | some b => #["-d", b])
+    ++ #[url])
   if status < 200 || status >= 300 then
     throw (.userError
       s!"{what} failed: GitHub answered HTTP {status} to {method} {url}\n  \
@@ -237,10 +254,20 @@ def getInstallationId (jwt : String) (owner : String) : IO Nat := do
   | some id => return id
   | none    => throw (.userError s!"no installation found for owner '{owner}'")
 
-/-- Create an installation access token. -/
-def createInstallationToken (jwt : String) (installationId : Nat) : IO String := do
+/-- Create an installation access token.
+
+    `repositories` narrows the token to the repositories it names, by name and within the
+    installation's own account. Empty — the default — asks for the installation's full scope,
+    which is every repository the App holds there. Narrow it whenever the token is going to leave
+    this process: `create_repository` hands one to the agent, and a token good for the whole fork
+    organisation would reach every other task's fork sitting in it. -/
+def createInstallationToken (jwt : String) (installationId : Nat)
+    (repositories : List String := []) : IO String := do
+  let reqBody := if repositories.isEmpty then none else
+    some (Json.mkObj [("repositories", Json.arr (repositories.toArray.map Json.str))]).compress
   let result ← githubAppApi s!"minting an installation token for installation {installationId}"
     jwt "POST" s!"https://api.github.com/app/installations/{installationId}/access_tokens"
+    reqBody
   match Json.parse result with
   -- Deliberately without the response body: a 2xx here *is* the token, so quoting what could
   -- not be parsed would put a live credential in the daemon log.
@@ -336,6 +363,29 @@ def probeWriteAccessRetrying (appConfig : AppConfig) (target : Repository)
       pause := pause * 2
   return result
 
+/-- The GitHub App's installation on `org`, as `(jwt, installationId)`.
+
+    The token an ordinary task carries is the *repository's* installation token, which is scoped
+    to repositories that already exist. Creating one in an organisation is an org-level act, so it
+    needs the org's own installation. An App that is not installed there cannot create anything,
+    and saying so is more use than the 404 GitHub would answer with.
+
+    The JWT comes back alongside the id because minting a second token — a narrower one, once the
+    repository exists — should not cost four more subprocesses to sign a fresh one. -/
+def orgInstallation (appId : Nat) (privateKeyPath : String) (org : String)
+    (what : String) : IO (String × Nat) := do
+  let jwt ← createJWT appId privateKeyPath
+  let some instId ← getInstallationId? jwt org
+    | throw (.userError s!"{what}: the GitHub App is not installed on '{org}', so it cannot \
+        create repositories there")
+  return (jwt, instId)
+
+/-- Mint an installation token for the GitHub App on `org`, at the installation's full scope. -/
+def orgInstallationToken (appId : Nat) (privateKeyPath : String) (org : String)
+    (what : String) : IO String := do
+  let (jwt, instId) ← orgInstallation appId privateKeyPath org what
+  createInstallationToken jwt instId
+
 /-- Fork `target` into organisation `org`, returning the fork GitHub says it created.
 
     Authenticates as `org`'s own installation — the one with permission to create repositories
@@ -350,11 +400,8 @@ def probeWriteAccessRetrying (appConfig : AppConfig) (target : Repository)
     guessed path. A response that does not identify the fork is an error, which `resolveFork` turns
     into a skip; that is the safe direction to fail in. -/
 def forkRepo (appConfig : AppConfig) (target : Repository) (org : String) : IO Repository := do
-  let jwt ← createJWT appConfig.appId appConfig.privateKeyPath
-  let some instId ← getInstallationId? jwt org
-    | throw (.userError s!"cannot fork {target} into '{org}': the GitHub App is not installed on \
-        '{org}', so it cannot create repositories there")
-  let token ← createInstallationToken jwt instId
+  let token ← orgInstallationToken appConfig.appId appConfig.privateKeyPath org
+    s!"cannot fork {target} into '{org}'"
   let reqBody := Json.mkObj
     [("organization", Json.str org), ("name", Json.str target.name)] |>.compress
   let (status, respBody) ← curlWithStatus #[
@@ -387,6 +434,107 @@ def forkRepo (appConfig : AppConfig) (target : Repository) (org : String) : IO R
     IO.sleep 1000
   -- The POST succeeded, so the fork will appear; return it rather than failing on a slow copy.
   return fork
+
+/-- Why GitHub will not accept `name` as a repository name, or `none` when it will.
+
+    GitHub itself normalises a name it half-accepts — spaces become hyphens, and the repository
+    that comes back is then not the one that was asked for — so a name that is not already in the
+    accepted alphabet is refused here rather than silently renamed there. The alphabet is ASCII
+    letters, digits, `-`, `_` and `.`; the length limit and the two reserved names (`.` and `..`,
+    which are path segments, not repositories) are GitHub's own.
+
+    Pure, and public, because it is the half of `create_repository` worth testing without a
+    network. -/
+def repoNameError? (name : String) : Option String :=
+  if name.isEmpty then
+    some "'name' must not be empty"
+  else if name.length > 100 then
+    some "'name' must be at most 100 characters"
+  else if name == "." || name == ".." then
+    some s!"{repr name} is not a repository name"
+  else if name.any (fun c => !(c.isAlphanum || c == '-' || c == '_' || c == '.')) then
+    some s!"{repr name} is not a valid repository name: GitHub accepts only letters, digits, \
+      '-', '_' and '.'"
+  else
+    none
+
+/-- Create repository `name` in organisation `org`, returning it together with a token that can
+    push to it — or, when the repository was made but the token could not be minted, the reason.
+
+    The push token is the reason this mints two. Creating a repository is an org-level act, so the
+    request needs the organisation installation's full scope; what comes back is scoped to the one
+    new repository, because it is handed to the agent and a token good for the whole fork
+    organisation would reach every other task's fork sitting in it. It is also the only token the
+    caller is sure to have: a task's own installation token is minted for whichever installation
+    the task was launched under — `github_app.installation_id` when the config pins one, the fork
+    owner's otherwise — and that reaches this repository only when it happens to cover `org`.
+
+    Unlike forking, this is **not** idempotent: a name the organisation already uses is a 422,
+    reported as GitHub explained it rather than resolved to the existing repository. Which
+    repository an agent's next push goes to is not a question to answer by guessing.
+
+    The name is read back out of the response for the same reason `forkRepo` reads its fork back:
+    the created repository is what a caller will push to, and GitHub — which normalises names — is
+    the authority on what it just made. A response that does not identify the repository is an
+    error. -/
+def createRepoInOrg (appId : Nat) (privateKeyPath : String) (org name : String)
+    (description : String) (isPrivate autoInit : Bool) :
+    IO (Repository × Except String String) := do
+  let (jwt, instId) ← orgInstallation appId privateKeyPath org
+    s!"cannot create '{name}' in '{org}'"
+  let token ← createInstallationToken jwt instId
+  let reqBody := Json.mkObj
+    [ ("name", Json.str name)
+    , ("description", Json.str description)
+    , ("private", Json.bool isPrivate)
+    , ("auto_init", Json.bool autoInit) ] |>.compress
+  let (status, respBody) ← curlWithStatus #[
+    "-X", "POST",
+    "-H", s!"Authorization: Bearer {token}",
+    "-H", "Accept: application/vnd.github+json",
+    "-d", reqBody,
+    s!"https://api.github.com/orgs/{org}/repos" ]
+  if status < 200 || status >= 300 then
+    -- A 422 is a validation failure, and which one is in the message above rather than here:
+    -- `already exists` calls for another name, but a name the organisation's policy forbids does
+    -- not, and an agent told the wrong one of those renames and retries forever. 403 is the App
+    -- holding no `administration: write`, which GitHub does not explain at all.
+    let hint :=
+      if status == 422 then
+        s!"\n  A 422 is GitHub refusing the request as it stands — read the reason above. If \
+'{org}' already has a repository by that name, pick another or work on the one that is there."
+      else if status == 403 then
+        s!"\n  A 403 here means the GitHub App's installation on '{org}' lacks the \
+'Administration: read and write' repository permission, which creating a repository needs."
+      else ""
+    throw (.userError s!"creating '{org}/{name}' failed: GitHub answered HTTP {status}\n  \
+      {githubErrorDetail respBody}{hint}")
+  -- Each of these follows a 2xx, so the repository was made and only its name is in doubt. Every
+  -- message says so: a caller told a flat "creating failed" retries under the same name, meets the
+  -- 422, and reads its own repository as somebody else's.
+  let created := s!"the repository was created — check '{org}' for '{name}' before retrying"
+  let .ok respJson := Json.parse respBody
+    | throw (.userError s!"creating '{org}/{name}': GitHub answered HTTP {status} with a body \
+        that is not JSON, so the repository cannot be identified, but {created}")
+  let .ok fullName := respJson.getObjValAs? String "full_name"
+    | throw (.userError s!"creating '{org}/{name}': the response carries no 'full_name', so the \
+        repository cannot be identified, but {created}\n  {githubErrorDetail respBody}")
+  let .ok repo := Repository.parse fullName
+    | throw (.userError s!"creating '{org}/{name}': GitHub named the repository {repr fullName}, \
+        which is not an 'owner/repo'; {created}")
+  -- Scoped to the repository GitHub says it made, not to the one that was asked for: those are
+  -- the same name in every case anyone has seen, and where they are not, the token has to match
+  -- the repository the caller is being handed.
+  --
+  -- Caught rather than thrown, because by this line the repository exists. A caller told only
+  -- "creating failed" retries under the same name, meets the 422, and reads it as somebody else's
+  -- repository — leaving an orphan in the organisation on every attempt and never learning that
+  -- the first one was its own. The repository comes back either way; the token is the part that
+  -- may be missing.
+  try
+    return (repo, .ok (← createInstallationToken jwt instId [repo.name]))
+  catch e =>
+    return (repo, .error (toString e))
 
 /-- The decision half of `resolveFork`, over an injected `probe` and `mkFork`. Split out so the
     branch table below can be exercised against stubs, without a network:
