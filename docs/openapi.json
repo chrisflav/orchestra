@@ -1511,7 +1511,7 @@
           },
           "resumeFrom": {
             "type": "string",
-            "description": "Start this session by picking up the conversation another one was having. The old session is not revived; this is a new one that inherits its agent-side history."
+            "description": "Start this session by picking up the conversation another one was having. The old session is not revived; this is a new one that inherits its agent-side history. Checked as a session id: it becomes a directory name."
           }
         }
       },

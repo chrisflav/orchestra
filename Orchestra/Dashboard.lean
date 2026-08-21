@@ -13,6 +13,7 @@ import Orchestra.Secret
 import Orchestra.Skill
 import Orchestra.Interactive.Store
 import Orchestra.Utils.UnixSocket
+import Orchestra.Utils.Files
 
 open Lean (Json ToJson FromJson)
 open Std.Net
@@ -305,6 +306,13 @@ private def maxLogLimit : Nat := 10000
     a quantity — but `natParam` takes one, and a value this far past the end of any transcript
     means the same thing as any other: nothing follows it. -/
 private def maxAfter : Nat := 1000000000
+
+/-- Ceiling on what a caller may set a session's budget to, in USD.
+
+    Not a policy about what a session should cost — that is `config.json`'s default — but the
+    same kind of bound every other parameter in this API carries, so that one request cannot
+    turn into an unbounded bill. -/
+private def maxSessionBudgetUsd : Float := 100.0
 
 private structure Page where
   limit  : Nat
@@ -1455,12 +1463,38 @@ private def startInteractive (body : String) : IO WriteResult := do
     | return .badRequest "the body must name an upstream repository as \"upstream\""
   let some forkStr := field "fork"
     | return .badRequest "the body must name a fork repository as \"fork\""
-  let .ok _ := Repository.parse upstreamStr
+  let .ok upstream := Repository.parse upstreamStr
     | return .badRequest s!"invalid upstream '{upstreamStr}', expected 'owner/repo'"
-  let .ok _ := Repository.parse forkStr
+  let .ok fork := Repository.parse forkStr
     | return .badRequest s!"invalid fork '{forkStr}', expected 'owner/repo'"
+  -- `Repository.parse` only checks for one slash, and both halves become path components of a
+  -- clone directory. This is the first network-reachable route that turns a client-supplied
+  -- repository into a path, so it is the one that has to say no: an owner of `..` resolves a
+  -- clone — and, for a directory that turns out not to be a git repository, a `removeDirAll` —
+  -- outside the work tree.
+  for (what, part) in [("upstream owner", upstream.owner), ("upstream name", upstream.name),
+                       ("fork owner", fork.owner), ("fork name", fork.name)] do
+    if let .error e := Utils.checkConfigName what part then return .badRequest e
+  -- The one id in this feature that does not arrive as a path segment, and so is the one the
+  -- routing layer's `safeSegment` never sees. It becomes a directory name in the session store.
+  if let some resume := field "resumeFrom" then
+    if let .error e := Utils.checkConfigName "resumeFrom session" resume then
+      return .badRequest e
+  -- A ceiling on the one route that spends money. Everything else in this API is scrupulous
+  -- about caps — `maxLimit`, `maxLogLimit`, `maxWindowCount` — precisely so one request cannot
+  -- become an unbounded cost, and `max_sessions` bounds how many sessions there are, never what
+  -- any one of them may spend.
+  if let some budget := j.getObjValAs? Float "budget" |>.toOption then
+    if budget ≤ 0.0 || budget > maxSessionBudgetUsd then
+      return .badRequest s!"'budget' must be between 0 and {maxSessionBudgetUsd} USD"
   match ← askDaemon (Json.mkObj [("type", Json.str "interactive_start"), ("spec", j)]) with
-  | .error why => return .conflict why
+  -- The daemon's refusals are not all the same kind of thing. A backend that cannot host a
+  -- session, or a repository it will not accept, is permanent and the caller's fault — a `409`
+  -- invites a client to retry something that can never work.
+  | .error why =>
+    if (why.splitOn "cannot host an interactive session").length > 1 then
+      return .badRequest why
+    return .conflict why
   | .ok reply =>
     let id := reply.getObjValAs? String "id" |>.toOption |>.getD ""
     -- The record rather than the bare id: a client that has just created something should not
@@ -1923,11 +1957,22 @@ private partial def transcriptLoop (out : Body.Stream) (id : String) (limit : Na
   | .error _ =>
     -- A read that threw is a torn file, or a directory momentarily unreadable. Skip the tick
     -- rather than close: the next one gets it whole, and closing would set `EventSource`
-    -- reconnecting for as long as the condition lasts.
+    -- reconnecting for as long as the condition lasts. The tick still counts towards the
+    -- keep-alive, so a stream that is failing every time does not also go silent.
+    let (frame, idleTicks) :=
+      if idleTicks + 1 ≥ transcriptKeepAliveTicks then (some ": keep-alive\n\n", 0)
+      else (none, idleTicks + 1)
+    if let some f := frame then
+      out.send (Chunk.ofByteArray f.toUTF8)
     Std.Async.sleep transcriptIntervalMs
     transcriptLoop out id limit after idleTicks
   | .ok (some payload) =>
     let newAfter := lastSeqOf payload after
+    -- Caught up on a session that has ended: nothing further will ever arrive, so the stream
+    -- has an ending rather than polling a finished conversation for as long as the tab is open.
+    if pageIsEmpty payload then
+      if let some r ← Interactive.loadSession id then
+        if r.status.isTerminal then return
     let (frame, idleTicks) :=
       if pageIsEmpty payload then
         if idleTicks + 1 ≥ transcriptKeepAliveTicks then (some ": keep-alive\n\n", 0)
@@ -1935,7 +1980,14 @@ private partial def transcriptLoop (out : Body.Stream) (id : String) (limit : Na
       else (some (sseFrameWithId newAfter (Json.compress payload)), 0)
     if let some f := frame then
       out.send (Chunk.ofByteArray f.toUTF8)
-    Std.Async.sleep transcriptIntervalMs
+    -- A full page means there is more behind it. Sleeping a whole tick after one would cap the
+    -- stream at `limit` events per interval, and a turn that outran that would fall further
+    -- behind on every tick and never catch up.
+    -- `limit > 0` matters: a client may ask for `?limit=0`, every page would then be "full",
+    -- and the loop would never sleep.
+    let full := limit > 0 && (payload.getObjVal? "items" |>.toOption.bind (·.getArr?.toOption)).any
+      (·.size ≥ limit)
+    unless full do Std.Async.sleep transcriptIntervalMs
     transcriptLoop out id limit newAfter idleTicks
 
 /-- The transcript stream, or `none` when `kind` does not name one.
@@ -1943,7 +1995,7 @@ private partial def transcriptLoop (out : Body.Stream) (id : String) (limit : Na
     Answers `404` and `400` before committing a `200`, for the same reason `sseResponse` does: a
     stream that opens and closes immediately tells `EventSource` only to reconnect, which turns a
     mistyped id into a silent retry loop. -/
-private def transcriptResponse (kind : String) (q : Query)
+private def transcriptResponse (kind : String) (q : Query) (lastEventId : Option Nat)
     : Async (Option (Response Body.Any)) := do
   unless kind.startsWith "interactive/" && kind.endsWith "/events" do return none
   let idPart := ((kind.drop "interactive/".length).dropEnd "/events".length).toString
@@ -1951,6 +2003,12 @@ private def transcriptResponse (kind : String) (q : Query)
   match natParam q "after" 0 maxAfter, natParam q "limit" defaultLimit maxLimit with
   | .error e, _ | _, .error e => return some (← errorResp e .badRequest)
   | .ok after, .ok limit =>
+    -- `EventSource` reconnects to the URL it was constructed with — cursor and all — and says
+    -- where it actually got to in `Last-Event-ID`. Without reading that, every drop replayed
+    -- the conversation from wherever the page happened to load, which for a long chat is
+    -- minutes of re-streaming before anything new can arrive. The larger of the two wins, so a
+    -- client that passes an explicit `after` is never sent backwards either.
+    let after := max after (lastEventId.getD 0)
     -- The first page goes out on the connection that asked for it, so a client attaching to a
     -- conversation already in progress sees it without a second request.
     let some first ← interactiveEventsApi id after limit | return some (← notFoundJsonResp)
@@ -2071,7 +2129,9 @@ private def route (st : ServeState) (req : Request Body.Stream) : Async (Respons
     unless method == .get do return ← methodNotAllowedResp
     -- The transcript is the one stream that advances a cursor rather than re-sending its whole
     -- payload; every other kind falls through to the loop that does.
-    if let some r ← transcriptResponse kind query then return r
+    -- `Last-Event-ID` is a request header, so it is read here where the request is.
+    let lastEventId := (reqHeader req "last-event-id").bind (·.trimAscii.toString.toNat?)
+    if let some r ← transcriptResponse kind query lastEventId then return r
     return ← sseResponse st kind query
 
   if isSite then
