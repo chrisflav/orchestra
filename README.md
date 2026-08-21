@@ -67,6 +67,9 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
   validation fails.
 - **Recorded history.** Every run is stored, can be grouped into a named series, and resumed with
   a follow-up prompt.
+- **A native app.** One client for macOS, Windows, Linux, iOS and Android that holds *several*
+  backends at once and switches between them — reading the same API the dashboard reads, over a
+  bearer token kept in the OS keychain → [native app](#native-app)
 - **Chat sessions the backend holds.** A conversation with an agent, in the same sandbox a task
   gets, reachable over the API from the CLI, the dashboard or a phone — and still running after
   the client that started it goes away → [interactive sessions](#interactive-sessions)
@@ -1139,6 +1142,64 @@ What a write costs: a listener change takes effect on that listener's next tick,
 *added* or *deleted* within fifteen seconds, which is how often the daemon rescans the directory.
 A role change takes effect on the dispatcher's next tick, since roles are read per dispatch. A
 skill change applies to tasks launched after it. Nothing here needs a restart.
+
+## native app
+
+The dashboard is a view of the backend that served it: a browser page and its API are the same
+origin by construction, and the API sends no CORS headers, so a page loaded from anywhere else
+cannot reach it at all. That is fine for one orchestra and wrong for three — a machine at home, a
+box in a datacentre, a container on the company network.
+
+The app under [`app/`](app/) is the client for that. It holds a list of backends, talks to
+whichever one is selected, and switches between them without a reload and without logging in
+again. Everything the dashboard shows, it shows; the one write the dashboard has — cancelling a
+run — it has too, plus a listener's on/off switch; and the chat pages are the same five routes
+`orchestra chat` uses, which is what makes a session started on a laptop readable from a phone.
+
+It is one codebase for five platforms: macOS, Windows and Linux on the desktop, iOS and Android
+on a phone. **Tauri v2** with a Rust core and a React front-end — the same React the dashboard is
+written in, so the two read as one product.
+
+Being native is not a preference here, it is what the three walls a browser puts up leave:
+
+- **A page cannot talk to a backend that did not serve it.** So the requests are made by the
+  Rust core, which is not subject to the same-origin policy.
+- **`EventSource` cannot carry a bearer token**, and every read in this API is also an SSE
+  stream. So the streams are read by the same core, over an ordinary request with an
+  `Authorization` header, and the frames are handed up to the interface.
+- **A browser has nowhere safe to keep a credential.** The dashboard never holds its password —
+  it trades it for an `HttpOnly` cookie. An app that must reach five backends has to store five
+  secrets, and `localStorage` is not where a secret goes. The OS keychain is.
+
+Two rules follow from those and hold the whole design: **the interface never opens a socket**,
+and **the interface never sees a token**. It names a backend by an opaque id; the core resolves
+the id to an origin and a secret, attaches the header, and returns only the answer. A bug in the
+front-end cannot leak a credential, because the credential was never in that process.
+
+A backend is a name, an origin, a colour and a password. The first three live in
+`backends.json` in the platform's config directory, so that file is copyable and readable; the
+password lives in the keychain — Keychain on macOS, the Credential Manager on Windows, a Secret
+Service keyring on Linux — with a `0600` file in the app's private data directory where no
+keychain answers, and the Backends screen says which of the two is in use rather than letting
+you assume. Adding one is probe-then-save: a wrong password, a wrong port, a certificate that
+does not cover the name and a daemon that is simply down are four different problems, and the
+add dialog says which before anything is written.
+
+Every configured backend is polled once a minute even when it is not selected, which is what
+makes the switcher worth opening: each entry says whether it is answering and how much is
+running there, so trouble on the box you are not looking at is visible before you go looking for
+it.
+
+```sh
+cd app
+npm install
+npm run tauri dev      # the app, against whatever backends you add to it
+npm run tauri build    # a bundle for this platform
+```
+
+The design — the shell that was chosen and against what, how switching tears streams down, what
+each screen is, and what ships in which phase — is [`docs/native-app.md`](docs/native-app.md);
+how to build and check it is [`app/README.md`](app/README.md).
 
 ## interactive sessions
 

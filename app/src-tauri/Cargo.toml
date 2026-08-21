@@ -1,0 +1,50 @@
+[package]
+name = "orchestra-app"
+version = "0.1.0"
+description = "Native client for one or more orchestra backends"
+edition = "2021"
+rust-version = "1.77"
+default-run = "orchestra-app"
+
+[lib]
+# Mobile targets link the app as a library; `main.rs` is a thin wrapper so both entry points
+# run the same `run()`.
+name = "orchestra_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+futures-util = "0.3"
+url = "2"
+
+[dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["json", "stream", "rustls-tls-native-roots", "http2"]
+
+# The keychain is per platform and has no meaning on mobile, where the app's own data directory
+# is already private to it. `secrets.rs` falls back to that directory anywhere the crate is
+# absent or the platform has no keychain daemon running.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

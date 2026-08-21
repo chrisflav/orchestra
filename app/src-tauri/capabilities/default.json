@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the front-end may do. Everything that reaches a backend goes through this app's own commands, which are allowed by default; nothing here opens the network to the webview.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "opener:allow-open-url"
+  ]
+}

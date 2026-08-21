@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Orchestra">
+  <!--
+    Four bars on a rounded indigo ground, bottom-aligned, in the section hues used throughout
+    the console: strings, brass, winds, percussion. The contour rises and falls like a phrase.
+    At 16px the colours survive where any glyph or baton would not, and the shape reads equally
+    as a score, an ensemble, and a queue with work in it.
+  -->
+  <rect width="32" height="32" rx="7" fill="#0B0A12"/>
+  <rect x="5"  y="14" width="4" height="12" rx="2" fill="#8B9BFF"/>
+  <rect x="11" y="8"  width="4" height="18" rx="2" fill="#E9A23B"/>
+  <rect x="17" y="11" width="4" height="15" rx="2" fill="#4FBE85"/>
+  <rect x="23" y="17" width="4" height="9"  rx="2" fill="#F0555B"/>
+</svg>

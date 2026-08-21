@@ -1,0 +1,1805 @@
+/*
+ * Orchestra.
+ *
+ * Type carries the voice, and width says whose voice it is. One superfamily, three settings:
+ * IBM Plex Sans condensed for what the system asserts (the verdict, page titles, the
+ * wordmark), the same face at normal width for what the interface explains to you, and IBM
+ * Plex Mono for anything the machine emitted verbatim — ids, counts, forks, timestamps,
+ * status words. Nothing is set in italic: liveness is carried by colour and by one moving
+ * element, which is what an operator actually scans for.
+ *
+ * The palette is read off the thing being watched. An orchestra is organised into sections,
+ * and so is this system's state: brass is loud and working, strings are the steady body of the
+ * ensemble waiting to play, percussion is impact, and rests are silence. Hue carries meaning
+ * here — a status is never a decorative colour, and the same hue means the same thing on every
+ * page and in both themes. The neutrals around them are cool and unsaturated, so the four
+ * section hues are the only colour on the page.
+ *
+ * Structure is carried by type and space rather than by boxes. Almost nothing sits in a card:
+ * rows sit on the page separated by hairlines, which is what keeps a page of live data reading
+ * as a page rather than as a control panel.
+ */
+
+/* `wdth.css` rather than `index.css`: it ships the width axis alongside the weight one, which
+   is what makes the condensed display setting available without a second font package. */
+@import "@fontsource-variable/ibm-plex-sans/wdth.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
+
+/* Light is the base. The dark block is written twice — once for the system preference, once
+   for the explicit override — because a set of custom properties cannot be aliased in CSS.
+   Keep the two in step. */
+:root {
+  --page: #f6f7f9;
+  --raised: #ffffff;
+  --sunken: #edeff4;
+  --rule: #dde0e8;
+  --rule-soft: #e9ebf1;
+
+  --text: #14171e;
+  --mute: #555b6a;
+  --faint: #838a9a;
+
+  --brass: #b3760c;
+  --strings: #4a5bd4;
+  --winds: #177a47;
+  --perc: #ce2e3a;
+  --rest: #7b8394;
+  --link: #4a5bd4;
+
+  --shadow: 0 1px 2px rgba(20, 23, 30, 0.05);
+  --bar: rgba(246, 247, 249, 0.86);
+
+  /* `--display` and `--ui` are the same family on purpose. What separates them is
+     `font-stretch: 75%`, which every display-voice rule below sets alongside the family. */
+  --display: "IBM Plex Sans Variable", system-ui, sans-serif;
+  --ui: "IBM Plex Sans Variable", system-ui, sans-serif;
+  --data: "IBM Plex Mono", ui-monospace, monospace;
+
+  --measure: 1080px;
+  --radius: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0c0e13;
+    --raised: #14171e;
+    --sunken: #181c25;
+    --rule: #262b36;
+    --rule-soft: #1e222c;
+
+    --text: #e7eaf0;
+    --mute: #98a0b1;
+    --faint: #6a7183;
+
+    --brass: #e9a23b;
+    --strings: #8b9bff;
+    --winds: #4fbe85;
+    --perc: #f0555b;
+    --rest: #626a7c;
+    --link: #9aa6ff;
+
+    --shadow: none;
+    --bar: rgba(12, 14, 19, 0.86);
+  }
+}
+
+:root[data-theme="dark"] {
+  --page: #0c0e13;
+  --raised: #14171e;
+  --sunken: #181c25;
+  --rule: #262b36;
+  --rule-soft: #1e222c;
+
+  --text: #e7eaf0;
+  --mute: #98a0b1;
+  --faint: #6a7183;
+
+  --brass: #e9a23b;
+  --strings: #8b9bff;
+  --winds: #4fbe85;
+  --perc: #f0555b;
+  --rest: #626a7c;
+  --link: #9aa6ff;
+
+  --shadow: none;
+  --bar: rgba(12, 14, 19, 0.86);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  background: var(--page);
+}
+
+body {
+  font-family: var(--ui);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--page);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--strings);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* The one label treatment: small, monospaced, spaced out, quiet. Used for the wordmark, the
+   eyebrow, section headings, figure labels and status words, so a reader learns once that
+   type set this way is a name for something rather than a value. */
+.eyebrow,
+.pulse,
+.section-title,
+.section-meta,
+.figure-label,
+.status-label,
+.log-kind {
+  font-family: var(--data);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* ============================================================
+   Top bar
+   ============================================================ */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bar);
+  backdrop-filter: saturate(1.6) blur(12px);
+  border-bottom: 1px solid var(--rule);
+}
+
+.topbar-inner {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 0 24px;
+  height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 26px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.brand-name {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.nav::-webkit-scrollbar {
+  display: none;
+}
+
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  color: var(--mute);
+  font-size: 14px;
+  white-space: nowrap;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.nav-link:hover {
+  color: var(--text);
+  background: var(--sunken);
+}
+.nav-link.active {
+  color: var(--text);
+  font-weight: 500;
+}
+
+/* A destination that leaves the app. The arrow is the only thing distinguishing it, and it
+   sits at the same weight as the label so the nav still reads as one row of peers. */
+.nav-out svg {
+  opacity: 0.55;
+  margin-left: -2px;
+  flex: none;
+}
+.nav-out:hover svg {
+  opacity: 1;
+}
+
+/* Present for screen readers, absent for everyone else. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* A count appears beside a destination only when it is telling you something: work in flight,
+   or an account that has run out. A badge on every item would be a control panel again. */
+.nav-count {
+  font-family: var(--data);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 6px;
+  border-radius: 20px;
+  background: var(--sunken);
+  color: var(--mute);
+}
+.nav-count.busy {
+  color: var(--brass);
+}
+.nav-count.alert {
+  color: var(--perc);
+}
+
+.topbar-end {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--mute);
+  cursor: pointer;
+}
+.icon-button:hover {
+  background: var(--sunken);
+  color: var(--text);
+}
+
+.text-button {
+  font: inherit;
+  font-size: 13.5px;
+  border: none;
+  background: none;
+  color: var(--mute);
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 7px;
+}
+.text-button:hover {
+  background: var(--sunken);
+  color: var(--text);
+}
+
+/* ============================================================
+   Page
+   ============================================================ */
+
+.page {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 40px 24px 96px;
+}
+
+.page-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 30px;
+}
+
+.page-title {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 40px;
+  font-weight: 600;
+  line-height: 1.08;
+  letter-spacing: -0.005em;
+}
+.page-qualifier {
+  display: block;
+  font-family: var(--data);
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--faint);
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+/* Whether the event stream is attached. It is chrome, not content, so it does not move —
+   the one animated thing on the page is the queue itself. */
+.pulse {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--faint);
+  flex: none;
+}
+.pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--rest);
+}
+.pulse.on .pulse-dot {
+  background: var(--winds);
+}
+.pulse.off .pulse-dot {
+  background: var(--brass);
+}
+
+.eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--faint);
+  margin-bottom: 20px;
+}
+.eyebrow-sep {
+  opacity: 0.4;
+}
+
+/* ============================================================
+   Verdict — the page's opening statement.
+   Counts alone make the reader do the diagnosis. This does it
+   instead, in a sentence, and the strip and ledger below are
+   its evidence. No box: it is a finding, not a widget.
+   ============================================================ */
+
+.verdict {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 46px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.005em;
+  max-width: 30ch;
+  margin-bottom: 16px;
+}
+.verdict .trail {
+  display: block;
+  color: var(--faint);
+}
+/* Red only when something is waiting on a person. */
+.verdict.stuck .lead {
+  color: var(--perc);
+}
+
+.lede {
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--mute);
+  max-width: 62ch;
+}
+.lede a {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ============================================================
+   The strip — the queue drawn at page scale.
+
+   One tick per entry, in the order the daemon will take them:
+   running ticks are full height and brass, waiting ones are
+   half height and strings. A number tells you how much; this
+   tells you how much, in what order, and what shape the queue
+   is in. An empty queue is a broken rule, so silence looks
+   like silence rather than like a zero.
+   ============================================================ */
+
+.strip {
+  margin-top: 44px;
+}
+
+.strip-ticks {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  height: 76px;
+  border-bottom: 1px solid var(--rule);
+}
+
+/* Ticks are strokes, not bars: narrow, evenly spaced, growing from the left so an eighth-full
+   queue looks eighth-full against the rule it sits on. They thin out rather than overflow
+   once the queue is deep. */
+.tick {
+  display: flex;
+  align-items: flex-end;
+  flex: 1 1 6px;
+  min-width: 2px;
+  max-width: 6px;
+  height: 100%;
+}
+.tick-bar {
+  width: 100%;
+  height: 24%;
+  border-radius: 2px 2px 0 0;
+  background: var(--rest);
+  transition: height 0.25s ease;
+}
+.tick-pending .tick-bar {
+  height: 46%;
+  background: var(--strings);
+}
+.tick-done .tick-bar {
+  height: 46%;
+  background: var(--winds);
+}
+.tick-failed .tick-bar {
+  height: 72%;
+  background: var(--perc);
+}
+.tick-running .tick-bar {
+  height: 100%;
+  background: var(--brass);
+  animation: sustain 3.2s ease-in-out infinite;
+}
+a.tick:hover .tick-bar {
+  filter: brightness(1.15);
+}
+@keyframes sustain {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* A broken rule and nothing on it. The verdict directly above already says the queue is
+   empty, so this carries no caption — it is the shape of that sentence. */
+.strip-empty {
+  height: 36px;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.strip-caption {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 11px;
+  font-family: var(--data);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+
+/* ============================================================
+   Ledger — the counts, on one ruled line
+   ============================================================ */
+
+.ledger {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  margin-top: 40px;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+.figure {
+  padding: 15px 18px;
+  border-left: 1px solid var(--rule-soft);
+}
+.figure:first-child {
+  padding-left: 0;
+  border-left: none;
+}
+.figure-value {
+  font-family: var(--data);
+  font-size: 23px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  color: var(--text);
+}
+.figure-value.zero {
+  color: var(--faint);
+}
+.figure-value.brass {
+  color: var(--brass);
+}
+.figure-value.perc {
+  color: var(--perc);
+}
+.figure-label {
+  color: var(--faint);
+  margin-top: 6px;
+}
+a.figure:hover {
+  background: var(--sunken);
+}
+
+/* ============================================================
+   Sections
+   ============================================================ */
+
+.section {
+  margin-top: 46px;
+}
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+.section-title {
+  color: var(--mute);
+}
+.section-meta {
+  color: var(--faint);
+}
+
+/* ============================================================
+   Rows — the one list pattern.
+   Every list in the app is this: what the thing is, then what is
+   true about it. The prompt or the name leads, because that is
+   what a person recognises; the id is metadata like any other.
+   ============================================================ */
+
+.list {
+  border-top: 1px solid var(--rule);
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 18px;
+  padding: 14px 10px;
+  border-bottom: 1px solid var(--rule-soft);
+  margin: 0 -10px;
+  border-radius: 8px;
+  transition: background 0.1s ease;
+}
+a.row:hover {
+  background: var(--sunken);
+}
+
+.row-main {
+  flex: 1;
+  min-width: 0;
+}
+.row-title {
+  font-size: 14.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+a.row:hover .row-title {
+  color: var(--link);
+}
+.row-title.data {
+  font-family: var(--data);
+  font-size: 13px;
+}
+.row-meta {
+  margin-top: 3px;
+  font-family: var(--data);
+  font-size: 11.5px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-meta .sep {
+  opacity: 0.45;
+  margin: 0 6px;
+}
+.row-end {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.empty {
+  padding: 34px 4px;
+  color: var(--faint);
+  font-size: 14px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+
+/* ============================================================
+   Status — one vocabulary, every page, both themes
+   ============================================================ */
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--mute);
+  white-space: nowrap;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--rest);
+}
+.status-running .status-dot {
+  background: var(--brass);
+}
+.status-pending .status-dot {
+  background: var(--strings);
+}
+.status-done .status-dot {
+  background: var(--winds);
+}
+.status-failed .status-dot {
+  background: var(--perc);
+}
+.status-running {
+  color: var(--brass);
+}
+.status-failed {
+  color: var(--perc);
+}
+
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 20px;
+  background: var(--sunken);
+  font-family: var(--data);
+  font-size: 11px;
+  color: var(--mute);
+  white-space: nowrap;
+}
+.tag + .tag {
+  margin-left: 6px;
+}
+.tag-default {
+  color: var(--strings);
+}
+.tag-alert {
+  color: var(--perc);
+}
+
+/* ============================================================
+   Facts — the header block on a detail page
+   ============================================================ */
+
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 40px;
+  padding-bottom: 26px;
+  border-bottom: 1px solid var(--rule);
+}
+.fact {
+  min-width: 0;
+}
+.fact-key {
+  font-size: 12.5px;
+  color: var(--faint);
+  margin-bottom: 1px;
+}
+.fact-value {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.fact-value.data {
+  font-family: var(--data);
+  font-size: 12.5px;
+}
+/* A fact whose value carries a control beside it. Wrapping rather than shrinking, so a narrow
+   column drops the button under the status instead of squeezing both. */
+.fact-inline {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* ============================================================
+   Panels — only where content genuinely needs a container
+   ============================================================ */
+
+.panel {
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow);
+}
+
+.notice {
+  padding: 40px 24px;
+  text-align: center;
+}
+.notice-title {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  margin-bottom: 6px;
+}
+.notice-note {
+  font-size: 14px;
+  color: var(--mute);
+  max-width: 48ch;
+  margin: 0 auto;
+}
+.notice-note.data {
+  font-family: var(--data);
+  font-size: 12.5px;
+  color: var(--faint);
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+
+.pre {
+  font-family: var(--data);
+  font-size: 12.5px;
+  line-height: 1.65;
+  padding: 16px 18px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 460px;
+  overflow-y: auto;
+}
+
+.caption {
+  padding: 11px 18px;
+  font-size: 12.5px;
+  color: var(--faint);
+  background: var(--sunken);
+  border-bottom: 1px solid var(--rule);
+}
+
+/* ============================================================
+   Task log
+   ============================================================ */
+
+.log {
+  max-height: 640px;
+  overflow-y: auto;
+}
+.log-entry {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 16px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.log-entry:last-child {
+  border-bottom: none;
+}
+.log-kind {
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  padding-top: 3px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+/* The log takes its colour from the same five sections, so a red line means here what a red
+   dot means in a list. */
+.log-kind.k-think {
+  color: var(--strings);
+}
+.log-kind.k-tool {
+  color: var(--brass);
+}
+.log-kind.k-text {
+  color: var(--winds);
+}
+.log-kind.k-err {
+  color: var(--perc);
+}
+.log-body {
+  min-width: 0;
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+.log-body pre {
+  font-family: var(--data);
+  font-size: 11.5px;
+  line-height: 1.55;
+  background: var(--sunken);
+  border-radius: 7px;
+  padding: 10px 12px;
+  margin-top: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 250px;
+  overflow-y: auto;
+}
+.log-meta {
+  color: var(--faint);
+  font-size: 12px;
+  margin-top: 3px;
+}
+.log-tool {
+  font-family: var(--data);
+  font-size: 12.5px;
+  color: var(--brass);
+}
+.log-think {
+  color: var(--mute);
+}
+.log-err {
+  color: var(--perc);
+}
+
+/* ============================================================
+   Auth
+   ============================================================ */
+
+.source {
+  padding: 22px 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.source-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.source-label {
+  font-family: var(--data);
+  font-size: 14px;
+  font-weight: 500;
+}
+.source-why {
+  font-size: 13.5px;
+  color: var(--perc);
+  margin-bottom: 6px;
+}
+.source-foot {
+  margin-top: 12px;
+  font-size: 12.5px;
+  color: var(--faint);
+}
+.source-error {
+  margin-top: 4px;
+  color: var(--perc);
+}
+.source-none {
+  font-size: 13.5px;
+  color: var(--faint);
+  padding: 6px 0;
+}
+
+.limits {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  margin-top: 12px;
+}
+.limits td {
+  padding: 7px 0;
+  vertical-align: middle;
+}
+.limit-name {
+  width: 30%;
+  font-size: 13.5px;
+  padding-right: 16px;
+}
+.limit-name .tag {
+  margin-left: 8px;
+}
+.limit-track {
+  width: 42%;
+}
+.limit-pct {
+  width: 11%;
+  text-align: right;
+  font-family: var(--data);
+  font-size: 12.5px;
+  color: var(--mute);
+  font-variant-numeric: tabular-nums;
+}
+.limit-reset {
+  width: 17%;
+  text-align: right;
+  font-family: var(--data);
+  font-size: 12px;
+  color: var(--faint);
+}
+.track {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--sunken);
+  overflow: hidden;
+}
+.track-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--strings);
+}
+.track-fill.warn {
+  background: var(--brass);
+}
+.track-fill.crit {
+  background: var(--perc);
+}
+
+/* Usage history.
+
+   A bar per limit window on a fixed 0–100 axis: the axis is the limit, never the data's own
+   range, so half height means half a window spent on every source and in every week. The
+   ceiling is a dashed hairline rather than a gridded frame — a bar touching it is the window
+   that ran out, and that is the only reference line the shape needs. */
+
+.charts {
+  display: grid;
+  /* Two across at page width, one on a phone. Wide enough that a chart's caption — the counts
+     that replace a label on every bar — sits on the same line as its title; a source that also
+     reports model-scoped weekly limits has four of these, and three columns crushed the titles
+     into a stack of single words. */
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: 22px 32px;
+  margin-top: 18px;
+}
+.chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  /* The caption drops below the title rather than squeezing it, in the narrow case the line
+     above cannot rule out. */
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  margin-bottom: 10px;
+}
+.chart-title {
+  font-size: 13px;
+  color: var(--mute);
+  white-space: nowrap;
+}
+.chart-note {
+  font-family: var(--data);
+  font-size: 11.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.chart-plot {
+  display: flex;
+  align-items: flex-end;
+  /* Spread rather than packed: the axis below says the right-hand end is now, so the newest
+     window has to sit there. With enough windows to fill the row this does nothing; with five
+     it is what keeps the labels bracketing the bars they describe. */
+  justify-content: space-between;
+  gap: 2px;
+  height: 64px;
+  border-top: 1px dashed var(--rule-soft);
+  border-bottom: 1px solid var(--rule);
+}
+.chart-col {
+  flex: 1 1 0;
+  /* Capped so that a handful of windows read as a handful of windows rather than as slabs. */
+  max-width: 40px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+.chart-bar {
+  width: 100%;
+  border-radius: 3px 3px 0 0;
+  background: var(--strings);
+}
+.chart-bar.warn {
+  background: var(--brass);
+}
+.chart-bar.crit {
+  background: var(--perc);
+}
+/* The window still filling. Drawn lighter, because its number is not final and a bar the same
+   weight as the closed ones would claim it is. */
+.chart-bar.open {
+  opacity: 0.55;
+}
+.chart-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 6px;
+  font-family: var(--data);
+  font-size: 11px;
+  color: var(--faint);
+}
+.chart-empty {
+  font-size: 13px;
+  color: var(--faint);
+  padding: 6px 0;
+}
+
+/* ============================================================
+   Sign in
+   ============================================================ */
+
+.gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.gate-card {
+  width: 100%;
+  max-width: 340px;
+}
+.gate-mark {
+  margin-bottom: 18px;
+}
+/* The wordmark, set exactly as it is in the top bar, then the one big line. Repeating the
+   lockup rather than shouting the product name is what makes this read as the same place. */
+.gate-title {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 15.5px;
+  font-weight: 600;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--mute);
+  margin-bottom: 14px;
+}
+.gate-note {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1.12;
+  letter-spacing: -0.005em;
+  color: var(--text);
+  margin-bottom: 26px;
+}
+.gate-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.gate-label {
+  font-size: 13px;
+  color: var(--mute);
+}
+.gate-input {
+  font-family: var(--data);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  padding: 11px 13px;
+}
+.gate-input:focus {
+  outline: none;
+  border-color: var(--strings);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--strings) 16%, transparent);
+}
+.gate-button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  margin-top: 8px;
+  padding: 11px 14px;
+  border: none;
+  border-radius: 9px;
+  background: var(--strings);
+  color: #ffffff;
+  cursor: pointer;
+}
+.gate-button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.gate-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.gate-error {
+  font-size: 13px;
+  color: var(--perc);
+}
+.gate-hint {
+  margin-top: 22px;
+  font-size: 12.5px;
+  color: var(--faint);
+  line-height: 1.65;
+}
+.gate-hint code {
+  font-family: var(--data);
+  color: var(--mute);
+}
+.gate-corner {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+}
+
+/* ============================================================
+   Cancelling — the one control on a page of readouts.
+   It sits beside the status it acts on and stays quiet until it
+   is armed: a page that is mostly a log should not be led by a
+   red button, and the weight belongs on the confirmation rather
+   than on the invitation.
+   ============================================================ */
+
+.cancel {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.cancel-button {
+  font-family: var(--data);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 5px 9px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: none;
+  color: var(--mute);
+  cursor: pointer;
+}
+.cancel-button:hover:not(:disabled) {
+  background: var(--sunken);
+  color: var(--text);
+}
+.cancel-button.danger:hover:not(:disabled),
+.cancel-button.danger:focus-visible {
+  border-color: var(--perc);
+  background: color-mix(in srgb, var(--perc) 9%, transparent);
+  color: var(--perc);
+}
+.cancel-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.cancel-ask,
+.cancel-note {
+  font-size: 12.5px;
+  color: var(--mute);
+}
+/* The question, not the button, is what has to be read before the second click. */
+.cancel-ask {
+  color: var(--text);
+}
+.cancel-note.bad {
+  color: var(--perc);
+}
+
+/* ============================================================
+   Narrow screens
+   ============================================================ */
+
+@media (max-width: 760px) {
+  .topbar-inner {
+    height: auto;
+    padding: 10px 16px;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+  }
+  .nav {
+    order: 3;
+    flex-basis: 100%;
+    margin: 0 -16px;
+    padding: 0 16px 2px;
+  }
+  .topbar-end {
+    margin-left: auto;
+  }
+  .page {
+    padding: 28px 16px 72px;
+  }
+  .page-title {
+    font-size: 31px;
+  }
+  .verdict {
+    font-size: 31px;
+    max-width: none;
+  }
+  .strip-ticks,
+  .strip-empty {
+    height: 56px;
+  }
+  .ledger {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .figure {
+    padding: 13px 14px;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .figure:nth-child(odd) {
+    padding-left: 0;
+    border-left: none;
+  }
+  .figure:last-child {
+    border-bottom: none;
+  }
+  .row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 7px;
+  }
+  /* A stacked row is a column flex container, where `min-width: 0` no longer holds the main
+     block back — without an explicit width a long, non-wrapping prompt sizes the row wider
+     than the page and the whole document scrolls sideways. */
+  .row-main {
+    width: 100%;
+  }
+  .row-end {
+    order: -1;
+  }
+  .log-entry {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+    padding: 12px 14px;
+  }
+  .log-kind {
+    text-align: left;
+    padding-top: 0;
+  }
+  .limit-name {
+    width: 42%;
+  }
+  .limit-track {
+    width: 30%;
+  }
+}
+
+/* Chat.
+ *
+ * The one page that talks back, so it is the one page with a text field on it. Everything
+ * about it borrows: the transcript is `LogView` for the agent's own output, the same
+ * component a task page uses, and the controls take their shape from the login form, which
+ * is the only other place this console asks for typing.
+ *
+ * What is new is only what the agent's stream cannot say — what the person typed, and what
+ * the daemon did — and each of those gets exactly one visual device. A turn is set flush
+ * against a strings-coloured rule on the left, because it is the one thing on the page a
+ * human wrote; a notice is small and takes its colour from the section vocabulary. */
+.chat-start,
+.chat-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 0;
+}
+.chat-start {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.chat-start input,
+.chat-compose textarea {
+  font-family: var(--data);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  padding: 11px 13px;
+}
+.chat-start input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.chat-compose textarea {
+  font-family: var(--ui);
+  resize: vertical;
+  width: 100%;
+  box-sizing: border-box;
+}
+.chat-start input:focus,
+.chat-compose textarea:focus {
+  outline: none;
+  border-color: var(--strings);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--strings) 16%, transparent);
+}
+.chat-compose textarea:disabled {
+  background: var(--sunken);
+  color: var(--mute);
+}
+.chat-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.chat-start button,
+.chat-actions button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 10px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  background: var(--raised);
+  color: var(--text);
+  cursor: pointer;
+}
+/* The affirmative action on each form is the filled one; the rest are outlines, so a page
+   with three buttons on it still has one obvious thing to press. */
+.chat-start button,
+.chat-actions button[type="submit"] {
+  border-color: transparent;
+  background: var(--strings);
+  color: #ffffff;
+}
+.chat-start button:hover:not(:disabled),
+.chat-actions button:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+.chat-start button:disabled,
+.chat-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.chat-actions .chat-end {
+  margin-left: auto;
+  color: var(--perc);
+}
+.chat-error {
+  font-size: 13px;
+  color: var(--perc);
+  padding-bottom: 12px;
+}
+.chat-transcript {
+  display: flex;
+  flex-direction: column;
+  /* The conversation is the scroll region, not each block inside it. */
+  max-height: 640px;
+  overflow-y: auto;
+}
+/* A log drawn inside someone else's scroll region flows rather than scrolling itself. */
+.log-flow {
+  max-height: none;
+  overflow-y: visible;
+}
+.chat-turn {
+  font-family: var(--ui);
+  font-size: 15px;
+  color: var(--text);
+  margin: 18px 0 10px;
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--strings);
+  white-space: pre-wrap;
+}
+.chat-turn-end,
+.chat-notice {
+  font-family: var(--data);
+  font-size: 12px;
+  color: var(--faint);
+  margin: 8px 0;
+}
+.chat-notice-warning {
+  color: var(--brass);
+}
+.chat-notice-error {
+  color: var(--perc);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────────────────
+ * The native app.
+ *
+ * Everything above this line is the dashboard's stylesheet, unchanged, so the two read as one
+ * product. What follows is only what a client with more than one backend needs and a page
+ * served by one does not: the switcher, the Backends screen, and the form that adds one.
+ *
+ * The four section hues do a second job here. On a status they mean what they always mean; on
+ * a backend they mean nothing at all beyond "this one, not that one" — which is what makes a
+ * glance at the title bar enough to know you are about to cancel a task on the right host.
+ * ───────────────────────────────────────────────────────────────────────────────────────── */
+
+.hue-brass { --hue: var(--brass); }
+.hue-strings { --hue: var(--strings); }
+.hue-winds { --hue: var(--winds); }
+.hue-perc { --hue: var(--perc); }
+
+.page-head-end {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+}
+
+/* ── the switcher ───────────────────────────────────────────────────────────────────────── */
+
+.switcher {
+  position: relative;
+  flex: none;
+}
+
+.switcher-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 13px;
+  cursor: pointer;
+}
+.switcher-button:hover {
+  border-color: var(--faint);
+}
+
+.switcher-name {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.switcher-caret {
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1;
+  margin-top: -3px;
+}
+
+/* The dot is the backend's colour when it is answering and hollow when it is not, so an
+   unreachable host reads as unreachable without opening the menu. */
+.backend-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--hue, var(--rest));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--hue, var(--rest)) 18%, transparent);
+}
+.backend-dot.off {
+  background: transparent;
+  border: 1.5px solid var(--rest);
+  box-shadow: none;
+}
+.backend-dot.unknown {
+  background: var(--rest);
+  box-shadow: none;
+}
+
+.switcher-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 40;
+  min-width: 280px;
+  padding: 6px;
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(20, 23, 30, 0.16);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.switcher-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 13.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.switcher-item:hover {
+  background: var(--sunken);
+}
+.switcher-item.current {
+  background: var(--sunken);
+}
+.switcher-item.manage {
+  border-top: 1px solid var(--rule-soft);
+  border-radius: 0 0 8px 8px;
+  margin-top: 4px;
+  padding-top: 10px;
+  color: var(--mute);
+}
+
+.switcher-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+.switcher-item-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.switcher-item-note {
+  font-size: 11.5px;
+  color: var(--faint);
+}
+.switcher-item-key {
+  font-size: 11px;
+  color: var(--faint);
+  flex: none;
+}
+
+/* ── the Backends screen ────────────────────────────────────────────────────────────────── */
+
+.backend-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 2px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.backend-row:last-child {
+  border-bottom: 0;
+}
+.backend-row .backend-dot {
+  margin-top: 5px;
+}
+
+.backend-main {
+  flex: 1;
+  min-width: 0;
+}
+.backend-name {
+  font-family: var(--display);
+  font-stretch: 75%;
+  font-size: 17px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.backend-tag {
+  font-family: var(--data);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--faint);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+.backend-tag.warn {
+  color: var(--brass);
+  border-color: color-mix(in srgb, var(--brass) 45%, transparent);
+}
+.backend-meta {
+  font-size: 12.5px;
+  color: var(--mute);
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+.backend-meta.data {
+  font-family: var(--data);
+  font-size: 12px;
+  color: var(--faint);
+}
+.backend-meta .sep {
+  color: var(--rule);
+  margin: 0 6px;
+}
+.bad {
+  color: var(--perc);
+}
+
+.backend-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* ── buttons and the add form ───────────────────────────────────────────────────────────── */
+
+.button {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--raised);
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.button:hover:not(:disabled) {
+  border-color: var(--faint);
+}
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.button.primary {
+  background: var(--strings);
+  border-color: var(--strings);
+  color: #fff;
+}
+.button.danger {
+  color: var(--perc);
+  border-color: color-mix(in srgb, var(--perc) 45%, transparent);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.field.check {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 10px;
+}
+.field.check > span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.field-key {
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.field-input {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--page);
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 14px;
+  width: 100%;
+}
+.field-input.data {
+  font-family: var(--data);
+  font-size: 13px;
+}
+.field-input:focus {
+  outline: none;
+  border-color: var(--strings);
+}
+.field-note {
+  font-size: 12px;
+  color: var(--faint);
+  line-height: 1.5;
+}
+.field-note code {
+  font-family: var(--data);
+  font-size: 11.5px;
+}
+
+.swatches {
+  display: flex;
+  gap: 8px;
+}
+.swatch {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  background: var(--hue);
+  cursor: pointer;
+  padding: 0;
+}
+.swatch.on {
+  border-color: var(--text);
+}
+
+.form-note {
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 0;
+  /* The core's failures are sentences, sometimes two: a hint follows the error on its own
+     line. Collapsing that break would run the two together into one long line. */
+  white-space: pre-line;
+}
+.form-note.good {
+  color: var(--winds);
+}
+.form-note.bad {
+  color: var(--perc);
+}
+
+.form-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ── narrow windows and phones ──────────────────────────────────────────────────────────── */
+
+@media (max-width: 640px) {
+  .topbar-inner {
+    height: auto;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 14px;
+  }
+  .nav {
+    order: 3;
+    width: 100%;
+  }
+  .switcher {
+    margin-left: auto;
+  }
+  .switcher-menu {
+    left: auto;
+    right: 0;
+  }
+  .backend-row {
+    flex-wrap: wrap;
+  }
+  .backend-actions {
+    width: 100%;
+    justify-content: flex-start;
+    padding-left: 21px;
+  }
+}

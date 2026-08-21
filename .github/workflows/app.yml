@@ -1,0 +1,129 @@
+name: App CI
+
+# The native client under `app/`. It has its own toolchain — npm and cargo, no Lake — so it has
+# its own workflow, and one that only runs when something under `app/` moved.
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "app/**"
+      - ".github/workflows/app.yml"
+  pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/app.yml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: app
+
+jobs:
+  # The fast half: types, lints and the core's own tests, on one platform. Everything that can
+  # fail without a webview fails here, in a couple of minutes, rather than three times over in
+  # the matrix below.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - name: Install the webview dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev
+
+      - run: npm ci
+      - run: npm run typecheck
+
+      # `generate_context!` reads the built front-end, so the bundle has to exist before
+      # anything cargo does will compile.
+      - run: npm run build
+
+      - name: Rust format
+        run: cargo fmt --check
+        working-directory: app/src-tauri
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: app/src-tauri
+
+      - name: Core tests
+        run: cargo test
+        working-directory: app/src-tauri
+
+  # The slow half: does it actually bundle on each desktop platform. This is what keeps
+  # "platform independent" a fact rather than a claim.
+  bundle:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            name: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - name: Install the webview dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev librsvg2-bin \
+            libsoup-3.0-dev patchelf fuse3
+
+      - run: npm ci
+
+      # The repository tracks the PNGs the Linux bundles use; macOS wants an `.icns` and
+      # Windows an `.ico`, which this derives from the same master rather than committing three
+      # copies of one drawing.
+      - name: Generate the icon set
+        run: npx tauri icon src-tauri/icons/icon.png
+
+      # Unsigned. Signing and notarisation are release-time concerns and want secrets this
+      # workflow deliberately does not have.
+      - name: Build the bundle
+        run: npx tauri build --bundles ${{ matrix.name == 'linux' && 'deb' || matrix.name == 'macos' && 'app' || 'msi' }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orchestra-app-${{ matrix.name }}
+          path: |
+            app/src-tauri/target/release/bundle/**/*.deb
+            app/src-tauri/target/release/bundle/**/*.app
+            app/src-tauri/target/release/bundle/**/*.msi
+          if-no-files-found: warn
+          retention-days: 7
