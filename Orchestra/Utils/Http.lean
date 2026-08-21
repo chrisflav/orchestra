@@ -157,4 +157,53 @@ def postBearerFull (url token body : String) (extraHeaders : Array String := #[]
   args := args.push "--data" |>.push body
   curlFull (args.push url) (maxTime := maxTime)
 
+/-! ## Streaming
+
+Every helper above is a request that ends. A Server-Sent Events stream does not: it is open for
+as long as the client wants it, and `--max-time` — which the rest of this module sets, rightly,
+so a hung server cannot wedge a CLI command — would cut it off mid-conversation. -/
+
+/-- A stream the caller reads a line at a time, and kills when it has had enough. -/
+structure Stream where
+  private child : IO.Process.Child { stdin := .null, stdout := .piped, stderr := .piped
+                                     : IO.Process.StdioConfig }
+
+namespace Stream
+
+/-- The next line, or `none` at end of stream. -/
+def nextLine (s : Stream) : IO (Option String) := do
+  let line ← s.child.stdout.getLine
+  return if line.isEmpty then none else some line
+
+/-- Stop reading and let the connection go.
+
+    `SIGKILL` rather than a polite close: curl is holding a socket open and has nothing to flush,
+    and the caller has already decided it is finished. -/
+def close (s : Stream) : IO Unit := do
+  try
+    let killer ← IO.Process.spawn {
+      cmd := "kill", args := #["-9", toString s.child.pid]
+      stdin := .null, stdout := .null, stderr := .null
+    }
+    let _ ← killer.wait
+  catch _ => pure ()
+  try let _ ← s.child.wait catch _ => pure ()
+
+end Stream
+
+/-- Open a Server-Sent Events stream with bearer authentication.
+
+    No `--max-time`: the point of the stream is to stay open. `-N` and `--no-buffer` are what
+    make it arrive a frame at a time rather than in whatever chunks curl's own buffering would
+    otherwise choose — without them a chat renders in bursts, several turns at once. -/
+def openStream (url token : String) : IO Stream := do
+  let child ← IO.Process.spawn {
+    cmd  := "curl"
+    args := #["-sS", "-N", "--no-buffer", "--connect-timeout", "10",
+              "-H", s!"Authorization: Bearer {token}",
+              "-H", "Accept: text/event-stream", url]
+    stdin := .null, stdout := .piped, stderr := .piped
+  }
+  return { child }
+
 end Orchestra.Utils.Http

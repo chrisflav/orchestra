@@ -1372,6 +1372,194 @@ private def allOptionalTools : List String :=
   ["create_pr", "merge_pr", "label_issue", "comment", "create_repository",
    "manage_issues", "work_issues", "review_issues"]
 
+/-! ## `orchestra chat` — a session on the backend, from a terminal
+
+`orchestra interactive` is unchanged and still local: it drops you into the agent's own TUI on
+the machine you are sitting at. This is the other thing — a conversation the *daemon* holds,
+which the dashboard and a phone can be looking at too, and which survives closing this terminal.
+
+Nothing here executes anything. It posts turns and renders the transcript stream, and every
+event it prints goes through `StreamFormat.format`, the same renderer `orchestra run` prints
+task output with. A chat therefore looks like a run that answers back.
+-/
+
+/-- Render one transcript envelope for a terminal.
+
+    Agent events go through the shared formatter; the kinds the agent's own stream cannot carry
+    are rendered here, because they are this client's news rather than the agent's. -/
+private def renderTranscriptEvent (j : Lean.Json) : Option String :=
+  match Client.str j "kind" with
+  | "user"        => some s!"\n> {Client.str j "text"}"
+  | "agent"       =>
+    match j.getObjVal? "event" |>.toOption with
+    | some ev =>
+      match (Lean.FromJson.fromJson? ev : Except String StreamFormat.Event) with
+      | .ok e    => some (StreamFormat.format e)
+      | .error _ => none
+    | none => none
+  -- Turn boundaries are structure, not content: the prompt below already shows when a turn is
+  -- in flight, and printing both says the same thing twice.
+  | "turnStarted" => none
+  | "turnEnded"   =>
+    let cost := match j.getObjValAs? Float "costUsd" |>.toOption with
+      | some c => s!" | ${c}"
+      | none   => ""
+    some s!"[turn done]{cost}"
+  | "notice"      => some s!"[{Client.str j "level"}] {Client.str j "message"}"
+  | _             => none
+
+/-- Print every event in one SSE payload, and answer the highest seq it carried. -/
+private def renderTranscriptPage (payload : Lean.Json) (after : Nat) : IO Nat := do
+  let (items, _) := Client.items payload
+  let mut last := after
+  let out ← IO.getStdout
+  for item in items do
+    last := max last (Client.nat item "seq")
+    if let some line := renderTranscriptEvent item then
+      out.putStrLn line
+      out.flush
+  return last
+
+/-- Read the transcript stream, printing as it goes, until it ends.
+
+    Run on its own thread while the main one reads the keyboard: a chat where you cannot type
+    until the agent has finished talking is not a chat.
+
+    It ends only when the stream does. There is no flag it checks between frames, because it
+    spends almost all its time blocked inside `nextLine` waiting for the next one — a flag would
+    be read once per event and never while it mattered. Detaching therefore closes the stream
+    from the other thread, which is what unblocks this one. -/
+private partial def followTranscript (stream : Utils.Http.Stream) (cursor : IO.Ref Nat)
+    : IO Unit := do
+  repeat do
+    let some line ← stream.nextLine | break
+    if let some data := Client.sseData line then
+      if let .ok payload := Lean.Json.parse data then
+        cursor.set (← renderTranscriptPage payload (← cursor.get))
+
+private def chatSessionPath (id : String) : String :=
+  s!"/api/v1/interactive/{Client.encodeSegment id}"
+
+/-- Post turns from standard input until it ends.
+
+    A blank line is not a turn — it is someone pressing enter — and `/quit` detaches without
+    ending the session, because detaching and ending are different things and only one of them
+    can be undone. -/
+private partial def chatInputLoop (cfg : Client.Config) (id : String) : IO Unit := do
+  let stdin ← IO.getStdin
+  let out ← IO.getStdout
+  repeat do
+    out.putStr "\nyou> "
+    out.flush
+    let line ← stdin.getLine
+    -- End of input: the terminal closed, or someone typed Ctrl-D. Detach, do not end.
+    if line.isEmpty then break
+    let text := line.trimAscii.toString
+    if text.isEmpty then continue
+    if text == "/quit" || text == "/detach" then break
+    let body := Lean.Json.compress (Lean.Json.mkObj [("text", Lean.Json.str text)])
+    match ← Client.post cfg s!"{chatSessionPath id}/messages" body with
+    | .error e => IO.eprintln e
+    | .ok _    => pure ()
+
+private def chatAttach (cfg : Client.Config) (id : String) (after : Nat) : IO UInt32 := do
+  IO.println s!"Attached to session {id}. Type a turn and press enter; /quit detaches without \
+ending it."
+  let cursor ← IO.mkRef after
+  let stream ← Client.openTranscript cfg id after
+  let follower ← IO.asTask (prio := .dedicated) (followTranscript stream cursor)
+  try chatInputLoop cfg id
+  finally
+    -- Closing is what stops the follower: it is blocked on a read that only ends when the
+    -- connection does. Waited on afterwards so the last frames are printed before the line
+    -- below, rather than racing it or being lost when the process exits.
+    stream.close
+    let _ ← IO.wait follower
+  IO.println s!"\nDetached. The session is still running; `orchestra chat --session {id}` picks \
+it up, and `orchestra chat --end {id}` ends it."
+  return 0
+
+private def chatHandler (p : Parsed) : IO UInt32 := do
+  withClient p fun cfg => do
+    -- List
+    if p.hasFlag "list" then
+      return ← apiCall (Client.get cfg "/api/v1/interactive") fun j => do
+        let (rows, total) := Client.items j
+        if rows.isEmpty then
+          IO.println "No sessions."
+        else
+          IO.println s!"{padRight "SESSION" 22} {padRight "STATUS" 9} {padRight "REPO" 28} \
+{padRight "TURNS" 6} TITLE"
+          IO.println (String.ofList (List.replicate 96 '-'))
+          for r in rows do
+            IO.println s!"{padRight (Client.str r "id") 22} \
+{padRight (Client.str r "status") 9} {padRight (Client.str r "fork") 28} \
+{padRight (toString (Client.nat r "turnCount")) 6} {Client.str r "title"}"
+          if total > rows.size then
+            IO.println s!"\n{rows.size} of {total}."
+    -- End
+    if let some idFlag := p.flag? "end" then
+      let id := idFlag.as! String
+      return ← apiCall (Client.delete cfg (chatSessionPath id)) fun _ => do
+        IO.println s!"Session {id} ended."
+    -- Attach to one that exists. The transcript is replayed from the beginning, because a
+    -- person re-attaching wants to see what was said, not an empty screen above a live tail.
+    if let some idFlag := p.flag? "session" then
+      let id := idFlag.as! String
+      match ← Client.get cfg (chatSessionPath id) with
+      | .error e => IO.eprintln e; return 1
+      | .ok _    => return ← chatAttach cfg id 0
+    -- Otherwise start one.
+    let some upstream := p.flag? "upstream" |>.map (·.as! String)
+      | do IO.eprintln "Give --upstream and --fork to start a session, --session to attach to \
+one, --list to see them, or --end to end one."
+           return 1
+    let some fork := p.flag? "fork" |>.map (·.as! String)
+      | do IO.eprintln "A session needs --fork as well as --upstream."
+           return 1
+    let mut fields : List (String × Lean.Json) :=
+      [("upstream", Lean.Json.str upstream), ("fork", Lean.Json.str fork)]
+    if let some b := p.flag? "backend" then
+      fields := fields ++ [("backend", Lean.Json.str (b.as! String))]
+    if let some m := p.flag? "model" then
+      fields := fields ++ [("model", Lean.Json.str (m.as! String))]
+    if let some bud := p.flag? "budget" then
+      if let some v := parseFloat? (bud.as! String) then
+        fields := fields ++ [("budget", Lean.toJson v)]
+    if let some t := p.flag? "tools" then
+      let names := ((t.as! String).splitOn ",").map (·.trimAscii.toString)
+                     |>.filter (!·.isEmpty)
+      unless names == ["all"] do
+        fields := fields ++ [("tools", Lean.Json.arr (names.map Lean.Json.str).toArray)]
+    if let some r := p.flag? "resume-from" then
+      fields := fields ++ [("resumeFrom", Lean.Json.str (r.as! String))]
+    IO.println "Starting a session; this clones the repository and launches the agent..."
+    match ← Client.post cfg "/api/v1/interactive"
+            (Lean.Json.compress (Lean.Json.mkObj fields)) with
+    | .error e => IO.eprintln e; return 1
+    | .ok j    => chatAttach cfg (Client.str j "id") 0
+
+private def chatCmd : Cmd := `[Cli|
+  chat VIA chatHandler; ["0.1.0"]
+  "Talk to an agent the backend holds open: a session the dashboard and a phone can see too."
+
+  FLAGS:
+    upstream     : String; "Upstream repository in 'owner/repo' format"
+    fork         : String; "Fork repository in 'owner/repo' format"
+    session      : String; "Attach to an existing session by id instead of starting one"
+    list;                  "List sessions and exit"
+    "end"        : String; "End the session with this id and exit"
+    backend      : String; "Agent backend (default: claude; it is the only one that can host a session)"
+    model        : String; "Model override passed to the agent"
+    budget       : String; "Maximum spend in USD for the whole session (default: 20.0)"
+    tools        : String; "Comma-separated optional tools to enable, or 'all' (default: all)"
+    "resume-from" : String; "Start a session that picks up the conversation of this one"
+    "api-url" : String; "Backend to talk to (default: $ORCHESTRA_API_URL, or \
+http://127.0.0.1:8080)"
+    "api-token" : String; "Shared secret (default: $ORCHESTRA_DASHBOARD_PASSWORD, or the \
+persisted one)"
+]
+
 private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let upstreamStr := p.flag! "upstream" |>.as! String
   let forkStr     := p.flag! "fork"     |>.as! String
@@ -1475,6 +1663,7 @@ def orchestraCmd : Cmd := `[Cli|
   SUBCOMMANDS:
     runCmd';
     interactiveCmd;
+    chatCmd;
     mcpServerCmd;
     prepareCmd;
     cleanupCmd;

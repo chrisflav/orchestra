@@ -173,4 +173,26 @@ def nat (j : Json) (field : String) (dflt : Nat := 0) : Nat :=
 def bool (j : Json) (field : String) (dflt : Bool := false) : Bool :=
   (j.getObjValAs? Bool field).toOption |>.getD dflt
 
+/-! ## Transcript streams
+
+The one thing this client does that is not a request and a reply. -/
+
+/-- Attach to a session's transcript from `after`.
+
+    The caller reads frames off the returned stream and closes it when it is done. Detaching is
+    not ending: closing this leaves the session up on the daemon, which is what lets a person
+    close a laptop and pick the conversation up from somewhere else. -/
+def openTranscript (cfg : Config) (id : String) (after : Nat) : IO Utils.Http.Stream :=
+  Utils.Http.openStream
+    s!"{cfg.baseUrl}/sse/v1/interactive/{encodeSegment id}/events?after={after}" cfg.token
+
+/-- The payload of one SSE `data:` line, or `none` for anything else on the wire — a comment,
+    the `id:` line, or the blank line between frames.
+
+    The `id:` line is not needed here: the seqs are in the payload, and a client that trusts the
+    payload cannot disagree with itself about where it has got to. -/
+def sseData (line : String) : Option String :=
+  let line := line.trimRight
+  if line.startsWith "data: " then some (line.drop "data: ".length).toString else none
+
 end Orchestra.Client

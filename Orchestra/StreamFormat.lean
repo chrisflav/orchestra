@@ -1,6 +1,6 @@
 import Lean.Data.Json
 
-open Lean (Json ToJson)
+open Lean (Json ToJson FromJson)
 
 namespace Orchestra.StreamFormat
 
@@ -112,6 +112,55 @@ instance : ToJson Event where
       Json.mkObj fields
     | .unknown t =>
       Json.mkObj [("type", "unknown"), ("event_type", t)]
+
+/-! ### Reading an event back
+
+The events written to a task log and to a session transcript are read back by anything rendering
+them — the CLI attaching to a chat, a test asserting on a fixture. Written out rather than
+derived, because the `ToJson` above is hand-written and does not have the shape `deriving` would
+expect.
+
+One asymmetry worth naming: a `.error` subtype serialises as the bare string `"error"`, its
+message living in the event's own `result` field. Reading back therefore takes the message from
+there, which reconstructs the same value for every event this module wrote. -/
+
+instance : FromJson ContentItem where
+  fromJson? j := do
+    match ← j.getObjValAs? String "type" with
+    | "thinking" => return .thinking (← j.getObjValAs? String "text")
+    | "text"     => return .text (← j.getObjValAs? String "text")
+    | "tool_use" =>
+      return .toolUse (← j.getObjValAs? String "name")
+                      ((j.getObjVal? "input").toOption.getD (Json.mkObj []))
+                      (j.getObjValAs? String "tool_use_id" |>.toOption)
+    | t => throw s!"unknown content item type: {t}"
+
+instance : FromJson Event where
+  fromJson? j := do
+    let str (key : String) : String := j.getObjValAs? String key |>.toOption |>.getD ""
+    match ← j.getObjValAs? String "type" with
+    | "init"      => return .init (str "session_id") (str "model")
+    | "system"    => return .system (str "subtype")
+    | "assistant" => return .assistant (← j.getObjValAs? ContentItem "item")
+    | "tool_result" =>
+      return .toolResult (str "stdout") (str "stderr")
+                         (j.getObjValAs? String "tool_use_id" |>.toOption)
+    | "result" =>
+      let res := str "result"
+      let sub := match str "subtype" with
+        | "success"              => ResultSubtype.success
+        | "error_max_budget_usd" => ResultSubtype.errorMaxBudgetUsd
+        | "error"                => ResultSubtype.error res
+        | raw                    => ResultSubtype.unknown raw
+      return .result sub
+        (j.getObjValAs? Nat "num_turns" |>.toOption)
+        (j.getObjValAs? Nat "duration_ms" |>.toOption)
+        (j.getObjVal? "total_cost_usd" |>.toOption)
+        res
+    | "rate_limit" =>
+      return .rateLimit (j.getObjValAs? String "resets_at" |>.toOption)
+    | "unknown" => return .unknown (str "event_type")
+    | t => throw s!"unknown event type: {t}"
 
 -- Parsing
 
