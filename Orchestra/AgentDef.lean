@@ -39,9 +39,12 @@ structure AgentDef where
       (`Sandbox.launchAgent`) then says so once and runs without a goal, rather than passing a
       flag the backend would reject. -/
   goalArgs : String → Option (Array String) := fun _ => none
-  /-- Parse one line of the agent's stdout stream output.
-      Returns `none` for events that should be suppressed. -/
-  parseOutputLine : String → Option Event
+  /-- Parse one line of the agent's stdout stream output into the events it carries.
+
+      An array because one line is not one event: an assistant message carries a list of content
+      items, and rendering only one of them loses the rest. An empty array is a line with
+      nothing to show — one that does not parse, or one that is deliberately suppressed. -/
+  parseOutputLine : String → Array Event
   /-- Try to extract the session ID after the run.
       Used for agents that don't emit the session ID in the output stream.
       Receives the context string from setupMcp. -/

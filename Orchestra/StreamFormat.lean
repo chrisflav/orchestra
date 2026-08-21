@@ -24,10 +24,15 @@ private def jArr (j : Json) (key : String) : Option (Array Json) :=
 
 -- Types
 
-/-- A content item within an assistant message. -/
+/-- A content item within an assistant message.
+
+    `toolUse` carries the provider's own id for the call when the backend reports one. It is
+    what pairs a call with the result that answers it: a turn can have several calls in flight,
+    and without the id a reader can only guess which `toolResult` belongs to which. `none` for
+    a backend that does not report one, which is why it is optional rather than empty. -/
 inductive ContentItem where
   | thinking (text : String)
-  | toolUse (name : String) (input : Json)
+  | toolUse (name : String) (input : Json) (toolUseId : Option String)
   | text (text : String)
 
 /-- The subtype of a result event emitted by the agent. -/
@@ -43,7 +48,7 @@ inductive Event where
   | init (sessionId : String) (model : String)
   | system (subtype : String)
   | assistant (item : ContentItem)
-  | toolResult (stdout : String) (stderr : String)
+  | toolResult (stdout : String) (stderr : String) (toolUseId : Option String)
   | result (subtype : ResultSubtype) (numTurns : Option Nat) (durationMs : Option Nat)
             (costUsd : Option Json) (res : String)
   /-- A `rate_limit_event` from the agent's stream. Its payload is undocumented and has changed
@@ -64,10 +69,18 @@ private def resultSubtypeStr : ResultSubtype → String
 instance : ToJson ResultSubtype where
   toJson sub := Json.str (resultSubtypeStr sub)
 
+/-- An optional string as a field: present as itself, absent as `null`. Absent is `null` rather
+    than an omitted key, so a reader never has to tell "no id" from "this version did not say". -/
+private def optStr : Option String → Json
+  | some s => Json.str s
+  | none   => Json.null
+
 instance : ToJson ContentItem where
   toJson
     | .thinking t    => Json.mkObj [("type", "thinking"), ("text", t)]
-    | .toolUse n inp => Json.mkObj [("type", "tool_use"), ("name", n), ("input", inp)]
+    | .toolUse n inp id =>
+      Json.mkObj [("type", "tool_use"), ("name", n), ("input", inp),
+                  ("tool_use_id", optStr id)]
     | .text t        => Json.mkObj [("type", "text"), ("text", t)]
 
 instance : ToJson Event where
@@ -78,8 +91,9 @@ instance : ToJson Event where
       Json.mkObj [("type", "system"), ("subtype", sub)]
     | .assistant ci =>
       Json.mkObj [("type", "assistant"), ("item", ToJson.toJson ci)]
-    | .toolResult stdout stderr =>
-      Json.mkObj [("type", "tool_result"), ("stdout", stdout), ("stderr", stderr)]
+    | .toolResult stdout stderr id =>
+      Json.mkObj [("type", "tool_result"), ("stdout", stdout), ("stderr", stderr),
+                  ("tool_use_id", optStr id)]
     | .result sub numTurns durationMs costUsd res =>
       let fields : List (String × Json) := [
         ("type",    "result"),
@@ -101,13 +115,19 @@ instance : ToJson Event where
 
 -- Parsing
 
+private def jStr? (j : Json) (key : String) : Option String :=
+  match j.getObjValAs? String key with
+  | .ok s => if s.isEmpty then none else some s
+  | _     => none
+
 private def parseContentItem (item : Json) : Option ContentItem :=
   match jStr item "type" with
   | "thinking" =>
     let t := jStr item "thinking"
     if t.isEmpty then none else some (.thinking t)
   | "tool_use" =>
-    some (.toolUse (jStr item "name") (jVal item "input" |>.getD (Json.mkObj [])))
+    some (.toolUse (jStr item "name") (jVal item "input" |>.getD (Json.mkObj []))
+                   (jStr? item "id"))
   | "text" =>
     let t := jStr item "text"
     if t.isEmpty then none else some (.text t)
@@ -129,10 +149,9 @@ def extractStringField (s key : String) : Option String := do
   guard !val.isEmpty
   return String.ofList val
 
-/-- Parse a stream-json event line into a typed `Event`.
-    Returns `none` for suppressed events (empty tool output). -/
-def parseEvent (line : String) : Option Event := do
-  let json ← (Json.parse line.trimAscii.toString).toOption
+/-- The line types that carry exactly one event. Split out so that `parseEvents` below reads as
+    the dispatch it is: the two interesting cases are the ones that do not answer one event. -/
+private def parseSingle (line : String) (json : Json) : Option Event :=
   match jStr json "type" with
   | "system" =>
     let sub := jStr json "subtype"
@@ -140,18 +159,12 @@ def parseEvent (line : String) : Option Event := do
       some (.init (jStr json "session_id") (jStr json "model"))
     else
       some (.system sub)
-  | "assistant" =>
-    let msg ← jVal json "message"
-    let items ← jArr msg "content"
-    let item ← items.back?
-    let ci ← parseContentItem item
-    some (.assistant ci)
   | "user" =>
-    let tr ← jVal json "tool_use_result"
-    let stdout := jStr tr "stdout"
-    let stderr := jStr tr "stderr"
-    if stdout.isEmpty && stderr.isEmpty then none
-    else some (.toolResult stdout stderr)
+    -- Kept even when both streams are empty. "The command produced no output" is a fact a
+    -- reader needs; dropped, a tool call reads as one that never returned.
+    let tr := (jVal json "tool_use_result").getD (Json.mkObj [])
+    some (.toolResult (jStr tr "stdout") (jStr tr "stderr")
+                      ((jStr? json "tool_use_id").orElse fun _ => jStr? tr "tool_use_id"))
   | "result" =>
     let isError := json.getObjValAs? Bool "is_error" |>.toOption |>.getD false
     let res := jStr json "result"
@@ -172,11 +185,45 @@ def parseEvent (line : String) : Option Event := do
       extractStringField line "resetsAt"))
   | other => some (.unknown other)
 
+/-- Parse a stream-json event line into the typed events it carries.
+
+    An array rather than an `Option`, because one line is not one event. An assistant message
+    carries a *list* of content items, and a turn that thinks, then says what it is about to do,
+    then calls a tool is all three of those on one line. Keeping only the last — which is what
+    this did before — rendered that turn as the tool call alone, with the reasoning and the
+    narration dropped on the floor. In a log that was a lossy summary; in a transcript someone
+    reads as a conversation, it is the conversation missing.
+
+    An empty array is a line with nothing to show: one that does not parse, or an assistant
+    message whose every item was empty. -/
+def parseEvents (line : String) : Array Event := Id.run do
+  let some json := (Json.parse line.trimAscii.toString).toOption | return #[]
+  if jStr json "type" == "assistant" then
+    let some msg := jVal json "message" | return #[]
+    let some items := jArr msg "content" | return #[]
+    return items.filterMap fun item => (parseContentItem item).map Event.assistant
+  match parseSingle line json with
+  | some e => return #[e]
+  | none   => return #[]
+
+/-- One event, or none, in the array `AgentDef.parseOutputLine` answers in. For the backends
+    that really do emit exactly one event per line. -/
+def one : Option Event → Array Event
+  | some e => #[e]
+  | none   => #[]
+
+/-- The first event a line carries, or `none` for a line that carries none.
+
+    For the callers that know their line is one event — every backend but Claude emits exactly
+    one per line — and for tests, which assert about a single known line. -/
+def parseEvent (line : String) : Option Event :=
+  (parseEvents line)[0]?
+
 -- Formatting
 
 private def formatContentItem : ContentItem → String
   | .thinking t => s!"[thinking] {truncate t}"
-  | .toolUse name input =>
+  | .toolUse name input _ =>
     let desc := jStr input "description"
     let cmd := jStr input "command"
     let fp := jStr input "file_path"
@@ -200,7 +247,7 @@ def format : Event → String
     s!"[init] session={sidShort} model={model}"
   | .system sub => s!"[system] {sub}"
   | .assistant ci => formatContentItem ci
-  | .toolResult stdout stderr =>
+  | .toolResult stdout stderr _ =>
     let outPart :=
       if stdout.isEmpty then ""
       else
