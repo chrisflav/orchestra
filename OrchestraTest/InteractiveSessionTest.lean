@@ -183,3 +183,43 @@ def aFailedStartLeavesNoSlotBehind : Test := do
                     fork := { owner := "f", name := "r" } }
   TestM.assertEqual (← reserved.get) 1 (msg := "a slot was taken")
   TestM.assertEqual (← released.get) 1 (msg := "and given back when the start failed")
+
+/-! ## What a failed start is allowed to say
+
+The message reaches whoever asked for the session, over an API that is not the daemon's log.
+The exceptions behind it name files — `openssl` reports the GitHub App private key by path when
+it cannot read it — and the one file on the host that must stay unguessable from the outside is
+exactly that one. -/
+
+@[test]
+def redactPathsKeepsTheFileAndDropsTheDirectory : Test := do
+  TestM.assertEqual
+    (redactPaths "Could not open file for loading private key from /etc/orch/secrets/app.pem")
+    "Could not open file for loading private key from …/app.pem"
+    (msg := "which file survives, where it lives does not")
+  TestM.assertEqual (redactPaths "cannot read '/srv/data/repos/o/r-slot-0/x.lean'")
+    "cannot read '…/x.lean'"
+    (msg := "a quoted path is still a path")
+  TestM.assertEqual (redactPaths "no such file: /etc/key.pem and /var/lib/orchestra/config.json")
+    "no such file: …/key.pem and …/config.json"
+    (msg := "every path in the message, not just the first")
+  TestM.assertEqual (redactPaths "GET https://api.github.com/app/installations failed: 401")
+    "GET https://api.github.com/app/installations failed: 401"
+    (msg := "a URL is not a path — its slashes follow a character, so nothing is cut")
+  TestM.assertEqual (redactPaths "exit 128: fatal: repository not found")
+    "exit 128: fatal: repository not found"
+    (msg := "a message with no path is left exactly as it was")
+
+@[test]
+def aFailedStartDoesNotNameTheDaemonsFilesystem : Test := do
+  let mgr ← Manager.new { maxSessions := 4 }
+    (fun _ => pure (some 0)) (fun _ _ => pure ())
+  let cfg : AppConfig := { appId := 0, privateKeyPath := "/etc/orch/secrets/app.pem" }
+  let outcome ← withTempSessions do
+    mgr.start cfg { upstream := { owner := "o", name := "r" },
+                    fork := { owner := "f", name := "r" } }
+  match outcome with
+  | .ok _ => TestM.fail "a start with no GitHub App cannot succeed"
+  | .error msg =>
+    TestM.assert ((msg.splitOn "/etc/orch/secrets").length == 1)
+      (msg := s!"the key's directory must not reach the caller; got: {msg}")

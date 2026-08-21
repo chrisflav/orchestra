@@ -194,6 +194,36 @@ where
 
 /-! ## Starting one -/
 
+/-- Characters that can appear inside a filesystem path as an error message renders it. -/
+private def pathChar (c : Char) : Bool :=
+  c.isAlphanum || c == '/' || c == '.' || c == '_' || c == '-' || c == '+'
+
+private partial def redactAux (rest : List Char) (prev : Char) (acc : String) : String :=
+  match rest with
+  | [] => acc
+  | c :: tl =>
+    -- `prev != ':'` is what keeps a URL intact: `https://…` is not a path, and cutting it to
+    -- its last component would take the host out of the one message where it is the answer.
+    if c == '/' && !pathChar prev && prev != ':' then
+      let run  := rest.takeWhile pathChar
+      let tail := rest.dropWhile pathChar
+      let base := ((String.ofList run).splitOn "/").getLastD ""
+      redactAux tail (run.getLastD '/')
+        (acc ++ (if base.isEmpty then "…" else "…/" ++ base))
+    else
+      redactAux tl c (acc.push c)
+
+/-- Cut every absolute path in a message down to its last component.
+
+    A failure to start is reported to whoever asked for the session, over an API that is not the
+    daemon's log. The exceptions that reach it name files: `createJWT` on an unreadable key
+    fails with the path to the GitHub App private key, `ensureSlot` with the layout of the data
+    directory. None of that is the caller's business, and the part that is — *which* file, and
+    what went wrong with it — survives the trim. The daemon still writes the untouched text to
+    its own stderr, where an operator can read it. -/
+def redactPaths (msg : String) : String :=
+  redactAux msg.toList ' ' ""
+
 /-- Every optional tool an interactive session may be granted. The same set
     `orchestra interactive --tools all` grants, and for the same reason: a person sitting in
     front of the agent is expected to be able to ask it for anything a task could do. -/
@@ -291,9 +321,13 @@ or another session"
   let release : IO Unit := do
     if let some shut ← shutdownRef.get then try shut catch _ => pure ()
     try mgr.releaseSlot spec.fork slot catch _ => pure ()
-  let fail (msg : String) : IO (Except String SessionRecord) := do
+  let fail (raw : String) : IO (Except String SessionRecord) := do
     release
     dropStarting
+    -- The operator's copy is the whole truth; the caller's is the same sentence with the
+    -- daemon's filesystem taken out of it. See `redactPaths`.
+    try IO.eprintln s!"interactive: {raw}" catch _ => pure ()
+    let msg := redactPaths raw
     -- Only stamp a record if one was written; before that there is nothing on disk to stamp.
     if let some record ← recordRef.get then
       let now ← TaskStore.currentIso8601
