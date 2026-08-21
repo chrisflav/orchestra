@@ -1372,6 +1372,316 @@ private def allOptionalTools : List String :=
   ["create_pr", "merge_pr", "label_issue", "comment", "create_repository",
    "manage_issues", "work_issues", "review_issues"]
 
+/-! ## `orchestra chat` — a session on the backend, from a terminal
+
+`orchestra interactive` is unchanged and still local: it drops you into the agent's own TUI on
+the machine you are sitting at. This is the other thing — a conversation the *daemon* holds,
+which the dashboard and a phone can be looking at too, and which survives closing this terminal.
+
+Nothing here executes anything. It posts turns and renders the transcript stream, and every
+event it prints goes through `StreamFormat.format`, the same renderer `orchestra run` prints
+task output with. A chat therefore looks like a run that answers back.
+-/
+
+/-- Render one transcript envelope for a terminal.
+
+    Agent events go through the shared formatter; the kinds the agent's own stream cannot carry
+    are rendered here, because they are this client's news rather than the agent's. -/
+private def renderTranscriptEvent (j : Lean.Json) : Option String :=
+  match Client.str j "kind" with
+  | "user"        => some s!"\n> {Client.str j "text"}"
+  | "agent"       =>
+    match j.getObjVal? "event" |>.toOption with
+    | some ev =>
+      match (Lean.FromJson.fromJson? ev : Except String StreamFormat.Event) with
+      | .ok e    => some (StreamFormat.format e)
+      | .error _ => none
+    | none => none
+  -- Turn boundaries are structure, not content: the prompt below already shows when a turn is
+  -- in flight, and printing both says the same thing twice.
+  | "turnStarted" => none
+  | "turnEnded"   =>
+    let cost := match j.getObjValAs? Float "costUsd" |>.toOption with
+      | some c => s!" | ${c}"
+      | none   => ""
+    some s!"[turn done]{cost}"
+  | "notice"      => some s!"[{Client.str j "level"}] {Client.str j "message"}"
+  | _             => none
+
+/-- Exclusive use of the terminal for one burst of output.
+
+    A chat has two writers — the follower thread printing the transcript, the input loop
+    printing the prompt — and unsynchronised they interleave, putting a line of agent output
+    through the middle of the prompt. It deliberately does not redraw the prompt afterwards:
+    what has been typed so far is held by the terminal's line discipline rather than by this
+    process, and a reprinted prompt would appear empty above characters that are still there. -/
+private def withTerminal (lock : Std.BaseMutex) (act : IO.FS.Stream → IO Unit) : IO Unit := do
+  let out ← IO.getStdout
+  lock.lock
+  try
+    act out
+    out.flush
+  finally
+    lock.unlock
+
+/-- Print every event in one SSE payload, and answer the highest seq it carried.
+
+    Rendered first and printed second, so one frame reaches the terminal as one burst rather
+    than as lines the input loop can get between. -/
+private def renderTranscriptPage (lock : Std.BaseMutex) (payload : Lean.Json) (after : Nat)
+    : IO Nat := do
+  let (items, _) := Client.items payload
+  let mut last := after
+  let mut lines : Array String := #[]
+  for item in items do
+    last := max last (Client.nat item "seq")
+    if let some line := renderTranscriptEvent item then
+      lines := lines.push line
+  unless lines.isEmpty do
+    withTerminal lock fun out => for line in lines do out.putStrLn line
+  return last
+
+private def chatSessionPath (id : String) : String :=
+  s!"/api/v1/interactive/{Client.encodeSegment id}"
+
+/-- Read one transcript stream until it ends, printing as it goes. -/
+private partial def drainTranscript (lock : Std.BaseMutex) (stream : Utils.Http.Stream)
+    (cursor : IO.Ref Nat) : IO Unit := do
+  repeat do
+    let some line ← stream.nextLine | break
+    if let some data := Client.sseData line then
+      if let .ok payload := Lean.Json.parse data then
+        cursor.set (← renderTranscriptPage lock payload (← cursor.get))
+
+/-- Follow a session's transcript for as long as someone is attached, reconnecting from the
+    cursor whenever the stream drops.
+
+    Run on its own thread while the main one reads the keyboard: a chat where you cannot type
+    until the agent has finished talking is not a chat.
+
+    A stream ends for three quite different reasons, and a client that cannot tell them apart is
+    a client that goes quiet and says nothing about it. The conversation is over and the server
+    closed it deliberately; the connection broke, which for a chat left open on a laptop is the
+    common case rather than the exceptional one; or this client detached. Only the last is a
+    reason to stop. Reconnecting from `cursor` is exact in both directions — the server replays
+    what follows it and nothing else — so a reattach costs neither a missed event nor a repeated
+    one.
+
+    Detaching is what `stopped` and `current` are for. This thread spends almost all its time
+    blocked inside `nextLine`, so a flag it polled between frames would be read once per event
+    and never while it mattered; closing the stream from the other thread is what unblocks it,
+    and the flag is what tells it afterwards not to open another. -/
+private partial def followTranscript (cfg : Client.Config) (id : String) (lock : Std.BaseMutex)
+    (cursor : IO.Ref Nat) (current : IO.Ref (Option Utils.Http.Stream))
+    (stopped : IO.Ref Bool) (over : IO.Ref Bool) : IO Unit := do
+  let mut live ← current.get
+  let mut failures := 0
+  repeat do
+    if let some stream := live then
+      try drainTranscript lock stream cursor catch _ => pure ()
+      stream.close
+      live := none
+      current.set none
+    if ← stopped.get then break
+    -- The server closes the stream once the session is terminal. Ask which it was rather than
+    -- reconnecting forever to a conversation that will never say anything again.
+    match ← Client.get cfg (chatSessionPath id) with
+    | .ok j =>
+      let status := Client.str j "status"
+      if status == "ended" || status == "failed" then
+        over.set true
+        withTerminal lock fun out => out.putStrLn s!"\n[session {status}]"
+        break
+    | .error _ => pure ()
+    IO.sleep (500 + 1000 * min failures 4).toUInt32
+    if ← stopped.get then break
+    match ← (try some <$> Client.openTranscript cfg id (← cursor.get) catch _ => pure none) with
+    | none =>
+      failures := failures + 1
+      if failures ≥ 5 then
+        withTerminal lock fun out => out.putStrLn "\n[lost the transcript stream; the session \
+is still on the backend — /quit and reattach with `orchestra chat --session ...`]"
+        break
+    | some next =>
+      -- A clean drop is routine — the server's own connection timeout ends a quiet stream every
+      -- few seconds — and since the cursor makes the reattach exact, there is nothing to say
+      -- about it. Only a reconnect that had to be retried is news.
+      let recovered := failures > 0
+      failures := 0
+      live := some next
+      current.set (some next)
+      -- A detach that landed while this was being opened would otherwise leave a stream running
+      -- with nobody left to close it.
+      if ← stopped.get then
+        next.close
+        live := none
+        current.set none
+        break
+      if recovered then
+        withTerminal lock fun out => out.putStrLn "\n[reconnected]"
+  current.set none
+
+/-- Post turns from standard input until it ends.
+
+    A blank line is not a turn — it is someone pressing enter — and `/quit` detaches without
+    ending the session, because detaching and ending are different things and only one of them
+    can be undone.
+
+    A turn the backend refused becomes the `draft`: it is shown again above the next prompt and
+    an empty line re-sends it. Losing what someone typed because a connection blinked is a poor
+    trade for four lines of state. -/
+private partial def chatInputLoop (cfg : Client.Config) (id : String) (lock : Std.BaseMutex)
+    (draft : Option String) : IO Unit := do
+  let stdin ← IO.getStdin
+  match draft with
+  | none   => withTerminal lock fun out => out.putStr "\nyou> "
+  | some d => withTerminal lock fun out =>
+      out.putStr s!"\n[not sent] {d}\nretry> (enter re-sends it) "
+  let line ← stdin.getLine
+  -- End of input: the terminal closed, or someone typed Ctrl-D. Detach, do not end.
+  if line.isEmpty then return
+  let typed := line.trimAscii.toString
+  let text := if typed.isEmpty then draft.getD "" else typed
+  if text.isEmpty then return ← chatInputLoop cfg id lock none
+  if text == "/quit" || text == "/detach" then return
+  let body := Lean.Json.compress (Lean.Json.mkObj [("text", Lean.Json.str text)])
+  match ← Client.post cfg s!"{chatSessionPath id}/messages" body with
+  | .error e =>
+    withTerminal lock fun out => out.putStrLn s!"\nThe turn was not delivered: {e}"
+    chatInputLoop cfg id lock (some text)
+  | .ok _ => chatInputLoop cfg id lock none
+
+private def chatAttach (cfg : Client.Config) (id : String) (after : Nat) : IO UInt32 := do
+  IO.println s!"Attached to session {id}. Type a turn and press enter; /quit detaches without \
+ending it."
+  let lock ← Std.BaseMutex.new
+  let cursor ← IO.mkRef after
+  let stopped ← IO.mkRef false
+  let over ← IO.mkRef false
+  let current ← IO.mkRef (some (← Client.openTranscript cfg id after))
+  let follower ← IO.asTask (prio := .dedicated)
+    (followTranscript cfg id lock cursor current stopped over)
+  try chatInputLoop cfg id lock none
+  finally
+    -- Closing is what stops the follower: it is blocked on a read that only ends when the
+    -- connection does. The flag goes up first, so a reconnect cannot start between the two.
+    -- Waited on afterwards so the last frames are printed before the line below, rather than
+    -- racing it or being lost when the process exits.
+    stopped.set true
+    if let some stream ← current.get then stream.close
+    let _ ← IO.wait follower
+  if ← over.get then
+    IO.println "\nThe conversation is over."
+  else
+    IO.println s!"\nDetached. The session is still running; `orchestra chat --session {id}` \
+picks it up, and `orchestra chat --end {id}` ends it."
+  return 0
+
+private def chatHandler (p : Parsed) : IO UInt32 := do
+  withClient p fun cfg => do
+    -- Four different things to do, and exactly one of them per invocation. Silently preferring
+    -- whichever was checked first is how a mistyped flag becomes "why did that do nothing" —
+    -- `--session x --budget 3` looked like it set a budget and did not, and `--list --end x`
+    -- listed and left the session up.
+    let startFlags := ["upstream", "fork", "backend", "model", "budget", "tools", "resume-from"]
+      |>.filter (fun f => (p.flag? f).isSome)
+      |>.map ("--" ++ ·)
+    let modes := [("--list", p.hasFlag "list"),
+                  ("--end", (p.flag? "end").isSome),
+                  ("--session", (p.flag? "session").isSome),
+                  (", ".intercalate startFlags, !startFlags.isEmpty)]
+      |>.filter (·.2) |>.map (·.1)
+    if modes.length > 1 then
+      IO.eprintln s!"{", ".intercalate modes} are different things; give one of them."
+      return 1
+    -- List
+    if p.hasFlag "list" then
+      return ← apiCall (Client.get cfg "/api/v1/interactive") fun j => do
+        let (rows, total) := Client.items j
+        if rows.isEmpty then
+          IO.println "No sessions."
+        else
+          IO.println s!"{padRight "SESSION" 22} {padRight "STATUS" 9} {padRight "REPO" 28} \
+{padRight "TURNS" 6} TITLE"
+          IO.println (String.ofList (List.replicate 96 '-'))
+          for r in rows do
+            IO.println s!"{padRight (Client.str r "id") 22} \
+{padRight (Client.str r "status") 9} {padRight (Client.str r "fork") 28} \
+{padRight (toString (Client.nat r "turnCount")) 6} {Client.str r "title"}"
+          if total > rows.size then
+            IO.println s!"\n{rows.size} of {total}."
+    -- End
+    if let some idFlag := p.flag? "end" then
+      let id := idFlag.as! String
+      return ← apiCall (Client.delete cfg (chatSessionPath id)) fun _ => do
+        IO.println s!"Session {id} ended."
+    -- Attach to one that exists. The transcript is replayed from the beginning, because a
+    -- person re-attaching wants to see what was said, not an empty screen above a live tail.
+    if let some idFlag := p.flag? "session" then
+      let id := idFlag.as! String
+      match ← Client.get cfg (chatSessionPath id) with
+      | .error e => IO.eprintln e; return 1
+      | .ok _    => return ← chatAttach cfg id 0
+    -- Otherwise start one.
+    let some upstream := p.flag? "upstream" |>.map (·.as! String)
+      | do IO.eprintln "Give --upstream and --fork to start a session, --session to attach to \
+one, --list to see them, or --end to end one."
+           return 1
+    let some fork := p.flag? "fork" |>.map (·.as! String)
+      | do IO.eprintln "A session needs --fork as well as --upstream."
+           return 1
+    let mut fields : List (String × Lean.Json) :=
+      [("upstream", Lean.Json.str upstream), ("fork", Lean.Json.str fork)]
+    if let some b := p.flag? "backend" then
+      fields := fields ++ [("backend", Lean.Json.str (b.as! String))]
+    if let some m := p.flag? "model" then
+      fields := fields ++ [("model", Lean.Json.str (m.as! String))]
+    if let some bud := p.flag? "budget" then
+      -- A budget that did not parse used to be dropped, and the session ran on the 20.0
+      -- default: the one flag whose whole purpose is to bound spending, ignored in silence.
+      let raw := bud.as! String
+      let some v := parseFloat? raw
+        | do IO.eprintln s!"--budget takes an amount in dollars; '{raw}' is not one."
+             return 1
+      fields := fields ++ [("budget", Lean.toJson v)]
+    if let some t := p.flag? "tools" then
+      let names := ((t.as! String).splitOn ",").map (·.trimAscii.toString)
+                     |>.filter (!·.isEmpty)
+      unless names == ["all"] do
+        fields := fields ++ [("tools", Lean.Json.arr (names.map Lean.Json.str).toArray)]
+    if let some r := p.flag? "resume-from" then
+      fields := fields ++ [("resumeFrom", Lean.Json.str (r.as! String))]
+    IO.println "Starting a session; this clones the repository and launches the agent..."
+    -- The default 30 s is a read-a-file-off-disk timeout. This route clones a repository, mints
+    -- a token, starts an MCP server and launches an agent inside the sandbox before it answers,
+    -- and a client that gives up at 30 s reports a failure for a session that is starting
+    -- perfectly well — and then leaves it running with nobody attached.
+    match ← Client.post cfg "/api/v1/interactive"
+            (Lean.Json.compress (Lean.Json.mkObj fields)) (maxTime := 900) with
+    | .error e => IO.eprintln e; return 1
+    | .ok j    => chatAttach cfg (Client.str j "id") 0
+
+private def chatCmd : Cmd := `[Cli|
+  chat VIA chatHandler; ["0.1.0"]
+  "Talk to an agent the backend holds open: a session the dashboard and a phone can see too."
+
+  FLAGS:
+    upstream     : String; "Upstream repository in 'owner/repo' format"
+    fork         : String; "Fork repository in 'owner/repo' format"
+    session      : String; "Attach to an existing session by id instead of starting one"
+    list;                  "List sessions and exit"
+    "end"        : String; "End the session with this id and exit"
+    backend      : String; "Agent backend (default: claude; it is the only one that can host a session)"
+    model        : String; "Model override passed to the agent"
+    budget       : String; "Maximum spend in USD for the whole session (default: 20.0)"
+    tools        : String; "Comma-separated optional tools to enable, or 'all' (default: all)"
+    "resume-from" : String; "Start a session that picks up the conversation of this one"
+    "api-url" : String; "Backend to talk to (default: $ORCHESTRA_API_URL, or \
+http://127.0.0.1:8080)"
+    "api-token" : String; "Shared secret (default: $ORCHESTRA_DASHBOARD_PASSWORD, or the \
+persisted one)"
+]
+
 private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let upstreamStr := p.flag! "upstream" |>.as! String
   let forkStr     := p.flag! "fork"     |>.as! String
@@ -1475,6 +1785,7 @@ def orchestraCmd : Cmd := `[Cli|
   SUBCOMMANDS:
     runCmd';
     interactiveCmd;
+    chatCmd;
     mcpServerCmd;
     prepareCmd;
     cleanupCmd;
