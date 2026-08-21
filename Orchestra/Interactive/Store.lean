@@ -156,6 +156,25 @@ instance : FromJson SessionRecord where
       error          := j.getObjValAs? String "error"          |>.toOption
     }
 
+/-- What a caller asks for when it starts a session.
+
+    Here rather than beside the manager so that the control-socket protocol can name it without
+    importing the sandbox, the MCP server and the task runner along with it. -/
+structure SessionSpec where
+  upstream : Repository
+  fork : Repository
+  backend : Option String := none
+  model : Option String := none
+  budget : Option Float := none
+  /-- Optional tools to grant the agent through the MCP server; `none` means all of them, as
+      `orchestra interactive` does. -/
+  tools : Option (List String) := none
+  systemPrompt : Option String := none
+  /-- Start this session by resuming the conversation another one was having. Used to pick up a
+      session whose agent died; the old session is not revived, this is a new one that inherits
+      its transcript's agent-side history. -/
+  resumeFrom : Option String := none
+
 /-! ## The transcript -/
 
 /-- What one line of the transcript says.

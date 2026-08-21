@@ -57,22 +57,6 @@ structure Config where
   /-- How long a session may sit without a turn before it is closed. -/
   idleTimeoutSeconds : Nat := 1800
 
-/-- What a caller asks for when it starts a session. -/
-structure SessionSpec where
-  upstream : Repository
-  fork : Repository
-  backend : Option String := none
-  model : Option String := none
-  budget : Option Float := none
-  /-- Optional tools to grant the agent through the MCP server; `none` means all of them, as
-      `orchestra interactive` does. -/
-  tools : Option (List String) := none
-  systemPrompt : Option String := none
-  /-- Start this session by resuming the conversation another one was having. Used to pick up a
-      session whose agent died; the old session is not revived, this is a new one that inherits
-      its transcript's agent-side history. -/
-  resumeFrom : Option String := none
-
 /-- A session the daemon is holding right now. Its on-disk record is the durable half; this is
     the half that cannot be written down. -/
 structure LiveSession where
