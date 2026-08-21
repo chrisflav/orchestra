@@ -67,6 +67,34 @@ def claude : AgentDef where
     if let some sid := resume then
       args := args.push "--resume" |>.push sid
     return args
+  buildStreamArgs o := Id.run do
+    -- `--input-format stream-json` is what makes the process read turns from stdin instead of
+    -- taking one prompt and exiting, and the CLI accepts it only alongside `--print`. There is
+    -- no `-p <prompt>` here for the same reason: the prompt arrives on stdin, one JSON line per
+    -- turn, for as long as the session lives.
+    let mut args : Array String := #[
+      "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+      "--dangerously-skip-permissions", "--mcp-config", o.mcpContext,
+      -- Bounds the whole session, not a turn — see `StreamOptions.budget`.
+      "--max-budget-usd", s!"{o.budget}"
+    ]
+    for p in o.pluginDirs do
+      args := args.push "--plugin-dir" |>.push p
+    if let some name := o.subAgent then
+      args := args.push "--agent" |>.push name
+    if let some m := o.model then
+      args := args.push "--model" |>.push m
+    if let some content := o.systemPrompt then
+      args := args.push "--append-system-prompt" |>.push content
+    if o.partialMessages then
+      args := args.push "--include-partial-messages"
+    -- Resuming names a session that already exists, so there is nothing left to assign: the two
+    -- are alternatives, and passing both would be asking the CLI to call one session two things.
+    if let some sid := o.resume then
+      args := args.push "--resume" |>.push sid
+    else if let some sid := o.sessionId then
+      args := args.push "--session-id" |>.push sid
+    return args
   goalArgs goal :=
     -- What `/goal <condition>` does inside a Claude Code session is register one session-scoped
     -- `Stop` hook of type `prompt` carrying the condition: on every attempt to stop, a second
