@@ -133,8 +133,23 @@ private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
     IO.eprintln s!"  [merger] pr checkout failed:\n{coStderr}"
     throw (.userError "pr checkout failed")
   -- Run the validation script before merging.
+  --
+  -- Captured like every other hook run, but note what that does and does not buy here. The capture
+  -- fixes the script before *this* function runs it, which is all it can do: unlike a task run,
+  -- there is no moment before the untrusted code arrives — `gh pr checkout` above is what put it
+  -- in the tree. So on a pull request from a fork, this still runs a script the PR author wrote,
+  -- unsandboxed. That is a separate hole from the one `Hooks` closes and it is not closed here.
   IO.println "  [merger] running validation script"
-  let (valid, validOutput) ← RepoConfig.runValidation repoPath
+  -- From the base ref rather than the checked-out pull request: the script that decides whether
+  -- to merge must be the one the base branch committed, not the one the PR proposes. That is also
+  -- what keeps a fork PR from supplying its own merge gate.
+  let some (_, baseRef) ← Repo.slotBaseRef repoPath
+    | throw (.userError "could not resolve the base ref, so the validation script that would run \
+outside the sandbox cannot be established; refusing to merge")
+  let hooksDir := (← Dirs.dataBase) / "hooks" / initialRecord.id
+  let hooks ← RepoConfig.capture repoPath hooksDir baseRef
+  let (valid, validOutput) ← hooks.runValidation
+  hooks.release
   if !validOutput.isEmpty then
     IO.println s!"  [merger] validation output:\n{validOutput}"
   if !valid then
@@ -532,9 +547,22 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"
-  -- 4. Run init hook and load per-repository config
-  RepoConfig.runInitIfNeeded repoPath
-  let repoConfig ← RepoConfig.loadRepoConfig repoPath
+  -- 4. Capture the repository's hooks, run the init hook, and load per-repository config.
+  --
+  -- The capture happens here, before the agent is launched, and everything below reads from it.
+  -- The agent holds `--rwx` on `repoPath` for the whole of step 5, so a hook read from the working
+  -- tree after that point is a script the agent may have written — running unsandboxed, with this
+  -- process's credentials. See `RepoConfig.Hooks`.
+  let hooksDir := (← Dirs.dataBase) / "hooks" / taskId
+  -- The *base* ref, not `HEAD`. A continuation task keeps its predecessor's tree
+  -- (`Repo.ensureSlot` skips `resetSlot` for one), so `HEAD` there is the commit the previous
+  -- agent made — and committing is exactly what a task that opens a pull request does.
+  let some (_, baseRef) ← Repo.slotBaseRef repoPath
+    | throw (.userError "could not resolve the repository's base ref, so the hooks that would run \
+outside the sandbox cannot be established; refusing to run the task")
+  let hooks ← RepoConfig.capture repoPath hooksDir baseRef
+  hooks.runInitIfNeeded
+  let repoConfig ← hooks.config
   -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
   let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
   -- 5a. Resolve memory directories and amend system prompt
@@ -570,7 +598,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       pure label
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
-    RepoConfig.runHook repoPath "before.sh"
+    hooks.run "before.sh"
     let prompt :=
       if attempt == 0 then baseTaskPrompt
       else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
@@ -616,11 +644,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
         Usage.markLimited backendName label ioTask.model "agent reported a usage limit"
           (resetHint := result.rateLimitReset)
       break
-    if !(← RepoConfig.hasValidationScript repoPath) then
+    if !(← hooks.hasValidation) then
       IO.println "  No validation script found, skipping validation."
       break
     IO.println "  Running validation script..."
-    let (valid, validationOutput) ← RepoConfig.runValidation repoPath
+    let (valid, validationOutput) ← hooks.runValidation
     lastValidationOutput := validationOutput
     if !validationOutput.isEmpty then
       IO.println s!"  Validation output:\n{validationOutput}"
@@ -632,7 +660,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     else
       IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
   -- 6. Run after hook and shut down MCP server
-  RepoConfig.runHook repoPath "after.sh"
+  hooks.run "after.sh"
+  hooks.release
   shutdown
   -- 7. Persist final task state
   --

@@ -819,6 +819,34 @@ file:
 
 The failing script's output is available to the retry prompt as `{{validation_output}}`.
 
+### hooks run outside the sandbox, and are read from your history
+
+Hooks are the one part of a task that is *not* sandboxed: they run as the daemon, with its
+environment and credentials, because installing a toolchain or running a test suite is what they
+are for. That makes which script runs a security question, so orchestra takes them from
+`git archive HEAD` rather than from the working tree:
+
+- **A hook must be committed**, and is read straight out of git's object store — not from the
+  checkout, and not through `git archive`. An uncommitted `.orchestra/validation.sh` sitting in the
+  working tree does not run. This is deliberate: an agent has write access to its whole clone,
+  `git clean -fd` (which resets a task slot) leaves ignored files in place, and `.git/config` and
+  `.git/info/attributes` survive every reset — so anything read from the tree, or through a
+  command that honours those files, could be chosen by an agent rather than by you.
+- **Hooks come from the base branch**, not from the commit under test. A task that changes its
+  repository's hooks does not run the changed versions; they take effect once merged. The merger
+  validates a pull request with the *base* branch's `validation.sh`, so a pull request cannot
+  supply its own merge gate.
+- **Symlinked hooks are ignored**, since the places a link could point at are writable by the
+  sandboxed agent.
+- **A repository with no commits has no hooks.** On an unborn `HEAD` there is nothing to read, so
+  `init.sh` does not run.
+
+What this does *not* do is make hooks safe to point at untrusted code. `validation.sh` runs your
+build and test suite over the tree the agent just modified, so agent-written code still executes
+unsandboxed by design — that is inherent to validating an agent's work. Treat a repository whose
+pull requests you merge automatically as trusted, and do not point the merger at a repository that
+accepts pull requests from strangers.
+
 ## listeners
 
 Listeners poll event sources and automatically enqueue tasks. Listener configs

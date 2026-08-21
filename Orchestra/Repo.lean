@@ -328,7 +328,7 @@ private def defaultBranchName (repoPath : System.FilePath) (remote : String) : I
     The commit is taken from `upstream` when available: a slot fetches upstream on every
     reset and never fetches origin, so the fork's remote-tracking refs are stale as of
     clone time and would silently base new work on an old commit. -/
-private def slotBaseRef (repoPath : System.FilePath) : IO (Option (String × String)) := do
+def slotBaseRef (repoPath : System.FilePath) : IO (Option (String × String)) := do
   let some branch ← defaultBranchName repoPath "origin" | return none
   for remote in ["upstream", "origin"] do
     let ref := s!"{remote}/{branch}"

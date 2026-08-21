@@ -11,6 +11,7 @@ import OrchestraTest.InteractiveWireTest
 import OrchestraTest.InteractiveStoreTest
 import OrchestraTest.InteractiveSessionTest
 import OrchestraTest.WorkflowParserTest
+import OrchestraTest.RepoHooksTest
 import OrchestraTest.ProjectClaimTest
 import OrchestraTest.ProjectFieldsTest
 import OrchestraTest.ProjectMetaTest

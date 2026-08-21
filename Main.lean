@@ -177,7 +177,19 @@ private def prepareHandler (p : Parsed) : IO UInt32 := do
     -- Run the repo's init hook now rather than inside the first task that lands here, so a
     -- toolchain install or a cold `lake exe cache get` is paid up front instead of counting
     -- against that task's budget and wall clock.
-    RepoConfig.runInitIfNeeded slotPath
+    -- Captured like every other hook run, though nothing has had a chance to tamper here: this
+    -- is a clone straight from `ensureSlot`, before any task has been dispatched into it.
+    -- Keyed on the fork as well as the slot: two `prepare` runs for different repositories share
+    -- a slot index, and a key of just the index would have one run's `capture` delete the other's
+    -- copy mid-flight.
+    let hooksDir := (← Dirs.dataBase) / "hooks"
+      / s!"prepare-{fork.owner}-{fork.name}-{slot}"
+    match ← Repo.slotBaseRef slotPath with
+    | none => IO.eprintln s!"  Warning: slot {slot} has no resolvable base ref; skipping init.sh."
+    | some (_, baseRef) =>
+      let hooks ← RepoConfig.capture slotPath hooksDir baseRef
+      hooks.runInitIfNeeded
+      hooks.release
     IO.println slotPath.toString
   return (0 : UInt32)
 
