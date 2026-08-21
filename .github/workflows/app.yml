@@ -189,11 +189,21 @@ jobs:
       - name: Generate the Android project
         run: npx tauri android init
 
-      # `--target aarch64` rather than the default, which builds every ABI into one universal
-      # APK: that came to 165 MB, most of it architectures the phone installing it cannot run.
-      # An emulator build is `--target aarch64 x86_64`.
+      # Two things keep this from being an absurd download.
+      #
+      # `--target aarch64` rather than the default, which builds every ABI into the APK. Gradle
+      # still calls the output `app-universal-debug.apk` — that is its name for the single APK
+      # it emits, not a claim about what is inside it.
+      #
+      # And the Rust library goes in stripped. `--debug` is what makes the APK installable
+      # without a signing identity, but it also means an unstripped `libapp.so`, which was most
+      # of a 161 MB APK. The debug symbols are of no use on someone else's phone. Set here
+      # rather than in `Cargo.toml` so a local `cargo build` keeps its symbols.
       - name: Build the APK
         run: npx tauri android build --apk --debug --target aarch64
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "false"
+          CARGO_PROFILE_DEV_STRIP: symbols
 
       # The exact directory Gradle writes into has moved between Tauri versions, and a glob
       # that silently matches nothing is how an empty artifact happens. This puts the real
@@ -224,6 +234,17 @@ jobs:
           body: >-
             A debug build of the orchestra app, signed with Gradle's debug keystore — which is
             what makes it installable without a signing identity, and what makes it not a Play
-            Store build. arm64 only. Built from
-            ${{ github.sha }}.
+            Store build. Your phone will ask you to allow installing from this source.
+
+
+            arm64 only, despite the file name: `app-universal-debug.apk` is what Gradle calls
+            the single APK it emits, not a claim about the architectures inside it.
+
+
+            One limit worth knowing before you add a backend: on Android the app verifies TLS
+            against Mozilla's roots rather than the system store, so a backend behind a private
+            CA will not verify here even though it does on the desktop.
+
+
+            Built from ${{ github.sha }}.
           files: app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk

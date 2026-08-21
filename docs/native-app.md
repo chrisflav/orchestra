@@ -302,9 +302,15 @@ It is a **debug** APK, arm64 only, signed with the debug keystore Gradle generat
 what makes it installable on a handset without a signing identity. Installing it means allowing
 your phone to install from that source; it is not, and cannot be, a Play Store build.
 
-Size is why it is one architecture. The default builds every ABI into one universal APK, and with
-unstripped debug Rust libraries for four of them that came to 165 MB — most of it code the phone
-installing it cannot execute. One ABI is about a quarter of that.
+Size is why it is one architecture, and why the Rust library goes in stripped. The default builds
+every ABI into the APK, most of it code the phone installing it cannot execute; and `--debug`,
+which is what makes the APK installable at all, otherwise leaves a `libapp.so` carrying full
+debug symbols, which was the majority of a 161 MB file. One ABI and
+`CARGO_PROFILE_DEV_STRIP=symbols` between them take the bulk of that out.
+
+The two sizes reported for the same build disagree, and it is worth knowing why: an Actions
+artifact is a **zip** of the APK, which compresses to roughly a third, while a release asset is
+the APK itself.
 
 Locally, with a JDK, the SDK and the NDK in place (`NDK_HOME` set):
 

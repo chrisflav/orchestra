@@ -65,9 +65,19 @@ touches `app/`, and on demand through *Run workflow*. Two ways to get it:
   you want to open it.
 
 It is arm64 only (`--target aarch64`), which is every handset made in roughly the last decade —
-an emulator wants `--target aarch64 x86_64`. It is signed with Gradle's debug keystore, which is
-what makes it installable without a signing identity, and what makes it not a Play Store build:
-the phone will ask you to allow installing from that source.
+an emulator wants `--target aarch64 x86_64`. Gradle names its output `app-universal-debug.apk`
+whatever is in it, so the file name is not a claim about architectures. CI also builds it with
+`CARGO_PROFILE_DEV_DEBUG=false` and `CARGO_PROFILE_DEV_STRIP=symbols`: `--debug` is what makes
+the APK installable without a signing identity, but it also leaves an unstripped `libapp.so`
+that was most of a 161 MB download, and those symbols are no use on someone else's phone.
+
+It is signed with Gradle's debug keystore, which is what makes it installable without a signing
+identity, and what makes it not a Play Store build: the phone will ask you to allow installing
+from that source.
+
+A note on sizes, because the two numbers disagree: the Actions artifact is a **zip** of the APK
+and is roughly a third of it, while the release asset is the APK itself. Compare like with
+like.
 
 For a desktop bundle:
 
