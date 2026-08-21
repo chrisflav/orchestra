@@ -135,3 +135,51 @@ def theSessionCapIsCheckedBeforeAnythingIsAcquired : Test := do
     TestM.assert ((e.splitOn "limit").length ≥ 2)
       (msg := s!"the message should say it is a limit; got: {e}")
   TestM.assert (!(← acquired.get)) (msg := "and no slot should have been taken")
+
+/-! ## The cap is a decision, not an observation
+
+A session takes seconds to start, so counting only what is already in the table let two requests
+arriving together both see room. -/
+
+@[test]
+def theCapCountsSessionsThatAreStillStarting : Test := do
+  -- The second call must be refused even though the first has not finished starting — which it
+  -- never will here, because there is no GitHub App behind it. What matters is that the cap was
+  -- already spent by the attempt, not by the outcome.
+  let reserved ← IO.mkRef 0
+  let released ← IO.mkRef 0
+  let mgr ← Manager.new { maxSessions := 1 }
+    (fun _ => do reserved.modify (· + 1); return some 0)
+    (fun _ _ => released.modify (· + 1))
+  let cfg : AppConfig := { appId := 0, privateKeyPath := "" }
+  let spec : SessionSpec := {
+    upstream := { owner := "o", name := "r" }, fork := { owner := "f", name := "r" } }
+  let outcome ← withTempSessions do
+    let first ← mgr.start cfg spec
+    let second ← mgr.start cfg spec
+    pure (first, second)
+  let (first, second) := outcome
+  -- The first attempt fails (no App), but it must give its reservation back on the way out.
+  let isError {α β : Type} : Except α β → Bool | .error _ => true | .ok _ => false
+  TestM.assert (isError first) (msg := "the first start cannot succeed without an App")
+  TestM.assert (isError second) (msg := "and the second is refused too")
+  -- Having released, the cap is free again — the reservation is not leaked by a failed start.
+  TestM.assertEqual (← released.get) (← reserved.get)
+    (msg := "every slot reserved by a failed start is given back")
+
+@[test]
+def aFailedStartLeavesNoSlotBehind : Test := do
+  -- The slot is taken before anything that can throw. Every exit past that point has to give it
+  -- back, or the repository runs one narrower for the life of the daemon with nothing holding
+  -- the slot and nothing able to find it.
+  let reserved ← IO.mkRef 0
+  let released ← IO.mkRef 0
+  let mgr ← Manager.new { maxSessions := 4 }
+    (fun _ => do reserved.modify (· + 1); return some 0)
+    (fun _ _ => released.modify (· + 1))
+  let cfg : AppConfig := { appId := 0, privateKeyPath := "/nonexistent/key.pem" }
+  let _ ← withTempSessions do
+    mgr.start cfg { upstream := { owner := "o", name := "r" },
+                    fork := { owner := "f", name := "r" } }
+  TestM.assertEqual (← reserved.get) 1 (msg := "a slot was taken")
+  TestM.assertEqual (← released.get) 1 (msg := "and given back when the start failed")

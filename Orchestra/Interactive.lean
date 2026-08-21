@@ -86,6 +86,12 @@ structure LiveSession where
     `Daemon.run`. -/
 structure Manager where
   private sessions : Std.Mutex (Array LiveSession)
+  /-- Sessions past the cap check but not yet in `sessions`.
+
+      A session takes seconds to start — a clone, a token, a sandbox — and counting only the
+      table meant two requests arriving together both saw room and both took it. Counted under
+      the same mutex as the table, so the cap is a decision rather than an observation. -/
+  private starting : IO.Ref Nat
   cfg : Config
   /-- Take a clone slot for `fork`, or answer `none` when the repository is at its limit. -/
   private reserveSlot : Repository → IO (Option Nat)
@@ -145,19 +151,32 @@ time, in the order the agent emitted them. -/
     the turn; and a rate-limit event carries when the limit lifts. The rest are transcript. -/
 private def onAgentEvent (s : LiveSession) (event : Event) : IO Unit := do
   if Wire.isNoise event then return
+  -- Recorded against the source this session is spending, exactly as a queued run does. Without
+  -- it the resolver keeps offering an account whose window is spent, and the next tasks
+  -- dispatched to it each clone a slot, mint a token, start a sandbox and die on the limit —
+  -- the waste `markLimited` exists to prevent.
+  if let .rateLimit reset := event then
+    if let some label := s.authLabel then
+      Usage.markLimited s.backend label none "the agent reported a usage limit"
+        (resetHint := reset)
   if let .init sid _ := event then
     -- Belt and braces: the id was assigned before launch, but a CLI that decided on a different
     -- one would otherwise leave the record naming a session nobody can resume.
     update s fun r => { r with agentSessionId := some sid }
   let _ ← append s (.agent event)
   if let .result sub _ durationMs cost _ := event then
-    let costFloat := cost.bind (·.getNum?.toOption) |>.map (·.toFloat)
+    -- `total_cost_usd` is the CLI's own running total for the process, not this turn's bill —
+    -- it returns a module-global. Adding it up across a session that keeps one process for
+    -- every turn therefore counts turn 1 once, turn 2 twice, and reads far over budget while
+    -- the CLI, enforcing `--max-budget-usd` against the true total, is nowhere near it. The
+    -- record takes the total as given; the turn reports the difference it made.
     let r ← s.record.get
-    let _ ← append s (.turnEnded r.turnCount (subtypeName sub) costFloat
+    let total := (cost.bind (·.getNum?.toOption) |>.map (·.toFloat)).getD r.costUsd
+    let _ ← append s (.turnEnded r.turnCount (subtypeName sub) (some (total - r.costUsd))
                                  (durationMs.map (· / 1000)))
     update s fun r => { r with
       status  := if r.status.isTerminal then r.status else .idle
-      costUsd := r.costUsd + costFloat.getD 0.0 }
+      costUsd := total }
     -- A budget the session has spent is the session over, not a turn that went badly: the CLI
     -- will refuse every turn after it, and a session that answers nothing while still reading
     -- `idle` is worse than one that says it is finished.
@@ -185,7 +204,8 @@ def allOptionalTools : List String :=
 def Manager.new (cfg : Config)
     (reserveSlot : Repository → IO (Option Nat))
     (releaseSlot : Repository → Nat → IO Unit) : IO Manager := do
-  return { sessions := ← Std.Mutex.new #[], cfg, reserveSlot, releaseSlot }
+  return { sessions := ← Std.Mutex.new #[], starting := ← IO.mkRef 0, cfg, reserveSlot,
+           releaseSlot }
 
 /-- Close a live session: stop the agent, shut down its MCP server, release its slot, and stamp
     the record terminal.
@@ -195,6 +215,20 @@ def Manager.new (cfg : Config)
     one narrower for the life of the daemon. -/
 private def teardown (mgr : Manager) (s : LiveSession) (status : SessionStatus)
     (why : Option String) : IO Unit := do
+  -- Claim the session out of the table first, and do nothing at all if someone else got there
+  -- first. Two callers reach here for the same session routinely — the reaper finding a dead
+  -- process while a close request is in flight, `send` noticing the same thing — and releasing
+  -- a clone slot twice is not a harmless repeat. The second release removes whichever session
+  -- or task has since been given that slot number, so a third claimant takes it too, and two
+  -- agents end up in one working tree with `git reset --hard` running under both.
+  let claimed ← mgr.sessions.atomically do
+    let ss ← get
+    if ss.any (·.id == s.id) then
+      set (ss.filter (·.id != s.id))
+      return true
+    else
+      return false
+  unless claimed do return
   try s.stream.shutdown catch _ => pure ()
   try s.shutdownMcp catch _ => pure ()
   try mgr.releaseSlot s.fork s.slot catch _ => pure ()
@@ -204,7 +238,6 @@ private def teardown (mgr : Manager) (s : LiveSession) (status : SessionStatus)
       if r.status.isTerminal then r
       else { r with status, endedAt := some now, error := why }
   catch _ => pure ()
-  mgr.sessions.atomically <| modify fun ss => ss.filter (·.id != s.id)
 
 private def find (mgr : Manager) (id : String) : IO (Option LiveSession) := do
   let ss ← mgr.sessions.atomically get
@@ -225,47 +258,91 @@ def Manager.start (mgr : Manager) (appConfig : AppConfig) (spec : SessionSpec)
   if (agentDef.buildStreamArgs { mcpContext := "" }).isNone then
     return .error s!"backend '{backendName}' cannot host an interactive session: its CLI has no \
 streaming input mode. Backends that can: claude."
-  let live ← mgr.sessions.atomically get
-  if live.size ≥ mgr.cfg.maxSessions then
-    return .error s!"the daemon is already holding {live.size} interactive \
-session{if live.size == 1 then "" else "s"}, which is its limit; end one first"
+  let held ← mgr.sessions.atomically do
+    let live ← get
+    let starting ← mgr.starting.get
+    let held := live.size + starting
+    if held < mgr.cfg.maxSessions then mgr.starting.set (starting + 1)
+    return held
+  if held ≥ mgr.cfg.maxSessions then
+    return .error s!"the daemon is already holding {held} interactive \
+session{if held == 1 then "" else "s"}, which is its limit; end one first"
   let some slot ← mgr.reserveSlot spec.fork
     | return .error s!"no free clone slot for {spec.fork}: every one is in use by a running task \
 or another session"
-  let id ← TaskStore.generateId
-  let now ← TaskStore.currentIso8601
-  -- Resuming inherits the agent-side history of the session named, not the session itself.
-  let resumeAgentSession : Option String ← match spec.resumeFrom with
-    | none     => pure none
-    | some old => pure ((← loadSession old).bind (·.agentSessionId))
-  let record : SessionRecord := {
-    id, createdAt := now, lastActivityAt := now
-    upstream := spec.upstream, fork := spec.fork
-    backend := backendName, model := spec.model
-    budget := spec.budget.getD 20.0
-    slot
-    agentSessionId := ← newUuid
-    resumedFrom := spec.resumeFrom
-  }
-  saveSession record
-  -- From here on the slot is held, so every exit releases it.
-  let fail (msg : String) : IO (Except String SessionRecord) := do
+  -- The slot is held from here, so from here everything is inside the handler that gives it
+  -- back. An earlier version opened its `try` several statements later, and every one of those
+  -- statements could throw — minting an id, reading the clock, reading the session being
+  -- resumed, opening `/dev/urandom`, writing the record. A throw there escaped `start`
+  -- entirely, the socket handler logged it and closed the connection without a reply, and the
+  -- slot stayed in `activeSlots` with nothing holding it: no `LiveSession`, so nothing the
+  -- reaper could ever find. With `parallel_per_repo: 1` that repository was finished for the
+  -- life of the daemon.
+  --
+  -- `shutdownRef` is how the MCP server joins the same guarantee. It is empty until
+  -- `Server.start` succeeds and holds that server's own shutdown afterwards, so the handler
+  -- below closes it on every failing path rather than only the two that were remembered by
+  -- hand — a leaked MCP server is a loopback port still serving `create_pr`, `merge_pr` and
+  -- `comment` against a live installation, with no session and no way to reach it.
+  let shutdownRef ← IO.mkRef (none : Option (IO Unit))
+  let recordRef ← IO.mkRef (none : Option SessionRecord)
+  let dropStarting : IO Unit :=
+    mgr.sessions.atomically <| mgr.starting.modify fun n => if n > 0 then n - 1 else 0
+  let release : IO Unit := do
+    if let some shut ← shutdownRef.get then try shut catch _ => pure ()
     try mgr.releaseSlot spec.fork slot catch _ => pure ()
-    let now ← TaskStore.currentIso8601
-    let r := { record with status := .failed, endedAt := some now, error := some msg }
-    saveSession r
-    appendEvent id 1 now (.notice "error" msg)
-    saveSession { r with lastEventSeq := 1 }
+  let fail (msg : String) : IO (Except String SessionRecord) := do
+    release
+    dropStarting
+    -- Only stamp a record if one was written; before that there is nothing on disk to stamp.
+    if let some record ← recordRef.get then
+      let now ← TaskStore.currentIso8601
+      let r := { record with status := .failed, endedAt := some now, error := some msg }
+      -- The seq continues from wherever the transcript got to. The pump may have written the
+      -- `init` event already, and reusing seq 1 would put two events at one cursor position.
+      let seq := r.lastEventSeq + 1
+      appendEvent r.id seq now (.notice "error" msg)
+      saveSession { r with lastEventSeq := seq }
     return .error msg
   try
+    let id ← TaskStore.generateId
+    let now ← TaskStore.currentIso8601
+    -- Resuming inherits the agent-side history of the session named, not the session itself.
+    let resumed ← match spec.resumeFrom with
+      | none     => pure none
+      | some old => loadSession old
+    let record : SessionRecord := {
+      id, createdAt := now, lastActivityAt := now
+      upstream := spec.upstream, fork := spec.fork
+      backend := backendName, model := spec.model
+      budget := spec.budget.getD 20.0
+      slot
+      agentSessionId := ← newUuid
+      resumedFrom := spec.resumeFrom
+    }
+    saveSession record
+    recordRef.set (some record)
+    let resumeAgentSession := resumed.bind (·.agentSessionId)
     let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
     let installationId ← match appConfig.installationId with
       | some i => pure i
       | none   => GitHub.getInstallationId jwt spec.fork.owner
+    -- Deliberately no `GitHub.setupGhAuth`: that writes the token into
+    -- `~/.config/gh/hosts.yml`, which every concurrently running task in this daemon shares.
+    -- `TaskRunner` avoids it for the same reason, and it is not needed — the token reaches the
+    -- clone through `ensureSlot` and the agent through `GH_TOKEN` in the sandbox. A session
+    -- doing it would silently re-point every other `gh` call in the process at its own
+    -- installation, and leave the token on disk afterwards.
     let token ← GitHub.createInstallationToken jwt installationId
-    GitHub.setupGhAuth token
+    -- `resumeFrom` on the assignment is what keeps the predecessor's working tree instead of
+    -- resetting it, and it is checked against the slot's recorded occupant, so asking for it is
+    -- safe even when the tree has since been taken. Without it a resumed session restored the
+    -- conversation onto a wiped tree: the agent opens with a context full of edits it made and
+    -- a checkout where none of them exist — the exact hazard the slot-pinning design exists to
+    -- avoid, reintroduced at the one moment it matters most.
+    let resumeSlotOf := resumed.filter (·.slot == slot) |>.map (·.id)
     let repoPath ← Repo.ensureSlot spec.fork spec.upstream
-      { slot, occupant := some id } (token := some token)
+      { slot, occupant := some id, resumeFrom := resumeSlotOf } (token := some token)
     let (port, shutdownMcp) ← Server.start {
       upstream := spec.upstream, fork := spec.fork
       allowedTools := spec.tools.getD allOptionalTools
@@ -273,13 +350,12 @@ or another session"
       installationId, pat := appConfig.pat
       agentBackend := backendName
     }
+    shutdownRef.set (some shutdownMcp)
     -- A session goes through the same resolver as a queued run, so an account the daemon has
     -- already found to be out of quota is not handed to a person either.
     let authLabel ← match ← Usage.resolveLabel appConfig backendName [] none none spec.model with
       | .ok label => pure label
-      | .error e  => do
-        shutdownMcp
-        return ← fail s!"no usable authentication source for '{backendName}': {e}"
+      | .error e  => return ← fail s!"no usable authentication source for '{backendName}': {e}"
     if let some l := authLabel then Usage.markUsed backendName l
     let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName authLabel
     let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
@@ -287,8 +363,11 @@ or another session"
     let recordRef ← IO.mkRef record
     let lock ← Std.BaseMutex.new
     -- The pump needs the session to deliver events to, and the session needs the pump. Broken
-    -- with a ref the callback reads: nothing arrives before `launchStreaming` returns, because
-    -- the agent has not been spawned yet.
+    -- with a ref the callback reads. `launchStreaming` does spawn the child and start the pump
+    -- before it returns, so there is a window here in which an event would be dropped — it is
+    -- the width of the rest of this function against a `landrun` plus a node start, so in
+    -- practice even the `init` event lands after the set. Worth knowing rather than believing
+    -- it cannot happen.
     let liveRef ← IO.mkRef (none : Option LiveSession)
     let onEvent (e : Event) : IO Unit := do
       if let some s ← liveRef.get then onAgentEvent s e
@@ -297,23 +376,52 @@ or another session"
           resume := resumeAgentSession, sessionId := record.agentSessionId,
           budget := record.budget }
         onEvent (debug := debug)
-        (extraEnv := apiKeyEnv) (pluginDirs := appConfig.pluginDirs)
+        (extraEnv := apiKeyEnv) (pluginDirs := ← TaskRunner.defaultPluginDirs appConfig)
         (extraPorts := extraPorts) (additionalPaths := appConfig.additionalSandboxPaths)
-      | do
-        shutdownMcp
-        return ← fail s!"backend '{backendName}' cannot host an interactive session"
+      | return ← fail s!"backend '{backendName}' cannot host an interactive session"
     let session : LiveSession := {
       id, fork := spec.fork, slot, record := recordRef, lock, stream, shutdownMcp
       authLabel, backend := backendName
     }
     liveRef.set (some session)
-    mgr.sessions.atomically <| modify (·.push session)
-    update session fun r => { r with status := .idle }
-    return .ok (← recordRef.get)
+    mgr.sessions.atomically do
+      modify (·.push session)
+      mgr.starting.modify fun n => if n > 0 then n - 1 else 0
+    -- Registered. From here the session owns the slot and the MCP server, and `fail` must not
+    -- take either back — `teardown` is the only thing that may, and only via the table. A throw
+    -- past this point would otherwise hand a running agent's clone slot to the queue.
+    shutdownRef.set none
+    try update session fun r => { r with status := .idle }
+    catch _ => pure ()
+    return .ok (← session.record.get)
   catch e =>
     fail s!"could not start the session: {e}"
 
 /-! ## Talking to one -/
+
+/-- Take the session from `idle` to `running`, and answer the turn number that claim owns.
+
+    The check and the transition are one critical section on purpose. Read-then-act, which is
+    what this was, let two turns posted at once both see `idle` and both proceed: the agent took
+    the second off the pipe the moment it finished the first, and the transcript recorded two
+    `turnStarted 2` and no turn 1 — "two answers in an order nobody chose", which is the exact
+    thing refusing a concurrent turn is for. -/
+private def claimTurn (s : LiveSession) (text : String) : IO (Except String Nat) := do
+  s.lock.lock
+  try
+    let r ← s.record.get
+    if r.status.isTerminal then
+      return .error s!"this session has {if r.status == .failed then "failed" else "ended"}"
+    if r.status != .idle then
+      return .error "this session is working on a turn; interrupt it or wait for it to finish"
+    let r := { r with
+      status := .running
+      turnCount := r.turnCount + 1
+      title := r.title.orElse fun _ => some (titleOf text) }
+    s.record.set r
+    saveSession r
+    return .ok r.turnCount
+  finally s.lock.unlock
 
 /-- Post a turn. Answers the seq the turn was written at, so a caller can start reading from it.
 
@@ -322,21 +430,16 @@ or another session"
     an order nobody chose. -/
 def Manager.send (mgr : Manager) (id : String) (text : String) : IO (Except String Nat) := do
   let some s ← find mgr id | return .error "no such session"
-  let r ← s.record.get
-  if r.status.isTerminal then
-    return .error s!"this session has {statusWord r.status}"
-  if r.status == .running then
-    return .error "this session is working on a turn; interrupt it or wait for it to finish"
   if (← s.stream.hasExited) then
-    let out ← s.stream.stderrSoFar
+    -- Not the agent's stderr: it is unbounded output from a process holding a GitHub token, and
+    -- this string is on its way to an HTTP client. The transcript carries the detail.
     teardown mgr s .failed (some "the agent process exited")
-    return .error s!"the agent process is gone{if out.isEmpty then "" else s!": {out}"}"
+    return .error "the agent process is gone"
+  let turn ← match ← claimTurn s text with
+    | .error e   => return .error e
+    | .ok   turn => pure turn
   let seq ← append s (.user text)
-  update s fun r => { r with
-    status := .running
-    turnCount := r.turnCount + 1
-    title := r.title.orElse fun _ => some (titleOf text) }
-  let _ ← append s (.turnStarted (← s.record.get).turnCount)
+  let _ ← append s (.turnStarted turn)
   try
     s.stream.sendLine (Wire.userTurn text)
     return .ok seq
@@ -344,10 +447,6 @@ def Manager.send (mgr : Manager) (id : String) (text : String) : IO (Except Stri
     let _ ← append s (.notice "error" s!"the turn could not be delivered: {e}")
     teardown mgr s .failed (some s!"the turn could not be delivered: {e}")
     return .error s!"the turn could not be delivered: {e}"
-where
-  statusWord : SessionStatus → String
-    | .failed => "failed"
-    | _       => "ended"
 
 /-- Abandon the turn in flight, keeping the process and the conversation.
 
@@ -397,17 +496,23 @@ def Manager.reap (mgr : Manager) : IO Unit := do
         s!"the session was closed after {mgr.cfg.idleTimeoutSeconds}s without a turn")
       teardown mgr s .ended none
 where
-  /-- Seconds between an RFC 3339 instant and now, via `date`, which is how the rest of the
-      daemon does arithmetic on the timestamps it writes. `0` for anything unparseable, so a
-      malformed record is never reaped for being old. -/
+  /-- Seconds between an RFC 3339 instant and now.
+
+      Through `Usage.parseIso8601`, which is pure, unit-tested and what the rest of the daemon
+      uses. An earlier version shelled out to `date -u +%s -d <iso>` and read the result with
+      `toNat!`. Three things were wrong with that and they compounded: `IO.Process.output` does
+      not throw on a non-zero exit, so a failure arrived as empty stdout; `"".toNat!` is a
+      *panic*, not an `IO.Error`, so the `catch` could not see it; and the panic's default value
+      is `0`, which made the elapsed time the whole Unix epoch. So the one input that was
+      supposed to be safe — an unparseable timestamp — reaped every live session on the next
+      tick instead of none. `date -d` is also GNU-only, which would have done the same thing on
+      BusyBox or macOS unconditionally.
+
+      `0` for anything unparseable, so a malformed record is never reaped for being old. -/
   secondsSince (iso : String) : IO Nat := do
-    try
-      let out ← IO.Process.output { cmd := "date", args := #["-u", "+%s", "-d", iso] }
-      let then_ := out.stdout.trimAscii.toString.toNat!
-      let nowOut ← IO.Process.output { cmd := "date", args := #["-u", "+%s"] }
-      let now := nowOut.stdout.trimAscii.toString.toNat!
-      return if now > then_ then now - then_ else 0
-    catch _ => return 0
+    let some then_ := Usage.parseIso8601 iso | return 0
+    let now ← Usage.nowEpoch
+    return if now > then_ then (now - then_).toNat else 0
 
 /-- Close every live session. The daemon's shutdown path. -/
 def Manager.closeAll (mgr : Manager) : IO Unit := do
