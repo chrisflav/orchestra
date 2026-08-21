@@ -367,12 +367,13 @@ goal; running without the goal condition."
       if debug then
         err.putStrLn s!"[raw] {line.trimAscii}"
         err.flush
-      match agentDef.parseOutputLine line with
-      | none =>
-        if debug then
-          err.putStrLn s!"[suppressed] {line.trimAscii}"
-          err.flush
-      | some event =>
+      let events := agentDef.parseOutputLine line
+      if events.isEmpty && debug then
+        err.putStrLn s!"[suppressed] {line.trimAscii}"
+        err.flush
+      -- One line can carry several events — an assistant message that thinks, narrates and
+      -- then calls a tool is three — so each is handled in the order the agent emitted it.
+      for event in events do
         if let .init sid _ := event then
           sessionIdRef.set (some sid)
         if let .result sub _ _ _ res := event then

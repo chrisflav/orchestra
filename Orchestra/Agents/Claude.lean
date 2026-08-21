@@ -82,7 +82,7 @@ def claude : AgentDef where
     let matcher := Json.mkObj [("matcher", .str ""), ("hooks", Json.arr #[stopHook])]
     let settings := Json.mkObj [("hooks", Json.mkObj [("Stop", Json.arr #[matcher])])]
     some #["--settings", settings.compress]
-  parseOutputLine := StreamFormat.parseEvent
+  parseOutputLine := StreamFormat.parseEvents
   extractSessionId _ := pure none
   cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()
   isUsageLimitError := stdUsageLimitError
