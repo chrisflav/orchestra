@@ -98,8 +98,15 @@ that are not browsers. It ticks faster than the dashboard streams, because chat 
 | `events.jsonl` | the transcript, appended and flushed per event |
 
 Append-only JSONL with a monotone `seq` is what makes the transcript cheap to tail from another
-process with a cursor, and what makes a dropped stream lossless to resume. It is the same shape
-as `<data>/logs/<owner>/<repo>/<taskId>.log`, which is already JSONL flushed per line.
+process with a cursor, and what makes a dropped stream lossless to resume. A reader walks it
+backwards and stops at the cursor, so a poll that finds nothing new costs one line rather than
+the whole conversation.
+
+Two details of the format are there to bound what a crash costs. The newline goes *before* each
+record rather than after it, so a daemon killed mid-write leaves a fragment the next append
+cannot splice itself onto — one lost event instead of two. And the file is decoded tolerantly at
+the tail: a kill in the middle of a multi-byte character would otherwise make the whole
+conversation unreadable rather than costing it one line.
 
 ### the session record
 
@@ -161,9 +168,12 @@ claude --print --input-format stream-json --output-format stream-json --verbose 
 ```
 
 `--session-id` **assigns** the session id rather than scraping it from the stream, so the daemon
-knows what to `--resume` even if the process dies before it says anything. `--replay-user-messages`
-makes the CLI re-emit stdin turns on stdout, so user messages arrive through the same stream as
-everything else and the transcript has exactly one writer.
+knows what to `--resume` even if the process dies before it says anything.
+
+The transcript has one writer for each kind of line and they do not overlap: the daemon records
+the turn it sends, because it is the thing that sent it, and the agent's own events arrive on the
+stream. (`--replay-user-messages`, which echoes stdin turns back on stdout, would buy a second
+copy of every turn and a second writer racing the first, so it is deliberately not passed.)
 
 `--max-budget-usd` bounds the **whole session**, not a turn; a conversation therefore wants a
 larger default than a one-shot task's. Exhausting it arrives as a result subtype the session

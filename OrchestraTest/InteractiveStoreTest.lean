@@ -119,12 +119,57 @@ def aTornLastLineIsSkippedRatherThanFatal : Test := do
     appendEvent "i-5" 1 "2026-08-21T10:00:00Z" (.user "first")
     appendEvent "i-5" 2 "2026-08-21T10:00:01Z" (.user "second")
     let h ← IO.FS.Handle.mk (← transcriptPath "i-5") .append
-    h.putStr "{\"seq\":3,\"kind\":\"us"
+    -- A kill lands mid-payload, so the fragment begins with the newline the writer put first.
+    h.putStr "\n{\"seq\":3,\"kind\":\"us"
     h.flush
     let (events, _) ← readEvents "i-5"
     pure (seqsOf events)
   TestM.assertEqual seqs [1, 2]
     (msg := "the half-written line is skipped and the whole ones are still there")
+
+@[test]
+def anEventAppendedAfterATornWriteSurvives : Test := do
+  -- The case the test above stops one step short of, and the one that actually happens: the
+  -- daemon is killed mid-write and then *restarts* and keeps appending. With the newline after
+  -- each record the next append lands on the fragment and the splice parses as neither, so the
+  -- crash takes the following event with it too. The newline goes before the record for exactly
+  -- this reason.
+  let seqs ← withTempSessions do
+    appendEvent "i-6" 1 "2026-08-21T10:00:00Z" (.user "before the crash")
+    let h ← IO.FS.Handle.mk (← transcriptPath "i-6") .append
+    h.putStr "\n{\"seq\":2,\"occurredAt\":\"2026-08-21T10:00:01Z\",\"kind\":\"us"
+    h.flush
+    appendEvent "i-6" 3 "2026-08-21T10:00:02Z" (.user "after the restart")
+    let (events, _) ← readEvents "i-6"
+    pure (seqsOf events)
+  TestM.assertEqual seqs [1, 3]
+    (msg := "only the torn event is lost — not the one written after it")
+
+@[test]
+def aTailTornMidCharacterDoesNotDestroyTheConversation : Test := do
+  -- `readFile` throws on invalid UTF-8, below the per-line recovery, so before this a daemon
+  -- killed mid-`→` made the whole transcript unreadable forever rather than costing one event.
+  let seqs ← withTempSessions do
+    appendEvent "i-7" 1 "2026-08-21T10:00:00Z" (.user "a turn mentioning → and ✓")
+    -- One byte of a three-byte character, which is what a killed writer leaves behind.
+    let h ← IO.FS.Handle.mk (← transcriptPath "i-7") .append
+    h.write (ByteArray.mk #[0x0a, 0x7b, 0xe2])
+    h.flush
+    let (events, _) ← readEvents "i-7"
+    pure (seqsOf events)
+  TestM.assertEqual seqs [1]
+    (msg := "the torn tail is trimmed and everything before it is still readable")
+
+@[test]
+def anIdThatWouldEscapeTheSessionRootIsRefused : Test := do
+  -- Not every id reaching the store came from a path segment the HTTP layer checked —
+  -- `resumeFrom` arrives in a request body — so the store holds this itself.
+  let outcome ← withTempSessions do
+    try
+      let _ ← loadSession "../../etc/passwd"
+      pure "accepted"
+    catch _ => pure "refused"
+  TestM.assertEqual outcome "refused" (msg := "a traversing id must not become a path")
 
 /-! ## The envelope
 

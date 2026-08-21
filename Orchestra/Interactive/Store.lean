@@ -1,4 +1,5 @@
 import Orchestra.Config
+import Orchestra.Utils.Files
 import Orchestra.Dirs
 import Orchestra.StreamFormat
 import Orchestra.TaskStore
@@ -210,7 +211,16 @@ def sessionsDir : IO System.FilePath := do
   | some p => return p
   | none   => return (← Dirs.dataBase) / "interactive"
 
-def sessionDir (id : String) : IO System.FilePath :=
+/-- The directory a session's files live in.
+
+    Every path in this module goes through here, and here is where the id is checked. That
+    placement is deliberate and the codebase has been bitten before: `Utils.ensureConfigName`
+    exists precisely because a store that trusted its callers wrote a file outside its root and
+    answered `201`. Not every id reaching this module comes from a path segment the HTTP layer
+    already checked — `resumeFrom` arrives in a request *body* — so the property is held here
+    rather than assumed. -/
+def sessionDir (id : String) : IO System.FilePath := do
+  Utils.ensureConfigName "session" id
   return (← sessionsDir) / id
 
 def recordPath (id : String) : IO System.FilePath :=
@@ -230,16 +240,31 @@ def saveSession (r : SessionRecord) : IO Unit := do
   let dir ← sessionDir r.id
   IO.FS.createDirAll dir
   let path ← recordPath r.id
-  let tmp := dir / "session.json.tmp"
+  -- Named uniquely rather than `session.json.tmp`: two writers sharing one temp file interleave
+  -- their writes and the later rename publishes the splice.
+  let tmp := dir / s!"session.json.{← uniqueToken}.tmp"
   IO.FS.writeFile tmp (Json.compress (ToJson.toJson r))
   IO.FS.rename tmp path
 
+/-- The record, or `none` when there is none.
+
+    A record that exists but cannot be read is reported before it is dropped. Silence there is
+    expensive in a specific way: `loadAllSessions` feeds the startup reconciliation, so a record
+    an older binary cannot parse — a status added by a newer one, say — would be a session that
+    never gets closed and a clone slot pinned for the life of the daemon, with nothing said. -/
 def loadSession (id : String) : IO (Option SessionRecord) := do
   let path ← recordPath id
   if !(← path.pathExists) then return none
+  let complain (why : String) : IO (Option SessionRecord) := do
+    IO.eprintln s!"  Warning: the session record at {path} could not be read ({why}); it is \
+being skipped, and any resource it still holds will not be reclaimed."
+    return none
   match Json.parse (← IO.FS.readFile path) with
-  | .error _ => return none
-  | .ok j    => return (FromJson.fromJson? j : Except String SessionRecord).toOption
+  | .error e => complain e
+  | .ok j    =>
+    match (FromJson.fromJson? j : Except String SessionRecord) with
+    | .ok r    => return some r
+    | .error e => complain e
 
 /-- Every session on disk, newest first.
 
@@ -256,18 +281,46 @@ def loadAllSessions : IO (Array SessionRecord) := do
 
 /-! ## Reading and writing the transcript -/
 
-/-- Append one event and answer the seq it was given.
+/-- Append one event.
 
-    The seq comes from the record's `lastEventSeq`, so the caller holding the session is the only
-    thing that hands them out and they cannot collide. Flushed per line, because the reader is
-    another process and an unflushed line is a line that did not happen. -/
+    The seq comes from the record's `lastEventSeq`, so the caller holding the session is the
+    only thing that hands them out and they cannot collide. Flushed per line, because the reader
+    is another process and an unflushed line is a line that did not happen.
+
+    The newline goes *before* the record, not after it, and that is the whole of what makes a
+    torn write cost one event instead of two. A daemon killed mid-write leaves a fragment at the
+    end of the file; with a trailing-newline format the next append lands straight onto that
+    fragment and splices the two into a line that parses as neither, so the crash takes the next
+    event with it. A leading newline bounds the fragment instead: it is skipped, and everything
+    appended afterwards is read normally. -/
 def appendEvent (id : String) (seq : Nat) (occurredAt : String) (kind : TranscriptKind)
     : IO Unit := do
   let dir ← sessionDir id
   IO.FS.createDirAll dir
   let h ← IO.FS.Handle.mk (← transcriptPath id) .append
-  h.putStrLn (Json.compress (ToJson.toJson ({ seq, occurredAt, kind } : TranscriptEvent)))
+  h.putStr ("\n" ++ Json.compress (ToJson.toJson ({ seq, occurredAt, kind } : TranscriptEvent)))
   h.flush
+
+/-- The transcript as text, tolerating a tail torn mid-character.
+
+    `IO.FS.readFile` throws outright on invalid UTF-8 — one level below the per-line recovery in
+    `readEvents`, so it never gets the chance. A daemon killed in the middle of writing a
+    multi-byte character (this repo's own tool output is full of `→` and `✓`) would leave a
+    transcript that throws on *every* subsequent read: not one lost event, the whole
+    conversation unreadable, permanently. A truncated code point is at most three bytes short,
+    so trimming back to the last valid boundary recovers everything written before the tear.
+
+    Damage anywhere but the tail is not something this writer can produce, and is reported
+    rather than papered over. -/
+private def readTranscriptText (path : System.FilePath) : IO String := do
+  let bytes ← IO.FS.readBinFile path
+  if let some s := String.fromUTF8? bytes then return s
+  for back in [1, 2, 3] do
+    if bytes.size ≥ back then
+      if let some s := String.fromUTF8? (bytes.extract 0 (bytes.size - back)) then
+        return s
+  throw (.userError s!"the transcript at {path} is not valid UTF-8, and not merely torn at the \
+end; it needs looking at by hand")
 
 /-- The transcript events after `after`, at most `limit` of them, and how many there are in
     total after `after`.
@@ -276,23 +329,27 @@ def appendEvent (id : String) (seq : Nat) (occurredAt : String) (kind : Transcri
     without asking a second time — the same envelope arithmetic every collection in the API
     uses.
 
-    Lines are handed back as parsed JSON rather than re-serialised from a typed value, so a field
-    written by a newer orchestra survives being read by an older one. A line that does not parse
-    is skipped rather than fatal: it can only be a torn last line, and the next read gets it
-    whole. -/
+    Walked backwards, and stopped at the first event the caller already has. Seqs only increase,
+    so everything past that point is behind the cursor by construction; scanning forward instead
+    meant parsing the entire conversation on every poll — three times a second, per attached
+    client — to answer "nothing new". A cursor that costs the whole file is not a cursor.
+
+    Lines are handed back as parsed JSON rather than re-serialised from a typed value, so a
+    field written by a newer orchestra survives being read by an older one. A line that does not
+    parse, or that carries no seq, is skipped rather than stopping the scan: it can only be a
+    torn write, and treating it as a boundary would hide every event before it. -/
 def readEvents (id : String) (after : Nat := 0) (limit : Nat := 500)
     : IO (Array Json × Nat) := do
   let path ← transcriptPath id
   if !(← path.pathExists) then return (#[], 0)
-  let contents ← IO.FS.readFile path
-  let mut matching : Array Json := #[]
-  for line in contents.splitOn "\n" do
+  let mut newer : List Json := []
+  for line in (← readTranscriptText path).splitOn "\n" |>.reverse do
     let line := line.trimAscii.toString
     if line.isEmpty then continue
     let some j := (Json.parse line).toOption | continue
-    let seq := j.getObjValAs? Nat "seq" |>.toOption |>.getD 0
-    if seq > after then
-      matching := matching.push j
-  return (matching.take limit, matching.size)
+    let some seq := j.getObjValAs? Nat "seq" |>.toOption | continue
+    if seq ≤ after then break
+    newer := j :: newer
+  return ((newer.take limit).toArray, newer.length)
 
 end Orchestra.Interactive
