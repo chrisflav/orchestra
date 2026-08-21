@@ -143,16 +143,25 @@ function LogEntry({ event }: { event: LogEvent }) {
  * A running task appends events every couple of seconds. Scrolling back up to read something
  * must not be undone by the next frame, so the scroll is only forced when the reader was
  * within a few pixels of the end when the update arrived.
+ *
+ * `autoScroll` turns both off — the box and the pinning — for a caller that draws several of
+ * these inside one scroll region of its own. A chat transcript is that caller: each block would
+ * otherwise be its own little scrolling window, and every one of them would read `scrollHeight`
+ * on every frame, which forces a synchronous layout per block for a page that has one place it
+ * could usefully be pinned to.
  */
 export function LogView({
   events,
   total,
   truncated,
   empty = "This task has no log file.",
+  autoScroll = true,
 }: {
   events: LogEvent[];
   total: number;
   truncated: boolean;
+  /** Whether this view scrolls itself. Off for a caller that owns the scroll region. */
+  autoScroll?: boolean;
   /** What to say when there is nothing to show. Only the page knows why there isn't. */
   empty?: string;
 }) {
@@ -160,9 +169,10 @@ export function LogView({
   const pinned = useRef(true);
 
   useEffect(() => {
+    if (!autoScroll) return;
     const el = ref.current;
     if (el && pinned.current) el.scrollTop = el.scrollHeight;
-  }, [events]);
+  }, [events, autoScroll]);
 
   if (events.length === 0) {
     return <p className="empty">{empty}</p>;
@@ -180,7 +190,7 @@ export function LogView({
           Showing the last {events.length} of {total} events. The tail follows as the task runs.
         </div>
       )}
-      <div className="log" ref={ref} onScroll={onScroll}>
+      <div className={autoScroll ? "log" : "log log-flow"} ref={ref} onScroll={onScroll}>
         {events.map((event, i) => (
           // Log events are append-only and carry no id, so position is a stable key here:
           // index `i` always names the same event for as long as the tail window holds.
