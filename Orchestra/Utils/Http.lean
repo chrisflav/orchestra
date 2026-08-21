@@ -85,6 +85,18 @@ partial def splitHeaders (out : String) : Array (String × String) × String :=
 def header? (headers : Array (String × String)) (name : String) : Option String :=
   headers.find? (·.1 == name.toLower) |>.map (·.2)
 
+/-- A curl config file, for the one argument that must not be an argument.
+
+    `/proc/<pid>/cmdline` is world-readable on an ordinary host, so a bearer token passed as
+    `-H` is visible to every other user on the machine for as long as the request runs — and
+    orchestra's tokens are a GitHub App installation and the dashboard secret. `-K -` makes curl
+    read the same setting from stdin, which is a pipe nobody else can open. Inside a quoted
+    config value only `\` and `"` mean anything, so those are the only two to escape. -/
+def bearerConfig (token : String) : String :=
+  let esc := token.foldl (init := "") fun acc c =>
+    if c == '\\' || c == '"' then acc.push '\\' |>.push c else acc.push c
+  s!"header = \"Authorization: Bearer {esc}\"\n"
+
 /-- Failure text for a curl invocation that exited non-zero. Arguments are deliberately never
     included: they carry bearer tokens. -/
 private def curlFailure (code : UInt32) (stdout stderr : String) : String :=
@@ -107,13 +119,20 @@ private def curlFailure (code : UInt32) (stdout stderr : String) : String :=
     The headers come from `-D -`, which prepends them to the same stream; a server that answers
     a request with `retry-after` is telling us something we would otherwise have to guess. -/
 def curlFull (args : Array String) (connectTimeout : Nat := 10) (maxTime : Nat := 30)
+    (bearer : Option String := none)
     : IO (Nat × Array (String × String) × String) := do
   let full := #["-sS", "--connect-timeout", toString connectTimeout,
                 "--max-time", toString maxTime, "-D", "-",
-                "-w", statusMarker ++ "%{http_code}"] ++ args
-  let child ← IO.Process.spawn {
-    cmd := "curl", args := full, stdin := .null, stdout := .piped, stderr := .piped
+                "-w", statusMarker ++ "%{http_code}"]
+              ++ (if bearer.isSome then #["-K", "-"] else #[]) ++ args
+  let spawned ← IO.Process.spawn {
+    cmd := "curl", args := full, stdin := .piped, stdout := .piped, stderr := .piped
   }
+  let (stdinHandle, child) ← spawned.takeStdin
+  if let some token := bearer then
+    stdinHandle.putStr (bearerConfig token)
+    stdinHandle.flush
+  -- The handle drops here, which is the EOF curl waits for before it starts the request.
   let stdout ← child.stdout.readToEnd
   let stderr ← child.stderr.readToEnd
   let code   ← child.wait
@@ -127,18 +146,18 @@ def curlFull (args : Array String) (connectTimeout : Nat := 10) (maxTime : Nat :
 
 /-- `curlFull` for the callers that only need the status and the body. -/
 def curlWithStatus (args : Array String) (connectTimeout : Nat := 10) (maxTime : Nat := 30)
-    : IO (Nat × String) := do
-  let (status, _, body) ← curlFull args connectTimeout maxTime
+    (bearer : Option String := none) : IO (Nat × String) := do
+  let (status, _, body) ← curlFull args connectTimeout maxTime bearer
   return (status, body)
 
 /-- A GET with bearer authentication, keeping the response headers. The token never appears in
     an error message. -/
 def getBearerFull (url token : String) (extraHeaders : Array String := #[])
     (maxTime : Nat := 15) : IO (Nat × Array (String × String) × String) := do
-  let mut args := #["-H", s!"Authorization: Bearer {token}"]
+  let mut args := #[]
   for h in extraHeaders do
     args := args.push "-H" |>.push h
-  curlFull (args.push url) (maxTime := maxTime)
+  curlFull (args.push url) (maxTime := maxTime) (bearer := some token)
 
 /-- A GET with bearer authentication. The token never appears in an error message. -/
 def getBearer (url token : String) (extraHeaders : Array String := #[])
@@ -151,11 +170,11 @@ def getBearer (url token : String) (extraHeaders : Array String := #[])
     read out of the rate-limit headers. -/
 def postBearerFull (url token body : String) (extraHeaders : Array String := #[])
     (maxTime : Nat := 30) : IO (Nat × Array (String × String) × String) := do
-  let mut args := #["-X", "POST", "-H", s!"Authorization: Bearer {token}"]
+  let mut args := #["-X", "POST"]
   for h in extraHeaders do
     args := args.push "-H" |>.push h
   args := args.push "--data" |>.push body
-  curlFull (args.push url) (maxTime := maxTime)
+  curlFull (args.push url) (maxTime := maxTime) (bearer := some token)
 
 /-! ## Streaming
 
@@ -197,13 +216,16 @@ end Stream
     make it arrive a frame at a time rather than in whatever chunks curl's own buffering would
     otherwise choose — without them a chat renders in bursts, several turns at once. -/
 def openStream (url token : String) : IO Stream := do
-  let child ← IO.Process.spawn {
+  let spawned ← IO.Process.spawn {
     cmd  := "curl"
-    args := #["-sS", "-N", "--no-buffer", "--connect-timeout", "10",
-              "-H", s!"Authorization: Bearer {token}",
+    args := #["-sS", "-N", "--no-buffer", "--connect-timeout", "10", "-K", "-",
               "-H", "Accept: text/event-stream", url]
-    stdin := .null, stdout := .piped, stderr := .piped
+    stdin := .piped, stdout := .piped, stderr := .piped
   }
+  -- The credential goes in over stdin rather than in `argv`; see `bearerConfig`.
+  let (stdinHandle, child) ← spawned.takeStdin
+  stdinHandle.putStr (bearerConfig token)
+  stdinHandle.flush
   return { child }
 
 end Orchestra.Utils.Http

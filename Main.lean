@@ -1408,79 +1408,192 @@ private def renderTranscriptEvent (j : Lean.Json) : Option String :=
   | "notice"      => some s!"[{Client.str j "level"}] {Client.str j "message"}"
   | _             => none
 
-/-- Print every event in one SSE payload, and answer the highest seq it carried. -/
-private def renderTranscriptPage (payload : Lean.Json) (after : Nat) : IO Nat := do
+/-- Exclusive use of the terminal for one burst of output.
+
+    A chat has two writers — the follower thread printing the transcript, the input loop
+    printing the prompt — and unsynchronised they interleave, putting a line of agent output
+    through the middle of the prompt. It deliberately does not redraw the prompt afterwards:
+    what has been typed so far is held by the terminal's line discipline rather than by this
+    process, and a reprinted prompt would appear empty above characters that are still there. -/
+private def withTerminal (lock : Std.BaseMutex) (act : IO.FS.Stream → IO Unit) : IO Unit := do
+  let out ← IO.getStdout
+  lock.lock
+  try
+    act out
+    out.flush
+  finally
+    lock.unlock
+
+/-- Print every event in one SSE payload, and answer the highest seq it carried.
+
+    Rendered first and printed second, so one frame reaches the terminal as one burst rather
+    than as lines the input loop can get between. -/
+private def renderTranscriptPage (lock : Std.BaseMutex) (payload : Lean.Json) (after : Nat)
+    : IO Nat := do
   let (items, _) := Client.items payload
   let mut last := after
-  let out ← IO.getStdout
+  let mut lines : Array String := #[]
   for item in items do
     last := max last (Client.nat item "seq")
     if let some line := renderTranscriptEvent item then
-      out.putStrLn line
-      out.flush
+      lines := lines.push line
+  unless lines.isEmpty do
+    withTerminal lock fun out => for line in lines do out.putStrLn line
   return last
 
-/-- Read the transcript stream, printing as it goes, until it ends.
+private def chatSessionPath (id : String) : String :=
+  s!"/api/v1/interactive/{Client.encodeSegment id}"
 
-    Run on its own thread while the main one reads the keyboard: a chat where you cannot type
-    until the agent has finished talking is not a chat.
-
-    It ends only when the stream does. There is no flag it checks between frames, because it
-    spends almost all its time blocked inside `nextLine` waiting for the next one — a flag would
-    be read once per event and never while it mattered. Detaching therefore closes the stream
-    from the other thread, which is what unblocks this one. -/
-private partial def followTranscript (stream : Utils.Http.Stream) (cursor : IO.Ref Nat)
-    : IO Unit := do
+/-- Read one transcript stream until it ends, printing as it goes. -/
+private partial def drainTranscript (lock : Std.BaseMutex) (stream : Utils.Http.Stream)
+    (cursor : IO.Ref Nat) : IO Unit := do
   repeat do
     let some line ← stream.nextLine | break
     if let some data := Client.sseData line then
       if let .ok payload := Lean.Json.parse data then
-        cursor.set (← renderTranscriptPage payload (← cursor.get))
+        cursor.set (← renderTranscriptPage lock payload (← cursor.get))
 
-private def chatSessionPath (id : String) : String :=
-  s!"/api/v1/interactive/{Client.encodeSegment id}"
+/-- Follow a session's transcript for as long as someone is attached, reconnecting from the
+    cursor whenever the stream drops.
+
+    Run on its own thread while the main one reads the keyboard: a chat where you cannot type
+    until the agent has finished talking is not a chat.
+
+    A stream ends for three quite different reasons, and a client that cannot tell them apart is
+    a client that goes quiet and says nothing about it. The conversation is over and the server
+    closed it deliberately; the connection broke, which for a chat left open on a laptop is the
+    common case rather than the exceptional one; or this client detached. Only the last is a
+    reason to stop. Reconnecting from `cursor` is exact in both directions — the server replays
+    what follows it and nothing else — so a reattach costs neither a missed event nor a repeated
+    one.
+
+    Detaching is what `stopped` and `current` are for. This thread spends almost all its time
+    blocked inside `nextLine`, so a flag it polled between frames would be read once per event
+    and never while it mattered; closing the stream from the other thread is what unblocks it,
+    and the flag is what tells it afterwards not to open another. -/
+private partial def followTranscript (cfg : Client.Config) (id : String) (lock : Std.BaseMutex)
+    (cursor : IO.Ref Nat) (current : IO.Ref (Option Utils.Http.Stream))
+    (stopped : IO.Ref Bool) (over : IO.Ref Bool) : IO Unit := do
+  let mut live ← current.get
+  let mut failures := 0
+  repeat do
+    if let some stream := live then
+      try drainTranscript lock stream cursor catch _ => pure ()
+      stream.close
+      live := none
+      current.set none
+    if ← stopped.get then break
+    -- The server closes the stream once the session is terminal. Ask which it was rather than
+    -- reconnecting forever to a conversation that will never say anything again.
+    match ← Client.get cfg (chatSessionPath id) with
+    | .ok j =>
+      let status := Client.str j "status"
+      if status == "ended" || status == "failed" then
+        over.set true
+        withTerminal lock fun out => out.putStrLn s!"\n[session {status}]"
+        break
+    | .error _ => pure ()
+    IO.sleep (500 + 1000 * min failures 4).toUInt32
+    if ← stopped.get then break
+    match ← (try some <$> Client.openTranscript cfg id (← cursor.get) catch _ => pure none) with
+    | none =>
+      failures := failures + 1
+      if failures ≥ 5 then
+        withTerminal lock fun out => out.putStrLn "\n[lost the transcript stream; the session \
+is still on the backend — /quit and reattach with `orchestra chat --session ...`]"
+        break
+    | some next =>
+      -- A clean drop is routine — the server's own connection timeout ends a quiet stream every
+      -- few seconds — and since the cursor makes the reattach exact, there is nothing to say
+      -- about it. Only a reconnect that had to be retried is news.
+      let recovered := failures > 0
+      failures := 0
+      live := some next
+      current.set (some next)
+      -- A detach that landed while this was being opened would otherwise leave a stream running
+      -- with nobody left to close it.
+      if ← stopped.get then
+        next.close
+        live := none
+        current.set none
+        break
+      if recovered then
+        withTerminal lock fun out => out.putStrLn "\n[reconnected]"
+  current.set none
 
 /-- Post turns from standard input until it ends.
 
     A blank line is not a turn — it is someone pressing enter — and `/quit` detaches without
     ending the session, because detaching and ending are different things and only one of them
-    can be undone. -/
-private partial def chatInputLoop (cfg : Client.Config) (id : String) : IO Unit := do
+    can be undone.
+
+    A turn the backend refused becomes the `draft`: it is shown again above the next prompt and
+    an empty line re-sends it. Losing what someone typed because a connection blinked is a poor
+    trade for four lines of state. -/
+private partial def chatInputLoop (cfg : Client.Config) (id : String) (lock : Std.BaseMutex)
+    (draft : Option String) : IO Unit := do
   let stdin ← IO.getStdin
-  let out ← IO.getStdout
-  repeat do
-    out.putStr "\nyou> "
-    out.flush
-    let line ← stdin.getLine
-    -- End of input: the terminal closed, or someone typed Ctrl-D. Detach, do not end.
-    if line.isEmpty then break
-    let text := line.trimAscii.toString
-    if text.isEmpty then continue
-    if text == "/quit" || text == "/detach" then break
-    let body := Lean.Json.compress (Lean.Json.mkObj [("text", Lean.Json.str text)])
-    match ← Client.post cfg s!"{chatSessionPath id}/messages" body with
-    | .error e => IO.eprintln e
-    | .ok _    => pure ()
+  match draft with
+  | none   => withTerminal lock fun out => out.putStr "\nyou> "
+  | some d => withTerminal lock fun out =>
+      out.putStr s!"\n[not sent] {d}\nretry> (enter re-sends it) "
+  let line ← stdin.getLine
+  -- End of input: the terminal closed, or someone typed Ctrl-D. Detach, do not end.
+  if line.isEmpty then return
+  let typed := line.trimAscii.toString
+  let text := if typed.isEmpty then draft.getD "" else typed
+  if text.isEmpty then return ← chatInputLoop cfg id lock none
+  if text == "/quit" || text == "/detach" then return
+  let body := Lean.Json.compress (Lean.Json.mkObj [("text", Lean.Json.str text)])
+  match ← Client.post cfg s!"{chatSessionPath id}/messages" body with
+  | .error e =>
+    withTerminal lock fun out => out.putStrLn s!"\nThe turn was not delivered: {e}"
+    chatInputLoop cfg id lock (some text)
+  | .ok _ => chatInputLoop cfg id lock none
 
 private def chatAttach (cfg : Client.Config) (id : String) (after : Nat) : IO UInt32 := do
   IO.println s!"Attached to session {id}. Type a turn and press enter; /quit detaches without \
 ending it."
+  let lock ← Std.BaseMutex.new
   let cursor ← IO.mkRef after
-  let stream ← Client.openTranscript cfg id after
-  let follower ← IO.asTask (prio := .dedicated) (followTranscript stream cursor)
-  try chatInputLoop cfg id
+  let stopped ← IO.mkRef false
+  let over ← IO.mkRef false
+  let current ← IO.mkRef (some (← Client.openTranscript cfg id after))
+  let follower ← IO.asTask (prio := .dedicated)
+    (followTranscript cfg id lock cursor current stopped over)
+  try chatInputLoop cfg id lock none
   finally
     -- Closing is what stops the follower: it is blocked on a read that only ends when the
-    -- connection does. Waited on afterwards so the last frames are printed before the line
-    -- below, rather than racing it or being lost when the process exits.
-    stream.close
+    -- connection does. The flag goes up first, so a reconnect cannot start between the two.
+    -- Waited on afterwards so the last frames are printed before the line below, rather than
+    -- racing it or being lost when the process exits.
+    stopped.set true
+    if let some stream ← current.get then stream.close
     let _ ← IO.wait follower
-  IO.println s!"\nDetached. The session is still running; `orchestra chat --session {id}` picks \
-it up, and `orchestra chat --end {id}` ends it."
+  if ← over.get then
+    IO.println "\nThe conversation is over."
+  else
+    IO.println s!"\nDetached. The session is still running; `orchestra chat --session {id}` \
+picks it up, and `orchestra chat --end {id}` ends it."
   return 0
 
 private def chatHandler (p : Parsed) : IO UInt32 := do
   withClient p fun cfg => do
+    -- Four different things to do, and exactly one of them per invocation. Silently preferring
+    -- whichever was checked first is how a mistyped flag becomes "why did that do nothing" —
+    -- `--session x --budget 3` looked like it set a budget and did not, and `--list --end x`
+    -- listed and left the session up.
+    let startFlags := ["upstream", "fork", "backend", "model", "budget", "tools", "resume-from"]
+      |>.filter (fun f => (p.flag? f).isSome)
+      |>.map ("--" ++ ·)
+    let modes := [("--list", p.hasFlag "list"),
+                  ("--end", (p.flag? "end").isSome),
+                  ("--session", (p.flag? "session").isSome),
+                  (", ".intercalate startFlags, !startFlags.isEmpty)]
+      |>.filter (·.2) |>.map (·.1)
+    if modes.length > 1 then
+      IO.eprintln s!"{", ".intercalate modes} are different things; give one of them."
+      return 1
     -- List
     if p.hasFlag "list" then
       return ← apiCall (Client.get cfg "/api/v1/interactive") fun j => do
@@ -1524,8 +1637,13 @@ one, --list to see them, or --end to end one."
     if let some m := p.flag? "model" then
       fields := fields ++ [("model", Lean.Json.str (m.as! String))]
     if let some bud := p.flag? "budget" then
-      if let some v := parseFloat? (bud.as! String) then
-        fields := fields ++ [("budget", Lean.toJson v)]
+      -- A budget that did not parse used to be dropped, and the session ran on the 20.0
+      -- default: the one flag whose whole purpose is to bound spending, ignored in silence.
+      let raw := bud.as! String
+      let some v := parseFloat? raw
+        | do IO.eprintln s!"--budget takes an amount in dollars; '{raw}' is not one."
+             return 1
+      fields := fields ++ [("budget", Lean.toJson v)]
     if let some t := p.flag? "tools" then
       let names := ((t.as! String).splitOn ",").map (·.trimAscii.toString)
                      |>.filter (!·.isEmpty)
@@ -1534,8 +1652,12 @@ one, --list to see them, or --end to end one."
     if let some r := p.flag? "resume-from" then
       fields := fields ++ [("resumeFrom", Lean.Json.str (r.as! String))]
     IO.println "Starting a session; this clones the repository and launches the agent..."
+    -- The default 30 s is a read-a-file-off-disk timeout. This route clones a repository, mints
+    -- a token, starts an MCP server and launches an agent inside the sandbox before it answers,
+    -- and a client that gives up at 30 s reports a failure for a session that is starting
+    -- perfectly well — and then leaves it running with nobody attached.
     match ← Client.post cfg "/api/v1/interactive"
-            (Lean.Json.compress (Lean.Json.mkObj fields)) with
+            (Lean.Json.compress (Lean.Json.mkObj fields)) (maxTime := 900) with
     | .error e => IO.eprintln e; return 1
     | .ok j    => chatAttach cfg (Client.str j "id") 0
 
