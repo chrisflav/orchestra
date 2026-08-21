@@ -220,9 +220,14 @@ structure ActionConfig where
       Defaults to `""`, in which case the `upstream` template variable is used. -/
   upstream       : String := ""
   /-- Fork org/name. May be a template string (e.g. `"{{fork}}"`).
-      Defaults to `""`, in which case the `fork` template variable is used. -/
+      Defaults to `""`, in which case the `fork` template variable is used.
+
+      Both empty, with no variable to fall back on either, queues a repository-independent task —
+      one that runs in a scratch workspace with nothing checked out. Every GitHub event source
+      supplies both variables, so that is reachable only from a listener that genuinely has no
+      repository to hand, such as one on a `shell` source. -/
   fork           : String := ""
-  mode           : TaskMode
+  mode           : TaskMode := .fork
   promptTemplate : String
   series         : Option String := none
   backend        : Option String := none
@@ -294,7 +299,10 @@ instance : FromJson ActionConfig where
   fromJson? j := do
     let upstream       := j.getObjValAs? String "upstream" |>.toOption |>.getD ""
     let fork           := j.getObjValAs? String "fork"     |>.toOption |>.getD ""
-    let mode           ← j.getObjValAs? TaskMode "mode"
+    -- Absent is fine — a listener that queues repository-independent tasks has no answer for a
+    -- field that is the deprecated spelling of a task's tools. Unreadable is not; see
+    -- `parseTaskMode?`.
+    let mode           ← parseTaskMode? j
     let promptTemplate ← j.getObjValAs? String "prompt_template"
     let series       := j.getObjValAs? String "series"        |>.toOption
     let backend      := j.getObjValAs? String "backend"       |>.toOption
@@ -630,8 +638,15 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
   let forkStr :=
     let rendered := renderTemplate action.fork vars
     if rendered.isEmpty then lookupVar "fork" else rendered
-  let upstream ← IO.ofExcept (Repository.parse upstreamStr)
-  let fork     ← IO.ofExcept (Repository.parse forkStr)
+  -- Neither named, by the action or by the event source, means a repository-independent task:
+  -- the listener watches something that is not one repository's business — a shell command, a
+  -- tracker — and the task it queues runs in a scratch workspace. Every GitHub event source
+  -- supplies both variables, so this is reachable only from a listener that genuinely has no
+  -- repository to hand, never from one whose event lost it on the way.
+  let repo ← if upstreamStr.isEmpty && forkStr.isEmpty then pure none else do
+    let upstream ← IO.ofExcept (Repository.parse upstreamStr)
+    let fork     ← IO.ofExcept (Repository.parse forkStr)
+    pure (some { upstream, fork : RepoPair })
   -- Resolve issue_number: prefer the explicit template field from the action config;
   -- fall back to the `issue_number` variable supplied by the event source.
   let issueNumber : Option Nat :=
@@ -641,8 +656,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
   IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent} priority={action.priority}"
   return {
     id, createdAt, status := .pending,
-    upstream
-    fork
+    repo
     mode
     prompt
     agent        := action.agent
@@ -1085,8 +1099,7 @@ def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : P
   let prompt := Project.render role.promptTemplate vars
   return some
     { id, createdAt
-    , upstream      := target'.repo
-    , fork
+    , repo          := some { upstream := target'.repo, fork }
     , mode          := .pr
     , prompt
     , goal          := Project.goalFor issue?

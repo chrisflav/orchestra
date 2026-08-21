@@ -38,9 +38,10 @@ instance : FromJson TaskStatus where
 structure TaskRecord where
   id            : String
   createdAt     : String
-  upstream      : Repository
-  fork          : Repository
-  mode          : TaskMode
+  /-- Repositories this run worked on, or `none` for a repository-independent run
+      (see `IOTask.repo`). Inherited by continuations, like everything else here. -/
+  repo          : Option RepoPair
+  mode          : TaskMode      := .fork
   prompt        : String
   /-- Condition this run was held to (mirrors `IOTask.goal`). Inherited by continuations, so
       resuming a task keeps the bar it was launched against. -/
@@ -73,15 +74,13 @@ deriving Repr
 
 instance : ToJson TaskRecord where
   toJson r :=
-    let base : List (String × Json) := [
-      ("id",         r.id),
-      ("created_at", r.createdAt),
-      ("upstream",   ToJson.toJson r.upstream),
-      ("fork",       ToJson.toJson r.fork),
-      ("mode",       ToJson.toJson r.mode),
-      ("prompt",     r.prompt),
-      ("status",     ToJson.toJson r.status)
-    ]
+    let base : List (String × Json) :=
+      [("id",         Json.str r.id),
+       ("created_at", Json.str r.createdAt)]
+      ++ repoPairFields r.repo
+      ++ [("mode",   ToJson.toJson r.mode),
+          ("prompt", Json.str r.prompt),
+          ("status", ToJson.toJson r.status)]
     let fields := base
     let fields := if let some s := r.goal          then fields ++ [("goal",           Json.str s)]      else fields
     let fields := if let some s := r.sessionId     then fields ++ [("session_id",    Json.str s)]      else fields
@@ -103,9 +102,8 @@ instance : FromJson TaskRecord where
   fromJson? j := do
     let id           ← j.getObjValAs? String "id"
     let createdAt    ← j.getObjValAs? String "created_at"
-    let upstream     ← j.getObjValAs? Repository "upstream"
-    let fork         ← j.getObjValAs? Repository "fork"
-    let mode         ← j.getObjValAs? TaskMode "mode"
+    let repo         ← parseRepoPair? j
+    let mode         ← parseTaskMode? j
     let prompt       ← j.getObjValAs? String "prompt"
     let status       ← j.getObjValAs? TaskStatus "status"
     let goal          := j.getObjValAs? String "goal"           |>.toOption
@@ -122,7 +120,7 @@ instance : FromJson TaskRecord where
     let projectId     := j.getObjValAs? Taxis.IssueId "project_id" |>.toOption
     let issueId       := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
     let role          := j.getObjValAs? String    "role"       |>.toOption
-    return { id, createdAt, upstream, fork, mode, prompt, goal, status, sessionId,
+    return { id, createdAt, repo, mode, prompt, goal, status, sessionId,
              continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority,
              projectId, issueId, role }
 

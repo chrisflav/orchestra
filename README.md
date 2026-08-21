@@ -8,8 +8,8 @@ in a sandbox with credentials the agent never gets to hold.
 
 Three pieces carry everything else.
 
-- A **task** is the unit of work and the only thing that ever runs an agent: a repository pair, a
-  prompt, a set of tools, a budget → [task files](#task-files)
+- A **task** is the unit of work and the only thing that ever runs an agent: a repository pair (or
+  none, for meta-work), a prompt, a set of tools, a budget → [task files](#task-files)
 - The **queue** is where tasks wait for the daemon that runs them, by priority and in parallel →
   [queue mode](#queue-mode)
 - **Listeners** poll an event source and enqueue a task whenever something matches →
@@ -41,6 +41,9 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
 - **Sandboxed runs.** Every agent runs under landrun: write access to its own clone and `/tmp`,
   read+execute on the toolchain, outbound TCP to HTTPS and the MCP port, nothing else. A task can
   mount its clone read-only, which is what review tasks use.
+- **Repository-independent tasks.** A task can name no repository at all and run in a scratch
+  workspace instead of a checkout — for maintenance and coordination that spans every project
+  rather than belonging to one → [repository-independent tasks](#repository-independent-tasks)
 - **Credentials the agent never sees.** A GitHub App installation token is minted per task and
   handed to `gh` for git transport only. The personal access token used for upstream pull
   requests, reviews and comments stays in the MCP server process.
@@ -225,6 +228,10 @@ orchestra prepare <upstream> <fork> --slots 2
 
 with `--slots` matching `parallel_per_repo`, so each slot's init hook is paid up
 front rather than charged to whichever task lands there first.
+
+[Repository-independent tasks](#repository-independent-tasks) are pooled the same way and under
+the same cap, in one pool they share with each other and with nothing else — their workspaces cost
+a directory each rather than a checkout, and there is nothing to prepare up front.
 
 Two backends always run exclusively regardless of these settings: `pi` and
 `opencode` keep per-run state at a fixed path under `$HOME`, so a second
@@ -534,8 +541,10 @@ Tasks are described in a JSON file:
 
 Fields:
 
-- `upstream` — upstream repository in `owner/repo` format
-- `fork` — fork repository the agent has write access to
+- `upstream` — upstream repository in `owner/repo` format. Omit it together with `fork` for a
+  [repository-independent task](#repository-independent-tasks)
+- `fork` — fork repository the agent has write access to. A task names both repositories or
+  neither; naming one is an error
 - `prompt` — instruction sent to the agent
 - `goal` — condition the run is held to: the agent may not stop before it holds, and a second
   model call decides whether it does. Keep it one short, checkable sentence — it is judged on its
@@ -567,6 +576,61 @@ Fields:
 - `triage_add_labels` / `triage_remove_labels` — labels the `triage` backend applies
 - `project_id` / `issue_id` / `role` — set by the project subsystem; see
   [projects, issues and roles](#projects-issues-and-roles)
+
+## repository-independent tasks
+
+A task that names no `upstream` and no `fork` runs with nothing checked out. It is sandboxed like
+any other task, but instead of a clone slot it gets an empty scratch workspace, and the tools that
+act on a repository are withheld from it.
+
+```json
+{
+  "tasks": [
+    {
+      "prompt": "Go through the open issues on the tracker, close the ones that duplicate work already merged elsewhere, and open a coordination issue for anything blocked on another project.",
+      "tools": ["manage_issues"],
+      "budget": 6.0
+    }
+  ]
+}
+```
+
+This is the shape meta-work takes: maintenance across the whole set of projects, coordinating
+efforts on the [taxis](#projects-issues-and-roles) tracker, anything where checking out one
+repository would mean picking an arbitrary one of the several the task is about.
+
+What such a task gets, and what it does not:
+
+- **A scratch workspace** at `~/.local/share/orchestra/workspaces/`, mounted read-write, and
+  `/tmp`. It is *emptied* between tasks rather than cleaned selectively — a clone slot can keep
+  gitignored build output because git says which files those are, and a workspace has nothing
+  that could draw that line. Anything meant to outlive a run belongs in a memory directory.
+- **The project, issue and task tools** — `manage_issues`, `work_issues`, `review_issues`,
+  `get_task_input`, `submit_task_output`, `health`. This is what the task is for.
+- **`create_repository`**, which creates a repository in `default_organization` rather than acting
+  on one the task named, so there is nothing about it a repository-independent task lacks. Starting
+  a project that does not exist yet is meta-work like any other.
+- **No `create_pr`, `merge_pr`, `label_issue` or `comment`.** Asking for one in `tools` is reported
+  on stderr and dropped, and the MCP server refuses the call as well. `get_pr_comments`, which no
+  task has to ask for, is simply not offered — nor is `refresh_token` when there is no
+  installation behind it.
+- **No per-project memory.** There is no upstream to name a directory after, so `memory: "project"`
+  resolves to nothing and `"both"` to the global directory alone — which is the right home for
+  what work spanning projects learns anyway.
+- **A GitHub App token only if the config says which installation.** With `installation_id` or
+  `default_organization` set, one is minted and reaches `gh` in the sandbox as `GH_TOKEN`; with
+  neither, the task runs without GitHub credentials rather than refusing to start.
+
+The `merger` and `triage` backends need a repository by definition and refuse to run without one.
+
+Workspaces are pooled the way clone slots are, so `--parallel-per-repo` bounds how many
+repository-independent tasks run at once — they share one pool with each other, and with nothing
+else. A continuation goes back to its predecessor's workspace and keeps the files there, on the
+same terms as a continuation on a repository.
+
+Listeners and concert workflows can queue these too: a listener whose action names no
+`upstream`/`fork` (and whose event source supplies neither) queues a repository-independent task,
+and so does a workflow step with no repositories at either the step or the program level.
 
 ## sandboxing
 
@@ -705,6 +769,14 @@ get, use its interactive TUI:
 
 ```
 orchestra interactive --upstream owner/repo --fork your-org/fork
+```
+
+Leave both flags out for a session with no repository, which is what a
+[repository-independent task](#repository-independent-tasks) sees: an empty workspace, the tracker
+tools, and none of the ones that act on a repository.
+
+```
+orchestra interactive
 ```
 
 That one is local: it hands *this* terminal to the agent. For the same conversation held by the
@@ -876,6 +948,10 @@ Fields:
   neither dispatched onto nor counted as work, while still rooting their subtree — so only what
   inherited the label is worked
 - `action.prompt_template` — template rendered with event variables (e.g. `{{upstream}}`, `{{fork}}`, `{{issue_number}}`, `{{body}}`, `{{author}}`)
+- `action.upstream` / `action.fork` — the repositories the queued task works on, as templates.
+  Left out, they fall back to the `{{upstream}}`/`{{fork}}` variables the event source supplies —
+  every GitHub source supplies both. A `shell` source supplies neither, so a listener on one that
+  names neither queues a [repository-independent task](#repository-independent-tasks)
 - `action.workflow_path` — path to a `.yaml` workflow file; when set the listener starts a concert instead of enqueueing a single task
 - `action.auth_sources` / `action.auth_mode` — candidate authentication sources for the tasks this
   listener queues, and how to pick among them. A listener that fires repeatedly is the case

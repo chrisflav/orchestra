@@ -71,7 +71,7 @@ private def mkEntry (id : String) (fork : String) (priority : Nat := 10)
     (status : Queue.QueueStatus := .pending) : Queue.QueueEntry :=
   let repo : Repository := { owner := fork, name := "r" }
   { id, createdAt := "2026-01-01T00:00:00Z", status
-  , upstream := repo, fork := repo, mode := .pr, prompt := "", priority }
+  , repo := some { upstream := repo, fork := repo }, mode := .pr, prompt := "", priority }
 
 @[test]
 def pendingCandidates_ordersByPriorityThenAge : Test := do
@@ -111,10 +111,10 @@ private def ctx (parallelLimit perRepoLimit : Nat)
     parallelSafe := TaskRunner.backendIsParallelSafe }
 
 /-- No slot anywhere has a recorded occupant. -/
-private def noOccupants : Repository → Nat → IO (Option String) := fun _ _ => pure none
+private def noOccupants : Option Repository → Nat → IO (Option String) := fun _ _ => pure none
 
 /-- Slot `slot` of any repository holds the tree `owner` left behind. -/
-private def occupantIs (slot : Nat) (owner : String) : Repository → Nat → IO (Option String) :=
+private def occupantIs (slot : Nat) (owner : String) : Option Repository → Nat → IO (Option String) :=
   fun _ s => pure (if s == slot then some owner else none)
 
 @[test]

@@ -27,3 +27,4 @@ import OrchestraTest.DashboardTest
 import OrchestraTest.GoalTest
 import OrchestraTest.ConfigApiTest
 import OrchestraTest.ClaudeAuthEnvTest
+import OrchestraTest.RepolessTaskTest

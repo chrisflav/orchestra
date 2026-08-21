@@ -418,8 +418,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let prompt := render role.promptTemplate vars
   let entry : Queue.QueueEntry :=
     { id := entryId, createdAt
-    , upstream      := target'.repo
-    , fork
+    , repo          := some { upstream := target'.repo, fork }
     , mode          := .pr
     , prompt
     , goal          := goalFor mIssue
@@ -499,8 +498,7 @@ def issueContinueHandler (p : Parsed) : IO UInt32 := do
   let createdAt ← currentIso8601
   let entry : Queue.QueueEntry :=
     { id, createdAt
-    , upstream      := prevRecord.upstream
-    , fork          := prevRecord.fork
+    , repo          := prevRecord.repo
     , mode          := prevRecord.mode
     , prompt
     -- Re-read from the issue rather than inherited from `prevRecord`: a goal edited since the

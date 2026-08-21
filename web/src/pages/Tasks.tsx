@@ -5,6 +5,7 @@ import { LogView } from "../components/LogView";
 import { Facts, LivePage, Section } from "../components/Page";
 import { Status } from "../components/Status";
 import { Time } from "../components/Time";
+import { repoLabel } from "../format";
 
 export function Tasks() {
   return (
@@ -22,7 +23,7 @@ export function Tasks() {
                 end={<Status status={t.status} />}
                 meta={[
                   t.id,
-                  t.fork,
+                  repoLabel(t.fork),
                   <Time key="t" iso={t.createdAt} />,
                   t.series ? `series ${t.series}` : "",
                 ]}
@@ -63,7 +64,7 @@ export function TaskDetail() {
                   </span>
                 ),
               },
-              { key: "Fork", value: data.fork, data: true },
+              { key: "Fork", value: repoLabel(data.fork), data: true },
               { key: "Started", value: <Time iso={data.createdAt} />, data: true },
               // Only when the two differ: a queue entry and the run it became are numbered
               // separately, and the run's id is what names its log, its session and its record.

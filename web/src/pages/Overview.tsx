@@ -5,7 +5,7 @@ import { Empty, List, Row } from "../components/List";
 import { PageHead, Section } from "../components/Page";
 import { sectionOf, Status } from "../components/Status";
 import { Time } from "../components/Time";
-import { relativeTime, truncate } from "../format";
+import { relativeTime, repoLabel, truncate } from "../format";
 import { useOverview } from "../overview";
 
 interface Verdict {
@@ -250,7 +250,7 @@ export function Overview() {
                 title={e.prompt}
                 end={<Status status={e.status} />}
                 meta={[
-                  e.fork,
+                  repoLabel(e.fork),
                   <Time key="t" iso={e.createdAt} />,
                   `priority ${e.priority}`,
                   e.concertId ? `concert ${e.concertId}` : "",
@@ -272,7 +272,7 @@ export function Overview() {
                 to={`/tasks/${encodeURIComponent(t.id)}`}
                 title={t.prompt}
                 end={<Status status={t.status} />}
-                meta={[t.fork, <Time key="t" iso={t.createdAt} />, t.series]}
+                meta={[repoLabel(t.fork), <Time key="t" iso={t.createdAt} />, t.series]}
               />
             ))
           )}
