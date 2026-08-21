@@ -67,6 +67,9 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
   validation fails.
 - **Recorded history.** Every run is stored, can be grouped into a named series, and resumed with
   a follow-up prompt.
+- **Chat sessions the backend holds.** A conversation with an agent, in the same sandbox a task
+  gets, reachable over the API from the CLI, the dashboard or a phone — and still running after
+  the client that started it goes away → [interactive sessions](#interactive-sessions)
 
 ## prerequisites
 
@@ -122,9 +125,9 @@ orchestrad dashboard --site web/dist   # the API and the web UI alone
 
 `orchestra` is the client. Its configuration commands — `orchestra config`, `orchestra listener`
 — are HTTP clients of `orchestrad`, so a running daemon picks up a change without a restart and
-there is never a second writer racing it for the same file. Its other commands (`run`,
-`interactive`, `prepare`) execute locally, because what they do is launch a sandbox on the
-machine you are sitting at.
+there is never a second writer racing it for the same file. `orchestra chat` is one too: the
+session it talks to runs on the backend. Its other commands (`run`, `interactive`, `prepare`)
+execute locally, because what they do is launch a sandbox on the machine you are sitting at.
 
 `orchestra queue start` and `orchestra dashboard` still work and still mean what they meant: they
 start `orchestrad`, looked for next to the `orchestra` binary, then at `$ORCHESTRA_SERVER_BIN`,
@@ -704,6 +707,10 @@ get, use its interactive TUI:
 orchestra interactive --upstream owner/repo --fork your-org/fork
 ```
 
+That one is local: it hands *this* terminal to the agent. For the same conversation held by the
+backend instead — reachable from the dashboard or a phone, and still there after you close the
+terminal — see [interactive sessions](#interactive-sessions).
+
 ## concert workflows
 
 Workflows are YAML files that describe a multi-step agent program. Steps run
@@ -1061,15 +1068,19 @@ curl -H "Authorization: Bearer $PASSWORD" \
 
 Three resources are configuration, and all three are writable: **listeners**, **roles** and
 **skills**. Everything else the API serves is a record of something that already happened, or is
-owned by another system, and stays read-only. Nothing here enqueues work — that is the daemon's
-control socket, which is not on the network at all.
+owned by another system, and stays read-only. Nothing here enqueues a *task* — the queue is fed
+over the daemon's control socket, which is not on the network at all.
 
-One route is an action rather than a document, and it is the only one: `POST
-/api/v1/queue/{id}/cancel` stops the one running task that id names. It writes no file; it
-forwards a single message naming the entry to that same control socket, which is where
-[`orchestra queue cancel`](#queue-mode) sends its own. The socket stays off the network — this
-route is the only thing on the HTTP side that speaks to it, and it takes the credential like
-every other non-`GET`.
+Some routes are actions rather than documents. None of them writes a file; each forwards a single
+message to that same control socket, which is where the CLI sends its own. `POST
+/api/v1/queue/{id}/cancel` stops the one running task that id names, and the five
+[interactive session](#interactive-sessions) routes start, drive and end a chat. That second set
+is the one place this API starts an agent — see the note at the end of that section.
+
+Taking the cancel route as the pattern for all of them: it forwards a message naming the entry to
+the socket, which is where [`orchestra queue cancel`](#queue-mode) sends its own. The socket
+stays off the network; these routes are the only things on the HTTP side that speak to it, and
+each takes the credential like every other non-`GET`.
 
 The id may be a queue entry's id or the id of the run it became; both are ids this API hands out
 for the same piece of work, and the server resolves either.
@@ -1129,6 +1140,99 @@ What a write costs: a listener change takes effect on that listener's next tick,
 A role change takes effect on the dispatcher's next tick, since roles are read per dispatch. A
 skill change applies to tasks launched after it. Nothing here needs a restart.
 
+## interactive sessions
+
+A **session** is a conversation with an agent, held open by the daemon and reachable over the
+API. `orchestra chat` talks to one, the dashboard shows one, and a phone can too — all three are
+clients of the same five routes, and nothing in the server is specific to any of them.
+
+This is the third shape orchestra runs an agent in. A [task](#task-files) is one prompt in and
+one run out; [`orchestra interactive`](#running-tasks) is a real conversation but strictly local,
+because it hands your terminal to the agent's own TUI. A session is that conversation without the
+terminal: the agent runs on the backend, in the same sandbox with the same credentials and the
+same MCP tools a task would get, and it stays up between turns rather than being relaunched for
+each one — the clone slot, the MCP server and the process are acquired once and kept, so a second
+turn costs a line on a pipe.
+
+```sh
+orchestra chat --upstream owner/repo --fork your-org/repo
+```
+
+Type a turn, press enter, watch it work. The other three spellings:
+
+```
+orchestra chat --list              # every session, running and finished
+orchestra chat --session <id>      # pick one back up, transcript and all
+orchestra chat --end <id>          # end it and release what it holds
+```
+
+Detaching and ending are different, and only one of them can be undone. `/quit`, Ctrl-D and
+closing the terminal all leave the session running on the backend; `--end` is how you end it.
+That is what makes it worth having a session rather than a TUI: you can start one at a desk,
+close the laptop, and pick the same conversation up from the dashboard.
+
+Only backends whose CLI can read turns from standard input can host a session, which today means
+`claude`. Asking for another is refused when the session is created, in a message naming it —
+never quietly substituted, because a backend that answers the first turn and exits looks exactly
+like a session that ended on its own.
+
+Two limits bound them, in an `interactive` block in `config.json`:
+
+```json
+{ "interactive": { "max_sessions": 2, "idle_timeout_seconds": 1800 } }
+```
+
+They are capacity, not access. A session pins a clone slot — one of the same slots the queue
+claims from, so a task can never take it and reset the working tree mid-conversation — and an
+abandoned browser tab should not hold one forever. `max_sessions` of `0` means a daemon that will
+not hold sessions at all.
+
+### over HTTP
+
+```sh
+# start one
+ID=$(curl -sX POST -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data '{"upstream":"owner/repo","fork":"your-org/repo"}' \
+     http://127.0.0.1:8080/api/v1/interactive | jq -r .id)
+
+# say something
+curl -X POST -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data '{"text":"why does the queue stall when nothing is running?"}' \
+     http://127.0.0.1:8080/api/v1/interactive/$ID/messages
+
+# watch it answer
+curl -N -H "Authorization: Bearer $PASSWORD" \
+     "http://127.0.0.1:8080/sse/v1/interactive/$ID/events?after=0"
+```
+
+`POST /api/v1/interactive/{id}/interrupt` abandons the turn in flight without ending the session,
+and `DELETE /api/v1/interactive/{id}` ends it.
+
+The transcript is the one stream in this API that is not a whole document re-read. A conversation
+only grows, so re-sending all of it every time a word is added is quadratic in its length. It
+carries a cursor instead: every frame holds only what follows the last one, and its `id` is the
+last sequence number in it, so a browser reconnecting with `Last-Event-ID` — or anything else
+passing the same number as `?after=` — resumes exactly where it dropped, with nothing seen twice
+and nothing missed.
+
+Reads come off `<data>/interactive/<id>/`, where the daemon writes the session record and an
+append-only transcript. Writes go the other way, forwarded to the daemon's control socket,
+because a session is a live process and only the daemon holds one. That split is why the reads
+answer identically whether the API and the daemon are one process or the two containers the
+[compose deployment](docker/README.md) runs.
+
+### what this changes
+
+`POST /api/v1/interactive` is the first route in this API that **starts an agent**. Everything
+before it read state or edited configuration. It is gated by the same shared secret, the same
+session cookie and the same `Content-Type: application/json` rule as every other write, and by
+nothing else — so a credential that could read the dashboard can now also start an agent with a
+repository, credentials and tools. On a loopback bind that is the same person who could already
+type `orchestra interactive`; on a wider one it is worth knowing before you set `--host`.
+
+The full design — the session lifecycle, what happens on a crash or a daemon restart, and the
+schemas — is in [`docs/interactive.md`](docs/interactive.md).
+
 ## configuration over the API
 
 `orchestra config` is the CLI front end to the routes above. It talks to the backend over HTTP
@@ -1173,6 +1277,7 @@ Two things are deliberately *not* writable through the API:
 orchestra prepare <upstream> <fork>   # clone the fork and configure remotes
 orchestra cleanup                     # remove all cloned repositories
 orchestra cleanup list                # list clones and their task slots
+orchestra chat --upstream <u> --fork <f>   # talk to an agent the backend holds open
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
 orchestra usage                       # usage limits of every configured auth source
 orchestra config list listeners       # read and change configuration through the backend API
