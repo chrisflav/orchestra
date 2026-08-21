@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   ApiError,
@@ -74,21 +74,41 @@ function agentEvents(events: TranscriptEvent[]) {
  * cannot say: what the person typed, and what the daemon did.
  */
 function Conversation({ events }: { events: TranscriptEvent[] }) {
+  // Grouped so a run of agent events becomes one `LogView` rather than one per line, which is
+  // what keeps the tool calls lined up the way they are on a task page. Memoised because the
+  // arrays it builds are `LogView`'s props: rebuilt on every render they would make every block
+  // in the conversation look new on every frame.
+  const blocks = useMemo(() => {
+    const out: { kind: "agent" | "other"; events: TranscriptEvent[] }[] = [];
+    for (const e of events) {
+      const kind = e.kind === "agent" ? "agent" : "other";
+      const last = out[out.length - 1];
+      if (last && last.kind === kind) last.events.push(e);
+      else out.push({ kind, events: [e] });
+    }
+    return out;
+  }, [events]);
+
+  // One scroll region for the whole conversation rather than one per block, pinned to the
+  // bottom only while the reader is already there — scrolling back to read something must not
+  // be undone by the next turn.
+  const ref = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+  useEffect(() => {
+    const el = ref.current;
+    if (el && pinned.current) el.scrollTop = el.scrollHeight;
+  }, [blocks]);
+  const onScroll = () => {
+    const el = ref.current;
+    if (el) pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+  };
+
   if (events.length === 0) {
     return <p className="empty">Nothing said yet. Type a turn below.</p>;
   }
-  // Grouped so a run of agent events becomes one `LogView` rather than one per line, which is
-  // what keeps the tool calls lined up the way they are on a task page.
-  const blocks: { kind: "agent" | "other"; events: TranscriptEvent[] }[] = [];
-  for (const e of events) {
-    const kind = e.kind === "agent" ? "agent" : "other";
-    const last = blocks[blocks.length - 1];
-    if (last && last.kind === kind) last.events.push(e);
-    else blocks.push({ kind, events: [e] });
-  }
 
   return (
-    <div className="chat-transcript">
+    <div className="chat-transcript" ref={ref} onScroll={onScroll}>
       {blocks.map((block, i) =>
         block.kind === "agent" ? (
           <LogView
@@ -96,6 +116,7 @@ function Conversation({ events }: { events: TranscriptEvent[] }) {
             events={agentEvents(block.events)}
             total={block.events.length}
             truncated={false}
+            autoScroll={false}
           />
         ) : (
           <div key={i}>
@@ -273,11 +294,20 @@ function Compose({ session, onEnded }: { session: SessionDetail; onEnded: () => 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     if (busy || !canType || text.trim() === "") return;
-    // Cleared optimistically: the turn appears in the transcript on the next frame, and leaving
-    // it in the box as well would show it twice.
+    // Cleared optimistically — the turn appears in the transcript on the next frame, and
+    // leaving it in the box as well would show it twice — and put back if the send failed. A
+    // refused turn is not a reason to lose what someone wrote, and "not idle" and "the daemon
+    // is not answering" are both answers this box gets and both temporary.
     const turn = text;
     setText("");
-    act(sendTurn(session.id, turn), () => undefined);
+    setBusy(true);
+    setError(null);
+    sendTurn(session.id, turn)
+      .catch((err: unknown) => {
+        setError(errorText(err));
+        setText((current) => (current === "" ? turn : current));
+      })
+      .finally(() => setBusy(false));
   };
 
   return (

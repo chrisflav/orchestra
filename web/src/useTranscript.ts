@@ -40,6 +40,12 @@ export function useTranscript(id: string): LiveTranscript {
   useEffect(() => {
     let cancelled = false;
     let source: EventSource | null = null;
+    // What throttles the probe below. A stream drops for ordinary reasons — the server closes a
+    // quiet one on its own timer — and `EventSource` retries every few seconds while a server is
+    // down, firing `onerror` each time. Probing on every one of those turns an outage into two
+    // requests where there was one, from every open tab.
+    let errorsSinceOpen = 0;
+    let lastProbe = 0;
 
     // A different session means the events on screen belong to another conversation.
     setEvents([]);
@@ -67,7 +73,9 @@ export function useTranscript(id: string): LiveTranscript {
         withCredentials: true,
       });
       source.onopen = () => {
-        if (!cancelled) setLive(true);
+        if (cancelled) return;
+        errorsSinceOpen = 0;
+        setLive(true);
       };
       source.onmessage = (event: MessageEvent<string>) => {
         try {
@@ -79,9 +87,17 @@ export function useTranscript(id: string): LiveTranscript {
       source.onerror = () => {
         if (cancelled) return;
         setLive(false);
+        errorsSinceOpen += 1;
         // `EventSource` reconnects on its own but cannot say *why* it dropped, so a revoked
         // session would reconnect forever. Re-probe over fetch, which can, and route to the
         // login screen. The reconnect resumes from the cursor either way.
+        //
+        // Not on the first error and not more than once a quarter-minute: a single drop is
+        // routine and the reconnect answers it, while a session that has genuinely been revoked
+        // keeps failing and is caught on the second try a few seconds later.
+        const now = Date.now();
+        if (errorsSinceOpen < 2 || now - lastProbe < 15000) return;
+        lastProbe = now;
         void fetch(transcriptUrl(id, cursor.current), { credentials: "same-origin" }).then(
           (r) => {
             if (r.status === 401 && !cancelled) {

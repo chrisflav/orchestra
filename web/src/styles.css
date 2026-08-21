@@ -1395,6 +1395,14 @@ a.row:hover .row-title {
 .chat-transcript {
   display: flex;
   flex-direction: column;
+  /* The conversation is the scroll region, not each block inside it. */
+  max-height: 640px;
+  overflow-y: auto;
+}
+/* A log drawn inside someone else's scroll region flows rather than scrolling itself. */
+.log-flow {
+  max-height: none;
+  overflow-y: visible;
 }
 .chat-turn {
   font-family: var(--ui);
