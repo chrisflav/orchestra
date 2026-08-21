@@ -471,17 +471,30 @@ private def workspaceSlotName (slot : Nat) : String := s!"slot-{slot}"
     once is what the queue is for, and there each gets a pooled slot of its own. -/
 private def adhocWorkspaceName : String := "adhoc"
 
+/-- The workspace base a call works under: an explicit one where the caller supplied it, and the
+    installation's own otherwise.
+
+    The override exists for the tests. Preparing a workspace *empties* it, and the directory a test
+    would otherwise land on is the very one `orchestra run` and `orchestra interactive` share — so
+    a test suite that reached the real base would delete the scratch files of a repository-
+    independent run happening to be in progress, and leave its own occupant marker behind for the
+    next continuation to trip over. Nothing outside the tests passes it. -/
+private def resolveWorkspaceBase : Option System.FilePath → IO System.FilePath
+  | some b => pure b
+  | none   => workspaceBase
+
 /-- File recording which task's files currently sit in the workspace named `name`.
 
     Beside the workspace rather than inside it, because the whole directory is handed to the
     agent and wiped between tasks — a marker within it would be both visible to the agent and
     destroyed by the next reset. -/
-private def workspaceOccupantPath (name : String) : IO System.FilePath :=
-  return (← workspaceBase) / s!"{name}.occupant"
+private def workspaceOccupantPath (base : System.FilePath) (name : String) : System.FilePath :=
+  base / s!"{name}.occupant"
 
 /-- The task whose files currently sit in workspace slot `slot`, if it is known. -/
-def workspaceOccupant (slot : Nat) : IO (Option String) := do
-  readOccupant (← workspaceOccupantPath (workspaceSlotName slot))
+def workspaceOccupant (slot : Nat) (base : Option System.FilePath := none)
+    : IO (Option String) := do
+  readOccupant (workspaceOccupantPath (← resolveWorkspaceBase base) (workspaceSlotName slot))
 
 /-- Who holds slot `slot` of the pool `fork` names, or of the shared repository-independent
     pool when `fork` is `none`. The one entry point the queue asks, so that a continuation is
@@ -503,15 +516,17 @@ def poolOccupant (fork : Option Repository) (slot : Nat) : IO (Option String) :=
     draw that line, so one task's scratch files would otherwise turn up in the next task's
     directory with no way to tell them apart from its own. Anything meant to outlive a run
     belongs in a memory directory, which is mounted separately and persists on purpose. -/
-private def prepareWorkspace (name : String) (assign : SlotAssignment) : IO System.FilePath := do
-  let path := (← workspaceBase) / name
+private def prepareWorkspace (base : System.FilePath) (name : String) (assign : SlotAssignment)
+    : IO System.FilePath := do
+  let path := base / name
+  let marker := workspaceOccupantPath base name
   -- Same rule as `ensureSlot`: a continuation only inherits the directory if the predecessor's
   -- files are still the ones sitting in it. Workspaces are pooled, so a free slot is not
   -- evidence of that.
   let keep ← match assign.resumeFrom with
     | none      => pure false
     | some pred =>
-      match ← readOccupant (← workspaceOccupantPath name) with
+      match ← readOccupant marker with
       | some cur =>
         if cur == pred then pure true
         else do
@@ -523,26 +538,38 @@ emptying it. The resumed agent will not find the files its session refers to."
 left cannot be confirmed; emptying it. The resumed agent will not find the files its session \
 refers to."
         pure false
+  -- Errors are reported, not raised, on both ends: failing to write the marker costs a
+  -- continuation its files, while failing to prepare the directory costs the run itself, and the
+  -- second is not worth risking for the first.
+  let writeMarker (occupant : Option String) : IO Unit := do
+    try
+      match occupant with
+      | some o => IO.FS.writeFile marker o
+      | none   => if ← marker.pathExists then IO.FS.removeFile marker
+    catch e =>
+      IO.eprintln s!"  Warning: could not record the occupant of workspace {name}: {e}"
   if keep then
     IO.println s!"  Keeping workspace {name} as-is (continuation of {assign.resumeFrom.getD "?"})"
-  else if ← path.pathExists then
-    IO.FS.removeDirAll path
+  else
+    -- Cleared *before* the directory is emptied, not merely overwritten afterwards. A run that
+    -- died between the two would otherwise leave an empty directory under a marker still naming
+    -- the previous occupant — and the next continuation of *that* task would match it, take the
+    -- branch above, and wake up in an empty directory with nothing on the way to say why.
+    -- Cleared first, the same crash leaves the workspace nobody's, which is the answer every
+    -- caller already handles.
+    writeMarker none
+    if ← path.pathExists then
+      IO.FS.removeDirAll path
   IO.FS.createDirAll path
   -- Stamped after preparation, for the same reason as `ensureSlot`: a task that dies while the
   -- directory is being emptied must not leave it claiming to hold files it never wrote.
-  let marker ← workspaceOccupantPath name
-  try
-    match assign.occupant with
-    | some o => IO.FS.writeFile marker o
-    | none   => IO.FS.removeFile marker
-  catch e =>
-    if assign.occupant.isSome then
-      IO.eprintln s!"  Warning: could not record the occupant of workspace {name}: {e}"
+  writeMarker assign.occupant
   return path
 
 /-- Ensure workspace slot `slot` of the repository-independent pool exists and is empty. -/
-def ensureWorkspace (assign : SlotAssignment) : IO System.FilePath :=
-  prepareWorkspace (workspaceSlotName assign.slot) assign
+def ensureWorkspace (assign : SlotAssignment) (base : Option System.FilePath := none)
+    : IO System.FilePath := do
+  prepareWorkspace (← resolveWorkspaceBase base) (workspaceSlotName assign.slot) assign
 
 /-- Ensure the workspace for a repository-independent run outside the queue exists, and empty it
     unless `resumeFrom` names the task whose files are still in it.
@@ -555,12 +582,14 @@ def ensureWorkspace (assign : SlotAssignment) : IO System.FilePath :=
 
     See `adhocWorkspaceName` for why this is not one of the pooled slots. -/
 def ensureAdhocWorkspace (occupant : Option String := none)
-    (resumeFrom : Option String := none) : IO System.FilePath :=
-  prepareWorkspace adhocWorkspaceName { slot := 0, occupant, resumeFrom }
+    (resumeFrom : Option String := none) (base : Option System.FilePath := none)
+    : IO System.FilePath := do
+  prepareWorkspace (← resolveWorkspaceBase base) adhocWorkspaceName
+    { slot := 0, occupant, resumeFrom }
 
 /-- Every scratch workspace that currently exists, in name order. -/
-def listWorkspaces : IO (Array System.FilePath) := do
-  let base ← workspaceBase
+def listWorkspaces (base : Option System.FilePath := none) : IO (Array System.FilePath) := do
+  let base ← resolveWorkspaceBase base
   if !(← base.pathExists) then return #[]
   let entries ← base.readDir
   let dirs ← entries.filterM (fun e => e.path.isDir)

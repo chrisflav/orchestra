@@ -290,22 +290,6 @@ private def resolveTools (mode : TaskMode) (tools : Option (List String)) :
     | .pr   => (["create_pr"], true)
     | .fork => ([], true)
 
-/-- Drop the tools that act on a repository from a repository-independent task's list, naming
-    each one it removes.
-
-    Loud rather than silent: a task file that asks for `create_pr` and names no repository has
-    said two contradictory things, and the one that wins decides whether the run can deliver
-    anything at all. The MCP server refuses these calls too — this is what keeps them out of the
-    tool list the agent plans against in the first place. -/
-private def withoutRepoScopedTools (repo : Option RepoPair) (tools : List String)
-    : IO (List String) := do
-  if repo.isSome then return tools
-  let (dropped, kept) := tools.partition Server.repoScopedTools.contains
-  unless dropped.isEmpty do
-    IO.eprintln s!"  Warning: this task has no repository, so {", ".intercalate dropped} \
-{if dropped.length == 1 then "is" else "are"} not granted — there is no repository to act on."
-  return kept
-
 /-- Resolve the authentication environment variables for a given backend and optional auth source label.
     If the task specifies an auth source label (or a default is configured), looks it up in the
     per-agent auth configs and returns its env vars via the agent's `envVarsOfAuthSource`.
@@ -570,7 +554,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   if usingModeFallback && !requestedTools.isEmpty then
     IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
       Use 'tools' instead (e.g. {repr requestedTools}) and optionally 'read_only: true/false'."
-  let allowedTools ← withoutRepoScopedTools ioTask.repo requestedTools
+  let allowedTools ← Server.withoutRepoScopedTools ioTask.repo requestedTools
   let inputJson := some (ResultType.valueToJson i input)
   let outputRef ← IO.mkRef (none : Option Lean.Json)
   let serverState : Server.State := {

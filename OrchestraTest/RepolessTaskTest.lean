@@ -168,28 +168,64 @@ def aContinuationAsksForTheWorkspaceItsPredecessorLeft : Test := do
 
 /-! ## The scratch workspace -/
 
+/-- A workspace base of this test's own, under `/tmp`.
+
+    Never the installation's: preparing a workspace *empties* it, and the directory these tests
+    would otherwise land on is the one `orchestra run` and `orchestra interactive` share, so a
+    test run would delete the scratch files of a repository-independent run in progress and leave
+    its own occupant marker behind for the next continuation to trip over. -/
+private def tempWorkspaceBase : IO System.FilePath := do
+  let base := System.FilePath.mk "/tmp" / s!"orchestra-workspace-test-{← IO.monoNanosNow}"
+  IO.FS.createDirAll base
+  return base
+
 @[test]
 def aWorkspaceIsEmptiedBetweenTasksAndKeptForAContinuation : Test := do
   -- The whole point of the occupant marker, on the path that has no slot record to consult: an
   -- unrelated run finds the directory and empties it, and the run continuing the task that left
   -- it gets the files back. Exercised through the ad-hoc workspace because that is the one
   -- `orchestra run` and `orchestra interactive` share.
-  let scratch ← Repo.ensureAdhocWorkspace (occupant := some "task-1")
+  let base ← tempWorkspaceBase
+  let scratch ← Repo.ensureAdhocWorkspace (occupant := some "task-1") (base := some base)
   IO.FS.writeFile (scratch / "notes.md") "half-finished"
   -- A continuation of `task-1` keeps what `task-1` wrote.
   let resumed ← Repo.ensureAdhocWorkspace (occupant := some "task-2") (resumeFrom := some "task-1")
+    (base := some base)
   TestM.assert (← (resumed / "notes.md").pathExists)
     (msg := "a continuation finds the files its session refers to")
   -- An unrelated run does not.
-  let fresh ← Repo.ensureAdhocWorkspace (occupant := some "task-3")
+  let fresh ← Repo.ensureAdhocWorkspace (occupant := some "task-3") (base := some base)
   TestM.assert (!(← (fresh / "notes.md").pathExists))
     (msg := "an unrelated task starts in an empty directory")
   -- Nor does a continuation whose predecessor's files are gone: `task-3` holds it now.
   IO.FS.writeFile (fresh / "other.md") "someone else's"
   let stale ← Repo.ensureAdhocWorkspace (occupant := some "task-4") (resumeFrom := some "task-1")
+    (base := some base)
   TestM.assert (!(← (stale / "other.md").pathExists))
     (msg := "a continuation is not resumed onto a tree its predecessor never left")
-  IO.FS.removeDirAll stale
+  IO.FS.removeDirAll base
+
+@[test]
+def anEmptiedWorkspaceClaimsNobodysFiles : Test := do
+  -- The invariant behind clearing the occupant marker *before* emptying the directory rather
+  -- than overwriting it after: at no point does an emptied workspace carry the name of the task
+  -- whose files were in it. A run killed mid-reset would otherwise leave exactly that, and the
+  -- next continuation of that task would match the stale name, be told its files were kept, and
+  -- find none of them. The crash itself is not reachable from a test; the state it would leave
+  -- is, by resetting with no occupant to record.
+  let base ← tempWorkspaceBase
+  let scratch ← Repo.ensureAdhocWorkspace (occupant := some "task-1") (base := some base)
+  IO.FS.writeFile (scratch / "notes.md") "half-finished"
+  let _ ← Repo.ensureAdhocWorkspace (occupant := none) (base := some base)
+  -- Named directly: `adhocWorkspaceName` is private, and the marker's placement beside the
+  -- workspace rather than inside it is part of what is being checked.
+  TestM.assert (!(← (base / "adhoc.occupant").pathExists))
+    (msg := "an emptied workspace records no occupant at all")
+  let resumed ← Repo.ensureAdhocWorkspace (occupant := some "task-2") (resumeFrom := some "task-1")
+    (base := some base)
+  TestM.assert (!(← (resumed / "notes.md").pathExists))
+    (msg := "so a continuation is not told it kept files that are gone")
+  IO.FS.removeDirAll base
 
 /-! ## Listeners -/
 
@@ -235,6 +271,40 @@ def theRepositoryScopedToolsAreRefusedWithoutOne : Test := do
     let result ← Server.evalToolCall state call
     TestM.assert (result.getObjValAs? Bool "isError" |>.toOption |>.getD false)
       (msg := s!"{name} should be refused when the task has no repository")
+
+@[test]
+def theRequestedToolsAreNarrowedBeforeTheAgentSeesThem : Test := do
+  -- The gate before `tools/list`: what a task file asked for, minus what it cannot have. Order is
+  -- kept, so the rest of the list reads as it was written.
+  let kept ← Server.withoutRepoScopedTools none
+    ["create_pr", "manage_issues", "comment", "create_repository"] (warn := false)
+  TestM.assertEqual kept ["manage_issues", "create_repository"]
+    (msg := "the repository-scoped tools go, and only those")
+  let unchanged ← Server.withoutRepoScopedTools (some repo) ["create_pr"] (warn := false)
+  TestM.assertEqual unchanged ["create_pr"] (msg := "a task with a repository keeps them")
+
+@[test]
+def theToolListShowsWhatWillActuallyBeServed : Test := do
+  -- `tools/list` is what the agent plans against, so what it shows has to be what `evalToolCall`
+  -- will serve. `create_repository` is the one that names a repository and still belongs here: it
+  -- creates one in `default_organization` rather than acting on one the task named, which is what
+  -- meta-work does when a project does not exist yet.
+  let state : Server.State :=
+    { repo := none
+    , allowedTools := Server.repoScopedTools ++ ["create_repository"]
+    , appId := 0, privateKeyPath := "", installationId := none, pat := "" }
+  let names := ((Server.toolsList state).getObjVal? "tools" |>.toOption.bind (·.getArr?.toOption))
+    |>.getD #[] |>.filterMap (·.getObjValAs? String "name" |>.toOption)
+  for hidden in Server.repoScopedTools do
+    TestM.assert (!names.contains hidden)
+      (msg := s!"{hidden} acts on a repository, so it is not offered to a task without one")
+  TestM.assert (!names.contains "get_pr_comments")
+    (msg := "get_pr_comments reads a pull request on the upstream, so it is not offered either")
+  TestM.assert (!names.contains "refresh_token")
+    (msg := "no installation to mint from ⇒ refresh_token is not offered")
+  TestM.assert (names.contains "create_repository")
+    (msg := "create_repository acts on no repository of the task's, so it stays")
+  TestM.assert (names.contains "health") (msg := "health needs nothing and is always offered")
 
 @[test]
 def refreshTokenIsRefusedWithoutAnInstallation : Test := do

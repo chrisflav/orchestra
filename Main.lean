@@ -1715,8 +1715,13 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     | some s => s.splitOn ","
   -- The repository-scoped tools are not offered to a session that has no repository; the MCP
   -- server refuses them anyway, and `--tools all` should not read as a promise it cannot keep.
-  let allowedTools :=
-    if repo.isSome then requested else requested.filter (!Server.repoScopedTools.contains ·)
+  -- Through the same helper a queued task goes through, so `--tools create_pr` typed at a session
+  -- with no repository is reported rather than dropped in silence — but not `--tools all` or its
+  -- absence, which named nothing in particular and would say this on every such session.
+  let namedTools := match toolsStr with
+    | some s => s != "all"
+    | none   => false
+  let allowedTools ← Server.withoutRepoScopedTools repo requested (warn := namedTools)
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
   let installationId : Option Nat ← match appConfig.installationId with

@@ -607,6 +607,9 @@ What such a task gets, and what it does not:
   that could draw that line. Anything meant to outlive a run belongs in a memory directory.
 - **The project, issue and task tools** — `manage_issues`, `work_issues`, `review_issues`,
   `get_task_input`, `submit_task_output`, `health`. This is what the task is for.
+- **`create_repository`**, which creates a repository in `default_organization` rather than acting
+  on one the task named, so there is nothing about it a repository-independent task lacks. Starting
+  a project that does not exist yet is meta-work like any other.
 - **No `create_pr`, `merge_pr`, `label_issue` or `comment`.** Asking for one in `tools` is reported
   on stderr and dropped, and the MCP server refuses the call as well. `get_pr_comments`, which no
   task has to ask for, is simply not offered — nor is `refresh_token` when there is no

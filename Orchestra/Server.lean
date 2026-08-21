@@ -160,8 +160,34 @@ private def alwaysAvailableTools (state : State) : Array Json :=
     ++ (if state.repo.isSome then #[getPrCommentsToolDef] else #[])
 
 /-- Optional tools that act on a repository, and are therefore never granted to a
-    repository-independent task. -/
+    repository-independent task.
+
+    Only the *optional* ones: `get_pr_comments` and `refresh_token` need a repository and an
+    installation too, but no task asks for them by name — `alwaysAvailableTools` is what withholds
+    those. `create_repository` is deliberately absent: it creates a repository in
+    `default_organization` rather than acting on one the task named, which is exactly the kind of
+    thing meta-work does. -/
 def repoScopedTools : List String := ["create_pr", "merge_pr", "label_issue", "comment"]
+
+/-- Drop the tools that act on a repository from a repository-independent run's tool list, naming
+    each one it removes.
+
+    Loud rather than silent: a task file or a `--tools` flag that asks for `create_pr` and names no
+    repository has said two contradictory things, and the one that wins decides whether the run can
+    deliver anything at all. `evalToolCall` refuses these calls as well — this is what keeps them
+    out of the tool list the agent plans against in the first place.
+
+    `warn := false` for a caller whose list was never a request for these in particular:
+    `--tools all` asks for whatever is going and has no opinion about what that includes, so
+    naming what it does not get is noise on every repository-independent session. -/
+def withoutRepoScopedTools (repo : Option RepoPair) (tools : List String)
+    (warn : Bool := true) : IO (List String) := do
+  if repo.isSome then return tools
+  let (dropped, kept) := tools.partition repoScopedTools.contains
+  if warn && !dropped.isEmpty then
+    IO.eprintln s!"  Warning: this run has no repository, so {", ".intercalate dropped} \
+{if dropped.length == 1 then "is" else "are"} not granted — there is no repository to act on."
+  return kept
 
 private def optionalToolDefs : List (String × Json) := [
   ("create_pr", Json.mkObj [
