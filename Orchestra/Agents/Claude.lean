@@ -74,10 +74,6 @@ def claude : AgentDef where
     -- turn, for as long as the session lives.
     let mut args : Array String := #[
       "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-      -- The CLI echoes each stdin turn back on stdout, so user messages arrive through the same
-      -- stream as everything else. Without it the transcript has two writers racing to append
-      -- in the right order; with it there is one, and the order is the agent's own.
-      "--replay-user-messages",
       "--dangerously-skip-permissions", "--mcp-config", o.mcpContext,
       -- Bounds the whole session, not a turn — see `StreamOptions.budget`.
       "--max-budget-usd", s!"{o.budget}"

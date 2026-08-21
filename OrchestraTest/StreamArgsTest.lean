@@ -35,13 +35,15 @@ def streamingIsPrintPlusBothStreamFormats : Test := do
   TestM.assert (args.contains "--verbose") (msg := "--verbose, or the stream carries little")
 
 @[test]
-def userTurnsAreReplayedIntoTheStream : Test := do
+def userTurnsAreNotAskedForBack : Test := do
   let args := streamArgs { mcpContext := "/tmp/mcp.json" }
-  -- Without this the transcript has two writers — the daemon appending the turn it just sent,
-  -- and the pump appending what the agent says about it — racing to get the order right. With
-  -- it there is one writer, and the order is the agent's own.
-  TestM.assert (args.contains "--replay-user-messages")
-    (msg := "user turns come back through the same stream")
+  -- `--replay-user-messages` echoes each stdin turn back on stdout. There is nothing to do with
+  -- one: a replayed turn is a `user` line with no `tool_use_result`, which the stream parser
+  -- correctly reads as "not an event", and the daemon has already written the turn to the
+  -- transcript itself — it is the thing that sent it. Asking for the echo would buy a second
+  -- copy of every turn on the wire and a second writer racing the first.
+  TestM.assert (!args.contains "--replay-user-messages")
+    (msg := "the sender records the turn; the echo would be a second copy")
 
 @[test]
 def thereIsNoPromptArgument : Test := do
