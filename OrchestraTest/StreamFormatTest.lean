@@ -111,15 +111,49 @@ def anAssistantMessageWithNothingToShowIsEmpty : Test := do
 
 Dropped, a tool call reads as one that never returned. -/
 
+/-- The shape Claude Code actually emits for a tool result: the id and the payload live in the
+    `tool_result` content block, and `tool_use_result` carries the raw tool return — which has
+    `stdout`/`stderr` only for Bash. -/
+private def bashResultLine : String :=
+  r#"{"type":"user","message":{"role":"user","content":[
+       {"type":"tool_result","tool_use_id":"toolu_01","content":"hi"}]},
+      "tool_use_result":{"stdout":"","stderr":""}}"#
+
 @[test]
 def toolResultWithNoOutputIsKept : Test := do
-  let line := r#"{"type":"user","tool_use_id":"toolu_01","tool_use_result":{"stdout":"","stderr":""}}"#
-  match parseEvent line with
-  | some (.toolResult out err id) => do
-    TestM.assertEqual out "" (msg := "empty stdout")
+  match parseEvent bashResultLine with
+  | some (.toolResult _ err id) => do
     TestM.assertEqual err "" (msg := "empty stderr")
+    -- The id is read from `message.content[i].tool_use_id`, which is where the CLI puts it —
+    -- not from the top level and not from inside `tool_use_result`, neither of which has it.
     TestM.assertEqual id (some "toolu_01") (msg := "paired with the call that made it")
   | _ => TestM.fail "expected the empty tool result to be kept"
+
+@[test]
+def aUserMessageThatIsNotAToolResultIsNotAnEvent : Test := do
+  -- The CLI emits these constantly: feedback from a `Stop` hook (which is what `goalArgs`
+  -- installs), "continue from where you left off", and other synthetic injections. Read as a
+  -- tool result they put an answer in the log for a call that never happened.
+  let line := r#"{"type":"user","message":{"role":"user","content":[
+      {"type":"text","text":"The goal is not met because there are no tests."}]},
+     "isSynthetic":true,"parent_tool_use_id":null}"#
+  TestM.assertEqual (parseEvents line).size 0
+    (msg := "a user line with no tool_use_result is an ordinary message, not a tool result")
+
+@[test]
+def aNonBashToolResultCarriesItsContent : Test := do
+  -- Only Bash reports stdout/stderr. Everything else answers in the content block, and reading
+  -- only the two streams rendered every Read and Edit as an empty `[output]`.
+  let line := r#"{"type":"user","message":{"role":"user","content":[
+      {"type":"tool_result","tool_use_id":"toolu_02","content":[
+        {"type":"text","text":"the file contents"}]}]},
+     "tool_use_result":{"type":"text","file":{"filePath":"a.lean"}}}"#
+  match parseEvent line with
+  | some (.toolResult out _ id) => do
+    TestM.assertEqual out "the file contents"
+      (msg := "the content block is the payload when there are no streams")
+    TestM.assertEqual id (some "toolu_02") (msg := "and it still pairs with its call")
+  | _ => TestM.fail "expected a tool result carrying its content"
 
 @[test]
 def toolUseIdRoundTripsThroughJson : Test := do

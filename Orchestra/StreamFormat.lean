@@ -149,6 +149,29 @@ def extractStringField (s key : String) : Option String := do
   guard !val.isEmpty
   return String.ofList val
 
+/-- The `tool_result` content block of a `user` line, if it has one.
+
+    This is where the id that pairs a result with its call lives — `message.content[i]
+    .tool_use_id`. It is emphatically not at the top level of the line, and not inside
+    `tool_use_result`, which is the raw tool return value and differs per tool. -/
+private def toolResultBlock (json : Json) : Option Json := do
+  let msg ← jVal json "message"
+  let items ← jArr msg "content"
+  items.find? fun b => jStr b "type" == "tool_result"
+
+/-- What a `tool_result` block says, as text. Its `content` is either a bare string or a list of
+    text blocks. -/
+private def blockText (block : Json) : String :=
+  match jVal block "content" with
+  | some (.str s)   => s
+  | some (.arr its) =>
+    String.intercalate "\n" <| its.toList.filterMap fun i =>
+      if jStr i "type" == "text" then
+        let t := jStr i "text"
+        if t.isEmpty then none else some t
+      else none
+  | _ => ""
+
 /-- The line types that carry exactly one event. Split out so that `parseEvents` below reads as
     the dispatch it is: the two interesting cases are the ones that do not answer one event. -/
 private def parseSingle (line : String) (json : Json) : Option Event :=
@@ -160,11 +183,28 @@ private def parseSingle (line : String) (json : Json) : Option Event :=
     else
       some (.system sub)
   | "user" =>
-    -- Kept even when both streams are empty. "The command produced no output" is a fact a
-    -- reader needs; dropped, a tool call reads as one that never returned.
-    let tr := (jVal json "tool_use_result").getD (Json.mkObj [])
-    some (.toolResult (jStr tr "stdout") (jStr tr "stderr")
-                      ((jStr? json "tool_use_id").orElse fun _ => jStr? tr "tool_use_id"))
+    -- A `user` line is a tool result only when it carries `tool_use_result`. Without that key
+    -- it is an ordinary user message, and the CLI emits plenty of those: feedback from a `Stop`
+    -- hook (which is exactly what `AgentDef.goalArgs` installs), "continue from where you left
+    -- off" after an interruption, and other synthetic injections. Treating those as tool
+    -- results puts a result into the log for a call that never happened. The CLI discriminates
+    -- the same way — `type === "user" && toolUseResult === undefined` is not a result to it
+    -- either.
+    match jVal json "tool_use_result" with
+    | none => none
+    | some tr =>
+      -- Only Bash reports `stdout`/`stderr` here; every other tool's answer is in the
+      -- `tool_result` content block, as a string or as text blocks. Reading just the two
+      -- streams rendered every `Read` and `Edit` as an empty `[output]` — which says the tool
+      -- returned nothing, when it returned something this parser could not see.
+      let block  := toolResultBlock json
+      let stdout := jStr tr "stdout"
+      let stderr := jStr tr "stderr"
+      let stdout :=
+        if stdout.isEmpty && stderr.isEmpty then (block.map blockText).getD "" else stdout
+      -- What is still kept is a result that really is empty: "the command produced no output"
+      -- is a fact a reader needs, and dropped, a tool call reads as one that never returned.
+      some (.toolResult stdout stderr (block.bind (jStr? · "tool_use_id")))
   | "result" =>
     let isError := json.getObjValAs? Bool "is_error" |>.toOption |>.getD false
     let res := jStr json "result"
