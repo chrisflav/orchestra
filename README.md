@@ -69,7 +69,8 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
   a follow-up prompt.
 - **A native app.** One client for macOS, Windows, Linux, iOS and Android that holds *several*
   backends at once and switches between them — reading the same API the dashboard reads, over a
-  bearer token kept in the OS keychain → [native app](#native-app)
+  bearer token kept in the OS keychain. Its own repository:
+  [orchestra-app](https://github.com/chrisflav/orchestra-app) → [native app](#native-app)
 - **Chat sessions the backend holds.** A conversation with an agent, in the same sandbox a task
   gets, reachable over the API from the CLI, the dashboard or a phone — and still running after
   the client that started it goes away → [interactive sessions](#interactive-sessions)
@@ -1150,56 +1151,28 @@ origin by construction, and the API sends no CORS headers, so a page loaded from
 cannot reach it at all. That is fine for one orchestra and wrong for three — a machine at home, a
 box in a datacentre, a container on the company network.
 
-The app under [`app/`](app/) is the client for that. It holds a list of backends, talks to
-whichever one is selected, and switches between them without a reload and without logging in
-again. Everything the dashboard shows, it shows; the one write the dashboard has — cancelling a
-run — it has too, plus a listener's on/off switch; and the chat pages are the same five routes
-`orchestra chat` uses, which is what makes a session started on a laptop readable from a phone.
+**[orchestra-app](https://github.com/chrisflav/orchestra-app)** is the client for that, and it
+lives in its own repository: it shares no build with this one — orchestra is Lean and Lake, the
+app is npm and cargo — so there is no reason to check the two out together.
 
-It is one codebase for five platforms: macOS, Windows and Linux on the desktop, iOS and Android
-on a phone. **Tauri v2** with a Rust core and a React front-end — the same React the dashboard is
-written in, so the two read as one product.
+It holds a list of backends, talks to whichever one is selected, and switches between them
+without a reload and without logging in again. Everything the dashboard shows, it shows; the one
+write the dashboard has — cancelling a run — it has too, plus a listener's on/off switch; and the
+chat pages are the same [session routes](#interactive-sessions) `orchestra chat` uses, which is
+what makes a conversation started on a laptop readable from a phone. One codebase for five
+platforms — macOS, Windows and Linux on the desktop, Android and iOS on a handset — on Tauri v2,
+with a Rust core holding the network and the OS keychain, because a webview can do neither
+across origins.
 
-Being native is not a preference here, it is what the three walls a browser puts up leave:
+It authenticates with the bearer half of the scheme above: the same password, sent as
+`Authorization: Bearer`, never a cookie. Nothing in this repository has to change for it to work,
+and nothing in it is aware of the app.
 
-- **A page cannot talk to a backend that did not serve it.** So the requests are made by the
-  Rust core, which is not subject to the same-origin policy.
-- **`EventSource` cannot carry a bearer token**, and every read in this API is also an SSE
-  stream. So the streams are read by the same core, over an ordinary request with an
-  `Authorization` header, and the frames are handed up to the interface.
-- **A browser has nowhere safe to keep a credential.** The dashboard never holds its password —
-  it trades it for an `HttpOnly` cookie. An app that must reach five backends has to store five
-  secrets, and `localStorage` is not where a secret goes. The OS keychain is.
-
-Two rules follow from those and hold the whole design: **the interface never opens a socket**,
-and **the interface never sees a token**. It names a backend by an opaque id; the core resolves
-the id to an origin and a secret, attaches the header, and returns only the answer. A bug in the
-front-end cannot leak a credential, because the credential was never in that process.
-
-A backend is a name, an origin, a colour and a password. The first three live in
-`backends.json` in the platform's config directory, so that file is copyable and readable; the
-password lives in the keychain — Keychain on macOS, the Credential Manager on Windows, a Secret
-Service keyring on Linux — with a `0600` file in the app's private data directory where no
-keychain answers, and the Backends screen says which of the two is in use rather than letting
-you assume. Adding one is probe-then-save: a wrong password, a wrong port, a certificate that
-does not cover the name and a daemon that is simply down are four different problems, and the
-add dialog says which before anything is written.
-
-Every configured backend is polled once a minute even when it is not selected, which is what
-makes the switcher worth opening: each entry says whether it is answering and how much is
-running there, so trouble on the box you are not looking at is visible before you go looking for
-it.
-
-```sh
-cd app
-npm install
-npm run tauri dev      # the app, against whatever backends you add to it
-npm run tauri build    # a bundle for this platform
-```
-
-The design — the shell that was chosen and against what, how switching tears streams down, what
-each screen is, and what ships in which phase — is [`docs/native-app.md`](docs/native-app.md);
-how to build and check it is [`app/README.md`](app/README.md).
+Two things here are its contract, and a change to either is a change the app has to follow:
+`docs/openapi.json`, which is the document of record for every payload, and the `Json` builders
+in `Orchestra/Dashboard.lean` that emit them. The app keeps its own copy of those types, which
+the split makes load-bearing rather than incidental — its design document says so at more
+length.
 
 ## interactive sessions
 

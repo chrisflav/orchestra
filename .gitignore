@@ -13,10 +13,3 @@ docker/secrets/*
 # stage, and a local `orchestra dashboard --site web/dist` needs `npm run build` first.
 web/node_modules/
 web/dist/
-
-# Native app. `dist/` is the bundled front-end, `target/` the Rust build, and `gen/` the
-# platform projects the Tauri CLI writes for the mobile targets — all three are artifacts.
-app/node_modules/
-app/dist/
-app/src-tauri/target/
-app/src-tauri/gen/
