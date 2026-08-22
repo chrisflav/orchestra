@@ -1333,6 +1333,11 @@ a.row:hover .row-title {
   flex: 1 1 220px;
   min-width: 0;
 }
+/* Optional, and narrower than the two repositories, which are not. Qualified with `input` so it
+   outweighs the `.chat-start input` rule above rather than silently losing to it. */
+.chat-start input.chat-start-model {
+  flex: 0 1 190px;
+}
 .chat-compose textarea {
   font-family: var(--ui);
   resize: vertical;
