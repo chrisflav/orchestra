@@ -1493,7 +1493,8 @@
             "description": "Agent backend. Only backends whose CLI can read turns from stdin can host a session; one that cannot is a `400` naming it."
           },
           "model": {
-            "type": "string"
+            "type": "string",
+            "description": "Passed to the backend's own CLI untouched, so a family alias and a pinned id are equally valid; orchestra keeps no list of what is. Absent, or blank, runs the backend's default. Fixed for the session's whole life, because the agent process is launched once and kept."
           },
           "budget": {
             "type": "number",

@@ -1487,6 +1487,15 @@ private def startInteractive (body : String) : IO WriteResult := do
   if let some budget := j.getObjValAs? Float "budget" |>.toOption then
     if budget ≤ 0.0 || budget > maxSessionBudgetUsd then
       return .badRequest s!"'budget' must be between 0 and {maxSessionBudgetUsd} USD"
+  -- A blank model is no model. `--model ""` reaches the vendor CLI as an argument it rejects
+  -- outright, and it does so only after the clone, the installation token, the MCP server and
+  -- the sandbox launch — a session that costs everything and answers nothing. Absent is what
+  -- the caller meant, so absent is what the daemon is asked for. Done here rather than in one
+  -- client because every client can send it: the dashboard's box, `orchestra chat --model ""`,
+  -- and whatever asks next.
+  let j := match j.getObjValAs? String "model" |>.toOption with
+    | some m => if m.trimAscii.isEmpty then j.setObjVal! "model" Json.null else j
+    | none   => j
   match ← askDaemon (Json.mkObj [("type", Json.str "interactive_start"), ("spec", j)]) with
   -- The daemon's refusals are not all the same kind of thing. A backend that cannot host a
   -- session, or a repository it will not accept, is permanent and the caller's fault — a `409`

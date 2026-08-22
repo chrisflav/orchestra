@@ -9,6 +9,7 @@ import {
   UnauthorizedError,
 } from "../api";
 import type { SessionDetail, TranscriptEvent } from "../api";
+import { orDash } from "../format";
 import { Empty, List, Row } from "../components/List";
 import { LogView } from "../components/LogView";
 import { Facts, LivePage, Section } from "../components/Page";
@@ -196,11 +197,37 @@ export function Chat() {
   );
 }
 
+/**
+ * Suggestions for the model box — not a closed list.
+ *
+ * orchestra passes this string through to the backend CLI's `--model` and has never had an
+ * opinion about what is valid, so the field stays a text input and this is only a `datalist`:
+ * anything the CLI accepts can be typed, and a suggestion that goes stale costs a keystroke
+ * rather than blocking a session. The family aliases lead because they are the durable half —
+ * they name a family rather than a release, so they keep meaning something as models come and
+ * go. The pinned ids are for a conversation that has to stay on one model.
+ *
+ * `claude` is the only backend that can host a session today; if that changes, these become
+ * suggestions for the wrong CLI, which is another reason not to make them a closed set.
+ */
+const MODEL_SUGGESTIONS = [
+  "fable",
+  "opus",
+  "sonnet",
+  "haiku",
+  "claude-fable-5",
+  "claude-opus-5",
+  "claude-opus-4-8",
+  "claude-sonnet-5",
+  "claude-haiku-4-5",
+];
+
 /** Starting one. The only form in this console that runs an agent. */
 function NewSession() {
   const navigate = useNavigate();
   const [upstream, setUpstream] = useState("");
   const [fork, setFork] = useState("");
+  const [model, setModel] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -209,7 +236,14 @@ function NewSession() {
     if (busy || upstream.trim() === "" || fork.trim() === "") return;
     setBusy(true);
     setError(null);
-    startSession({ upstream: upstream.trim(), fork: fork.trim() })
+    const chosen = model.trim();
+    startSession({
+      upstream: upstream.trim(),
+      fork: fork.trim(),
+      // Left out rather than sent empty. Absent means "whatever the backend runs by default",
+      // which is a different request from asking it to resolve a model named "".
+      ...(chosen === "" ? {} : { model: chosen }),
+    })
       .then((s) => navigate(`/chat/${encodeURIComponent(s.id)}`))
       .catch((err: unknown) => setError(errorText(err)))
       .finally(() => setBusy(false));
@@ -230,6 +264,21 @@ function NewSession() {
           placeholder="fork (owner/repo)"
           aria-label="Fork repository"
         />
+        <input
+          className="chat-start-model"
+          list="chat-models"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          placeholder="model (optional)"
+          // The placeholder is not part of the accessible name once `aria-label` is set, and
+          // "optional" is the one thing about this field a listener cannot otherwise tell.
+          aria-label="Model (optional)"
+        />
+        <datalist id="chat-models">
+          {MODEL_SUGGESTIONS.map((m) => (
+            <option key={m} value={m} />
+          ))}
+        </datalist>
         <button type="submit" disabled={busy}>
           {busy ? "Starting…" : "Start"}
         </button>
@@ -262,7 +311,11 @@ export function ChatDetail() {
             items={[
               { key: "Status", value: <Status status={session.status} /> },
               { key: "Repository", value: session.fork },
-              { key: "Backend", value: session.model ?? session.backend },
+              { key: "Backend", value: session.backend },
+              // The model as it was asked for, not as the agent resolved it: a session started
+              // without one runs on the backend's default, and saying "—" is the honest way to
+              // show that rather than naming a model nobody chose.
+              { key: "Model", value: orDash(session.model) },
               { key: "Turns", value: String(session.turnCount) },
               { key: "Spent", value: `$${session.costUsd.toFixed(4)} of $${session.budget}` },
               { key: "Last activity", value: <Time iso={session.lastActivityAt} /> },

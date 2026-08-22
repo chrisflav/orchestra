@@ -1281,6 +1281,24 @@ closing the terminal all leave the session running on the backend; `--end` is ho
 That is what makes it worth having a session rather than a TUI: you can start one at a desk,
 close the laptop, and pick the same conversation up from the dashboard.
 
+Which model answers is yours to choose, at the moment the session starts and not after: the
+agent process is launched once and kept, so the model is a property of the session rather than
+of a turn. `orchestra chat --model <name>` on the command line, and the box beside the two
+repositories on the dashboard's chat page; leaving it empty runs whatever the backend runs by
+default. The name is passed through to the backend's own CLI untouched, so a family alias
+(`opus`) and a pinned id (`claude-opus-5`) are both fine, and orchestra does not keep a list of
+what is valid — the backend answers that.
+
+A session's model is fixed once it starts, because the agent process is. To carry a conversation
+to a different one, start a new session that resumes the old — repositories and all, since
+starting a session always takes them:
+
+```sh
+orchestra chat --upstream owner/repo --fork your-org/repo --resume-from <id> --model opus
+```
+
+It inherits the old session's history and is launched with the model it was given.
+
 Only backends whose CLI can read turns from standard input can host a session, which today means
 `claude`. Asking for another is refused when the session is created, in a message naming it —
 never quietly substituted, because a backend that answers the first turn and exits looks exactly
