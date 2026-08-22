@@ -2,10 +2,14 @@ import { useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 import type { LogEvent } from "../api";
 
-/** Cap on how much of a single stdout/stderr blob is rendered inline. */
+/** Cap on how much of a single stdout/stderr blob is rendered inline.
+
+    Sized for a task log, where a blob is the output of a command and a runaway one would wedge
+    the page. A conversation is the other case — there the blob is the model's prose, and 4000
+    characters is an ordinary long answer — so the chat raises it; see `maxBlob`. */
 const MAX_BLOB = 4000;
 
-function clamp(text: string, max = MAX_BLOB): string {
+function clamp(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n… ${text.length - max} more characters`;
 }
 
@@ -36,7 +40,7 @@ function Entry({ kind, tone = "", children }: { kind: string; tone?: string; chi
  * fields that carry the meaning — the command, the path, the pattern — are pulled out and
  * everything else falls back to compact JSON.
  */
-function ToolInput({ input }: { input: Record<string, unknown> }) {
+function ToolInput({ input, maxBlob }: { input: Record<string, unknown>; maxBlob: number }) {
   const str = (key: string): string => {
     const v = input[key];
     return typeof v === "string" ? v : "";
@@ -50,7 +54,7 @@ function ToolInput({ input }: { input: Record<string, unknown> }) {
     return (
       <>
         {description && <div className="log-meta">{description}</div>}
-        <pre>{clamp(command)}</pre>
+        <pre>{clamp(command, maxBlob)}</pre>
       </>
     );
   }
@@ -60,7 +64,7 @@ function ToolInput({ input }: { input: Record<string, unknown> }) {
   return <pre>{truncate(JSON.stringify(input), 280)}</pre>;
 }
 
-function LogEntry({ event }: { event: LogEvent }) {
+function LogEntry({ event, maxBlob }: { event: LogEvent; maxBlob: number }) {
   switch (event.type) {
     case "init":
       return (
@@ -78,20 +82,20 @@ function LogEntry({ event }: { event: LogEvent }) {
       if (item.type === "thinking")
         return (
           <Entry kind="thinking" tone="k-think">
-            <div className="log-think">{clamp(item.text ?? "")}</div>
+            <div className="log-think">{clamp(item.text ?? "", maxBlob)}</div>
           </Entry>
         );
       if (item.type === "tool_use")
         return (
           <Entry kind="tool" tone="k-tool">
             <span className="log-tool">{item.name ?? "?"}</span>
-            <ToolInput input={item.input ?? {}} />
+            <ToolInput input={item.input ?? {}} maxBlob={maxBlob} />
           </Entry>
         );
       if (item.type === "text")
         return (
           <Entry kind="says" tone="k-text">
-            {clamp(item.text ?? "")}
+            {clamp(item.text ?? "", maxBlob)}
           </Entry>
         );
       return (
@@ -104,11 +108,11 @@ function LogEntry({ event }: { event: LogEvent }) {
       const stderr = event.stderr ?? "";
       return (
         <Entry kind="output">
-          {stdout && <pre>{clamp(stdout)}</pre>}
+          {stdout && <pre>{clamp(stdout, maxBlob)}</pre>}
           {stderr && (
             <>
               <div className="log-meta log-err">stderr</div>
-              <pre>{clamp(stderr)}</pre>
+              <pre>{clamp(stderr, maxBlob)}</pre>
             </>
           )}
         </Entry>
@@ -124,7 +128,7 @@ function LogEntry({ event }: { event: LogEvent }) {
       if (event.total_cost_usd != null) parts.push(`$${event.total_cost_usd}`);
       return (
         <Entry kind={subtype || "result"} tone={failed ? "k-err" : "k-text"}>
-          {event.result && <pre>{clamp(event.result)}</pre>}
+          {event.result && <pre>{clamp(event.result, maxBlob)}</pre>}
           {parts.length > 0 && <div className="log-meta">{parts.join(" · ")}</div>}
         </Entry>
       );
@@ -156,12 +160,15 @@ export function LogView({
   truncated,
   empty = "This task has no log file.",
   autoScroll = true,
+  maxBlob = MAX_BLOB,
 }: {
   events: LogEvent[];
   total: number;
   truncated: boolean;
   /** Whether this view scrolls itself. Off for a caller that owns the scroll region. */
   autoScroll?: boolean;
+  /** How much of one blob to render before cutting it. See `MAX_BLOB`. */
+  maxBlob?: number;
   /** What to say when there is nothing to show. Only the page knows why there isn't. */
   empty?: string;
 }) {
@@ -194,7 +201,7 @@ export function LogView({
         {events.map((event, i) => (
           // Log events are append-only and carry no id, so position is a stable key here:
           // index `i` always names the same event for as long as the tail window holds.
-          <LogEntry key={i} event={event} />
+          <LogEntry key={i} event={event} maxBlob={maxBlob} />
         ))}
       </div>
     </div>

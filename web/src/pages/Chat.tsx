@@ -117,6 +117,11 @@ function Conversation({ events }: { events: TranscriptEvent[] }) {
             total={block.events.length}
             truncated={false}
             autoScroll={false}
+            // The task log's 4000-character cap is a guard against a runaway command; here the
+            // blob is the answer, and cutting it at 4000 is the same "shown partially" the
+            // transcript's own layout used to be guilty of. Still bounded, but well past any
+            // real turn.
+            maxBlob={100000}
           />
         ) : (
           <div key={i}>
