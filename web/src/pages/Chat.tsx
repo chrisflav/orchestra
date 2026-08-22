@@ -66,9 +66,21 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** The events the agent itself produced, for `LogView` — which already knows how to draw them. */
+/** Is this transcript event the agent thinking? */
+function isThinking(e: TranscriptEvent): boolean {
+  return e.kind === "agent" && e.event?.type === "assistant" && e.event.item?.type === "thinking";
+}
+
+/**
+ * The events the agent itself produced, for `LogView` — which already knows how to draw them.
+ *
+ * Thinking is dropped. It is not something the agent said, it is the agent working out what to
+ * say, and a transcript that keeps every reasoning block is mostly reasoning blocks — the answer
+ * ends up somewhere in the middle of them. What a reader wants from it is only that it is
+ * happening, which the indicator below says once and then stops saying.
+ */
 function agentEvents(events: TranscriptEvent[]) {
-  return events.flatMap((e) => (e.kind === "agent" && e.event ? [e.event] : []));
+  return events.flatMap((e) => (e.kind === "agent" && e.event && !isThinking(e) ? [e.event] : []));
 }
 
 /**
@@ -78,7 +90,7 @@ function agentEvents(events: TranscriptEvent[]) {
  * the same here as it does there. What is rendered around it is the part the agent's own stream
  * cannot say: what the person typed, and what the daemon did.
  */
-function Conversation({ events }: { events: TranscriptEvent[] }) {
+function Conversation({ events, working }: { events: TranscriptEvent[]; working: boolean }) {
   // Grouped so a run of agent events becomes one `LogView` rather than one per line, which is
   // what keeps the tool calls lined up the way they are on a task page. Memoised because the
   // arrays it builds are `LogView`'s props: rebuilt on every render they would make every block
@@ -91,8 +103,18 @@ function Conversation({ events }: { events: TranscriptEvent[] }) {
       if (last && last.kind === kind) last.events.push(e);
       else out.push({ kind, events: [e] });
     }
-    return out;
+    // An agent block that is nothing but thinking renders nothing, and `LogView` with no events
+    // draws its empty state — which on a task page reads "This task has no log file." in the
+    // middle of a conversation. Dropped here instead.
+    return out.filter((b) => b.kind !== "agent" || b.events.some((e) => !isThinking(e)));
   }, [events]);
+
+  // "Thinking…" is a live status, not a line of transcript: it belongs at the end and only while
+  // it is true. True means the agent is working on a turn and the last thing it produced was a
+  // reasoning block — the next thing it says replaces it, which is exactly the behaviour a
+  // reader expects of a spinner rather than of a log.
+  const last = events[events.length - 1];
+  const thinking = working && last !== undefined && isThinking(last);
 
   // The page is the scroll region — there is no box around the conversation and none inside it —
   // so the thing to keep at the bottom is the window. Only while the reader is already there:
@@ -110,11 +132,12 @@ function Conversation({ events }: { events: TranscriptEvent[] }) {
   }, []);
   useEffect(() => {
     if (pinned.current) window.scrollTo({ top: document.documentElement.scrollHeight });
-  }, [blocks]);
+  }, [blocks, thinking]);
 
   if (events.length === 0) {
     return <p className="empty">Nothing said yet. Type a turn below.</p>;
   }
+
 
   return (
     <div className="chat-transcript">
@@ -126,6 +149,7 @@ function Conversation({ events }: { events: TranscriptEvent[] }) {
             total={block.events.length}
             truncated={false}
             flow
+            collapseTools
             // The task log's 4000-character cap is a guard against a runaway command; here the
             // blob is the answer, and cutting it at 4000 is the same "shown partially" the
             // transcript's own layout used to be guilty of. Still bounded, but well past any
@@ -167,6 +191,11 @@ function Conversation({ events }: { events: TranscriptEvent[] }) {
             })}
           </div>
         ),
+      )}
+      {thinking && (
+        <p className="chat-thinking" role="status">
+          thinking…
+        </p>
       )}
     </div>
   );
@@ -357,7 +386,7 @@ function Transcript({ session }: { session: SessionDetail }) {
     <Section title="Conversation">
       {streamError !== null && <p className="chat-error">{streamError}</p>}
       {!live && !finished && streamError === null && <p className="empty">Attaching…</p>}
-      <Conversation events={events} />
+      <Conversation events={events} working={session.status === "running"} />
     </Section>
   );
 }
