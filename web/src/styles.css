@@ -1399,6 +1399,17 @@ a.row:hover .row-title {
   max-height: 640px;
   overflow-y: auto;
 }
+/* Blocks keep their own height; the conversation scrolls.
+
+   Without this the transcript does not scroll at all. A flex item's default `flex-shrink: 1`
+   lets it be squashed to fit a bounded container, and its automatic minimum size — the thing
+   that normally stops that at the height of the content — is zero for any box whose `overflow`
+   is not `visible`, which `.panel` sets. So every agent block was compressed to (640px / number
+   of blocks) and clipped there: each model response showed a line and a half, and showed less
+   of itself with every turn that arrived after it. */
+.chat-transcript > * {
+  flex: 0 0 auto;
+}
 /* A log drawn inside someone else's scroll region flows rather than scrolling itself. */
 .log-flow {
   max-height: none;
