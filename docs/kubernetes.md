@@ -223,6 +223,40 @@ arrangement the landrun backend gets for free from the machine it runs on. The c
 The checkout's own build output (`.lake`, `target`, `node_modules`) travels with the checkout
 instead, unless `excludes` leaves it behind.
 
+## what a pod's lifetime covers
+
+**One pod per task, reused for everything in it.** `init.sh`, `before.sh`, the agent, the
+validation script, the agent again on a retry, `after.sh` — all of it is a `kubectl exec` into the
+same container. Nothing is reused *between* tasks: the pod is created when the task starts and
+deleted when it ends, including when it fails or is cancelled.
+
+**The agent's conversation lives as long as its `$HOME`.** A session id is a file the agent CLI
+wrote there, and `--resume <id>` is a request to read it back. Within a task that always works: the
+retry after a failed validation runs in the same pod as the attempt before it. Across tasks it
+depends on `home_claim`:
+
+| | scratch home (default) | `home_claim` set |
+| --- | --- | --- |
+| retry after failed validation | resumes | resumes |
+| `continues_from` / a series | **refused** | resumes |
+| toolchain `init.sh` installed | reinstalled each task | kept |
+
+A task that continues another one, in an environment that cannot have its conversation, fails at
+the start and says which setting keeps it. Running anyway is the worse outcome: a follow-up prompt
+— "now also handle the timeout case" — answered by a model that has never seen what came before,
+which reads as a plausible pull request and is not one.
+
+**If the pod goes away mid-task** — `deadline_seconds` expiring, an eviction, a node lost — the
+`kubectl exec` carrying whatever was running dies with it, and the task fails. The checkout is
+*not* brought back, since there is nothing left to copy it from; the daemon says so plainly rather
+than reporting a failed transfer, because the difference matters: the work is not there to retry,
+only to run again. `deadline_seconds` counts the whole task, hooks and retries included, so a
+repository whose build is slow wants it raised rather than discovered.
+
+**If a session id no longer resolves** for any other reason — the agent CLI expired it, a claim was
+wiped — the CLI is what says so, on the run it was passed to. Orchestra records that as the task's
+failure; it does not silently start a fresh conversation in its place.
+
 ## the checkout, and what comes back
 
 The daemon prepares the checkout as it always has — a clone slot per concurrent task — and the

@@ -118,6 +118,16 @@ structure Session where
       `true` says so, and `RepoConfig.runInitIfNeeded` then runs the hook every task. A repository's
       `init.sh` is expected to be idempotent for exactly this reason. -/
   freshEnvironment : Bool := false
+  /-- Whether a conversation the agent started in an *earlier* task can be resumed in this one.
+
+      An agent CLI's session is a file it wrote under its own `$HOME`, and `--resume <id>` is a
+      request to read it. That is always true on a machine, where every task shares one home. It is
+      not true of an environment that is new each task and takes its home with it, and a task that
+      continues another one — `continues_from`, a series — has no conversation to continue there.
+
+      Not a detail to leave to the agent CLI: the failure is a follow-up prompt ("now also handle
+      the timeout case") answered by a model that has never seen what came before. -/
+  carriesAgentState : Bool := true
 
 /-- What an execution environment has to be opened with.
 

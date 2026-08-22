@@ -598,7 +598,8 @@ are described once, as a backend-neutral spec, and an *execution backend* render
 the default and the one described above. `local` runs the agent with no confinement at all, for
 machines without Landlock — an agent under it can read and write everything the daemon can,
 orchestra's own credentials included, so it is opt-in and says so on every launch. `kubernetes`
-gives each task a pod on a cluster and runs everything in it — the repository's hooks, the agent,
+gives each task a pod on a cluster — one per task, reused for every command in it — and runs
+everything there — the repository's hooks, the agent,
 the validation script and its retries — with the checkout copied in when the task starts and back
 out when it ends → [running agents on a Kubernetes cluster](docs/kubernetes.md)
 

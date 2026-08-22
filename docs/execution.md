@@ -65,7 +65,15 @@ task, everything runs through it, and it is closed when the task ends, however i
 | `describe` | the run as a command a person can read, for `--debug` |
 | `mcpEndpoint` | where the agent should reach the MCP server |
 | `freshEnvironment` | whether every task starts from one with nothing a previous task installed |
+| `carriesAgentState` | whether a conversation an earlier task started can be resumed in this one |
 | `id` | what to call this environment in a log line |
+
+`carriesAgentState` is the other question a session answers about itself: whether a conversation
+the agent started in an *earlier* task can be resumed in this one. That is a file under the agent's
+own `$HOME`, so it is always true on a machine, where every task shares one home, and true of a
+container backend only when the home outlives the pod. A task that continues another one is
+refused by the task runner when its environment cannot have the conversation, rather than being run
+with a follow-up prompt and no memory of what it follows.
 
 `freshEnvironment` is what `init.sh` is measured against. The hook is meant to run once — install a
 toolchain, warm a cache — and it records that it has by writing a marker into the checkout, which

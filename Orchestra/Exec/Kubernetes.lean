@@ -555,6 +555,10 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     -- previous one installed — and the marker it leaves in the checkout, which is carried in here,
     -- would otherwise say it can.
     freshEnvironment := true
+    -- The agent's conversation is a file under its `$HOME`. With an `emptyDir` home that is gone
+    -- when the pod is, so a task cannot continue one an earlier task started; with a claim, home
+    -- outlives the pod and it can.
+    carriesAgentState := cfg.homeClaim.isSome
     mcpEndpoint := fun e => pure { e with host := cfg.mcpHost }
     describe := fun run => do
       let envFile := envFilePath 0
@@ -604,9 +608,22 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
         return { exitCode, output := (stdout ++ stderr).trimAscii.toString }
     close := do
       if cfg.syncBack then
-        for st in staged do
-          if st.writable then
-            syncOut cfg podName st.hostPath st.podPath (merge := !st.isWorkspace)
+        -- A pod that is already gone is the interesting case: it means something outside this
+        -- daemon ended the task's environment — `deadline_seconds` expiring, an eviction, a node
+        -- going away — and the difference between that and a transfer that failed is the
+        -- difference between "retry it" and "the work is not there to retry".
+        let (code, out, _) ← kube cfg #["get", "pod", podName, "-o", "jsonpath={.status.phase}"]
+        if code != 0 then
+          IO.eprintln s!"  [k8s] pod {podName} is gone before the task finished with it — \
+deleted, evicted, or past its {cfg.deadlineSeconds}s deadline_seconds. Nothing was copied back, \
+so {spec.workdir} still holds what the agent started from."
+        else
+          for st in staged do
+            if st.writable then
+              syncOut cfg podName st.hostPath st.podPath (merge := !st.isWorkspace)
+          if out.trimAscii.toString == "Failed" then
+            IO.eprintln s!"  [k8s] pod {podName} ended in Failed — if the task itself looked fine, \
+check whether it ran past deadline_seconds ({cfg.deadlineSeconds}s)."
       deletePod }
 
 /-- Check that `kubectl` is here and that it may do what this backend does.

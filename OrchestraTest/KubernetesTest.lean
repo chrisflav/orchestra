@@ -332,6 +332,24 @@ def apersistentHomeIsWhatMakesInitCheap : Test := do
       "a configured claim becomes the agent's home"
     TestM.assert (!AgentDef.containsCI v.compress "emptyDir") "and replaces the scratch volume"
 
+@[test]
+def aConversationOnlyOutlivesThePodIfHomeDoes : Test := do
+  -- Within a task the pod is reused for every command, so the retry after a failed validation
+  -- resumes what the first attempt started. Across tasks — `continues_from`, a series — the pod is
+  -- gone, and the conversation is a file the agent CLI wrote under its `$HOME`.
+  match Kubernetes.factory.make (options) with
+  | .error e => TestM.fail s!"a valid config was rejected: {e}"
+  | .ok _    => pure ()
+  let scratch := config
+  let kept    := config [("home_claim", .str "orchestra-agent-home")]
+  TestM.assert (!scratch.homeClaim.isSome)
+    "with a scratch home, nothing the agent wrote about itself outlives the task"
+  TestM.assert kept.homeClaim.isSome
+    "with a claim, home outlives the pod and an earlier task's conversation is still there"
+  -- The backends that run on this machine always can: every task shares one home.
+  TestM.assert Landrun.session.carriesAgentState "a landrun session carries the agent's state"
+  TestM.assert Local.session.carriesAgentState "and so does an unconfined local one"
+
 /-! ## Running something in the pod -/
 
 @[test]

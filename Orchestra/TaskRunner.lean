@@ -560,6 +560,14 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     image   := repoConfig.image }
   IO.println s!"  Running in: {session.id}"
   try
+    -- A task that continues another one is asking the agent to pick up a conversation it had
+    -- before, and that conversation is a file the agent CLI wrote where it was running. An
+    -- environment that is new each task and takes its home with it does not have it, and running
+    -- anyway would answer a follow-up prompt — "now also handle the timeout case" — with a model
+    -- that has never seen what came before. Better to stop and say which knob keeps it.
+    if initialResume.isSome && !session.carriesAgentState then
+      TaskStore.saveTask { initialRecord with status := .failed }
+      throw (IO.userError s!"this task continues {continuesFrom.getD "another task"}, whose conversation the agent left in an environment that no longer exists ({session.id} is new for every task). Configure a persistent agent home for this execution backend — execution.options.home_claim for kubernetes — or queue the work as a task of its own.")
     -- 4. Start MCP server (runs in this process, outside the sandbox)
     -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
     let (allowedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
