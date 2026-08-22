@@ -266,6 +266,9 @@ private def teardown (mgr : Manager) (s : LiveSession) (status : SessionStatus)
   try
     update s fun r =>
       if r.status.isTerminal then r
+      -- Dormant is not an ending, so it does not get stamped with one. The record keeps its
+      -- `endedAt` empty because the conversation has not ended; only the process has.
+      else if status == .dormant then { r with status := .dormant, error := why }
       else { r with status, endedAt := some now, error := why }
   catch _ => pure ()
 
@@ -273,43 +276,27 @@ private def find (mgr : Manager) (id : String) : IO (Option LiveSession) := do
   let ss ← mgr.sessions.atomically get
   return ss.find? (·.id == id)
 
-/-- Start a session: acquire everything it will hold, launch the agent, and register it.
+/-- Acquire everything a session needs and put it in the table, for a record `prepare` has just
+    written to disk.
 
-    The prologue is `Main.interactiveHandler`'s, moved where a later HTTP request can reach what
-    it built. Every failure past the slot reservation goes through `teardown`, so a session that
-    could not start leaves nothing behind but a record saying why. -/
-def Manager.start (mgr : Manager) (appConfig : AppConfig) (spec : SessionSpec)
-    (debug : Bool := false) : IO (Except String SessionRecord) := do
-  let backendName := spec.backend.getD "claude"
-  let agentDef := TaskRunner.agentDefOfBackend (some backendName)
-  -- Checked before anything is acquired, and said plainly. The alternative — falling back to the
-  -- one-shot invocation — hands back a process that answers the first turn and exits, which to
-  -- everyone watching looks like a session that ended on its own.
-  if (agentDef.buildStreamArgs { mcpContext := "" }).isNone then
-    return .error s!"backend '{backendName}' cannot host an interactive session: its CLI has no \
-streaming input mode. Backends that can: claude."
-  let held ← mgr.sessions.atomically do
-    let live ← get
-    let starting ← mgr.starting.get
-    let held := live.size + starting
-    if held < mgr.cfg.maxSessions then mgr.starting.set (starting + 1)
-    return held
-  if held ≥ mgr.cfg.maxSessions then
-    return .error s!"the daemon is already holding {held} interactive \
-session{if held == 1 then "" else "s"}, which is its limit; end one first"
-  let some slot ← mgr.reserveSlot spec.fork
-    | return .error s!"no free clone slot for {spec.fork}: every one is in use by a running task \
-or another session"
-  -- The slot is held from here, so from here everything is inside the handler that gives it
-  -- back. An earlier version opened its `try` several statements later, and every one of those
-  -- statements could throw — minting an id, reading the clock, reading the session being
-  -- resumed, opening `/dev/urandom`, writing the record. A throw there escaped `start`
-  -- entirely, the socket handler logged it and closed the connection without a reply, and the
-  -- slot stayed in `activeSlots` with nothing holding it: no `LiveSession`, so nothing the
-  -- reaper could ever find. With `parallel_per_repo: 1` that repository was finished for the
-  -- life of the daemon.
-  --
-  -- `shutdownRef` is how the MCP server joins the same guarantee. It is empty until
+    Shared by starting a new session and waking a dormant one, which differ only in where the
+    record comes from and which agent-side conversation is resumed. The caller has already
+    checked the backend, counted the session against the cap and reserved `record.slot`; from
+    here on the slot is held, so from here on everything is inside the handler that gives it
+    back — including `prepare`, which reads a clock, `/dev/urandom` and the session store, any
+    of which can throw. An earlier version opened its `try` after the record was written, and a
+    throw there escaped `start` entirely: the socket handler logged it and closed the connection
+    without a reply, and the slot stayed in `activeSlots` with nothing holding it — no
+    `LiveSession`, so nothing the reaper could ever find. With `parallel_per_repo: 1` that
+    repository was finished for the life of the daemon.
+
+    `prepare` answers the record it saved, the agent-side session to resume (`none` to start a
+    fresh one), and the slot occupant whose working tree may be kept. -/
+private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repository)
+    (slot : Nat) (agentDef : AgentDef) (debug : Bool) (onFailure : SessionStatus)
+    (prepare : IO (SessionRecord × Option String × Option String))
+    : IO (Except String SessionRecord) := do
+  -- `shutdownRef` is how the MCP server joins the slot's guarantee. It is empty until
   -- `Server.start` succeeds and holds that server's own shutdown afterwards, so the handler
   -- below closes it on every failing path rather than only the two that were remembered by
   -- hand — a leaked MCP server is a loopback port still serving `create_pr`, `merge_pr` and
@@ -320,7 +307,7 @@ or another session"
     mgr.sessions.atomically <| mgr.starting.modify fun n => if n > 0 then n - 1 else 0
   let release : IO Unit := do
     if let some shut ← shutdownRef.get then try shut catch _ => pure ()
-    try mgr.releaseSlot spec.fork slot catch _ => pure ()
+    try mgr.releaseSlot fork slot catch _ => pure ()
   let fail (raw : String) : IO (Except String SessionRecord) := do
     release
     dropStarting
@@ -331,7 +318,14 @@ or another session"
     -- Only stamp a record if one was written; before that there is nothing on disk to stamp.
     if let some record ← recordRef.get then
       let now ← TaskStore.currentIso8601
-      let r := { record with status := .failed, endedAt := some now, error := some msg }
+      -- Where a session lands when it could not be brought up. A *start* that fails has failed:
+      -- there is no conversation yet, and the record exists only to say what went wrong. A
+      -- *wake* that fails has not — the transcript is intact and the daemon's GitHub App being
+      -- misconfigured for a minute is no reason to throw away what was said — so it goes back
+      -- to sleep and the next turn tries again.
+      let r :=
+        if onFailure == .dormant then { record with status := .dormant, error := some msg }
+        else { record with status := .failed, endedAt := some now, error := some msg }
       -- The seq continues from wherever the transcript got to. The pump may have written the
       -- `init` event already, and reusing seq 1 would put two events at one cursor position.
       let seq := r.lastEventSeq + 1
@@ -339,28 +333,13 @@ or another session"
       saveSession { r with lastEventSeq := seq }
     return .error msg
   try
-    let id ← TaskStore.generateId
-    let now ← TaskStore.currentIso8601
-    -- Resuming inherits the agent-side history of the session named, not the session itself.
-    let resumed ← match spec.resumeFrom with
-      | none     => pure none
-      | some old => loadSession old
-    let record : SessionRecord := {
-      id, createdAt := now, lastActivityAt := now
-      upstream := spec.upstream, fork := spec.fork
-      backend := backendName, model := spec.model
-      budget := spec.budget.getD 20.0
-      slot
-      agentSessionId := ← newUuid
-      resumedFrom := spec.resumeFrom
-    }
-    saveSession record
+    let (record, resumeAgentSession, resumeSlotOf) ← prepare
     recordRef.set (some record)
-    let resumeAgentSession := resumed.bind (·.agentSessionId)
+    let backendName := record.backend
     let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
     let installationId ← match appConfig.installationId with
       | some i => pure i
-      | none   => GitHub.getInstallationId jwt spec.fork.owner
+      | none   => GitHub.getInstallationId jwt fork.owner
     -- Deliberately no `GitHub.setupGhAuth`: that writes the token into
     -- `~/.config/gh/hosts.yml`, which every concurrently running task in this daemon shares.
     -- `TaskRunner` avoids it for the same reason, and it is not needed — the token reaches the
@@ -368,18 +347,17 @@ or another session"
     -- doing it would silently re-point every other `gh` call in the process at its own
     -- installation, and leave the token on disk afterwards.
     let token ← GitHub.createInstallationToken jwt installationId
-    -- `resumeFrom` on the assignment is what keeps the predecessor's working tree instead of
-    -- resetting it, and it is checked against the slot's recorded occupant, so asking for it is
-    -- safe even when the tree has since been taken. Without it a resumed session restored the
-    -- conversation onto a wiped tree: the agent opens with a context full of edits it made and
-    -- a checkout where none of them exist — the exact hazard the slot-pinning design exists to
-    -- avoid, reintroduced at the one moment it matters most.
-    let resumeSlotOf := resumed.filter (·.slot == slot) |>.map (·.id)
-    let repoPath ← Repo.ensureSlot spec.fork spec.upstream
-      { slot, occupant := some id, resumeFrom := resumeSlotOf } (token := some token)
+    -- `resumeFrom` on the assignment is what keeps a working tree instead of resetting it, and
+    -- it is checked against the slot's recorded occupant, so asking for it is safe even when the
+    -- tree has since been taken. Without it a resumed conversation was restored onto a wiped
+    -- tree: the agent opens with a context full of edits it made and a checkout where none of
+    -- them exist — the exact hazard the slot-pinning design exists to avoid, reintroduced at the
+    -- one moment it matters most.
+    let repoPath ← Repo.ensureSlot fork record.upstream
+      { slot, occupant := some record.id, resumeFrom := resumeSlotOf } (token := some token)
     let (port, shutdownMcp) ← Server.start {
-      repo := some { upstream := spec.upstream, fork := spec.fork }
-      allowedTools := spec.tools.getD allOptionalTools
+      repo := some { upstream := record.upstream, fork }
+      allowedTools := record.tools.getD allOptionalTools
       appId := appConfig.appId, privateKeyPath := appConfig.privateKeyPath
       installationId := some installationId, pat := appConfig.pat
       agentBackend := backendName
@@ -387,7 +365,7 @@ or another session"
     shutdownRef.set (some shutdownMcp)
     -- A session goes through the same resolver as a queued run, so an account the daemon has
     -- already found to be out of quota is not handed to a person either.
-    let authLabel ← match ← Usage.resolveLabel appConfig backendName [] none none spec.model with
+    let authLabel ← match ← Usage.resolveLabel appConfig backendName [] none none record.model with
       | .ok label => pure label
       | .error e  => return ← fail s!"no usable authentication source for '{backendName}': {e}"
     if let some l := authLabel then Usage.markUsed backendName l
@@ -406,7 +384,7 @@ or another session"
     let onEvent (e : Event) : IO Unit := do
       if let some s ← liveRef.get then onAgentEvent s e
     let some stream ← Sandbox.launchStreaming agentDef repoPath port token
-        { mcpContext := "", model := spec.model, systemPrompt := spec.systemPrompt,
+        { mcpContext := "", model := record.model, systemPrompt := record.systemPrompt,
           resume := resumeAgentSession, sessionId := record.agentSessionId,
           budget := record.budget }
         onEvent (debug := debug)
@@ -414,7 +392,7 @@ or another session"
         (extraPorts := extraPorts) (additionalPaths := appConfig.additionalSandboxPaths)
       | return ← fail s!"backend '{backendName}' cannot host an interactive session"
     let session : LiveSession := {
-      id, fork := spec.fork, slot, record := recordRef, lock, stream, shutdownMcp
+      id := record.id, fork, slot, record := recordRef, lock, stream, shutdownMcp
       authLabel, backend := backendName
     }
     liveRef.set (some session)
@@ -429,7 +407,96 @@ or another session"
     catch _ => pure ()
     return .ok (← session.record.get)
   catch e =>
-    fail s!"could not start the session: {e}"
+    fail s!"could not bring the session up: {e}"
+
+/-- Take a place under the session cap, or say why there is none. -/
+private def Manager.claimPlace (mgr : Manager) : IO (Option String) := do
+  let held ← mgr.sessions.atomically do
+    let live ← get
+    let starting ← mgr.starting.get
+    let held := live.size + starting
+    if held < mgr.cfg.maxSessions then mgr.starting.set (starting + 1)
+    return held
+  if held ≥ mgr.cfg.maxSessions then
+    return some s!"the daemon is already holding {held} interactive \
+session{if held == 1 then "" else "s"}, which is its limit; end one first"
+  return none
+
+/-- Start a session: acquire everything it will hold, launch the agent, and register it.
+
+    The prologue is `Main.interactiveHandler`'s, moved where a later HTTP request can reach what
+    it built. -/
+def Manager.start (mgr : Manager) (appConfig : AppConfig) (spec : SessionSpec)
+    (debug : Bool := false) : IO (Except String SessionRecord) := do
+  let backendName := spec.backend.getD "claude"
+  let agentDef := TaskRunner.agentDefOfBackend (some backendName)
+  -- Checked before anything is acquired, and said plainly. The alternative — falling back to the
+  -- one-shot invocation — hands back a process that answers the first turn and exits, which to
+  -- everyone watching looks like a session that ended on its own.
+  if (agentDef.buildStreamArgs { mcpContext := "" }).isNone then
+    return .error s!"backend '{backendName}' cannot host an interactive session: its CLI has no \
+streaming input mode. Backends that can: claude."
+  if let some why ← mgr.claimPlace then return .error why
+  let some slot ← mgr.reserveSlot spec.fork
+    | do
+        mgr.sessions.atomically <| mgr.starting.modify fun n => if n > 0 then n - 1 else 0
+        return .error s!"no free clone slot for {spec.fork}: every one is in use by a running \
+task or another session"
+  mgr.acquire appConfig spec.fork slot agentDef debug .failed do
+    let id ← TaskStore.generateId
+    let now ← TaskStore.currentIso8601
+    -- Resuming inherits the agent-side history of the session named, not the session itself.
+    let resumed ← match spec.resumeFrom with
+      | none     => pure none
+      | some old => loadSession old
+    let record : SessionRecord := {
+      id, createdAt := now, lastActivityAt := now
+      upstream := spec.upstream, fork := spec.fork
+      backend := backendName, model := spec.model
+      budget := spec.budget.getD 20.0
+      slot
+      agentSessionId := ← newUuid
+      resumedFrom := spec.resumeFrom
+      tools := spec.tools, systemPrompt := spec.systemPrompt
+    }
+    saveSession record
+    return (record, resumed.bind (·.agentSessionId),
+            resumed.filter (·.slot == slot) |>.map (·.id))
+
+/-- Bring a dormant session back up, resuming the conversation it was having.
+
+    Same id, same transcript, same record — only the process, the clone slot and the MCP server
+    are new, which is the whole point: they are what a session should not hold while nobody is
+    talking to it, and the conversation is not one of them. -/
+def Manager.wake (mgr : Manager) (appConfig : AppConfig) (id : String) (debug : Bool := false)
+    : IO (Except String SessionRecord) := do
+  let some record ← loadSession id | return .error "no such session"
+  unless record.status == .dormant do
+    return .error "this session is not dormant"
+  let agentDef := TaskRunner.agentDefOfBackend (some record.backend)
+  if (agentDef.buildStreamArgs { mcpContext := "" }).isNone then
+    return .error s!"backend '{record.backend}' cannot host an interactive session"
+  if let some why ← mgr.claimPlace then return .error why
+  let some slot ← mgr.reserveSlot record.fork
+    | do
+        mgr.sessions.atomically <| mgr.starting.modify fun n => if n > 0 then n - 1 else 0
+        return .error s!"no free clone slot for {record.fork}: every one is in use by a running \
+task or another session"
+  mgr.acquire appConfig record.fork slot agentDef debug .dormant do
+    let now ← TaskStore.currentIso8601
+    let seq := record.lastEventSeq + 1
+    appendEvent record.id seq now (.notice "info" "waking the session up")
+    let woken := { record with
+      status := .starting, slot, lastActivityAt := now, lastEventSeq := seq, error := none }
+    saveSession woken
+    -- Nothing was ever said, so there is nothing to resume: the agent gets `--session-id` and
+    -- starts the conversation the record has been holding a name for. Asking a CLI to `--resume`
+    -- a session it never created is an error, and a session that died during its own start-up
+    -- is exactly the record that names one.
+    let resumeAgentSession := if record.turnCount > 0 then record.agentSessionId else none
+    -- The tree this session left behind, if the slot it left it in is the one just handed back.
+    let resumeSlotOf := if slot == record.slot then some record.id else none
+    return (woken, resumeAgentSession, resumeSlotOf)
 
 /-! ## Talking to one -/
 
@@ -469,6 +536,10 @@ private def gone (id : String) : IO String := do
   | some r =>
     if r.status.isTerminal then
       return s!"this session has {if r.status == .failed then "failed" else "ended"}"
+    -- Dormant reaches here from `interrupt`, which cannot wake anything: there is no turn in
+    -- flight to abandon, and starting an agent in order to stop it is not what was asked for.
+    else if r.status == .dormant then
+      return "this session is asleep; say something to wake it"
     else return "no such session"
   | none => return "no such session"
 
@@ -477,8 +548,26 @@ private def gone (id : String) : IO String := do
     Refused rather than queued when a turn is already running: the agent would take the second
     line as soon as it finished the first, and a person who typed twice would get two answers in
     an order nobody chose. -/
-def Manager.send (mgr : Manager) (id : String) (text : String) : IO (Except String Nat) := do
-  let some s ← find mgr id | return .error (← gone id)
+def Manager.send (mgr : Manager) (appConfig : AppConfig) (id : String) (text : String)
+    (debug : Bool := false) : IO (Except String Nat) := do
+  -- A turn posted to a session the daemon is not holding is not necessarily a mistake. A session
+  -- whose process was put down for being idle, or whose daemon restarted under it, is dormant:
+  -- the conversation is on disk and nothing is running. Posting to one is how you pick it up —
+  -- the wake happens here rather than as a thing the caller has to know to ask for, because
+  -- "say something to this session" is the same request whether or not an agent happens to be
+  -- up, and every client would otherwise have to implement the same two-step by hand.
+  let s ← match ← find mgr id with
+    | some s => pure s
+    | none =>
+      match (← loadSession id).map (fun r => r.status) with
+      | some SessionStatus.dormant =>
+        match ← mgr.wake appConfig id debug with
+        | .error e => return .error s!"the session could not be woken: {e}"
+        | .ok _ =>
+          match ← find mgr id with
+          | some s => pure s
+          | none   => return .error "the session was woken but is not holding"
+      | _ => return .error (← gone id)
   if (← s.stream.hasExited) then
     -- Not the agent's stderr: it is unbounded output from a process holding a GitHub token, and
     -- this string is on its way to an HTTP client. The transcript carries the detail.
@@ -517,11 +606,23 @@ def Manager.interrupt (mgr : Manager) (id : String) : IO (Except String Unit) :=
 /-- End a session and release everything it holds. -/
 def Manager.close (mgr : Manager) (id : String) : IO (Except String Unit) := do
   let some s ← find mgr id | do
-    -- A session the daemon is not holding but that exists on disk is one a restart already
-    -- closed. Ending it again is not a failure; it is a request that no longer applies.
     match ← loadSession id with
-    | some r => return if r.status.isTerminal then .ok () else .error "no such session"
-    | none   => return .error "no such session"
+    -- Already over: ending it again is not a failure, it is a request that no longer applies.
+    | some r =>
+      if r.status.isTerminal then return .ok ()
+      -- Dormant. Nothing is running, so there is nothing to shut down — but the caller is
+      -- asking for the conversation to be over, and only an explicit end says that. This is
+      -- what makes "closed" and "put down for being idle" different states rather than the
+      -- same one reached two ways.
+      else if r.status == .dormant then
+        let now ← TaskStore.currentIso8601
+        let seq := r.lastEventSeq + 1
+        appendEvent id seq now (.notice "info" "the session was closed")
+        saveSession { r with
+          status := .ended, endedAt := some now, lastEventSeq := seq, lastActivityAt := now }
+        return .ok ()
+      else return .error "no such session"
+    | none => return .error "no such session"
   let _ ← append s (.notice "info" "the session was closed")
   teardown mgr s .ended none
   return .ok ()
@@ -556,9 +657,14 @@ def Manager.reap (mgr : Manager) : IO Unit := do
     if r.status == .running then continue
     let idleFor ← secondsSince r.lastActivityAt
     if idleFor ≥ mgr.cfg.idleTimeoutSeconds then
+      -- Put down, not ended. What an idle session is wasting is a clone slot, an MCP server and
+      -- an agent process — and a conversation is none of those. The timeout takes the three that
+      -- cost something and leaves the one that does not, so the next turn picks up where this
+      -- one left off instead of finding a session that expired while nobody was looking.
       let _ ← append s (.notice "info"
-        s!"the session was closed after {mgr.cfg.idleTimeoutSeconds}s without a turn")
-      teardown mgr s .ended none
+        s!"no turn for {mgr.cfg.idleTimeoutSeconds}s, so the agent was stopped; say something \
+to pick the conversation up")
+      teardown mgr s .dormant none
 where
   /-- Seconds between an RFC 3339 instant and now.
 
@@ -581,25 +687,29 @@ where
 /-- Close every live session. The daemon's shutdown path. -/
 def Manager.closeAll (mgr : Manager) : IO Unit := do
   for s in ← mgr.sessions.atomically get do
-    let _ ← append s (.notice "info" "the daemon is shutting down")
-    teardown mgr s .ended (some "the daemon shut down")
+    let _ ← append s (.notice "info"
+      "the daemon is shutting down, so the agent was stopped; say something to pick the \
+conversation up")
+    teardown mgr s .dormant none
 
-/-- Close every session on disk that is not already terminal.
+/-- Put every session on disk that is not already terminal to sleep.
 
     Run at start-up, before anything else can read them. The processes those records describe
     died with the last daemon, and a session left reading `running` is a conversation that will
-    never answer — worse than one that says plainly it is over, because a client will sit on its
-    stream waiting. Resuming is offered as a new session; see `SessionSpec.resumeFrom`. -/
+    never answer — worse than one that says what state it is in, because a client will sit on its
+    stream waiting for it. What died is the process, though, not the conversation: the record and
+    the transcript are exactly as they were, so these come back as `dormant` and the next turn
+    posted to one starts an agent and resumes it. A session already dormant is left alone, or
+    every restart would append the same notice to a transcript nobody was adding to. -/
 def reconcile : IO Unit := do
   for r in ← loadAllSessions do
-    unless r.status.isTerminal do
+    unless r.status.isTerminal || r.status == .dormant do
       let now ← TaskStore.currentIso8601
       let seq := r.lastEventSeq + 1
-      appendEvent r.id seq now (.notice "error"
-        "the daemon restarted, so this session's agent is gone; start a new session resuming \
-this one to pick the conversation up")
+      appendEvent r.id seq now (.notice "info"
+        "the daemon restarted, so this session's agent is gone; say something to pick the \
+conversation up")
       saveSession { r with
-        status := .ended, endedAt := some now, lastEventSeq := seq, lastActivityAt := now
-        error := some "the daemon restarted" }
+        status := .dormant, lastEventSeq := seq, lastActivityAt := now, error := none }
 
 end Orchestra.Interactive

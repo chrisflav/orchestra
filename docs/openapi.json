@@ -281,7 +281,7 @@
           "interactive"
         ],
         "summary": "Post a turn",
-        "description": "Sends what the person typed to the agent. Answers the seq the turn was written at, so a client can start reading from exactly there rather than from wherever the transcript happens to be by the time it asks.\n\n`409` when the session is already working on a turn — refused rather than queued, because the agent would take the second line as soon as it finished the first and a person who typed twice would get two answers in an order nobody chose. Interrupt it, or wait. Also `409` when the session has ended, or the daemon is not reachable.",
+        "description": "Sends what the person typed to the agent. Answers the seq the turn was written at, so a client can start reading from exactly there rather than from wherever the transcript happens to be by the time it asks.\n\nA turn posted to a `dormant` session wakes it first — an agent is started and the conversation resumed — so this is also how a session that was put down for being idle, or that outlived a daemon restart, comes back. That first turn takes as long as starting a session does, and is refused if the daemon is already holding as many awake sessions as it may.\n\n`409` when the session is already working on a turn — refused rather than queued, because the agent would take the second line as soon as it finished the first and a person who typed twice would get two answers in an order nobody chose. Interrupt it, or wait. Also `409` when the session has ended, or the daemon is not reachable.",
         "operationId": "postInteractiveTurn",
         "parameters": [
           {
@@ -1272,10 +1272,11 @@
           "starting",
           "idle",
           "running",
+          "dormant",
           "ended",
           "failed"
         ],
-        "description": "Where the session is in its life. `ended` and `failed` are both terminal and mean different things: a session that was closed, reaped, or ran out of budget ended; one whose agent died did not."
+        "description": "Where the session is in its life. `dormant` is not an ending: nothing is running — the agent was stopped for being idle, or the daemon restarted — and the conversation is intact, so posting a turn starts an agent again and resumes it. `ended` and `failed` are the two terminal states and mean different things: a session that was closed or ran out of budget ended; one whose agent died did not."
       },
       "InteractiveSession": {
         "type": "object",

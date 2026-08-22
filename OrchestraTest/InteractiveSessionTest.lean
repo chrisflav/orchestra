@@ -35,7 +35,7 @@ private def sampleRecord (id : String) (status : SessionStatus) : SessionRecord 
 The agent processes died with the last daemon. The records did not. -/
 
 @[test]
-def aRestartClosesEverySessionItCannotStillBeHolding : Test := do
+def aRestartPutsEverySessionToSleepRatherThanEndingIt : Test := do
   let after ← withTempSessions do
     saveSession (sampleRecord "i-starting" .starting)
     saveSession (sampleRecord "i-idle" .idle)
@@ -45,13 +45,47 @@ def aRestartClosesEverySessionItCannotStillBeHolding : Test := do
   TestM.assertEqual after.size 3 (msg := "nothing is deleted — the transcripts are still worth \
 reading")
   for r in after do
+    -- Not terminal, and not `running` either. The processes those records described died with
+    -- the last daemon, so a session left reading `running` is a conversation that will never
+    -- answer and a client that sits on its stream waiting; but the conversation itself survived
+    -- the restart, and closing it would throw away the only thing that did.
+    TestM.assert (r.status == SessionStatus.dormant)
+      (msg := s!"{r.id} still reads {Json.compress (Lean.ToJson.toJson r.status)} after a \
+restart; the agent is gone, so it is dormant")
+    TestM.assert (!r.status.isTerminal)
+      (msg := s!"{r.id} must still be resumable — a restart is not an ending")
+    TestM.assertEqual r.error none
+      (msg := s!"{r.id} has nothing wrong with it; it is asleep")
+    TestM.assert r.endedAt.isNone (msg := s!"{r.id} has not ended, so it has no ending time")
+
+@[test]
+def aRestartLeavesADormantSessionExactlyAsItWas : Test := do
+  -- Reconciliation runs on every start-up, and most restarts find sessions that were already
+  -- put down by the last shutdown. Stamping them again would append a "the daemon restarted"
+  -- notice to a transcript for every restart that happened while nobody was talking.
+  let before := { sampleRecord "i-asleep" .dormant with lastEventSeq := 7 }
+  let after ← withTempSessions do
+    saveSession before
+    reconcile
+    pure (← loadSession "i-asleep")
+  match after with
+  | none   => TestM.fail "the record should still be there"
+  | some r =>
+    TestM.assert (r.status == SessionStatus.dormant) (msg := "still dormant")
+    TestM.assertEqual r.lastEventSeq 7 (msg := "and untouched — no notice was appended")
+
+@[test]
+def endedAndFailedSurviveARestartUnchanged : Test := do
+  let after ← withTempSessions do
+    saveSession { sampleRecord "i-done" .ended with endedAt := some "2026-08-22T00:00:00Z" }
+    saveSession { sampleRecord "i-dead" .failed with error := some "the agent process exited" }
+    reconcile
+    pure (← loadAllSessions)
+  for r in after do
     TestM.assert r.status.isTerminal
-      (msg := s!"{r.id} still reads {Json.compress (Lean.ToJson.toJson r.status)}; a session \
-left alive after a restart is a conversation that will never answer, and a client will sit on \
-its stream waiting for it")
-    TestM.assertEqual r.error (some "the daemon restarted")
-      (msg := s!"{r.id} should say why it ended")
-    TestM.assert r.endedAt.isSome (msg := s!"{r.id} should say when")
+      (msg := s!"{r.id} was over before the restart and is still over")
+  TestM.assertEqual ((after.filter (·.id == "i-dead"))[0]?.bind (·.error))
+    (some "the agent process exited") (msg := "and still says what happened to it")
 
 @[test]
 def aRestartLeavesFinishedSessionsExactlyAsTheyWere : Test := do

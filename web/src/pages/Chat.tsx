@@ -34,6 +34,10 @@ function turnState(session: SessionDetail): {
   switch (session.status) {
     case "idle":
       return { canType: true, canInterrupt: false, note: "" };
+    case "dormant":
+      // A turn is exactly how a dormant session comes back, so the box stays open. The first one
+      // takes as long as a start does, because it is one.
+      return { canType: true, canInterrupt: false, note: "" };
     case "running":
       // Refused rather than queued, and the input says so rather than accepting a turn that
       // would be rejected: the agent would take the second line as soon as it finished the
