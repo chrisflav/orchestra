@@ -228,21 +228,41 @@ function NewSession() {
   const [upstream, setUpstream] = useState("");
   const [fork, setFork] = useState("");
   const [model, setModel] = useState("");
+  const [budget, setBudget] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     if (busy || upstream.trim() === "" || fork.trim() === "") return;
+    const chosen = model.trim();
+    const spend = budget.trim();
+    // Parsed here rather than by `type="number"`, which hands back an empty string for anything
+    // it cannot read: "abour" would leave the box reading what was typed while the request
+    // carried no budget at all, and the session would run on the default with the person
+    // believing they had capped it. The one field whose whole purpose is to bound spending is
+    // the one that must not fail quietly — the same reason `orchestra chat --budget` refuses a
+    // value it cannot parse instead of dropping it.
+    //
+    // Only "is this a positive amount" is checked here. The ceiling is the server's, and asking
+    // it is cheaper than keeping a copy of `maxSessionBudgetUsd` in the browser that can drift.
+    let amount: number | undefined;
+    if (spend !== "") {
+      amount = Number(spend);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        setError(`The budget is an amount in dollars; '${spend}' is not one.`);
+        return;
+      }
+    }
     setBusy(true);
     setError(null);
-    const chosen = model.trim();
     startSession({
       upstream: upstream.trim(),
       fork: fork.trim(),
       // Left out rather than sent empty. Absent means "whatever the backend runs by default",
       // which is a different request from asking it to resolve a model named "".
       ...(chosen === "" ? {} : { model: chosen }),
+      ...(amount === undefined ? {} : { budget: amount }),
     })
       .then((s) => navigate(`/chat/${encodeURIComponent(s.id)}`))
       .catch((err: unknown) => setError(errorText(err)))
@@ -279,6 +299,14 @@ function NewSession() {
             <option key={m} value={m} />
           ))}
         </datalist>
+        <input
+          className="chat-start-budget"
+          inputMode="decimal"
+          value={budget}
+          onChange={(e) => setBudget(e.target.value)}
+          placeholder="budget USD (optional)"
+          aria-label="Budget in USD (optional)"
+        />
         <button type="submit" disabled={busy}>
           {busy ? "Starting…" : "Start"}
         </button>

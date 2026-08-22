@@ -314,6 +314,16 @@ private def maxAfter : Nat := 1000000000
     turn into an unbounded bill. -/
 private def maxSessionBudgetUsd : Float := 100.0
 
+/-- The ceiling as a sentence says it. `toString` on a `Float` writes six decimal places, and
+    "between 0 and 100.000000 USD" is the kind of message that reads as a machine talking to
+    itself — which matters now that the dashboard's own start form can provoke it. -/
+private def maxSessionBudgetLabel : String :=
+  let cents := (maxSessionBudgetUsd * 100.0).round.toUInt64.toNat
+  if cents % 100 == 0 then toString (cents / 100)
+  else
+    let frac := cents % 100
+    s!"{cents / 100}.{if frac < 10 then "0" else ""}{frac}"
+
 private structure Page where
   limit  : Nat
   offset : Nat
@@ -1486,7 +1496,7 @@ private def startInteractive (body : String) : IO WriteResult := do
   -- any one of them may spend.
   if let some budget := j.getObjValAs? Float "budget" |>.toOption then
     if budget ≤ 0.0 || budget > maxSessionBudgetUsd then
-      return .badRequest s!"'budget' must be between 0 and {maxSessionBudgetUsd} USD"
+      return .badRequest s!"'budget' must be more than 0 and at most {maxSessionBudgetLabel} USD"
   -- A blank model is no model. `--model ""` reaches the vendor CLI as an argument it rejects
   -- outright, and it does so only after the clone, the installation token, the MCP server and
   -- the sandbox launch — a session that costs everything and answers nothing. Absent is what

@@ -523,6 +523,16 @@ def Manager.reap (mgr : Manager) : IO Unit := do
       teardown mgr s .failed (some "the agent process exited")
       continue
     let r ← s.record.get
+    -- A session can reach a terminal state without anything having torn it down. Spending the
+    -- budget is the case that does it: the pump sees `error_max_budget_usd`, writes the record
+    -- as `ended` because every further turn would be refused, and stops there. Left in the table
+    -- it keeps the clone slot, the MCP server and the agent process until the idle timeout — a
+    -- slot the queue cannot claim for half an hour after the conversation is provably over, and
+    -- an agent process alive with nothing that will ever speak to it again. `teardown` leaves an
+    -- already-terminal record exactly as it is, so this releases without rewriting what happened.
+    if r.status.isTerminal then
+      teardown mgr s r.status r.error
+      continue
     if r.status == .running then continue
     let idleFor ← secondsSince r.lastActivityAt
     if idleFor ≥ mgr.cfg.idleTimeoutSeconds then

@@ -1338,6 +1338,9 @@ a.row:hover .row-title {
 .chat-start input.chat-start-model {
   flex: 0 1 190px;
 }
+.chat-start input.chat-start-budget {
+  flex: 0 1 205px;
+}
 .chat-compose textarea {
   font-family: var(--ui);
   resize: vertical;

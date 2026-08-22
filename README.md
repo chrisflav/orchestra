@@ -1299,6 +1299,12 @@ orchestra chat --upstream owner/repo --fork your-org/repo --resume-from <id> --m
 
 It inherits the old session's history and is launched with the model it was given.
 
+What a session may spend is chosen the same way, and is the whole conversation's budget rather
+than a turn's: `orchestra chat --budget <usd>`, or the box next to the model on the chat page.
+Left alone it is 20 USD, and the API will not accept more than 100 — a bound on the one route
+that spends money, not a policy about what a session should cost. Running out is not a crash:
+the agent reports it, the session ends saying so, and the transcript is kept.
+
 Only backends whose CLI can read turns from standard input can host a session, which today means
 `claude`. Asking for another is refused when the session is created, in a message naming it —
 never quietly substituted, because a backend that answers the first turn and exits looks exactly
