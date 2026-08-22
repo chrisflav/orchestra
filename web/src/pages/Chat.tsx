@@ -211,9 +211,11 @@ export function Chat() {
  * suggestions for the wrong CLI, which is another reason not to make them a closed set.
  */
 const MODEL_SUGGESTIONS = [
+  "fable",
   "opus",
   "sonnet",
   "haiku",
+  "claude-fable-5",
   "claude-opus-5",
   "claude-opus-4-8",
   "claude-sonnet-5",
@@ -268,7 +270,9 @@ function NewSession() {
           value={model}
           onChange={(e) => setModel(e.target.value)}
           placeholder="model (optional)"
-          aria-label="Model"
+          // The placeholder is not part of the accessible name once `aria-label` is set, and
+          // "optional" is the one thing about this field a listener cannot otherwise tell.
+          aria-label="Model (optional)"
         />
         <datalist id="chat-models">
           {MODEL_SUGGESTIONS.map((m) => (

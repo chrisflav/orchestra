@@ -1287,9 +1287,17 @@ of a turn. `orchestra chat --model <name>` on the command line, and the box besi
 repositories on the dashboard's chat page; leaving it empty runs whatever the backend runs by
 default. The name is passed through to the backend's own CLI untouched, so a family alias
 (`opus`) and a pinned id (`claude-opus-5`) are both fine, and orchestra does not keep a list of
-what is valid — the backend answers that. To carry a conversation to a different model, start a
-new session with `--resume-from <id>` and the model you want: the new session inherits the old
-one's history and is launched with the model it was given.
+what is valid — the backend answers that.
+
+A session's model is fixed once it starts, because the agent process is. To carry a conversation
+to a different one, start a new session that resumes the old — repositories and all, since
+starting a session always takes them:
+
+```sh
+orchestra chat --upstream owner/repo --fork your-org/repo --resume-from <id> --model opus
+```
+
+It inherits the old session's history and is launched with the model it was given.
 
 Only backends whose CLI can read turns from standard input can host a session, which today means
 `claude`. Asking for another is refused when the session is created, in a message naming it —
