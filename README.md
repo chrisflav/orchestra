@@ -70,6 +70,10 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
   validation fails.
 - **Recorded history.** Every run is stored, can be grouped into a named series, and resumed with
   a follow-up prompt.
+- **A native app.** One client for macOS, Windows, Linux, iOS and Android that holds *several*
+  backends at once and switches between them — reading the same API the dashboard reads, over a
+  bearer token kept in the OS keychain. Its own repository:
+  [orchestra-app](https://github.com/chrisflav/orchestra-app) → [native app](#native-app)
 - **Chat sessions the backend holds.** A conversation with an agent, in the same sandbox a task
   gets, reachable over the API from the CLI, the dashboard or a phone — and still running after
   the client that started it goes away → [interactive sessions](#interactive-sessions)
@@ -1215,6 +1219,36 @@ What a write costs: a listener change takes effect on that listener's next tick,
 *added* or *deleted* within fifteen seconds, which is how often the daemon rescans the directory.
 A role change takes effect on the dispatcher's next tick, since roles are read per dispatch. A
 skill change applies to tasks launched after it. Nothing here needs a restart.
+
+## native app
+
+The dashboard is a view of the backend that served it: a browser page and its API are the same
+origin by construction, and the API sends no CORS headers, so a page loaded from anywhere else
+cannot reach it at all. That is fine for one orchestra and wrong for three — a machine at home, a
+box in a datacentre, a container on the company network.
+
+**[orchestra-app](https://github.com/chrisflav/orchestra-app)** is the client for that, and it
+lives in its own repository: it shares no build with this one — orchestra is Lean and Lake, the
+app is npm and cargo — so there is no reason to check the two out together.
+
+It holds a list of backends, talks to whichever one is selected, and switches between them
+without a reload and without logging in again. Everything the dashboard shows, it shows; the one
+write the dashboard has — cancelling a run — it has too, plus a listener's on/off switch; and the
+chat pages are the same [session routes](#interactive-sessions) `orchestra chat` uses, which is
+what makes a conversation started on a laptop readable from a phone. One codebase for five
+platforms — macOS, Windows and Linux on the desktop, Android and iOS on a handset — on Tauri v2,
+with a Rust core holding the network and the OS keychain, because a webview can do neither
+across origins.
+
+It authenticates with the bearer half of the scheme above: the same password, sent as
+`Authorization: Bearer`, never a cookie. Nothing in this repository has to change for it to work,
+and nothing in it is aware of the app.
+
+Two things here are its contract, and a change to either is a change the app has to follow:
+`docs/openapi.json`, which is the document of record for every payload, and the `Json` builders
+in `Orchestra/Dashboard.lean` that emit them. The app keeps its own copy of those types, which
+the split makes load-bearing rather than incidental — its design document says so at more
+length.
 
 ## interactive sessions
 
