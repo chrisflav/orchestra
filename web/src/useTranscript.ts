@@ -24,7 +24,12 @@ export interface LiveTranscript {
  * re-sending the whole thing on every word — and a reconnect resumes from the last seq seen
  * instead of starting over.
  */
-export function useTranscript(id: string): LiveTranscript {
+/**
+ * @param finished the session has reached a terminal state, so the transcript is complete and
+ *   the stream is not coming back. The first page is still read — a finished conversation is
+ *   still worth showing — but nothing subscribes, and a stream that drops is not retried.
+ */
+export function useTranscript(id: string, finished = false): LiveTranscript {
   const [events, setEvents] = useState<TranscriptEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [live, setLive] = useState(false);
@@ -36,6 +41,10 @@ export function useTranscript(id: string): LiveTranscript {
   // The cursor, in a ref rather than in state: it is read by the append below and must be the
   // value as of that moment, not as of the last render.
   const cursor = useRef(0);
+  // In a ref rather than the effect's deps: this flips from false to true partway through a
+  // session's life, and re-running the effect would clear the transcript and start over.
+  const finishedRef = useRef(finished);
+  finishedRef.current = finished;
 
   useEffect(() => {
     let cancelled = false;
@@ -68,7 +77,7 @@ export function useTranscript(id: string): LiveTranscript {
     };
 
     const subscribe = () => {
-      if (cancelled) return;
+      if (cancelled || finishedRef.current) return;
       source = new EventSource(transcriptStreamUrl(id, cursor.current), {
         withCredentials: true,
       });
@@ -87,6 +96,15 @@ export function useTranscript(id: string): LiveTranscript {
       source.onerror = () => {
         if (cancelled) return;
         setLive(false);
+        // The server closes the stream of a finished session on purpose, and `EventSource`
+        // cannot tell that from a connection it should retry — so it retries, every few seconds,
+        // for as long as the tab is open, each attempt costing a full read of the transcript on
+        // the far end. Closing it here is what makes "the conversation is over" an ending rather
+        // than a loop.
+        if (finishedRef.current) {
+          source?.close();
+          return;
+        }
         errorsSinceOpen += 1;
         // `EventSource` reconnects on its own but cannot say *why* it dropped, so a revoked
         // session would reconnect forever. Re-probe over fetch, which can, and route to the

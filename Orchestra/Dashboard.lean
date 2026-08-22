@@ -1895,9 +1895,14 @@ private def sseFrame (payload : String) : String :=
 /-- Refresh interval for SSE pushes, in milliseconds. -/
 private def sseIntervalMs : Std.Time.Millisecond.Offset := 2000
 
-/-- Ticks between keep-alive comments when nothing has changed. At the 2s interval above this
-    is one line every 30s, which is under the idle timeout of every proxy worth naming. -/
-private def sseKeepAliveTicks : Nat := 15
+/-- Ticks between keep-alive comments when nothing has changed — 8s at the 2s interval above.
+
+    Chosen against the server rather than a proxy, for the reason `transcriptKeepAliveTicks`
+    spells out: `Std.Http`'s `lingeringTimeout` closes a connection ten seconds after the last
+    byte moves, whatever a proxy in front of it would have tolerated. At the previous 30s every
+    quiet dashboard stream was cut at ten seconds and rebuilt by `EventSource`, three requests
+    every ten seconds per open tab, for as long as nothing was happening. -/
+private def sseKeepAliveTicks : Nat := 4
 
 /-- Push `kind` into `out` until the client goes away.
 

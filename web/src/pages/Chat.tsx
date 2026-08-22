@@ -90,26 +90,30 @@ function Conversation({ events }: { events: TranscriptEvent[] }) {
     return out;
   }, [events]);
 
-  // One scroll region for the whole conversation rather than one per block, pinned to the
-  // bottom only while the reader is already there — scrolling back to read something must not
-  // be undone by the next turn.
-  const ref = useRef<HTMLDivElement>(null);
+  // The page is the scroll region — there is no box around the conversation and none inside it —
+  // so the thing to keep at the bottom is the window. Only while the reader is already there:
+  // scrolling back to read something must not be undone by the next turn. The margin is
+  // generous because the composer sits below the transcript, and someone at the composer is at
+  // the bottom of the conversation whatever the pixel arithmetic says.
   const pinned = useRef(true);
   useEffect(() => {
-    const el = ref.current;
-    if (el && pinned.current) el.scrollTop = el.scrollHeight;
+    const onScroll = () => {
+      const doc = document.documentElement;
+      pinned.current = doc.scrollHeight - window.scrollY - doc.clientHeight < 120;
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  useEffect(() => {
+    if (pinned.current) window.scrollTo({ top: document.documentElement.scrollHeight });
   }, [blocks]);
-  const onScroll = () => {
-    const el = ref.current;
-    if (el) pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
-  };
 
   if (events.length === 0) {
     return <p className="empty">Nothing said yet. Type a turn below.</p>;
   }
 
   return (
-    <div className="chat-transcript" ref={ref} onScroll={onScroll}>
+    <div className="chat-transcript">
       {blocks.map((block, i) =>
         block.kind === "agent" ? (
           <LogView
@@ -117,7 +121,7 @@ function Conversation({ events }: { events: TranscriptEvent[] }) {
             events={agentEvents(block.events)}
             total={block.events.length}
             truncated={false}
-            autoScroll={false}
+            flow
             // The task log's 4000-character cap is a guard against a runaway command; here the
             // blob is the answer, and cutting it at 4000 is the same "shown partially" the
             // transcript's own layout used to be guilty of. Still bounded, but well past any
@@ -333,11 +337,31 @@ function NewSession() {
   );
 }
 
+/**
+ * The transcript of one session, live while there is anything left to be live about.
+ *
+ * Its own component so that it can be told the session's status. `useTranscript` had no way to
+ * know a conversation was over: the server closes the stream of a finished session deliberately,
+ * `EventSource` treats every close as something to retry, and the page said "Attaching…" over a
+ * transcript that was already complete — for as long as the tab stayed open, at a reconnect
+ * every three seconds, each one costing a full read of the transcript on the server.
+ */
+function Transcript({ session }: { session: SessionDetail }) {
+  const finished = ["ended", "failed"].includes(session.status);
+  const { events, error: streamError, live } = useTranscript(session.id, finished);
+  return (
+    <Section title="Conversation">
+      {streamError !== null && <p className="chat-error">{streamError}</p>}
+      {!live && !finished && streamError === null && <p className="empty">Attaching…</p>}
+      <Conversation events={events} />
+    </Section>
+  );
+}
+
 /** One conversation, and the box to say something into. */
 export function ChatDetail() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
-  const { events, error: streamError, live } = useTranscript(id);
 
   return (
     <LivePage
@@ -371,11 +395,7 @@ export function ChatDetail() {
               { key: "Last activity", value: <Time iso={session.lastActivityAt} /> },
             ]}
           />
-          <Section title="Conversation">
-            {streamError !== null && <p className="chat-error">{streamError}</p>}
-            {!live && streamError === null && <p className="empty">Attaching…</p>}
-            <Conversation events={events} />
-          </Section>
+          <Transcript session={session} />
           <Compose session={session} onEnded={() => navigate("/chat")} />
         </>
       )}

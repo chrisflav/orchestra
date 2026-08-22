@@ -148,25 +148,26 @@ function LogEntry({ event, maxBlob }: { event: LogEvent; maxBlob: number }) {
  * must not be undone by the next frame, so the scroll is only forced when the reader was
  * within a few pixels of the end when the update arrived.
  *
- * `autoScroll` turns both off — the box and the pinning — for a caller that draws several of
- * these inside one scroll region of its own. A chat transcript is that caller: each block would
- * otherwise be its own little scrolling window, and every one of them would read `scrollHeight`
- * on every frame, which forces a synchronous layout per block for a page that has one place it
- * could usefully be pinned to.
+ * `flow` turns all of that off — the panel, the box, and the pinning — for a caller that draws
+ * several of these as part of its own page. A chat transcript is that caller: a conversation is
+ * continuous prose, and every turn arriving as a bordered card with its own scrollbar reads as a
+ * stack of documents rather than as something someone said. It also costs: each block would read
+ * `scrollHeight` on every frame, a synchronous layout per block, for a page that has exactly one
+ * place worth pinning to — the window.
  */
 export function LogView({
   events,
   total,
   truncated,
   empty = "This task has no log file.",
-  autoScroll = true,
+  flow = false,
   maxBlob = MAX_BLOB,
 }: {
   events: LogEvent[];
   total: number;
   truncated: boolean;
-  /** Whether this view scrolls itself. Off for a caller that owns the scroll region. */
-  autoScroll?: boolean;
+  /** Draw as part of the caller's page — no panel, no scroll box, no pinning. */
+  flow?: boolean;
   /** How much of one blob to render before cutting it. See `MAX_BLOB`. */
   maxBlob?: number;
   /** What to say when there is nothing to show. Only the page knows why there isn't. */
@@ -176,10 +177,10 @@ export function LogView({
   const pinned = useRef(true);
 
   useEffect(() => {
-    if (!autoScroll) return;
+    if (flow) return;
     const el = ref.current;
     if (el && pinned.current) el.scrollTop = el.scrollHeight;
-  }, [events, autoScroll]);
+  }, [events, flow]);
 
   if (events.length === 0) {
     return <p className="empty">{empty}</p>;
@@ -191,13 +192,13 @@ export function LogView({
   };
 
   return (
-    <div className="panel">
+    <div className={flow ? "log-plain" : "panel"}>
       {truncated && (
         <div className="caption">
           Showing the last {events.length} of {total} events. The tail follows as the task runs.
         </div>
       )}
-      <div className={autoScroll ? "log" : "log log-flow"} ref={ref} onScroll={onScroll}>
+      <div className={flow ? "log log-flow" : "log"} ref={ref} onScroll={onScroll}>
         {events.map((event, i) => (
           // Log events are append-only and carry no id, so position is a stable key here:
           // index `i` always names the same event for as long as the tail window holds.
