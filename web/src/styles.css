@@ -1410,8 +1410,14 @@ a.row:hover .row-title {
 .chat-transcript > * {
   flex: 0 0 auto;
 }
-/* A log drawn inside someone else's scroll region flows rather than scrolling itself. */
+/* A log drawn inside someone else's scroll region flows rather than scrolling itself — and so
+   do the `pre` blocks inside it, or the conversation still has a 250px window inside its 640px
+   one. The turn's final answer is rendered as a `pre`, so that inner box hid the end of it. */
 .log-flow {
+  max-height: none;
+  overflow-y: visible;
+}
+.log-flow .log-body pre {
   max-height: none;
   overflow-y: visible;
 }
