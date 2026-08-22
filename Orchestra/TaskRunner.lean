@@ -515,6 +515,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       -- claim this task is holding, and a task that returned normally would keep it.
       TaskStore.saveTask { initialRecord with status := .failed }
       throw (IO.userError s!"cannot run the agent: {e}")
+  -- Where the MCP server has to listen for this backend's agents, and the secret they present.
+  -- Loopback and no secret unless the backend runs the agent off this machine.
+  let (mcpBind, mcpToken) ← Exec.mcpBinding execBackend
   -- 4. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
   let (allowedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
@@ -545,8 +548,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     enqueueMerger   := some (enqueueMergerImpl appConfig)
     enqueueReviewer := some enqueueReviewerImpl
     prLabels  := ioTask.prLabels
+    authToken := mcpToken
   }
-  let (port, shutdown) ← Server.start serverState
+  let (port, shutdown) ← Server.start serverState (bindHost := mcpBind)
   IO.println s!"  MCP server on port {port}"
   -- 5. Run init hook and load per-repository config
   RepoConfig.runInitIfNeeded repoPath
@@ -613,6 +617,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
       (additionalPaths := appConfig.additionalSandboxPaths)
       (interactiveAgent := interactiveAgent) (goal := ioTask.goal) (exec := execBackend)
+      (mcpToken := mcpToken)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     lastResultSubtype := result.resultSubtype

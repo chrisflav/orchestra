@@ -1402,6 +1402,12 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let repoPath ← Repo.ensureCloned fork upstream
   IO.println s!"  Repo at {repoPath}"
   let backendName := backend.getD "claude"
+  let execBackend ← match ← Exec.resolve appConfig.execution with
+    | .ok b => pure b
+    | .error e =>
+      IO.eprintln s!"Cannot launch the agent: {e}"
+      return 1
+  let (mcpBind, mcpToken) ← Exec.mcpBinding execBackend
   let serverState : Server.State := {
     upstream, fork
     allowedTools
@@ -1410,8 +1416,9 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     installationId
     pat            := appConfig.pat
     agentBackend   := backendName
+    authToken      := mcpToken
   }
-  let (port, shutdown) ← Server.start serverState
+  let (port, shutdown) ← Server.start serverState (bindHost := mcpBind)
   IO.println s!"  MCP server on port {port}"
   let agentDef := match backend with
     | some "pi"       => AgentDef.pi
@@ -1433,19 +1440,13 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   if let some label := resolved then
     IO.println s!"  Auth source: {label}"
     Usage.markUsed backendName label
-  let execBackend ← match ← Exec.resolve appConfig.execution with
-    | .ok b => pure b
-    | .error e =>
-      IO.eprintln s!"Cannot launch the agent: {e}"
-      shutdown
-      return 1
   IO.println "  Launching agent..."
   let result ← Sandbox.launchAgent agentDef repoPath "" port token
     (debug := debug) (pluginDirs := appConfig.pluginDirs)
     (model := model) (budget := budget)
     (extraEnv := apiKeyEnv) (extraPorts := extraPorts)
     (additionalPaths := appConfig.additionalSandboxPaths)
-    (interactiveAgent := true) (exec := execBackend)
+    (interactiveAgent := true) (exec := execBackend) (mcpToken := mcpToken)
   IO.println s!"  Agent exited with code {result.exitCode}"
   shutdown
   return if result.exitCode == 0 then 0 else 1

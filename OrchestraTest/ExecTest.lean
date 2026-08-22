@@ -147,8 +147,8 @@ def mcpAndHttpsAreOutboundOnly : Test := do
 def theDefaultBackendIsLandrun : Test := do
   let cfg : ExecutionConfig := {}
   TestM.assertEqual cfg.backend "landrun" (msg := "default execution backend")
-  match Orchestra.Exec.ofName? cfg.backend with
-  | some b => TestM.assertEqual b.name "landrun" (msg := "and it resolves to itself")
+  match Orchestra.Exec.factoryOf? cfg.backend with
+  | some f => TestM.assertEqual f.name "landrun" (msg := "and it resolves to itself")
   | none   => TestM.fail "the default backend is not registered"
 
 @[test]
@@ -167,12 +167,13 @@ def executionConfigIsReadFromJson : Test := do
 
 @[test]
 def anUnknownBackendNamesTheOnesThatExist : Test := do
-  match ← Orchestra.Exec.resolve { backend := "kubernetes" } with
+  match ← Orchestra.Exec.resolve { backend := "podman" } with
   | .ok _ => TestM.fail "an unknown backend was accepted"
   | .error e =>
-    TestM.assert (AgentDef.containsCI e "kubernetes") "the error names what was asked for"
-    TestM.assert (AgentDef.containsCI e "landrun" && AgentDef.containsCI e "local")
-      "and lists the backends that do exist"
+    TestM.assert (AgentDef.containsCI e "podman") "the error names what was asked for"
+    TestM.assert (AgentDef.containsCI e "landrun" && AgentDef.containsCI e "local"
+                  && AgentDef.containsCI e "kubernetes")
+      "and lists the backends that do exist, with a line on each"
 
 /-! ## Running something
 

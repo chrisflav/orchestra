@@ -120,11 +120,12 @@ def pi : AgentDef where
   -- with a stdio MCP server pointing at the Orchestra MCP server on the given port.
   -- Saves any existing mcp.json so cleanup can restore it.
   setupMcp mcp _model _systemPrompt := do
+    let (cmd, cmdArgs) := mcp.stdioCommand
     let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
       ("orchestra", Json.mkObj [
         ("transport", .str "stdio"),
-        ("command", .str "nc"),
-        ("args", .arr #[.str mcp.host, .str (toString mcp.port)])
+        ("command", .str cmd),
+        ("args", .arr (cmdArgs.map Json.str))
       ])
     ])]
     match ← IO.getEnv "HOME" with

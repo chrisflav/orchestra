@@ -110,4 +110,11 @@ def backend : Backend where
   describe := describe
   start := start
 
+/-- Reads nothing from `execution.options`: what landrun grants comes from the agent backend and
+    from `additional_sandbox_paths`, both of which predate this and stay where they are. -/
+def factory : BackendFactory where
+  name := "landrun"
+  summary := "Landlock confinement on this machine (the default)"
+  make _ := .ok backend
+
 end Orchestra.Exec.Landrun

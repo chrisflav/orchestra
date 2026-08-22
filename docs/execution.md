@@ -17,7 +17,7 @@ add a backend — a container runtime, a Kubernetes cluster, a machine over SSH.
                     RunSpec ─────────► Exec.Backend ────► Handle
              what the run needs      how it is run     what is running
                                             │
-                                     landrun │ local │ (yours)
+                              landrun │ local │ kubernetes
                         ◄───────────────────┘
                 supervision: stream parsing, logs,
                 cancellation, usage-limit detection
@@ -29,11 +29,11 @@ add a backend — a container runtime, a Kubernetes cluster, a machine over SSH.
 
 `Orchestra/Exec/Spec.lean`. A command, its arguments, a working directory, the paths it may touch,
 the ports it may use, and the environment it starts with. It names no mechanism: landrun renders
-it as Landlock flags, a Kubernetes backend would render the same fields as a pod spec — volume
-mounts, a `NetworkPolicy`, `env` entries — and neither vocabulary leaks into the other.
+it as Landlock flags, the Kubernetes backend renders the same fields as a pod spec — volume
+mounts, a `Secret`, `env` entries — and neither vocabulary leaks into the other.
 
-Two fields are shaped by remote execution rather than by landrun, and are worth reading before
-writing a backend:
+Three fields are shaped by running the agent somewhere else rather than by landrun, and are worth
+reading before writing a backend:
 
 - **`PathGrant.scope`** is `.absolute` or `.home`. A home-scoped grant means "wherever *this
   agent* keeps its state", which is a different directory when the agent runs somewhere else.
@@ -42,6 +42,10 @@ writing a backend:
 - **`envPassthrough`** carries variable *names*, never values. `PATH` and `HOME` mean what they
   mean where the agent runs, and copying this machine's values into a container is how an agent
   ends up with a `PATH` full of binaries that are not there.
+- **`PathGrant.from_`** says who supplies what is at a path: the environment (`/usr`, `/etc`, the
+  agent's own `$HOME` — the image has them) or orchestra (the checkout, plugin directories, memory
+  directories — they exist on the daemon's disk and nowhere else). A backend that runs the agent
+  elsewhere has to carry the second kind there, and carry the writable ones back.
 
 `PathGrant.required` marks a grant the run is expected to break without: the backend's own
 `$HOME` paths, the checkout, `/tmp`. Backends that can only grant paths which exist say so on the
@@ -49,15 +53,22 @@ way out for those, and stay quiet about the rest — `/nix` on a machine without
 
 ### `Exec.Backend` — how it is run
 
-`Orchestra/Exec/Backend.lean`. Five fields:
+`Orchestra/Exec/Backend.lean`. Six fields:
 
 | field | what it does |
 | --- | --- |
 | `name` | what `execution.backend` selects it by |
-| `mcpEndpoint` | where the agent should reach the MCP server started on this machine's loopback |
+| `exposure` | where the MCP server must listen for this backend's agents to reach it |
+| `mcpEndpoint` | rewrites that endpoint into the one the agent can actually reach |
 | `preflight` | one check that this backend can run here, before a task depends on it |
 | `describe` | the run as a command a person can read, for `--debug` |
 | `start` | start the run, return a `Handle` |
+
+`exposure` is the one field a backend cannot get away with leaving at its default if it moves the
+agent. `.loopback` means the server is reachable only from this machine, which is the whole of the
+access control it needs. `.network` binds wider — and mints a one-run token in the same breath
+(`Exec.mcpBinding`), because the server hands out the PAT's authority to whatever can talk to it.
+Neither half can be set without the other.
 
 ### `Handle` — what is running
 
@@ -76,6 +87,9 @@ once, for all backends. That is most of the code, and none of it had to move.
 - **`local`** — a plain child process, with no confinement at all. For machines where Landlock is
   unavailable. It says what it is on every launch, and it means it: an agent under it can read and
   write everything the daemon can, orchestra's own configuration and credentials included.
+- **`kubernetes`** — one pod per run, on a cluster reached through `kubectl`. The agent is off this
+  machine entirely; the checkout travels to it and back. `Orchestra/Exec/Kubernetes.lean`, and
+  [docs/kubernetes.md](kubernetes.md) for running it.
 
 Selected in `config.json`:
 
@@ -93,65 +107,71 @@ configuration type learning about any of them.
 
 ## adding a backend
 
-1. Write `Orchestra/Exec/<Name>.lean` with a `backend : Backend`.
-2. Add it to `Exec.backends` in `Orchestra/Exec.lean`. That is the whole registration: every
+1. Write `Orchestra/Exec/<Name>.lean` with a `factory : BackendFactory` — a name, a one-line
+   summary, and `make`, which builds the backend from `execution.options` or says which key is
+   wrong. A backend that needs no settings ignores the argument.
+2. Add it to `Exec.factories` in `Orchestra/Exec.lean`. That is the whole registration: every
    launch path resolves through `Exec.resolve`.
 3. Give `preflight` a real check. It runs once per task, before the clone and the token, and it is
    what turns "every attempt fails with `could not execute external process`" into one line naming
    what is missing.
 4. Make `describe` reproduce what you actually do. `--debug` is the first thing anyone reaches for
    when an agent cannot see a path.
-5. Test the rendering, not the running. `Landrun.argv` is a pure function from a spec to an
-   argument vector for exactly this reason — see `OrchestraTest/ExecTest.lean`. A wrong grant is a
-   security bug, and finding it should not need a cluster.
+5. Say where the MCP server has to listen (`exposure`) and where the agent should look for it
+   (`mcpEndpoint`). Getting this wrong is the quiet failure: the agent starts, finds no tools, and
+   does the task without them.
+6. Test the rendering, not the running. `Landrun.argv` and `Kubernetes.podManifest` are pure
+   functions from a spec to what gets sent, for exactly this reason — see
+   `OrchestraTest/ExecTest.lean` and `OrchestraTest/KubernetesTest.lean`. A wrong grant is a
+   security bug, and finding it should not need a Landlock kernel or a cluster. What genuinely
+   cannot be tested that way — the shell that runs inside a pod — is written to take its paths as
+   parameters so it can be run against a directory in `/tmp` instead.
 
-## what a Kubernetes backend would look like
+## how the Kubernetes backend uses this
 
-The mapping itself is mechanical:
+The mapping is mechanical, which is the point of the interface:
 
 | `RunSpec` | pod |
 | --- | --- |
-| `command` + `args` | container `command` / `args` |
-| `workdir` | `workingDir`, on the volume the checkout lives in |
-| `grants` | `volumeMounts` (`readOnly` for `.ro`/`.rox`), plus whatever the image already carries |
-| `ports` | a `NetworkPolicy` egress rule per `connect` port |
-| `env` | `env` entries, or a `Secret` for the ones that are credentials |
-| `envPassthrough` | resolved from the *image*, not from the daemon |
-| `stdio := .piped` | `kubectl logs -f` / the pod-log API |
-| `Handle.wait` | watch the pod until `Succeeded`/`Failed`, read the container's exit code |
+| `command` + `args` | the `agent` container's `command`, after a wrapper that waits to be started |
+| `workdir` | `workingDir`, on the volume the checkout is staged into |
+| `grants` marked `.orchestra` | `emptyDir` volumes, filled from the daemon's disk before the agent starts |
+| `grants` marked `.environment` | nothing: `/usr`, `/etc` and the agent's home come from the image |
+| `env` | a per-run `Secret`, referenced with `envFrom` |
+| `envPassthrough` | nothing: `PATH` and `HOME` are resolved in the image, which is why they travel by name |
+| `stdio := .piped` | `kubectl logs -f` for stdout; a tailed file for stderr, since a pod's log merges the two |
+| `Handle.wait` | the agent container's `terminated.exitCode`, then the checkout is copied back |
 | `Handle.kill` | delete the pod |
-| `mcpEndpoint` | the daemon's service address, not loopback |
+| `exposure` | `.network`, so the MCP server binds where a pod can reach it and mints a token |
+| `mcpEndpoint` | rewrites the host to the daemon's cluster address, keeping port and token |
 
-Three things are *not* mechanical, and each is a decision rather than a translation. They are
-listed here because the interface above deliberately does not pretend to have answered them.
+Three things were decisions rather than translations, and they are what the rest of this section is
+about: how the workspace gets there, how the pod reaches the MCP server safely, and how a container
+that has exited can still be copied out of.
 
-**The workspace.** Today `TaskRunner` clones the repository on the daemon's own disk — a *slot*,
-one per concurrent task on a repository (`Repo.ensureSlot`) — and grants the agent that path. A
-pod cannot see it. Either the pod materialises its own checkout (an init container cloning with
-the installation token, which is the natural fit and makes clone slots unnecessary for that
-backend), or the checkout is placed on a volume the pod mounts. The first is cleaner and the
-second is closer to what exists; either way the workspace step needs the same treatment the
-sandbox just got — an interface with the host implementation behind it — before this backend can
-run. It is the largest remaining piece of work.
+**The workspace travels.** The daemon keeps doing everything except running the agent — it clones,
+runs the repository's hooks, and runs the validation script afterwards — so the pod has to start
+from the checkout the daemon prepared and hand it back changed. The alternative, a pod that clones
+for itself, leaves the daemon validating a tree the agent never touched. What travels is exactly
+the grants marked `.orchestra`: the checkout, plugin directories, memory directories. `Provenance`
+exists for this and for nothing else — landrun ignores it entirely.
 
-**Reaching the MCP server.** `Server.start` binds `127.0.0.1` and speaks an unauthenticated
-protocol, which is safe exactly because only a process on this machine can connect. It holds the
-PAT that opens pull requests and posts comments — the token the sandbox exists to keep away from
-the agent — so exposing it to a cluster network is not a matter of changing the bind address. It
-needs a per-task credential the pod is given and the server checks. `Backend.mcpEndpoint` is the
-seam where the address is decided (and `AgentDef.setupMcp` takes a host and port rather than a
-port for the same reason), but the authentication is still to be built.
+**Reaching the MCP server needed authentication, not just an address.** The server holds the PAT
+that opens pull requests and posts comments, and it speaks an unauthenticated line protocol,
+which is safe precisely as long as only this machine can connect. `Exec.Exposure` is how a backend
+says that no longer holds: `.network` makes `Server.start` bind wider *and* makes
+`Exec.mcpBinding` mint a one-run token, so neither can happen without the other. The agent sends
+it as its first line — `nc` has no way to do that, so `McpEndpoint.stdioCommand` wraps it in a
+shell that sends the token and gets out of the way. A connection that presents anything else is
+closed rather than asked again.
 
-**Getting the agent's configuration into the pod.** `AgentDef.setupMcp` writes files on the
-daemon's filesystem — `/tmp/agent-mcp-*.json` for Claude, `~/.pi/agent/mcp.json` for pi — and
-returns a path that lands in the agent's command line. A pod sees none of them. The fix that keeps
-the hook honest is for `setupMcp` to return file *contents* keyed by their destination path, and
-for `RunSpec` to carry them, so that a host backend writes them to disk and a pod backend
-projects them as a `ConfigMap` or `Secret`. That change touches all four agent backends and was
-left out until something needs it.
+**A container that has exited cannot be `exec`ed into**, and the checkout is only worth copying
+once the agent is done. Hence two containers: the agent's, which exits when the agent does — so
+its log stream ends, which is what tells the daemon to collect an exit code — and a `workspace`
+container that stays alive until released, which is what the copy goes through.
 
-Two smaller notes. `AgentDef.parallelSafe` is about a CLI's process-global state on one machine —
-a fixed port, a config file under `$HOME` — and a backend that gives every run its own filesystem
-makes it moot for that backend, which the queue does not know yet. And usage limits, retries,
-validation hooks and the whole result-parsing path are backend-independent by construction: they
-read what the agent said, not where it ran.
+What is still true of every backend: usage limits, retries, validation hooks and the whole
+result-parsing path are backend-independent by construction. They read what the agent said, not
+where it ran. The one place that is not yet true is `AgentDef.parallelSafe`, which is about a CLI's
+process-global state on one machine — a fixed port, a config file under `$HOME` — and which a
+backend that gives every run its own filesystem makes moot without the queue knowing it.

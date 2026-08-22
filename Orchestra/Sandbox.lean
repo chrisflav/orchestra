@@ -113,7 +113,8 @@ def grantsFor (paths additional : SandboxPaths) (repoPath : System.FilePath) (re
   -- which every agent CLI uses for its own scratch files. Both are required: the run cannot do
   -- anything useful without them.
   grants := grants.push
-    { path := repoPath.toString, access := if readOnly then .rox else .rwx, required := true }
+    { path := repoPath.toString, access := if readOnly then .rox else .rwx, required := true
+    , from_ := .orchestra }
   grants := grants.push { path := "/tmp", access := .rw, required := true }
   -- The agent backend's declared needs.
   grants := grants ++ ofList .absolute .rox false paths.rox
@@ -129,9 +130,13 @@ def grantsFor (paths additional : SandboxPaths) (repoPath : System.FilePath) (re
   grants := grants ++ ofList .home     .rox false additional.homeRox
   grants := grants ++ ofList .home     .rw  false additional.homeRw
   grants := grants ++ ofList .home     .rwx false additional.homeRwx
-  -- Plugins are read and run; memories are written back by the agent.
-  grants := grants ++ pluginDirs.map fun p => { path := p, access := .rox : PathGrant }
-  grants := grants ++ memoryDirs.map fun p => { path := p, access := .rw : PathGrant }
+  -- Plugins are read and run; memories are written back by the agent. Both are orchestra's own
+  -- content, like the checkout: they sit on the daemon's disk and in no image, so a backend that
+  -- runs the agent elsewhere has to carry them there — and carry the memories back.
+  grants := grants ++ pluginDirs.map fun p =>
+    { path := p, access := .rox, from_ := .orchestra : PathGrant }
+  grants := grants ++ memoryDirs.map fun p =>
+    { path := p, access := .rw, from_ := .orchestra : PathGrant }
   return grants
 
 /-- The ports an agent run may use: the MCP server it was started for, HTTPS, and whatever the
@@ -216,11 +221,15 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (goal : Option String := none)
     -- How the agent is executed. Defaults to landrun, which is what every caller that has not
     -- read `execution.backend` from the config should get.
-    (exec : Exec.Backend := Exec.Landrun.backend) : IO LaunchResult := do
+    (exec : Exec.Backend := Exec.Landrun.backend)
+    -- Secret the agent must present to the MCP server, when the server had to listen somewhere
+    -- other than loopback for this backend to reach it. Minted with the server by
+    -- `Exec.mcpBinding`; `none` for every loopback run.
+    (mcpToken : Option String := none) : IO LaunchResult := do
   -- Where the agent reaches the MCP server: loopback for a backend that runs it on this machine,
   -- and whatever a remote one says instead. Resolved before `setupMcp`, which writes it into the
   -- agent's config file.
-  let mcp ← exec.mcpEndpoint serverPort
+  let mcp ← exec.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
   let (mcpContext, agentEnv) ← agentDef.setupMcp mcp model systemPrompt
   -- Enforced here rather than where the prompts are built: every backend and every caller
   -- reaches the CLI through this one launch, and the limit is a property of `execve`, not of any

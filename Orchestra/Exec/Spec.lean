@@ -47,6 +47,18 @@ inductive Scope where
   | home
 deriving Repr, BEq, Inhabited, DecidableEq
 
+/-- Who is expected to have put the content at a path there. -/
+inductive Provenance where
+  /-- Whatever the agent runs on supplies it: `/usr`, `/etc`, the toolchain, the agent's own
+      `$HOME`. A backend that runs the agent elsewhere finds these in its image, or does without
+      them, and either way has nothing to carry. -/
+  | environment
+  /-- Orchestra supplies the content: the checkout, plugin directories, memory directories. These
+      exist on the daemon's disk and nowhere else, so a backend that runs the agent elsewhere has
+      to carry them there — and carry the writable ones back, or the work is lost. -/
+  | orchestra
+deriving Repr, BEq, Inhabited, DecidableEq
+
 /-- One path the run may touch, and how. -/
 structure PathGrant where
   /-- The path, interpreted according to `scope`. -/
@@ -55,6 +67,9 @@ structure PathGrant where
   access : Access
   /-- How to read `path`. -/
   scope : Scope := .absolute
+  /-- Who supplies what is at the path. Backends that run the agent on this machine can ignore
+      this; one that runs it elsewhere cannot. -/
+  from_ : Provenance := .environment
   /-- Whether the run is expected to break without this path.
 
       A backend that can only grant paths that exist has to drop the rest, and the two kinds of
@@ -74,7 +89,8 @@ structure Ports where
   bind : Array UInt16 := #[]
 deriving Repr, BEq, Inhabited
 
-/-- Where the agent should reach the MCP server this task started.
+/-- Where the agent should reach the MCP server this task started, and what it must say to be
+    let in.
 
     A port alone was enough while every backend ran the agent on the same machine and loopback was
     the answer by construction. It stops being enough the moment the agent runs anywhere else, and
@@ -86,6 +102,15 @@ structure McpEndpoint where
   host : String
   /-- Port the MCP server was started on. -/
   port : UInt16
+  /-- A one-run secret the client sends as its first line, when the server is listening anywhere
+      but loopback.
+
+      Loopback needs no token: only a process on this machine can connect at all, which is the
+      same thing the sandbox already grants. Off-loopback it is not optional — the server holds
+      the PAT that opens pull requests and posts comments, the one credential the sandbox exists
+      to keep out of the agent's hands, and a listening socket on a cluster network is reachable
+      by everything else on it. `none` means loopback; see `Exposure`. -/
+  token : Option String := none
 deriving Repr, BEq, Inhabited
 
 /-- How the run's standard streams are wired. -/
@@ -140,11 +165,49 @@ def resolve (home : String) (g : PathGrant) : PathGrant :=
 
 end PathGrant
 
+/-- Quote `s` for a shell command line.
+
+    Used both for display — `--debug` output a person can paste — and for the few places a backend
+    genuinely needs a shell, such as a pipeline between two commands. Nothing orchestra spawns
+    directly goes through a shell; `IO.Process.spawn` takes an argv. -/
+def shellEscape (s : String) : String :=
+  if s.any (fun c => c == ' ' || c == '"' || c == '\'' || c == '\\' || c == '$' || c == '`'
+                   || c == '(' || c == ')' || c == '!' || c == '&' || c == '|'
+                   || c == ';' || c == '\n' || c == '\t') then
+    "'" ++ s.replace "'" "'\\''" ++ "'"
+  else s
+
+namespace McpEndpoint
+
+/-- The command an agent's MCP client runs to reach this endpoint over a stdio transport, as
+    `(command, args)`.
+
+    Every agent backend asks for this rather than writing `nc <host> <port>` itself, because the
+    answer stops being `nc` as soon as the endpoint carries a token: the token has to be the first
+    line on the connection, and `nc` has no way to put it there. A shell sends it and then gets
+    out of the way, leaving the same bidirectional pipe the agent expects.
+
+    The token is emitted through `echo` rather than `printf` on purpose: it is written into TOML
+    as well as JSON (`vibe`'s config), and a `\n` escape means one thing in one and another in the
+    other. -/
+def stdioCommand (e : McpEndpoint) : String × Array String :=
+  match e.token with
+  | none   => ("nc", #[e.host, toString e.port])
+  | some t => ("sh", #["-c",
+      "{ echo " ++ shellEscape t ++ "; cat; } | nc " ++ e.host ++ " " ++ toString e.port])
+
+end McpEndpoint
+
 namespace RunSpec
 
 /-- Every grant, with `.home` paths resolved against `home`. -/
 def resolveGrants (home : String) (spec : RunSpec) : RunSpec :=
   { spec with grants := spec.grants.map (PathGrant.resolve home) }
+
+/-- The paths orchestra itself supplies, which a backend running the agent elsewhere has to carry
+    there. -/
+def orchestraGrants (spec : RunSpec) : Array PathGrant :=
+  spec.grants.filter (·.from_ == .orchestra)
 
 end RunSpec
 

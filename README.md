@@ -46,6 +46,9 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
 - **Credentials the agent never sees.** A GitHub App installation token is minted per task and
   handed to `gh` for git transport only. The personal access token used for upstream pull
   requests, reviews and comments stays in the MCP server process.
+- **Agents where you need them.** Every run goes through an execution backend: landrun on this
+  machine by default, or a Kubernetes cluster, one pod per run, with the checkout carried there and
+  back and the MCP server authenticated per run → [kubernetes](docs/kubernetes.md)
 - **Four agent backends** — `claude` (Claude Code), `vibe` (mistral-vibe), `opencode` and `pi` —
   plus two built-in agent-less backends: `merger`, which lands an approved pull request, and
   `triage`, which applies and removes labels deterministically.
@@ -205,8 +208,9 @@ cache directory:
 TCP ports beyond HTTPS and the MCP server are opened per backend, via `extra_ports` on that
 backend's entry in the `agents` array — for a local model server, for instance.
 
-The `execution` block chooses what runs the agent — `landrun` (the default) or `local`, which does
-not confine it at all. See [other execution backends](#other-execution-backends).
+The `execution` block chooses what runs the agent — `landrun` (the default), `local`, which does
+not confine it at all, or `kubernetes`, which runs it in a pod. See
+[other execution backends](#other-execution-backends).
 
 The `queue` block sets how many tasks the daemon runs at once. Both keys default
 to `1`, which is the serial behaviour, and `orchestra queue start --parallel N` /
@@ -592,7 +596,9 @@ What an agent is allowed to do and how that is enforced are two separate things:
 are described once, as a backend-neutral spec, and an *execution backend* renders it. `landrun` is
 the default and the one described above. `local` runs the agent with no confinement at all, for
 machines without Landlock — an agent under it can read and write everything the daemon can,
-orchestra's own credentials included, so it is opt-in and says so on every launch.
+orchestra's own credentials included, so it is opt-in and says so on every launch. `kubernetes`
+runs each agent in a pod of its own on a cluster, with the checkout copied in before the run and
+back out after it → [running agents on a Kubernetes cluster](docs/kubernetes.md)
 
 ```json
 {

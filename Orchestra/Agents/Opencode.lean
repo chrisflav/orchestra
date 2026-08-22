@@ -64,10 +64,11 @@ def opencode : AgentDef where
     extraPorts := [4096]
   }
   setupMcp mcp _ _ := do
+    let (cmd, cmdArgs) := mcp.stdioCommand
     let mcpConfig := Json.mkObj [("mcp", Json.mkObj [
       ("agent", Json.mkObj [
         ("type", .str "local"),
-        ("command", .arr #[.str "nc", .str mcp.host, .str (toString mcp.port)]),
+        ("command", .arr ((#[cmd] ++ cmdArgs).map Json.str)),
         ("enabled", .bool true)
       ])
     ])]

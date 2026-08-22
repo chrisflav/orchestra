@@ -24,10 +24,11 @@ def claude : AgentDef where
     homeRwx := [".elan", ".cache"]
   }
   setupMcp mcp _ _ := do
+    let (cmd, cmdArgs) := mcp.stdioCommand
     let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
       ("agent", Json.mkObj [
-        ("command", .str "nc"),
-        ("args", .arr #[.str mcp.host, .str (toString mcp.port)])
+        ("command", .str cmd),
+        ("args", .arr (cmdArgs.map Json.str))
       ])
     ])]
     let ts ← uniqueToken

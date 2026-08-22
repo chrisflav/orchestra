@@ -1,4 +1,5 @@
 import Orchestra.Exec.Spec
+import Lean.Data.Json
 
 /-!
 # The execution backend interface
@@ -36,6 +37,18 @@ structure Handle where
       logs and for a human trying to find it by hand. -/
   id : String
 
+/-- Where the MCP server has to listen for this backend's agents to reach it.
+
+    This is the backend's answer to a question only it can answer, and the reason it is asked
+    before the server starts: `Server.start` binds what this says, and a task whose agent runs off
+    this machine gets a per-run token minted along with it. -/
+inductive Exposure where
+  /-- The agent runs here, so loopback is reachable and no one else is. No token. -/
+  | loopback
+  /-- The agent runs elsewhere: bind this address, and mint a token the agent must present. -/
+  | network (bindHost : String)
+deriving Repr, BEq, Inhabited
+
 /-- One way of executing agents.
 
     Everything a backend needs to know about the task is in the `RunSpec` it is handed;
@@ -43,14 +56,16 @@ structure Handle where
 structure Backend where
   /-- The name this backend is selected by in `execution.backend`. -/
   name : String
-  /-- Where the agent should reach the MCP server orchestra started on `port` of this machine's
-      loopback.
+  /-- Where the MCP server must listen for this backend's agents. -/
+  exposure : Exposure := .loopback
+  /-- Rewrite the endpoint orchestra would hand the agent — this machine's loopback, plus the
+      token if one was minted — into the one the agent can actually reach.
 
-      The default is that answer unchanged, which is right for any backend that runs the agent
-      here. A backend that runs it elsewhere overrides it — and has to, since the server binds
-      loopback (`Server.start`): moving the agent off this machine means also giving the server an
-      address the agent can reach. See `docs/execution.md`. -/
-  mcpEndpoint : UInt16 → IO McpEndpoint := fun port => pure { host := "127.0.0.1", port }
+      The default is that endpoint unchanged, which is right for any backend that runs the agent
+      here. A backend that runs it elsewhere replaces the host: the agent's MCP client is
+      configured from what this returns, and getting it wrong is silent — the agent starts, finds
+      no tools, and does the task without them. See `docs/execution.md`. -/
+  mcpEndpoint : McpEndpoint → IO McpEndpoint := pure
   /-- Check that this backend can actually run something here, before a task depends on it.
 
       Called once per task, ahead of the clone and the token, so that a machine without `landrun`
@@ -100,16 +115,36 @@ def ofInheritChild
 
 end Handle
 
-/-- Quote `s` for display in a shell command line, so that `--debug` output can be pasted.
+/-- How a backend is built from the `execution.options` object in `config.json`.
 
-    Display only: nothing orchestra runs goes through a shell, and this is not what makes that
-    safe — `IO.Process.spawn` passing an argv is. -/
-def shellEscape (s : String) : String :=
-  if s.any (fun c => c == ' ' || c == '"' || c == '\'' || c == '\\' || c == '$' || c == '`'
-                   || c == '(' || c == ')' || c == '!' || c == '&' || c == '|'
-                   || c == ';' || c == '\n' || c == '\t') then
-    "'" ++ s.replace "'" "'\\''" ++ "'"
-  else s
+    A registry of these rather than of `Backend`s directly, because a backend that runs agents
+    somewhere else needs to be told where: a namespace, an image, an address. Settings that belong
+    to one backend are read by that backend, and a bad one is an `.error` naming the key rather
+    than a launch that fails later for a reason nobody can trace to a config file. -/
+structure BackendFactory where
+  /-- The name this backend is selected by in `execution.backend`. -/
+  name : String
+  /-- One line for the error a person sees when they name a backend that does not exist. -/
+  summary : String
+  /-- Build the backend from `execution.options`. -/
+  make : Lean.Json → Except String Backend
+
+/-- `bytes` random bytes as lowercase hex, for names and secrets that must be unguessable.
+
+    Falls back to the monotonic clock if `/dev/urandom` cannot be read, which keeps a name unique
+    but not unpredictable — fine for a pod name, and the reason a caller minting a credential
+    should care that this is best-effort. -/
+def randomHex (bytes : Nat) : IO String := do
+  let digits := "0123456789abcdef".toList
+  try
+    let h ← IO.FS.Handle.mk "/dev/urandom" .read
+    let bs ← h.read bytes.toUSize
+    let mut out := ""
+    for b in bs.toList do
+      out := out.push digits[b.toNat / 16]! |>.push digits[b.toNat % 16]!
+    if out.isEmpty then throw (IO.userError "no entropy") else return out
+  catch _ =>
+    return toString (← IO.monoNanosNow)
 
 /-- This machine's `$HOME`, or `""` when it is unset.
 

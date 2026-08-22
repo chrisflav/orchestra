@@ -78,12 +78,17 @@ private def vibeExtractSessionId (vibeHome : String) : IO (Option String) := do
 /-- Produce a config.toml for the temp VIBE_HOME by injecting the MCP server and optional
     model override into the user's existing config. -/
 private def vibeConfigToml (mcp : Exec.McpEndpoint) (model : Option String) (base : String) : String :=
+  let (cmd, cmdArgs) := mcp.stdioCommand
+  -- TOML basic strings, so nothing here may contain a quote or a backslash. Nothing does:
+  -- `stdioCommand` builds its shell form out of a host, a port and a hex token, and says why it
+  -- avoids the one escape that would differ between TOML and JSON.
+  let renderedArgs := String.intercalate ", " (cmdArgs.toList.map fun a => "\"" ++ a ++ "\"")
   let mcpEntry :=
     "[[mcp_servers]]\n" ++
     "name = \"agent\"\n" ++
     "transport = \"stdio\"\n" ++
-    "command = \"nc\"\n" ++
-    s!"args = [\"{mcp.host}\", \"{mcp.port}\"]\n"
+    s!"command = \"{cmd}\"\n" ++
+    s!"args = [{renderedArgs}]\n"
   let withMcp := base.replace "mcp_servers = []" mcpEntry
   match model with
   | none => withMcp

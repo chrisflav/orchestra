@@ -58,6 +58,14 @@ structure State where
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
   prLabels : List String := []
+  /-- Secret a client must send as its first line before anything it says is acted on.
+
+      `none` — the default, and what every loopback run uses — means no line is expected and the
+      protocol is exactly what it was. It is set when the agent runs somewhere that had to be let
+      in over a network (see `Exec.Exposure`), because this server hands out the PAT's authority:
+      it opens pull requests, posts comments and merges. Whoever can talk to it can do those
+      things as the person who configured it. -/
+  authToken : Option String := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -776,6 +784,9 @@ or a message is split across multiple receives.
 -/
 private def handleClient (state : State) (client : Socket) : IO Unit := do
   let buf ← IO.mkRef ""
+  -- Authenticated from the start when no token is configured, which is the loopback case and
+  -- every case orchestra had before there were any others.
+  let authed ← IO.mkRef state.authToken.isNone
   repeat do
     let data? ← awaitTcp (← client.recv? 65536)
     match data? with
@@ -788,6 +799,20 @@ private def handleClient (state : State) (client : Socket) : IO Unit := do
       for line in lines.dropLast do
         let trimmed := line.trimAscii.toString
         if trimmed.isEmpty then continue
+        -- The first line a client sends is its token. Nothing else is read from a connection that
+        -- has not sent it, and a wrong one ends the connection rather than being retried: this is
+        -- a secret handed to exactly one agent, so a second guess is not a typo.
+        unless ← authed.get do
+          if some trimmed == state.authToken then
+            authed.set true
+            continue
+          else
+            log "client failed authentication"
+            -- Closed rather than merely abandoned: a client that is never going to be served
+            -- should find that out now, and the only way it learns anything is the connection
+            -- ending. Best-effort — the connection is being dropped either way.
+            try let _ ← awaitTcp (← client.shutdown) catch _ => pure ()
+            return
         match Json.parse trimmed with
         | .error _ => pure ()
         | .ok msg =>
@@ -799,10 +824,33 @@ private def handleClient (state : State) (client : Socket) : IO Unit := do
             | some response =>
               let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
 
-/-- Start the MCP server. Returns (port, shutdown action). -/
-def start (state : State) : IO (UInt16 × IO Unit) := do
+/-- Parse a dotted-quad address. `none` for anything else, including a hostname: this binds a
+    socket, and a name would have to be resolved to do that. -/
+def parseIPv4? (s : String) : Option IPv4Addr :=
+  match s.splitOn "." with
+  | [a, b, c, d] => do
+    let p (x : String) : Option UInt8 := do
+      let n ← x.toNat?
+      if n > 255 then none else some (UInt8.ofNat n)
+    return IPv4Addr.ofParts (← p a) (← p b) (← p c) (← p d)
+  | _ => none
+
+/-- Start the MCP server. Returns (port, shutdown action).
+
+    `bindHost` is loopback unless the execution backend says the agent runs somewhere that cannot
+    reach loopback (`Exec.Backend.exposure`). Binding wider is only ever done together with
+    `State.authToken`; the two are decided in one place, `Exec.mcpBinding`, so that neither can be
+    set without the other. -/
+def start (state : State) (bindHost : String := "127.0.0.1") : IO (UInt16 × IO Unit) := do
   let server ← Socket.new
-  let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := 0 }
+  let bindAddr := match parseIPv4? bindHost with
+    | some a => a
+    | none   =>
+      -- Refusing to start would take the whole task down over a typo in one config key; loopback
+      -- is the safe reading of an address that cannot be parsed.
+      dbg_trace s!"[mcp] cannot parse bind address '{bindHost}', listening on 127.0.0.1 instead"
+      IPv4Addr.ofParts 127 0 0 1
+  let addr := SocketAddress.v4 { addr := bindAddr, port := 0 }
   server.bind addr
   server.listen 8
   let localAddr ← server.getSockName
@@ -823,9 +871,18 @@ def start (state : State) : IO (UInt16 × IO Unit) := do
   let shutdown : IO Unit := do
     running.set false
     try
+      -- Wakes the accept loop so it can notice `running` is false. Loopback reaches a socket
+      -- bound to `0.0.0.0` as readily as one bound to loopback; a socket bound to one specific
+      -- interface is reached at that address instead.
       let dummy ← Socket.new
-      let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port }
-      let _ ← dummy.connect addr
+      let wake := if bindAddr == IPv4Addr.ofParts 0 0 0 0 then IPv4Addr.ofParts 127 0 0 1
+                  else bindAddr
+      let addr := SocketAddress.v4 { addr := wake, port }
+      -- Awaited, not merely started. Dropping the promise leaves the accept loop free to be
+      -- still blocked in `accept` when the socket is collected, and a task blocked there is
+      -- never collected — one per completed task, for the life of the daemon.
+      awaitTcp (← dummy.connect addr)
+      awaitTcp (← dummy.shutdown)
     catch _ => pure ()
   return (port, shutdown)
 

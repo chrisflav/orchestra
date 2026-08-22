@@ -66,4 +66,10 @@ def backend : Backend where
   describe := describe
   start := start
 
+/-- Reads nothing from `execution.options`: there is nothing to configure about doing nothing. -/
+def factory : BackendFactory where
+  name := "local"
+  summary := "an ordinary child process, with no confinement at all"
+  make _ := .ok backend
+
 end Orchestra.Exec.Local
