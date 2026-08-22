@@ -244,13 +244,23 @@ function NewSession() {
     // the one that must not fail quietly — the same reason `orchestra chat --budget` refuses a
     // value it cannot parse instead of dropping it.
     //
-    // Only "is this a positive amount" is checked here. The ceiling is the server's, and asking
-    // it is cheaper than keeping a copy of `maxSessionBudgetUsd` in the browser that can drift.
+    // Matched against the JSON number grammar rather than handed to `Number`, which reads
+    // `0x10` as sixteen and `0b101` as five. A box labelled "budget USD" that quietly charges
+    // $16 for `0x10` is the same class of surprise, and it is a grammar the CLI's own
+    // `--budget` already holds to, so the two clients agree on what an amount is.
+    //
+    // Only the shape and a floor of one cent are checked here — anything smaller reaches the
+    // agent as `0.000000`. The ceiling is the server's, and asking it is cheaper than keeping a
+    // copy of `maxSessionBudgetUsd` in the browser that can drift out of date.
     let amount: number | undefined;
     if (spend !== "") {
+      if (!/^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(spend)) {
+        setError(`The budget is an amount in dollars, like 5 or 12.50; '${spend}' is not one.`);
+        return;
+      }
       amount = Number(spend);
-      if (!Number.isFinite(amount) || amount <= 0) {
-        setError(`The budget is an amount in dollars; '${spend}' is not one.`);
+      if (!Number.isFinite(amount) || amount < 0.01) {
+        setError(`The budget must be at least 0.01 USD; '${spend}' is not.`);
         return;
       }
     }
@@ -311,8 +321,14 @@ function NewSession() {
           {busy ? "Starting…" : "Start"}
         </button>
       </form>
-      {/* The daemon's sentence, verbatim: it is the only thing that knows why it refused. */}
-      {error !== null && <p className="chat-error">{error}</p>}
+      {/* The daemon's sentence, verbatim: it is the only thing that knows why it refused.
+          `role="alert"` because a refusal is the whole outcome of pressing Start, and without it
+          a reader who cannot see the form is told nothing at all. */}
+      {error !== null && (
+        <p className="chat-error" role="alert">
+          {error}
+        </p>
+      )}
     </Section>
   );
 }
@@ -345,7 +361,13 @@ export function ChatDetail() {
               // show that rather than naming a model nobody chose.
               { key: "Model", value: orDash(session.model) },
               { key: "Turns", value: String(session.turnCount) },
-              { key: "Spent", value: `$${session.costUsd.toFixed(4)} of $${session.budget}` },
+              // Both halves to the same precision. `${session.budget}` was fine while every
+              // session had the 20.0 default; now that a budget can be set it reads `$4.5` and
+              // `$3.141593` against a four-decimal spend.
+              {
+                key: "Spent",
+                value: `$${session.costUsd.toFixed(4)} of $${session.budget.toFixed(2)}`,
+              },
               { key: "Last activity", value: <Time iso={session.lastActivityAt} /> },
             ]}
           />

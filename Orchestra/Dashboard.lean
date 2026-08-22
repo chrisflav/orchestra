@@ -314,15 +314,26 @@ private def maxAfter : Nat := 1000000000
     turn into an unbounded bill. -/
 private def maxSessionBudgetUsd : Float := 100.0
 
-/-- The ceiling as a sentence says it. `toString` on a `Float` writes six decimal places, and
-    "between 0 and 100.000000 USD" is the kind of message that reads as a machine talking to
-    itself — which matters now that the dashboard's own start form can provoke it. -/
-private def maxSessionBudgetLabel : String :=
-  let cents := (maxSessionBudgetUsd * 100.0).round.toUInt64.toNat
+/-- An amount of USD as a sentence says it, to the cent.
+
+    `toString` on a `Float` writes six decimal places, and "at most 100.000000 USD" is the kind
+    of message that reads as a machine talking to itself — which matters now that the dashboard's
+    own start form can provoke it.
+
+    Rounded **down**, so a bound rendered through this is always a value the bound itself
+    accepts. To nearest it would not be: `2.675 * 100.0` is `267.4999…` in binary, which rounds
+    to `268`, and a caller who then sends `2.68` would be refused by the very message that told
+    them `2.68` was allowed. Negatives and anything past `UInt64` are not amounts of money and
+    come back as `0`, which is what `Float.toUInt64` saturates them to anyway. -/
+def usdLabel (usd : Float) : String :=
+  let cents := (usd * 100.0).floor.toUInt64.toNat
   if cents % 100 == 0 then toString (cents / 100)
   else
     let frac := cents % 100
     s!"{cents / 100}.{if frac < 10 then "0" else ""}{frac}"
+
+/-- The session budget ceiling, as a sentence says it. -/
+private def maxSessionBudgetLabel : String := usdLabel maxSessionBudgetUsd
 
 private structure Page where
   limit  : Nat
@@ -1494,9 +1505,28 @@ private def startInteractive (body : String) : IO WriteResult := do
   -- about caps — `maxLimit`, `maxLogLimit`, `maxWindowCount` — precisely so one request cannot
   -- become an unbounded cost, and `max_sessions` bounds how many sessions there are, never what
   -- any one of them may spend.
-  if let some budget := j.getObjValAs? Float "budget" |>.toOption then
-    if budget ≤ 0.0 || budget > maxSessionBudgetUsd then
-      return .badRequest s!"'budget' must be more than 0 and at most {maxSessionBudgetLabel} USD"
+  --
+  -- Matched on the value present rather than on `getObjValAs? Float`, whose failure is
+  -- indistinguishable from an absent key once it is an `Option`. `{"budget": "1000"}` — which
+  -- is what a shell script interpolating a variable into JSON sends — was neither rejected nor
+  -- honoured: the check was skipped, the daemon's own read failed the same way, and the session
+  -- ran on the default while the caller believed it was capped. The one field whose purpose is
+  -- to bound spending is the one that must not fail quietly, on this side of the wire too.
+  match j.getObjVal? "budget" |>.toOption with
+  | none | some Json.null => pure ()
+  | some v =>
+    match v.getNum? |>.toOption with
+    | none => return .badRequest "'budget' must be a number of USD"
+    | some n =>
+      let budget := n.toFloat
+      -- A floor as well as a ceiling. `--max-budget-usd` reaches the agent through
+      -- `Float.toString`, which writes six decimals, so anything under a microdollar arrives as
+      -- `0.000000` — a session that clones a repository, mints a token, starts an MCP server and
+      -- launches a sandbox in order to refuse its first turn. A cent is the smallest amount that
+      -- means anything.
+      if budget < 0.01 || budget > maxSessionBudgetUsd then
+        return .badRequest
+          s!"'budget' must be at least 0.01 and at most {maxSessionBudgetLabel} USD"
   -- A blank model is no model. `--model ""` reaches the vendor CLI as an argument it rejects
   -- outright, and it does so only after the clone, the installation token, the MCP server and
   -- the sandbox launch — a session that costs everything and answers nothing. Absent is what
