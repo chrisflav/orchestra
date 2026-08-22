@@ -363,30 +363,51 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
   | "update_issue" =>
     some <| do
       let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
-      let title  := args.getObjValAs? String "title"       |>.toOption
-      let descr  := args.getObjValAs? String "description" |>.toOption
-      let status :=
-        match args.getObjValAs? String "status" |>.toOption with
-        | none => none
-        | some s => issueStatusOfString? s
-      let target ← parseTarget? args
-      let dependencies := args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" |>.toOption
-      -- An absent list means "leave this alone"; a *malformed* one is an error rather than the
-      -- same thing. Swallowing it would turn `labels_add: "auto-work-opus"` — an array field
-      -- given a bare string, the likeliest way to get this wrong — into a call that reports
-      -- success and routes nothing, which is exactly the silent failure closed labels exist to
-      -- prevent.
-      let names (field : String) : Except String (List String) :=
+      -- Every optional field here distinguishes *absent* from *malformed*. Absent means "leave
+      -- this alone" and is the ordinary case — a retitle names one field and omits six. Malformed
+      -- is a mistake, and reading it as absent is how `labels_add: "auto-work-opus"` (an array
+      -- field given a bare string, the likeliest way to get this wrong) or `status: "done"` used
+      -- to become a call that reported success and changed nothing, which is exactly the silent
+      -- failure a closed label vocabulary exists to prevent.
+      let present (field : String) : Bool :=
         match args.getObjVal? field with
-        | .error _   => .ok []
-        | .ok .null  => .ok []
-        | .ok _      =>
-          match args.getObjValAs? (Array String) field with
-          | .ok a    => .ok a.toList
+        | .error _  => false   -- no such key
+        | .ok .null => false   -- explicit null: how a client spells "not set"
+        | .ok _     => true
+      let str (field : String) : Except String (Option String) :=
+        if !present field then .ok none
+        else match args.getObjValAs? String field with
+          | .ok v    => .ok (some v)
+          | .error e => .error s!"{field} must be a string: {e}"
+      let title ← str "title"
+      let descr ← str "description"
+      let status ← do
+        match ← str "status" with
+        | none   => pure none
+        | some s =>
+          match issueStatusOfString? s with
+          | some st => pure (some st)
+          | none    =>
+            Except.error s!"status must be open, claimed, completed or abandoned, got {repr s}"
+      let target ← parseTarget? args
+      let dependencies ←
+        if !present "dependency_ids" then pure none
+        else match args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" with
+          | .ok v    => pure (some v)
+          | .error e => Except.error s!"dependency_ids must be an array of issue ids: {e}"
+      -- Names are trimmed, and a blank one is refused rather than passed down to be reported as
+      -- `no such label: `. `label_issue` already draws the line here on the GitHub side.
+      let names (field : String) : Except String (List String) :=
+        if !present field then .ok []
+        else match args.getObjValAs? (Array String) field with
           | .error e => .error s!"{field} must be an array of names: {e}"
-      let labelsAdd      ← names "labels_add"
-      let labelsRemove   ← names "labels_remove"
-      let assigneesAdd   ← names "assignees_add"
+          | .ok a    =>
+            let trimmed := (a.map (·.trimAscii.toString)).toList
+            if trimmed.any (·.isEmpty) then .error s!"{field} contains an empty name"
+            else .ok trimmed
+      let labelsAdd       ← names "labels_add"
+      let labelsRemove    ← names "labels_remove"
+      let assigneesAdd    ← names "assignees_add"
       let assigneesRemove ← names "assignees_remove"
       return .updateIssue iid title descr status target dependencies
         labelsAdd labelsRemove assigneesAdd assigneesRemove
@@ -669,18 +690,21 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       -- Each half is refused on its own, and a refusal carries whatever already landed with it.
       -- An unknown label leaves the title change standing, and an agent told only "no such label"
       -- would reasonably retry the call that made it.
-      let failure (e : IO.Error) : Json :=
-        content (joinLines (done ++ #[toString e])) (isError := true)
+      -- `soFar` is a parameter and not a capture of `done`: a closure in a `do` block takes the
+      -- value the variable had where the closure was written, so one reading `done` directly
+      -- would report the state before the label write and lose the very line this exists to keep.
+      let failure (soFar : Array String) (e : IO.Error) : Json :=
+        content (joinLines (soFar ++ #[toString e])) (isError := true)
       unless labelsAdd.isEmpty && labelsRemove.isEmpty do
         try
           let change ← setIssueLabels iid labelsAdd labelsRemove
           done := done.push s!"labels: {change.summary iid.toString}"
-        catch e => return failure e
+        catch e => return failure done e
       unless assigneesAdd.isEmpty && assigneesRemove.isEmpty do
         try
           let change ← setIssueAssignees iid assigneesAdd assigneesRemove
           done := done.push s!"assignees: {change.summary iid.toString}"
-        catch e => return failure e
+        catch e => return failure done e
       if done.isEmpty then
         return content s!"issue {iid.toString}: nothing to change — no field, label or assignee \
           was named"

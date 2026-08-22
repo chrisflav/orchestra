@@ -247,8 +247,9 @@ time.
 `update_issue` are scoped by `refuseOutsideScope` to the project or issue the
 task is attached to — and a workflow step is attached to neither, since
 `TaskSpec` has no way to name one. Both therefore fail at runtime, which takes
-setting labels and assignees with them, since those ride on `update_issue`. `work_issues` and `review_issues` are unaffected:
-they take the project id as a tool argument.
+setting labels and assignees with them, since those ride on `update_issue`.
+`work_issues` and `review_issues` are unaffected: they take the project id as a
+tool argument.
 
 `health`, `refresh_token` and `get_pr_comments` are always available; naming them
 grants nothing. A name outside the table fails the workflow at parse time rather
