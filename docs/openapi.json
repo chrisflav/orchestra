@@ -1498,7 +1498,7 @@
           },
           "budget": {
             "type": "number",
-            "description": "Maximum spend for the whole session, in USD."
+            "description": "Maximum spend for the whole conversation, in USD — not per turn. Absent runs on the default of 20; more than 100 is a `400`. Reaching it ends the session rather than failing it, with a notice saying so and the transcript kept."
           },
           "tools": {
             "type": "array",

@@ -326,3 +326,35 @@ def cookieValue_findsTheSessionAmongOthers : Test := do
     (msg := "a cleared cookie reads as empty, which no session id ever equals")
 
 end OrchestraTest.Dashboard
+
+/-! ## Money in a sentence
+
+The one number in this API that a refusal has to name. It exists because `toString` on a `Float`
+writes six decimal places, so the bound read "at most 100.000000 USD" — and it rounds down
+because the alternative is a message that names a value the bound then rejects. -/
+
+@[test]
+def usdLabelReadsAsMoney : Test := do
+  TestM.assertEqual (usdLabel 100.0) "100" (msg := "a whole amount has no decimals")
+  TestM.assertEqual (usdLabel 20.0) "20" (msg := "the session default")
+  TestM.assertEqual (usdLabel 0.5) "0.50" (msg := "cents are always two digits")
+  TestM.assertEqual (usdLabel 12.5) "12.50" (msg := "and padded, not truncated")
+  TestM.assertEqual (usdLabel 99.99) "99.99" (msg := "two decimals survive")
+  TestM.assertEqual (usdLabel 1000.0) "1000" (msg := "no thousands separator to misread")
+
+@[test]
+def usdLabelNeverNamesAnAmountTheBoundWouldRefuse : Test := do
+  -- `2.675 * 100.0` is 267.4999… in binary. Rounded to nearest this label says "2.68", and a
+  -- caller who sends 2.68 is then refused by the message that told them it was allowed. Rounding
+  -- down is what makes the sentence true.
+  TestM.assertEqual (usdLabel 2.675) "2.67" (msg := "a binary-inexact amount rounds down")
+  TestM.assertEqual (usdLabel 1.005) "1" (msg := "and so does one that reads as exact")
+  TestM.assertEqual (usdLabel 0.999) "0.99" (msg := "never up to a value that would be refused")
+
+@[test]
+def usdLabelIsTotalOnThingsThatAreNotMoney : Test := do
+  -- Not reachable from the constant it renders, but it is a `Float` parameter and a panic in a
+  -- 400's message would be a 500.
+  TestM.assertEqual (usdLabel (-5.0)) "0" (msg := "a negative is not an amount")
+  TestM.assertEqual (usdLabel 0.0) "0" (msg := "and neither is nothing")
+  TestM.assertEqual (usdLabel 0.001) "0" (msg := "below a cent there is nothing to say")

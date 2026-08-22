@@ -457,13 +457,28 @@ private def claimTurn (s : LiveSession) (text : String) : IO (Except String Nat)
     return .ok r.turnCount
   finally s.lock.unlock
 
+/-- What to say about an id the table does not hold.
+
+    "No such session" is true of an id that was never real and false of one that ended a moment
+    ago — and the second is the common case, because a session leaves the table the instant it
+    is torn down while its record stays on disk forever. The record is right there; reading it
+    is what makes the answer to "why won't it take my turn" the reason rather than a denial that
+    the conversation existed. `close` has answered this way from the start. -/
+private def gone (id : String) : IO String := do
+  match ← loadSession id with
+  | some r =>
+    if r.status.isTerminal then
+      return s!"this session has {if r.status == .failed then "failed" else "ended"}"
+    else return "no such session"
+  | none => return "no such session"
+
 /-- Post a turn. Answers the seq the turn was written at, so a caller can start reading from it.
 
     Refused rather than queued when a turn is already running: the agent would take the second
     line as soon as it finished the first, and a person who typed twice would get two answers in
     an order nobody chose. -/
 def Manager.send (mgr : Manager) (id : String) (text : String) : IO (Except String Nat) := do
-  let some s ← find mgr id | return .error "no such session"
+  let some s ← find mgr id | return .error (← gone id)
   if (← s.stream.hasExited) then
     -- Not the agent's stderr: it is unbounded output from a process holding a GitHub token, and
     -- this string is on its way to an HTTP client. The transcript carries the detail.
@@ -487,7 +502,7 @@ def Manager.send (mgr : Manager) (id : String) (text : String) : IO (Except Stri
     The turn ends the way every turn ends — with a result on the stream — so nothing here waits
     for the acknowledgement. -/
 def Manager.interrupt (mgr : Manager) (id : String) : IO (Except String Unit) := do
-  let some s ← find mgr id | return .error "no such session"
+  let some s ← find mgr id | return .error (← gone id)
   let r ← s.record.get
   if r.status != .running then
     return .error "this session is not working on a turn"
@@ -518,11 +533,26 @@ def Manager.close (mgr : Manager) (id : String) : IO (Except String Unit) := do
 def Manager.reap (mgr : Manager) : IO Unit := do
   let ss ← mgr.sessions.atomically get
   for s in ss do
+    let r ← s.record.get
+    -- Asked *before* the process is, because the two are not mutually exclusive and only one of
+    -- them is news. A session can reach a terminal state without anything having torn it down —
+    -- spending the budget is the case that does it: the pump sees `error_max_budget_usd`, writes
+    -- the record as `ended` because every further turn would be refused, and stops there,
+    -- leaving the entry in the table holding the clone slot, the MCP server and the process.
+    -- Whether the agent then exits or stays up refusing turns is the vendor CLI's business, and
+    -- checking the process first meant a session that ended cleanly on its budget was announced
+    -- to the reader as a crash — an `error` notice saying the agent exited, under a record that
+    -- already said why it ended. A session that knows how it finished is not told it crashed.
+    --
+    -- `teardown` leaves an already-terminal record exactly as it is, so this releases what is
+    -- held without rewriting what happened.
+    if r.status.isTerminal then
+      teardown mgr s r.status r.error
+      continue
     if ← s.stream.hasExited then
       let _ ← append s (.notice "error" "the agent process exited")
       teardown mgr s .failed (some "the agent process exited")
       continue
-    let r ← s.record.get
     if r.status == .running then continue
     let idleFor ← secondsSince r.lastActivityAt
     if idleFor ≥ mgr.cfg.idleTimeoutSeconds then
