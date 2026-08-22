@@ -1549,7 +1549,11 @@ private partial def chatInputLoop (cfg : Client.Config) (id : String) (lock : St
   if text.isEmpty then return ← chatInputLoop cfg id lock none
   if text == "/quit" || text == "/detach" then return
   let body := Lean.Json.compress (Lean.Json.mkObj [("text", Lean.Json.str text)])
-  match ← Client.post cfg s!"{chatSessionPath id}/messages" body with
+  -- The same fifteen minutes the start route gets, and for the same reason: a turn posted to a
+  -- session the daemon has put down wakes it first, which is a clone, a token, an MCP server and
+  -- a sandbox before anything is answered. At the default thirty seconds the client reports a
+  -- failure for a turn that is being delivered, and the retry prompt then sends it twice.
+  match ← Client.post cfg s!"{chatSessionPath id}/messages" body (maxTime := 900) with
   | .error e =>
     withTerminal lock fun out => out.putStrLn s!"\nThe turn was not delivered: {e}"
     chatInputLoop cfg id lock (some text)

@@ -105,6 +105,16 @@ structure SessionRecord where
       Assigned before the process starts rather than read back out of its stream, so a session
       whose agent died before saying anything can still be picked up where it left off. -/
   agentSessionId : Option String := none
+  /-- Whether an agent has ever announced itself under `agentSessionId`.
+
+      What `--resume` actually needs to know, and `turnCount` is not a proxy for it in either
+      direction. A turn is counted before it reaches the CLI, so a daemon killed in that window
+      leaves turns recorded against a conversation the CLI never wrote — and `--resume` on one of
+      those errors, which for a dormant session means every wake fails the same way, forever.
+      The other direction is the common one: a session started and never spoken to still has an
+      `init` from the CLI, so it *is* resumable at zero turns. Set from the `init` event, which
+      is the only thing that knows. -/
+  agentStarted : Bool := false
   /-- The session this one resumed, when it was started to revive a dead one. -/
   resumedFrom : Option String := none
   /-- Optional tools this session's MCP server grants, as the request asked for them; `none`
@@ -145,6 +155,7 @@ instance : ToJson SessionRecord where
     ("budget",         ToJson.toJson r.budget),
     ("slot",           ToJson.toJson r.slot),
     ("agentSessionId", optStr r.agentSessionId),
+    ("agentStarted",   ToJson.toJson r.agentStarted),
     ("resumedFrom",    optStr r.resumedFrom),
     ("turnCount",      ToJson.toJson r.turnCount),
     ("costUsd",        ToJson.toJson r.costUsd),
@@ -175,6 +186,7 @@ instance : FromJson SessionRecord where
       budget         := j.getObjValAs? Float  "budget"         |>.toOption |>.getD 20.0
       slot           := j.getObjValAs? Nat    "slot"           |>.toOption |>.getD 0
       agentSessionId := j.getObjValAs? String "agentSessionId" |>.toOption
+      agentStarted   := j.getObjValAs? Bool   "agentStarted"   |>.toOption |>.getD false
       resumedFrom    := j.getObjValAs? String "resumedFrom"    |>.toOption
       turnCount      := j.getObjValAs? Nat    "turnCount"      |>.toOption |>.getD 0
       costUsd        := j.getObjValAs? Float  "costUsd"        |>.toOption |>.getD 0.0
