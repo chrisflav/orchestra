@@ -141,20 +141,6 @@ function LogEntry({ event, maxBlob }: { event: LogEvent; maxBlob: number }) {
   }
 }
 
-/**
- * The task log, pinned to the bottom while the reader is already there.
- *
- * A running task appends events every couple of seconds. Scrolling back up to read something
- * must not be undone by the next frame, so the scroll is only forced when the reader was
- * within a few pixels of the end when the update arrived.
- *
- * `flow` turns all of that off — the panel, the box, and the pinning — for a caller that draws
- * several of these as part of its own page. A chat transcript is that caller: a conversation is
- * continuous prose, and every turn arriving as a bordered card with its own scrollbar reads as a
- * stack of documents rather than as something someone said. It also costs: each block would read
- * `scrollHeight` on every frame, a synchronous layout per block, for a page that has exactly one
- * place worth pinning to — the window.
- */
 /** Is this event a tool being called, or a tool answering? */
 function isToolwork(event: LogEvent): boolean {
   return event.type === "tool_result" || (event.type === "assistant" && event.item?.type === "tool_use");
@@ -172,8 +158,10 @@ function isToolwork(event: LogEvent): boolean {
 function ToolRun({ events, maxBlob }: { events: LogEvent[]; maxBlob: number }) {
   const [open, setOpen] = useState(false);
   const calls = events.filter((e) => e.type === "assistant").length;
-  // A run with results but no calls is a torn transcript, not nothing: count what is there.
+  // A run with results but no calls is a torn transcript, not nothing — but it is not evidence
+  // of calls either, so it says what it actually has.
   const n = calls > 0 ? calls : events.length;
+  const noun = calls > 0 ? "tool" : "tool result";
   return (
     <div className="log-tools">
       <button
@@ -182,13 +170,30 @@ function ToolRun({ events, maxBlob }: { events: LogEvent[]; maxBlob: number }) {
         aria-expanded={open}
         onClick={() => setOpen(!open)}
       >
-        {open ? "▾" : "▸"} called {n} tool{n === 1 ? "" : "s"}
+        <span className="log-tools-caret" aria-hidden="true">
+          {open ? "▾" : "▸"}
+        </span>
+        {`called ${n} ${noun}${n === 1 ? "" : "s"}`}
       </button>
       {open && events.map((event, i) => <LogEntry key={i} event={event} maxBlob={maxBlob} />)}
     </div>
   );
 }
 
+/**
+ * The task log, pinned to the bottom while the reader is already there.
+ *
+ * A running task appends events every couple of seconds. Scrolling back up to read something
+ * must not be undone by the next frame, so the scroll is only forced when the reader was
+ * within a few pixels of the end when the update arrived.
+ *
+ * `flow` turns all of that off — the panel, the box, and the pinning — for a caller that draws
+ * several of these as part of its own page. A chat transcript is that caller: a conversation is
+ * continuous prose, and every turn arriving as a bordered card with its own scrollbar reads as a
+ * stack of documents rather than as something someone said. It also costs: each block would read
+ * `scrollHeight` on every frame, a synchronous layout per block, for a page that has exactly one
+ * place worth pinning to — the window.
+ */
 export function LogView({
   events,
   total,

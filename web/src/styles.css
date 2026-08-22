@@ -1476,14 +1476,26 @@ a.row:hover .row-title {
 .log-tools {
   padding: 6px 0;
 }
+/* Sat on the body column, where the agent's words are, rather than across the kind gutter it
+   neither belongs to nor lines up with. `.log-entry` is `92px + 16px gap`, so this is that. */
+.log-flow .log-tools-toggle {
+  margin-left: 108px;
+}
 .log-tools-toggle {
   font-family: var(--data);
   font-size: 12px;
-  color: var(--faint);
+  /* `--mute`, not `--faint`: this is the only way to reach the tool detail, and `--faint` at
+     12px is 3.2:1 against the page — under AA for text you are meant to be able to click. The
+     5px padding takes the box to 24px, which is the smallest target WCAG 2.2 allows. */
+  color: var(--mute);
   background: none;
   border: none;
-  padding: 4px 0;
+  padding: 5px 0;
   cursor: pointer;
+}
+.log-tools-caret {
+  display: inline-block;
+  width: 12px;
 }
 .log-tools-toggle:hover {
   color: var(--text);

@@ -72,6 +72,18 @@ function isThinking(e: TranscriptEvent): boolean {
 }
 
 /**
+ * Has the reader been given something to read?
+ *
+ * A prose block from the agent, or the line that says the turn is over. Everything else a turn
+ * produces — a thought, a tool being called, a tool answering — is the agent working, which is
+ * the thing the indicator is for.
+ */
+function isSomethingToRead(e: TranscriptEvent): boolean {
+  if (e.kind === "turnEnded") return true;
+  return e.kind === "agent" && e.event?.type === "assistant" && e.event.item?.type === "text";
+}
+
+/**
  * The events the agent itself produced, for `LogView` — which already knows how to draw them.
  *
  * Thinking is dropped. It is not something the agent said, it is the agent working out what to
@@ -80,7 +92,14 @@ function isThinking(e: TranscriptEvent): boolean {
  * happening, which the indicator below says once and then stops saying.
  */
 function agentEvents(events: TranscriptEvent[]) {
-  return events.flatMap((e) => (e.kind === "agent" && e.event && !isThinking(e) ? [e.event] : []));
+  return events.flatMap((e) =>
+    // `rate_limit` goes with it: `StreamFormat` documents it as never displayed, and displayed
+    // is exactly what it was — as a raw JSON blob, through `LogEntry`'s unknown-type fallback,
+    // in the middle of a conversation. It also split a run of tool calls in two on its way past.
+    e.kind === "agent" && e.event && !isThinking(e) && e.event.type !== "rate_limit"
+      ? [e.event]
+      : [],
+  );
 }
 
 /**
@@ -103,18 +122,29 @@ function Conversation({ events, working }: { events: TranscriptEvent[]; working:
       if (last && last.kind === kind) last.events.push(e);
       else out.push({ kind, events: [e] });
     }
-    // An agent block that is nothing but thinking renders nothing, and `LogView` with no events
-    // draws its empty state — which on a task page reads "This task has no log file." in the
-    // middle of a conversation. Dropped here instead.
-    return out.filter((b) => b.kind !== "agent" || b.events.some((e) => !isThinking(e)));
+    // An agent block that renders nothing must not reach `LogView`, which draws its empty state
+    // for an empty array — "This task has no log file.", in the middle of a conversation. Asked
+    // with `agentEvents` itself rather than with a predicate that ought to agree with it: the
+    // two differ on an `agent` event carrying no payload, which `readEvents` will happily hand
+    // over because it validates `seq` and nothing else, deliberately, so that a field written by
+    // a newer orchestra survives an older reader.
+    return out.filter((b) => b.kind !== "agent" || agentEvents(b.events).length > 0);
   }, [events]);
 
   // "Thinking…" is a live status, not a line of transcript: it belongs at the end and only while
-  // it is true. True means the agent is working on a turn and the last thing it produced was a
-  // reasoning block — the next thing it says replaces it, which is exactly the behaviour a
-  // reader expects of a spinner rather than of a log.
+  // it is true, and the next thing the agent says takes it away — which is what a reader expects
+  // of a spinner and never gets from a log.
+  //
+  // True is "a turn is in flight and there is nothing new to read", *not* "the last event is a
+  // reasoning block". The narrower version was almost never true: `parseEvents` explodes one
+  // assistant message into an event per content item and the pump appends them microseconds
+  // apart, so a `[thinking, tool_use]` message — the ordinary shape of an extended-thinking
+  // turn — arrives in a single 300ms frame with the tool call last. The indicator would have
+  // needed the agent to stop for a third of a second immediately after a thought and before
+  // doing anything else. It would also have missed the longest wait in a turn, which is after a
+  // tool answers and before the model has composed anything.
   const last = events[events.length - 1];
-  const thinking = working && last !== undefined && isThinking(last);
+  const thinking = working && (last === undefined || !isSomethingToRead(last));
 
   // The page is the scroll region — there is no box around the conversation and none inside it —
   // so the thing to keep at the bottom is the window. Only while the reader is already there:
@@ -138,7 +168,6 @@ function Conversation({ events, working }: { events: TranscriptEvent[]; working:
     return <p className="empty">Nothing said yet. Type a turn below.</p>;
   }
 
-
   return (
     <div className="chat-transcript">
       {blocks.map((block, i) =>
@@ -146,7 +175,7 @@ function Conversation({ events, working }: { events: TranscriptEvent[]; working:
           <LogView
             key={i}
             events={agentEvents(block.events)}
-            total={block.events.length}
+            total={agentEvents(block.events).length}
             truncated={false}
             flow
             collapseTools
@@ -192,11 +221,13 @@ function Conversation({ events, working }: { events: TranscriptEvent[]; working:
           </div>
         ),
       )}
-      {thinking && (
-        <p className="chat-thinking" role="status">
-          thinking…
-        </p>
-      )}
+      {/* Rendered whether or not it has anything to say. A live region that is mounted at the
+          same moment its text appears is one several screen readers never announce, and one
+          unmounted between reasoning blocks announces itself again for every one of them. The
+          region is constant; the text is what changes. */}
+      <p className="chat-thinking" role="status" aria-live="polite">
+        {thinking ? "thinking…" : ""}
+      </p>
     </div>
   );
 }
