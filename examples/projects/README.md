@@ -57,9 +57,34 @@ so `orchestra issue show <project-id>` also works, showing it like any other iss
 
 Tool permission groups (set via the task config's `tools` list):
 
-- `manage_issues` — plan agents: list / create / update issues + sub-issues.
+- `manage_issues` — plan agents: list / create / update issues + sub-issues, and set an issue's
+  labels and assignees.
 - `work_issues` — worker agents: list open issues, claim, attach PR, release, split into sub-issues.
 - `review_issues` — reviewer agents: list issues awaiting review, approve / complete / reject.
+
+### Routing work by label
+
+`update_issue` takes `labels_add` / `labels_remove`, which is how a triaging agent decides what
+happens to an issue next: the label-dispatcher (`Listener.SourceConfig.labelDispatcher`) selects
+the issues it offers, and the role it offers them to, by label. A planner labelling an issue is
+therefore what causes a worker to be spawned on it — and with one listener per label, *which*
+worker, so the same mechanism can choose the model a piece of work gets.
+
+`list_labels` is the vocabulary and it is a closed one: a name the tracker does not already
+define is refused, listing what exists, rather than created. A typo would otherwise mint a label
+that dispatches nothing while looking exactly like one that does.
+
+`o-claimed` and `t-project` are refused outright — orchestra keeps an issue's claim and its
+project marker in that same label array (`statusOf`, `anchorsProject`), and an agent setting
+either by hand puts the tracker and orchestra's reading of it out of step silently.
+
+Labels and assignees are add/remove **deltas**, never a set to write, for the same reason: taxis
+takes the whole array in one `PATCH`, so an agent handed the set wholesale would drop the claim
+label by omission on every call that only meant to add one.
+
+`assignees_add` / `assignees_remove` take emails or display names, resolved against `list_actors`
+(an ambiguous display name is refused rather than guessed). Assigning a person is how an agent
+escalates: it says the issue is waiting on a named human rather than on another agent.
 
 A reviewer is queued for **any open issue with an unmerged pull request attached**, including one
 with children — a container can have a PR of its own. Merge state comes from GitHub, so an issue

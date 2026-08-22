@@ -15,6 +15,7 @@ import Orchestra.Queue
 import Orchestra.DaemonRequest
 import Orchestra.Utils.Format
 import Orchestra.Utils.Http
+import Orchestra.Utils.Labels
 import Orchestra.Utils.Signals
 import Orchestra.Utils.UnixSocket
 import Orchestra.Repo

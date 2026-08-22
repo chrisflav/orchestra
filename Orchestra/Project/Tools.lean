@@ -52,6 +52,13 @@ inductive ProjectTool where
   | updateIssue      (issueId : Taxis.IssueId) (title description : Option String)
                      (status : Option IssueStatus) (target : Option RepoTarget)
                      (dependencies : Option (Array Taxis.IssueId) := none)
+                     (labelsAdd labelsRemove : List String := [])
+                     (assigneesAdd assigneesRemove : List String := [])
+  /-- The labels the tracker defines: the vocabulary a relabelling request is resolved against,
+      and the only one it may name. -/
+  | listLabels
+  /-- The actors the tracker knows, so an issue can be handed to a named human. -/
+  | listActors
   -- work_issues
   | listOpenIssues   (projectId : Taxis.IssueId) (targetRepo : Option Repository)
   | claimIssue       (issueId : Taxis.IssueId)
@@ -82,6 +89,12 @@ private def strProp (desc : String) : Json :=
 
 private def intProp (desc : String) : Json :=
   Json.mkObj [("type", "integer"), ("description", desc)]
+
+private def strArrayProp (desc : String) : Json :=
+  Json.mkObj
+    [ ("type", "array")
+    , ("description", desc)
+    , ("items", Json.mkObj [("type", "string")]) ]
 
 private def obj (props : List (String × Json)) (required : List String) : Json :=
   Json.mkObj
@@ -159,8 +172,10 @@ def toolDefs : List (String × String × Json) :=
       Json.mkObj
         [ ("name", "update_issue")
         , ("description",
-            "Update an issue's title, description, status, target, or dependencies. " ++
-            "Pass dependency_ids to replace the full dependency list; omit to leave it unchanged.")
+            "Update an issue's title, description, status, target, dependencies, labels or " ++
+            "assignees. Pass dependency_ids to replace the full dependency list; omit to leave " ++
+            "it unchanged. Labels and assignees are add/remove lists rather than a set to " ++
+            "write, so a call that adds one label leaves the others alone.")
         , ("inputSchema", obj
             [ ("issue_id", intProp "Issue ID")
             , ("title", strProp "New title")
@@ -171,8 +186,32 @@ def toolDefs : List (String × String × Json) :=
             , ("dependency_ids", Json.mkObj
                 [ ("type", "array")
                 , ("description", "Replace the dependency list with these issue IDs (issues that must be completed before this one is dispatched)")
-                , ("items", Json.mkObj [("type", "integer")]) ]) ]
+                , ("items", Json.mkObj [("type", "integer")]) ])
+            , ("labels_add", strArrayProp
+                ("Taxis labels to put on the issue. These are what the dispatcher routes on, " ++
+                 "so this is how work is marked ready and steered. Only labels the tracker " ++
+                 "already defines (list_labels); orchestra's own o-claimed / t-project are refused."))
+            , ("labels_remove", strArrayProp "Taxis labels to take off the issue.")
+            , ("assignees_add", strArrayProp
+                ("Actors to assign, by email or display name (list_actors). Assigning a human " ++
+                 "is how an issue is escalated to one."))
+            , ("assignees_remove", strArrayProp "Actors to unassign, by email or display name.") ]
             ["issue_id"]) ])
+  , (manageIssuesPerm, "list_labels",
+      Json.mkObj
+        [ ("name", "list_labels")
+        , ("description",
+            "List the labels the taxis tracker defines. These are the only names update_issue " ++
+            "will accept — it creates none — so check here before routing an issue with one. " ++
+            "Not GitHub labels: use label_issue for those.")
+        , ("inputSchema", obj [] []) ])
+  , (manageIssuesPerm, "list_actors",
+      Json.mkObj
+        [ ("name", "list_actors")
+        , ("description",
+            "List the actors (people and bots) the taxis tracker knows, with the email that " ++
+            "names each one uniquely. Use before assigning an issue to a human.")
+        , ("inputSchema", obj [] []) ])
     -- work_issues
   , (workIssuesPerm, "list_open_issues",
       Json.mkObj
@@ -283,9 +322,27 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "abandoned" => some .abandoned
   | _           => none
 
+/-- Read an optional string argument, telling *absent* from *malformed*.
+
+    A missing key and an explicit `null` — which is how a client serialises "not set" — both mean
+    leave it alone. Anything else that is not a string is the caller's mistake and is reported as
+    one: read as absent instead, a mistyped field is a call that changes nothing while answering
+    as though it had nothing to change. -/
+private def optStrArg (args : Json) (field : String) : Except String (Option String) :=
+  match args.getObjVal? field with
+  | .error _  => .ok none
+  | .ok .null => .ok none
+  | .ok _     =>
+    match args.getObjValAs? String field with
+    | .ok v    => .ok (some v)
+    | .error e => .error s!"{field} must be a string: {e}"
+
 private def parseTarget? (args : Json) : Except String (Option RepoTarget) := do
-  let mRepo  := args.getObjValAs? String "target_repo"   |>.toOption
-  let mBranch := args.getObjValAs? String "target_branch" |>.toOption
+  -- Mistyped rather than lenient, so that "provided together" means what it says: read through
+  -- `.toOption`, `target_repo: 1` was indistinguishable from an absent one, and naming both with
+  -- one of them mistyped was reported as failing to provide both.
+  let mRepo   ← optStrArg args "target_repo"
+  let mBranch ← optStrArg args "target_branch"
   match mRepo, mBranch with
   | none,   none   => return none
   | some r, some b =>
@@ -324,15 +381,51 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
   | "update_issue" =>
     some <| do
       let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
-      let title  := args.getObjValAs? String "title"       |>.toOption
-      let descr  := args.getObjValAs? String "description" |>.toOption
-      let status :=
-        match args.getObjValAs? String "status" |>.toOption with
-        | none => none
-        | some s => issueStatusOfString? s
+      -- Every optional field here distinguishes *absent* from *malformed*. Absent means "leave
+      -- this alone" and is the ordinary case — a retitle names one field and omits six. Malformed
+      -- is a mistake, and reading it as absent is how `labels_add: "auto-work-opus"` (an array
+      -- field given a bare string, the likeliest way to get this wrong) or `status: "done"` used
+      -- to become a call that reported success and changed nothing, which is exactly the silent
+      -- failure a closed label vocabulary exists to prevent.
+      let present (field : String) : Bool :=
+        match args.getObjVal? field with
+        | .error _  => false   -- no such key
+        | .ok .null => false   -- explicit null: how a client spells "not set"
+        | .ok _     => true
+      let title ← optStrArg args "title"
+      let descr ← optStrArg args "description"
+      let status ← do
+        match ← optStrArg args "status" with
+        | none   => pure none
+        | some s =>
+          match issueStatusOfString? s with
+          | some st => pure (some st)
+          | none    =>
+            Except.error s!"status must be open, claimed, completed or abandoned, got {repr s}"
       let target ← parseTarget? args
-      let dependencies := args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" |>.toOption
+      let dependencies ←
+        if !present "dependency_ids" then pure none
+        else match args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" with
+          | .ok v    => pure (some v)
+          | .error e => Except.error s!"dependency_ids must be an array of issue ids: {e}"
+      -- Names are trimmed, and a blank one is refused rather than passed down to be reported as
+      -- `no such label: `. `label_issue` already draws the line here on the GitHub side.
+      let names (field : String) : Except String (List String) :=
+        if !present field then .ok []
+        else match args.getObjValAs? (Array String) field with
+          | .error e => .error s!"{field} must be an array of names: {e}"
+          | .ok a    =>
+            let trimmed := (a.map (·.trimAscii.toString)).toList
+            if trimmed.any (·.isEmpty) then .error s!"{field} contains an empty name"
+            else .ok trimmed
+      let labelsAdd       ← names "labels_add"
+      let labelsRemove    ← names "labels_remove"
+      let assigneesAdd    ← names "assignees_add"
+      let assigneesRemove ← names "assignees_remove"
       return .updateIssue iid title descr status target dependencies
+        labelsAdd labelsRemove assigneesAdd assigneesRemove
+  | "list_labels" => some (.ok .listLabels)
+  | "list_actors" => some (.ok .listActors)
   | "list_open_issues" =>
     some <| do
       let pid ← args.getObjValAs? Taxis.IssueId "project_id"
@@ -527,6 +620,15 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       let childLines := children.map (fun c => s!"  - {c.id.toString}  [{issueStatusToString c.status}]  {c.title}")
       let depsStr := if i.dependencies.isEmpty then "-"
                      else String.intercalate ", " (i.dependencies.map (·.toString)).toList
+      -- The two fields `Issue` does not carry. Shown because they are what routes the issue —
+      -- which worker the dispatcher offers it to, and which human is on the hook for it — and an
+      -- agent asked to change them can otherwise only guess at what they are.
+      let routing ← issueLabelsAndAssignees iid
+      let orDash (pick : Array String × Array String → Array String) : String :=
+        match routing with
+        | none    => "(could not be read from taxis)"
+        | some rs => let xs := pick rs
+                     if xs.isEmpty then "-" else String.intercalate ", " xs.toList
       let header : Array String := #[
         s!"id:           {i.id.toString}",
         s!"project:      {project.id.toString} ({project.name})",
@@ -534,6 +636,8 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         s!"title:        {i.title}",
         s!"status:       {issueStatusToString i.status}",
         s!"target:       {target}",
+        s!"labels:       {orDash (·.1)}",
+        s!"assignees:    {orDash (·.2)}",
         s!"dependencies: {depsStr}",
         s!"created:      {i.createdAt}",
         s!"updated:      {i.updatedAt}",
@@ -566,23 +670,69 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     let issue ← createIssue pid title descr (parentId := parent) (target := target)
       (dependencies := dependencies)
     return content s!"created issue {issue.id.toString} in project {pid.toString}"
-  | .updateIssue iid title descr status target dependencies =>
+  | .updateIssue iid title descr status target dependencies
+      labelsAdd labelsRemove assigneesAdd assigneesRemove =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     if let some msg ← refuseOutsideScope env iid "update that issue" then
       return content msg (isError := true)
     match ← findIssue iid with
     | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (_, i) =>
-      let updated : Issue :=
-        { i with
-          title        := title.getD i.title
-          description  := descr.getD i.description
-          status       := status.getD i.status
-          target       := match target with | some t => some t | none => i.target
-          dependencies := dependencies.getD i.dependencies
-          updatedAt    := now }
-      saveIssue updated
-      return content s!"updated issue {iid.toString}"
+      let mut done : Array String := #[]
+      -- Only when a field was actually named. `saveIssue` asserts the *whole* issue — including
+      -- `state` and the status labels, both derived from the `i` read a moment ago — so firing it
+      -- for a call that carried only `labels_add` would write back a status nobody mentioned,
+      -- from a read that a worker completing the issue in between has already invalidated.
+      let touchesFields :=
+        title.isSome || descr.isSome || status.isSome || target.isSome || dependencies.isSome
+      if touchesFields then
+        let updated : Issue :=
+          { i with
+            title        := title.getD i.title
+            description  := descr.getD i.description
+            status       := status.getD i.status
+            target       := match target with | some t => some t | none => i.target
+            dependencies := dependencies.getD i.dependencies
+            updatedAt    := now }
+        saveIssue updated
+        done := done.push s!"updated issue {iid.toString}"
+      -- After the field write, not before: `saveIssue` reconciles the status labels against the
+      -- issue as taxis holds it, so a label delta applied first would be read back and rewritten
+      -- from a set that no longer matches.
+      --
+      -- Each half is refused on its own, and a refusal carries whatever already landed with it.
+      -- An unknown label leaves the title change standing, and an agent told only "no such label"
+      -- would reasonably retry the call that made it.
+      -- `soFar` is a parameter and not a capture of `done`: a closure in a `do` block takes the
+      -- value the variable had where the closure was written, so one reading `done` directly
+      -- would report the state before the label write and lose the very line this exists to keep.
+      let failure (soFar : Array String) (e : IO.Error) : Json :=
+        content (joinLines (soFar ++ #[toString e])) (isError := true)
+      unless labelsAdd.isEmpty && labelsRemove.isEmpty do
+        try
+          let change ← setIssueLabels iid labelsAdd labelsRemove
+          done := done.push s!"labels: {change.summary iid.toString}"
+        catch e => return failure done e
+      unless assigneesAdd.isEmpty && assigneesRemove.isEmpty do
+        try
+          let change ← setIssueAssignees iid assigneesAdd assigneesRemove
+          done := done.push s!"assignees: {change.summary iid.toString}"
+        catch e => return failure done e
+      if done.isEmpty then
+        return content s!"issue {iid.toString}: nothing to change — no field, label or assignee \
+          was named"
+      return content (joinLines done)
+  | .listLabels =>
+    if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
+    let names ← listLabelNames
+    if names.isEmpty then return content "The tracker defines no labels."
+    return content (joinLines (names.map (s!"  - {·}")))
+  | .listActors =>
+    if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
+    let actors ← listActorSummaries
+    if actors.isEmpty then return content "The tracker knows no actors."
+    return content (joinLines (actors.map fun (name, email, bot) =>
+      s!"  - {email}  ({name}){if bot then "  [bot]" else ""}"))
   -- ---------------- work_issues ----------------
   | .listOpenIssues pid targetRepo? =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)

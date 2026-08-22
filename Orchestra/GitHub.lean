@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Orchestra.Config
+import Orchestra.Utils.Labels
 
 open Lean (Json FromJson ToJson)
 
@@ -846,77 +847,11 @@ def listIssueLabels (pat : String) (repo : Repository) (issueNumber : Nat) : IO 
   ] (env := env)
   return out.splitOn "\n" |>.map (·.trimAscii.toString) |>.filter (!·.isEmpty)
 
-/-- What relabelling an issue actually changes, once the labels it already carries are taken
-    into account. `add` and `remove` are the calls that will be made; the other two fields are
-    the requests that turned out to be nothing to do, kept so they can be reported rather than
-    silently dropped. -/
-structure LabelChange where
-  /-- Labels to add, spelled as the repository spells them. None is already on the issue. -/
-  add : List String := []
-  /-- Labels to remove, spelled as the repository spells them. All are on the issue. -/
-  remove : List String := []
-  /-- Requested additions the issue already carried. -/
-  alreadyPresent : List String := []
-  /-- Requested removals the issue did not carry. -/
-  notPresent : List String := []
-deriving Repr, Inhabited, DecidableEq
+/-! Relabelling is decided before it is performed, and by rules the taxis side needs verbatim — so
+`LabelChange` and `planLabelChange` live in `Orchestra.Utils.Labels`, re-exported here where every
+existing caller (and `setIssueLabels` below) still finds them. -/
 
-private def dedup (xs : List String) : List String :=
-  xs.foldl (fun acc x => if acc.contains x then acc else acc ++ [x]) []
-
-/-- Work out which label calls a relabelling request actually needs, or why it cannot be served.
-    `known` is the repository's labels, `current` the ones already on the issue.
-
-    Names are matched case-insensitively and answered in the repository's spelling, because an
-    agent asking for `T-Feature` means the `t-feature` the repository defines and GitHub would
-    create a second label rather than say so.
-
-    A name the repository does not define is an error, not a label to create: the point of
-    triage is to sort into the vocabulary a project already has, and `create_pr`'s label
-    auto-creation exists for labels the *configuration* names, not ones an agent invented. Pure,
-    so the whole mapping is tested without a network. -/
-def planLabelChange (known current add remove : List String) : Except String LabelChange :=
-  let canon? (name : String) : Option String :=
-    known.find? (·.toLower == name.toLower)
-  let unknown := dedup ((add ++ remove).filter (canon? · |>.isNone))
-  if !unknown.isEmpty then
-    let names := String.intercalate ", " unknown
-    let vocabulary :=
-      if known.isEmpty then "the repository defines no labels at all"
-      else s!"the repository defines: {String.intercalate ", " known}"
-    .error s!"no such label: {names} — {vocabulary}"
-  else
-    let canonAdd := dedup (add.filterMap canon?)
-    let canonRemove := dedup (remove.filterMap canon?)
-    let contradictory := canonAdd.filter canonRemove.contains
-    if !contradictory.isEmpty then
-      .error s!"asked to both add and remove {String.intercalate ", " contradictory}"
-    else
-      let present (label : String) : Bool := current.any (·.toLower == label.toLower)
-      .ok {
-        add            := canonAdd.filter (!present ·)
-        remove         := canonRemove.filter present
-        alreadyPresent := canonAdd.filter present
-        notPresent     := canonRemove.filter (!present ·)
-      }
-
-/-- One line saying what the relabelling did, for whoever asked for it. `subject` names the
-    issue, e.g. `owner/repo#12`. -/
-def LabelChange.summary (change : LabelChange) (subject : String) : String :=
-  let added := String.intercalate ", " change.add
-  let removed := String.intercalate ", " change.remove
-  let had := String.intercalate ", " change.alreadyPresent
-  let lacked := String.intercalate ", " change.notPresent
-  let done :=
-    (if change.add.isEmpty then [] else [s!"added {added}"]) ++
-    (if change.remove.isEmpty then [] else [s!"removed {removed}"])
-  let notes :=
-    (if change.alreadyPresent.isEmpty then [] else [s!"already had {had}"]) ++
-    (if change.notPresent.isEmpty then [] else [s!"did not have {lacked}"])
-  let head :=
-    if done.isEmpty then s!"{subject}: nothing to change"
-    else s!"{subject}: {String.intercalate "; " done}"
-  if notes.isEmpty then head else s!"{head} (it {String.intercalate "; " notes})"
+export Orchestra.Utils.Labels (LabelChange planLabelChange)
 
 /-- Add and remove labels on an issue or pull request of `repo`, reporting what changed.
 

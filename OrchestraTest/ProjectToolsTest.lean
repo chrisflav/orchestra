@@ -60,6 +60,128 @@ def parseAttachPrFailsWithoutFields : Test := do
   | other => TestM.fail s!"expected error, got {repr other}"
 
 @[test]
+def parseUpdateIssueTakesLabelAndAssigneeDeltas : Test := do
+  let args := Json.mkObj
+    [ ("issue_id", Json.num 7)
+    , ("labels_add", Json.arr #["auto-work-opus"])
+    , ("labels_remove", Json.arr #["auto-work-fable"])
+    , ("assignees_add", Json.arr #["chris@example.com"]) ]
+  match tryParseToolCall "update_issue" args with
+  | some (.ok (.updateIssue iid _ _ _ _ _ add remove assignAdd assignRemove)) =>
+    TestM.assertEqual iid.val (7 : Int64) (msg := "issue id")
+    TestM.assertEqual add ["auto-work-opus"] (msg := "labels_add")
+    TestM.assertEqual remove ["auto-work-fable"] (msg := "labels_remove")
+    TestM.assertEqual assignAdd ["chris@example.com"] (msg := "assignees_add")
+    TestM.assertEqual assignRemove ([] : List String)
+      (msg := "an omitted list is empty, not a write")
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
+def parseUpdateIssueWithoutDeltasTouchesNeither : Test := do
+  -- The delta lists have to default to empty rather than to the issue's current set: a plain
+  -- retitle goes through this same constructor, and anything else would have it rewrite labels.
+  match tryParseToolCall "update_issue" (Json.mkObj [("issue_id", Json.num 7), ("title", "t")]) with
+  | some (.ok (.updateIssue _ _ _ _ _ _ add remove assignAdd assignRemove)) =>
+    TestM.assert (add.isEmpty && remove.isEmpty && assignAdd.isEmpty && assignRemove.isEmpty)
+      "no label or assignee write is implied by a field update"
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
+def parseUpdateIssueRejectsAMalformedDeltaList : Test := do
+  -- A bare string where an array belongs is the likeliest way to get this wrong, and it must not
+  -- read as "asked for nothing": the call would report success and route the issue nowhere, which
+  -- is the silent failure a closed label vocabulary exists to prevent.
+  let args := Json.mkObj [("issue_id", Json.num 7), ("labels_add", Json.str "auto-work-opus")]
+  match tryParseToolCall "update_issue" args with
+  | some (.error e) => TestM.assert (e.contains "labels_add") "the refusal names the field"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
+def parseUpdateIssueRejectsANonStringInADeltaList : Test := do
+  let args := Json.mkObj
+    [("issue_id", Json.num 7), ("assignees_add", Json.arr #[Json.str "a@b.c", Json.num 1])]
+  match tryParseToolCall "update_issue" args with
+  | some (.error e) => TestM.assert (e.contains "assignees_add") "the refusal names the field"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
+def parseUpdateIssueRejectsABlankName : Test := do
+  let args := Json.mkObj [("issue_id", Json.num 7), ("labels_add", Json.arr #[Json.str "  "])]
+  match tryParseToolCall "update_issue" args with
+  | some (.error e) => TestM.assert (e.contains "labels_add") "the refusal names the field"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
+def parseUpdateIssueTrimsNames : Test := do
+  let args := Json.mkObj
+    [("issue_id", Json.num 7), ("labels_add", Json.arr #[Json.str " auto-work-opus "])]
+  match tryParseToolCall "update_issue" args with
+  | some (.ok (.updateIssue _ _ _ _ _ _ add _ _ _)) =>
+    TestM.assertEqual add ["auto-work-opus"] (msg := "surrounding space is not part of the name")
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
+def parseUpdateIssueRejectsAMalformedScalar : Test := do
+  -- A status nobody defines used to be dropped on the floor, which since the field write became
+  -- conditional would have the handler answer "nothing to change — no field was named" to a call
+  -- that named one. Absent and malformed have to be different answers for every field, not just
+  -- the list-shaped ones.
+  match tryParseToolCall "update_issue"
+      (Json.mkObj [("issue_id", Json.num 7), ("status", Json.str "done")]) with
+  | some (.error e) => TestM.assert (e.contains "status") "the refusal names the field"
+  | other => TestM.fail s!"expected a parse error for an unknown status, got {repr other}"
+
+@[test]
+def parseUpdateIssueRejectsAMistypedScalar : Test := do
+  match tryParseToolCall "update_issue"
+      (Json.mkObj [("issue_id", Json.num 7), ("title", Json.num 1)]) with
+  | some (.error e) => TestM.assert (e.contains "title") "the refusal names the field"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
+def parseUpdateIssueRejectsAMistypedTarget : Test := do
+  -- The last field that read a mistype as an absence. `target_repo: 1` used to parse as "no
+  -- target named", so the handler answered "no field was named" to a call that named one.
+  match tryParseToolCall "update_issue"
+      (Json.mkObj [("issue_id", Json.num 7), ("target_repo", Json.num 1)]) with
+  | some (.error e) => TestM.assert (e.contains "target_repo") "the refusal names the field"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
+def parseUpdateIssueDiagnosesAMistypedHalfOfATarget : Test := do
+  -- Both halves were named, so "must be provided together" would be the wrong complaint.
+  let args := Json.mkObj
+    [("issue_id", Json.num 7), ("target_repo", Json.num 1), ("target_branch", Json.str "main")]
+  match tryParseToolCall "update_issue" args with
+  | some (.error e) =>
+    TestM.assert (e.contains "target_repo" && !e.contains "provided together")
+      "the refusal is about the type, not about a missing half"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
+def parseCreateIssueStillTakesABareTarget : Test := do
+  -- `parseTarget?` is shared, so this is the regression check on the other caller.
+  let args := Json.mkObj
+    [ ("project_id", Json.num 1), ("title", Json.str "t"), ("description", Json.str "d")
+    , ("target_repo", Json.str "o/r"), ("target_branch", Json.str "main") ]
+  match tryParseToolCall "create_issue" args with
+  | some (.ok (.createIssue _ _ _ _ target _)) =>
+    TestM.assert (target.isSome) "a well-formed target still parses"
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
+def parseUpdateIssueTreatsNullAsAbsent : Test := do
+  -- `null` is how a client serialises "not set", so it must mean the same as omitting the key —
+  -- rejecting it would fail calls that are asking for nothing in particular.
+  let args := Json.mkObj
+    [("issue_id", Json.num 7), ("title", Json.null), ("labels_add", Json.null)]
+  match tryParseToolCall "update_issue" args with
+  | some (.ok (.updateIssue _ title _ _ _ _ add _ _ _)) =>
+    TestM.assert title.isNone "a null title is absent, not an error"
+    TestM.assert add.isEmpty "and so is a null list"
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
 def parseUnknownToolReturnsNone : Test := do
   match tryParseToolCall "totally_made_up" (Json.mkObj []) with
   | none => TestM.assert true "unknown tool falls through"
