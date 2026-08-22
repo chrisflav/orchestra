@@ -186,12 +186,12 @@ private def endedCancelled (cancelToken : Option Std.CancellationToken) : IO Boo
   | some ct => pure ((← ct.getCancellationReason) == some .cancel)
 
 /--
-Launch the coding agent through `exec`, the execution backend (landrun unless configured
-otherwise), and supervise the run.
+Launch the coding agent in `session` — the environment the configured execution backend opened for
+this task — and supervise the run.
 
 The agent backend's `setupMcp` hook runs before launch to configure MCP connectivity, at the
-address `exec` says the MCP server is reachable at. Returns a `LaunchResult` with the exit code,
-session ID, and usage-limit flag.
+address the session says the MCP server is reachable at. Returns a `LaunchResult` with the exit
+code, session ID, and usage-limit flag.
 -/
 def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : String)
     (serverPort : UInt16)
@@ -219,9 +219,10 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     -- Condition the run is held to: the agent must not stop before it holds. Passed to the
     -- backend on its own, never folded into `prompt` — see `AgentDef.goalArgs`.
     (goal : Option String := none)
-    -- How the agent is executed. Defaults to landrun, which is what every caller that has not
-    -- read `execution.backend` from the config should get.
-    (exec : Exec.Backend := Exec.Landrun.backend)
+    -- The environment the agent runs in, opened for the whole task by whichever execution
+    -- backend is configured. Defaults to this machine under landrun, which is what a caller that
+    -- has not read `execution.backend` from the config should get.
+    (session : Exec.Session := Exec.Landrun.session)
     -- Secret the agent must present to the MCP server, when the server had to listen somewhere
     -- other than loopback for this backend to reach it. Minted with the server by
     -- `Exec.mcpBinding`; `none` for every loopback run.
@@ -229,7 +230,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- Where the agent reaches the MCP server: loopback for a backend that runs it on this machine,
   -- and whatever a remote one says instead. Resolved before `setupMcp`, which writes it into the
   -- agent's config file.
-  let mcp ← exec.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
+  let mcp ← session.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
   let (mcpContext, agentEnv) ← agentDef.setupMcp mcp model systemPrompt
   -- Enforced here rather than where the prompts are built: every backend and every caller
   -- reaches the CLI through this one launch, and the limit is a property of `execve`, not of any
@@ -279,8 +280,8 @@ goal; running without the goal condition."
     label   := s!"orchestra-{agentDef.command}"
   }
   if debug then
-    IO.eprintln (← exec.describe spec)
-  let handle ← exec.start spec
+    IO.eprintln (← session.describe spec)
+  let handle ← session.start spec
   killOnCancel handle cancelToken
   if interactiveAgent then
     -- Interactive mode: the run has orchestra's own terminal, and the user is looking at the

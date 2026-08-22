@@ -190,7 +190,7 @@ def theLocalBackendRunsWhatTheSpecSays : Test := do
     workdir := System.FilePath.mk "/tmp"
     env     := #[("GREETING", "hello from the spec")]
   }
-  let handle ← Orchestra.Exec.Local.backend.start spec
+  let handle ← Orchestra.Exec.Local.session.start spec
   let line ← match handle.stdout with
     | some out => out.getLine
     | none     => pure ""

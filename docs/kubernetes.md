@@ -1,14 +1,20 @@
 # running agents on a Kubernetes cluster
 
-The `kubernetes` execution backend runs each agent in a pod of its own, on a cluster the daemon
-reaches through `kubectl`. What confines the agent is the pod: it sees the image's filesystem and
-nothing of the daemon's, its egress is whatever the namespace allows, and it is deleted when the
-run ends.
+The `kubernetes` execution backend gives each task a pod, and runs everything the task consists of
+inside it: the repository's `init.sh` and `before.sh`, the agent, `validation.sh`, the retry the
+agent gets when that fails, and `after.sh`. The pod is a container that does nothing on its own;
+each of those is a `kubectl exec` into it.
 
-Everything else stays where it was. The daemon still clones, holds the credentials, runs the
-repository's hooks and validation script, and parses what the agent says — see
-[the execution model](execution.md) for how the pieces divide. That is also why the checkout
-travels: it goes into the pod before the agent starts and comes back changed when it finishes.
+That the pod belongs to the *task* rather than to one agent launch is what makes the rest work:
+
+- **`validation.sh` runs where the work happened.** It is the repository's build, and it decides
+  whether the agent is finished — the daemon's own machine has no toolchain to run it with and no
+  reason to produce the same answer.
+- **A retry resumes.** `--resume <session>` names a file the agent CLI wrote where it ran.
+- **The checkout is carried once**, not once per attempt.
+
+The daemon still clones, holds the credentials, mints the tokens, and parses what the agent says —
+see [the execution model](execution.md) for how the pieces divide.
 
 ```json
 {
@@ -19,34 +25,32 @@ travels: it goes into the pod before the agent starts and comes back changed whe
       "namespace": "orchestra",
       "mcp_host": "orchestra.orchestra.svc.cluster.local",
       "service_account": "orchestra-agent",
-      "home_claim": "orchestra-agent-home",
       "excludes": [".lake", "node_modules"]
     }
   }
 }
 ```
 
-## what a run looks like
+## what a task looks like
 
 ```
-  create secret + pod ─► wait Ready ─► stage the checkout in ─► touch go
-                                                                  │
-        stdout ◄── kubectl logs -f -c agent                        ▼
-        stderr ◄── kubectl exec -c workspace -- tail -f       the agent runs
-                                                                  │
-   exit code ◄── pod status ◄──────────────────────────────────────┘
-        │
-        └─► copy the checkout back ─► touch release ─► delete pod + secret
+  open ─► create pod ─► wait Ready ─► stage the checkout in
+                                              │
+       init.sh / before.sh ── kubectl exec ────┤
+       the agent ─────────── kubectl exec ────┤   (stdout and stderr arrive separately)
+       validation.sh ─────── kubectl exec ────┤
+       after.sh ──────────── kubectl exec ────┘
+                                              │
+  close ─► copy the checkout back ─► delete the pod
 ```
 
-Each pod has two containers. **`agent`** runs the agent CLI, after waiting for a go-file — which
-is how a workspace gets into a container that is already running — and with its stderr redirected
-to a file, so the pod's log stays a clean event stream. **`workspace`** does nothing but stay
-alive until released, because `kubectl exec` needs a running container and the agent's is gone at
-the moment there is finally something to copy back.
+`orchestra interactive` is the same mechanism with a terminal: `kubectl exec -i -t`, with the
+daemon's own streams handed straight through, so the agent's TUI behaves as it does locally. A
+queued run deliberately gets no TTY — `kubectl exec` merges stdout and stderr as soon as there is
+one, and orchestra reads the two for different things.
 
-Cancelling a task deletes the pod, which ends both streams. Nothing is copied back from a
-cancelled run.
+Cancelling a task deletes the pod, which ends whatever was running in it. Nothing is copied back
+from a cancelled task.
 
 ## what you need
 
@@ -54,9 +58,9 @@ cancelled run.
 start of every task that it is there and that it may create pods, and fails the task with one line
 if not, rather than dispatching into a cluster that will refuse it.
 
-**In the image:** the agent CLI (`claude`, `vibe`, `opencode` or `pi`), `sh`, `tar`, `nc`, `git`,
-and whatever the repositories being worked on need to build. `tar` moves the checkout in and out;
-`nc` is the agent's MCP transport.
+**In the image:** the agent CLI (`claude`, `vibe`, `opencode` or `pi`), `sh`, `bash` (the
+repository's scripts are run with it), `tar`, `nc`, `git`, and whatever the repositories being
+worked on need to build. The same list the daemon's own machine needs, minus `landrun`.
 
 **RBAC** for the daemon's service account, in the namespace the pods run in:
 
@@ -76,15 +80,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["create", "delete"]
 ```
 
 **A route from the pods to the daemon's MCP server.** This is the part that is easy to get wrong
 and silent when it is: without it the agent starts, finds no tools, and does the task by hand — it
-cannot open a pull request, comment, or claim an issue. `mcp_host` is where the pod should look.
-If the daemon runs in the cluster, that is a Service in front of it:
+cannot open a pull request, comment, or claim an issue. `mcp_host` is where the pod should look. If
+the daemon runs in the cluster, that is a Service in front of it:
 
 ```yaml
 apiVersion: v1
@@ -99,82 +100,84 @@ spec:
 ```
 
 The port is not fixed and does not need to be: the daemon starts one MCP server per task on an
-ephemeral port and tells that task's agent which one. What has to be reachable is the daemon's
-pod, on arbitrary high ports, from the agent pods. If the daemon runs outside the cluster, set
-`mcp_host` to an address of that machine which the cluster can route to, and expect to open a port
-range through whatever is in between.
+ephemeral port and tells that task's agent which one. What has to be reachable is the daemon's pod,
+on arbitrary high ports, from the agent pods. If the daemon runs outside the cluster, set
+`mcp_host` to an address of that machine the cluster can route to.
 
 **Authentication happens on its own.** Because the agent is off this machine, the MCP server binds
-`0.0.0.0` rather than loopback, and a one-run token is minted with it. The agent's MCP client
-sends the token as its first line; a connection that presents anything else is closed. The token
-is written only into the agent's own configuration inside its pod. There is nothing to configure,
-and nothing that turns it off.
+`0.0.0.0` rather than loopback, and a one-task token is minted with it. The agent's MCP client
+sends the token as its first line; a connection presenting anything else is closed. The token is
+written only into the agent's own configuration inside its pod. There is nothing to configure, and
+nothing that turns it off.
 
 ## the checkout, and what comes back
 
 The daemon prepares the checkout as it always has — a clone slot per concurrent task — and the
-backend copies it into the pod. Plugin and memory directories go the same way, since they too live
-on the daemon's disk and in no image.
+backend copies it into the pod when the session opens. Plugin and memory directories go the same
+way, since they too live on the daemon's disk and in no image.
 
-On the way back:
+When the task ends:
 
 - the **checkout** is replaced wholesale, so that a file the agent deleted is gone. The new tree is
   assembled beside the old one and swapped in, so a transfer that fails leaves the checkout as it
   was;
-- **memory directories** are merged, because other tasks may be writing to them at the same time.
-  A file the agent deleted survives, which is the lesser mistake;
+- **memory directories** are merged, because other tasks may be writing to them at the same time. A
+  file the agent deleted survives, which is the lesser mistake;
 - **read-only paths**, such as plugin directories, are not copied back at all.
 
 `excludes` keeps build output out of both directions (`.lake`, `target`, `node_modules`). It costs
 a rebuild in the pod and saves copying hundreds of megabytes twice. `sync_back: false` turns the
-return trip off entirely — only right when the agent pushes and nothing local reads the result,
-since the repository's validation script and every `git` command the daemon runs afterwards would
-otherwise see the tree unchanged.
+return trip off entirely — reasonable when the agent pushes and nothing local reads the result,
+since with the hooks and validation now running in the pod, the daemon's copy is mostly there for
+the next task and for anyone looking.
+
+## credentials
+
+Nothing sensitive is passed on a command line or written into the pod's spec — the first is visible
+in the cluster's audit log and in `/proc` inside the pod, the second to anything that can list
+pods. The environment for each command is written to a file inside the pod, over the same channel
+the checkout travels on, and sourced there. Values are quoted, so one containing a quote or a
+newline cannot end its own assignment.
 
 ## operating it
 
-**Orphans.** Pods and secrets are deleted when a run ends, including a cancelled one. A daemon that
-dies mid-run leaves them; `activeDeadlineSeconds` (`deadline_seconds`, four hours by default) is
-what eventually stops the pod, and everything this backend creates carries
-`app.kubernetes.io/managed-by=orchestra`:
+**Orphans.** The pod is deleted when the task ends, including when it fails or is cancelled. A
+daemon that dies mid-task leaves one; `activeDeadlineSeconds` (`deadline_seconds`, four hours by
+default, counted over the whole task) is what eventually stops it, and everything this backend
+creates carries `app.kubernetes.io/managed-by=orchestra`:
 
 ```sh
-kubectl -n orchestra get pod,secret -l app.kubernetes.io/managed-by=orchestra
-kubectl -n orchestra delete pod,secret -l app.kubernetes.io/managed-by=orchestra
+kubectl -n orchestra get pod -l app.kubernetes.io/managed-by=orchestra
+kubectl -n orchestra delete pod -l app.kubernetes.io/managed-by=orchestra
 ```
 
-**Credentials** — the installation token and the agent's API key — travel in a per-run `Secret`
-rather than in the pod's own spec, which anything that can list pods in the namespace can read.
-The secret is deleted with the run.
+Pods are also labelled `orchestra.dev/task=<task id>`, so a running task can be found from its id
+in the dashboard — and `kubectl exec` into for a look around while it works.
 
-**Retries.** A run that fails its repository's validation script is relaunched with `--resume`, and
-the session it resumes is a file the agent CLI wrote under its home. Set `home_claim` to a
-`PersistentVolumeClaim` if you use validation retries: without it each attempt gets a fresh
-`emptyDir` home and has nothing to resume. The claim needs `ReadWriteMany`, or `ReadWriteOnce` with
-all agent pods on one node.
+**Long silences.** An agent run is a single `kubectl exec` connection, and some load balancers and
+API-server configurations drop streams that go idle. The agent's output keeps the connection busy
+most of the time, but a long pause between tool calls is the thing to watch if runs die mid-task
+with no error from the agent itself. If the connection does drop, the agent process in the pod
+outlives it — the next attempt kills whatever the last one left behind before starting, so two
+agents never share a checkout.
 
-**`orchestra interactive` does not work on this backend** and says so: there is no terminal to hand
-a pod. Run it on a machine configured for `landrun`.
-
-**`--debug`** prints the pod manifest and the commands that produce the run, which is the quickest
-way to see what the cluster was actually asked for.
+**`--debug`** prints the pod manifest and the exec command, which is the quickest way to see what
+the cluster was actually asked for.
 
 ## all options
 
 | key | default | what it does |
 | --- | --- | --- |
-| `image` | *required* | image the agent runs in |
+| `image` | *required* | image tasks run in |
 | `mcp_host` | *required* | where the pod reaches this daemon's MCP server |
-| `namespace` | `default` | namespace for the run's pod and secret |
+| `namespace` | `default` | namespace the pod is created in |
 | `kubectl` | `kubectl` | path to the binary |
-| `sidecar_image` | `image` | image for the `workspace` container |
 | `service_account` | *(namespace default)* | `serviceAccountName` for the pod |
 | `image_pull_secrets` | `[]` | `imagePullSecrets` names |
 | `node_selector` | *(none)* | `nodeSelector`, verbatim |
-| `resources` | *(none)* | `resources` for the agent container, verbatim |
+| `resources` | *(none)* | `resources` for the container, verbatim |
 | `volumes` / `volume_mounts` | `[]` | extra volumes and mounts, verbatim — a build cache, most usefully |
-| `home_path` | `/home/agent` | where the agent's `$HOME` is |
-| `home_claim` | *(none)* | PVC to use as `$HOME` instead of an `emptyDir` |
+| `home_path` | `/home/agent` | where the agent's `$HOME` is in the pod |
 | `mcp_bind` | `0.0.0.0` | address the daemon's MCP server binds |
 | `deadline_seconds` | `14400` | `activeDeadlineSeconds` on the pod |
 | `startup_timeout_seconds` | `600` | how long to wait for the pod to be ready |

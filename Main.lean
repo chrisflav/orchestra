@@ -171,12 +171,34 @@ private def prepareHandler (p : Parsed) : IO UInt32 := do
   -- gitignored build output across either, so each slot has to be initialised on its own.
   let repoPath ← Repo.ensureCloned fork upstream
   IO.println repoPath.toString
+  -- Only the part of the configuration that says where things run is read, and a machine that
+  -- has no configuration at all still prepares its slots: `prepare` needs no credentials, and the
+  -- landrun default is the right answer there.
+  let execConfig : ExecutionConfig ←
+    try pure (← loadAppConfig none).execution catch _ => pure {}
+  let execBackend ← match ← Exec.resolve execConfig with
+    | .ok b => pure b
+    | .error e =>
+      IO.eprintln s!"Cannot run the repository's init hook: {e}"
+      return 1
   for slot in List.range slots do
     let slotPath ← Repo.ensureSlot fork upstream { slot }
     -- Run the repo's init hook now rather than inside the first task that lands here, so a
     -- toolchain install or a cold `lake exe cache get` is paid up front instead of counting
     -- against that task's budget and wall clock.
-    RepoConfig.runInitIfNeeded slotPath
+    --
+    -- Through the configured execution backend, because that is where the hook has to run to be
+    -- worth anything: on a daemon that dispatches into a cluster, this machine may have no
+    -- toolchain to install and nothing that reads what it installed.
+    let session ← execBackend.openSession {
+      workdir := slotPath
+      grants  := #[{ path := slotPath.toString, access := .rwx, required := true
+                   , from_ := .orchestra }]
+      label   := s!"prepare-{slot}" }
+    try
+      RepoConfig.runInitIfNeeded session slotPath
+    finally
+      session.close
     IO.println slotPath.toString
   return (0 : UInt32)
 
@@ -1440,13 +1462,24 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   if let some label := resolved then
     IO.println s!"  Auth source: {label}"
     Usage.markUsed backendName label
+  -- The same session a queued task gets, for the same reasons: it is what carries the checkout
+  -- to wherever the agent runs, and what brings it back when the person is done with it.
+  let session ← execBackend.openSession {
+    workdir := repoPath
+    grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths repoPath
+                 false appConfig.pluginDirs #[]
+    label   := "interactive" }
+  IO.println s!"  Running in: {session.id}"
   IO.println "  Launching agent..."
-  let result ← Sandbox.launchAgent agentDef repoPath "" port token
-    (debug := debug) (pluginDirs := appConfig.pluginDirs)
-    (model := model) (budget := budget)
-    (extraEnv := apiKeyEnv) (extraPorts := extraPorts)
-    (additionalPaths := appConfig.additionalSandboxPaths)
-    (interactiveAgent := true) (exec := execBackend) (mcpToken := mcpToken)
+  let result ← try
+      Sandbox.launchAgent agentDef repoPath "" port token
+        (debug := debug) (pluginDirs := appConfig.pluginDirs)
+        (model := model) (budget := budget)
+        (extraEnv := apiKeyEnv) (extraPorts := extraPorts)
+        (additionalPaths := appConfig.additionalSandboxPaths)
+        (interactiveAgent := true) (session := session) (mcpToken := mcpToken)
+    finally
+      session.close
   IO.println s!"  Agent exited with code {result.exitCode}"
   shutdown
   return if result.exitCode == 0 then 0 else 1

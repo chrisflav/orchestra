@@ -10,17 +10,16 @@ This document describes the split those three jobs were pulled apart into, and w
 add a backend — a container runtime, a Kubernetes cluster, a machine over SSH.
 
 ```
-  TaskRunner ────► Sandbox.launchAgent
-                        │
-                        │ builds
-                        ▼
-                    RunSpec ─────────► Exec.Backend ────► Handle
-             what the run needs      how it is run     what is running
-                                            │
-                              landrun │ local │ kubernetes
-                        ◄───────────────────┘
-                supervision: stream parsing, logs,
-                cancellation, usage-limit detection
+  TaskRunner ─── opens ──► Exec.Session ◄─── landrun │ local │ kubernetes
+      │                    the environment for one task
+      │                      │        │         │
+      │  init.sh, before.sh ─┘        │         └─ validation.sh, after.sh
+      │  (Session.runScript)          │            (Session.runScript)
+      │                               │
+      └─► Sandbox.launchAgent ── RunSpec ──► Session.start ──► Handle
+                    │                                            │
+                    └──── supervision: stream parsing, logs, ─────┘
+                          cancellation, usage-limit detection
 ```
 
 ## the three pieces
@@ -51,9 +50,31 @@ reading before writing a backend:
 `$HOME` paths, the checkout, `/tmp`. Backends that can only grant paths which exist say so on the
 way out for those, and stay quiet about the rest — `/nix` on a machine without Nix is not news.
 
+### `Exec.Session` — where the task happens
+
+`Orchestra/Exec/Backend.lean`. A task is not one command. It is `init.sh`, then `before.sh`, then
+the agent, then `validation.sh`, then the agent again if that failed, and `after.sh` at the end —
+and all of it has to happen in one place, on one copy of the checkout. A session is opened once per
+task, everything runs through it, and it is closed when the task ends, however it ended.
+
+| field | what it does |
+| --- | --- |
+| `start` | run the agent, return a `Handle` |
+| `runScript` | run one of the repository's own scripts, where the agent works |
+| `close` | bring back what has to come back, release what was held |
+| `describe` | the run as a command a person can read, for `--debug` |
+| `mcpEndpoint` | where the agent should reach the MCP server |
+| `id` | what to call this environment in a log line |
+
+For landrun and local there is nothing to open: the checkout is already where the daemon put it,
+and `runScript` is `bash` on this machine, exactly as the task runner did it before sessions
+existed. For a backend that runs the agent elsewhere the session is the whole problem — and the
+reason `validation.sh` gets asked its question about the tree the agent actually worked on, rather
+than about a copy on a machine with no toolchain.
+
 ### `Exec.Backend` — how it is run
 
-`Orchestra/Exec/Backend.lean`. Six fields:
+`Orchestra/Exec/Backend.lean`. Five fields:
 
 | field | what it does |
 | --- | --- |
@@ -61,8 +82,7 @@ way out for those, and stay quiet about the rest — `/nix` on a machine without
 | `exposure` | where the MCP server must listen for this backend's agents to reach it |
 | `mcpEndpoint` | rewrites that endpoint into the one the agent can actually reach |
 | `preflight` | one check that this backend can run here, before a task depends on it |
-| `describe` | the run as a command a person can read, for `--debug` |
-| `start` | start the run, return a `Handle` |
+| `openSession` | open an environment for one task |
 
 `exposure` is the one field a backend cannot get away with leaving at its default if it moves the
 agent. `.loopback` means the server is reachable only from this machine, which is the whole of the
@@ -87,9 +107,9 @@ once, for all backends. That is most of the code, and none of it had to move.
 - **`local`** — a plain child process, with no confinement at all. For machines where Landlock is
   unavailable. It says what it is on every launch, and it means it: an agent under it can read and
   write everything the daemon can, orchestra's own configuration and credentials included.
-- **`kubernetes`** — one pod per run, on a cluster reached through `kubectl`. The agent is off this
-  machine entirely; the checkout travels to it and back. `Orchestra/Exec/Kubernetes.lean`, and
-  [docs/kubernetes.md](kubernetes.md) for running it.
+- **`kubernetes`** — one pod per task, on a cluster reached through `kubectl`. The agent is off this
+  machine entirely; the checkout travels to it and back, and the repository's scripts run there
+  too. `Orchestra/Exec/Kubernetes.lean`, and [docs/kubernetes.md](kubernetes.md) for running it.
 
 Selected in `config.json`:
 
@@ -109,7 +129,9 @@ configuration type learning about any of them.
 
 1. Write `Orchestra/Exec/<Name>.lean` with a `factory : BackendFactory` — a name, a one-line
    summary, and `make`, which builds the backend from `execution.options` or says which key is
-   wrong. A backend that needs no settings ignores the argument.
+   wrong. A backend that needs no settings ignores the argument. Its `openSession` returns the
+   session everything else goes through; if the agent runs on this machine, `hostRunScript` is the
+   `runScript` you want, since that is what the task runner always did.
 2. Add it to `Exec.factories` in `Orchestra/Exec.lean`. That is the whole registration: every
    launch path resolves through `Exec.resolve`.
 3. Give `preflight` a real check. It runs once per task, before the clone and the token, and it is
@@ -131,47 +153,45 @@ configuration type learning about any of them.
 
 The mapping is mechanical, which is the point of the interface:
 
-| `RunSpec` | pod |
+| orchestra | pod |
 | --- | --- |
-| `command` + `args` | the `agent` container's `command`, after a wrapper that waits to be started |
-| `workdir` | `workingDir`, on the volume the checkout is staged into |
-| `grants` marked `.orchestra` | `emptyDir` volumes, filled from the daemon's disk before the agent starts |
-| `grants` marked `.environment` | nothing: `/usr`, `/etc` and the agent's home come from the image |
-| `env` | a per-run `Secret`, referenced with `envFrom` |
-| `envPassthrough` | nothing: `PATH` and `HOME` are resolved in the image, which is why they travel by name |
-| `stdio := .piped` | `kubectl logs -f` for stdout; a tailed file for stderr, since a pod's log merges the two |
-| `Handle.wait` | the agent container's `terminated.exitCode`, then the checkout is copied back |
+| `SessionSpec.workdir` | the container's `workingDir`, on the volume the checkout is staged into |
+| `SessionSpec.grants` marked `.orchestra` | `emptyDir` volumes, filled from the daemon's disk when the session opens |
+| `SessionSpec.grants` marked `.environment` | nothing: `/usr`, `/etc` and the agent's home come from the image |
+| `Session.start` | `kubectl exec` — with `-i -t` when the spec asked for the daemon's own terminal |
+| `Session.runScript` | `kubectl exec ... bash <script>`, in the same pod |
+| `Session.close` | copy the checkout back, delete the pod |
+| `RunSpec.env` | a file written into the pod and sourced, never a command line or a pod spec |
+| `RunSpec.envPassthrough` | nothing: `PATH` and `HOME` are resolved in the image, which is why they travel by name |
 | `Handle.kill` | delete the pod |
 | `exposure` | `.network`, so the MCP server binds where a pod can reach it and mints a token |
 | `mcpEndpoint` | rewrites the host to the daemon's cluster address, keeping port and token |
 
-Three things were decisions rather than translations, and they are what the rest of this section is
-about: how the workspace gets there, how the pod reaches the MCP server safely, and how a container
-that has exited can still be copied out of.
+Three things were decisions rather than translations.
 
-**The workspace travels.** The daemon keeps doing everything except running the agent — it clones,
-runs the repository's hooks, and runs the validation script afterwards — so the pod has to start
-from the checkout the daemon prepared and hand it back changed. The alternative, a pod that clones
-for itself, leaves the daemon validating a tree the agent never touched. What travels is exactly
-the grants marked `.orchestra`: the checkout, plugin directories, memory directories. `Provenance`
-exists for this and for nothing else — landrun ignores it entirely.
+**The workspace travels, and the session is what carries it.** The daemon keeps doing everything
+except running things — it clones, mints the tokens, parses the agent's output — so the pod starts
+from the checkout the daemon prepared and hands it back changed. The alternative, a pod that clones
+for itself, leaves the daemon holding a tree nothing wrote to. What travels is exactly the grants
+marked `.orchestra`: the checkout, plugin directories, memory directories. `Provenance` exists for
+this and for nothing else — landrun ignores it entirely.
 
 **Reaching the MCP server needed authentication, not just an address.** The server holds the PAT
-that opens pull requests and posts comments, and it speaks an unauthenticated line protocol,
-which is safe precisely as long as only this machine can connect. `Exec.Exposure` is how a backend
-says that no longer holds: `.network` makes `Server.start` bind wider *and* makes
-`Exec.mcpBinding` mint a one-run token, so neither can happen without the other. The agent sends
-it as its first line — `nc` has no way to do that, so `McpEndpoint.stdioCommand` wraps it in a
-shell that sends the token and gets out of the way. A connection that presents anything else is
-closed rather than asked again.
+that opens pull requests and posts comments, and it speaks an unauthenticated line protocol, which
+is safe precisely as long as only this machine can connect. `Exec.Exposure` is how a backend says
+that no longer holds: `.network` makes `Server.start` bind wider *and* makes `Exec.mcpBinding` mint
+a one-task token, so neither can happen without the other. The agent sends it as its first line —
+`nc` has no way to do that, so `McpEndpoint.stdioCommand` wraps it in a shell that sends the token
+and gets out of the way. A connection that presents anything else is closed rather than asked
+again.
 
-**A container that has exited cannot be `exec`ed into**, and the checkout is only worth copying
-once the agent is done. Hence two containers: the agent's, which exits when the agent does — so
-its log stream ends, which is what tells the daemon to collect an exit code — and a `workspace`
-container that stays alive until released, which is what the copy goes through.
+**A `kubectl exec` connection can die without the process at the far end dying with it**, and the
+daemon cannot tell that from the agent having exited. Left alone, the retry after a failed
+validation would put a second agent in the same checkout as the first. So each agent records its
+process id in the pod and kills whatever the last one left behind before starting.
 
-What is still true of every backend: usage limits, retries, validation hooks and the whole
-result-parsing path are backend-independent by construction. They read what the agent said, not
-where it ran. The one place that is not yet true is `AgentDef.parallelSafe`, which is about a CLI's
-process-global state on one machine — a fixed port, a config file under `$HOME` — and which a
-backend that gives every run its own filesystem makes moot without the queue knowing it.
+What is still true of every backend: usage limits, retries, the validation loop's own logic and the
+whole result-parsing path are backend-independent by construction. They read what the agent said,
+not where it ran. The one place that is not yet true is `AgentDef.parallelSafe`, which is about a
+CLI's process-global state on one machine — a fixed port, a config file under `$HOME` — and which a
+backend that gives every task its own filesystem makes moot without the queue knowing it.

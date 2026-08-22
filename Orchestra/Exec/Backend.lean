@@ -49,10 +49,76 @@ inductive Exposure where
   | network (bindHost : String)
 deriving Repr, BEq, Inhabited
 
+/-- One of the repository's own scripts — `init.sh`, `before.sh`, `validation.sh`, `after.sh` —
+    as an execution environment is asked to run it.
+
+    These are not the agent, but they belong exactly where the agent is: `validation.sh` decides
+    whether the agent's work is finished, and a validation run on a different machine from the one
+    the work happened on is answering a different question. -/
+structure ScriptSpec where
+  /-- The script, as a path in the checkout. -/
+  path : String
+  /-- Where to run it: the checkout. -/
+  workdir : System.FilePath
+  /-- `.inherit` for the hooks, whose output belongs in the daemon log as it happens; `.piped` for
+      `validation.sh`, whose output is fed back to the agent in the retry prompt. -/
+  stdio : Stdio := .inherit
+
+/-- What a script did. -/
+structure ScriptResult where
+  exitCode : UInt32
+  /-- Combined stdout and stderr, captured only under `.piped`; empty otherwise. -/
+  output : String := ""
+
+/-- An execution environment, held for as long as one task.
+
+    A task is not one command. It is `init.sh`, then `before.sh`, then the agent, then
+    `validation.sh`, then the agent again if that failed, and `after.sh` at the end — and all of it
+    has to happen in one place, on one copy of the checkout. For the backends that run on this
+    machine that is true by construction. For one that runs the agent elsewhere it is the whole
+    problem, and a session is the answer: it is opened once, everything runs through it, and it is
+    closed when the task ends.
+
+    It is also what makes the agent's own state outlive a single launch. A run relaunched after a
+    failed validation resumes the session the first attempt started, and that session is a file the
+    agent CLI wrote where it was running. -/
+structure Session where
+  /-- What to call this environment in a log line: a host, a pod name. -/
+  id : String
+  /-- Where the agent should reach the MCP server, given the endpoint orchestra would hand it —
+      this machine's loopback, plus the token if one was minted. Copied from the backend when the
+      session is opened; see `Backend.mcpEndpoint`. -/
+  mcpEndpoint : McpEndpoint → IO McpEndpoint
+  /-- The run as a human-readable command, for `--debug`. What it prints should be close enough to
+      what happens that a person can paste it and see the same thing. -/
+  describe : RunSpec → IO String
+  /-- Start the agent. -/
+  start : RunSpec → IO Handle
+  /-- Run one of the repository's scripts, where the agent works. -/
+  runScript : ScriptSpec → IO ScriptResult
+  /-- Finish: bring back anything that has to come back, and release whatever was held. Called once
+      per task, including when the task failed. -/
+  close : IO Unit
+
+/-- What an execution environment has to be opened with.
+
+    Everything here is known before the agent's own command line is built, which is what lets the
+    session exist before the first thing that runs in it — `init.sh`, which runs before any agent
+    has been launched. -/
+structure SessionSpec where
+  /-- The checkout: where scripts and the agent run. -/
+  workdir : System.FilePath
+  /-- Every path the task was granted. A backend running the agent elsewhere carries the ones
+      marked `.orchestra` there (see `Provenance`); the rest describe an environment it is
+      expected to already have. -/
+  grants : Array PathGrant := #[]
+  /-- What to call the environment where it is created — the task's id. -/
+  label : String := "orchestra"
+
 /-- One way of executing agents.
 
-    Everything a backend needs to know about the task is in the `RunSpec` it is handed;
-    everything orchestra needs to know about the backend is here. -/
+    Everything a backend needs to know about the task is in the specs it is handed; everything
+    orchestra needs to know about the backend is here. -/
 structure Backend where
   /-- The name this backend is selected by in `execution.backend`. -/
   name : String
@@ -72,11 +138,8 @@ structure Backend where
       says so in one line instead of failing every attempt with `could not execute external
       process` and burning the retry budget on it. -/
   preflight : IO (Except String Unit) := pure (.ok ())
-  /-- The run as a human-readable command, for `--debug`. What it prints should be close enough to
-      what the backend does that a person can paste it and see the same thing happen. -/
-  describe : RunSpec → IO String
-  /-- Start the run. -/
-  start : RunSpec → IO Handle
+  /-- Open an environment for one task. -/
+  openSession : SessionSpec → IO Session
 
 namespace Handle
 
@@ -114,6 +177,27 @@ def ofInheritChild
     id     := s!"pid {child.pid}" }
 
 end Handle
+
+/-- Run a repository script on this machine, as `bash <script>` in the checkout.
+
+    Shared by the two backends that run the agent here, and unchanged from what the task runner
+    did itself before sessions existed: the hooks inherit the daemon's streams, and
+    `validation.sh` has its output captured for the retry prompt. -/
+def hostRunScript (spec : ScriptSpec) : IO ScriptResult := do
+  match spec.stdio with
+  | .inherit =>
+    let child ← IO.Process.spawn {
+      cmd := "bash", args := #[spec.path], cwd := spec.workdir
+      stdout := .inherit, stderr := .inherit }
+    return { exitCode := ← child.wait }
+  | .piped =>
+    let child ← IO.Process.spawn {
+      cmd := "bash", args := #[spec.path], cwd := spec.workdir
+      stdout := .piped, stderr := .piped }
+    let stdout ← child.stdout.readToEnd
+    let stderr ← child.stderr.readToEnd
+    let exitCode ← child.wait
+    return { exitCode, output := (stdout ++ stderr).trimAscii.toString }
 
 /-- How a backend is built from the `execution.options` object in `config.json`.
 

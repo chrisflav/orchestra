@@ -59,14 +59,23 @@ def start (spec : RunSpec) : IO Handle := do
     }
     return Handle.ofPipedChild child
 
-/-- Unconfined local execution as an execution backend. -/
+/-- The environment a task gets here: this machine, with nothing between the agent and it. -/
+def session : Session where
+  id := "this machine (unconfined)"
+  mcpEndpoint := pure
+  describe := describe
+  start := start
+  runScript := hostRunScript
+  close := pure ()
+
+/-- Unconfined local execution as an execution backend.
+
+    Reads nothing from `execution.options`: there is nothing to configure about doing nothing. -/
 def backend : Backend where
   name := "local"
   preflight := preflight
-  describe := describe
-  start := start
+  openSession _ := pure session
 
-/-- Reads nothing from `execution.options`: there is nothing to configure about doing nothing. -/
 def factory : BackendFactory where
   name := "local"
   summary := "an ordinary child process, with no confinement at all"

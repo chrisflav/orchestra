@@ -103,15 +103,29 @@ def start (spec : RunSpec) : IO Handle := do
     }
     return Handle.ofPipedChild child
 
-/-- landrun as an execution backend. -/
+/-- The environment a task gets here: this machine.
+
+    There is nothing to open and nothing to close — the checkout is already where the daemon put
+    it, and every launch builds its own ruleset. The repository's scripts run outside the sandbox,
+    as they always have: they are the operator's own code, not the agent's, and they set up and
+    check a working tree the agent is not running in at the time. -/
+def session : Session where
+  id := "this machine"
+  mcpEndpoint := pure
+  describe := describe
+  start := start
+  runScript := hostRunScript
+  close := pure ()
+
+/-- landrun as an execution backend.
+
+    Reads nothing from `execution.options`: what landrun grants comes from the agent backend and
+    from `additional_sandbox_paths`, both of which predate this and stay where they are. -/
 def backend : Backend where
   name := "landrun"
   preflight := preflight
-  describe := describe
-  start := start
+  openSession _ := pure session
 
-/-- Reads nothing from `execution.options`: what landrun grants comes from the agent backend and
-    from `additional_sandbox_paths`, both of which predate this and stay where they are. -/
 def factory : BackendFactory where
   name := "landrun"
   summary := "Landlock confinement on this machine (the default)"

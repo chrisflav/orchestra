@@ -8,15 +8,16 @@ open Orchestra.Exec
 /-!
 # The Kubernetes execution backend
 
-A pod spec is this backend's ruleset, exactly as an argument vector is landrun's, and it is
-checked here the same way: by rendering it, without a cluster to send it to. What the tests are
-holding onto is that the pod says what the run asked for — the agent's own command, the checkout
-mounted where the daemon has it, the environment nowhere but in a `Secret` — and that the things
-the daemon has to carry to the cluster are exactly the things no image could have.
+A pod spec is this backend's ruleset, exactly as an argument vector is landrun's, and it is checked
+here the same way: by rendering it, without a cluster to send it to. What the tests hold onto is
+that the pod says what the task asked for — the checkout mounted where the daemon has it, a
+container that stays up so everything the task consists of can run in it, no credential anywhere a
+cluster reader could find one — and that the shell each command runs under does what it claims,
+which is checked by running it.
 
-The parts that cannot be checked without a cluster are the pod's *lifecycle*: staging the checkout
-in over `kubectl exec`, the two streams, the exit code, copying the workspace back. Those are IO
-against a real API server; what stands in for a test of them is that each has one job and says so.
+What cannot be checked without a cluster is `kubectl` itself: creating the pod, the copies in and
+out, the exec streams. Those are IO against a real API server; what stands in for a test of them is
+that each has one job and says so.
 -/
 
 namespace OrchestraTest.Kubernetes
@@ -32,10 +33,11 @@ private def config (extra : List (String × Json) := []) : Config :=
   | .ok c    => c
   | .error _ => { image := "unparsed", mcpHost := "unparsed" }
 
-private def sampleSpec : RunSpec := {
-  command := "claude"
-  args    := #["-p", "fix the bug"]
+/-- What a task's session is opened with: the checkout it runs on, and every path it was granted.
+    The grants are what `Sandbox.grantsFor` produces for a task with plugins and memories. -/
+private def sampleSession : SessionSpec := {
   workdir := System.FilePath.mk "/var/lib/orchestra/work/acme-widgets-slot0"
+  label   := "t-1234"
   grants  := #[
     { path := "/var/lib/orchestra/work/acme-widgets-slot0", access := .rwx, required := true
     , from_ := .orchestra },
@@ -44,25 +46,21 @@ private def sampleSpec : RunSpec := {
     { path := ".claude", access := .rw, scope := .home, required := true },
     { path := "/opt/orchestra/plugins", access := .rox, from_ := .orchestra },
     { path := "/var/lib/orchestra/memories/acme", access := .rw, from_ := .orchestra }]
-  ports   := { connect := #[8080, 443] }
-  env     := #[("GH_TOKEN", "ghs_averysecrettoken"), ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")]
-  envPassthrough := #["PATH", "HOME"]
 }
 
-private def staged : Array StagedPath := stagedPaths (config) "/home/daemon" sampleSpec
+private def staged : Array StagedPath := stagedPaths (config) "/home/daemon" sampleSession
 
-private def manifest : Json :=
-  podManifest (config) sampleSpec "orchestra-abc123" "orchestra-abc123-env" staged
+private def manifest : Json := podManifest (config) sampleSession "orchestra-abc123" staged
 
-private def container (name : String) : Option Json :=
+private def container : Option Json :=
   match manifest.getObjVal? "spec" |>.toOption |>.bind (·.getObjVal? "containers" |>.toOption) with
-  | some (.arr cs) => cs.find? fun c => (c.getObjValAs? String "name" |>.toOption) == some name
+  | some (.arr cs) => cs[0]?
   | _              => none
 
-private def strings (j : Option Json) : List String :=
-  match j with
-  | some (.arr a) => a.toList.filterMap fun v => match v with | .str s => some s | _ => none
-  | _             => []
+private def mountPaths : List String :=
+  match container.bind (·.getObjVal? "volumeMounts" |>.toOption) with
+  | some (.arr ms) => ms.toList.filterMap (·.getObjValAs? String "mountPath" |>.toOption)
+  | _              => []
 
 /-! ## Configuration -/
 
@@ -140,172 +138,147 @@ def whatComesBackIsWhatCouldBeWritten : Test := do
 /-! ## The pod -/
 
 @[test]
-def thePodRunsTheAgentTheSpecNamed : Test := do
-  match container "agent" with
-  | none   => TestM.fail "there is no agent container"
+def thePodIsAPlaceToRunThingsRatherThanOneCommand : Test := do
+  -- The task is `init.sh`, `before.sh`, the agent, `validation.sh`, the agent again, `after.sh`.
+  -- The container has to be there for all of it, so it runs nothing of its own and everything is
+  -- `kubectl exec`ed into it.
+  match container with
+  | none   => TestM.fail "the pod has no container"
   | some c =>
-    let cmd := strings (c.getObjVal? "command" |>.toOption)
-    TestM.assertEqual (cmd.take 2) ["/bin/sh", "-c"] (msg := "the wrapper is a shell script")
-    -- Everything after the script and the shell's `$0` is the agent's own argv, unchanged.
-    TestM.assertEqual (cmd.drop 4) ["claude", "-p", "fix the bug"] (msg := "the agent's argv")
+    let cmd : List String := match c.getObjVal? "command" |>.toOption with
+      | some (.arr a) => a.toList.filterMap fun v =>
+          match v with | Json.str s => some s | _ => none
+      | _             => []
+    TestM.assertEqual (cmd.take 2) ["/bin/sh", "-c"] (msg := "it runs a shell")
+    TestM.assert (AgentDef.containsCI (cmd.getD 2 "") "sleep") "that does nothing but wait"
     TestM.assertEqual (c.getObjValAs? String "workingDir" |>.toOption)
-      (some "/var/lib/orchestra/work/acme-widgets-slot0") (msg := "it starts in the checkout")
+      (some "/var/lib/orchestra/work/acme-widgets-slot0") (msg := "rooted in the checkout")
     TestM.assertEqual (c.getObjValAs? String "image" |>.toOption)
       (some "ghcr.io/example/agent:1") (msg := "image")
 
 @[test]
-def theWrapperWaitsToBeToldToStart : Test := do
-  -- The workspace is copied in after the container is running, because there is no earlier moment
-  -- to copy it at; the go-file is what keeps the agent from starting before it arrives.
-  TestM.assert (AgentDef.containsCI agentScript "/orchestra/go") "it waits for the go file"
-  TestM.assert (AgentDef.containsCI agentScript "2>/orchestra/stderr")
-    "and sends its stderr to a file, so the pod log stays a clean event stream"
-  TestM.assert (AgentDef.containsCI agentScript "/orchestra/exit") "and records its exit code"
-
-@[test]
-def aSecondContainerOutlivesTheAgent : Test := do
-  -- `kubectl exec` needs a running container, and the agent's is gone at exactly the moment there
-  -- is something to copy back out of it.
-  match container "workspace" with
-  | none   => TestM.fail "there is no workspace container"
-  | some c =>
-    TestM.assert (AgentDef.containsCI sidecarScript "/orchestra/release")
-      "it stays alive until the daemon releases it"
-    let mounts := c.getObjVal? "volumeMounts" |>.toOption
-    match mounts with
-    | some (.arr ms) =>
-      let paths := ms.toList.filterMap (·.getObjValAs? String "mountPath" |>.toOption)
-      TestM.assert (paths.contains "/var/lib/orchestra/work/acme-widgets-slot0")
-        "and it can see the checkout, or it could not copy it"
-      TestM.assert (paths.contains "/orchestra") "and the control directory"
-    | _ => TestM.fail "the workspace container mounts nothing"
-
-@[test]
 def theCheckoutIsMountedWhereTheDaemonHasIt : Test := do
-  match container "agent" with
-  | none   => TestM.fail "there is no agent container"
-  | some c =>
-    match c.getObjVal? "volumeMounts" |>.toOption with
-    | some (.arr ms) =>
-      let paths := ms.toList.filterMap (·.getObjValAs? String "mountPath" |>.toOption)
-      TestM.assert (paths.contains "/var/lib/orchestra/work/acme-widgets-slot0") "the checkout"
-      TestM.assert (paths.contains "/opt/orchestra/plugins") "the plugin directory"
-      TestM.assert (paths.contains "/home/agent") "a writable home"
-      TestM.assert (paths.contains "/orchestra") "the control directory"
-    | _ => TestM.fail "the agent container mounts nothing"
+  TestM.assert (mountPaths.contains "/var/lib/orchestra/work/acme-widgets-slot0") "the checkout"
+  TestM.assert (mountPaths.contains "/opt/orchestra/plugins") "the plugin directory"
+  TestM.assert (mountPaths.contains "/var/lib/orchestra/memories/acme") "the memories"
+  TestM.assert (mountPaths.contains "/home/agent") "a writable home"
+  TestM.assert (mountPaths.contains "/orchestra") "and orchestra's own control directory"
 
 @[test]
-def thePodIsNotAllowedToOutliveTheRun : Test := do
+def theAgentsHomeIsPodLocalAndLastsTheTask : Test := do
+  -- Everything the agent CLI writes about itself — its session above all, which a validation retry
+  -- resumes — lives here. It survives every command in the task because the pod does, and nothing
+  -- of it survives the task.
+  let volumes := match manifest.getObjVal? "spec" |>.toOption
+                       |>.bind (·.getObjVal? "volumes" |>.toOption) with
+    | some (.arr vs) => vs.toList
+    | _              => []
+  match volumes.find? fun v => (v.getObjValAs? String "name" |>.toOption) == some "home" with
+  | none   => TestM.fail "the pod has no home volume"
+  | some v => TestM.assert (AgentDef.containsCI v.compress "emptyDir") "home is pod-local scratch"
+  match container.bind (·.getObjVal? "env" |>.toOption) with
+  | some (.arr env) =>
+    TestM.assert (env.any fun e => (e.getObjValAs? String "value" |>.toOption) == some "/home/agent")
+      "and HOME points at it, since the image's idea of home is not orchestra's"
+  | _ => TestM.fail "the container has no environment"
+
+@[test]
+def thePodIsNotAllowedToOutliveTheTask : Test := do
   match manifest.getObjVal? "spec" |>.toOption with
   | none => TestM.fail "the manifest has no spec"
   | some spec =>
     TestM.assertEqual (spec.getObjValAs? String "restartPolicy" |>.toOption) (some "Never")
-      (msg := "a failed agent is a failed run, not a retry the daemon cannot see")
-    -- The backstop for a daemon that dies mid-run: without it the pod would hold a token and a
-    -- checkout until someone noticed.
+      (msg := "nothing restarts behind the daemon's back")
+    -- The backstop for a daemon that dies mid-task: without it the pod would hold a checkout until
+    -- someone noticed.
     TestM.assertEqual (spec.getObjValAs? Nat "activeDeadlineSeconds" |>.toOption) (some 14400)
-      (msg := "the cluster kills the pod eventually, whatever the daemon is doing")
+      (msg := "the cluster ends it eventually, whatever the daemon is doing")
 
-/-! ## The shell the pod actually runs
-
-The two scripts below are the only real logic this backend runs inside the cluster, and both are
-load-bearing in a way a rendering test cannot reach: one decides when the agent starts and what
-its exit code was, the other decides whether the daemon ever stops waiting. They take the control
-directory as a parameter precisely so they can be run here, by the same `/bin/sh`, against a
-directory in `/tmp`. -/
-
-private def scratchDir : IO System.FilePath := do
-  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-test-{← Exec.randomHex 6}"
-  IO.FS.createDirAll dir
-  return dir
+/-! ## Running something in the pod -/
 
 @[test]
-def theWrapperHoldsTheAgentUntilTheWorkspaceArrives : Test := do
-  let dir ← scratchDir
+def credentialsAreNeitherInThePodNorOnACommandLine : Test := do
+  -- A pod's spec is readable by anything that can list pods, and a command line shows up in the
+  -- cluster's audit log and in `/proc` inside the pod. The environment goes in a file instead,
+  -- copied in over the same channel as the checkout.
+  TestM.assert (!AgentDef.containsCI manifest.compress "ghs_")
+    "the pod carries no environment of its own beyond HOME"
+  let env := envFileContents #[("GH_TOKEN", "ghs_averysecrettoken"), ("EMPTY", "")]
+  TestM.assert (AgentDef.containsCI env "export GH_TOKEN=") "the file exports what was asked for"
+  TestM.assert (AgentDef.containsCI env "ghs_averysecrettoken") "with the value"
+  let args := execArgs (config) "orchestra-abc123" false "script" "claude" #["-p", "do it"]
+  TestM.assert (!args.any fun a => AgentDef.containsCI a "ghs_")
+    "and no credential reaches the command line"
+
+@[test]
+def anInteractiveRunAsksForATerminal : Test := do
+  -- This is what makes `orchestra interactive` work on a cluster: the same exec, with a TTY, and
+  -- the daemon's own streams handed through.
+  let plain := execArgs (config) "pod-1" false "script" "claude" #["-p", "x"]
+  let tty   := execArgs (config) "pod-1" true  "script" "claude" #[]
+  TestM.assert (!plain.contains "-t") "a queued run has no terminal to give"
+  TestM.assert (tty.contains "-t" && tty.contains "-i") "an interactive one asks for both"
+  -- The agent's own argv survives intact in either case, after the `--` that ends kubectl's flags.
+  TestM.assertEqual (plain.toList.drop (plain.toList.length - 3)) ["claude", "-p", "x"]
+    (msg := "the command and its arguments")
+  TestM.assert (plain.contains "--") "separated from kubectl's own flags"
+
+@[test]
+def theRunnerScriptSourcesTheEnvironmentAndBecomesTheCommand : Test := do
+  -- Run for real, by the same `/bin/sh` that runs it in the pod: an environment file it sources, a
+  -- directory it has to change to, and a command it must `exec` rather than wrap — so that what
+  -- the container kills is the agent.
+  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-test-{← Exec.randomHex 6}"
+  IO.FS.createDirAll (dir / "work")
+  let envFile := dir / "env"
+  IO.FS.writeFile envFile (envFileContents #[("GREETING", "hello from the env file")])
   let child ← IO.Process.spawn {
     cmd := "/bin/sh"
-    args := #["-c", agentScript dir.toString, "orchestra-agent",
-              "/bin/sh", "-c", "echo hello; echo trouble 1>&2; exit 3"]
+    args := #["-c", runnerScript envFile.toString (dir / "work").toString, "orchestra",
+              "/bin/sh", "-c", "echo \"$GREETING from $(pwd)\"; exit 7"]
     stdin := .null, stdout := .piped, stderr := .piped }
-  -- Nothing runs until the go-file appears: this is what makes it safe to copy a repository into
-  -- a container that is already running.
-  IO.sleep 400
-  TestM.assert (!(← (dir / "exit").pathExists)) "the agent has not run yet"
-  IO.FS.writeFile (dir / "go") ""
   let line ← child.stdout.getLine
   let exitCode ← child.wait
-  TestM.assertEqual line.trimAscii.toString "hello" (msg := "stdout is the pod's log")
-  TestM.assertEqual exitCode 3 (msg := "the container exits with the agent's code")
-  -- stderr goes to a file rather than the log, because a pod's log merges the two and orchestra
-  -- reads them for different things — events on one, a usage limit on the other.
-  TestM.assertEqual (← IO.FS.readFile (dir / "stderr")).trimAscii.toString "trouble"
-    (msg := "stderr was captured separately")
-  TestM.assertEqual (← IO.FS.readFile (dir / "exit")).trimAscii.toString "3"
-    (msg := "and the exit code is left where the sidecar can still be asked for it")
   try IO.FS.removeDirAll dir catch _ => pure ()
+  TestM.assert (AgentDef.containsCI line "hello from the env file")
+    "the environment file was sourced"
+  TestM.assert (AgentDef.containsCI line (dir / "work").toString)
+    "and the command ran in the checkout"
+  TestM.assertEqual exitCode 7 (msg := "its exit code is the one the caller sees")
 
 @[test]
-def theStderrStreamEndsWhenTheAgentDoes : Test := do
-  -- The hang this rules out: the daemon drains both streams before it collects an exit code, so a
-  -- `tail -f` that outlived the run would stall the task for as long as the pod's deadline.
-  let dir ← scratchDir
-  IO.FS.writeFile (dir / "stderr") "first line
-"
+def anAgentShootsWhateverTheLastOneLeftBehind : Test := do
+  -- A `kubectl exec` connection can die without the process at the far end dying with it, and the
+  -- daemon cannot tell that from the agent having exited. Without this, the retry after a failed
+  -- validation would put a second agent in the same checkout as the first.
+  let script := runnerScript "/orchestra/env-1" "/work" (guard := true)
+  TestM.assert (AgentDef.containsCI script "kill -9") "the previous agent is killed"
+  TestM.assert (AgentDef.containsCI script agentPidPath) "by the id it recorded"
+  TestM.assert (AgentDef.containsCI script "echo $$") "and this one records its own"
+  -- Only the agent: a hook or the validation script killing the agent would be a bug of its own.
+  let plain := runnerScript "/orchestra/env-2" "/work"
+  TestM.assert (!AgentDef.containsCI plain "kill") "the repository's own scripts kill nothing"
+
+@[test]
+def anEnvironmentValueCannotEndItsOwnAssignment : Test := do
+  -- The values here are a GitHub token and an API key, but also a system prompt and a model name;
+  -- one of them containing a quote must not turn into a second command.
+  let env := envFileContents #[("EVIL", "'; touch /tmp/orchestra-pwned; echo '")]
+  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-test-{← Exec.randomHex 6}"
+  IO.FS.createDirAll dir
+  IO.FS.writeFile (dir / "env") env
   let child ← IO.Process.spawn {
-    cmd := "/bin/sh", args := #["-c", stderrScript dir.toString]
+    cmd := "/bin/sh"
+    args := #["-c", runnerScript (dir / "env").toString dir.toString, "orchestra",
+              "/bin/sh", "-c", "printf '%s' \"$EVIL\""]
     stdin := .null, stdout := .piped, stderr := .piped }
-  let line ← child.stdout.getLine
-  TestM.assertEqual line.trimAscii.toString "first line" (msg := "it streams what is there")
-  IO.FS.writeFile (dir / "exit") "0
-"
-  let exitCode ← child.wait
-  TestM.assertEqual exitCode 0 (msg := "and ends itself once the agent has recorded its exit")
+  let out ← child.stdout.readToEnd
+  let _ ← child.wait
   try IO.FS.removeDirAll dir catch _ => pure ()
-
-@[test]
-def homeIsAPodLocalScratchUnlessAClaimIsNamed : Test := do
-  let volumes (j : Json) : List Json :=
-    match j.getObjVal? "spec" |>.toOption |>.bind (·.getObjVal? "volumes" |>.toOption) with
-    | some (.arr vs) => vs.toList
-    | _              => []
-  let home (j : Json) : Option Json :=
-    (volumes j).find? fun v => (v.getObjValAs? String "name" |>.toOption) == some "home"
-  match home manifest with
-  | none   => TestM.fail "the pod has no home volume"
-  | some v =>
-    TestM.assert (AgentDef.containsCI v.compress "emptyDir")
-      "by default the agent's state lives and dies with the pod"
-  -- With a claim it survives, which is what makes a validation retry able to `--resume` the
-  -- session the first attempt started: that session is a file under the agent's home.
-  let withClaim := podManifest (config [("home_claim", .str "orchestra-agent-home")])
-    sampleSpec "orchestra-abc123" "orchestra-abc123-env" staged
-  match home withClaim with
-  | none   => TestM.fail "the pod has no home volume"
-  | some v =>
-    TestM.assert (AgentDef.containsCI v.compress "orchestra-agent-home")
-      "a configured claim becomes the agent's home"
-    TestM.assert (!AgentDef.containsCI v.compress "emptyDir") "and replaces the scratch volume"
-
-/-! ## Credentials -/
-
-@[test]
-def theEnvironmentTravelsInASecretAndNotInThePod : Test := do
-  -- A pod's spec is readable by anything that can list pods in the namespace, and the environment
-  -- is where the installation token and the agent's API key are.
-  TestM.assert (!AgentDef.containsCI manifest.compress "ghs_averysecrettoken")
-    "no credential appears in the pod manifest"
-  match container "agent" with
-  | none   => TestM.fail "there is no agent container"
-  | some c =>
-    TestM.assert (AgentDef.containsCI c.compress "orchestra-abc123-env")
-      "the agent's environment comes from the run's secret"
-  let secret := secretManifest (config) sampleSpec "orchestra-abc123-env" "orchestra-abc123"
-  TestM.assertEqual
-    (secret.getObjVal? "stringData" |>.toOption |>.bind
-      (·.getObjValAs? String "GH_TOKEN" |>.toOption))
-    (some "ghs_averysecrettoken") (msg := "the secret carries it instead")
-  TestM.assert (AgentDef.containsCI secret.compress "orchestra.dev/run")
-    "and it is labelled with the run, so an orphan can be found and deleted"
+  TestM.assertEqual out "'; touch /tmp/orchestra-pwned; echo '"
+    (msg := "the value arrives as itself")
+  TestM.assert (!(← System.FilePath.pathExists (System.FilePath.mk "/tmp/orchestra-pwned")))
+    "and nothing in it ran"
 
 /-! ## Reaching the daemon from the cluster -/
 
@@ -325,8 +298,8 @@ def theBackendMovesTheEndpointAndKeepsTheToken : Test := do
 @[test]
 def anExposedServerAlwaysGetsAToken : Test := do
   let (bind, token) ← Exec.mcpBinding { name := "test", exposure := .network "0.0.0.0"
-                                      , describe := fun _ => pure "", start := fun _ =>
-                                          throw (IO.userError "not started") }
+                                      , openSession := fun _ =>
+                                          throw (IO.userError "not opened") }
   TestM.assertEqual bind "0.0.0.0" (msg := "bind address")
   match token with
   | none   => TestM.fail "a server reachable over a network was left unauthenticated"
@@ -359,62 +332,58 @@ private def testServerState (token : Option String) : Server.State :=
     appId := 0, privateKeyPath := "", installationId := 0, pat := ""
     authToken := token }
 
-/-- Ask an MCP server for its tool list the way an agent would: through the command
-    `McpEndpoint.stdioCommand` produces, token and all. Returns whatever the server said, or `""`
-    when it said nothing.
+private def await (p : IO.Promise (Except IO.Error α)) : IO α := do
+  match ← IO.wait p.result! with
+  | .error e => throw e
+  | .ok v    => return v
 
-    Both sides go through files and the answer is collected after a fixed wait, rather than by
-    reading until end-of-file. A client that is refused is *supposed* to be told nothing, and
-    "nothing, ever" is not a thing a blocking read can distinguish from "not yet". -/
-private def askOverStdio (endpoint : McpEndpoint) : IO String := do
-  let tag ← Exec.randomHex 6
-  let inPath  := s!"/tmp/orchestra-mcp-{tag}.in"
-  let outPath := s!"/tmp/orchestra-mcp-{tag}.out"
-  IO.FS.writeFile inPath "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n"
-  IO.FS.writeFile outPath ""
-  let (cmd, args) := endpoint.stdioCommand
-  let rendered := String.intercalate " " ((#[cmd] ++ args).toList.map Exec.shellEscape)
-  let child ← IO.Process.spawn {
-    cmd := "/bin/sh"
-    args := #["-c", s!"{rendered} < {inPath} > {outPath} 2>/dev/null"]
-    stdin := .null, stdout := .null, stderr := .null }
-  IO.sleep 1500
-  Exec.Handle.killPid child.pid
-  let _ ← child.wait
-  let out ← IO.FS.readFile (System.FilePath.mk outPath)
-  try IO.FS.removeFile (System.FilePath.mk inPath) catch _ => pure ()
-  try IO.FS.removeFile (System.FilePath.mk outPath) catch _ => pure ()
-  return out
+/-- Open one connection to the MCP server on `port`, send `lines`, and return what came back —
+    `""` if the server hung up without saying anything.
+
+    Blocking on the answer is safe here precisely because of the property being tested: a client is
+    either served or disconnected, so something always arrives. An agent reaches the same socket
+    through `nc` (see `theClientSendsItsTokenBeforeAnythingElse` for the command that puts the
+    token on it); a socket is used here because `nc` does not exit when the far end hangs up while
+    its own stdin is still open, which would leave a test waiting on a pipe forever. -/
+private def ask (port : UInt16) (lines : List String) : IO String := do
+  let sock ← Std.Internal.UV.TCP.Socket.new
+  let addr := Std.Net.SocketAddress.v4 { addr := Std.Net.IPv4Addr.ofParts 127 0 0 1, port }
+  await (← sock.connect addr)
+  for l in lines do
+    await (← sock.send #[(l ++ "\n").toUTF8])
+  let answer ← match ← await (← sock.recv? 65536) with
+    | none       => pure ""
+    | some bytes => pure (String.fromUTF8! bytes)
+  -- Closed from this side too, so the server's handler stops waiting on a connection nobody is
+  -- going to say anything else on.
+  try await (← sock.shutdown) catch _ => pure ()
+  return answer
+
+private def toolsList : String := "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"
 
 @[test]
 def anAgentWithTheTokenIsServedAndOneWithoutIsNot : Test := do
-  -- The whole remote path, minus the network: a server that had to listen off loopback, the
-  -- transport `stdioCommand` builds for it, and the token the two agree on. `nc` is doing here
-  -- exactly what it does inside a pod.
-  if !(← System.FilePath.pathExists (System.FilePath.mk "/usr/bin/nc")) then
-    TestM.skip "nc is not installed, and it is what an agent's MCP transport is made of"
-    return ()
+  -- The server as a pod would find it: listening for something that is not on this machine, and
+  -- letting in only what presents the secret minted with it.
   let token := "s3cret-" ++ (← Exec.randomHex 8)
   let (port, shutdown) ← Server.start (testServerState (some token)) (bindHost := "127.0.0.1")
-  let served ← askOverStdio { host := "127.0.0.1", port, token := some token }
-  let refused ← askOverStdio { host := "127.0.0.1", port, token := some "not-the-token" }
-  let silent ← askOverStdio { host := "127.0.0.1", port }
+  let served ← ask port [token, toolsList]
+  let wrong  ← ask port ["not-the-token", toolsList]
+  let silent ← ask port [toolsList]
   shutdown
   TestM.assert (AgentDef.containsCI served "tools") "an agent holding the token gets its tools"
-  TestM.assertEqual refused "" (msg := "one with the wrong token is hung up on, not retried")
-  TestM.assertEqual silent "" (msg := "and so is one that never presents a token at all")
+  TestM.assertEqual wrong "" (msg := "one with the wrong token is hung up on, not asked again")
+  TestM.assertEqual silent ""
+    (msg := "and so is one that starts talking without presenting a token at all")
 
 @[test]
 def aLoopbackServerIsUnchanged : Test := do
-  -- No token configured, no line expected: the protocol for a local run is exactly what it was
-  -- before any of this existed.
-  if !(← System.FilePath.pathExists (System.FilePath.mk "/usr/bin/nc")) then
-    TestM.skip "nc is not installed"
-    return ()
+  -- No token configured, no line expected: for a local run the protocol is exactly what it was
+  -- before any of this existed, which is what keeps `nc <host> <port>` a working transport.
   let (port, shutdown) ← Server.start (testServerState none)
-  let served ← askOverStdio { host := "127.0.0.1", port }
+  let served ← ask port [toolsList]
   shutdown
-  TestM.assert (AgentDef.containsCI served "tools") "a plain nc client is served as before"
+  TestM.assert (AgentDef.containsCI served "tools") "a client that sends no token is served"
 
 @[test]
 def theServerBindsWhatItIsTold : Test := do

@@ -46,9 +46,10 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
 - **Credentials the agent never sees.** A GitHub App installation token is minted per task and
   handed to `gh` for git transport only. The personal access token used for upstream pull
   requests, reviews and comments stays in the MCP server process.
-- **Agents where you need them.** Every run goes through an execution backend: landrun on this
-  machine by default, or a Kubernetes cluster, one pod per run, with the checkout carried there and
-  back and the MCP server authenticated per run → [kubernetes](docs/kubernetes.md)
+- **Agents where you need them.** Every task goes through an execution backend: landrun on this
+  machine by default, or a Kubernetes cluster, one pod per task, running the repository's hooks and
+  validation where the agent works, with the MCP server authenticated per task →
+  [kubernetes](docs/kubernetes.md)
 - **Four agent backends** — `claude` (Claude Code), `vibe` (mistral-vibe), `opencode` and `pi` —
   plus two built-in agent-less backends: `merger`, which lands an approved pull request, and
   `triage`, which applies and removes labels deterministically.
@@ -597,8 +598,9 @@ are described once, as a backend-neutral spec, and an *execution backend* render
 the default and the one described above. `local` runs the agent with no confinement at all, for
 machines without Landlock — an agent under it can read and write everything the daemon can,
 orchestra's own credentials included, so it is opt-in and says so on every launch. `kubernetes`
-runs each agent in a pod of its own on a cluster, with the checkout copied in before the run and
-back out after it → [running agents on a Kubernetes cluster](docs/kubernetes.md)
+gives each task a pod on a cluster and runs everything in it — the repository's hooks, the agent,
+the validation script and its retries — with the checkout copied in when the task starts and back
+out when it ends → [running agents on a Kubernetes cluster](docs/kubernetes.md)
 
 ```json
 {
