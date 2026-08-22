@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { LogEvent } from "../api";
 
@@ -141,6 +141,45 @@ function LogEntry({ event, maxBlob }: { event: LogEvent; maxBlob: number }) {
   }
 }
 
+/** Is this event a tool being called, or a tool answering? */
+function isToolwork(event: LogEvent): boolean {
+  return event.type === "tool_result" || (event.type === "assistant" && event.item?.type === "tool_use");
+}
+
+/**
+ * A run of tool calls and their output, behind one line saying how many there were.
+ *
+ * Collapsed by default because in a conversation they are not the conversation: a turn that
+ * reads six files to answer one question is six calls and six blobs of output around one
+ * sentence, and left open the sentence is what you have to hunt for. The count is the part
+ * worth seeing at a glance — that work happened, and how much — with the detail one click away
+ * for when it is what you actually came for.
+ */
+function ToolRun({ events, maxBlob }: { events: LogEvent[]; maxBlob: number }) {
+  const [open, setOpen] = useState(false);
+  const calls = events.filter((e) => e.type === "assistant").length;
+  // A run with results but no calls is a torn transcript, not nothing — but it is not evidence
+  // of calls either, so it says what it actually has.
+  const n = calls > 0 ? calls : events.length;
+  const noun = calls > 0 ? "tool" : "tool result";
+  return (
+    <div className="log-tools">
+      <button
+        type="button"
+        className="log-tools-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
+        <span className="log-tools-caret" aria-hidden="true">
+          {open ? "▾" : "▸"}
+        </span>
+        {`called ${n} ${noun}${n === 1 ? "" : "s"}`}
+      </button>
+      {open && events.map((event, i) => <LogEntry key={i} event={event} maxBlob={maxBlob} />)}
+    </div>
+  );
+}
+
 /**
  * The task log, pinned to the bottom while the reader is already there.
  *
@@ -161,6 +200,7 @@ export function LogView({
   truncated,
   empty = "This task has no log file.",
   flow = false,
+  collapseTools = false,
   maxBlob = MAX_BLOB,
 }: {
   events: LogEvent[];
@@ -168,6 +208,8 @@ export function LogView({
   truncated: boolean;
   /** Draw as part of the caller's page — no panel, no scroll box, no pinning. */
   flow?: boolean;
+  /** Fold each run of tool calls and their output behind a line saying how many. */
+  collapseTools?: boolean;
   /** How much of one blob to render before cutting it. See `MAX_BLOB`. */
   maxBlob?: number;
   /** What to say when there is nothing to show. Only the page knows why there isn't. */
@@ -191,6 +233,17 @@ export function LogView({
     if (el) pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
   };
 
+  // Consecutive toolwork becomes one run; everything else stays one entry per event. Without
+  // `collapseTools` nothing is toolwork, so this is a single run rendered one entry per event —
+  // exactly what the task log has always drawn.
+  const runs: { tools: boolean; events: LogEvent[] }[] = [];
+  for (const event of events) {
+    const tools = collapseTools && isToolwork(event);
+    const last = runs[runs.length - 1];
+    if (last && last.tools === tools) last.events.push(event);
+    else runs.push({ tools, events: [event] });
+  }
+
   return (
     <div className={flow ? "log-plain" : "panel"}>
       {truncated && (
@@ -199,11 +252,17 @@ export function LogView({
         </div>
       )}
       <div className={flow ? "log log-flow" : "log"} ref={ref} onScroll={onScroll}>
-        {events.map((event, i) => (
+        {runs.map((run, i) =>
           // Log events are append-only and carry no id, so position is a stable key here:
-          // index `i` always names the same event for as long as the tail window holds.
-          <LogEntry key={i} event={event} maxBlob={maxBlob} />
-        ))}
+          // index `i` always names the same run for as long as the tail window holds.
+          run.tools ? (
+            <ToolRun key={i} events={run.events} maxBlob={maxBlob} />
+          ) : (
+            run.events.map((event, j) => (
+              <LogEntry key={`${i}-${j}`} event={event} maxBlob={maxBlob} />
+            ))
+          ),
+        )}
       </div>
     </div>
   );
