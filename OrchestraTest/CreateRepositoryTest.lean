@@ -25,13 +25,15 @@ the name check that stops a name GitHub would have quietly renamed.
 
 /-! ## Permission gating -/
 
-private def state (tools : List String) (org : Option String := some "fork-org") : State :=
-  { upstream := { owner := "up", name := "repo" }
-  , fork     := { owner := "fork", name := "repo" }
+private def state (tools : List String) (org : Option String := some "fork-org")
+    (repo : Option RepoPair := some { upstream := { owner := "up",   name := "repo" }
+                                    , fork     := { owner := "fork", name := "repo" } })
+    : State :=
+  { repo
   , allowedTools := tools
   , appId := 0
   , privateKeyPath := ""
-  , installationId := 0
+  , installationId := some 0
   , pat := "pat"
   , defaultOrganization := org }
 
@@ -59,6 +61,20 @@ def createRepository_deniedWhenOnlyOtherToolsAreGranted : Test := do
   -- repository: the tools a task holds are the ones it was given, not a category.
   let result ← evalToolCall (state ["create_pr", "merge_pr", "comment"]) call
   TestM.assert (isError result) "create_pr and merge_pr do not imply create_repository"
+
+@[test]
+def createRepository_survivesATaskWithNoRepository : Test := do
+  -- The one repository-writing tool a repository-independent task keeps. It creates a repository
+  -- in `default_organization` rather than acting on one the task named, so nothing about it needs
+  -- an `upstream`/`fork` pair — which is why it is not in `repoScopedTools`. The refusal below is
+  -- the destination check, not the "acts on a repository, and this task runs without one" one,
+  -- and that is the whole point: it got past the gate the others do not.
+  let result ← evalToolCall (state ["create_repository"] (org := none) (repo := none)) call
+  let text := textOf result
+  TestM.assert (!text.contains "runs without one")
+    "create_repository is not refused for want of a repository the task never needed"
+  TestM.assert (text.contains "default_organization")
+    "it reaches the destination check like any other task's would"
 
 @[test]
 def createRepository_grantedButNoOrganisationIsReported : Test := do

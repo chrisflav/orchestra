@@ -25,8 +25,9 @@ orchestra run --debug workflow.yaml
 name: my-workflow
 description: Optional human-readable description
 
-# Default repository for every step. Both fields are optional if every
-# step supplies its own upstream/fork.
+# Default repository for every step. Both fields are optional if every step supplies its own
+# upstream/fork — or if the workflow works on no repository at all, in which case its steps run
+# repository-independent (see below).
 upstream: owner/repo
 fork: your-org/fork
 
@@ -469,7 +470,8 @@ setting `workflow_path`:
 When `workflow_path` is set the listener:
 
 1. Reads and parses the YAML workflow.
-2. Substitutes `upstream` and `fork` from the event into the parsed program.
+2. Substitutes `upstream` and `fork` from the event into the parsed program, where the event
+   has them. A listener with neither leaves the workflow's own values in place.
 3. Spawns a new `IO.asTask` fiber that calls `evalQueued` with the concert
    manager and app config.
 
@@ -498,3 +500,14 @@ steps:
 When absent the program-level `upstream`/`fork` values are used. Steps that
 span different repositories within a single workflow are therefore fully
 supported.
+
+A step with no repository at either level runs **repository-independent**: in a
+scratch workspace, with the repository-scoped tools withheld. That is the shape
+a workflow coordinating several projects through the issue tracker takes, where
+there is no one repository to check out. See
+[repository-independent tasks](../README.md#repository-independent-tasks).
+
+Half a pair is refused rather than half-inherited: an `upstream` from the
+program and a `fork` from the step is a combination somebody meant, but an
+`upstream` with no `fork` anywhere is a workflow missing a line, and the step
+aborts rather than running against a repository nobody named.

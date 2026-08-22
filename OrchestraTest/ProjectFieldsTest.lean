@@ -16,16 +16,16 @@ namespace OrchestraTest.ProjectFields
 private def baseEntry : Queue.QueueEntry :=
   { id := "qe-1"
   , createdAt := "2026-05-05T00:00:00Z"
-  , upstream := { owner := "org", name := "repo" }
-  , fork     := { owner := "me",  name := "repo" }
+  , repo     := some { upstream := { owner := "org", name := "repo" }
+                     , fork     := { owner := "me",  name := "repo" } }
   , mode     := .pr
   , prompt   := "do x" }
 
 private def baseRecord : TaskStore.TaskRecord :=
   { id := "task-1"
   , createdAt := "2026-05-05T00:00:00Z"
-  , upstream := { owner := "org", name := "repo" }
-  , fork     := { owner := "me",  name := "repo" }
+  , repo     := some { upstream := { owner := "org", name := "repo" }
+                     , fork     := { owner := "me",  name := "repo" } }
   , mode     := .pr
   , prompt   := "do x" }
 

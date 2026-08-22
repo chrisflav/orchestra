@@ -378,10 +378,10 @@ or another session"
     let repoPath ← Repo.ensureSlot spec.fork spec.upstream
       { slot, occupant := some id, resumeFrom := resumeSlotOf } (token := some token)
     let (port, shutdownMcp) ← Server.start {
-      upstream := spec.upstream, fork := spec.fork
+      repo := some { upstream := spec.upstream, fork := spec.fork }
       allowedTools := spec.tools.getD allOptionalTools
       appId := appConfig.appId, privateKeyPath := appConfig.privateKeyPath
-      installationId, pat := appConfig.pat
+      installationId := some installationId, pat := appConfig.pat
       agentBackend := backendName
     }
     shutdownRef.set (some shutdownMcp)

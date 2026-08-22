@@ -88,9 +88,10 @@ structure QueueEntry where
   id            : String
   createdAt     : String
   status        : QueueStatus   := .pending
-  upstream      : Repository
-  fork          : Repository
-  mode          : TaskMode
+  /-- Repositories this entry works on, or `none` for a repository-independent entry that runs
+      in a scratch workspace instead of a clone slot (see `IOTask.repo`). -/
+  repo          : Option RepoPair
+  mode          : TaskMode      := .fork
   prompt        : String
   /-- Condition the run is held to (mirrors `IOTask.goal`). Set from the bound issue's taxis
       `goal` field when the entry is built for one, so it survives enqueue → dequeue → run. -/
@@ -168,17 +169,25 @@ structure QueueEntry where
   /-- Name of the listener that created this entry, if any. -/
   listenerName : Option String := none
 
+/-- The pool this entry draws its workspace slot from.
+
+    One pool per fork repository, plus a single shared pool for repository-independent entries —
+    which therefore share the `--parallel-per-repo` budget with each other, and with nothing
+    else. Spelled without a `/` so it can never collide with an `owner/repo`. -/
+def QueueEntry.slotKey (e : QueueEntry) : String :=
+  match e.repo with
+  | some r => r.fork.toString
+  | none   => "(no repository)"
+
 instance : ToJson QueueEntry where
   toJson e :=
-    let fields : List (String × Json) := [
-      ("id",         e.id),
-      ("created_at", e.createdAt),
-      ("status",     ToJson.toJson e.status),
-      ("upstream",   ToJson.toJson e.upstream),
-      ("fork",       ToJson.toJson e.fork),
-      ("mode",       ToJson.toJson e.mode),
-      ("prompt",     e.prompt)
-    ]
+    let fields : List (String × Json) :=
+      [("id",     Json.str e.id),
+       ("created_at", Json.str e.createdAt),
+       ("status", ToJson.toJson e.status)]
+      ++ repoPairFields e.repo
+      ++ [("mode",   ToJson.toJson e.mode),
+          ("prompt", Json.str e.prompt)]
     let fields := if let some s := e.goal          then fields ++ [("goal",            Json.str s)]      else fields
     let fields := if let some s := e.agent         then fields ++ [("agent",           Json.str s)]      else fields
     let fields := if let some s := e.systemPrompt  then fields ++ [("system_prompt",   Json.str s)]      else fields
@@ -218,9 +227,8 @@ instance : FromJson QueueEntry where
     let id           ← j.getObjValAs? String "id"
     let createdAt    ← j.getObjValAs? String "created_at"
     let status       ← j.getObjValAs? QueueStatus "status"
-    let upstream     ← j.getObjValAs? Repository "upstream"
-    let fork         ← j.getObjValAs? Repository "fork"
-    let mode         ← j.getObjValAs? TaskMode "mode"
+    let repo         ← parseRepoPair? j
+    let mode         ← parseTaskMode? j
     let prompt       ← j.getObjValAs? String "prompt"
     let goal          := j.getObjValAs? String "goal"           |>.toOption
     let agent         := j.getObjValAs? String "agent"          |>.toOption
@@ -254,7 +262,7 @@ instance : FromJson QueueEntry where
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
     let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
     let listenerName := j.getObjValAs? String "listener_name"    |>.toOption
-    return { id, createdAt, status, upstream, fork, mode, prompt, goal,
+    return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
@@ -313,8 +321,8 @@ def loadAllEntries : IO (Array QueueEntry) := do
 
 /-- Every pending entry that may start now, in the order the daemon should try them.
 
-    `activePerRepo` maps a fork key (owner/name) to the number of tasks currently running on
-    that repository; entries for a repository already at `perRepoLimit` are excluded.
+    `activePerRepo` maps a slot-pool key (`QueueEntry.slotKey`) to the number of tasks currently
+    running in that pool; entries whose pool is already at `perRepoLimit` are excluded.
     Ordering is by priority (higher first), then oldest first — ids are monotonic, so the
     smaller id is the older entry.
 
@@ -326,7 +334,7 @@ def pendingCandidates (all : Array QueueEntry) (activePerRepo : Std.HashMap Stri
     (perRepoLimit : Nat) : Array QueueEntry :=
   let pending := all.filter (fun e =>
     e.status == .pending &&
-    activePerRepo.getD e.fork.toString 0 < perRepoLimit)
+    activePerRepo.getD e.slotKey 0 < perRepoLimit)
   pending.qsort (fun a b =>
     if a.priority != b.priority then a.priority > b.priority else a.id < b.id)
 
@@ -384,7 +392,7 @@ deriving Repr, Inhabited
     rather than a closure over the daemon's `IO.Ref`s, which makes the interesting cases —
     exclusive backends, blocked continuations, per-repo limits — reachable from a test. -/
 structure ClaimContext where
-  /-- Fork key (owner/name) → slot indices currently in use for that repository. -/
+  /-- Slot-pool key (`QueueEntry.slotKey`) → slot indices currently in use in that pool. -/
   occupiedSlots : Std.HashMap String (Array Nat)
   /-- Number of tasks running across all repositories. -/
   total : Nat
@@ -423,7 +431,8 @@ structure Claim where
 
 /-- Pick the entry the daemon should start next, or `none` if nothing can start right now.
 
-    `slotOccupant fork slot` reports which entry's working tree currently sits in a slot. It
+    `slotOccupant fork slot` reports which entry's working tree currently sits in a slot — of
+    the pool `fork` names, or of the shared repository-independent pool when it is `none`. It
     is consulted for continuations only, and it is what makes resuming safe: a predecessor's
     slot being *free* does not mean the predecessor's tree is still in it, because slots are
     pooled and an unrelated task may have taken it and reset it in between. Resuming onto that
@@ -431,7 +440,7 @@ structure Claim where
     conversation describes work that is gone — so when the occupant does not match, the
     continuation is treated as an ordinary entry that resets whatever slot it lands in. -/
 def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
-    (slotOccupant : Repository → Nat → IO (Option String)) : IO (Option Claim) := do
+    (slotOccupant : Option Repository → Nat → IO (Option String)) : IO (Option Claim) := do
   if ctx.total >= ctx.parallelLimit then return none
   -- Once a task on a backend that needs the daemon to itself is running, nothing else may
   -- start alongside it.
@@ -450,9 +459,9 @@ def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
       | none => pure none
       | some (predId, predSlot) =>
         -- Confirm the predecessor's tree is still there before asking to wait for its slot.
-        if (← slotOccupant e.fork predSlot) == some predId then pure (some predSlot)
+        if (← slotOccupant (e.repo.map (·.fork)) predSlot) == some predId then pure (some predSlot)
         else pure none
-    let occupied := ctx.occupiedSlots.getD e.fork.toString #[]
+    let occupied := ctx.occupiedSlots.getD e.slotKey #[]
     let some (slot, reuseTree) := chooseSlot occupied ctx.perRepoLimit preferred | continue
     -- Last, because it is the only check that can cost a network round trip: an entry ruled out
     -- by occupancy never reaches the usage monitor.

@@ -187,16 +187,22 @@ private def writeOutput (stepName : String) (spec : OutputSpec)
 private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSpec)
     (accumulate : Bool := false) : WorkflowM Unit := do
   let (env, _) ← get
-  let upstream ← match spec.upstream <|> prog.upstream with
-    | some r => pure r
-    | none   => StateT.lift Concert.abort
-  let fork ← match spec.fork <|> prog.fork with
-    | some r => pure r
-    | none   => StateT.lift Concert.abort
+  -- A step inherits the program's repositories unless it names its own, and a workflow that
+  -- names neither runs its steps repository-independent: in a scratch workspace, with the
+  -- repository-scoped tools withheld. That is the shape a workflow coordinating several projects
+  -- through the issue tracker takes, where there is no one repository to check out.
+  --
+  -- Half a pair is refused rather than half-inherited. `upstream` from the program and `fork`
+  -- from the step is a combination somebody meant; `upstream` alone, at either level, is a
+  -- workflow missing a line.
+  let repo ← match spec.upstream <|> prog.upstream, spec.fork <|> prog.fork with
+    | none,          none      => pure none
+    | some upstream, some fork => pure (some { upstream, fork : RepoPair })
+    | _,             _         => StateT.lift Concert.abort
   let inputSection := buildInputSection env spec.input
   if spec.output.isEmpty then
     let ioTask : IOTask .unit .unit := {
-      upstream, fork, mode := .fork
+      repo, mode := .fork
       prompt := spec.prompt ++ inputSection
       agent := spec.agent, model := spec.model, budget := spec.budget
       tools := spec.tools
@@ -212,7 +218,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
     let mappingFields := spec.output.map fun o => (o.name, o.type)
     let outInstr := s!"\n\nCommunicate your result by calling the `submit_task_output` MCP tool with a JSON object matching this schema:\n{(ResultType.mapping mappingFields).toJsonSchema.compress}"
     let ioTask : IOTask .unit (.mapping mappingFields) := {
-      upstream, fork, mode := .fork
+      repo, mode := .fork
       prompt := spec.prompt ++ inputSection ++ outInstr
       agent := spec.agent, model := spec.model, budget := spec.budget
       tools := spec.tools

@@ -38,8 +38,9 @@ export interface QueueEntry {
   status: QueueStatus;
   createdAt: string;
   priority: number;
-  upstream: string;
-  fork: string;
+  /** Null for a repository-independent entry, which runs in a scratch workspace. */
+  upstream: string | null;
+  fork: string | null;
   prompt: string;
   series: string | null;
   backend: string | null;
@@ -54,8 +55,9 @@ export interface TaskRecord {
   id: string;
   status: TaskStatus;
   createdAt: string;
-  upstream: string;
-  fork: string;
+  /** Null for a repository-independent run, which ran in a scratch workspace. */
+  upstream: string | null;
+  fork: string | null;
   prompt: string;
   series: string | null;
   backend: string | null;
@@ -183,7 +185,8 @@ export interface TaskDetail {
    */
   taskId: string | null;
   status: TaskStatus | QueueStatus;
-  fork: string;
+  /** Null for a repository-independent run, which ran in a scratch workspace. */
+  fork: string | null;
   createdAt: string;
   prompt: string;
   /** The trailing `logLimit` events of the run's log, oldest first. */
