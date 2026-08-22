@@ -50,7 +50,11 @@ private def sampleSession : SessionSpec := {
 
 private def staged : Array StagedPath := stagedPaths (config) "/home/daemon" sampleSession
 
-private def manifest : Json := podManifest (config) sampleSession "orchestra-abc123" staged
+private def imageOf (cfg : Config) (spec : SessionSpec) : String :=
+  match imageFor cfg spec with | .ok i => i | .error _ => "<refused>"
+
+private def manifest : Json :=
+  podManifest (config) sampleSession "orchestra-abc123" (imageOf (config) sampleSession) staged
 
 private def container : Option Json :=
   match manifest.getObjVal? "spec" |>.toOption |>.bind (·.getObjVal? "containers" |>.toOption) with
@@ -206,9 +210,9 @@ private def repoAsked : SessionSpec :=
 @[test]
 def aRepositorySaysWhatItNeedsInstalled : Test := do
   -- The repository already writes this down for its own CI, and it is the thing that knows.
-  TestM.assertEqual (imageFor (config) repoAsked) "ghcr.io/acme/widgets-ci:2"
+  TestM.assertEqual (imageOf (config) repoAsked) "ghcr.io/acme/widgets-ci:2"
     (msg := "the repository's own image is used")
-  TestM.assertEqual (imageFor (config) sampleSession) "ghcr.io/example/agent:1"
+  TestM.assertEqual (imageOf (config) sampleSession) "ghcr.io/example/agent:1"
     (msg := "and the configured default covers everything that has not said otherwise")
 
 @[test]
@@ -216,18 +220,73 @@ def anOperatorCanPinARepositoryAndCanRefuseTheWholeIdea : Test := do
   -- A pin beats what the repository asked for: it is the choice someone made deliberately for that
   -- repository, and nothing inside the repository should be able to talk them out of it.
   let pinned := config [("images", Json.mkObj [("acme/widgets", .str "ghcr.io/ops/pinned:1")])]
-  TestM.assertEqual (imageFor pinned repoAsked) "ghcr.io/ops/pinned:1"
+  TestM.assertEqual (imageOf pinned repoAsked) "ghcr.io/ops/pinned:1"
     (msg := "the operator's pin wins")
-  TestM.assertEqual (imageFor pinned { sampleSession with repo := some "acme/other" })
+  TestM.assertEqual (imageOf pinned { sampleSession with repo := some "acme/other" })
     "ghcr.io/example/agent:1" (msg := "and applies to the repository it names, not the rest")
   -- Or the whole mechanism can be turned off, and every task runs in what the configuration says.
   let fixed := config [("allow_repo_image", .bool false)]
-  TestM.assertEqual (imageFor fixed repoAsked) "ghcr.io/example/agent:1"
+  TestM.assertEqual (imageOf fixed repoAsked) "ghcr.io/example/agent:1"
     (msg := "a repository cannot choose when it is not allowed to")
 
 @[test]
+def whatARepositoryNamesIsCheckedBeforeItBecomesAManifest : Test := do
+  -- This is the one image reference that did not come from the daemon's own configuration: it is
+  -- read out of a file in the repository, so a name with a space or a quote in it is refused here
+  -- rather than turned into a pod spec.
+  TestM.assert (validImageRef "ghcr.io/acme/widgets-ci:2") "an ordinary reference is fine"
+  TestM.assert (validImageRef "registry.internal:5000/team/img@sha256:abc123")
+    "so is a port and a digest"
+  TestM.assert (!validImageRef "") "an empty one is not"
+  TestM.assert (!validImageRef "ghcr.io/acme/img:1 --privileged") "nor is one with a space in it"
+  TestM.assert (!validImageRef "img\";echo") "nor one carrying a quote"
+  let malformed : SessionSpec :=
+    { sampleSession with repo := some "acme/widgets", image := some "not a reference" }
+  match imageFor (config) malformed with
+  | .ok _    => TestM.fail "a malformed reference was accepted"
+  | .error e =>
+    -- Refused, not quietly replaced by the default: a repository that asked for a JDK image and
+    -- silently got one without would fail its validation script for a reason nothing points at.
+    TestM.assert (AgentDef.containsCI e "not a usable image reference") "and says why"
+
+@[test]
+def anOperatorCanAllowTheChoiceWithoutAllowingTheRegistry : Test := do
+  -- The middle ground between "any image a repository names" and "no repository chooses": a
+  -- namespace that pulls from a scanned mirror lets repositories pick within it.
+  let allowlisted := config [("allowed_image_prefixes", .arr #[.str "ghcr.io/acme/"])]
+  TestM.assertEqual (imageOf allowlisted repoAsked) "ghcr.io/acme/widgets-ci:2"
+    (msg := "a repository may pick inside the allowed prefixes")
+  let outside : SessionSpec :=
+    { sampleSession with
+      repo := some "acme/widgets", image := some "docker.io/library/ubuntu:24.04" }
+  match imageFor allowlisted outside with
+  | .ok _    => TestM.fail "an image outside the allowed prefixes was accepted"
+  | .error e =>
+    TestM.assert (AgentDef.containsCI e "ghcr.io/acme/") "the error names what is allowed"
+    TestM.assert (AgentDef.containsCI e "images") "and how to pin it instead"
+  -- The operator's own two answers are never checked against it; they are the operator's.
+  TestM.assertEqual (imageOf allowlisted sampleSession) "ghcr.io/example/agent:1"
+    (msg := "the configured default is exempt")
+
+@[test]
+def thePullPolicyIsTheClustersUnlessItIsSet : Test := do
+  -- Unset means Kubernetes' own rule: `Always` for `:latest` or no tag, `IfNotPresent` otherwise.
+  -- Which is the wrong one for a floating tag that is not `:latest` — a `:main` rebuilt nightly is
+  -- otherwise served from whatever each node cached.
+  TestM.assert (!AgentDef.containsCI manifest.compress "imagePullPolicy")
+    "nothing is said by default"
+  let always := config [("image_pull_policy", .str "Always")]
+  let m := podManifest always sampleSession "orchestra-abc123" (imageOf always sampleSession) staged
+  TestM.assert (AgentDef.containsCI m.compress "\"imagePullPolicy\":\"Always\"")
+    "and what is set reaches the container"
+  -- A typo here would otherwise be a pod the API server rejects, once per task.
+  match ← (Kubernetes.preflight (config [("image_pull_policy", .str "always")])) with
+  | .ok _    => TestM.fail "an invalid pull policy was accepted"
+  | .error e => TestM.assert (AgentDef.containsCI e "IfNotPresent") "the error names the valid ones"
+
+@[test]
 def theImageReachesThePodAndTheLogLine : Test := do
-  let m := podManifest (config) repoAsked "orchestra-abc123" staged
+  let m := podManifest (config) repoAsked "orchestra-abc123" (imageOf (config) repoAsked) staged
   TestM.assert (AgentDef.containsCI m.compress "ghcr.io/acme/widgets-ci:2")
     "the container runs the image the repository asked for"
   -- The repository is on the pod too, so a running task can be found from what the dashboard
@@ -263,8 +322,9 @@ def apersistentHomeIsWhatMakesInitCheap : Test := do
   | some v =>
     TestM.assert (AgentDef.containsCI v.compress "emptyDir")
       "by default it is scratch, and every task installs from nothing"
-  let cached := podManifest (config [("home_claim", .str "orchestra-agent-home")])
-    sampleSession "orchestra-abc123" staged
+  let cachedCfg := config [("home_claim", .str "orchestra-agent-home")]
+  let cached := podManifest cachedCfg sampleSession "orchestra-abc123"
+    (imageOf cachedCfg sampleSession) staged
   match home cached with
   | none   => TestM.fail "the pod has no home volume"
   | some v =>

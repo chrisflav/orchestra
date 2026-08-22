@@ -836,8 +836,9 @@ finished, so it has to see the tree the agent worked on and the toolchain that b
 
 `execution.image` is how a repository says what it needs installed, for a backend that runs tasks
 in an image; the landrun backend ignores it, since what is installed on the daemon's machine is
-what is installed. An operator can pin a repository to an image of their choosing, or refuse
-repository-declared images entirely →
+what is installed. It is an ordinary OCI reference, pulled by the cluster with the cluster's own
+credentials. An operator can pin a repository to an image of their choosing, restrict which
+registries a repository may name, or refuse repository-declared images entirely →
 [running agents on a Kubernetes cluster](docs/kubernetes.md).
 
 ## listeners

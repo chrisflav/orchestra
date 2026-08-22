@@ -144,6 +144,36 @@ that repository's code, with this task's credentials in the environment, either 
 turning off when the images that may run in the namespace are a decision of their own — an
 allowlisted registry, a scanned base — rather than a matter of convenience.
 
+### how a reference is written, and where it is pulled from
+
+An image is a plain OCI reference — `ghcr.io/acme/widgets-ci:latest`,
+`registry.internal:5000/team/img@sha256:…` — and it goes into the pod's `image` field exactly as
+written. Orchestra never contacts a registry: the kubelet on the node resolves the reference and
+pulls it, by the same rules as any other pod. A reference with no registry host is Docker Hub, or
+whatever the node's container runtime has been configured to mirror it to; one with a host is that
+host.
+
+**Credentials** are the cluster's, not orchestra's. `image_pull_secrets` names `Secret`s that must
+already exist in the namespace — orchestra never creates or reads them — and the service account
+the pods run under (`service_account`) contributes any `imagePullSecrets` attached to it, as does
+whatever node-level credential the platform provides (an instance role for ECR, a metadata-server
+token for GCR). If a task fails to start with `ImagePullBackOff`, the reason is in the pod's events
+and the fix is a registry credential, not an orchestra setting.
+
+**Pull policy** is unset by default, so Kubernetes' own rule applies: `Always` for a `:latest` or
+untagged reference, `IfNotPresent` for everything else. That last one is worth knowing about a
+floating tag that is *not* `:latest` — a `:main` rebuilt nightly is served from whatever each node
+happened to cache, so two tasks can run different code under one name. Set
+`image_pull_policy: "Always"` for that, or refer to images by digest.
+
+**A repository's own choice is checked** before it becomes a manifest, since it is the one
+reference that did not come from this daemon's configuration: a name with a space or a quote in it
+is refused. `allowed_image_prefixes` narrows it further — a namespace that pulls only from a
+scanned mirror sets `["ghcr.io/acme/", "registry.internal/"]` and lets repositories pick within it.
+Either refusal fails the task with the reason, rather than quietly falling back to the default: a
+repository that asked for a JDK image and silently got one without would fail its validation script
+for a reason nothing in the log points at.
+
 **What the image does not have, `init.sh` installs.** Every task starts from a new pod, so the hook
 runs on every task rather than once per checkout: the marker it writes lives in the checkout, and
 the checkout is exactly what gets carried into a pod that has nothing installed. Repository hooks
@@ -223,7 +253,9 @@ the cluster was actually asked for.
 | `namespace` | `default` | namespace the pod is created in |
 | `kubectl` | `kubectl` | path to the binary |
 | `service_account` | *(namespace default)* | `serviceAccountName` for the pod |
-| `image_pull_secrets` | `[]` | `imagePullSecrets` names |
+| `image_pull_secrets` | `[]` | `imagePullSecrets` names; the Secrets must already exist in the namespace |
+| `image_pull_policy` | *(cluster default)* | `Always`, `IfNotPresent` or `Never` |
+| `allowed_image_prefixes` | `[]` | prefixes a repository-declared image must start with; empty allows any |
 | `node_selector` | *(none)* | `nodeSelector`, verbatim |
 | `resources` | *(none)* | `resources` for the container, verbatim |
 | `volumes` / `volume_mounts` | `[]` | extra volumes and mounts, verbatim — a build cache, most usefully |

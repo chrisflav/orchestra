@@ -92,8 +92,24 @@ structure Config where
   allowRepoImage : Bool := true
   /-- Service account for the pod. Omitted means the namespace's default. -/
   serviceAccount : Option String := none
-  /-- `imagePullSecrets` names. -/
+  /-- `imagePullSecrets` names. The Secrets have to exist in the namespace already; orchestra never
+      creates or reads them, and never talks to a registry itself. -/
   imagePullSecrets : Array String := #[]
+  /-- `imagePullPolicy` for the container: `Always`, `IfNotPresent` or `Never`.
+
+      Left unset by default, which means Kubernetes' own rule applies: `Always` for a `:latest` or
+      untagged reference, `IfNotPresent` for anything else. Worth setting to `Always` on a floating
+      tag that is not `:latest` — a `:main` that is rebuilt nightly is otherwise served from
+      whatever each node happened to cache, so two tasks can run different code under one name. -/
+  imagePullPolicy : Option String := none
+  /-- Prefixes a *repository-declared* image has to start with, when the operator would rather
+      allow the choice than the registry.
+
+      Empty means any reference is accepted, which is the default and is what
+      `allow_repo_image: false` is the other end of. A namespace that pulls only from a scanned
+      mirror sets `["ghcr.io/acme/", "registry.internal/"]` and lets repositories pick within it.
+      Never applied to a pin or to `image`: those are the operator's own. -/
+  allowedImagePrefixes : Array String := #[]
   /-- `nodeSelector`, verbatim. -/
   nodeSelector : Option Json := none
   /-- `resources` for the container, verbatim. -/
@@ -178,6 +194,9 @@ runs with no tools at all"
     serviceAccount := jsonStr? j "service_account"
     imagePullSecrets := (jsonArr? j "image_pull_secrets").filterMap fun v =>
       match v with | .str s => some s | _ => none
+    imagePullPolicy := jsonStr? j "image_pull_policy"
+    allowedImagePrefixes := (jsonArr? j "allowed_image_prefixes").filterMap fun v =>
+      match v with | .str s => some s | _ => none
     nodeSelector := j.getObjVal? "node_selector" |>.toOption
     resources := j.getObjVal? "resources" |>.toOption
     extraVolumes := jsonArr? j "volumes"
@@ -198,20 +217,44 @@ runs with no tools at all"
     allowRepoImage := j.getObjValAs? Bool "allow_repo_image" |>.toOption |>.getD true
   }
 
-/-- The image a task runs in, in the order the three answers are asked for.
+/-- Whether `ref` is something that can be an image reference at all.
+
+    Not a parse of the OCI grammar — the registry is the authority on that, and a reference this
+    accepts and the registry rejects fails as an unstartable pod with the registry's own message.
+    What this is for is the one case where the string is not the operator's: a repository names its
+    own image in a file in the repository, so a name with a space, a quote or a newline in it
+    should be refused here rather than turned into a manifest field. -/
+def validImageRef (ref : String) : Bool :=
+  !ref.isEmpty && ref.length ≤ 512 &&
+    ref.all fun c =>
+      c.isAlphanum || c == '.' || c == '_' || c == '-' || c == '/' || c == ':' || c == '@'
+
+/-- The image a task runs in, or why the one it asked for cannot be used.
 
     An operator's per-repository pin first, because that is the one someone chose deliberately for
     this repository and nothing in the repository should be able to override it. Then what the
     repository itself asked for, which is where the answer usually belongs — the repository is what
     knows whether its tests need a JDK or a browser. Then the configured default, for everything
-    that has not said otherwise. -/
-def imageFor (cfg : Config) (spec : SessionSpec) : String :=
+    that has not said otherwise.
+
+    The middle one is the only one checked, because it is the only one that did not come from this
+    daemon's own configuration. Refused rather than quietly replaced by the default: a repository
+    that asked for a JDK image and silently got one without would fail its validation script for a
+    reason nothing in the log points at. -/
+def imageFor (cfg : Config) (spec : SessionSpec) : Except String String :=
   match spec.repo.bind (fun r => cfg.repoImages.find? (·.1 == r)) with
-  | some (_, pinned) => pinned
+  | some (_, pinned) => .ok pinned
   | none =>
     match (if cfg.allowRepoImage then spec.image else none) with
-    | some declared => declared
-    | none          => cfg.image
+    | none          => .ok cfg.image
+    | some declared =>
+      if !validImageRef declared then
+        .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not a usable image reference"
+      else if cfg.allowedImagePrefixes.isEmpty
+              || cfg.allowedImagePrefixes.any (fun p => declared.startsWith p) then
+        .ok declared
+      else
+        .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not under any of the image prefixes this daemon allows a repository to name ({String.intercalate ", " cfg.allowedImagePrefixes.toList}). Pin the repository under execution.options.images instead, or widen allowed_image_prefixes."
 
 /-! ## The pod
 
@@ -253,7 +296,7 @@ def stagedPaths (cfg : Config) (hostHome : String) (spec : SessionSpec) : Array 
       isWorkspace := podPath == spec.workdir.toString }
 
 /-- The pod manifest for a task. -/
-def podManifest (cfg : Config) (spec : SessionSpec) (podName : String)
+def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
     (staged : Array StagedPath) : Json :=
   let stageMounts : Array Json := staged.mapIdx fun i st =>
     Json.mkObj [("name", .str (stageVolumeName i)), ("mountPath", .str st.podPath)]
@@ -278,12 +321,14 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName : String)
   -- `envFilePath`), because a pod's spec is readable by anything that can list pods.
   let container := Json.mkObj ([
     ("name", .str "agent"),
-    ("image", .str (imageFor cfg spec)),
+    ("image", .str image),
     ("command", .arr #[.str "/bin/sh", .str "-c", .str idleScript]),
     ("workingDir", .str spec.workdir.toString),
     ("env", .arr #[Json.mkObj [("name", .str "HOME"), ("value", .str cfg.homePath)]]),
     ("volumeMounts", .arr mounts)
-  ] ++ (match cfg.resources with | some r => [("resources", r)] | none => []))
+  ] ++ (match cfg.imagePullPolicy with
+        | some p => [("imagePullPolicy", Json.str p)] | none => [])
+     ++ (match cfg.resources with | some r => [("resources", r)] | none => []))
   let podSpec := Json.mkObj ([
     ("restartPolicy", .str "Never"),
     ("activeDeadlineSeconds", .num cfg.deadlineSeconds),
@@ -449,7 +494,10 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
   let home ← hostHome
   let staged := stagedPaths cfg home spec
   let podName := s!"orchestra-{← randomHex 6}"
-  let manifest := podManifest cfg spec podName staged
+  let image ← match imageFor cfg spec with
+    | .ok i    => pure i
+    | .error e => throw (IO.userError s!"kubernetes: {e}")
+  let manifest := podManifest cfg spec podName image staged
   let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
   IO.FS.createDirAll dir
   let manifestPath := dir / "pod.json"
@@ -485,7 +533,7 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     putFile cfg podName path (envFileContents env)
     return path
   return {
-    id := s!"pod {cfg.ns}/{podName} ({imageFor cfg spec})"
+    id := s!"pod {cfg.ns}/{podName} ({image})"
     -- Every task starts from a new pod, so the repository's `init.sh` cannot rely on what a
     -- previous one installed — and the marker it leaves in the checkout, which is carried in here,
     -- would otherwise say it can.
@@ -550,6 +598,10 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     operator most often forgets; the rest of the verbs are named in the error so that fixing it is
     a single edit to a Role rather than a sequence of failed tasks. -/
 def preflight (cfg : Config) : IO (Except String Unit) := do
+  if let some p := cfg.imagePullPolicy then
+    unless ["Always", "IfNotPresent", "Never"].contains p do
+      return .error s!"execution.options.image_pull_policy is '{p}'; Kubernetes accepts only \
+Always, IfNotPresent or Never"
   try
     let version ← IO.Process.output { cmd := cfg.kubectl, args := #["version", "--client=true"] }
     if version.exitCode != 0 then
