@@ -64,7 +64,18 @@ task, everything runs through it, and it is closed when the task ends, however i
 | `close` | bring back what has to come back, release what was held |
 | `describe` | the run as a command a person can read, for `--debug` |
 | `mcpEndpoint` | where the agent should reach the MCP server |
+| `freshEnvironment` | whether every task starts from one with nothing a previous task installed |
 | `id` | what to call this environment in a log line |
+
+`freshEnvironment` is what `init.sh` is measured against. The hook is meant to run once — install a
+toolchain, warm a cache — and it records that it has by writing a marker into the checkout, which
+is right when the environment is a machine that keeps what it was given and wrong when the
+environment is new each time and the checkout is the one thing carried into it. Saying so makes
+`RepoConfig.runInitIfNeeded` run the hook every task instead of trusting the marker.
+
+A session is opened with a `SessionSpec`, which also carries the repository and the image it asked
+for in its own `.orchestra/config.json`: what a task needs installed varies by repository, and a
+backend that runs tasks in an image of some kind is the one that has to decide which.
 
 For landrun and local there is nothing to open: the checkout is already where the daemon put it,
 and `runScript` is `bash` on this machine, exactly as the task runner did it before sessions
@@ -158,6 +169,7 @@ The mapping is mechanical, which is the point of the interface:
 | `SessionSpec.workdir` | the container's `workingDir`, on the volume the checkout is staged into |
 | `SessionSpec.grants` marked `.orchestra` | `emptyDir` volumes, filled from the daemon's disk when the session opens |
 | `SessionSpec.grants` marked `.environment` | nothing: `/usr`, `/etc` and the agent's home come from the image |
+| `SessionSpec.image` / `.repo` | which image the pod runs, and the label it carries |
 | `Session.start` | `kubectl exec` — with `-i -t` when the spec asked for the daemon's own terminal |
 | `Session.runScript` | `kubectl exec ... bash <script>`, in the same pod |
 | `Session.close` | copy the checkout back, delete the pod |

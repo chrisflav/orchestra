@@ -814,18 +814,31 @@ file:
 - `.orchestra/validation.sh` — run after each agent launch; non-zero exit triggers
   a retry
 - `.orchestra/after.sh` — run after the validation loop completes
-- `.orchestra/config.json` — validation settings:
+- `.orchestra/config.json` — validation settings, and the image the repository's tasks need:
 
 ```json
 {
   "validation": {
     "max_retries": 3,
     "retry_prompt": "Validation failed. Please fix the issues."
+  },
+  "execution": {
+    "image": "ghcr.io/acme/widgets-ci:latest"
   }
 }
 ```
 
 The failing script's output is available to the retry prompt as `{{validation_output}}`.
+
+The hooks run wherever the agent runs: on this machine under the default landrun backend, and
+inside the task's pod under the `kubernetes` one — `validation.sh` decides whether the agent is
+finished, so it has to see the tree the agent worked on and the toolchain that builds it.
+
+`execution.image` is how a repository says what it needs installed, for a backend that runs tasks
+in an image; the landrun backend ignores it, since what is installed on the daemon's machine is
+what is installed. An operator can pin a repository to an image of their choosing, or refuse
+repository-declared images entirely →
+[running agents on a Kubernetes cluster](docs/kubernetes.md).
 
 ## listeners
 

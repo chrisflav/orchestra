@@ -73,9 +73,23 @@ structure Config where
   kubectl : String := "kubectl"
   /-- Namespace the task's pod is created in. -/
   ns : String := "default"
-  /-- Image the task runs in. Required: there is no sensible default, and guessing one would mean
-      a pod that starts and cannot run anything. -/
+  /-- Image a task runs in when nothing more specific applies. Required: there is no sensible
+      default, and guessing one would mean a pod that starts and cannot run anything.
+
+      Which build and dev dependencies a task needs varies by repository, so this is the last of
+      three answers, not the only one. See `imageFor`. -/
   image : String
+  /-- Image per repository, by `owner/name`, for an operator who would rather decide centrally than
+      take what a repository asks for. Beats the repository's own choice. -/
+  repoImages : Array (String × String) := #[]
+  /-- Whether a repository may name its own image in its `.orchestra/config.json`.
+
+      On by default, because the repository is what knows what it needs to build, and because
+      allowing it grants nothing that is not already granted: the agent runs that repository's code
+      with its own credentials in the environment either way. Turn it off to pin every task to what
+      this configuration names — a fork whose `.orchestra/config.json` was edited then changes
+      nothing about where its task runs. -/
+  allowRepoImage : Bool := true
   /-- Service account for the pod. Omitted means the namespace's default. -/
   serviceAccount : Option String := none
   /-- `imagePullSecrets` names. -/
@@ -110,10 +124,21 @@ structure Config where
   /-- Paths not carried in either direction, as `tar --exclude` patterns. Build output is the usual
       candidate: `.lake`, `target`, `node_modules`. -/
   excludes : Array String := #[]
-  /-- Where the agent's `$HOME` is in the pod. An `emptyDir`, so the agent's own state directories
-      are writable without the image having to make them so, and so that everything it writes —
-      its session above all — is there for the whole task and gone after it. -/
+  /-- Where the agent's `$HOME` is in the pod. An `emptyDir` by default, so the agent's own state
+      directories are writable without the image having to make them so, and so that everything it
+      writes is there for the whole task and gone after it. -/
   homePath : String := "/home/agent"
+  /-- A `PersistentVolumeClaim` to mount as `$HOME` instead of an `emptyDir`.
+
+      What this buys is the cost of `init.sh`. Every task starts from a new pod, so a hook that
+      installs a toolchain or warms a build cache pays in full each time unless what it installs
+      survives — and `~/.elan`, `~/.cargo`, `~/.cache` and the rest are all under `$HOME`. With a
+      claim the first task on an image pays and the ones after it do not, which is the same
+      arrangement the landrun backend gets for free from the machine it runs on.
+
+      Needs `ReadWriteMany`, or `ReadWriteOnce` with every agent pod on one node: tasks run in
+      parallel and would mount it at the same time. -/
+  homeClaim : Option String := none
 deriving Inhabited
 
 /-- Where orchestra keeps its own files in the pod: the environment for each command. An
@@ -165,7 +190,28 @@ runs with no tools at all"
     excludes := (jsonArr? j "excludes").filterMap fun v =>
       match v with | .str s => some s | _ => none
     homePath := (jsonStr? j "home_path").getD "/home/agent"
+    homeClaim := jsonStr? j "home_claim"
+    repoImages := match j.getObjVal? "images" with
+      | .ok (.obj kvs) => kvs.toArray.filterMap fun (k, v) =>
+          match v with | .str i => some (k, i) | _ => none
+      | _              => #[]
+    allowRepoImage := j.getObjValAs? Bool "allow_repo_image" |>.toOption |>.getD true
   }
+
+/-- The image a task runs in, in the order the three answers are asked for.
+
+    An operator's per-repository pin first, because that is the one someone chose deliberately for
+    this repository and nothing in the repository should be able to override it. Then what the
+    repository itself asked for, which is where the answer usually belongs — the repository is what
+    knows whether its tests need a JDK or a browser. Then the configured default, for everything
+    that has not said otherwise. -/
+def imageFor (cfg : Config) (spec : SessionSpec) : String :=
+  match spec.repo.bind (fun r => cfg.repoImages.find? (·.1 == r)) with
+  | some (_, pinned) => pinned
+  | none =>
+    match (if cfg.allowRepoImage then spec.image else none) with
+    | some declared => declared
+    | none          => cfg.image
 
 /-! ## The pod
 
@@ -213,10 +259,13 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName : String)
     Json.mkObj [("name", .str (stageVolumeName i)), ("mountPath", .str st.podPath)]
   let stageVolumes : Array Json := staged.mapIdx fun i _ =>
     Json.mkObj [("name", .str (stageVolumeName i)), ("emptyDir", Json.mkObj [])]
+  let homeVolume := match cfg.homeClaim with
+    | some claim => Json.mkObj [("name", .str "home"),
+        ("persistentVolumeClaim", Json.mkObj [("claimName", .str claim)])]
+    | none       => Json.mkObj [("name", .str "home"), ("emptyDir", Json.mkObj [])]
   let volumes : Array Json :=
     stageVolumes
-      ++ #[Json.mkObj [("name", .str "control"), ("emptyDir", Json.mkObj [])],
-           Json.mkObj [("name", .str "home"), ("emptyDir", Json.mkObj [])]]
+      ++ #[Json.mkObj [("name", .str "control"), ("emptyDir", Json.mkObj [])], homeVolume]
       ++ cfg.extraVolumes
   let mounts : Array Json :=
     stageMounts
@@ -229,7 +278,7 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName : String)
   -- `envFilePath`), because a pod's spec is readable by anything that can list pods.
   let container := Json.mkObj ([
     ("name", .str "agent"),
-    ("image", .str cfg.image),
+    ("image", .str (imageFor cfg spec)),
     ("command", .arr #[.str "/bin/sh", .str "-c", .str idleScript]),
     ("workingDir", .str spec.workdir.toString),
     ("env", .arr #[Json.mkObj [("name", .str "HOME"), ("value", .str cfg.homePath)]]),
@@ -252,9 +301,14 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName : String)
     ("metadata", Json.mkObj [
       ("name", .str podName),
       ("namespace", .str cfg.ns),
-      ("labels", Json.mkObj [
+      ("labels", Json.mkObj ([
         ("app.kubernetes.io/managed-by", .str "orchestra"),
-        ("orchestra.dev/task", .str spec.label)])]),
+        ("orchestra.dev/task", .str spec.label)]
+        -- A label value cannot hold a `/`, so `owner/name` is written the way Kubernetes writes
+        -- its own two-part names.
+        ++ (match spec.repo with
+            | some r => [("orchestra.dev/repo", Json.str (r.replace "/" "."))]
+            | none   => [])))]),
     ("spec", podSpec)]
 
 /-- `tar` flags for the excluded paths, in the order they were configured. -/
@@ -431,7 +485,11 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     putFile cfg podName path (envFileContents env)
     return path
   return {
-    id := s!"pod {cfg.ns}/{podName}"
+    id := s!"pod {cfg.ns}/{podName} ({imageFor cfg spec})"
+    -- Every task starts from a new pod, so the repository's `init.sh` cannot rely on what a
+    -- previous one installed — and the marker it leaves in the checkout, which is carried in here,
+    -- would otherwise say it can.
+    freshEnvironment := true
     mcpEndpoint := fun e => pure { e with host := cfg.mcpHost }
     describe := fun run => do
       let envFile := envFilePath 0

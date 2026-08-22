@@ -59,8 +59,9 @@ start of every task that it is there and that it may create pods, and fails the 
 if not, rather than dispatching into a cluster that will refuse it.
 
 **In the image:** the agent CLI (`claude`, `vibe`, `opencode` or `pi`), `sh`, `bash` (the
-repository's scripts are run with it), `tar`, `nc`, `git`, and whatever the repositories being
-worked on need to build. The same list the daemon's own machine needs, minus `landrun`.
+repository's scripts are run with it), `tar`, `nc` and `git`. That is the fixed part — the same
+list the daemon's own machine needs, minus `landrun`. What each repository needs on top of it is
+the subject of the next section.
 
 **RBAC** for the daemon's service account, in the namespace the pods run in:
 
@@ -109,6 +110,53 @@ on arbitrary high ports, from the agent pods. If the daemon runs outside the clu
 sends the token as its first line; a connection presenting anything else is closed. The token is
 written only into the agent's own configuration inside its pod. There is nothing to configure, and
 nothing that turns it off.
+
+## what is installed, when repositories disagree
+
+Build and dev dependencies are a property of the repository, so `image` is a default rather than
+the answer. Three sources, settled in this order:
+
+1. **An operator's pin**, `images` in the options, keyed by `owner/name`. Deliberate, and nothing
+   inside the repository can talk it out of it.
+2. **What the repository asked for**, `execution.image` in its own `.orchestra/config.json`. The
+   repository already writes this down for its own CI, and it is the thing that knows whether its
+   tests need a JDK, a browser or a database client. Set `allow_repo_image: false` to ignore it.
+3. **`image`**, for everything that has not said otherwise.
+
+```json
+{
+  "execution": {
+    "backend": "kubernetes",
+    "options": {
+      "image": "ghcr.io/example/orchestra-agent:latest",
+      "images": {
+        "acme/widgets": "ghcr.io/acme/widgets-ci:latest",
+        "acme/mobile":  "ghcr.io/acme/android-ci:latest"
+      },
+      "home_claim": "orchestra-agent-home"
+    }
+  }
+}
+```
+
+Allowing a repository to name its image grants nothing that is not already granted: the agent runs
+that repository's code, with this task's credentials in the environment, either way. It is worth
+turning off when the images that may run in the namespace are a decision of their own — an
+allowlisted registry, a scanned base — rather than a matter of convenience.
+
+**What the image does not have, `init.sh` installs.** Every task starts from a new pod, so the hook
+runs on every task rather than once per checkout: the marker it writes lives in the checkout, and
+the checkout is exactly what gets carried into a pod that has nothing installed. Repository hooks
+that install a toolchain or warm a build cache are already idempotent for their own reasons — they
+check before they fetch — and that is what is expected of them here.
+
+**`home_claim` is what makes that cheap.** Point it at a `PersistentVolumeClaim` and `$HOME` — with
+`~/.elan`, `~/.cargo`, `~/.cache`, `~/.npm` and the rest under it — survives between tasks, so the
+first task on an image pays for the toolchain and the ones after it do not. That is the same
+arrangement the landrun backend gets for free from the machine it runs on. The claim needs
+`ReadWriteMany`, or `ReadWriteOnce` with every agent pod on one node, since tasks run in parallel.
+The checkout's own build output (`.lake`, `target`, `node_modules`) travels with the checkout
+instead, unless `excludes` leaves it behind.
 
 ## the checkout, and what comes back
 
@@ -168,7 +216,9 @@ the cluster was actually asked for.
 
 | key | default | what it does |
 | --- | --- | --- |
-| `image` | *required* | image tasks run in |
+| `image` | *required* | image tasks run in, unless something more specific applies |
+| `images` | `{}` | image per repository, by `owner/name`; beats what the repository asks for |
+| `allow_repo_image` | `true` | whether a repository's own `execution.image` is honoured |
 | `mcp_host` | *required* | where the pod reaches this daemon's MCP server |
 | `namespace` | `default` | namespace the pod is created in |
 | `kubectl` | `kubectl` | path to the binary |
@@ -178,6 +228,7 @@ the cluster was actually asked for.
 | `resources` | *(none)* | `resources` for the container, verbatim |
 | `volumes` / `volume_mounts` | `[]` | extra volumes and mounts, verbatim — a build cache, most usefully |
 | `home_path` | `/home/agent` | where the agent's `$HOME` is in the pod |
+| `home_claim` | *(none)* | PVC to mount as `$HOME`, so toolchains and caches survive between tasks |
 | `mcp_bind` | `0.0.0.0` | address the daemon's MCP server binds |
 | `deadline_seconds` | `14400` | `activeDeadlineSeconds` on the pod |
 | `startup_timeout_seconds` | `600` | how long to wait for the pod to be ready |

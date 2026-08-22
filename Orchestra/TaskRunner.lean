@@ -140,11 +140,14 @@ private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : S
   -- elsewhere copies the tree at that moment, and a copy taken before `gh pr checkout` would be of
   -- the branch the merger is not merging.
   IO.println "  [merger] running validation script"
+  let repoConfig ← RepoConfig.loadRepoConfig repoPath
   let session ← execBackend.openSession {
     workdir := repoPath
     grants  := #[{ path := repoPath.toString, access := .rwx, required := true
                  , from_ := .orchestra }]
-    label   := initialRecord.id }
+    label   := initialRecord.id
+    repo    := some pr.repo.toString
+    image   := repoConfig.image }
   let (valid, validOutput) ← try
       RepoConfig.runValidation session repoPath
     finally
@@ -538,6 +541,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- here ignores them and builds its ruleset per launch.
   let pluginDirs ← defaultPluginDirs appConfig
   let memoryDirs ← resolveMemoryDirs ioTask.memory ioTask.upstream
+  -- Read before the environment is opened, because one of the things it says is which environment
+  -- to open: what a task needs installed is a property of the repository, and the repository is
+  -- where that is written down.
+  let repoConfig ← RepoConfig.loadRepoConfig repoPath
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth + clone setup with
   -- all other backends but skips the MCP server and the agent — and opens its own environment for
   -- the validation script, once the branch it is merging is checked out.
@@ -548,7 +555,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     workdir := repoPath
     grants  := Sandbox.grantsFor (agentDefOfBackend ioTask.backend).sandboxPaths
                  appConfig.additionalSandboxPaths repoPath ioTask.readOnly pluginDirs memoryDirs
-    label   := taskId }
+    label   := taskId
+    repo    := some ioTask.fork.toString
+    image   := repoConfig.image }
   IO.println s!"  Running in: {session.id}"
   try
     -- 4. Start MCP server (runs in this process, outside the sandbox)
@@ -585,10 +594,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     }
     let (port, shutdown) ← Server.start serverState (bindHost := mcpBind)
     IO.println s!"  MCP server on port {port}"
-    -- 5. Run init hook and load per-repository config. Both run in the session, which is where the
-    -- agent will work — `init.sh` installs the toolchain that `validation.sh` later needs.
+    -- 5. Run the init hook, in the session — that is where the agent will work, and where
+    -- `init.sh` installs the toolchain `validation.sh` later needs. The repository's config was
+    -- read before the session was opened, since it says which environment to open.
     RepoConfig.runInitIfNeeded session repoPath
-    let repoConfig ← RepoConfig.loadRepoConfig repoPath
     -- 6. Validation loop: before.sh → agent → validation.sh, retry on failure
     let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
     let systemPrompt :=

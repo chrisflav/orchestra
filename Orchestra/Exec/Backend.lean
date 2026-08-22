@@ -99,6 +99,18 @@ structure Session where
   /-- Finish: bring back anything that has to come back, and release whatever was held. Called once
       per task, including when the task failed. -/
   close : IO Unit
+  /-- Whether every task starts from a new environment, with nothing a previous one installed.
+
+      This is what the repository's `init.sh` is measured against. It is meant to run once — a
+      toolchain install, a warmed build cache — and it records that it has by writing a marker
+      *into the checkout*, which is the right place when the environment is a machine that keeps
+      what it was given. It is the wrong place when the environment is new each time and the
+      checkout is the one thing carried into it: the marker arrives from the last task, and the
+      hook that installs the toolchain is skipped in a container that has none.
+
+      `true` says so, and `RepoConfig.runInitIfNeeded` then runs the hook every task. A repository's
+      `init.sh` is expected to be idempotent for exactly this reason. -/
+  freshEnvironment : Bool := false
 
 /-- What an execution environment has to be opened with.
 
@@ -114,6 +126,16 @@ structure SessionSpec where
   grants : Array PathGrant := #[]
   /-- What to call the environment where it is created — the task's id. -/
   label : String := "orchestra"
+  /-- The repository being worked on, as `owner/name`. For labelling the environment, and for
+      backends that let an operator pin one repository's environment separately from the rest. -/
+  repo : Option String := none
+  /-- The environment this repository asked for, from its own `.orchestra/config.json`.
+
+      Which build and dev dependencies a task needs is a property of the repository, not of the
+      daemon: one needs a Lean toolchain, the next a JDK, the one after that a browser and a
+      database client. A backend that runs tasks in an image of some kind reads this to decide
+      which; one that runs them on this machine has nothing to choose and ignores it. -/
+  image : Option String := none
 
 /-- One way of executing agents.
 

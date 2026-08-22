@@ -194,6 +194,84 @@ def thePodIsNotAllowedToOutliveTheTask : Test := do
     TestM.assertEqual (spec.getObjValAs? Nat "activeDeadlineSeconds" |>.toOption) (some 14400)
       (msg := "the cluster ends it eventually, whatever the daemon is doing")
 
+/-! ## Which image a task runs in
+
+What a task needs installed — a Lean toolchain, a JDK, a browser, a database client — is a property
+of the repository, so one image for the whole daemon is not an answer. Three sources, in the order
+a conflict between them should be settled. -/
+
+private def repoAsked : SessionSpec :=
+  { sampleSession with repo := some "acme/widgets", image := some "ghcr.io/acme/widgets-ci:2" }
+
+@[test]
+def aRepositorySaysWhatItNeedsInstalled : Test := do
+  -- The repository already writes this down for its own CI, and it is the thing that knows.
+  TestM.assertEqual (imageFor (config) repoAsked) "ghcr.io/acme/widgets-ci:2"
+    (msg := "the repository's own image is used")
+  TestM.assertEqual (imageFor (config) sampleSession) "ghcr.io/example/agent:1"
+    (msg := "and the configured default covers everything that has not said otherwise")
+
+@[test]
+def anOperatorCanPinARepositoryAndCanRefuseTheWholeIdea : Test := do
+  -- A pin beats what the repository asked for: it is the choice someone made deliberately for that
+  -- repository, and nothing inside the repository should be able to talk them out of it.
+  let pinned := config [("images", Json.mkObj [("acme/widgets", .str "ghcr.io/ops/pinned:1")])]
+  TestM.assertEqual (imageFor pinned repoAsked) "ghcr.io/ops/pinned:1"
+    (msg := "the operator's pin wins")
+  TestM.assertEqual (imageFor pinned { sampleSession with repo := some "acme/other" })
+    "ghcr.io/example/agent:1" (msg := "and applies to the repository it names, not the rest")
+  -- Or the whole mechanism can be turned off, and every task runs in what the configuration says.
+  let fixed := config [("allow_repo_image", .bool false)]
+  TestM.assertEqual (imageFor fixed repoAsked) "ghcr.io/example/agent:1"
+    (msg := "a repository cannot choose when it is not allowed to")
+
+@[test]
+def theImageReachesThePodAndTheLogLine : Test := do
+  let m := podManifest (config) repoAsked "orchestra-abc123" staged
+  TestM.assert (AgentDef.containsCI m.compress "ghcr.io/acme/widgets-ci:2")
+    "the container runs the image the repository asked for"
+  -- The repository is on the pod too, so a running task can be found from what the dashboard
+  -- shows. A label value cannot hold a `/`.
+  TestM.assert (AgentDef.containsCI m.compress "acme.widgets") "and the pod is labelled with it"
+
+@[test]
+def aFreshEnvironmentRunsTheInitHookEveryTime : Test := do
+  -- `init.sh` is what installs the toolchain, and it records that it has run in a marker inside
+  -- the checkout — which is precisely the thing carried into a pod that has nothing installed. The
+  -- marker would then skip the install in an environment that needs it.
+  match Kubernetes.factory.make (options) with
+  | .error e => TestM.fail s!"a valid config was rejected: {e}"
+  | .ok _ =>
+    -- The backend says its environments are new each task; `RepoConfig.runInitIfNeeded` reads that.
+    TestM.assert (!Landrun.session.freshEnvironment)
+      "a machine keeps what a previous task installed, so the marker means what it says"
+    TestM.assert (!Local.session.freshEnvironment) "and so does this one"
+
+@[test]
+def apersistentHomeIsWhatMakesInitCheap : Test := do
+  -- Every task starts from a new pod, so a hook that installs a toolchain pays in full each time
+  -- unless what it installs survives — and `~/.elan`, `~/.cargo` and `~/.cache` are all under
+  -- `$HOME`.
+  let volumes (j : Json) : List Json :=
+    match j.getObjVal? "spec" |>.toOption |>.bind (·.getObjVal? "volumes" |>.toOption) with
+    | some (.arr vs) => vs.toList
+    | _              => []
+  let home (j : Json) : Option Json :=
+    (volumes j).find? fun v => (v.getObjValAs? String "name" |>.toOption) == some "home"
+  match home manifest with
+  | none   => TestM.fail "the pod has no home volume"
+  | some v =>
+    TestM.assert (AgentDef.containsCI v.compress "emptyDir")
+      "by default it is scratch, and every task installs from nothing"
+  let cached := podManifest (config [("home_claim", .str "orchestra-agent-home")])
+    sampleSession "orchestra-abc123" staged
+  match home cached with
+  | none   => TestM.fail "the pod has no home volume"
+  | some v =>
+    TestM.assert (AgentDef.containsCI v.compress "orchestra-agent-home")
+      "a configured claim becomes the agent's home"
+    TestM.assert (!AgentDef.containsCI v.compress "emptyDir") "and replaces the scratch volume"
+
 /-! ## Running something in the pod -/
 
 @[test]

@@ -190,11 +190,14 @@ private def prepareHandler (p : Parsed) : IO UInt32 := do
     -- Through the configured execution backend, because that is where the hook has to run to be
     -- worth anything: on a daemon that dispatches into a cluster, this machine may have no
     -- toolchain to install and nothing that reads what it installed.
+    let repoConfig ← RepoConfig.loadRepoConfig slotPath
     let session ← execBackend.openSession {
       workdir := slotPath
       grants  := #[{ path := slotPath.toString, access := .rwx, required := true
                    , from_ := .orchestra }]
-      label   := s!"prepare-{slot}" }
+      label   := s!"prepare-{slot}"
+      repo    := some fork.toString
+      image   := repoConfig.image }
     try
       RepoConfig.runInitIfNeeded session slotPath
     finally
@@ -1464,11 +1467,14 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     Usage.markUsed backendName label
   -- The same session a queued task gets, for the same reasons: it is what carries the checkout
   -- to wherever the agent runs, and what brings it back when the person is done with it.
+  let repoConfig ← RepoConfig.loadRepoConfig repoPath
   let session ← execBackend.openSession {
     workdir := repoPath
     grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths repoPath
                  false appConfig.pluginDirs #[]
-    label   := "interactive" }
+    label   := "interactive"
+    repo    := some fork.toString
+    image   := repoConfig.image }
   IO.println s!"  Running in: {session.id}"
   IO.println "  Launching agent..."
   let result ← try
