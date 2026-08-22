@@ -44,18 +44,21 @@ def resolve (cfg : ExecutionConfig) : IO (Except String Backend) := do
       | .ok ()   => return .ok b
       | .error e => return .error s!"execution backend '{b.name}' is not usable here: {e}"
 
-/-- Where the MCP server should listen for `backend`'s agents, and the token it should demand.
+/-- Where the MCP server should listen for `backend`'s agents — address and, if it matters, which
+    ports it may use — and the token it should demand.
 
-    The two are decided together because they are the same decision. Loopback is reachable only by
-    something already on this machine, which is the whole of the access control it needs. Anywhere
-    else, the socket is reachable by whatever else is on that network, and the server holds the
-    PAT — so a run that is exposed at all is exposed with a secret the agent has to present.
+    Decided together because they are the same decision. Loopback is reachable only by something
+    already on this machine, which is the whole of the access control it needs, and the port can be
+    whatever the kernel hands out because nothing else has to find it. Anywhere else, the socket is
+    reachable by whatever else is on that network, and the server holds the PAT — so a run that is
+    exposed at all is exposed with a secret the agent has to present, and on a port whoever has to
+    route to it can be told about in advance.
 
-    Minted here, once per task, and never written anywhere but the agent's own MCP configuration
-    inside its sandbox. -/
-def mcpBinding (backend : Backend) : IO (String × Option String) := do
+    The token is minted here, once per task, and never written anywhere but the agent's own MCP
+    configuration inside its sandbox. -/
+def mcpBinding (backend : Backend) : IO (String × Option (UInt16 × UInt16) × Option String) := do
   match backend.exposure with
-  | .loopback     => return ("127.0.0.1", none)
-  | .network host => return (host, some (← randomHex 24))
+  | .loopback            => return ("127.0.0.1", none, none)
+  | .network host ports  => return (host, ports, some (← randomHex 24))
 
 end Orchestra.Exec

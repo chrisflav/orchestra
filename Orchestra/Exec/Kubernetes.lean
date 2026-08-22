@@ -48,7 +48,7 @@ file inside the pod — over the same `tar` channel the checkout travels on — 
 
 namespace Orchestra.Exec.Kubernetes
 
-open Lean (Json)
+open Lean (Json fromJson?)
 open Orchestra.Exec
 
 /-! ## Configuration -/
@@ -125,8 +125,18 @@ structure Config where
   mcpHost : String
   /-- Address the daemon's MCP server binds so the cluster can reach it. `0.0.0.0` because the
       daemon is usually itself in a pod, where the interface it should bind is not knowable by
-      name. Every connection is authenticated with a per-run token whatever this is set to. -/
+      name. Every connection is authenticated with a per-task token whatever this is set to. -/
   mcpBind : String := "0.0.0.0"
+  /-- Ports the daemon's MCP server may listen on, as `[from, to]` inclusive.
+
+      Only needed when something between the pods and the daemon has to be told the port before the
+      task that uses it exists — a firewall rule, a port-forward, an SSH tunnel — which is the case
+      for a daemon that runs outside the cluster its pods are in. A daemon inside the cluster needs
+      nothing here: pods reach its address on any port.
+
+      One server is started per task, so the range has to be at least as wide as the queue's
+      parallelism. Unset means any free port, which is what orchestra has always done. -/
+  mcpPorts : Option (UInt16 × UInt16) := none
   /-- `activeDeadlineSeconds`: the cluster kills the pod after this, whatever the daemon is doing.
       The backstop for a daemon that dies mid-task and leaves a pod holding a checkout. Counted
       over the whole task, hooks and retries included. -/
@@ -203,6 +213,13 @@ runs with no tools at all"
     extraMounts := jsonArr? j "volume_mounts"
     mcpHost
     mcpBind := (jsonStr? j "mcp_bind").getD "0.0.0.0"
+    mcpPorts := match j.getObjVal? "mcp_ports" with
+      | .ok (.arr #[lo, hi]) => do
+        let l ← (fromJson? lo : Except String Nat).toOption
+        let h ← (fromJson? hi : Except String Nat).toOption
+        if l == 0 || h < l || h > 65535 then none else
+          some (UInt16.ofNat l, UInt16.ofNat h)
+      | _ => none
     deadlineSeconds := nat "deadline_seconds" 14400
     startupTimeoutSeconds := nat "startup_timeout_seconds" 600
     syncBack := j.getObjValAs? Bool "sync_back" |>.toOption |>.getD true
@@ -625,7 +642,7 @@ def factory : BackendFactory where
       name := "kubernetes"
       -- The agent is off this machine, so the MCP server has to listen somewhere it can reach —
       -- and every connection to it then carries a per-run token, minted with the server.
-      exposure := .network cfg.mcpBind
+      exposure := .network cfg.mcpBind cfg.mcpPorts
       mcpEndpoint := fun e => pure { e with host := cfg.mcpHost }
       preflight := preflight cfg
       openSession := openSession cfg }

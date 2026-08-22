@@ -43,10 +43,17 @@ structure Handle where
     before the server starts: `Server.start` binds what this says, and a task whose agent runs off
     this machine gets a per-run token minted along with it. -/
 inductive Exposure where
-  /-- The agent runs here, so loopback is reachable and no one else is. No token. -/
+  /-- The agent runs here, so loopback is reachable and no one else is. No token, and any free
+      port will do — nothing outside this machine has to find it. -/
   | loopback
-  /-- The agent runs elsewhere: bind this address, and mint a token the agent must present. -/
-  | network (bindHost : String)
+  /-- The agent runs elsewhere: bind this address, and mint a token the agent must present.
+
+      `ports` is an inclusive range to pick the listening port from, for the case where something
+      between the agent and the daemon has to be told about it in advance — a firewall rule, a
+      port-forward, a tunnel. One server is started per task, so the range bounds how many tasks
+      can run at once. `none` takes any free port, which is right when nothing between the two
+      needs to know it: a daemon inside the same cluster as its pods, for instance. -/
+  | network (bindHost : String) (ports : Option (UInt16 × UInt16))
 deriving Repr, BEq, Inhabited
 
 /-- One of the repository's own scripts — `init.sh`, `before.sh`, `validation.sh`, `after.sh` —

@@ -534,7 +534,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       throw (IO.userError s!"cannot run the agent: {e}")
   -- Where the MCP server has to listen for this backend's agents, and the secret they present.
   -- Loopback and no secret unless the backend runs the agent off this machine.
-  let (mcpBind, mcpToken) ← Exec.mcpBinding execBackend
+  let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
   -- What the session is opened with. The grants are the same ones the agent's own launch will be
   -- built from (`Sandbox.grantsFor`): a backend running the agent elsewhere reads them to know
   -- what to carry there — the checkout, the plugin directories, the memories — and one running it
@@ -593,6 +593,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       authToken := mcpToken
     }
     let (port, shutdown) ← Server.start serverState (bindHost := mcpBind)
+      (portRange := mcpPorts)
     IO.println s!"  MCP server on port {port}"
     -- 5. Run the init hook, in the session — that is where the agent will work, and where
     -- `init.sh` installs the toolchain `validation.sh` later needs. The repository's config was

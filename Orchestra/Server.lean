@@ -841,8 +841,8 @@ def parseIPv4? (s : String) : Option IPv4Addr :=
     reach loopback (`Exec.Backend.exposure`). Binding wider is only ever done together with
     `State.authToken`; the two are decided in one place, `Exec.mcpBinding`, so that neither can be
     set without the other. -/
-def start (state : State) (bindHost : String := "127.0.0.1") : IO (UInt16 × IO Unit) := do
-  let server ← Socket.new
+def start (state : State) (bindHost : String := "127.0.0.1")
+    (portRange : Option (UInt16 × UInt16) := none) : IO (UInt16 × IO Unit) := do
   let bindAddr := match parseIPv4? bindHost with
     | some a => a
     | none   =>
@@ -850,9 +850,37 @@ def start (state : State) (bindHost : String := "127.0.0.1") : IO (UInt16 × IO 
       -- is the safe reading of an address that cannot be parsed.
       dbg_trace s!"[mcp] cannot parse bind address '{bindHost}', listening on 127.0.0.1 instead"
       IPv4Addr.ofParts 127 0 0 1
-  let addr := SocketAddress.v4 { addr := bindAddr, port := 0 }
-  server.bind addr
-  server.listen 8
+  -- Port zero unless a range was asked for, in which case the first free port in it. A range is
+  -- how a daemon whose agents are somewhere else stays routable: the firewall rule, port-forward
+  -- or tunnel between them has to name a port before the task that uses it exists.
+  -- Bound *and* listening before a port counts as taken: `bind` here succeeds on a port another
+  -- socket is already serving, and the conflict only surfaces at `listen`. Probing with `bind`
+  -- alone hands two tasks the same port and splits the agents' connections between their two MCP
+  -- servers at the kernel's discretion.
+  let listenOn (port : UInt16) : IO (Option Socket) := do
+    try
+      let sock ← Socket.new
+      sock.bind (SocketAddress.v4 { addr := bindAddr, port })
+      sock.listen 8
+      return some sock
+    catch _ => return none
+  let server ← match portRange with
+    | none =>
+      match ← listenOn 0 with
+      | some sock => pure sock
+      | none      => throw (IO.userError "could not listen for this task's MCP server")
+    | some (lo, hi) => do
+      let mut found : Option Socket := none
+      for i in List.range (hi.toNat + 1 - lo.toNat) do
+        if found.isNone then
+          found ← listenOn (UInt16.ofNat (lo.toNat + i))
+      match found with
+      | some sock => pure sock
+      | none =>
+        -- One server per task, so an exhausted range is the daemon running more tasks at once than
+        -- the range has room for. Said plainly, because the alternative reading — "the network is
+        -- broken" — sends someone looking in the wrong place.
+        throw (IO.userError s!"no free port between {lo} and {hi} for this task's MCP server. Every port in the range is in use, which means as many tasks are already running; widen execution.options.mcp_ports or lower the queue's parallelism.")
   let localAddr ← server.getSockName
   let port := match localAddr with
     | .v4 a => a.port | .v6 a => a.port

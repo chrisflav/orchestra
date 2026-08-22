@@ -425,7 +425,7 @@ def theBackendMovesTheEndpointAndKeepsTheToken : Test := do
   match Kubernetes.factory.make (options) with
   | .error e => TestM.fail s!"a valid config was rejected: {e}"
   | .ok b =>
-    TestM.assert (b.exposure == .network "0.0.0.0")
+    TestM.assert (b.exposure == .network "0.0.0.0" none)
       "the daemon has to listen where a pod can reach it"
     let reached ← b.mcpEndpoint { host := "127.0.0.1", port := 8080, token := some "s3cret" }
     TestM.assertEqual reached.host "orchestra.orchestra.svc.cluster.local"
@@ -435,17 +435,20 @@ def theBackendMovesTheEndpointAndKeepsTheToken : Test := do
 
 @[test]
 def anExposedServerAlwaysGetsAToken : Test := do
-  let (bind, token) ← Exec.mcpBinding { name := "test", exposure := .network "0.0.0.0"
-                                      , openSession := fun _ =>
-                                          throw (IO.userError "not opened") }
+  let (bind, _ports, token) ← Exec.mcpBinding { name := "test"
+                                              , exposure := .network "0.0.0.0" none
+                                              , openSession := fun _ =>
+                                                  throw (IO.userError "not opened") }
   TestM.assertEqual bind "0.0.0.0" (msg := "bind address")
   match token with
   | none   => TestM.fail "a server reachable over a network was left unauthenticated"
   | some t => TestM.assert (t.length ≥ 32) "and the token is long enough to be worth having"
-  let (loopbackBind, loopbackToken) ← Exec.mcpBinding Landrun.backend
+  let (loopbackBind, loopbackPorts, loopbackToken) ← Exec.mcpBinding Landrun.backend
   TestM.assertEqual loopbackBind "127.0.0.1" (msg := "a local run still binds loopback")
   TestM.assertEqual loopbackToken none
     (msg := "and needs no token: only this machine can connect at all")
+  TestM.assertEqual loopbackPorts none
+    (msg := "nor a port anything outside has to be told about in advance")
 
 @[test]
 def theClientSendsItsTokenBeforeAnythingElse : Test := do
@@ -522,6 +525,42 @@ def aLoopbackServerIsUnchanged : Test := do
   let served ← ask port [toolsList]
   shutdown
   TestM.assert (AgentDef.containsCI served "tools") "a client that sends no token is served"
+
+@[test]
+def aDaemonOutsideTheClusterCanBeGivenPortsToLiveOn : Test := do
+  -- The point of a range: something between the pods and the daemon — a firewall rule, a
+  -- port-forward, a tunnel — has to be told the port before the task that uses it exists, and an
+  -- ephemeral one cannot be told to anybody.
+  let c := config [("mcp_ports", .arr #[.num 31000, .num 31009])]
+  TestM.assertEqual c.mcpPorts (some (31000, 31009)) (msg := "the range is read")
+  match Kubernetes.factory.make (options [("mcp_ports", .arr #[.num 31000, .num 31009])]) with
+  | .error e => TestM.fail s!"a valid config was rejected: {e}"
+  | .ok b =>
+    let (_, ports, _) ← Exec.mcpBinding b
+    TestM.assertEqual ports (some (31000, 31009)) (msg := "and reaches the server that binds it")
+  -- Nonsense is ignored rather than obeyed: a backwards or out-of-range pair would otherwise
+  -- become a server that binds nothing and a task that fails for an unrelated-looking reason.
+  TestM.assertEqual (config [("mcp_ports", .arr #[.num 900, .num 100])]).mcpPorts none
+    (msg := "a backwards range is not a range")
+  TestM.assertEqual (config [("mcp_ports", .arr #[.num 1])]).mcpPorts none
+    (msg := "nor is a single number")
+
+@[test]
+def theServerListensInsideTheRangeItWasGiven : Test := do
+  -- Started for real: this is the property a firewall rule depends on.
+  let (port, shutdown) ← Server.start (testServerState none) (bindHost := "127.0.0.1")
+    (portRange := some (39120, 39129))
+  shutdown
+  TestM.assert (port ≥ 39120 && port ≤ 39129) s!"the server listened on {port}, inside the range"
+  -- A second server takes the next port, which is what makes the range's width the number of
+  -- tasks that can run at once.
+  let (first, shutFirst) ← Server.start (testServerState none) (bindHost := "127.0.0.1")
+    (portRange := some (39130, 39131))
+  let (second, shutSecond) ← Server.start (testServerState none) (bindHost := "127.0.0.1")
+    (portRange := some (39130, 39131))
+  shutFirst
+  shutSecond
+  TestM.assert (first != second) "two tasks at once do not land on the same port"
 
 @[test]
 def theServerBindsWhatItIsTold : Test := do

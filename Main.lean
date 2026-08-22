@@ -1432,7 +1432,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     | .error e =>
       IO.eprintln s!"Cannot launch the agent: {e}"
       return 1
-  let (mcpBind, mcpToken) ← Exec.mcpBinding execBackend
+  let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
   let serverState : Server.State := {
     upstream, fork
     allowedTools
@@ -1444,6 +1444,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     authToken      := mcpToken
   }
   let (port, shutdown) ← Server.start serverState (bindHost := mcpBind)
+    (portRange := mcpPorts)
   IO.println s!"  MCP server on port {port}"
   let agentDef := match backend with
     | some "pi"       => AgentDef.pi

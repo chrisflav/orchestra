@@ -83,6 +83,41 @@ rules:
     verbs: ["get"]
 ```
 
+### where the daemon runs
+
+The cluster does not have to be the machine the daemon is on, and usually is not. Everything
+orchestra does to the cluster goes through `kubectl` and therefore through the API server, so
+creating the pod, copying the checkout in and out, running each command and reading its output all
+work against a cluster anywhere. What decides the topology is the *other* direction: the pod has to
+reach the daemon's MCP server, or the agent has no tools.
+
+**The daemon in the cluster** is the arrangement with nothing to configure. Pods reach it at its
+Service address on whatever port each task's server happens to take, so `mcp_host` is that Service
+and there is nothing else to do.
+
+**The daemon outside the cluster, with a route in** — a workstation on the same network as an
+on-prem cluster, a VM peered with a cloud VPC. Set `mcp_host` to an address of that machine the
+pods can route to, and set `mcp_ports` to a range that whatever is in between can be told about:
+
+```json
+"options": { "mcp_host": "10.0.4.11", "mcp_ports": [31000, 31015] }
+```
+
+Without a range the port is ephemeral and different for every task, which no firewall rule, no
+port-forward and no tunnel can be written against. One server runs per task, so the range has to be
+at least as wide as the queue's parallelism; orchestra takes the first free port in it and fails
+the task with a clear message when there is none left.
+
+**The daemon outside, with no route in** — a laptop behind NAT, a managed cluster with no path back
+to it. There is nothing to set here: the agent's tools need an inbound connection. The usual
+answers are to run the daemon in the cluster, or to give it one — a reverse tunnel or a VPN that
+puts the daemon on a routable address, and then the case above.
+
+Two things cost more the further away the cluster is. The checkout is copied in when a task starts
+and out when it ends, over the API server, so `excludes` for build output earns its keep on a
+distant cluster. And each command is a single long-lived `kubectl exec` connection, which anything
+in between may drop if it goes quiet; see the note on long silences below.
+
 **A route from the pods to the daemon's MCP server.** This is the part that is easy to get wrong
 and silent when it is: without it the agent starts, finds no tools, and does the task by hand — it
 cannot open a pull request, comment, or claim an issue. `mcp_host` is where the pod should look. If
@@ -262,6 +297,7 @@ the cluster was actually asked for.
 | `home_path` | `/home/agent` | where the agent's `$HOME` is in the pod |
 | `home_claim` | *(none)* | PVC to mount as `$HOME`, so toolchains and caches survive between tasks |
 | `mcp_bind` | `0.0.0.0` | address the daemon's MCP server binds |
+| `mcp_ports` | *(any free port)* | `[from, to]` the MCP server may listen on, for a daemon something has to route to |
 | `deadline_seconds` | `14400` | `activeDeadlineSeconds` on the pod |
 | `startup_timeout_seconds` | `600` | how long to wait for the pod to be ready |
 | `sync_back` | `true` | whether the checkout is copied back out |
