@@ -496,6 +496,12 @@ def planTaxisLabels (known : Array Orchestra.Taxis.Label)
   -- have to pick one, and picking wrong is silent: the request is planned and reported against
   -- one id and applied to a set holding the other, so the call answers "removed t-ready" having
   -- changed nothing. Refuse instead, the way an ambiguous actor name is refused.
+  --
+  -- Preferring an exact match would serve most such requests correctly and is tempting, since
+  -- exact matching is what `issuesWithLabel` and `ensureLabel` already do. It is not taken
+  -- because the case it gets wrong is the silent one: an agent picking `T-Ready` off `list_labels`
+  -- when the dispatcher watches `t-ready` would be given exactly what it asked for, and the issue
+  -- would sit unrouted with nothing to show why. A refusal names both spellings and is actionable.
   let ambiguous := (add ++ remove).filter fun n =>
     (known.filter (·.name.toLower == n.toLower)).size > 1
   unless ambiguous.isEmpty do

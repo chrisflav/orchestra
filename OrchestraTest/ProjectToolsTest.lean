@@ -139,6 +139,37 @@ def parseUpdateIssueRejectsAMistypedScalar : Test := do
   | other => TestM.fail s!"expected a parse error, got {repr other}"
 
 @[test]
+def parseUpdateIssueRejectsAMistypedTarget : Test := do
+  -- The last field that read a mistype as an absence. `target_repo: 1` used to parse as "no
+  -- target named", so the handler answered "no field was named" to a call that named one.
+  match tryParseToolCall "update_issue"
+      (Json.mkObj [("issue_id", Json.num 7), ("target_repo", Json.num 1)]) with
+  | some (.error e) => TestM.assert (e.contains "target_repo") "the refusal names the field"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
+def parseUpdateIssueDiagnosesAMistypedHalfOfATarget : Test := do
+  -- Both halves were named, so "must be provided together" would be the wrong complaint.
+  let args := Json.mkObj
+    [("issue_id", Json.num 7), ("target_repo", Json.num 1), ("target_branch", Json.str "main")]
+  match tryParseToolCall "update_issue" args with
+  | some (.error e) =>
+    TestM.assert (e.contains "target_repo" && !e.contains "provided together")
+      "the refusal is about the type, not about a missing half"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
+def parseCreateIssueStillTakesABareTarget : Test := do
+  -- `parseTarget?` is shared, so this is the regression check on the other caller.
+  let args := Json.mkObj
+    [ ("project_id", Json.num 1), ("title", Json.str "t"), ("description", Json.str "d")
+    , ("target_repo", Json.str "o/r"), ("target_branch", Json.str "main") ]
+  match tryParseToolCall "create_issue" args with
+  | some (.ok (.createIssue _ _ _ _ target _)) =>
+    TestM.assert (target.isSome) "a well-formed target still parses"
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
 def parseUpdateIssueTreatsNullAsAbsent : Test := do
   -- `null` is how a client serialises "not set", so it must mean the same as omitting the key —
   -- rejecting it would fail calls that are asking for nothing in particular.

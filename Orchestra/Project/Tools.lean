@@ -322,9 +322,27 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "abandoned" => some .abandoned
   | _           => none
 
+/-- Read an optional string argument, telling *absent* from *malformed*.
+
+    A missing key and an explicit `null` — which is how a client serialises "not set" — both mean
+    leave it alone. Anything else that is not a string is the caller's mistake and is reported as
+    one: read as absent instead, a mistyped field is a call that changes nothing while answering
+    as though it had nothing to change. -/
+private def optStrArg (args : Json) (field : String) : Except String (Option String) :=
+  match args.getObjVal? field with
+  | .error _  => .ok none
+  | .ok .null => .ok none
+  | .ok _     =>
+    match args.getObjValAs? String field with
+    | .ok v    => .ok (some v)
+    | .error e => .error s!"{field} must be a string: {e}"
+
 private def parseTarget? (args : Json) : Except String (Option RepoTarget) := do
-  let mRepo  := args.getObjValAs? String "target_repo"   |>.toOption
-  let mBranch := args.getObjValAs? String "target_branch" |>.toOption
+  -- Mistyped rather than lenient, so that "provided together" means what it says: read through
+  -- `.toOption`, `target_repo: 1` was indistinguishable from an absent one, and naming both with
+  -- one of them mistyped was reported as failing to provide both.
+  let mRepo   ← optStrArg args "target_repo"
+  let mBranch ← optStrArg args "target_branch"
   match mRepo, mBranch with
   | none,   none   => return none
   | some r, some b =>
@@ -374,15 +392,10 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | .error _  => false   -- no such key
         | .ok .null => false   -- explicit null: how a client spells "not set"
         | .ok _     => true
-      let str (field : String) : Except String (Option String) :=
-        if !present field then .ok none
-        else match args.getObjValAs? String field with
-          | .ok v    => .ok (some v)
-          | .error e => .error s!"{field} must be a string: {e}"
-      let title ← str "title"
-      let descr ← str "description"
+      let title ← optStrArg args "title"
+      let descr ← optStrArg args "description"
       let status ← do
-        match ← str "status" with
+        match ← optStrArg args "status" with
         | none   => pure none
         | some s =>
           match issueStatusOfString? s with
