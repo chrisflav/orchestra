@@ -160,7 +160,7 @@ def handleSocketRequest
           | .ok record => pure (.withId record.id)
           | .error e   => pure (.error e)
         | .interactiveMessage id text =>
-          match ← interactive.send id text with
+          match ← interactive.send appConfig id text debug with
           | .ok seq  => pure (.withId (toString seq))
           | .error e => pure (.error e)
         | .interactiveInterrupt id =>

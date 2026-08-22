@@ -330,7 +330,14 @@ export interface UsageHistory {
 
 /* ── Interactive sessions ───────────────────────────────────────────────────────────────── */
 
-export type SessionStatus = "starting" | "idle" | "running" | "ended" | "failed";
+export type SessionStatus =
+  | "starting"
+  | "idle"
+  | "running"
+  /** Nothing running, conversation intact: posting a turn starts an agent again and resumes it. */
+  | "dormant"
+  | "ended"
+  | "failed";
 
 export interface SessionSummary {
   id: string;

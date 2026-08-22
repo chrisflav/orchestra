@@ -39,7 +39,17 @@ inductive SessionStatus where
   | idle
   /-- Working on a turn. -/
   | running
-  /-- Closed, reaped, out of budget, or the daemon restarted under it. -/
+  /-- Nothing is running, and the conversation is intact.
+
+      What an idle session becomes when its process is put down, and what every session becomes
+      when the daemon restarts. A session holds a clone slot, an MCP server and an agent process,
+      and none of those should be held by a conversation nobody is having — but the conversation
+      itself costs a directory, and a person who closed a laptop on Friday has not finished
+      talking. The next turn posted to a dormant session starts an agent again and resumes the
+      agent-side history, so it picks up where it left off. Deliberately **not** terminal: this
+      is a session that is waiting, not one that is over. -/
+  | dormant
+  /-- Closed by request, or out of budget. -/
   | ended
   /-- The agent process died, or the session could not be started at all. -/
   | failed
@@ -50,6 +60,7 @@ instance : ToJson SessionStatus where
     | .starting => "starting"
     | .idle     => "idle"
     | .running  => "running"
+    | .dormant  => "dormant"
     | .ended    => "ended"
     | .failed   => "failed"
 
@@ -58,6 +69,7 @@ instance : FromJson SessionStatus where
     | .str "starting" => .ok .starting
     | .str "idle"     => .ok .idle
     | .str "running"  => .ok .running
+    | .str "dormant"  => .ok .dormant
     | .str "ended"    => .ok .ended
     | .str "failed"   => .ok .failed
     | j => .error s!"expected session status string, got {j}"
@@ -93,8 +105,27 @@ structure SessionRecord where
       Assigned before the process starts rather than read back out of its stream, so a session
       whose agent died before saying anything can still be picked up where it left off. -/
   agentSessionId : Option String := none
+  /-- Whether an agent has ever announced itself under `agentSessionId`.
+
+      What `--resume` actually needs to know, and `turnCount` is not a proxy for it in either
+      direction. A turn is counted before it reaches the CLI, so a daemon killed in that window
+      leaves turns recorded against a conversation the CLI never wrote — and `--resume` on one of
+      those errors, which for a dormant session means every wake fails the same way, forever.
+      The other direction is the common one: a session started and never spoken to still has an
+      `init` from the CLI, so it *is* resumable at zero turns. Set from the `init` event, which
+      is the only thing that knows. -/
+  agentStarted : Bool := false
   /-- The session this one resumed, when it was started to revive a dead one. -/
   resumedFrom : Option String := none
+  /-- Optional tools this session's MCP server grants, as the request asked for them; `none`
+      means all of them.
+
+      On the record rather than only in the request because a dormant session is woken from what
+      is on disk, and a conversation that comes back with a different set of tools than it went
+      to sleep with is not the same session. -/
+  tools : Option (List String) := none
+  /-- The system prompt appended at launch, for the same reason. -/
+  systemPrompt : Option String := none
   turnCount : Nat := 0
   /-- Spend so far, as the agent reported it. -/
   costUsd : Float := 0.0
@@ -124,12 +155,19 @@ instance : ToJson SessionRecord where
     ("budget",         ToJson.toJson r.budget),
     ("slot",           ToJson.toJson r.slot),
     ("agentSessionId", optStr r.agentSessionId),
+    ("agentStarted",   ToJson.toJson r.agentStarted),
     ("resumedFrom",    optStr r.resumedFrom),
     ("turnCount",      ToJson.toJson r.turnCount),
     ("costUsd",        ToJson.toJson r.costUsd),
     ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
     ("title",          optStr r.title),
-    ("error",          optStr r.error)
+    ("error",          optStr r.error),
+    -- Not part of the API payload — `Orchestra.Dashboard` builds that itself. These are here
+    -- because the record is what a dormant session is woken from.
+    ("tools",          match r.tools with
+                       | some ts => Json.arr (ts.map Json.str).toArray
+                       | none    => Json.null),
+    ("systemPrompt",   optStr r.systemPrompt)
   ]
 
 instance : FromJson SessionRecord where
@@ -148,12 +186,15 @@ instance : FromJson SessionRecord where
       budget         := j.getObjValAs? Float  "budget"         |>.toOption |>.getD 20.0
       slot           := j.getObjValAs? Nat    "slot"           |>.toOption |>.getD 0
       agentSessionId := j.getObjValAs? String "agentSessionId" |>.toOption
+      agentStarted   := j.getObjValAs? Bool   "agentStarted"   |>.toOption |>.getD false
       resumedFrom    := j.getObjValAs? String "resumedFrom"    |>.toOption
       turnCount      := j.getObjValAs? Nat    "turnCount"      |>.toOption |>.getD 0
       costUsd        := j.getObjValAs? Float  "costUsd"        |>.toOption |>.getD 0.0
       lastEventSeq   := j.getObjValAs? Nat    "lastEventSeq"   |>.toOption |>.getD 0
       title          := j.getObjValAs? String "title"          |>.toOption
       error          := j.getObjValAs? String "error"          |>.toOption
+      tools          := j.getObjValAs? (List String) "tools"   |>.toOption
+      systemPrompt   := j.getObjValAs? String "systemPrompt"   |>.toOption
     }
 
 /-- What a caller asks for when it starts a session.

@@ -26,6 +26,9 @@ const SECTION: Record<string, Section> = {
   // waiting in the same sense `pending` is; `ended` finished, and `starting` is on its way.
   starting: "pending",
   idle: "pending",
+  // Waiting, like `idle` — the difference is whether an agent is up for it, which is the
+  // daemon's business rather than the conversation's.
+  dormant: "pending",
   ended: "done",
 };
 

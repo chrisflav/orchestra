@@ -1277,21 +1277,33 @@ orchestra chat --end <id>          # end it and release what it holds
 ```
 
 Detaching and ending are different, and only one of them can be undone. `/quit`, Ctrl-D and
-closing the terminal all leave the session running on the backend; `--end` is how you end it.
-That is what makes it worth having a session rather than a TUI: you can start one at a desk,
-close the laptop, and pick the same conversation up from the dashboard.
+closing the terminal all leave the session on the backend; `--end` is how you end it. That is
+what makes it worth having a session rather than a TUI: you can start one at a desk, close the
+laptop, and pick the same conversation up from the dashboard.
 
-Which model answers is yours to choose, at the moment the session starts and not after: the
-agent process is launched once and kept, so the model is a property of the session rather than
-of a turn. `orchestra chat --model <name>` on the command line, and the box beside the two
-repositories on the dashboard's chat page; leaving it empty runs whatever the backend runs by
-default. The name is passed through to the backend's own CLI untouched, so a family alias
-(`opus`) and a pinned id (`claude-opus-5`) are both fine, and orchestra does not keep a list of
-what is valid — the backend answers that.
+**A session does not expire.** Its *process* does — an agent holding a clone slot, an MCP server
+and a sandbox is expensive to keep up for a conversation nobody is having, so after
+`idle_timeout_seconds` without a turn the daemon stops it and hands the slot back. The session
+goes `dormant`, which is not an ending: the record and the transcript are untouched, and the
+next turn posted to it starts an agent again and resumes the agent-side history where it left
+off. Say something and it comes back, from whichever client is to hand. A daemon restart leaves
+sessions in the same state for the same reason.
 
-A session's model is fixed once it starts, because the agent process is. To carry a conversation
-to a different one, start a new session that resumes the old — repositories and all, since
-starting a session always takes them:
+The first turn to a dormant session takes as long as starting one does, because it is starting
+one. If the working tree it left behind is still in the slot it gets handed back, that tree is
+kept rather than reset. What ends a session is asking: `orchestra chat --end <id>`, the
+dashboard's **End session**, or spending its budget.
+
+Which model answers is yours to choose when the session starts: `orchestra chat --model <name>`
+on the command line, and the box beside the two repositories on the dashboard's chat page.
+Leaving it empty runs whatever the backend runs by default. The name is passed through to the
+backend's own CLI untouched, so a family alias (`opus`) and a pinned id (`claude-opus-5`) are
+both fine, and orchestra does not keep a list of what is valid — the backend answers that.
+
+The model is a property of the session rather than of a turn, and it is on the record, so one
+that goes dormant wakes on the same model it went to sleep on. To carry a conversation to a
+*different* one, start a new session that resumes the old — repositories and all, since starting
+a session always takes them:
 
 ```sh
 orchestra chat --upstream owner/repo --fork your-org/repo --resume-from <id> --model opus
@@ -1316,10 +1328,13 @@ Two limits bound them, in an `interactive` block in `config.json`:
 { "interactive": { "max_sessions": 2, "idle_timeout_seconds": 1800 } }
 ```
 
-They are capacity, not access. A session pins a clone slot — one of the same slots the queue
-claims from, so a task can never take it and reset the working tree mid-conversation — and an
-abandoned browser tab should not hold one forever. `max_sessions` of `0` means a daemon that will
-not hold sessions at all.
+They are capacity, not access, and they bound processes rather than conversations. A session
+that is awake pins a clone slot — one of the same slots the queue claims from, so a task can
+never take it and reset the working tree mid-conversation — and an abandoned browser tab should
+not hold one forever; `idle_timeout_seconds` is what takes it back, by putting the session to
+sleep rather than ending it. `max_sessions` bounds how many are awake at once, so waking a
+dormant session can be refused when that many already are: end one, or wait. `max_sessions` of
+`0` means a daemon that will not hold sessions at all.
 
 ### over HTTP
 
