@@ -243,10 +243,11 @@ pull request it posts to; asking for one without the other is refused at parse
 time.
 
 `manage_issues` is only half useful to a step. Its read tools (`list_issues`,
-`get_issue`) work, but `create_issue` and `update_issue` are scoped by
-`refuseOutsideScope` to the project or issue the task is attached to — and a
-workflow step is attached to neither, since `TaskSpec` has no way to name one.
-Both therefore fail at runtime. `work_issues` and `review_issues` are unaffected:
+`get_issue`, `list_labels`, `list_actors`) work, but `create_issue` and
+`update_issue` are scoped by `refuseOutsideScope` to the project or issue the
+task is attached to — and a workflow step is attached to neither, since
+`TaskSpec` has no way to name one. Both therefore fail at runtime, which takes
+setting labels and assignees with them, since those ride on `update_issue`. `work_issues` and `review_issues` are unaffected:
 they take the project id as a tool argument.
 
 `health`, `refresh_token` and `get_pr_comments` are always available; naming them

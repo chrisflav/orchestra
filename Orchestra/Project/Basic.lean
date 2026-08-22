@@ -489,6 +489,22 @@ def planTaxisLabels (known : Array Orchestra.Taxis.Label)
   unless reserved.isEmpty do
     .error s!"{String.intercalate ", " reserved}: orchestra maintains this label itself and it \
       is not yours to set — claiming an issue and marking one a project have tools of their own"
+  -- taxis's label names are unique under a case-*sensitive* constraint, so `t-ready` and
+  -- `T-Ready` can be two different labels with two different ids — and the dispatcher, which
+  -- resolves its configured label by exact name, is watching exactly one of them. Matching
+  -- case-insensitively (`planLabelChange`, so that `T-Bug` finds GitHub's `t-bug`) would then
+  -- have to pick one, and picking wrong is silent: the request is planned and reported against
+  -- one id and applied to a set holding the other, so the call answers "removed t-ready" having
+  -- changed nothing. Refuse instead, the way an ambiguous actor name is refused.
+  let ambiguous := (add ++ remove).filter fun n =>
+    (known.filter (·.name.toLower == n.toLower)).size > 1
+  unless ambiguous.isEmpty do
+    let spellings (n : String) : String :=
+      String.intercalate ", " ((known.filter (·.name.toLower == n.toLower)).map (·.name)).toList
+    .error s!"{String.intercalate ", " ambiguous}: the tracker defines more than one label \
+      differing only in case ({String.intercalate "; " (ambiguous.map spellings)}), so which one \
+      is meant cannot be told from the name — and a dispatcher is watching only one of them. \
+      This is a fault in the tracker, not in the request: merge the duplicates in taxis"
   let name? (id : Orchestra.Taxis.LabelId) : Option String := (known.find? (·.id == id)).map (·.name)
   let currentNames := (current.filterMap name?).toList
   let change ← Utils.Labels.planLabelChange (known.map (·.name)).toList currentNames add remove
@@ -505,7 +521,15 @@ def planTaxisLabels (known : Array Orchestra.Taxis.Label)
     A request that turns out to be a no-op writes nothing: taxis would accept the unchanged set,
     but a `PATCH` that changes nothing still stamps the issue as updated and lands in its event
     log, and a triage agent re-asserting labels it already set every pass is exactly the caller
-    this has. -/
+    this has.
+
+    **The read and the write are two calls, and taxis offers nothing to make them one.** Its
+    `PATCH /issues/:id` takes the whole label array and carries no `If-Match`, so a claim taken
+    (or dropped) between the `getIssue` here and the `updateIssue` below is overwritten by a set
+    that predates it — the issue then reads as unclaimed while a task holds it, and the
+    dispatcher offers it to a second worker. `saveIssue` has always had the same window; this
+    widens it by adding a second writer that a triage role is meant to call regularly. Closing it
+    needs optimistic concurrency in taxis, not a change here. -/
 def setIssueLabels (iid : Taxis.IssueId) (add remove : List String) :
     IO Utils.Labels.LabelChange := do
   let cfg ← Orchestra.Taxis.getConfig
@@ -537,8 +561,11 @@ def findActor? (known : Array Orchestra.Taxis.Actor) (name : String) :
       else s!"the tracker knows: {String.intercalate ", " (known.map (·.email)).toList}"
     .error s!"no such actor: {name} — {vocabulary}"
   | several =>
-    .error s!"{name} is the display name of several actors \
-      ({String.intercalate ", " (several.map (·.email))}); name one by email"
+    -- Reached by a shared display name in practice; the email branch can only collide if the
+    -- tracker holds two actors with one address, so the wording covers both rather than
+    -- asserting which it was.
+    .error s!"{name} names several actors \
+      ({String.intercalate ", " (several.map (·.email))}); say which by email"
 
 /-- What an assignment request comes down to, and the assignee set to write for it.
 
@@ -557,11 +584,16 @@ def planAssignees (known : Array Orchestra.Taxis.Actor)
     .error s!"asked to both assign and unassign \
       {String.intercalate ", " (contradictory.map (·.email))}"
   let held (a : Orchestra.Taxis.Actor) : Bool := current.contains a.id
+  -- By id, not by string: one actor named twice in a request — once by email and once by display
+  -- name — is one assignment, and `final` below already treats it as one. Without this the two
+  -- disagree and the summary reads "assigned chris@…, chris@…".
+  let once (actors : List Orchestra.Taxis.Actor) : List String :=
+    (actors.foldl (fun acc a => if acc.any (·.id == a.id) then acc else acc ++ [a]) []).map (·.email)
   let change : Utils.Labels.LabelChange :=
-    { add            := (toAdd.filter (!held ·)).map (·.email)
-      remove         := (toRemove.filter held).map (·.email)
-      alreadyPresent := (toAdd.filter held).map (·.email)
-      notPresent     := (toRemove.filter (!held ·)).map (·.email) }
+    { add            := once (toAdd.filter (!held ·))
+      remove         := once (toRemove.filter held)
+      alreadyPresent := once (toAdd.filter held)
+      notPresent     := once (toRemove.filter (!held ·)) }
   let removedIds := (toRemove.map (·.id))
   let kept := current.filter fun a => !removedIds.contains a
   let final := (toAdd.map (·.id)).foldl
@@ -583,12 +615,18 @@ def setIssueAssignees (iid : Taxis.IssueId) (add remove : List String) :
     return change
 
 /-- An issue's labels and assignees, by name — the two fields `Issue` does not carry, fetched for
-    `get_issue` so an agent can read the routing state it is allowed to change. One call. -/
-def issueLabelsAndAssignees (iid : Taxis.IssueId) : IO (Array String × Array String) := do
+    `get_issue` so an agent can read the routing state it is allowed to change.
+
+    `none` when the fetch failed, which the caller has to render as its own thing: an empty pair
+    would read as "this issue carries no labels", and an agent that believes that about a routing
+    label goes on to add one the issue already has, or reports the work unrouted. The rest of
+    `get_issue` is still worth answering, so this does not throw. -/
+def issueLabelsAndAssignees (iid : Taxis.IssueId) : IO (Option (Array String × Array String)) := do
   let cfg ← Orchestra.Taxis.getConfig
   match ← Orchestra.Taxis.getIssueDetail cfg iid with
-  | .error _ => return (#[], #[])
-  | .ok detail => return (detail.issueLabels.map (·.name), detail.assignedActors.map (·.displayName))
+  | .error _ => return none
+  | .ok detail =>
+    return some (detail.issueLabels.map (·.name), detail.assignedActors.map (·.displayName))
 
 /-- Every label the tracker defines, by name. What an agent is shown when it needs to know which
     labels it may route with — the same vocabulary `planTaxisLabels` refuses against. -/

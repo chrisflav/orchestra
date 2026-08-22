@@ -60,7 +60,30 @@ def labels_refuseOrchestrasOwn : Test := do
 def labels_refuseRemovingOrchestrasOwn : Test := do
   match planTaxisLabels known (ids [4]) [] ["o-claimed"] with
   | .ok _ => TestM.fail "expected removing o-claimed to be refused too"
+  | .error e => TestM.assert (e.contains "o-claimed") "the refusal names the label"
+
+@[test]
+def labels_refuseReservedInAnyCase : Test := do
+  -- The check folds case because the tracker's spelling is not the agent's. Matching `o-claimed`
+  -- exactly would leave `O-Claimed` to be resolved case-insensitively downstream and applied to
+  -- the very label the check exists to protect.
+  match planTaxisLabels known (ids []) ["O-Claimed"] [] with
+  | .ok _ => TestM.fail "expected a case variant of o-claimed to be refused"
   | .error _ => TestM.assert true
+
+@[test]
+def labels_refuseWhenTheTrackerSpellsOneLabelTwoWays : Test := do
+  -- taxis's uniqueness on label names is case-sensitive, so these are two labels with two ids,
+  -- and a dispatcher configured for one of them watches one id. Resolving the request
+  -- case-insensitively has to pick one, and picking wrong is silent: the plan reports against the
+  -- id it chose and writes a set holding the other, so the call answers "removed auto-work-opus"
+  -- having changed nothing at all.
+  let twoWays := known.push (label 6 "Auto-Work-Opus")
+  match planTaxisLabels twoWays (ids [3]) [] ["auto-work-opus"] with
+  | .ok _ => TestM.fail "expected a case-ambiguous label to be refused rather than guessed at"
+  | .error e =>
+    TestM.assert (e.contains "auto-work-opus" && e.contains "Auto-Work-Opus")
+      "the refusal shows both spellings, since fixing it means merging them in the tracker"
 
 @[test]
 def labels_refuseProjectMarker : Test := do
@@ -148,6 +171,16 @@ def assignees_reportWhatWasAlreadyTheCase : Test := do
     TestM.assertEqual change.alreadyPresent ["chris@example.com"] (msg := "but reported")
     TestM.assertEqual change.notPresent ["jj@example.com"] (msg := "and so is the absent removal")
     TestM.assertEqual final.toList (actorIds [1]).toList (msg := "the set is unchanged")
+
+@[test]
+def assignees_oneActorNamedTwiceIsOneAssignment : Test := do
+  -- Both keys reach the same actor, and `final` already treats that as one assignment. Without
+  -- the same collapse on the report it reads "assigned chris@…, chris@…".
+  match planAssignees actors (actorIds []) ["Christian", "chris@example.com"] [] with
+  | .error e => TestM.fail s!"expected a plan, got: {e}"
+  | .ok (change, final) =>
+    TestM.assertEqual change.add ["chris@example.com"] (msg := "reported once")
+    TestM.assertEqual final.toList (actorIds [1]).toList (msg := "and assigned once")
 
 @[test]
 def assignees_contradictoryRequestIsRefused : Test := do

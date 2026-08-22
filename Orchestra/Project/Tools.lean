@@ -371,11 +371,25 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | some s => issueStatusOfString? s
       let target ← parseTarget? args
       let dependencies := args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" |>.toOption
-      let names (field : String) : List String :=
-        ((args.getObjValAs? (Array String) field |>.toOption).getD #[]).toList
+      -- An absent list means "leave this alone"; a *malformed* one is an error rather than the
+      -- same thing. Swallowing it would turn `labels_add: "auto-work-opus"` — an array field
+      -- given a bare string, the likeliest way to get this wrong — into a call that reports
+      -- success and routes nothing, which is exactly the silent failure closed labels exist to
+      -- prevent.
+      let names (field : String) : Except String (List String) :=
+        match args.getObjVal? field with
+        | .error _   => .ok []
+        | .ok .null  => .ok []
+        | .ok _      =>
+          match args.getObjValAs? (Array String) field with
+          | .ok a    => .ok a.toList
+          | .error e => .error s!"{field} must be an array of names: {e}"
+      let labelsAdd      ← names "labels_add"
+      let labelsRemove   ← names "labels_remove"
+      let assigneesAdd   ← names "assignees_add"
+      let assigneesRemove ← names "assignees_remove"
       return .updateIssue iid title descr status target dependencies
-        (names "labels_add") (names "labels_remove")
-        (names "assignees_add") (names "assignees_remove")
+        labelsAdd labelsRemove assigneesAdd assigneesRemove
   | "list_labels" => some (.ok .listLabels)
   | "list_actors" => some (.ok .listActors)
   | "list_open_issues" =>
@@ -575,9 +589,12 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       -- The two fields `Issue` does not carry. Shown because they are what routes the issue —
       -- which worker the dispatcher offers it to, and which human is on the hook for it — and an
       -- agent asked to change them can otherwise only guess at what they are.
-      let (labels, assignees) ← issueLabelsAndAssignees iid
-      let orDash (xs : Array String) : String :=
-        if xs.isEmpty then "-" else String.intercalate ", " xs.toList
+      let routing ← issueLabelsAndAssignees iid
+      let orDash (pick : Array String × Array String → Array String) : String :=
+        match routing with
+        | none    => "(could not be read from taxis)"
+        | some rs => let xs := pick rs
+                     if xs.isEmpty then "-" else String.intercalate ", " xs.toList
       let header : Array String := #[
         s!"id:           {i.id.toString}",
         s!"project:      {project.id.toString} ({project.name})",
@@ -585,8 +602,8 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         s!"title:        {i.title}",
         s!"status:       {issueStatusToString i.status}",
         s!"target:       {target}",
-        s!"labels:       {orDash labels}",
-        s!"assignees:    {orDash assignees}",
+        s!"labels:       {orDash (·.1)}",
+        s!"assignees:    {orDash (·.2)}",
         s!"dependencies: {depsStr}",
         s!"created:      {i.createdAt}",
         s!"updated:      {i.updatedAt}",
@@ -627,31 +644,47 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     match ← findIssue iid with
     | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (_, i) =>
-      let updated : Issue :=
-        { i with
-          title        := title.getD i.title
-          description  := descr.getD i.description
-          status       := status.getD i.status
-          target       := match target with | some t => some t | none => i.target
-          dependencies := dependencies.getD i.dependencies
-          updatedAt    := now }
-      saveIssue updated
+      let mut done : Array String := #[]
+      -- Only when a field was actually named. `saveIssue` asserts the *whole* issue — including
+      -- `state` and the status labels, both derived from the `i` read a moment ago — so firing it
+      -- for a call that carried only `labels_add` would write back a status nobody mentioned,
+      -- from a read that a worker completing the issue in between has already invalidated.
+      let touchesFields :=
+        title.isSome || descr.isSome || status.isSome || target.isSome || dependencies.isSome
+      if touchesFields then
+        let updated : Issue :=
+          { i with
+            title        := title.getD i.title
+            description  := descr.getD i.description
+            status       := status.getD i.status
+            target       := match target with | some t => some t | none => i.target
+            dependencies := dependencies.getD i.dependencies
+            updatedAt    := now }
+        saveIssue updated
+        done := done.push s!"updated issue {iid.toString}"
       -- After the field write, not before: `saveIssue` reconciles the status labels against the
       -- issue as taxis holds it, so a label delta applied first would be read back and rewritten
-      -- from a set that no longer matches. Each is its own refusal — an unknown label leaves the
-      -- title change standing rather than reverting it, and says so.
-      let mut notes : Array String := #[]
+      -- from a set that no longer matches.
+      --
+      -- Each half is refused on its own, and a refusal carries whatever already landed with it.
+      -- An unknown label leaves the title change standing, and an agent told only "no such label"
+      -- would reasonably retry the call that made it.
+      let failure (e : IO.Error) : Json :=
+        content (joinLines (done ++ #[toString e])) (isError := true)
       unless labelsAdd.isEmpty && labelsRemove.isEmpty do
         try
           let change ← setIssueLabels iid labelsAdd labelsRemove
-          notes := notes.push s!"labels: {change.summary iid.toString}"
-        catch e => return content (toString e) (isError := true)
+          done := done.push s!"labels: {change.summary iid.toString}"
+        catch e => return failure e
       unless assigneesAdd.isEmpty && assigneesRemove.isEmpty do
         try
           let change ← setIssueAssignees iid assigneesAdd assigneesRemove
-          notes := notes.push s!"assignees: {change.summary iid.toString}"
-        catch e => return content (toString e) (isError := true)
-      return content (joinLines (#[s!"updated issue {iid.toString}"] ++ notes))
+          done := done.push s!"assignees: {change.summary iid.toString}"
+        catch e => return failure e
+      if done.isEmpty then
+        return content s!"issue {iid.toString}: nothing to change — no field, label or assignee \
+          was named"
+      return content (joinLines done)
   | .listLabels =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     let names ← listLabelNames

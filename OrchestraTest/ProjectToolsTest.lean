@@ -87,6 +87,24 @@ def parseUpdateIssueWithoutDeltasTouchesNeither : Test := do
   | other => TestM.fail s!"unexpected parse: {repr other}"
 
 @[test]
+def parseUpdateIssueRejectsAMalformedDeltaList : Test := do
+  -- A bare string where an array belongs is the likeliest way to get this wrong, and it must not
+  -- read as "asked for nothing": the call would report success and route the issue nowhere, which
+  -- is the silent failure a closed label vocabulary exists to prevent.
+  let args := Json.mkObj [("issue_id", Json.num 7), ("labels_add", Json.str "auto-work-opus")]
+  match tryParseToolCall "update_issue" args with
+  | some (.error e) => TestM.assert (e.contains "labels_add") "the refusal names the field"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
+def parseUpdateIssueRejectsANonStringInADeltaList : Test := do
+  let args := Json.mkObj
+    [("issue_id", Json.num 7), ("assignees_add", Json.arr #[Json.str "a@b.c", Json.num 1])]
+  match tryParseToolCall "update_issue" args with
+  | some (.error e) => TestM.assert (e.contains "assignees_add") "the refusal names the field"
+  | other => TestM.fail s!"expected a parse error, got {repr other}"
+
+@[test]
 def parseUnknownToolReturnsNone : Test := do
   match tryParseToolCall "totally_made_up" (Json.mkObj []) with
   | none => TestM.assert true "unknown tool falls through"
