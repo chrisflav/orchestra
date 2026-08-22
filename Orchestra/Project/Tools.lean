@@ -52,6 +52,13 @@ inductive ProjectTool where
   | updateIssue      (issueId : Taxis.IssueId) (title description : Option String)
                      (status : Option IssueStatus) (target : Option RepoTarget)
                      (dependencies : Option (Array Taxis.IssueId) := none)
+                     (labelsAdd labelsRemove : List String := [])
+                     (assigneesAdd assigneesRemove : List String := [])
+  /-- The labels the tracker defines: the vocabulary a relabelling request is resolved against,
+      and the only one it may name. -/
+  | listLabels
+  /-- The actors the tracker knows, so an issue can be handed to a named human. -/
+  | listActors
   -- work_issues
   | listOpenIssues   (projectId : Taxis.IssueId) (targetRepo : Option Repository)
   | claimIssue       (issueId : Taxis.IssueId)
@@ -82,6 +89,12 @@ private def strProp (desc : String) : Json :=
 
 private def intProp (desc : String) : Json :=
   Json.mkObj [("type", "integer"), ("description", desc)]
+
+private def strArrayProp (desc : String) : Json :=
+  Json.mkObj
+    [ ("type", "array")
+    , ("description", desc)
+    , ("items", Json.mkObj [("type", "string")]) ]
 
 private def obj (props : List (String × Json)) (required : List String) : Json :=
   Json.mkObj
@@ -159,8 +172,10 @@ def toolDefs : List (String × String × Json) :=
       Json.mkObj
         [ ("name", "update_issue")
         , ("description",
-            "Update an issue's title, description, status, target, or dependencies. " ++
-            "Pass dependency_ids to replace the full dependency list; omit to leave it unchanged.")
+            "Update an issue's title, description, status, target, dependencies, labels or " ++
+            "assignees. Pass dependency_ids to replace the full dependency list; omit to leave " ++
+            "it unchanged. Labels and assignees are add/remove lists rather than a set to " ++
+            "write, so a call that adds one label leaves the others alone.")
         , ("inputSchema", obj
             [ ("issue_id", intProp "Issue ID")
             , ("title", strProp "New title")
@@ -171,8 +186,32 @@ def toolDefs : List (String × String × Json) :=
             , ("dependency_ids", Json.mkObj
                 [ ("type", "array")
                 , ("description", "Replace the dependency list with these issue IDs (issues that must be completed before this one is dispatched)")
-                , ("items", Json.mkObj [("type", "integer")]) ]) ]
+                , ("items", Json.mkObj [("type", "integer")]) ])
+            , ("labels_add", strArrayProp
+                ("Taxis labels to put on the issue. These are what the dispatcher routes on, " ++
+                 "so this is how work is marked ready and steered. Only labels the tracker " ++
+                 "already defines (list_labels); orchestra's own o-claimed / t-project are refused."))
+            , ("labels_remove", strArrayProp "Taxis labels to take off the issue.")
+            , ("assignees_add", strArrayProp
+                ("Actors to assign, by email or display name (list_actors). Assigning a human " ++
+                 "is how an issue is escalated to one."))
+            , ("assignees_remove", strArrayProp "Actors to unassign, by email or display name.") ]
             ["issue_id"]) ])
+  , (manageIssuesPerm, "list_labels",
+      Json.mkObj
+        [ ("name", "list_labels")
+        , ("description",
+            "List the labels the taxis tracker defines. These are the only names update_issue " ++
+            "will accept — it creates none — so check here before routing an issue with one. " ++
+            "Not GitHub labels: use label_issue for those.")
+        , ("inputSchema", obj [] []) ])
+  , (manageIssuesPerm, "list_actors",
+      Json.mkObj
+        [ ("name", "list_actors")
+        , ("description",
+            "List the actors (people and bots) the taxis tracker knows, with the email that " ++
+            "names each one uniquely. Use before assigning an issue to a human.")
+        , ("inputSchema", obj [] []) ])
     -- work_issues
   , (workIssuesPerm, "list_open_issues",
       Json.mkObj
@@ -332,7 +371,13 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | some s => issueStatusOfString? s
       let target ← parseTarget? args
       let dependencies := args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" |>.toOption
+      let names (field : String) : List String :=
+        ((args.getObjValAs? (Array String) field |>.toOption).getD #[]).toList
       return .updateIssue iid title descr status target dependencies
+        (names "labels_add") (names "labels_remove")
+        (names "assignees_add") (names "assignees_remove")
+  | "list_labels" => some (.ok .listLabels)
+  | "list_actors" => some (.ok .listActors)
   | "list_open_issues" =>
     some <| do
       let pid ← args.getObjValAs? Taxis.IssueId "project_id"
@@ -527,6 +572,12 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       let childLines := children.map (fun c => s!"  - {c.id.toString}  [{issueStatusToString c.status}]  {c.title}")
       let depsStr := if i.dependencies.isEmpty then "-"
                      else String.intercalate ", " (i.dependencies.map (·.toString)).toList
+      -- The two fields `Issue` does not carry. Shown because they are what routes the issue —
+      -- which worker the dispatcher offers it to, and which human is on the hook for it — and an
+      -- agent asked to change them can otherwise only guess at what they are.
+      let (labels, assignees) ← issueLabelsAndAssignees iid
+      let orDash (xs : Array String) : String :=
+        if xs.isEmpty then "-" else String.intercalate ", " xs.toList
       let header : Array String := #[
         s!"id:           {i.id.toString}",
         s!"project:      {project.id.toString} ({project.name})",
@@ -534,6 +585,8 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         s!"title:        {i.title}",
         s!"status:       {issueStatusToString i.status}",
         s!"target:       {target}",
+        s!"labels:       {orDash labels}",
+        s!"assignees:    {orDash assignees}",
         s!"dependencies: {depsStr}",
         s!"created:      {i.createdAt}",
         s!"updated:      {i.updatedAt}",
@@ -566,7 +619,8 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     let issue ← createIssue pid title descr (parentId := parent) (target := target)
       (dependencies := dependencies)
     return content s!"created issue {issue.id.toString} in project {pid.toString}"
-  | .updateIssue iid title descr status target dependencies =>
+  | .updateIssue iid title descr status target dependencies
+      labelsAdd labelsRemove assigneesAdd assigneesRemove =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     if let some msg ← refuseOutsideScope env iid "update that issue" then
       return content msg (isError := true)
@@ -582,7 +636,33 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           dependencies := dependencies.getD i.dependencies
           updatedAt    := now }
       saveIssue updated
-      return content s!"updated issue {iid.toString}"
+      -- After the field write, not before: `saveIssue` reconciles the status labels against the
+      -- issue as taxis holds it, so a label delta applied first would be read back and rewritten
+      -- from a set that no longer matches. Each is its own refusal — an unknown label leaves the
+      -- title change standing rather than reverting it, and says so.
+      let mut notes : Array String := #[]
+      unless labelsAdd.isEmpty && labelsRemove.isEmpty do
+        try
+          let change ← setIssueLabels iid labelsAdd labelsRemove
+          notes := notes.push s!"labels: {change.summary iid.toString}"
+        catch e => return content (toString e) (isError := true)
+      unless assigneesAdd.isEmpty && assigneesRemove.isEmpty do
+        try
+          let change ← setIssueAssignees iid assigneesAdd assigneesRemove
+          notes := notes.push s!"assignees: {change.summary iid.toString}"
+        catch e => return content (toString e) (isError := true)
+      return content (joinLines (#[s!"updated issue {iid.toString}"] ++ notes))
+  | .listLabels =>
+    if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
+    let names ← listLabelNames
+    if names.isEmpty then return content "The tracker defines no labels."
+    return content (joinLines (names.map (s!"  - {·}")))
+  | .listActors =>
+    if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
+    let actors ← listActorSummaries
+    if actors.isEmpty then return content "The tracker knows no actors."
+    return content (joinLines (actors.map fun (name, email, bot) =>
+      s!"  - {email}  ({name}){if bot then "  [bot]" else ""}"))
   -- ---------------- work_issues ----------------
   | .listOpenIssues pid targetRepo? =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)

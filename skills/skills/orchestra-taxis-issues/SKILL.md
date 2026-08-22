@@ -81,9 +81,13 @@ clear; being decomposed is read from the tree.
 
 ```
 list_issues(project_id: 42, status: "open", parent_id: 57)
-get_issue(issue_id: 57)                    full detail: children, attached PRs, dependencies
+get_issue(issue_id: 57)                    full detail: labels, assignees, children, attached PRs
 create_issue(project_id: 42, title: "...", description: "...", parent_id: 57)
 update_issue(issue_id: 57, title/description/status/target_repo/target_branch/dependency_ids)
+update_issue(issue_id: 57, labels_add: [...], labels_remove: [...])
+update_issue(issue_id: 57, assignees_add: [...], assignees_remove: [...])
+list_labels()                              the labels the tracker defines
+list_actors()                              the people and bots it knows, by email
 ```
 
 Ids are **integers**, taxis's own convention — `42`, not `"42"`.
@@ -94,7 +98,36 @@ it guessing.
 `dependency_ids` lists issues that must be finished before this one is dispatched. A dependency
 blocks only while it is still **open** — completing or abandoning it unblocks the dependent, so
 abandoning work does not strand everything downstream. Use this for real ordering constraints
-rather than encoding them in prose.
+rather than encoding them in prose. There is no priority field: ordering *is* the dependency
+graph.
+
+### Labels are how work is routed
+
+A taxis label is not decoration. Orchestra's dispatcher selects the issues it offers, and the
+role it offers them to, by label — so labelling an issue is what causes an agent to be spawned on
+it, and relabelling is what sends it to a different one. Labels are inherited down the tree: a
+label on a project root puts the whole subtree in scope.
+
+Which labels mean what is your instance's configuration, not something to infer from the name.
+`list_labels` is the vocabulary, and it is a closed one: a name the tracker does not already
+define is refused (with the list, so you can pick a real one) rather than created.
+
+Two are refused outright, because orchestra maintains them itself and reads state back off them:
+`o-claimed` *is* an issue's claim, and `t-project` *is* what makes an issue a project. Claim an
+issue with `claim_issue`, not by labelling it.
+
+Labels and assignees are **add/remove deltas**, not a set to write: `labels_add: ["x"]` leaves
+every other label alone. There is no way to set the list wholesale, which is deliberate — taxis
+takes the whole label array in one write, so an agent replacing the set would drop the claim
+label by omission.
+
+### Assignees are how a human is put on the hook
+
+`assignees_add` takes emails or display names (`list_actors` gives both; the email is what is
+unique, and an ambiguous display name is refused rather than guessed). Assigning a person is the
+escalation move: it says this issue is waiting on a named human rather than on an agent. Say what
+you need from them with `comment_issue` in the same pass — an assignment with no question
+attached tells them nothing.
 
 ### Writes are confined to your project subtree
 
@@ -159,12 +192,16 @@ worker's question or leaving guidance without deciding yet.
 
 Tools are gated per task by permission group:
 
-- `manage_issues` — `list_projects`, `list_issues`, `get_issue`, `create_issue`, `update_issue`
+- `manage_issues` — `list_projects`, `list_issues`, `get_issue`, `create_issue`, `update_issue`,
+  `list_labels`, `list_actors`
 - `work_issues` — `list_open_issues`, `claim_issue`, `release_claim`, `attach_pr`, `split_issue`
 - `review_issues` — `list_issues_in_review`, `decide_issue`
 
 `list_issue_comments` comes with any of the three, and `comment_issue` with `work_issues` or
 `review_issues` — the thread is shared ground between whoever reviews and whoever reworks.
+
+Labels and assignees ride on `update_issue`, so they belong to `manage_issues`: a task that can
+route work is a task that was given the group for shaping the backlog.
 
 A refusal saying the task is not authorized for a group is deliberate, not a bug. Report what you
 needed; do not look for another route to it.

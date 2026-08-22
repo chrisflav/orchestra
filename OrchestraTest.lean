@@ -18,6 +18,7 @@ import OrchestraTest.ExamplesTest
 import OrchestraTest.LabelDispatcherTest
 import OrchestraTest.DispatchCandidatesTest
 import OrchestraTest.ProjectToolsTest
+import OrchestraTest.TaxisLabelsTest
 import OrchestraTest.ProjectRoleTest
 import OrchestraTest.ParallelQueueTest
 import OrchestraTest.GitHubErrorTest

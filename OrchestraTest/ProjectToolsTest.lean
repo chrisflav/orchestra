@@ -60,6 +60,33 @@ def parseAttachPrFailsWithoutFields : Test := do
   | other => TestM.fail s!"expected error, got {repr other}"
 
 @[test]
+def parseUpdateIssueTakesLabelAndAssigneeDeltas : Test := do
+  let args := Json.mkObj
+    [ ("issue_id", Json.num 7)
+    , ("labels_add", Json.arr #["auto-work-opus"])
+    , ("labels_remove", Json.arr #["auto-work-fable"])
+    , ("assignees_add", Json.arr #["chris@example.com"]) ]
+  match tryParseToolCall "update_issue" args with
+  | some (.ok (.updateIssue iid _ _ _ _ _ add remove assignAdd assignRemove)) =>
+    TestM.assertEqual iid.val (7 : Int64) (msg := "issue id")
+    TestM.assertEqual add ["auto-work-opus"] (msg := "labels_add")
+    TestM.assertEqual remove ["auto-work-fable"] (msg := "labels_remove")
+    TestM.assertEqual assignAdd ["chris@example.com"] (msg := "assignees_add")
+    TestM.assertEqual assignRemove ([] : List String)
+      (msg := "an omitted list is empty, not a write")
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
+def parseUpdateIssueWithoutDeltasTouchesNeither : Test := do
+  -- The delta lists have to default to empty rather than to the issue's current set: a plain
+  -- retitle goes through this same constructor, and anything else would have it rewrite labels.
+  match tryParseToolCall "update_issue" (Json.mkObj [("issue_id", Json.num 7), ("title", "t")]) with
+  | some (.ok (.updateIssue _ _ _ _ _ _ add remove assignAdd assignRemove)) =>
+    TestM.assert (add.isEmpty && remove.isEmpty && assignAdd.isEmpty && assignRemove.isEmpty)
+      "no label or assignee write is implied by a field update"
+  | other => TestM.fail s!"unexpected parse: {repr other}"
+
+@[test]
 def parseUnknownToolReturnsNone : Test := do
   match tryParseToolCall "totally_made_up" (Json.mkObj []) with
   | none => TestM.assert true "unknown tool falls through"
