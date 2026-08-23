@@ -144,8 +144,11 @@ structure Config where
   /-- How long to wait for the pod to be ready before giving up on the task. Image pulls on a cold
       node are the reason this is minutes rather than seconds. -/
   startupTimeoutSeconds : Nat := 600
-  /-- Whether the checkout is copied back out when the task ends. Off means the daemon's copy stays
-      as the agent found it — which is only right when nothing local reads it afterwards. -/
+  /-- Whether the *checkout* is copied back out when the task ends. Off means the daemon's copy
+      stays as the agent found it — which is only right when nothing local reads it afterwards.
+
+      Memory directories are not covered by this and always come back: they are the record of what
+      earlier tasks learned, and a memory that does not outlive its pod is not one. -/
   syncBack : Bool := true
   /-- Paths not carried in either direction, as `tar --exclude` patterns. Build output is the usual
       candidate: `.lake`, `target`, `node_modules`. -/
@@ -607,22 +610,31 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
         let exitCode ← child.wait
         return { exitCode, output := (stdout ++ stderr).trimAscii.toString }
     close := do
-      if cfg.syncBack then
-        -- A pod that is already gone is the interesting case: it means something outside this
-        -- daemon ended the task's environment — `deadline_seconds` expiring, an eviction, a node
-        -- going away — and the difference between that and a transfer that failed is the
-        -- difference between "retry it" and "the work is not there to retry".
-        let (code, out, _) ← kube cfg #["get", "pod", podName, "-o", "jsonpath={.status.phase}"]
-        if code != 0 then
-          IO.eprintln s!"  [k8s] pod {podName} is gone before the task finished with it — \
-deleted, evicted, or past its {cfg.deadlineSeconds}s deadline_seconds. Nothing was copied back, \
-so {spec.workdir} still holds what the agent started from."
-        else
-          for st in staged do
-            if st.writable then
-              syncOut cfg podName st.hostPath st.podPath (merge := !st.isWorkspace)
-          if out.trimAscii.toString == "Failed" then
-            IO.eprintln s!"  [k8s] pod {podName} ended in Failed — if the task itself looked fine, \
+      -- A pod that is already gone is the interesting case: it means something outside this daemon
+      -- ended the task's environment — `deadline_seconds` expiring, an eviction, a node going
+      -- away — and the difference between that and a transfer that failed is the difference
+      -- between "retry it" and "the work is not there to retry".
+      let (code, out, _) ← kube cfg #["get", "pod", podName, "-o", "jsonpath={.status.phase}"]
+      if code != 0 then
+        IO.eprintln s!"  [k8s] pod {podName} is gone before the task finished with it — deleted, \
+evicted, or past its {cfg.deadlineSeconds}s deadline_seconds. Nothing was copied back, so \
+{spec.workdir} still holds what the agent started from, and anything the agent wrote to a memory \
+directory is lost."
+      else
+        for st in staged do
+          if st.writable then
+            if st.isWorkspace then
+              -- `sync_back` is about the checkout, and only the checkout: an operator turns it off
+              -- because the agent pushes its work and nothing local reads the tree afterwards.
+              if cfg.syncBack then
+                syncOut cfg podName st.hostPath st.podPath (merge := false)
+            else
+              -- Memory directories come back either way. "The agent pushes its code" is not a
+              -- reason to throw away what it learned, and a memory that does not outlive the pod
+              -- is not a memory.
+              syncOut cfg podName st.hostPath st.podPath (merge := true)
+        if out.trimAscii.toString == "Failed" then
+          IO.eprintln s!"  [k8s] pod {podName} ended in Failed — if the task itself looked fine, \
 check whether it ran past deadline_seconds ({cfg.deadlineSeconds}s)."
       deletePod }
 

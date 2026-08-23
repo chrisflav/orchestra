@@ -223,6 +223,35 @@ arrangement the landrun backend gets for free from the machine it runs on. The c
 The checkout's own build output (`.lake`, `target`, `node_modules`) travels with the checkout
 instead, unless `excludes` leaves it behind.
 
+## memory, continuations and series
+
+**Memory directories travel with the task.** Orchestra's memory system is a directory on the
+daemon's disk — one global, one per upstream repository — that the agent is told about and writes
+files into. Each is copied into the pod when the task starts, mounted at the same absolute path,
+and merged back when it ends. Merged, not swapped: several tasks hold a copy at once, and the
+repository-per-file convention the agent is instructed to follow (one new file per memory, never
+appending to another run's) is what makes those merges disjoint.
+
+Two differences from a daemon that runs its agents locally, both consequences of the copy:
+
+- a memory written by a task while another is already running is **not** visible to that other
+  task; it sees the snapshot taken when it started, and picks the new file up on its next task;
+- a file the agent *deletes* comes back, since a merge never deletes. Correcting a memory by adding
+  a file that supersedes it — which is what the agent is told to do — works; deleting one does not.
+
+Memories are copied back even when `sync_back` is off. That setting is about the checkout, for the
+case where the agent pushes its work and nothing local reads the tree afterwards; it is not a
+statement about what the agent learned.
+
+**Continuations and series are the same mechanism.** A series resolves to the latest task in it and
+runs the next one with `continues_from` pointing at it, so both need the agent's earlier
+conversation — which lives under the agent's `$HOME`, in the pod that ran it. With a scratch home
+that pod is gone and the task is refused at the start, naming the setting that keeps it. With
+`home_claim` the home outlives the pod and both work.
+
+The checkout side of a continuation already works either way: the daemon hands a continuation its
+predecessor's clone slot, and that is the tree copied into the new pod.
+
 ## what a pod's lifetime covers
 
 **One pod per task, reused for everything in it.** `init.sh`, `before.sh`, the agent, the
@@ -239,6 +268,7 @@ depends on `home_claim`:
 | --- | --- | --- |
 | retry after failed validation | resumes | resumes |
 | `continues_from` / a series | **refused** | resumes |
+| memory directories | copied back | copied back |
 | toolchain `init.sh` installed | reinstalled each task | kept |
 
 A task that continues another one, in an environment that cannot have its conversation, fails at
@@ -334,5 +364,5 @@ the cluster was actually asked for.
 | `mcp_ports` | *(any free port)* | `[from, to]` the MCP server may listen on, for a daemon something has to route to |
 | `deadline_seconds` | `14400` | `activeDeadlineSeconds` on the pod |
 | `startup_timeout_seconds` | `600` | how long to wait for the pod to be ready |
-| `sync_back` | `true` | whether the checkout is copied back out |
+| `sync_back` | `true` | whether the *checkout* is copied back out; memory directories always are |
 | `excludes` | `[]` | `tar --exclude` patterns, applied in both directions |

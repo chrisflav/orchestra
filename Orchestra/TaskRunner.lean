@@ -566,8 +566,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- anyway would answer a follow-up prompt — "now also handle the timeout case" — with a model
     -- that has never seen what came before. Better to stop and say which knob keeps it.
     if initialResume.isSome && !session.carriesAgentState then
+      let what := match series with
+        | some name => s!"this task continues series '{name}' ({continuesFrom.getD "?"})"
+        | none      => s!"this task continues {continuesFrom.getD "another task"}"
       TaskStore.saveTask { initialRecord with status := .failed }
-      throw (IO.userError s!"this task continues {continuesFrom.getD "another task"}, whose conversation the agent left in an environment that no longer exists ({session.id} is new for every task). Configure a persistent agent home for this execution backend — execution.options.home_claim for kubernetes — or queue the work as a task of its own.")
+      throw (IO.userError s!"{what}, whose conversation the agent left in an environment that no longer exists ({session.id} is new for every task). Configure a persistent agent home for this execution backend — execution.options.home_claim for kubernetes — or queue the work as a task of its own.")
     -- 4. Start MCP server (runs in this process, outside the sandbox)
     -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
     let (allowedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools

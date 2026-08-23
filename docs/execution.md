@@ -189,6 +189,11 @@ The mapping is mechanical, which is the point of the interface:
 
 Three things were decisions rather than translations.
 
+**Memory is a grant like any other.** Orchestra's memory directories are `.orchestra`-provenance
+paths marked writable, so they are carried into the environment with the checkout and merged back
+out of it — the merge being what lets several tasks hold a copy at once. Nothing in the memory
+system knows about pods; it knows about directories, and the session puts them where the agent is.
+
 **The workspace travels, and the session is what carries it.** The daemon keeps doing everything
 except running things — it clones, mints the tokens, parses the agent's output — so the pod starts
 from the checkout the daemon prepared and hands it back changed. The alternative, a pod that clones

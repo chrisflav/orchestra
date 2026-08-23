@@ -123,6 +123,21 @@ def stagedPathsKeepTheirAbsolutePosition : Test := do
     "an absolute path means the same thing on both sides"
 
 @[test]
+def aMemoryDirectoryComesBackWhateverSyncBackSays : Test := do
+  -- `sync_back` is about the checkout: an operator turns it off because the agent pushes its work
+  -- and nothing local reads the tree afterwards. That is not a reason to throw away what the agent
+  -- learned, and a memory that does not outlive its pod is not a memory. The staging plan is the
+  -- same either way; what differs is what `close` copies, which the two flags below select.
+  let memories := staged.find? (·.hostPath == "/var/lib/orchestra/memories/acme")
+  let checkout := staged.find? (·.isWorkspace)
+  match memories, checkout with
+  | some m, some c =>
+    TestM.assert (m.writable && !m.isWorkspace)
+      "a memory directory is writable and is not the checkout — which is what close keys on"
+    TestM.assert c.isWorkspace "and the checkout is the one path sync_back speaks for"
+  | _, _ => TestM.fail "the staging plan is missing the checkout or the memories"
+
+@[test]
 def whatComesBackIsWhatCouldBeWritten : Test := do
   let byPath (p : String) : Option StagedPath := staged.find? (·.hostPath == p)
   match byPath "/var/lib/orchestra/work/acme-widgets-slot0" with
