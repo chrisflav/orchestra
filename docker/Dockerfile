@@ -66,9 +66,13 @@ FROM debian:bookworm-slim AS runtime
 # agent backend points Claude/opencode/pi at the built-in MCP server with `nc 127.0.0.1 <port>`
 # (see each `setupMcp` in Orchestra/Agents/). Without it the agent reports the "agent" MCP server
 # as perpetually connecting and gets no orchestra tools at all.
-# zlib1g is what the binaries' `-lz` (taxis's gzip shim) resolves against at run time.
+# zlib1g-dev, like build-essential above, is here for what agent *tasks* compile rather than for
+# anything orchestra links: a task working on orchestra itself, or on any Lean project that
+# depends on taxis, builds taxis's gzip shim inside this container. The binaries themselves
+# carry no `-lz` — orchestra never calls Taxis.Compress, so gzip.o is never pulled out of the
+# static library.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg git openssl jq procps build-essential netcat-openbsd zlib1g \
+      ca-certificates curl gnupg git openssl jq procps build-essential netcat-openbsd zlib1g-dev \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
          -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \

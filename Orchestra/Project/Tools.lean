@@ -145,8 +145,9 @@ private def listContextToolDef : Json :=
     , ("description",
         "Read the context notes attached to a taxis issue: what an earlier run worked out, an " ++
         "approach already tried and abandoned, what the build environment needs. Read these " ++
-        "before starting work — this is where the last agent on the issue left its findings, " ++
-        "and they are folded away in the taxis UI so nothing else shows them to you.")
+        "before starting work — this is where the last agent on the issue left its findings. " ++
+        "get_issue shows only their titles and the taxis UI keeps them folded, so this is what " ++
+        "reads the notes themselves.")
     , ("inputSchema", obj [ ("issue_id", intProp "Issue ID") ] ["issue_id"]) ]
 
 private def addContextToolDef : Json :=
@@ -181,7 +182,6 @@ private def updateContextToolDef : Json :=
         ["issue_id", "context_id", "title", "text"]) ]
 
 def toolDefs : List (String × String × Json) :=
-
   [ -- manage_issues
     (manageIssuesPerm, "list_projects",
       Json.mkObj
@@ -611,6 +611,12 @@ structure Env where
 private def deny (perm : String) : String :=
   s!"this task is not authorized for the {perm} tool group"
 
+/-- Refusal for the tools gated on holding *any* issue group rather than a named one. Naming a
+    single group, as `deny` does, would send an agent looking for the wrong permission. -/
+private def denyAnyGroup : String :=
+  "this task is not authorized for any of the manage_issues, work_issues or review_issues \
+   tool groups"
+
 /-- The issue bounding what this task may create or update: the root of its own project subtree
     (`Project.projectRootOf`). Anchored on the task's issue when it has one, otherwise on its
     project — a role dispatched without an issue (a planner or a maintainer) is still confined to
@@ -641,6 +647,19 @@ private def refuseOutsideScope (env : Env) (target : Taxis.IssueId) (what : Stri
     if ← isWithinSubtree root target then return none
     return some s!"cannot {what}: issue {target.toString} is outside this task's project \
       subtree (root {root.toString}); a task may only write to issues at or below it"
+
+/-- Refuse a context note with a blank field, before taxis does.
+
+    Taxis requires both and rejects a blank one with a 422, which reaches the agent as a thrown
+    `IO.userError` rather than as a tool error: the server catches it by closing the connection,
+    so an empty title costs the task every tool it had. Neither field is optional in any sense
+    worth passing on — a note with no title is one the rail cannot show, and one with no text is
+    not a note. -/
+private def refuseBlankNote (title text : String) : Option String :=
+  if title.trimAscii.isEmpty then some "a context note needs a title: it is the only part of it \
+    shown before someone unfolds it"
+  else if text.trimAscii.isEmpty then some "a context note needs text — there is nothing else to it"
+  else none
 
 private def has (env : Env) (perm : String) : Bool :=
   env.allowedTools.contains perm
@@ -981,13 +1000,15 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
   -- ---------------- context notes (all three groups) ----------------
   | .listContext iid =>
     if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
-      return content (deny workIssuesPerm) (isError := true)
+      return content denyAnyGroup (isError := true)
     match ← renderContextNotes iid with
     | none   => return content s!"No context notes on issue {iid.toString}."
     | some s => return content s
   | .addContext iid title text =>
     if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
-      return content (deny workIssuesPerm) (isError := true)
+      return content denyAnyGroup (isError := true)
+    if let some msg := refuseBlankNote title text then
+      return content msg (isError := true)
     if let some msg ← refuseOutsideScope env iid "add a context note there" then
       return content msg (isError := true)
     let note ← attachContext iid title text
@@ -995,7 +1016,9 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     return content s!"context note {note.id.val} attached to issue {iid.toString}"
   | .updateContext iid cid title text =>
     if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
-      return content (deny workIssuesPerm) (isError := true)
+      return content denyAnyGroup (isError := true)
+    if let some msg := refuseBlankNote title text then
+      return content msg (isError := true)
     if let some msg ← refuseOutsideScope env iid "revise a context note there" then
       return content msg (isError := true)
     -- Checked against the issue named rather than patched blind: an artifact id is

@@ -482,6 +482,17 @@ def contextToolsNeedAnIssueGroup : Test := do
     let r ← evalProjectTool env call
     TestM.assert (jsonContains r "not authorized") s!"{repr call} must be refused without a group"
 
+/-- A blank field is refused here rather than at taxis, which rejects it with a 422 — and a 422
+    reaches the agent as a thrown error that closes the MCP connection, costing it every tool it
+    had. Checked before the scope check, so this needs no tracker. -/
+@[test]
+def blankContextFieldsAreRefusedLocally : Test := do
+  let env := baseEnv [workIssuesPerm]
+  let blankTitle ← evalProjectTool env (.addContext ⟨57⟩ "   " "body")
+  TestM.assert (jsonContains blankTitle "needs a title") "a note with no title is refused"
+  let blankText ← evalProjectTool env (.updateContext ⟨57⟩ ⟨9⟩ "Repro" "")
+  TestM.assert (jsonContains blankText "needs text") "a note with no text is refused"
+
 /-- Registered under all three groups, like `list_issue_comments`: same dedupe requirement in
     `Server.toolsList`, and the same reason — the notes are shared ground. -/
 @[test]

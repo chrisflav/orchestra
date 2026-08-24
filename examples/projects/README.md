@@ -128,7 +128,6 @@ hang off and nothing more — anything genuinely secret belongs elsewhere.
 
 ## Configuring taxis
 
-
 Add a `taxis` section to `config.json` (`$XDG_CONFIG_HOME/orchestra/config.json`, falling back to
 `~/.config/orchestra/config.json`, with a legacy `~/.agent/config.json` fallback if that's what you
 already have — see `Orchestra.Dirs`):

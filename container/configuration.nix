@@ -35,8 +35,13 @@ in
     jq
     openssl
     gcc
-    # Headers and library for taxis's gzip shim, which an agent building orchestra itself has
-    # to compile. Mirrors zlib1g-dev/zlib1g in docker/Dockerfile.
+    # zlib, for taxis's gzip shim: an agent building orchestra itself, or any Lean project
+    # depending on taxis, compiles `bindings/gzip.c` and cannot without it. Mirrors
+    # zlib1g-dev in docker/Dockerfile — but three things rather than one, because on NixOS a
+    # package in this list is not a package on a compiler's search path: the headers are in
+    # `zlib.dev` (the default output installs none), the system profile links no `/include` at
+    # all unless told to, and `cc` reads neither location without being pointed at it.
+    zlib.dev
     zlib
     # `nc` is the MCP transport, not a debugging tool: every agent backend points its MCP client
     # at the built-in server with `nc 127.0.0.1 <port>` (see setupMcp in Orchestra/Agents/).
@@ -51,6 +56,12 @@ in
     unstable.mistral-vibe
     pi-coding-agent-wrapped
   ];
+
+  environment.pathsToLink = [ "/include" ];
+  environment.variables = {
+    C_INCLUDE_PATH = "/run/current-system/sw/include";
+    LIBRARY_PATH = "/run/current-system/sw/lib";
+  };
 
   users.users.orchestra = {
     isNormalUser = true;

@@ -1043,6 +1043,11 @@ def loadComments (iid : Taxis.IssueId) : IO (Array Orchestra.Taxis.Comment) := d
   let cfg ← Orchestra.Taxis.getConfig
   unwrap (← Orchestra.Taxis.listComments cfg iid)
 
+/-- A block of text indented under the line that introduces it, as both an issue's comments and
+    its context notes are rendered for an agent. -/
+private def indentBlock (s : String) : String :=
+  String.intercalate "\n" ((s.splitOn "\n").map ("    " ++ ·))
+
 /-- One comment as a line of agent-facing text: author, time, then the body indented. -/
 def renderComment (c : Orchestra.Taxis.Comment) : IO String := do
   let when ← Orchestra.Taxis.epochToIso8601 c.createdAt
@@ -1050,8 +1055,7 @@ def renderComment (c : Orchestra.Taxis.Comment) : IO String := do
   let verdict := match c.review with
     | some v => s!" [review: {repr v}]"
     | none => ""
-  let body := String.intercalate "\n" ((c.body.splitOn "\n").map (s!"    " ++ ·))
-  return s!"  {who} at {when}{verdict}\n{body}"
+  return s!"  {who} at {when}{verdict}\n{indentBlock c.body}"
 
 /-- An issue's whole comment thread rendered for a prompt, or `none` when there is nothing to
     show. Lets a role template carry the discussion — a rejection's reasoning above all — without
@@ -1125,9 +1129,7 @@ def reviseContext (id : Orchestra.Taxis.ArtifactId) (title text : String) : IO U
 def renderContextNotes (iid : Taxis.IssueId) : IO (Option String) := do
   let notes ← loadContext iid
   if notes.isEmpty then return none
-  let rendered := notes.map fun n =>
-    let body := String.intercalate "\n" ((n.text.splitOn "\n").map ("    " ++ ·))
-    s!"  [{n.id.val}] {n.title}\n{body}"
+  let rendered := notes.map fun n => s!"  [{n.id.val}] {n.title}\n{indentBlock n.text}"
   return some (String.intercalate "\n" rendered.toList)
 
 /-! ## Write scoping
