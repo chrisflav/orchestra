@@ -1043,6 +1043,11 @@ def loadComments (iid : Taxis.IssueId) : IO (Array Orchestra.Taxis.Comment) := d
   let cfg ← Orchestra.Taxis.getConfig
   unwrap (← Orchestra.Taxis.listComments cfg iid)
 
+/-- A block of text indented under the line that introduces it, as both an issue's comments and
+    its context notes are rendered for an agent. -/
+private def indentBlock (s : String) : String :=
+  String.intercalate "\n" ((s.splitOn "\n").map ("    " ++ ·))
+
 /-- One comment as a line of agent-facing text: author, time, then the body indented. -/
 def renderComment (c : Orchestra.Taxis.Comment) : IO String := do
   let when ← Orchestra.Taxis.epochToIso8601 c.createdAt
@@ -1050,8 +1055,7 @@ def renderComment (c : Orchestra.Taxis.Comment) : IO String := do
   let verdict := match c.review with
     | some v => s!" [review: {repr v}]"
     | none => ""
-  let body := String.intercalate "\n" ((c.body.splitOn "\n").map (s!"    " ++ ·))
-  return s!"  {who} at {when}{verdict}\n{body}"
+  return s!"  {who} at {when}{verdict}\n{indentBlock c.body}"
 
 /-- An issue's whole comment thread rendered for a prompt, or `none` when there is nothing to
     show. Lets a role template carry the discussion — a rejection's reasoning above all — without
@@ -1061,6 +1065,102 @@ def renderCommentThread (iid : Taxis.IssueId) : IO (Option String) := do
   if comments.isEmpty then return none
   let rendered ← comments.mapM renderComment
   return some (String.intercalate "\n" rendered.toList)
+
+/-! ## Context notes
+
+A `context` artifact holds prose *beside* an issue rather than in it: what an earlier run worked
+out, the approach already tried and abandoned, what the build environment needs. Taxis folds it
+away in the issue's artifact rail, so it can accumulate over the life of an issue without any of
+it competing with the description for a human reader's attention.
+
+That is what makes it the right home for the findings an agent would otherwise append to the
+description or leave in a comment. The description says what the issue *is* and a reader has to
+read it; the comment thread is a conversation and a note dropped into it sinks. Context is
+neither: it is written for whoever picks the issue up next, which is usually another agent. -/
+
+/-- One `context` artifact: the artifact's own id, and the two fields of its payload. -/
+structure ContextNote where
+  /-- Taxis artifact id. Needed to revise the note in place — `Basic.reviseContext`. -/
+  id : Orchestra.Taxis.ArtifactId
+  title : String
+  text : String
+deriving Repr, Inhabited
+
+/-- The `context` artifacts among `artifacts`, in the order taxis returned them.
+
+    An artifact whose payload does not carry both strings is skipped rather than reported: taxis
+    validates the payload on the way in, so a malformed one means a kind that has moved on, and
+    dropping it is better than failing every read of the issue it hangs off. -/
+def contextNotesOf (artifacts : Array Orchestra.Taxis.ArtifactView) : Array ContextNote :=
+  artifacts.filterMap fun a =>
+    if a.kind != "context" then none
+    else match a.payload.getObjValAs? String "title", a.payload.getObjValAs? String "text" with
+      | .ok title, .ok text => some { id := a.id, title, text }
+      | _, _ => none
+
+/-- The context notes attached to an issue. -/
+def loadContext (iid : Taxis.IssueId) : IO (Array ContextNote) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let detail ← unwrap (← Orchestra.Taxis.getIssueDetail cfg iid)
+  return contextNotesOf detail.attachedArtifacts
+
+private def contextPayload (title text : String) : Json :=
+  Json.mkObj [("title", Json.str title), ("text", Json.str text)]
+
+/-- Attach a new context note to an issue. -/
+def attachContext (iid : Taxis.IssueId) (title text : String) : IO ContextNote := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let a ← unwrap (← Orchestra.Taxis.createArtifact cfg iid "context" (contextPayload title text))
+  return { id := a.id, title, text }
+
+/-- Rewrite a context note in place, keeping its id.
+
+    In place rather than delete-then-create: the note is meant to be revised as it accumulates,
+    and recreating it would renumber it, move it to the end of the rail, and record one edit as a
+    removal plus an unrelated addition in the issue's activity log. -/
+def reviseContext (id : Orchestra.Taxis.ArtifactId) (title text : String) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let _ ← unwrap (← Orchestra.Taxis.updateArtifact cfg id (contextPayload title text)
+    (kind := "context"))
+
+/-- An issue's context notes, whole: id, title and body for each. What `list_context` returns —
+    an agent that asked for the notes is asking for all of them. -/
+def renderContextNotes (iid : Taxis.IssueId) : IO (Option String) := do
+  let notes ← loadContext iid
+  if notes.isEmpty then return none
+  let rendered := notes.map fun n => s!"  [{n.id.val}] {n.title}\n{indentBlock n.text}"
+  return some (String.intercalate "\n" rendered.toList)
+
+/-- How many bytes of note *bodies* a dispatch prompt carries. -/
+def contextPromptBudget : Nat := 8000
+
+/-- An issue's context notes rendered for a prompt, or `none` when it has none. Lets a role
+    template carry them the way `{{issue_comments}}` carries the thread — a worker dispatched
+    onto an issue should not have to know to ask for what the last worker on it left behind.
+
+    Bounded, unlike the thread. Notes are the one part of an issue designed to accumulate
+    without limit, and `Sandbox.capPromptArg` cuts an over-long prompt from the *end* — which is
+    where the task's own instructions are, not where the notes are. An issue with a long enough
+    history would therefore have silently traded its instructions for its notes.
+
+    Newest first while deciding what fits, because the last thing written about an issue is the
+    likeliest to still be true. Past the budget a note keeps its title and loses its body, so
+    the agent can still see that it exists and read it with `list_context`. -/
+def renderContextNotesForPrompt (iid : Taxis.IssueId)
+    (budget : Nat := contextPromptBudget) : IO (Option String) := do
+  let notes ← loadContext iid
+  if notes.isEmpty then return none
+  let mut spent := 0
+  let mut out : Array String := #[]
+  for n in notes.reverse do
+    let head := s!"  [{n.id.val}] {n.title}"
+    let cost := n.text.utf8ByteSize
+    if spent + cost ≤ budget then
+      spent := spent + cost
+      out := out.push s!"{head}\n{indentBlock n.text}"
+    else
+      out := out.push s!"{head}\n    (not shown here — read this one with list_context)"
+  return some (String.intercalate "\n" out.reverse.toList)
 
 /-! ## Write scoping
 

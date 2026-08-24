@@ -72,6 +72,13 @@ inductive ProjectTool where
   | listIssueComments  (issueId : Taxis.IssueId)
   /-- Add a comment to an issue's thread. -/
   | commentIssue       (issueId : Taxis.IssueId) (body : String)
+  /-- Read an issue's context notes: what earlier runs on it worked out. -/
+  | listContext        (issueId : Taxis.IssueId)
+  /-- Attach a new context note to an issue. -/
+  | addContext         (issueId : Taxis.IssueId) (title text : String)
+  /-- Rewrite one context note in place, keeping its id. -/
+  | updateContext      (issueId : Taxis.IssueId) (contextId : Taxis.ArtifactId)
+                       (title text : String)
   -- review_issues
   | listIssuesInReview (projectId : Taxis.IssueId)
   | decideIssue        (issueId : Taxis.IssueId) (decision : ReviewDecision) (notes : String)
@@ -125,6 +132,55 @@ private def commentIssueToolDef : Json :=
         , ("body", strProp "Comment text (markdown allowed)") ]
         ["issue_id", "body"]) ]
 
+/-! ### Context notes
+
+Offered under all three groups, reads and writes alike. Every role that touches an issue
+accumulates something the next one would otherwise rediscover — a worker what it tried, a
+reviewer what it checked, a manager what it decided not to do — and the point of the artifact is
+that recording it costs the description and the thread nothing. -/
+
+private def listContextToolDef : Json :=
+  Json.mkObj
+    [ ("name", "list_context")
+    , ("description",
+        "Read the context notes attached to a taxis issue: what an earlier run worked out, an " ++
+        "approach already tried and abandoned, what the build environment needs. Read these " ++
+        "before starting work — this is where the last agent on the issue left its findings. " ++
+        "get_issue shows only their titles and the taxis UI keeps them folded, so this is what " ++
+        "reads the notes themselves.")
+    , ("inputSchema", obj [ ("issue_id", intProp "Issue ID") ] ["issue_id"]) ]
+
+private def addContextToolDef : Json :=
+  Json.mkObj
+    [ ("name", "add_context")
+    , ("description",
+        "Attach a context note to a taxis issue: a title and a block of markdown, held beside " ++
+        "the issue rather than in it. This is where implementation detail, findings and results " ++
+        "belong — not in the description, which states what the work is and is read by every " ++
+        "person who opens the issue, and not in the comment thread, which is discussion and " ++
+        "review. Notes stay folded, so they can accumulate over an issue's life without " ++
+        "crowding either.")
+    , ("inputSchema", obj
+        [ ("issue_id", intProp "Issue ID")
+        , ("title", strProp "Short label for the note — the one line shown before it is unfolded")
+        , ("text", strProp "The note itself (markdown, with $…$ math)") ]
+        ["issue_id", "title", "text"]) ]
+
+private def updateContextToolDef : Json :=
+  Json.mkObj
+    [ ("name", "update_context")
+    , ("description",
+        "Rewrite a context note in place, keeping its id. Title and text replace what was " ++
+        "there — a note is revised whole rather than appended to, so pass the full text you " ++
+        "want it to end up with; list_context gives you the current one. Prefer revising a note " ++
+        "that has gone out of date over attaching a second one that contradicts it.")
+    , ("inputSchema", obj
+        [ ("issue_id", intProp "ID of the issue the note is attached to")
+        , ("context_id", intProp "ID of the note to rewrite (from list_context)")
+        , ("title", strProp "Replacement title")
+        , ("text", strProp "Replacement text (markdown)") ]
+        ["issue_id", "context_id", "title", "text"]) ]
+
 def toolDefs : List (String × String × Json) :=
   [ -- manage_issues
     (manageIssuesPerm, "list_projects",
@@ -144,7 +200,9 @@ def toolDefs : List (String × String × Json) :=
   , (manageIssuesPerm, "get_issue",
       Json.mkObj
         [ ("name", "get_issue")
-        , ("description", "Get full issue detail (children + attached PRs).")
+        , ("description",
+            "Get full issue detail: children, attached PRs, the comment thread, and the " ++
+            "titles of any context notes (read them with list_context).")
         , ("inputSchema", obj
             [ ("issue_id", intProp "Issue ID") ]
             ["issue_id"]) ])
@@ -279,6 +337,15 @@ def toolDefs : List (String × String × Json) :=
   , (manageIssuesPerm, "list_issue_comments", commentsToolDef)
   , (workIssuesPerm, "comment_issue", commentIssueToolDef)
   , (reviewIssuesPerm, "comment_issue", commentIssueToolDef)
+  , (workIssuesPerm, "list_context", listContextToolDef)
+  , (reviewIssuesPerm, "list_context", listContextToolDef)
+  , (manageIssuesPerm, "list_context", listContextToolDef)
+  , (workIssuesPerm, "add_context", addContextToolDef)
+  , (reviewIssuesPerm, "add_context", addContextToolDef)
+  , (manageIssuesPerm, "add_context", addContextToolDef)
+  , (workIssuesPerm, "update_context", updateContextToolDef)
+  , (reviewIssuesPerm, "update_context", updateContextToolDef)
+  , (manageIssuesPerm, "update_context", updateContextToolDef)
     -- review_issues
   , (reviewIssuesPerm, "list_issues_in_review",
       Json.mkObj
@@ -474,6 +541,23 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
       let iid  ← args.getObjValAs? Taxis.IssueId "issue_id"
       let body ← args.getObjValAs? String "body"
       return .commentIssue iid body
+  | "list_context" =>
+    some <| do
+      let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
+      return .listContext iid
+  | "add_context" =>
+    some <| do
+      let iid   ← args.getObjValAs? Taxis.IssueId "issue_id"
+      let title ← args.getObjValAs? String "title"
+      let text  ← args.getObjValAs? String "text"
+      return .addContext iid title text
+  | "update_context" =>
+    some <| do
+      let iid   ← args.getObjValAs? Taxis.IssueId "issue_id"
+      let cid   ← args.getObjValAs? Taxis.ArtifactId "context_id"
+      let title ← args.getObjValAs? String "title"
+      let text  ← args.getObjValAs? String "text"
+      return .updateContext iid cid title text
   | "list_issues_in_review" =>
     some <| do
       let pid ← args.getObjValAs? Taxis.IssueId "project_id"
@@ -527,6 +611,12 @@ structure Env where
 private def deny (perm : String) : String :=
   s!"this task is not authorized for the {perm} tool group"
 
+/-- Refusal for the tools gated on holding *any* issue group rather than a named one. Naming a
+    single group, as `deny` does, would send an agent looking for the wrong permission. -/
+private def denyAnyGroup : String :=
+  "this task is not authorized for any of the manage_issues, work_issues or review_issues \
+   tool groups"
+
 /-- The issue bounding what this task may create or update: the root of its own project subtree
     (`Project.projectRootOf`). Anchored on the task's issue when it has one, otherwise on its
     project — a role dispatched without an issue (a planner or a maintainer) is still confined to
@@ -556,7 +646,20 @@ private def refuseOutsideScope (env : Env) (target : Taxis.IssueId) (what : Stri
   | some root =>
     if ← isWithinSubtree root target then return none
     return some s!"cannot {what}: issue {target.toString} is outside this task's project \
-      subtree (root {root.toString}); manage_issues may only modify issues at or below it"
+      subtree (root {root.toString}); a task may only write to issues at or below it"
+
+/-- Refuse a context note with a blank field, before taxis does.
+
+    Taxis requires both and rejects a blank one with a 422, which reaches the agent as a thrown
+    `IO.userError` rather than as a tool error: the server catches it by closing the connection,
+    so an empty title costs the task every tool it had. Neither field is optional in any sense
+    worth passing on — a note with no title is one the rail cannot show, and one with no text is
+    not a note. -/
+private def refuseBlankNote (title text : String) : Option String :=
+  if title.trimAscii.isEmpty then some "a context note needs a title: it is the only part of it \
+    shown before someone unfolds it"
+  else if text.trimAscii.isEmpty then some "a context note needs text — there is nothing else to it"
+  else none
 
 private def has (env : Env) (perm : String) : Bool :=
   env.allowedTools.contains perm
@@ -650,6 +753,13 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       if !comments.isEmpty then
         let rendered ← comments.mapM renderComment
         body := body ++ #["comments:"] ++ rendered
+      -- Titles only, as the taxis rail shows them. Notes accumulate over an issue's life and
+      -- are the one part of it with no bound, so listing them whole here would make the cost of
+      -- reading an issue grow with how much has been written beside it.
+      let notes ← loadContext iid
+      if !notes.isEmpty then
+        body := body ++ #["context (read with list_context):"] ++
+          notes.map (fun n => s!"  [{n.id.val}] {n.title}")
       return content (joinLines body)
   | .createIssue pid title descr parent target dependencies =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
@@ -887,6 +997,40 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     addComment iid body
     IO.println s!"  [mcp] comment_issue: {iid.toString}"
     return content s!"commented on issue {iid.toString}"
+  -- ---------------- context notes (all three groups) ----------------
+  | .listContext iid =>
+    if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
+      return content denyAnyGroup (isError := true)
+    match ← renderContextNotes iid with
+    | none   => return content s!"No context notes on issue {iid.toString}."
+    | some s => return content s
+  | .addContext iid title text =>
+    if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
+      return content denyAnyGroup (isError := true)
+    if let some msg := refuseBlankNote title text then
+      return content msg (isError := true)
+    if let some msg ← refuseOutsideScope env iid "add a context note there" then
+      return content msg (isError := true)
+    let note ← attachContext iid title text
+    IO.println s!"  [mcp] add_context: {iid.toString} note {note.id.val} — {note.title}"
+    return content s!"context note {note.id.val} attached to issue {iid.toString}"
+  | .updateContext iid cid title text =>
+    if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
+      return content denyAnyGroup (isError := true)
+    if let some msg := refuseBlankNote title text then
+      return content msg (isError := true)
+    if let some msg ← refuseOutsideScope env iid "revise a context note there" then
+      return content msg (isError := true)
+    -- Checked against the issue named rather than patched blind: an artifact id is
+    -- tracker-wide, so a stale or guessed one otherwise reaches straight past the scope check
+    -- above into another issue's subtree.
+    let notes ← loadContext iid
+    if !notes.any (·.id == cid) then
+      return content s!"issue {iid.toString} has no context note {cid.val} — list_context \
+        shows the ones it has" (isError := true)
+    reviseContext cid title text
+    IO.println s!"  [mcp] update_context: {iid.toString} note {cid.val}"
+    return content s!"context note {cid.val} on issue {iid.toString} rewritten"
   -- ---------------- review_issues ----------------
   | .listIssuesInReview pid =>
     if !has env reviewIssuesPerm then return content (deny reviewIssuesPerm) (isError := true)

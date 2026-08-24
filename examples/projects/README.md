@@ -20,6 +20,7 @@ error.
 | Dependencies | taxis's native issue-dependency graph — no separate plumbing. A dependency holds its dependent back only while it is still open; completed *or* abandoned releases it. |
 | Claim (which task currently holds an issue) | A `session`-kind artifact on the issue (`{task_id, agent, series?, claimed_at}`) — "claimed" means the issue has one. |
 | Attached PR | A `github-pr`-kind artifact on the issue. |
+| Context note | A `context`-kind artifact on the issue (`{title, text}`) — prose held beside the issue, folded away in the taxis UI. Any number per issue. |
 | Goal | taxis's native `goal` field on the issue — the condition that decides whether it is done. Read as `Issue.goal`; empty when unset. |
 | `RepoTarget` override / reviewer template | Not a native taxis field — encoded as a JSON blob in a trailing ` ```orchestra-meta ` fenced block appended to the issue's description, stripped before a human sees it. |
 
@@ -97,6 +98,34 @@ all three groups and writing to `work_issues`/`review_issues`, so a rejected iss
 reasoning forward to whoever picks it up next. These are taxis comments, distinct from the
 `comment` tool, which posts to the GitHub issue or PR a task was launched from.
 
+### Context notes: where findings go
+
+An issue accumulates material that is worth keeping and is not worth putting in front of every
+person who opens it — what an earlier run worked out, an approach tried and abandoned, what the
+build environment needs. It has three possible homes and only one right one:
+
+| | Read by | Holds |
+| --- | --- | --- |
+| `description` | Everyone who opens the issue, and every dispatched worker | What the work *is*. One statement, kept current. |
+| Comment thread | Whoever scrolls it | The conversation: review verdicts, questions, decisions and why. |
+| Context notes | Whoever asks, or is handed them in a prompt | Findings and detail for whoever picks the issue up next. |
+
+`add_context` attaches one (a title and a block of markdown), `update_context` rewrites one in
+place, and `list_context` reads them. All three are offered under **all three** groups, reads and
+writes alike: every role that touches an issue learns something the next one would otherwise
+rediscover, and the point of the artifact is that recording it costs the description and the
+thread nothing. Writes are scoped to the agent's own project subtree, the same as `update_issue`.
+
+Taxis folds notes away behind their titles, so they can accumulate over an issue's life without
+crowding a human reader. That is what makes this the answer to an agent appending its results to
+the description: the description stays the one thing a reader has to read, and nothing is lost.
+`get_issue` lists the titles for the same reason — the notes themselves have no bound, so putting
+them in every issue read would make reading an issue cost whatever has been written beside it.
+
+Revising beats accumulating near-duplicates: a note that has gone out of date should be rewritten
+with `update_context`, not contradicted by a second one. Notes are as visible as the issue they
+hang off and nothing more — anything genuinely secret belongs elsewhere.
+
 ## Configuring taxis
 
 Add a `taxis` section to `config.json` (`$XDG_CONFIG_HOME/orchestra/config.json`, falling back to
@@ -156,13 +185,17 @@ $XDG_DATA_HOME/orchestra/projects/<project-id>/roles/<name>.json     -- per-proj
 
 Prompt templates support `{{project_id}}`, `{{project_name}}`, `{{instructions}}`, and — when the
 role is dispatched onto an issue — `{{issue_id}}`, `{{issue_title}}`, `{{issue_description}}`,
-`{{issue_comments}}`, `{{target_repo}}`, `{{target_branch}}`, `{{pr_number}}`, `{{pr_branch}}`,
-`{{pr_repo}}`. Unrecognised placeholders pass through; an absent value renders empty.
+`{{issue_comments}}`, `{{issue_context}}`, `{{target_repo}}`, `{{target_branch}}`,
+`{{pr_number}}`, `{{pr_branch}}`, `{{pr_repo}}`. Unrecognised placeholders pass through; an
+absent value renders empty.
 
-`{{issue_description}}` and `{{issue_comments}}` are the two worth putting in every worker
-template. They are the only way an agent sees what an issue asks for and what a reviewer said
-about it — `get_issue` and `list_issue_comments` render both, but a worker has to know to call
-them, and a rejection lives nowhere else now that there is no rejected status.
+`{{issue_description}}`, `{{issue_comments}}` and `{{issue_context}}` are the three worth
+putting in every worker template. They are the only way an agent sees what the issue asks for,
+what a reviewer said about it, and what the last agent on it worked out — `get_issue`,
+`list_issue_comments` and `list_context` render all three, but a worker has to know to call
+them. A rejection lives nowhere but the thread now that there is no rejected status, and a
+context note is folded away by design, so an agent that does not know it exists will
+rediscover what the last one already established.
 
 A role never carries a goal of its own, and none is rendered from the template. When a role is
 dispatched onto an issue whose taxis `goal` is set, that field — on its own, not the prompt the

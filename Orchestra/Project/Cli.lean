@@ -414,7 +414,11 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
   let comments ← match mIssue with
     | some i => renderCommentThread i.id
     | none   => pure none
+  let context ← match mIssue with
+    | some i => renderContextNotesForPrompt i.id
+    | none   => pure none
   let vars := renderVarsFor project mIssue extraInstructions (comments := comments)
+    (context := context)
   let prompt := render role.promptTemplate vars
   let entry : Queue.QueueEntry :=
     { id := entryId, createdAt

@@ -1281,12 +1281,16 @@ def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : P
   let some fork ← GitHub.resolveFork appConfig target'.repo | return none
   let id ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
-  -- One extra fetch per dispatch (not per tick) so the thread lands in the prompt: a worker
-  -- picking up a rejected issue would otherwise have to know to ask for it.
+  -- Two extra fetches per dispatch (not per tick) so the thread and the context notes land in
+  -- the prompt: a worker picking up a rejected issue, or one an earlier worker already learned
+  -- something about, would otherwise have to know to ask for either.
   let comments ← match issue? with
     | some i => Project.renderCommentThread i.id
     | none   => pure none
-  let vars   := Project.renderVarsFor project issue? instructions targetOverride comments
+  let context ← match issue? with
+    | some i => Project.renderContextNotesForPrompt i.id
+    | none   => pure none
+  let vars   := Project.renderVarsFor project issue? instructions targetOverride comments context
   let prompt := Project.render role.promptTemplate vars
   return some
     { id, createdAt

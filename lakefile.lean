@@ -7,7 +7,7 @@ package orchestra where
 
 require Cli from git "https://github.com/leanprover/lean4-cli.git" @ "main"
 require Yaml from git "https://github.com/chrisflav/lean-yaml" @ "master"
-require Taxis from git "https://github.com/chrisflav/taxis" @ "0b45830f32f6fc4e8a3448e5811b59913e05db47"
+require Taxis from git "https://github.com/chrisflav/taxis" @ "d029b06a912a39fef52734ef90f29537561c7785"
 
 /-- Compile a single C shim under `ffi/` into a static library of the same name. -/
 private def ffiStaticLib (pkg : Package) (name : String) : FetchM (Job System.FilePath) := do

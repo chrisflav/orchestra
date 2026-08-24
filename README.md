@@ -716,7 +716,8 @@ for the full concept mapping, the `taxis` config section, and a CLI/tool cheat s
 `skills/` is a Claude plugin directory loaded into every agent by default. It carries two skills:
 
 - **`orchestra-pull-requests`** — opening PRs, commenting, reading review feedback.
-- **`orchestra-taxis-issues`** — claiming, splitting, attaching PRs, and managing tracker issues.
+- **`orchestra-taxis-issues`** — claiming, splitting, attaching PRs, managing tracker issues,
+  and keeping an issue's context notes.
 
 Both exist mainly to state one rule the agent cannot infer: **`gh` must never be used for pull
 requests or issues.** Everything goes through the MCP tools, which select the right credential
