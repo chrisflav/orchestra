@@ -600,7 +600,51 @@ its workspace; it will start from a clean checkout."
           if !state.enabled then pure () else
           let (events, processedIdsReplacement) ← Listener.pollSource liveCfg.source state appConfig.pat
             appConfig.authorizedUsers
-          for (_, vars) in (events : Array (String × List (String × String))) do
+          -- This tick's dispatch budget. A listener with no `rate_limits` — the common case, and
+          -- every listener written before the field existed — costs nothing here: no clock is
+          -- read, no stamp is kept and no check is made.
+          let limits := liveCfg.rateLimits
+          -- `none` when the clock could not be read — `currentIso8601` answers with an empty
+          -- string rather than throwing if `date` fails. A ceiling with no clock behind it
+          -- cannot be honoured, and a budget guard that fails open is not a guard, so the tick
+          -- below holds everything and says why.
+          let nowEpoch? : Option Int ←
+            if limits.isEmpty then pure (some 0)
+            else pure (Usage.parseIso8601 (← TaskStore.currentIso8601))
+          let dispatchesRef ← IO.mkRef state.dispatches
+          -- Events this tick declined to handle because a ceiling was already full. They are
+          -- deliberately *not* marked processed below, so the listener offers them again once
+          -- the window has moved; a rate limit paces work, it does not discard it.
+          let heldRef ← IO.mkRef (#[] : Array String)
+          -- Called at each point a dispatch actually happened, and written through immediately:
+          -- the whole tick runs inside a `catch`, and a tick that dies after dispatching must
+          -- not forget what it spent, or the ceiling is one failed poll away from being
+          -- exceeded.
+          let noteDispatch : IO Unit := do
+            if limits.isEmpty then return
+            let some now := nowEpoch? | return
+            let stamps := Listener.pruneDispatches limits
+              ((← dispatchesRef.get).push (Usage.secsToIso8601 now)) now
+            dispatchesRef.set stamps
+            let cur ← Listener.loadListenerState name
+            Listener.saveListenerState name { cur with dispatches := stamps }
+          for (eventId, vars) in (events : Array (String × List (String × String))) do
+            if !limits.isEmpty then
+              let stamps ← dispatchesRef.get
+              let holdReason : Option String :=
+                match nowEpoch? with
+                | none     => some "its clock cannot be read, so its rate limits cannot be \
+                              honoured"
+                | some now => (Listener.rateLimitHit? limits stamps now).map fun hit =>
+                                s!"it is at its rate limit of {hit.describe}"
+              if let some reason := holdReason then
+                -- Once, not once per event: a full window holds back everything left in the
+                -- tick, and a busy source would otherwise fill the log with the same sentence.
+                if (← heldRef.get).isEmpty then
+                  IO.println s!"  Listener '{name}': {reason}; holding the rest of this tick \
+until the window moves"
+                heldRef.modify (·.push eventId)
+                continue
             -- github-label-count: skip if a task from this listener is already active.
             if let .githubLabelCount .. := liveCfg.source then
               if ← Queue.hasActiveEntryForListener name then
@@ -647,6 +691,7 @@ its workspace; it will start from a clean checkout."
                   | _, _ => pure true
                 if claimed then
                   Queue.saveEntry entry
+                  noteDispatch
                   IO.println s!"  Listener '{name}': dispatched {roleName} → {entry.id}"
               continue
             | .labelDispatcher label .. =>
@@ -724,6 +769,7 @@ its workspace; it will start from a clean checkout."
                   | _, _ => pure true
                 if claimed then
                   Queue.saveEntry entry
+                  noteDispatch
                   IO.println s!"  Listener '{name}': dispatched {roleName} for \
                     {scope} ({label}) → {entry.id}"
               continue
@@ -765,6 +811,7 @@ its workspace; it will start from a clean checkout."
                     workflowFile := some resolvedPath
                   }
                   Queue.saveConcertRun concertRun
+                  noteDispatch
                   let _concertTask ← IO.asTask (prio := .dedicated) do
                     try
                       Concert.evalQueued concertMgr appConfig cfg.debug none (some concertId) concert
@@ -781,15 +828,19 @@ its workspace; it will start from a clean checkout."
               -- Single-task mode: enqueue a QueueEntry as before.
               let qentry ← Listener.buildQueueEntry liveCfg.action vars (some name)
               Queue.saveEntry qentry
+              noteDispatch
               IO.println s!"  Listener '{name}': queued entry {qentry.id}"
+          let held ← heldRef.get
           let newIds := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)
           -- Re-read enabled so a disable issued mid-tick is not overwritten.
           let currentEnabled := (← Listener.loadListenerState name).enabled
           let newState : Listener.ListenerState := {
             lastChecked  := ← TaskStore.currentIso8601
-            processedIds := processedIdsReplacement.getD (state.processedIds ++ newIds)
+            processedIds := Listener.nextProcessedIds state.processedIds newIds held
+                              processedIdsReplacement
             enabled      := currentEnabled
+            dispatches   := ← dispatchesRef.get
           }
           Listener.saveListenerState name newState
         catch e =>

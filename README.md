@@ -961,6 +961,9 @@ Fields:
   listener queues, and how to pick among them. A listener that fires repeatedly is the case
   several accounts exist for: it keeps producing runnable work after one account's weekly window
   closes → [usage limits](#usage-limits)
+- `interval_seconds` — how often the listener *looks*. What it may *do* once it has looked is
+  `rate_limits`, below
+- `rate_limits` — ceilings on how often this listener may dispatch (see below)
 
 To trigger a multi-step workflow from a listener, replace `prompt_template` with `workflow_path`:
 
@@ -990,6 +993,63 @@ orchestra listener list
 orchestra listener enable <name>
 orchestra listener disable <name>
 ```
+
+### how often a listener may fire
+
+`interval_seconds` says how often a listener looks; it says nothing about how much it may do
+when it looks. A source can hand a listener twenty events in a single tick, and a listener
+watching a busy repository can have something to do on every tick of the day — neither is a
+reason to spend twenty tasks' worth of an account's budget in a minute.
+
+`rate_limits` is the ceiling on the doing. Each entry is a `max` and a window, and a dispatch
+has to fit under all of them:
+
+```json
+{
+  "source": {
+    "type": "github-issues",
+    "repos": [{"upstream": "owner/repo", "fork": "your-org/fork"}],
+    "labels": ["orchestra"]
+  },
+  "action": {
+    "mode": "pr",
+    "prompt_template": "Issue #{{issue_number}}: {{title}}\n\n{{body}}"
+  },
+  "interval_seconds": 300,
+  "rate_limits": [
+    {"max": 5,  "per": "hour"},
+    {"max": 20, "per": "day"}
+  ]
+}
+```
+
+The window is either `per` — a unit (`"minute"`, `"hour"`, `"day"`, `"week"`) or a count and a
+unit (`"6h"`, `"90 minutes"`) — or `per_seconds` for the same thing in seconds. A spelling that
+cannot be read (`"hourly"`, a `max` with no window at all) is rejected rather than quietly
+becoming no ceiling; so is `"max": 0`, which is an off switch and has a better one in
+`orchestra listener disable`.
+
+The windows are rolling, not calendar ones: "5 per hour" means five in the last sixty minutes,
+not five since the top of the hour.
+
+**Nothing is dropped.** An event that arrives over the ceiling is *held*: it is not marked
+processed, so the listener offers it again on a later tick, once the window has moved. A
+project- or label-dispatcher, whose events are recomputed from scratch every tick anyway, simply
+dispatches fewer roles this tick and the rest later. What a rate limit changes is the pace, not
+the work.
+
+Where each ceiling stands is visible without reading the log:
+
+```
+$ orchestra listener show nightly
+...
+Rate limits:
+  5 per hour (5 used, next at 2026-08-24T21:12:04Z)
+  20 per day (11 used)
+```
+
+Listeners with no `rate_limits` — which is every listener written before the field existed — are
+unpaced and cost nothing: no timestamps are kept for them and no check is made.
 
 See `examples/listeners/` for further listener examples.
 

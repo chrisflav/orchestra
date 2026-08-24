@@ -110,6 +110,22 @@ def validateListenerConfig_rejectsWhatWouldCorruptTheStore : Test := do
   let zeroInterval := goodListener.replace "\"interval_seconds\": 300" "\"interval_seconds\": 0"
   TestM.assert (← listenerVerdict "nightly" zeroInterval |>.map Option.isSome)
     (msg := "a zero poll interval would spin against the source as fast as the network allows")
+  -- Dispatch ceilings. A window nobody can read is the dangerous one: left to parse loosely it
+  -- would become no ceiling at all, which is the opposite of what its author asked for.
+  let withLimits (limits : String) : String :=
+    goodListener.replace "{\"interval_seconds\""
+      ("{\"rate_limits\": " ++ limits ++ ", \"interval_seconds\"")
+  TestM.assertEqual (← listenerVerdict "nightly"
+      (withLimits "[{\"max\": 5, \"per\": \"hour\"}, {\"max\": 20, \"per\": \"day\"}]"))
+    none (msg := "five an hour and twenty a day is a pair of ceilings, not a mistake")
+  TestM.assert (← listenerVerdict "nightly"
+      (withLimits "[{\"max\": 5, \"per\": \"hourly\"}]") |>.map Option.isSome)
+    (msg := "a window that cannot be read must not become no ceiling at all")
+  TestM.assert (← listenerVerdict "nightly" (withLimits "[{\"max\": 5}]") |>.map Option.isSome)
+    (msg := "a ceiling with no window is not a ceiling")
+  TestM.assert (← listenerVerdict "nightly"
+      (withLimits "[{\"max\": 0, \"per\": \"hour\"}]") |>.map Option.isSome)
+    (msg := "a ceiling of zero is an off switch, and there is a better one")
 
 /-! ## Role validation -/
 

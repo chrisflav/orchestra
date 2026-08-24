@@ -5,6 +5,7 @@ import Orchestra.Queue
 import Orchestra.Project
 import Orchestra.GitHub
 import Orchestra.Utils.Files
+import Orchestra.Usage
 
 open Lean (Json FromJson ToJson)
 
@@ -332,6 +333,150 @@ instance : FromJson ActionConfig where
              budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
              workflowPath, issueNumber, prLabels }
 
+-- Dispatch rate limits
+
+/-- A ceiling on how often a listener may dispatch: at most `max` in any window of
+    `windowSeconds` ending now.
+
+    This is not `interval_seconds`, which says how often a listener *looks*. A source can hand a
+    listener twenty events in a single tick, and a listener watching a busy repository can have
+    something to do on every tick of the day; neither is a reason to spend twenty tasks' worth of
+    an account's budget in a minute. Several limits compose — "five an hour and thirty a day" is
+    two of them — and a dispatch has to fit under all of them.
+
+    What is over the ceiling is *held*, not dropped: an event held back is not marked processed,
+    so the listener offers it again on a later tick once the window has moved. -/
+structure RateLimit where
+  max           : Nat
+  windowSeconds : Nat
+deriving BEq, DecidableEq, Repr, Inhabited
+
+/-- Seconds in a unit name, in the spellings a person actually writes. -/
+private def unitSeconds? (u : String) : Option Nat :=
+  match u.toLower with
+  | "s" | "sec" | "secs" | "second" | "seconds" => some 1
+  | "m" | "min" | "mins" | "minute" | "minutes" => some 60
+  | "h" | "hr" | "hrs" | "hour" | "hours"       => some 3600
+  | "d" | "day" | "days"                        => some 86400
+  | "w" | "week" | "weeks"                      => some 604800
+  | _                                           => none
+
+/-- Read a window: a bare unit (`"hour"`), or a count and a unit (`"6h"`, `"90 minutes"`).
+    `none` on anything else, so that a misspelled window is reported rather than quietly
+    becoming no limit at all — which is the one way this feature could fail dangerously. -/
+def parseWindow? (s : String) : Option Nat :=
+  let cs     := s.trimAscii.toString.toList
+  let digits := cs.takeWhile Char.isDigit
+  let rest   := String.ofList (cs.drop digits.length) |>.trimAscii.toString
+  let count  := if digits.isEmpty then some 1 else (String.ofList digits).toNat?
+  match count, unitSeconds? rest with
+  | some c, some u => if c == 0 then none else some (c * u)
+  | _,      _      => none
+
+/-- A limit as a person would say it: `"5 per hour"`, `"20 per 6 hours"`, `"3 per 90s"`. -/
+def RateLimit.describe (l : RateLimit) : String :=
+  let w   := l.windowSeconds
+  let per :=
+    if w == 60 then "minute" else if w == 3600 then "hour"
+    else if w == 86400 then "day" else if w == 604800 then "week"
+    else if w % 604800 == 0 then s!"{w / 604800} weeks"
+    else if w % 86400 == 0  then s!"{w / 86400} days"
+    else if w % 3600 == 0   then s!"{w / 3600} hours"
+    else if w % 60 == 0     then s!"{w / 60} minutes"
+    else s!"{w}s"
+  s!"{l.max} per {per}"
+
+instance : ToJson RateLimit where
+  toJson l := Json.mkObj [
+    ("max",         ToJson.toJson l.max),
+    ("per_seconds", ToJson.toJson l.windowSeconds)
+  ]
+
+instance : FromJson RateLimit where
+  fromJson? j := do
+    let max ← j.getObjValAs? Nat "max"
+    match j.getObjValAs? Nat "per_seconds" |>.toOption with
+    | some 0 => .error "'per_seconds' must be at least 1"
+    | some w => return { max, windowSeconds := w }
+    | none   =>
+      match j.getObjValAs? String "per" |>.toOption with
+      | none   => .error "a rate limit needs a window: 'per' (\"hour\", \"6h\", \"90 minutes\") \
+or 'per_seconds'"
+      | some p =>
+        match parseWindow? p with
+        | some w => return { max, windowSeconds := w }
+        | none   => .error s!"'per' is not a window this understands: '{p}'. Write a unit \
+(\"minute\", \"hour\", \"day\", \"week\"), a count and a unit (\"6h\", \"90 minutes\"), or give \
+'per_seconds'"
+
+/-- How many of `dispatches` fall in the `windowSeconds` ending at `now`, both epoch seconds.
+
+    A stamp we cannot read does not count: a state file edited by hand must not be able to hold
+    a listener shut forever. A stamp in the *future* does — a clock that jumped is a reason to
+    dispatch less, not more. -/
+def countWithin (dispatches : Array String) (now : Int) (windowSeconds : Nat) : Nat :=
+  dispatches.foldl (init := 0) fun n s =>
+    match Usage.parseIso8601 s with
+    | some t => if t > now - (windowSeconds : Int) then n + 1 else n
+    | none   => n
+
+/-- The first of `limits` that `dispatches` has already filled at `now`. `none` means there is
+    room under every one of them, and the listener may dispatch. -/
+def rateLimitHit? (limits : List RateLimit) (dispatches : Array String) (now : Int) :
+    Option RateLimit :=
+  limits.find? fun l => countWithin dispatches now l.windowSeconds ≥ l.max
+
+/-- Drop the stamps no configured limit can still count, so that a listener running for months
+    does not accumulate a state file of them. No limits means nothing worth remembering. -/
+def pruneDispatches (limits : List RateLimit) (dispatches : Array String) (now : Int) :
+    Array String :=
+  if limits.isEmpty then #[] else
+    let longest := limits.foldl (fun m l => max m l.windowSeconds) 0
+    dispatches.filter fun s =>
+      match Usage.parseIso8601 s with
+      | some t => t > now - (longest : Int)
+      | none   => false
+
+/-- The processed-event set a tick leaves behind.
+
+    `newIds` are the event ids the tick handled and `held` the ones a rate limit turned away.
+    `replacement` is what a source that rewrites the whole set hands back — `github-labels`
+    prunes the ids whose label was stripped, so that re-applying it fires the listener again —
+    and it names every id that source saw this tick, the ones never reached included. That is
+    why `held` is subtracted here rather than merely left out of `newIds`: an event marked
+    processed is not paced, it is lost, and a ceiling is supposed to slow work down rather than
+    throw it away. -/
+def nextProcessedIds (previous newIds held : Array String)
+    (replacement : Option (Array String)) : Array String :=
+  (replacement.getD (previous ++ newIds)).filter fun id => !held.contains id
+
+/-- Where one limit stands right now. Reported by the API and by `orchestra listener show`, so
+    that "why has this listener gone quiet" has an answer that does not need the log. -/
+structure RateLimitStatus where
+  limit         : RateLimit
+  /-- Dispatches inside this limit's window. -/
+  used          : Nat
+  /-- When the window next has room, as epoch seconds. `none` when it has room already — or, for
+      the degenerate `max: 0` that `validateListenerConfig` refuses to store, when it never
+      will. Read `used < limit.max` for "may dispatch now"; this only answers "when". -/
+  nextAllowedAt : Option Int
+deriving Repr
+
+/-- `limits` measured against the dispatches a listener has on record. -/
+def rateLimitStatuses (limits : List RateLimit) (dispatches : Array String) (now : Int) :
+    List RateLimitStatus :=
+  limits.map fun l =>
+    let inWindow := (dispatches.filterMap Usage.parseIso8601).filter
+      (fun t => t > now - (l.windowSeconds : Int))
+    let used := inWindow.size
+    -- With the window full, room appears when the oldest dispatch still being counted ages out
+    -- of it — the `(used - max + 1)`-th oldest, so that a window over its cap (a limit lowered
+    -- since) reports when it will be back under rather than merely one short.
+    let nextAllowedAt :=
+      if used < l.max then none
+      else (inWindow.qsort (· < ·))[used - l.max]?.map (· + (l.windowSeconds : Int))
+    { limit := l, used, nextAllowedAt }
+
 -- Listener config
 
 /-- What a listener does; *not* what it is called.
@@ -349,20 +494,34 @@ structure ListenerConfig where
   source          : SourceConfig
   action          : ActionConfig
   intervalSeconds : Nat := 60
+  /-- Ceilings on how often this listener may dispatch, all of which a dispatch has to fit
+      under. Empty — the default, and what every listener written before this field existed
+      gets — means the source's own pace is the only limit. -/
+  rateLimits      : List RateLimit := []
 
 instance : ToJson ListenerConfig where
-  toJson l := Json.mkObj [
-    ("source",           ToJson.toJson l.source),
-    ("action",           ToJson.toJson l.action),
-    ("interval_seconds", l.intervalSeconds)
-  ]
+  toJson l :=
+    let fields : List (String × Json) := [
+      ("source",           ToJson.toJson l.source),
+      ("action",           ToJson.toJson l.action),
+      ("interval_seconds", ToJson.toJson l.intervalSeconds)
+    ]
+    -- Written out only when there are any, so that a config round-tripped through this instance
+    -- does not grow a field its author never asked for.
+    Json.mkObj (if l.rateLimits.isEmpty then fields
+                else fields ++ [("rate_limits", ToJson.toJson l.rateLimits)])
 
 instance : FromJson ListenerConfig where
   fromJson? j := do
     let source          ← j.getObjValAs? SourceConfig "source"
     let action          ← j.getObjValAs? ActionConfig "action"
     let intervalSeconds  := j.getObjValAs? Nat "interval_seconds" |>.toOption |>.getD 60
-    return { source, action, intervalSeconds }
+    -- Absent is fine; present and unreadable is not. A limit whose window is a typo would
+    -- otherwise parse as no limit at all, which is the failure this field exists to prevent.
+    let rateLimits ← match j.getObjVal? "rate_limits" with
+      | .error _ => pure []
+      | .ok v    => (FromJson.fromJson? v : Except String (List RateLimit))
+    return { source, action, intervalSeconds, rateLimits }
 
 -- Listener state
 
@@ -372,12 +531,17 @@ structure ListenerState where
   /-- When false the daemon skips this listener each tick. Toggled via
       `orchestra listener enable/disable` without editing config files. -/
   enabled      : Bool := true
+  /-- ISO 8601 UTC stamp of each dispatch this listener has made and a configured rate limit can
+      still count, oldest first. Pruned to the longest window on every write, so a listener with
+      no `rate_limits` carries none of these at all. -/
+  dispatches   : Array String := #[]
 
 instance : ToJson ListenerState where
   toJson s := Json.mkObj [
     ("last_checked",   s.lastChecked),
     ("processed_ids",  ToJson.toJson s.processedIds),
-    ("enabled",        Json.bool s.enabled)
+    ("enabled",        Json.bool s.enabled),
+    ("dispatches",     ToJson.toJson s.dispatches)
   ]
 
 instance : FromJson ListenerState where
@@ -385,7 +549,8 @@ instance : FromJson ListenerState where
     let lastChecked  ← j.getObjValAs? String "last_checked"
     let processedIds  := j.getObjValAs? (Array String) "processed_ids" |>.toOption |>.getD #[]
     let enabled       := j.getObjValAs? Bool "enabled" |>.toOption |>.getD true
-    return { lastChecked, processedIds, enabled }
+    let dispatches    := j.getObjValAs? (Array String) "dispatches" |>.toOption |>.getD #[]
+    return { lastChecked, processedIds, enabled, dispatches }
 
 -- Directories
 
@@ -519,6 +684,11 @@ stored as '{name}'. A listener is named by its file; drop the field, or store th
   if cfg.intervalSeconds == 0 then
     return .error "'interval_seconds' must be at least 1; a listener polling zero seconds apart \
 would spin against its source as fast as the network allows"
+  -- A ceiling of nothing is not a ceiling; it is an off switch, and there is already one of
+  -- those that does not lose the listener's configured pace along the way.
+  if cfg.rateLimits.any (·.max == 0) then
+    return .error "a rate limit of 0 dispatches would stop this listener from ever firing; \
+to switch one off, use 'orchestra listener disable' instead"
   return .ok cfg
 
 /-- Store a listener config verbatim. Validation is the caller's business — see
