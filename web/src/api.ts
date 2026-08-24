@@ -116,6 +116,20 @@ export interface ConcertDetail {
   steps: QueueEntry[];
 }
 
+/**
+ * One dispatch ceiling and where it stands. `nextAllowedAt` answers *when* the window next has
+ * room, not *whether* it has any now — `remaining` is what says that.
+ */
+export interface RateLimitStatus {
+  /** The ceiling as a person would say it, e.g. `"5 per hour"`. */
+  description: string;
+  max: number;
+  windowSeconds: number;
+  used: number;
+  remaining: number;
+  nextAllowedAt: string | null;
+}
+
 export interface ListenerSummary {
   name: string;
   enabled: boolean;
@@ -123,6 +137,8 @@ export interface ListenerSummary {
   intervalSeconds: number;
   lastCheckedAt: string | null;
   eventCount: number;
+  /** Empty when the listener is not paced. */
+  rateLimits: RateLimitStatus[];
 }
 
 export interface ActionConfig {
@@ -147,6 +163,10 @@ export interface ListenerDetail {
   sourceDetail: string;
   /** Source-kind-specific extras, as `[label, value]` pairs. */
   sourceExtras: [string, string][];
+  /** Empty when the listener is not paced. */
+  rateLimits: RateLimitStatus[];
+  /** The dispatches still inside the longest configured window, oldest first. */
+  recentDispatches: string[];
   action: ActionConfig;
   recentEvents: string[];
 }

@@ -811,21 +811,46 @@ private def sourceExtras : Listener.SourceConfig → List (String × String)
       [("authorized users", String.intercalate ", " authU)]
   | _ => []
 
-private def listenerSummaryJson (name : String) (c : Listener.ListenerConfig)
-    (st : Listener.ListenerState) : Json :=
-  let (srcType, _) := sourceSummary c.source
+/-- One dispatch ceiling and where it stands. `nextAllowedAt` is null while the window still has
+    room, which is the same thing `remaining` being non-zero says; it answers *when*, not
+    *whether*. -/
+private def rateLimitJson (s : Listener.RateLimitStatus) : Json :=
   Json.mkObj [
+    ("description",   Json.str s.limit.describe),
+    ("max",           ToJson.toJson s.limit.max),
+    ("windowSeconds", ToJson.toJson s.limit.windowSeconds),
+    ("used",          ToJson.toJson s.used),
+    ("remaining",     ToJson.toJson (s.limit.max - s.used)),
+    ("nextAllowedAt", optEpochIso s.nextAllowedAt)
+  ]
+
+/-- `c`'s ceilings measured against the dispatches `st` has on record, as of now. -/
+private def rateLimitsJson (c : Listener.ListenerConfig) (st : Listener.ListenerState) :
+    IO Json := do
+  if c.rateLimits.isEmpty then return Json.arr #[]
+  -- `Usage.nowEpoch`, not `TaskStore.currentIso8601`: this runs once per paced listener and the
+  -- whole payload is rebuilt every two seconds per SSE client, so a `date` subprocess each time
+  -- adds up to process spawns per second on a handful of listeners and open dashboards.
+  let now ← Usage.nowEpoch
+  let statuses := Listener.rateLimitStatuses c.rateLimits st.dispatches now
+  return Json.arr (statuses.map rateLimitJson).toArray
+
+private def listenerSummaryJson (name : String) (c : Listener.ListenerConfig)
+    (st : Listener.ListenerState) : IO Json := do
+  let (srcType, _) := sourceSummary c.source
+  return Json.mkObj [
     ("name",            name),
     ("enabled",         Json.bool st.enabled),
     ("sourceType",      srcType),
     ("intervalSeconds", ToJson.toJson c.intervalSeconds),
     ("lastCheckedAt",   optNormIso (if st.lastChecked.isEmpty then none else some st.lastChecked)),
-    ("eventCount",      ToJson.toJson st.processedIds.size)
+    ("eventCount",      ToJson.toJson st.processedIds.size),
+    ("rateLimits",      ← rateLimitsJson c st)
   ]
 
 private def listenersApi (p : Page) : IO Json := do
   pageOverUnordered p (← Listener.loadAllListenerConfigs) fun (name, c) => do
-    return listenerSummaryJson name c (← Listener.loadListenerState name)
+    listenerSummaryJson name c (← Listener.loadListenerState name)
 
 private def actionJson (a : Listener.ActionConfig) : Json :=
   Json.mkObj [
@@ -850,6 +875,9 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
     let extrasJson : Array Json := (extras.filter (fun (_, v) => ! v.isEmpty)).map
       (fun (k, v) => (Json.arr #[Json.str k, Json.str v])) |>.toArray
     let recent := st.processedIds.toList.reverse.take 50
+    -- Newest 50, back in oldest-first order — the order the state file keeps them in, and the
+    -- one a reader following a window forward wants.
+    let recentDispatches := (st.dispatches.toList.reverse.take 50).reverse
     -- The file as stored, `{{secret}}` placeholders intact — this is the document a client edits
     -- and sends back to `PUT`. Everything above it is derived and is what a *display* wants; a
     -- round trip through those fields would lose whatever this version does not model and would
@@ -864,6 +892,8 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
       ("sourceType",      srcType),
       ("sourceDetail",    srcDetail),
       ("sourceExtras",    Json.arr extrasJson),
+      ("rateLimits",      ← rateLimitsJson c st),
+      ("recentDispatches", Json.arr (recentDispatches.map normIso).toArray),
       ("action",          actionJson c.action),
       ("recentEvents",    Json.arr (recent.map Json.str).toArray),
       ("config",          config.getD Json.null)

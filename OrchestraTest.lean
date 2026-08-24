@@ -1,6 +1,7 @@
 import OrchestraTest.TestM
 import OrchestraTest.GitHubFormatTest
 import OrchestraTest.ListenerConfigTest
+import OrchestraTest.ListenerRateLimitTest
 import OrchestraTest.ServerParseTest
 import OrchestraTest.MergePrTest
 import OrchestraTest.CreateRepositoryTest

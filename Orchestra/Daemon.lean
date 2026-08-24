@@ -591,16 +591,75 @@ its workspace; it will start from a clean checkout."
         -- Re-read the config each tick so config changes take effect live; its absence means
         -- the listener was deleted, and this fiber is what is left of it.
         let some liveCfg ← Listener.loadListenerConfig name
-          | IO.println s!"  Listener '{name}': config is gone, stopping"
+          | -- Absent is a deletion. Present but unreadable is a config this fiber cannot act
+            -- on, and calling that "gone" sends the operator looking for a deletion that never
+            -- happened — the likeliest cause being a field it has just mistyped. Either way the
+            -- fiber retires; the supervisor's next scan picks the listener back up once it
+            -- parses, and `loadAllListenerConfigs` prints the parse error itself meanwhile.
+            let stillOnDisk := (← Listener.loadListenerConfigRaw name).isSome
+            if stillOnDisk then
+              IO.println s!"  Listener '{name}': config cannot be read, stopping until it parses \
+(see the warning from the next config scan for what is wrong with it)"
+            else
+              IO.println s!"  Listener '{name}': config is gone, stopping"
             listenerFibers.modify (·.erase name)
             break
         interval := liveCfg.intervalSeconds
         try
           let state  ← Listener.loadListenerState name
           if !state.enabled then pure () else
+          -- This listener's dispatch ceilings. Empty is the common case — and every listener
+          -- written before the field existed — and every use of `limits` below short-circuits
+          -- on it, so an unpaced listener reads no clock, keeps no stamp and makes no check.
+          let limits := liveCfg.rateLimits
+          -- Already full before anything is polled: skip the tick outright rather than poll and
+          -- throw the result away. A poll is neither free nor side-effect-free — a `shell`
+          -- source runs its command, `github-comments` reacts 🚀 to every comment it picks up —
+          -- and for a source that *consumes* what it reads, polling only to hold the result
+          -- does not pace the work, it loses it. Nothing is missed by waiting: every source
+          -- re-derives its candidates on a later tick, and `lastChecked` stays where it is, so
+          -- the one source that pages by time still has its cursor.
+          let ceilingHit ← if limits.isEmpty then pure none
+            else pure (Listener.rateLimitHit? limits state.dispatches (← Usage.nowEpoch))
+          if let some hit := ceilingHit then
+            IO.println s!"  Listener '{name}': at its rate limit of {hit.describe}; \
+not polling until the window moves"
+          else
           let (events, processedIdsReplacement) ← Listener.pollSource liveCfg.source state appConfig.pat
             appConfig.authorizedUsers
-          for (_, vars) in (events : Array (String × List (String × String))) do
+          let dispatchesRef ← IO.mkRef state.dispatches
+          -- Events this tick declined to handle because a ceiling was already full. They are
+          -- deliberately *not* marked processed below, so the listener offers them again once
+          -- the window has moved; a rate limit paces work, it does not discard it.
+          let heldRef ← IO.mkRef (#[] : Array String)
+          -- Called at each point a dispatch actually happened, and written through immediately:
+          -- the whole tick runs inside a `catch`, and a tick that dies after dispatching must
+          -- not forget what it spent, or the ceiling is one failed poll away from being
+          -- exceeded.
+          let noteDispatch : IO Unit := do
+            if limits.isEmpty then return
+            -- Stamped when the dispatch happened rather than when the tick began. `nowEpoch`
+            -- reads a clock rather than spawning one, so there is nothing to save by reusing a
+            -- stale reading across a tick that may take a while.
+            let now ← Usage.nowEpoch
+            let stamps := Listener.pruneDispatches limits
+              ((← dispatchesRef.get).push (Usage.secsToIso8601 now)) now
+            dispatchesRef.set stamps
+            let cur ← Listener.loadListenerState name
+            Listener.saveListenerState name { cur with dispatches := stamps }
+          for (eventId, vars) in (events : Array (String × List (String × String))) do
+            if !limits.isEmpty then
+              -- The tick began with room and filled up part-way through it. What is left over
+              -- is held: not marked processed, so a later tick offers it again.
+              let now ← Usage.nowEpoch
+              if let some hit := Listener.rateLimitHit? limits (← dispatchesRef.get) now then
+                -- Once, not once per event: a full window holds back everything left in the
+                -- tick, and a busy source would otherwise fill the log with the same sentence.
+                if (← heldRef.get).isEmpty then
+                  IO.println s!"  Listener '{name}': reached its rate limit of {hit.describe}; \
+holding the rest of this tick until the window moves"
+                heldRef.modify (·.push eventId)
+                continue
             -- github-label-count: skip if a task from this listener is already active.
             if let .githubLabelCount .. := liveCfg.source then
               if ← Queue.hasActiveEntryForListener name then
@@ -647,6 +706,7 @@ its workspace; it will start from a clean checkout."
                   | _, _ => pure true
                 if claimed then
                   Queue.saveEntry entry
+                  noteDispatch
                   IO.println s!"  Listener '{name}': dispatched {roleName} → {entry.id}"
               continue
             | .labelDispatcher label .. =>
@@ -724,6 +784,7 @@ its workspace; it will start from a clean checkout."
                   | _, _ => pure true
                 if claimed then
                   Queue.saveEntry entry
+                  noteDispatch
                   IO.println s!"  Listener '{name}': dispatched {roleName} for \
                     {scope} ({label}) → {entry.id}"
               continue
@@ -765,6 +826,7 @@ its workspace; it will start from a clean checkout."
                     workflowFile := some resolvedPath
                   }
                   Queue.saveConcertRun concertRun
+                  noteDispatch
                   let _concertTask ← IO.asTask (prio := .dedicated) do
                     try
                       Concert.evalQueued concertMgr appConfig cfg.debug none (some concertId) concert
@@ -781,15 +843,30 @@ its workspace; it will start from a clean checkout."
               -- Single-task mode: enqueue a QueueEntry as before.
               let qentry ← Listener.buildQueueEntry liveCfg.action vars (some name)
               Queue.saveEntry qentry
+              noteDispatch
               IO.println s!"  Listener '{name}': queued entry {qentry.id}"
+          let held ← heldRef.get
           let newIds := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)
           -- Re-read enabled so a disable issued mid-tick is not overwritten.
           let currentEnabled := (← Listener.loadListenerState name).enabled
+          let nowIso ← TaskStore.currentIso8601
+          let stamps ← dispatchesRef.get
+          let nowEpoch ← Usage.nowEpoch
           let newState : Listener.ListenerState := {
-            lastChecked  := ← TaskStore.currentIso8601
-            processedIds := processedIdsReplacement.getD (state.processedIds ++ newIds)
+            -- For a source that pages by time, this is a fetch cursor and not just a display:
+            -- advancing it past an event this tick held would drop that event rather than
+            -- delay it. See `Listener.pagesByTime`. Re-reading the same slice next tick is
+            -- free — what was dispatched from it is in `processedIds` and filtered there.
+            lastChecked  := if !held.isEmpty && Listener.pagesByTime liveCfg.source
+                            then state.lastChecked else nowIso
+            processedIds := Listener.nextProcessedIds state.processedIds newIds held
+                              processedIdsReplacement
             enabled      := currentEnabled
+            -- Pruned here as well as in `noteDispatch`, so that stamps left behind by a
+            -- `rate_limits` since removed from the config are dropped rather than kept for
+            -- ever: `pruneDispatches` answers `#[]` when there are no limits to count them.
+            dispatches   := Listener.pruneDispatches limits stamps nowEpoch
           }
           Listener.saveListenerState name newState
         catch e =>

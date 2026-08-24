@@ -1690,16 +1690,34 @@
           "finishedAt": { "type": ["string", "null"], "format": "date-time" }
         }
       },
+      "RateLimitStatus": {
+        "type": "object",
+        "description": "One of a listener's dispatch ceilings and where it stands right now. `nextAllowedAt` answers *when* the window next has room, not *whether* it has any: `remaining` is what says that.",
+        "required": ["description", "max", "windowSeconds", "used", "remaining", "nextAllowedAt"],
+        "properties": {
+          "description": { "type": "string", "description": "The ceiling as a person would say it, e.g. `5 per hour`." },
+          "max": { "type": "integer", "description": "Dispatches allowed in one window." },
+          "windowSeconds": { "type": "integer", "description": "Length of the window." },
+          "used": { "type": "integer", "description": "Dispatches inside the window as of now." },
+          "remaining": { "type": "integer", "description": "Room left in the window. Zero means the listener is holding its events back." },
+          "nextAllowedAt": { "type": ["string", "null"], "format": "date-time", "description": "When the window next has room. `null` while it already has some." }
+        }
+      },
       "Listener": {
         "type": "object",
-        "required": ["name", "enabled", "sourceType", "intervalSeconds", "lastCheckedAt", "eventCount"],
+        "required": ["name", "enabled", "sourceType", "intervalSeconds", "lastCheckedAt", "eventCount", "rateLimits"],
         "properties": {
           "name": { "type": "string" },
           "enabled": { "type": "boolean" },
           "sourceType": { "type": "string", "description": "What the listener polls, e.g. `github-issues`." },
           "intervalSeconds": { "type": "integer", "description": "Poll interval." },
           "lastCheckedAt": { "type": ["string", "null"], "format": "date-time", "description": "`null` if it has never run." },
-          "eventCount": { "type": "integer", "description": "Distinct events processed so far." }
+          "eventCount": { "type": "integer", "description": "Distinct events processed so far." },
+          "rateLimits": {
+            "type": "array",
+            "description": "This listener's dispatch ceilings and where each stands. Empty when it is not paced.",
+            "items": { "$ref": "#/components/schemas/RateLimitStatus" }
+          }
         }
       },
       "ListenerConfig": {
@@ -1709,7 +1727,21 @@
         "properties": {
           "source": { "type": "object", "description": "What to watch. `type` selects the variant: `github-issues`, `github-pr-reviews`, `github-comments`, `github-labels`, `github-label-count`, `shell`, `project-dispatcher`, `label-dispatcher`." },
           "action": { "type": "object", "description": "The task to enqueue when it fires. `mode` and `prompt_template` are required." },
-          "interval_seconds": { "type": "integer", "minimum": 1, "default": 60, "description": "Poll interval. Zero is rejected: a listener polling zero seconds apart would spin against its source as fast as the network allows." }
+          "interval_seconds": { "type": "integer", "minimum": 1, "default": 60, "description": "Poll interval. Zero is rejected: a listener polling zero seconds apart would spin against its source as fast as the network allows." },
+          "rate_limits": {
+            "type": "array",
+            "description": "Ceilings on how often this listener may dispatch, all of which a dispatch has to fit under — \"five an hour and twenty a day\" is two of them. Not the same as `interval_seconds`, which says how often it *looks*. What is over a ceiling is held rather than dropped: an event held back is not marked processed, so a later tick offers it again once the window has moved. Absent means the source's own pace is the only limit.",
+            "items": {
+              "type": "object",
+              "required": ["max"],
+              "anyOf": [{ "required": ["per"] }, { "required": ["per_seconds"] }],
+              "properties": {
+                "max": { "type": "integer", "minimum": 1, "description": "Dispatches allowed in one window. Zero is rejected: that is an off switch, and `PUT /api/v1/listeners/{name}/enabled` is a better one." },
+                "per": { "type": "string", "description": "The window, as a unit (`minute`, `hour`, `day`, `week`) or a count and a unit (`6h`, `90 minutes`). A spelling this does not understand is rejected rather than read as no limit at all." },
+                "per_seconds": { "type": "integer", "minimum": 1, "description": "The window in seconds, as an alternative to `per`." }
+              }
+            }
+          }
         },
         "additionalProperties": true
       },
@@ -1810,7 +1842,7 @@
       },
       "ListenerDetail": {
         "type": "object",
-        "required": ["name", "enabled", "intervalSeconds", "lastCheckedAt", "eventCount", "sourceType", "sourceDetail", "sourceExtras", "action", "recentEvents"],
+        "required": ["name", "enabled", "intervalSeconds", "lastCheckedAt", "eventCount", "sourceType", "sourceDetail", "sourceExtras", "rateLimits", "recentDispatches", "action", "recentEvents"],
         "properties": {
           "name": { "type": "string" },
           "enabled": { "type": "boolean" },
@@ -1823,6 +1855,16 @@
             "type": "array",
             "description": "Source-kind-specific fields, as `[label, value]` pairs.",
             "items": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 }
+          },
+          "rateLimits": {
+            "type": "array",
+            "description": "This listener's dispatch ceilings and where each stands. Empty when it is not paced.",
+            "items": { "$ref": "#/components/schemas/RateLimitStatus" }
+          },
+          "recentDispatches": {
+            "type": "array",
+            "description": "The dispatches still inside the longest configured window, oldest first. Empty for a listener with no `rate_limits`, which keeps none.",
+            "items": { "type": "string", "format": "date-time" }
           },
           "action": { "$ref": "#/components/schemas/ListenerAction" },
           "recentEvents": {

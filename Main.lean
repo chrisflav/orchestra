@@ -776,6 +776,17 @@ private def listenerShowHandler (p : Parsed) : IO UInt32 := do
       IO.println s!"Interval:     {Client.nat j "intervalSeconds"}s"
       IO.println s!"Last checked: {Client.str j "lastCheckedAt" "never"}"
       IO.println s!"Events seen:  {Client.nat j "eventCount"}"
+      -- Printed only when there are ceilings to print: a listener with none is not paced, and
+      -- "Rate limits: none" is a line that says nothing on every other listener there is.
+      let rateLimits := (j.getObjVal? "rateLimits" |>.toOption).bind (·.getArr?.toOption)
+      if let some rls := rateLimits then
+        if !rls.isEmpty then
+          IO.println "Rate limits:"
+          for r in rls do
+            let nextAt := Client.str r "nextAllowedAt"
+            let when_  := if nextAt.isEmpty then "" else s!", next at {nextAt}"
+            IO.println s!"  {Client.str r "description"} \
+({Client.nat r "used"} used{when_})"
       if let some c := j.getObjVal? "config" |>.toOption then
         IO.println "Config:"
         for line in c.pretty.splitOn "\n" do
