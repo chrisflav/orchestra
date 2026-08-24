@@ -29,9 +29,12 @@ RUN npm run build
 # elan is installed directly rather than using a Lean base image, so the toolchain pinned by
 # lean-toolchain is fetched exactly as `lake` would locally. `build-essential` provides the `cc`
 # that ffi/UnixSocket.c (the daemon's Unix-socket shim) and leansqlite's amalgamation need.
+# `zlib1g-dev` provides the headers for taxis's own gzip shim, which is compiled here as part of
+# the dependency and fails the whole build without them — the same package taxis's Dockerfile
+# installs for the same file.
 FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git build-essential \
+      ca-certificates curl git build-essential zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 ENV ELAN_HOME=/root/.elan
 ENV PATH="${ELAN_HOME}/bin:${PATH}"
@@ -63,8 +66,9 @@ FROM debian:bookworm-slim AS runtime
 # agent backend points Claude/opencode/pi at the built-in MCP server with `nc 127.0.0.1 <port>`
 # (see each `setupMcp` in Orchestra/Agents/). Without it the agent reports the "agent" MCP server
 # as perpetually connecting and gets no orchestra tools at all.
+# zlib1g is what the binaries' `-lz` (taxis's gzip shim) resolves against at run time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg git openssl jq procps build-essential netcat-openbsd \
+      ca-certificates curl gnupg git openssl jq procps build-essential netcat-openbsd zlib1g \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
          -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \

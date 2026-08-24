@@ -35,6 +35,9 @@ in
     jq
     openssl
     gcc
+    # Headers and library for taxis's gzip shim, which an agent building orchestra itself has
+    # to compile. Mirrors zlib1g-dev/zlib1g in docker/Dockerfile.
+    zlib
     # `nc` is the MCP transport, not a debugging tool: every agent backend points its MCP client
     # at the built-in server with `nc 127.0.0.1 <port>` (see setupMcp in Orchestra/Agents/).
     # Without it the agent sees the "agent" MCP server stuck connecting and gets no tools.
