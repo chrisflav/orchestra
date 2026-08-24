@@ -1288,7 +1288,7 @@ def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : P
     | some i => Project.renderCommentThread i.id
     | none   => pure none
   let context ← match issue? with
-    | some i => Project.renderContextNotes i.id
+    | some i => Project.renderContextNotesForPrompt i.id
     | none   => pure none
   let vars   := Project.renderVarsFor project issue? instructions targetOverride comments context
   let prompt := Project.render role.promptTemplate vars

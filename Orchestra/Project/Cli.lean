@@ -415,7 +415,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     | some i => renderCommentThread i.id
     | none   => pure none
   let context ← match mIssue with
-    | some i => renderContextNotes i.id
+    | some i => renderContextNotesForPrompt i.id
     | none   => pure none
   let vars := renderVarsFor project mIssue extraInstructions (comments := comments)
     (context := context)

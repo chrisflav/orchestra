@@ -1123,14 +1123,44 @@ def reviseContext (id : Orchestra.Taxis.ArtifactId) (title text : String) : IO U
   let _ ← unwrap (← Orchestra.Taxis.updateArtifact cfg id (contextPayload title text)
     (kind := "context"))
 
-/-- An issue's context notes rendered for a prompt, or `none` when it has none. Lets a role
-    template carry them the way `{{issue_comments}}` carries the thread — a worker dispatched onto
-    an issue should not have to know to ask for what the last worker on it left behind. -/
+/-- An issue's context notes, whole: id, title and body for each. What `list_context` returns —
+    an agent that asked for the notes is asking for all of them. -/
 def renderContextNotes (iid : Taxis.IssueId) : IO (Option String) := do
   let notes ← loadContext iid
   if notes.isEmpty then return none
   let rendered := notes.map fun n => s!"  [{n.id.val}] {n.title}\n{indentBlock n.text}"
   return some (String.intercalate "\n" rendered.toList)
+
+/-- How many bytes of note *bodies* a dispatch prompt carries. -/
+def contextPromptBudget : Nat := 8000
+
+/-- An issue's context notes rendered for a prompt, or `none` when it has none. Lets a role
+    template carry them the way `{{issue_comments}}` carries the thread — a worker dispatched
+    onto an issue should not have to know to ask for what the last worker on it left behind.
+
+    Bounded, unlike the thread. Notes are the one part of an issue designed to accumulate
+    without limit, and `Sandbox.capPromptArg` cuts an over-long prompt from the *end* — which is
+    where the task's own instructions are, not where the notes are. An issue with a long enough
+    history would therefore have silently traded its instructions for its notes.
+
+    Newest first while deciding what fits, because the last thing written about an issue is the
+    likeliest to still be true. Past the budget a note keeps its title and loses its body, so
+    the agent can still see that it exists and read it with `list_context`. -/
+def renderContextNotesForPrompt (iid : Taxis.IssueId)
+    (budget : Nat := contextPromptBudget) : IO (Option String) := do
+  let notes ← loadContext iid
+  if notes.isEmpty then return none
+  let mut spent := 0
+  let mut out : Array String := #[]
+  for n in notes.reverse do
+    let head := s!"  [{n.id.val}] {n.title}"
+    let cost := n.text.utf8ByteSize
+    if spent + cost ≤ budget then
+      spent := spent + cost
+      out := out.push s!"{head}\n{indentBlock n.text}"
+    else
+      out := out.push s!"{head}\n    (not shown here — read this one with list_context)"
+  return some (String.intercalate "\n" out.reverse.toList)
 
 /-! ## Write scoping
 
