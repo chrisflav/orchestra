@@ -220,6 +220,80 @@ def heldEventsComeBackThroughAReplacement : Test := do
     (msg := "a replacement still prunes what it dropped")
 
 @[test]
+def onlyGithubCommentsPagesByTime : Test := do
+  -- What a held event costs depends on this. `github-comments` asks for the comments updated
+  -- `since` the last check, so advancing that cursor past a held one loses it; every other
+  -- source re-derives its candidates from the world and offers it again for free.
+  let repos := [({ upstream := { owner := "org", name := "repo" },
+                   fork := { owner := "my-org", name := "fork" } } : RepoEntry)]
+  TestM.assert (pagesByTime (.githubComments repos [] "@bot" []))
+    "github-comments pages by time"
+  TestM.assert (!pagesByTime (.githubIssues repos [] "" []))
+    "github-issues re-derives"
+  TestM.assert (!pagesByTime (.githubPrReviews repos [] "" []))
+    "github-pr-reviews re-derives"
+  TestM.assert (!pagesByTime (.githubLabels repos [] "all" []))
+    "github-labels re-derives"
+  TestM.assert (!pagesByTime (.githubLabelCount repos [] 5 "issues"))
+    "github-label-count re-derives"
+  TestM.assert (!pagesByTime (.shell "echo" []))
+    "shell re-derives"
+
+@[test]
+def alreadyProcessedIdsAreNeverUnprocessed : Test := do
+  -- `held` is subtracted from what the tick adds, never from what was already there. No source
+  -- re-emits an id it has processed, so this is not reachable today; it is asserted so that a
+  -- source that starts doing so cannot quietly un-process history.
+  TestM.assertEqual
+    (nextProcessedIds #["org/repo:1"] #["org/repo:2"] #["org/repo:1"] none)
+    #["org/repo:1", "org/repo:2"]
+    (msg := "a held id that was already processed stays processed")
+
+@[test]
+def theWindowBoundaryIsExclusive : Test := do
+  -- Exactly one window old is out; a second inside it is in. Pinned because `nextAllowedAt` is
+  -- computed as "oldest counted stamp + window" and has to name the first instant at which a
+  -- dispatch is allowed, not the last at which it is refused.
+  let limits : List RateLimit := [{ max := 1, windowSeconds := 3600 }]
+  TestM.assertEqual (countWithin #[ago 3600] now 3600) 0 (msg := "exactly a window old is out")
+  TestM.assertEqual (countWithin #[ago 3599] now 3600) 1 (msg := "a second inside is in")
+  match rateLimitStatuses limits #[ago 3599] now with
+  | [s] =>
+    match s.nextAllowedAt with
+    | none      => TestM.fail "a full window should say when it frees up"
+    | some free =>
+      TestM.assertEqual (rateLimitHit? limits #[ago 3599] (free - 1)).isSome true
+        (msg := "still refused the second before")
+      TestM.assertEqual (rateLimitHit? limits #[ago 3599] free).isSome false
+        (msg := "allowed exactly at nextAllowedAt")
+  | _ => TestM.fail "expected one status"
+
+@[test]
+def aZeroCapIsSurvivableEvenThoughItIsRefusedOnWrite : Test := do
+  -- `validateListenerConfig` rejects `max: 0`, but that guards the API and the CLI, not a file
+  -- placed by hand. The status arithmetic indexes with `used - max`, so this pins that it stays
+  -- in bounds rather than reaching for an element that is not there.
+  let limits : List RateLimit := [{ max := 0, windowSeconds := 3600 }]
+  TestM.assertEqual (rateLimitHit? limits #[] now) (some { max := 0, windowSeconds := 3600 })
+    (msg := "a zero cap holds even an empty record")
+  match rateLimitStatuses limits #[ago 30] now with
+  | [s] =>
+    TestM.assertEqual s.used 1 (msg := "used is still counted")
+    TestM.assertEqual s.nextAllowedAt (none : Option Int)
+      (msg := "and it never frees up, rather than indexing out of bounds")
+  | _ => TestM.fail "expected one status"
+
+@[test]
+def describeRoundTripsEveryUnitItAccepts : Test := do
+  -- Every spelling `parseWindow?` takes has to come back out of `describe` as itself, or a
+  -- config round trip renames the window its author chose.
+  for unit in ["second", "minute", "hour", "day", "week"] do
+    match parseWindow? unit with
+    | none   => TestM.fail s!"parseWindow? rejected '{unit}'"
+    | some w => TestM.assertEqual (RateLimit.describe { max := 1, windowSeconds := w })
+                  s!"1 per {unit}" (msg := s!"describe round-trips '{unit}'")
+
+@[test]
 def listenerConfigParsesRateLimits : Test := do
   let raw := r#"
     {"source": {"type": "shell", "command": "echo", "args": []},

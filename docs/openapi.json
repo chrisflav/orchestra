@@ -1734,6 +1734,7 @@
             "items": {
               "type": "object",
               "required": ["max"],
+              "anyOf": [{ "required": ["per"] }, { "required": ["per_seconds"] }],
               "properties": {
                 "max": { "type": "integer", "minimum": 1, "description": "Dispatches allowed in one window. Zero is rejected: that is an off switch, and `PUT /api/v1/listeners/{name}/enabled` is a better one." },
                 "per": { "type": "string", "description": "The window, as a unit (`minute`, `hour`, `day`, `week`) or a count and a unit (`6h`, `90 minutes`). A spelling this does not understand is rejected rather than read as no limit at all." },

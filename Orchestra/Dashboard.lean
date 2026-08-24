@@ -828,7 +828,10 @@ private def rateLimitJson (s : Listener.RateLimitStatus) : Json :=
 private def rateLimitsJson (c : Listener.ListenerConfig) (st : Listener.ListenerState) :
     IO Json := do
   if c.rateLimits.isEmpty then return Json.arr #[]
-  let now := (Usage.parseIso8601 (← TaskStore.currentIso8601)).getD 0
+  -- `Usage.nowEpoch`, not `TaskStore.currentIso8601`: this runs once per paced listener and the
+  -- whole payload is rebuilt every two seconds per SSE client, so a `date` subprocess each time
+  -- adds up to process spawns per second on a handful of listeners and open dashboards.
+  let now ← Usage.nowEpoch
   let statuses := Listener.rateLimitStatuses c.rateLimits st.dispatches now
   return Json.arr (statuses.map rateLimitJson).toArray
 

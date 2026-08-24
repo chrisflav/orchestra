@@ -1023,20 +1023,24 @@ has to fit under all of them:
 }
 ```
 
-The window is either `per` — a unit (`"minute"`, `"hour"`, `"day"`, `"week"`) or a count and a
-unit (`"6h"`, `"90 minutes"`) — or `per_seconds` for the same thing in seconds. A spelling that
-cannot be read (`"hourly"`, a `max` with no window at all) is rejected rather than quietly
-becoming no ceiling; so is `"max": 0`, which is an off switch and has a better one in
-`orchestra listener disable`.
+The window is either `per` — a unit (`"second"`, `"minute"`, `"hour"`, `"day"`, `"week"`) or a
+count and a unit (`"6h"`, `"90 minutes"`) — or `per_seconds` for the same thing in seconds. A
+spelling that cannot be read (`"hourly"`, a `max` with no window at all) fails the config rather
+than quietly becoming no ceiling at all. `"max": 0` is refused on the way in too — through the
+API or `orchestra config set`, which is where configs written by a person arrive — because it is
+an off switch and `orchestra listener disable` is a better one, keeping the listener's configured
+pace for when it comes back.
 
 The windows are rolling, not calendar ones: "5 per hour" means five in the last sixty minutes,
 not five since the top of the hour.
 
-**Nothing is dropped.** An event that arrives over the ceiling is *held*: it is not marked
-processed, so the listener offers it again on a later tick, once the window has moved. A
-project- or label-dispatcher, whose events are recomputed from scratch every tick anyway, simply
-dispatches fewer roles this tick and the rest later. What a rate limit changes is the pace, not
-the work.
+**Nothing is dropped.** A listener that is already at a ceiling does not poll at all until the
+window moves — a poll is neither free nor side-effect-free, and for a source that consumes what
+it reads there would be nothing to come back to. When a tick starts with room and fills up
+part-way through, what is left over is *held*: not marked processed, so a later tick offers it
+again. `github-comments`, the one source that pages by time rather than re-deriving what it is
+looking at, keeps its `since` cursor where it was for that tick, so a held comment is still
+there to be found. What a rate limit changes is the pace, not the work.
 
 Where each ceiling stands is visible without reading the log:
 
@@ -1049,7 +1053,8 @@ Rate limits:
 ```
 
 Listeners with no `rate_limits` — which is every listener written before the field existed — are
-unpaced and cost nothing: no timestamps are kept for them and no check is made.
+unpaced and cost nothing: no clock is read, no timestamps are kept and no check is made. Removing
+the field from a listener that had one drops the timestamps it had kept, too.
 
 See `examples/listeners/` for further listener examples.
 

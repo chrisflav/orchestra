@@ -377,7 +377,7 @@ def parseWindow? (s : String) : Option Nat :=
 def RateLimit.describe (l : RateLimit) : String :=
   let w   := l.windowSeconds
   let per :=
-    if w == 60 then "minute" else if w == 3600 then "hour"
+    if w == 1 then "second" else if w == 60 then "minute" else if w == 3600 then "hour"
     else if w == 86400 then "day" else if w == 604800 then "week"
     else if w % 604800 == 0 then s!"{w / 604800} weeks"
     else if w % 86400 == 0  then s!"{w / 86400} days"
@@ -437,18 +437,39 @@ def pruneDispatches (limits : List RateLimit) (dispatches : Array String) (now :
       | some t => t > now - (longest : Int)
       | none   => false
 
+/-- Whether a source pages by time — using `lastChecked` as the cursor for what it has not
+    looked at yet — rather than re-deriving its candidates from the world each tick.
+
+    `github-comments` asks GitHub for the comments updated `since` the last check, so the slice
+    of time it has not read *is* its candidate set. Every other source asks for a state of the
+    world — open issues, labelled items, a project's issues, a command's output — and filters
+    what comes back against `processedIds`.
+
+    That difference is what a *held* event costs. A source that re-derives offers a held event
+    again on the next tick for nothing. A source that pages by time will not: advance its cursor
+    past an event it held and the event is not late, it is gone. So a tick that held anything
+    has to leave the cursor where it found it. -/
+def pagesByTime : SourceConfig → Bool
+  | .githubComments .. => true
+  | _                  => false
+
 /-- The processed-event set a tick leaves behind.
 
     `newIds` are the event ids the tick handled and `held` the ones a rate limit turned away.
     `replacement` is what a source that rewrites the whole set hands back — `github-labels`
     prunes the ids whose label was stripped, so that re-applying it fires the listener again —
     and it names every id that source saw this tick, the ones never reached included. That is
-    why `held` is subtracted here rather than merely left out of `newIds`: an event marked
-    processed is not paced, it is lost, and a ceiling is supposed to slow work down rather than
-    throw it away. -/
+    why a replacement has `held` taken back out of it, rather than the held ids merely being
+    left out of `newIds`: an event marked processed is not paced, it is lost, and a ceiling is
+    supposed to slow work down rather than throw it away.
+
+    Only ever the *new* ids are filtered. `previous` passes through untouched, so an id that was
+    already processed cannot be un-processed by sharing a name with something held this tick. -/
 def nextProcessedIds (previous newIds held : Array String)
     (replacement : Option (Array String)) : Array String :=
-  (replacement.getD (previous ++ newIds)).filter fun id => !held.contains id
+  match replacement with
+  | some r => r.filter       fun id => !held.contains id
+  | none   => previous ++ newIds.filter fun id => !held.contains id
 
 /-- Where one limit stands right now. Reported by the API and by `orchestra listener show`, so
     that "why has this listener gone quiet" has an answer that does not need the log. -/
