@@ -1062,6 +1062,74 @@ def renderCommentThread (iid : Taxis.IssueId) : IO (Option String) := do
   let rendered ← comments.mapM renderComment
   return some (String.intercalate "\n" rendered.toList)
 
+/-! ## Context notes
+
+A `context` artifact holds prose *beside* an issue rather than in it: what an earlier run worked
+out, the approach already tried and abandoned, what the build environment needs. Taxis folds it
+away in the issue's artifact rail, so it can accumulate over the life of an issue without any of
+it competing with the description for a human reader's attention.
+
+That is what makes it the right home for the findings an agent would otherwise append to the
+description or leave in a comment. The description says what the issue *is* and a reader has to
+read it; the comment thread is a conversation and a note dropped into it sinks. Context is
+neither: it is written for whoever picks the issue up next, which is usually another agent. -/
+
+/-- One `context` artifact: the artifact's own id, and the two fields of its payload. -/
+structure ContextNote where
+  /-- Taxis artifact id. Needed to revise the note in place — `Basic.reviseContext`. -/
+  id : Orchestra.Taxis.ArtifactId
+  title : String
+  text : String
+deriving Repr, Inhabited
+
+/-- The `context` artifacts among `artifacts`, in the order taxis returned them.
+
+    An artifact whose payload does not carry both strings is skipped rather than reported: taxis
+    validates the payload on the way in, so a malformed one means a kind that has moved on, and
+    dropping it is better than failing every read of the issue it hangs off. -/
+def contextNotesOf (artifacts : Array Orchestra.Taxis.ArtifactView) : Array ContextNote :=
+  artifacts.filterMap fun a =>
+    if a.kind != "context" then none
+    else match a.payload.getObjValAs? String "title", a.payload.getObjValAs? String "text" with
+      | .ok title, .ok text => some { id := a.id, title, text }
+      | _, _ => none
+
+/-- The context notes attached to an issue. -/
+def loadContext (iid : Taxis.IssueId) : IO (Array ContextNote) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let detail ← unwrap (← Orchestra.Taxis.getIssueDetail cfg iid)
+  return contextNotesOf detail.attachedArtifacts
+
+private def contextPayload (title text : String) : Json :=
+  Json.mkObj [("title", Json.str title), ("text", Json.str text)]
+
+/-- Attach a new context note to an issue. -/
+def attachContext (iid : Taxis.IssueId) (title text : String) : IO ContextNote := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let a ← unwrap (← Orchestra.Taxis.createArtifact cfg iid "context" (contextPayload title text))
+  return { id := a.id, title, text }
+
+/-- Rewrite a context note in place, keeping its id.
+
+    In place rather than delete-then-create: the note is meant to be revised as it accumulates,
+    and recreating it would renumber it, move it to the end of the rail, and record one edit as a
+    removal plus an unrelated addition in the issue's activity log. -/
+def reviseContext (id : Orchestra.Taxis.ArtifactId) (title text : String) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let _ ← unwrap (← Orchestra.Taxis.updateArtifact cfg id (contextPayload title text)
+    (kind := "context"))
+
+/-- An issue's context notes rendered for a prompt, or `none` when it has none. Lets a role
+    template carry them the way `{{issue_comments}}` carries the thread — a worker dispatched onto
+    an issue should not have to know to ask for what the last worker on it left behind. -/
+def renderContextNotes (iid : Taxis.IssueId) : IO (Option String) := do
+  let notes ← loadContext iid
+  if notes.isEmpty then return none
+  let rendered := notes.map fun n =>
+    let body := String.intercalate "\n" ((n.text.splitOn "\n").map ("    " ++ ·))
+    s!"  [{n.id.val}] {n.title}\n{body}"
+  return some (String.intercalate "\n" rendered.toList)
+
 /-! ## Write scoping
 
 An agent working an issue may only create and update issues within its own project subtree. The

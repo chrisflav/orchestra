@@ -1,6 +1,6 @@
 ---
 name: orchestra-taxis-issues
-description: Work with taxis issues from inside an orchestra task — claim one, split it, attach a PR, release it, or create and update issues in the tracker. Use whenever you need to find what to work on, record progress against an issue, or restructure a project's issue tree. Taxis issues are not GitHub issues; `gh` cannot see them.
+description: Work with taxis issues from inside an orchestra task — claim one, split it, attach a PR, release it, create and update issues, and keep the context notes that carry findings from one run to the next. Use whenever you need to find what to work on, record what you worked out, or restructure a project's issue tree. Taxis issues are not GitHub issues; `gh` cannot see them.
 ---
 
 # Taxis issues
@@ -162,6 +162,44 @@ These are comments on the **taxis** issue. Do not confuse them with `comment`, w
 GitHub issue or pull request the task was launched from — a different system, see the
 `orchestra-pull-requests` skill.
 
+## Context notes — where findings go
+
+Besides its description and its thread, an issue carries any number of **context notes**: a title
+and a block of markdown, held beside the issue rather than in it. Taxis keeps them folded behind
+their titles, so they accumulate over an issue's life without any of it competing for a reader's
+attention.
+
+```
+list_context(issue_id: 57)                      read them
+add_context(issue_id: 57, title: …, text: …)    attach one
+update_context(issue_id: 57, context_id: 9, title: …, text: …)   rewrite one in place
+```
+
+This is where implementation detail, findings and results belong. Three places, one right answer
+for each:
+
+| | What belongs there |
+| --- | --- |
+| `description` | What the work *is*. One statement, kept current — what every reader has to read, and what a dispatched worker is shown as its task. |
+| The comment thread | The conversation: review verdicts, questions, decisions and their reasons. |
+| A context note | What the next agent would otherwise rediscover: what you tried, what you measured, which approach failed and why, what the build environment needs. |
+
+**Do not append your results to the description.** Appending run notes to the one field a reader
+is meant to read displaces the task with a log of the work. And do not leave them in a comment:
+the thread is a conversation, and a note dropped into it sinks under everything said since.
+
+**Read them before you start.** `list_context` — or, if your prompt carries `{{issue_context}}`,
+you already have them and need not fetch anything. Whatever the last agent on this issue learned
+is there and nowhere else. Then, when your own work is done, record what you learned that the
+diff does not show.
+
+**Revise rather than pile up.** A note that has gone out of date is rewritten with
+`update_context`, not contradicted by a second one. Title and text replace what was there — a
+note is revised whole, so pass the full text you want it to end up with. `get_issue` shows the
+titles; `list_context` gives you the bodies.
+
+Notes are exactly as visible as the issue they hang off. Nothing secret goes in one.
+
 ## Reviewing
 
 ```
@@ -199,6 +237,10 @@ Tools are gated per task by permission group:
 
 `list_issue_comments` comes with any of the three, and `comment_issue` with `work_issues` or
 `review_issues` — the thread is shared ground between whoever reviews and whoever reworks.
+
+`list_context`, `add_context` and `update_context` come with any of the three, reads and writes
+alike. Every role that touches an issue learns something the next one would otherwise have to
+rediscover.
 
 Labels and assignees ride on `update_issue`, so they belong to `manage_issues`: a task that can
 route work is a task that was given the group for shaping the backlog.

@@ -93,7 +93,8 @@ structure Role where
   budget         : Option Float  := none
   /-- Prompt body — supports {{project_id}}, {{project_name}}, {{instructions}},
       and (when an issue is bound) {{issue_id}}, {{issue_title}}, {{issue_description}},
-      {{issue_comments}}, {{target_repo}}, {{target_branch}}, {{pr_number}}, {{pr_branch}},
+      {{issue_comments}}, {{issue_context}}, {{target_repo}}, {{target_branch}}, {{pr_number}},
+      {{pr_branch}},
       {{pr_repo}}.
       Unrecognised placeholders pass through.
 
@@ -297,8 +298,8 @@ def deleteGlobalRole (name : String) : IO Bool := do
 /-- Variables available to a role template. Issue-specific fields are `none`
     for triggers that don't bind to one issue (e.g. planners).
     Supports: {{project_id}}, {{project_name}}, {{instructions}},
-    {{issue_id}}, {{issue_title}}, {{target_repo}}, {{target_branch}},
-    {{pr_number}}, {{pr_branch}}, {{pr_repo}}. -/
+    {{issue_id}}, {{issue_title}}, {{issue_description}}, {{issue_comments}}, {{issue_context}},
+    {{target_repo}}, {{target_branch}}, {{pr_number}}, {{pr_branch}}, {{pr_repo}}. -/
 structure RenderVars where
   projectId    : String
   projectName  : String
@@ -312,6 +313,10 @@ structure RenderVars where
       next, which matters most for a rejection: there is no rejected status, so the
       request-changes review is the only record of what was wrong. -/
   issueComments : Option String := none
+  /-- The issue's context notes: what earlier runs on it worked out. Taxis folds these away, so
+      nothing puts them in front of an agent that does not ask — and an agent that does not know
+      they exist will rediscover what the last one already established. -/
+  issueContext : Option String := none
   targetRepo   : Option String := none
   targetBranch : Option String := none
   prNumber     : Option String := none
@@ -330,6 +335,7 @@ def render (tmpl : String) (v : RenderVars) : String :=
     , ("{{issue_title}}",   v.issueTitle.getD "")
     , ("{{issue_description}}", v.issueDescription.getD "")
     , ("{{issue_comments}}", v.issueComments.getD "")
+    , ("{{issue_context}}", v.issueContext.getD "")
     , ("{{target_repo}}",   v.targetRepo.getD "")
     , ("{{target_branch}}", v.targetBranch.getD "")
     , ("{{pr_number}}",     v.prNumber.getD "")
@@ -346,7 +352,7 @@ def render (tmpl : String) (v : RenderVars) : String :=
     `{{target_branch}}` would render empty in the very prompts that need them. -/
 def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : String)
     (targetOverride : Option RepoTarget := none) (comments : Option String := none)
-    : RenderVars :=
+    (context : Option String := none) : RenderVars :=
   match issue? with
   | none => { projectId := project.id.toString, projectName := project.name, instructions }
   | some i =>
@@ -359,6 +365,7 @@ def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : St
     , issueTitle   := some i.title
     , issueDescription := some i.description
     , issueComments := comments
+    , issueContext := context
     , targetRepo   := target.map (·.repo.toString)
     , targetBranch := target.map (·.branch)
     , prNumber     := pr?.map (fun p => toString p.number)

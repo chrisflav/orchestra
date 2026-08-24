@@ -164,9 +164,12 @@ def release (mgr : ClaimManager) (pid : Taxis.IssueId) (iid : Taxis.IssueId)
 
 /-- Retag an existing claim with a new task ID. Called when a pre-claimed issue
     is picked up by a freshly-generated session: the claim was written with the
-    queue-entry ID, but the running task has a different generated ID. Artifacts are immutable
-    (there's no `PATCH /artifacts/:id`), so "update" is delete-then-recreate — the artifact gets a
-    new id, which is fine since callers only ever look it up by `kind`, never by stored id. -/
+    queue-entry ID, but the running task has a different generated ID. Delete-then-recreate
+    rather than `updateArtifact`, which since taxis's client wrapper landed could patch the
+    payload in place: a retag is a different claim by a different task, and there is nothing
+    about the old one worth preserving. The artifact gets a new id, which costs nothing here —
+    callers only ever look a claim up by `kind`, never by stored id. Contrast `context` notes,
+    which are revised in place precisely because their id is how one is named again. -/
 def updateClaimTaskId (mgr : ClaimManager) (iid : Taxis.IssueId)
     (newTaskId : String) : IO Unit := do
   mgr.mutex.lock
