@@ -909,7 +909,16 @@ private def percentOfFraction (s : String) : Option Nat :=
 
 /-- Build one `Limit` from a `unified-<window>-*` header triple, or `none` when the window is
     absent. `winKey` is `5h` / `7d`; the headers carry no per-model-family (scoped) windows, so
-    `scopeModel` is always `none` and an exhausted single-model weekly limit is invisible here. -/
+    `scopeModel` is always `none` and an exhausted single-model weekly limit is invisible here.
+
+    The `-status` header is not a binary allowed/rejected: the server also reports a warning state
+    once a window is merely *near* its cap — the same region this function already calls
+    `severity := "warning"`. Only a rejection may set `isActive`, because that is the field
+    `limitIsBinding` reads to idle a source, and reading a warning as a rejection idles an account
+    that still has a fifth of its week left, for the rest of the week. An unrecognised status is
+    therefore usable rather than exhausted: a run that really is refused is caught by `markLimited`
+    the moment it happens, so failing open here costs one rejected request, while failing closed
+    costs days of an idle account. -/
 private def limitFromHeaders (headers : Array (String × String)) (winKey : String)
     (kind : LimitKind) (group : String) : Option Limit := do
   let util ← Utils.Http.header? headers s!"anthropic-ratelimit-unified-{winKey}-utilization"
@@ -923,7 +932,7 @@ private def limitFromHeaders (headers : Array (String × String)) (winKey : Stri
     severity := if percent ≥ 100 then "critical" else if percent ≥ 75 then "warning" else "normal"
     resetsAt
     scopeModel := none
-    isActive := status != "allowed" || percent ≥ 100
+    isActive := status == "rejected" || percent ≥ 100
   }
 
 /-- Turn the `anthropic-ratelimit-unified-*` headers into the same `Limit` values the endpoint body
