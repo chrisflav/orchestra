@@ -173,13 +173,37 @@ def limitFamilies : List (String × String) :=
     and a transcript mentions model names routinely. -/
 def familySpanChars : Nat := 40
 
+/-- How much of the classified text is worth reading at all.
+
+    A limit message is the last thing said, so the tail is where it is. Clamping here is what
+    keeps the rest of this file cheap: the caller may hand it a whole failing run's stderr, which
+    is measured in megabytes, and every helper below would otherwise walk all of it. -/
+def classifyTailChars : Nat := 4096
+
 private def clampAfter (s : String) : String :=
   String.ofList (s.toList.take familySpanChars)
 
 private def clampBefore (s : String) : String :=
   String.ofList (s.toList.reverse.take familySpanChars).reverse
 
-/-- The family named between "your" and "limit", if the message names one.
+/-- The text a marker phrase opens, paired with where in `s` it starts — every occurrence, not
+    just the first, and latest first.
+
+    Position matters because the provider's message is the *last* thing in the text. A limit
+    notice the run recovered from earlier ("You've reached your Opus limit, now using Sonnet")
+    must not outrank the one that actually ended it. -/
+private def markerSpans (s marker : String) : List (Nat × String) :=
+  match s.splitOn marker with
+  | []      => []
+  | p :: ps =>
+    (ps.foldl (init := (p.length + marker.length, ([] : List (Nat × String))))
+      fun (off, acc) seg => (off + seg.length + marker.length, (off, seg) :: acc)).2
+
+private def familyIn (span : String) : Option String :=
+  (limitFamilies.find? fun (needle, _) => containsCI span needle).map (·.2)
+
+/-- The family named between "your" and "limit", if the message names one. `lowered` must already
+    be lowercased and clamped — see `classifyUsageLimit`, the only caller.
 
     Bounded on both sides deliberately, because a bare search for "fable" anywhere in the output
     would fire on an agent that merely mentioned the model. The span must be short *and* must
@@ -187,34 +211,37 @@ private def clampBefore (s : String) : String :=
     ("reached the maximum number of retries") that the marker alone is not evidence, and taking
     everything after it when no "limit" follows would hand the family search the whole run.
 
-    Every occurrence of every marker is considered, not just the first. The provider's message is
-    appended after the run's stderr, so it is the *last* thing in the text; examining only the
-    first match would let an early false positive in the transcript outvote the real one. -/
-def familyNamedIn (output : String) : Option String :=
-  let s := output.toLower
+    The *last* span that reaches a "limit" decides, and it decides alone. Reading earlier spans
+    when it names no family would be the same bug in slower motion: a run that hit its Opus limit,
+    said so, switched to Sonnet and later died on the account-wide window would be recorded as an
+    Opus-only block, and every other family would keep dispatching into a spent account. A later
+    limit message is a later fact about the same account, and it supersedes. -/
+def familyNamedIn (lowered : String) : Option String :=
   let spans := ["reached your ", "exceeded your ", "exceed your ", "reached the "].flatMap
-    fun marker =>
-      ((s.splitOn marker).drop 1).filterMap fun rest =>
-        match (clampAfter rest).splitOn "limit" with
-        | span :: _ :: _ => some span
-        | _              => none
-  spans.findSome? fun span =>
-    (limitFamilies.find? fun (needle, _) => containsCI span needle).map (·.2)
+    (markerSpans lowered)
+  let ranked := spans.toArray.qsort (fun a b => a.1 > b.1)
+  let lastSpan := ranked.toList.findSome? fun (_, rest) =>
+    match (clampAfter rest).splitOn "limit" with
+    | span :: _ :: _ => some span
+    | _              => none
+  lastSpan.bind familyIn
 
 /-- The family named just before `marker`, for phrasings that put it there: "Fable requires usage
-    credits". Bounded the same way and for the same reason. -/
-def familyBefore (output marker : String) : Option String :=
-  match output.toLower.splitOn marker with
-  | before :: _ :: _ =>
-    (limitFamilies.find? fun (needle, _) => containsCI (clampBefore before) needle).map (·.2)
-  | _ => none
+    credits". `lowered` must already be lowercased and clamped. Bounded the same way and for the
+    same reason; the last occurrence wins, again because the message that ended the run is last. -/
+def familyBefore (lowered marker : String) : Option String :=
+  match (lowered.splitOn marker).dropLast.reverse with
+  | []            => none
+  | before :: _   => familyIn (clampBefore before)
 
 /-- Classify a usage-limit message. Only meaningful once `isUsageLimitError` has said there is
     something to classify; on anything else it answers `unknown`, which is the caller's cue to
     keep whatever it already believed. -/
 def classifyUsageLimit (output : String) : LimitScope :=
-  let s := output.toLower
-  let named := familyNamedIn output
+  -- Lowercased and clamped once, here, rather than in each helper. Every read below is a scan of
+  -- this string, and the caller's input can be a whole run's stderr.
+  let s := (String.ofList (output.toList.reverse.take classifyTailChars).reverse).toLower
+  let named := familyNamedIn s
   -- "requires usage credits", not a bare "usage credits": the ordinary subscription-limit
   -- message ends "Run /usage-credits to continue or switch models", and that is a window with a
   -- reset, not a balance problem. Only the hyphen separates the two today; the phrase does not.
@@ -225,7 +252,7 @@ def classifyUsageLimit (output : String) : LimitScope :=
     -- that position too — but bounded, like every other read here. Being inside a message about
     -- credits is not licence to search a whole transcript for a model name, and a wrongly scoped
     -- credits block leaves the rest of the account dispatching into a hard billing failure.
-    .credits (named.orElse fun _ => familyBefore output "requires usage credits")
+    .credits (named.orElse fun _ => familyBefore s "requires usage credits")
   else match named with
   | some f => .family f
   | none   =>

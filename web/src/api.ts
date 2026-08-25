@@ -261,6 +261,26 @@ export interface UsageLimit {
   resetsAt: string | null;
 }
 
+/**
+ * A limit a run walked into, rather than one a poll reported.
+ *
+ * Kept apart from `UsageLimit` because the two are known in different ways. A poll reads the
+ * account's session and weekly windows and can see nothing else — not a limit scoped to one
+ * model family, not a billing failure — so those are only ever learned by a run hitting them,
+ * and they appear here and nowhere else.
+ */
+export interface UsageBlock {
+  /** The family this covers, as the provider named it. `null` closes the whole account. */
+  model: string | null;
+  reason: string;
+  /** When it lifts, if anything reported or guessed a time. */
+  until: string | null;
+  /** Whether it also holds back tasks that name no model, because the run that hit it named none. */
+  coversUnscoped: boolean;
+  /** Credits or entitlement rather than a window: no reset is coming, only a person can clear it. */
+  notAWindow: boolean;
+}
+
 export interface AuthSource {
   label: string;
   backend: string;
@@ -279,6 +299,12 @@ export interface AuthSource {
   lastError: string | null;
   backoffUntil: string | null;
   limits: UsageLimit[];
+  /**
+   * Limits observed by a run and still in force. A source whose only block is scoped to one
+   * model family still reports `state: "available"` — correctly, because the other families run
+   * — so this is the only place that block is visible.
+   */
+  blocks: UsageBlock[];
 }
 
 export interface AuthBackend {

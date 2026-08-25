@@ -474,8 +474,17 @@ goal; running without the goal condition."
   let usageLimitHit := agentDef.isUsageLimitError effectiveExit combinedOutput
   -- Read the same text a second time for *which* limit it was, so the usage store records the
   -- scope the provider named rather than the model the task happened to ask for.
+  --
+  -- The result event first, and stderr only when it says nothing. The result event *is* the
+  -- provider's message; stderr is the run's own noise that sometimes carries one too, and a
+  -- limit the run recovered from earlier ("reached your Opus limit, now using Sonnet") must not
+  -- outrank the one that actually ended it. Detection above reads both at once because either
+  -- may hold the evidence; attribution has to prefer the authoritative one.
   let limitScope :=
-    if usageLimitHit then AgentDef.classifyUsageLimit combinedOutput else .unknown
+    if !usageLimitHit then .unknown
+    else match AgentDef.classifyUsageLimit (resultText.getD "") with
+      | .unknown => AgentDef.classifyUsageLimit stderrContent
+      | scope    => scope
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
   return { exitCode, sessionId, usageLimitHit, limitScope, wasCancelled, resultSubtype, resultText,

@@ -501,6 +501,21 @@ def sourceState_liftsALegacySingleBlock : Test := do
     TestM.assertEqual (st.blocks[0]!.model) (some "Fable") (msg := "with its scope intact")
 
 @[test]
+def sourceState_oneBadBlockDoesNotDropTheRest : Test := do
+  -- Decoding the array as a whole would fail on the bad element, fall through to a `"block"`
+  -- key that is not there, and forget every block the source had — leaving it looking runnable,
+  -- which is the failure the migration exists to prevent, reached by another route.
+  let mixed := "{\"backend\":\"claude\",\"label\":\"main\",\"limits\":[],\"blocks\":[\
+    {\"until_epoch\":1785351600,\"model\":\"Fable\",\"reason\":\"observed\"},\
+    \"not an object\",\
+    {\"until_epoch\":1785351600,\"reason\":\"session\"}]}"
+  match Json.parse mixed >>= fun j => (Lean.FromJson.fromJson? j : Except String SourceState) with
+  | .error e => TestM.fail s!"a partly unreadable block list should still parse: {e}"
+  | .ok st   =>
+    TestM.assertEqual st.blocks.size 2 (msg := "the readable blocks survive the unreadable one")
+    TestM.assertEqual (st.blocks[0]!.model) (some "Fable") (msg := "and keep their scopes")
+
+@[test]
 def sourceState_absentBlocksStayAbsent : Test := do
   -- The reason `Block`'s decoder rejects non-objects: `getObjValAs?` reads a missing key as
   -- `Json.null`, and a block with no expiry reads as "blocked forever".
@@ -899,6 +914,25 @@ def classifyUsageLimit_doesNotReadAFamilyOutOfAWholeTranscript : Test := do
   TestM.assertEqual (AgentDef.classifyUsageLimit both)
     (AgentDef.LimitScope.family "Fable")
     (msg := "the real message wins over an earlier marker that named nothing")
+
+@[test]
+def classifyUsageLimit_theMessageThatEndedTheRunWins : Test := do
+  -- stderr carries a limit the run recovered from and kept going; the result event carries the
+  -- one that actually stopped it. Reading the first match rather than the last would scope an
+  -- account-wide block to Opus and leave every other family dispatching into a spent account.
+  let text :=
+    "You've reached your Opus limit, now using Sonnet\n" ++
+    "You've reached your usage limit."
+  TestM.assertEqual (AgentDef.classifyUsageLimit text)
+    AgentDef.LimitScope.account
+    (msg := "the later message decides, not the earlier one")
+  -- And the other way round, so this is about position and not about preferring `account`.
+  let reversed :=
+    "You've reached your usage limit.\n" ++
+    "You've reached your Opus limit."
+  TestM.assertEqual (AgentDef.classifyUsageLimit reversed)
+    (AgentDef.LimitScope.family "Opus")
+    (msg := "position decides, in either direction")
 
 @[test]
 def classifyUsageLimit_creditsDoesNotScopeItselfFromStrayProse : Test := do

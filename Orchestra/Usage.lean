@@ -342,6 +342,17 @@ structure Block where
       same wall. Without this the scoped block is invisible to exactly the tasks guaranteed to
       reproduce it. -/
   coversUnscoped : Bool := false
+  /-- Whether this block describes something other than a window on a clock — credits, or an
+      entitlement the client refuses to confirm.
+
+      Two things follow from it, and both are about what counts as evidence. Such a block must
+      not borrow a reset time from a polled window, because it is not that window and will still
+      be there when it lifts; and a quiet poll must not retire it, because the probe is a
+      one-token inference call reporting the 5h and 7d utilisation windows and cannot observe a
+      billing failure at all. Left to the ordinary rules the block would be recorded with a
+      window's reset, deleted by the next poll five minutes later, and the source would go back
+      into rotation to spend a clone and a run per queued task on the same wall. -/
+  notAWindow : Bool := false
 deriving Repr, Inhabited
 
 instance : ToJson Block where
@@ -350,6 +361,7 @@ instance : ToJson Block where
     let fields := if let some u := b.untilEpoch then fields ++ [("until_epoch", Json.num u)] else fields
     let fields := if let some m := b.model      then fields ++ [("model",       Json.str m)] else fields
     let fields := if b.coversUnscoped then fields ++ [("covers_unscoped", Json.bool true)] else fields
+    let fields := if b.notAWindow     then fields ++ [("not_a_window",    Json.bool true)] else fields
     Json.mkObj fields
 
 instance : FromJson Block where
@@ -362,7 +374,8 @@ instance : FromJson Block where
     let model := (j.getObjValAs? String "model").toOption
     let reason := (j.getObjValAs? String "reason").toOption.getD ""
     let coversUnscoped := (j.getObjValAs? Bool "covers_unscoped").toOption.getD false
-    return { untilEpoch, model, reason, coversUnscoped }
+    let notAWindow := (j.getObjValAs? Bool "not_a_window").toOption.getD false
+    return { untilEpoch, model, reason, coversUnscoped, notAWindow }
 
 /-- Everything known about one `(backend, label)` authentication source. -/
 structure SourceState where
@@ -417,9 +430,14 @@ instance : FromJson SourceState where
     -- record that a limit was ever observed, and an upgrade that forgot one would send the next
     -- task straight into it. Reading both is the whole migration — the files are a regenerable
     -- cache, so nothing has to be rewritten ahead of time.
-    let blocks := match (j.getObjValAs? (Array Block) "blocks").toOption with
-      | some bs => bs
-      | none    => match (j.getObjValAs? Block "block").toOption with
+    -- Element by element, and the legacy key only when `"blocks"` is genuinely absent. Decoding
+    -- the array as a whole would drop *every* block on one unreadable element and then fall
+    -- through to a `"block"` that is not there, leaving the source looking runnable — the very
+    -- forgetting this migration exists to prevent, arrived at by a different route.
+    let blocks := match j.getObjVal? "blocks" with
+      | .ok (.arr items) => items.filterMap fun it =>
+          (FromJson.fromJson? it : Except String Block).toOption
+      | _ => match (j.getObjValAs? Block "block").toOption with
         | some b => #[b]
         | none   => #[]
     let lastUsedTick := (j.getObjValAs? Int "last_used_tick").toOption
@@ -862,12 +880,12 @@ def markUsed (backend label : String) : IO Unit := do
     failing that falls back to `fallbackBackoff`.
 
     `coversUnscoped` marks a scoped block as also covering tasks that name no model, which is
-    what an observed hit on an unnamed model is evidence of. `fallbackBackoff` is how long to
-    hold the source when nothing reports a reset; a limit that is not a window wants
-    `creditsBackoffSecs` rather than the hourly default. -/
+    what an observed hit on an unnamed model is evidence of. `notAWindow` says the limit is not
+    a window at all: it then takes `creditsBackoffSecs` outright rather than borrowing a reset
+    from some polled window it has nothing to do with. -/
 def markLimited (backend label : String) (model : Option String) (reason : String)
     (resetHint : Option String := none) (coversUnscoped : Bool := false)
-    (fallbackBackoff : Int := defaultBackoffSecs) : IO Unit := do
+    (notAWindow : Bool := false) : IO Unit := do
   let now ← nowEpoch
   let st ← loadState backend label
   let fromPoll : Option Int :=
@@ -878,15 +896,19 @@ def markLimited (backend label : String) (model : Option String) (reason : Strin
         | some r, none      => some r
         | none, a           => a
       else acc
+  -- Borrowing a polled window's reset is right for a limit that *is* a window and wrong for one
+  -- that is not: a credits failure recorded while the session window has eight minutes left
+  -- would inherit those eight minutes and be retried, unchanged, eight minutes later.
   let untilEpoch :=
-    (resetHint.bind parseIso8601).orElse fun _ =>
-      fromPoll.orElse fun _ => some (now + fallbackBackoff)
+    if notAWindow then some (now + creditsBackoffSecs)
+    else (resetHint.bind parseIso8601).orElse fun _ =>
+      fromPoll.orElse fun _ => some (now + defaultBackoffSecs)
   -- Upsert by scope, dropping what has expired on the way past. Two blocks with the same scope
   -- are two readings of one window, so the newer replaces the older; two with *different* scopes
   -- are different windows and both stay. Pruning here is what keeps the array bounded by the
   -- number of scopes rather than by the number of limits ever hit.
   let kept := st.blocks.filter fun b => !sameScope b.model model && blockIsLive b now
-  saveState { st with blocks := kept.push { untilEpoch, model, reason, coversUnscoped } }
+  saveState { st with blocks := kept.push { untilEpoch, model, reason, coversUnscoped, notAWindow } }
 
 /-- Retire the blocks a completed run disproves.
 
@@ -1096,12 +1118,15 @@ def refresh (cfg : AppConfig) (backend label : String) : IO (Except String Bool)
       let now ← nowEpoch
       let st ← loadState backend label
       -- A poll that shows nothing binding retires the blocks it is *evidence about*, and it is
-      -- evidence only about the windows it can see. The headers carry the session and weekly-all
-      -- windows and nothing model-scoped, so a quiet poll says nothing whatsoever about an
-      -- exhausted Fable week — clearing a scoped block here would forget a limit this poll
-      -- cannot observe, which is exactly how an account comes to look runnable and is not.
+      -- evidence only about the windows it can see. The probe is a one-token inference call and
+      -- the headers carry the session and weekly-all windows: nothing model-scoped, and nothing
+      -- about billing. So a quiet poll says nothing whatsoever about an exhausted Fable week or
+      -- an empty balance, and retiring either here would forget a limit this poll cannot
+      -- observe — which is exactly how an account comes to look runnable and is not.
       let stillBlocked := limits.any (limitIsBinding · now)
-      let blocks := st.blocks.filter fun b => blockIsLive b now && (stillBlocked || b.model.isSome)
+      let pollIsEvidenceAbout (b : Block) : Bool := b.model.isNone && !b.notAWindow
+      let blocks := st.blocks.filter fun b =>
+        blockIsLive b now && (stillBlocked || !pollIsEvidenceAbout b)
       saveState { st with
         limits, fetchedEpoch := some now, lastError := none, pollAfter := none
         blocks }

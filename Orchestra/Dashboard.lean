@@ -537,7 +537,8 @@ private def blockJson (b : Usage.Block) : Json :=
     ("model",          optStr b.model),
     ("reason",         Json.str b.reason),
     ("until",          optEpochIso b.untilEpoch),
-    ("coversUnscoped", Json.bool b.coversUnscoped)
+    ("coversUnscoped", Json.bool b.coversUnscoped),
+    ("notAWindow",     Json.bool b.notAWindow)
   ]
 
 /-- One configured authentication source, joined with whatever the usage store knows about it.
