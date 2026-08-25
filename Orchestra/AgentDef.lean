@@ -133,6 +133,78 @@ def stdUsageLimitError (exitCode : UInt32) (output : String) : Bool :=
     containsCI s "insufficient credits" ||
     containsCI s "credit balance")
 
+/-! ## What the limit was about
+
+`stdUsageLimitError` answers whether a run hit a limit. That is not enough to record one, because
+the answer decides how much of an account to close: a limit the provider attributed to one model
+family leaves the rest of the account perfectly runnable, an account-wide window closes all of it,
+and an entitlement problem is not a window at all — it does not reset on a clock, so waiting for it
+is waiting forever.
+
+The message says which. It was already being read and thrown away. -/
+
+/-- Which limit a usage-limit message describes. -/
+inductive LimitScope where
+  /-- The provider named a model family: "You've reached your Fable 5 limit." -/
+  | family (name : String)
+  /-- A window that names no model — a session or weekly total, or a transport-level 429. -/
+  | account
+  /-- Credits or entitlement rather than a window, carrying the family when one was named. -/
+  | credits (family : Option String)
+  /-- A limit phrase matched but nothing in it says which limit. The caller falls back to
+      whatever it already assumed, so classifying is never worse than not classifying. -/
+  | unknown
+deriving Repr, BEq, Inhabited
+
+/-- The families a limit message can name, as the lowercase needle to look for and the display
+    name to record.
+
+    Display names rather than model ids, because that is what the usage store scopes by and what
+    the provider writes: the message says "Fable", the task asked for `claude-fable-5`, and
+    `Usage.modelMatchesScope` is what reconciles the two. -/
+def limitFamilies : List (String × String) :=
+  [("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
+
+/-- The family named between "your" and "limit", if the message names one.
+
+    Scoped to that span deliberately. A bare search for "fable" anywhere in the output would fire
+    on an agent that merely mentioned the model, and a coding agent mentions models routinely.
+    "reached your Fable 5 limit" is a phrase a provider writes and ordinary output does not — the
+    same reasoning that makes `stdUsageLimitError` match phrases rather than the word "limit". -/
+def familyNamedIn (output : String) : Option String :=
+  let s := output.toLower
+  let spans := ["reached your ", "exceeded your ", "exceed your ", "reached the "].filterMap
+    fun marker =>
+      match (s.splitOn marker).drop 1 with
+      | []        => none
+      | rest :: _ => some ((rest.splitOn "limit").headD rest)
+  spans.findSome? fun span =>
+    (limitFamilies.find? fun (needle, _) => containsCI span needle).map (·.2)
+
+/-- Classify a usage-limit message. Only meaningful once `isUsageLimitError` has said there is
+    something to classify; on anything else it answers `unknown`, which is the caller's cue to
+    keep whatever it already believed. -/
+def classifyUsageLimit (output : String) : LimitScope :=
+  let s := output.toLower
+  let named := familyNamedIn output
+  -- "requires usage credits", not a bare "usage credits": the ordinary subscription-limit
+  -- message ends "Run /usage-credits to continue or switch models", and that is a window with a
+  -- reset, not a balance problem. Only the hyphen separates the two today; the phrase does not.
+  if containsCI s "insufficient credits" || containsCI s "credit balance"
+     || containsCI s "requires usage credits" then
+    -- Credits messages are short, specific, and do not always route the family through a "your
+    -- … limit" span — the Fable entitlement refusal reads "requires usage credits". Inside a
+    -- message already known to be about credits, a bare family search is safe.
+    let bare := (limitFamilies.find? fun (needle, _) => containsCI s needle).map (·.2)
+    .credits (named.orElse fun _ => bare)
+  else match named with
+  | some f => .family f
+  | none   =>
+    -- A transport-level 429 carries no model scope: it is the account being told to slow down.
+    if containsCI s "rate_limit_error" || containsCI s "rate limit exceeded"
+       || containsCI s "usage limit" || containsCI s "weekly limit" then .account
+    else .unknown
+
 end AgentDef
 
 end Orchestra

@@ -18,6 +18,9 @@ structure LaunchResult where
   sessionId      : Option String
   /-- True if the agent exited because it hit a usage or quota limit. -/
   usageLimitHit  : Bool
+  /-- Which limit the run said it hit. Only meaningful when `usageLimitHit`; `unknown` there
+      means the message named a limit but not which one, and the caller keeps its own guess. -/
+  limitScope     : AgentDef.LimitScope := .unknown
   /-- True if the agent was killed because the cancel token was signalled. -/
   wasCancelled   : Bool := false
   /-- The subtype from the agent's result event, if one was emitted. -/
@@ -469,9 +472,13 @@ goal; running without the goal condition."
       | some (.error _) => 1
       | _               => 0
   let usageLimitHit := agentDef.isUsageLimitError effectiveExit combinedOutput
+  -- Read the same text a second time for *which* limit it was, so the usage store records the
+  -- scope the provider named rather than the model the task happened to ask for.
+  let limitScope :=
+    if usageLimitHit then AgentDef.classifyUsageLimit combinedOutput else .unknown
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
-  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype, resultText,
+  return { exitCode, sessionId, usageLimitHit, limitScope, wasCancelled, resultSubtype, resultText,
            rateLimitReset }
 
 /-! ## Streaming mode

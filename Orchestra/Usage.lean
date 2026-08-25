@@ -30,7 +30,13 @@ Two things write to the state this module keeps, and they cover each other:
   reset time; and
 * an **observed hit** — a run that came back rate-limited — recorded by `markLimited`. This is
   the authoritative signal (it happened) but carries no reset time of its own, so it borrows one
-  from the last poll and otherwise falls back to a conservative default.
+  from the last poll and otherwise falls back to a conservative default. Its *scope* comes from
+  the message the provider wrote, classified by `AgentDef.classifyUsageLimit`, rather than from
+  the model the task happened to ask for — those differ, and in both directions.
+
+A source therefore accumulates a *set* of blocks, one per scope, not a single one. They are
+independent facts with independent expiries, and a completed run retires only the blocks covering
+the model it ran: proof that Sonnet works on an account says nothing about whether Fable does.
 
 State lives on disk, one file per `(backend, label)`, because the processes that need to agree
 about it are genuinely separate: `orchestra run` in a terminal and the queue daemon are different
@@ -352,7 +358,14 @@ structure SourceState where
   label         : String
   fetchedEpoch  : Option Int := none
   limits        : Array Limit := #[]
-  block         : Option Block := none
+  /-- Every block currently recorded against this source, at most one per scope.
+
+      A set rather than a single slot, because an account runs several limits at once and they
+      are independent facts about it: "Fable is spent until Friday" and "the session window is
+      spent until 14:00" are both true, both matter, and neither is evidence about the other.
+      Held as one slot, the second recorded silently erased the first — and when the survivor
+      expired, the erased one came back as an account that looked runnable and was not. -/
+  blocks        : Array Block := #[]
   /-- When this source was last handed to a task, in epoch **nanoseconds**. An ordering key
       only — never compared against a reset time, which is why the finer unit costs nothing. -/
   lastUsedTick : Option Int := none
@@ -375,7 +388,7 @@ instance : ToJson SourceState where
       ("limits",  ToJson.toJson s.limits)
     ]
     let fields := if let some e := s.fetchedEpoch  then fields ++ [("fetched_epoch",   Json.num e)] else fields
-    let fields := if let some b := s.block         then fields ++ [("block",           ToJson.toJson b)] else fields
+    let fields := if !s.blocks.isEmpty             then fields ++ [("blocks",          ToJson.toJson s.blocks)] else fields
     let fields := if let some e := s.lastUsedTick then fields ++ [("last_used_tick", Json.num e)] else fields
     let fields := if let some e := s.lastError     then fields ++ [("last_error",      Json.str e)] else fields
     let fields := if let some e := s.pollAfter     then fields ++ [("poll_after",       Json.num e)] else fields
@@ -387,11 +400,20 @@ instance : FromJson SourceState where
     let label   ← j.getObjValAs? String "label"
     let limits := (j.getObjValAs? (Array Limit) "limits").toOption.getD #[]
     let fetchedEpoch := (j.getObjValAs? Int "fetched_epoch").toOption
-    let block := (j.getObjValAs? Block "block").toOption
+    -- `"blocks"` is the current shape. A single `"block"` object is what state files written
+    -- before this existed carry, and it is lifted rather than dropped: these files are the only
+    -- record that a limit was ever observed, and an upgrade that forgot one would send the next
+    -- task straight into it. Reading both is the whole migration — the files are a regenerable
+    -- cache, so nothing has to be rewritten ahead of time.
+    let blocks := match (j.getObjValAs? (Array Block) "blocks").toOption with
+      | some bs => bs
+      | none    => match (j.getObjValAs? Block "block").toOption with
+        | some b => #[b]
+        | none   => #[]
     let lastUsedTick := (j.getObjValAs? Int "last_used_tick").toOption
     let lastError := (j.getObjValAs? String "last_error").toOption
     let pollAfter := (j.getObjValAs? Int "poll_after").toOption
-    return { backend, label, limits, fetchedEpoch, block, lastUsedTick, lastError, pollAfter }
+    return { backend, label, limits, fetchedEpoch, blocks, lastUsedTick, lastError, pollAfter }
 
 def usageDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "usage"
@@ -648,6 +670,30 @@ def modelMatchesScope (scope : String) (model : Option String) : Bool :=
     let s := scope.toLower
     !s.isEmpty && (m.splitOn s).length > 1
 
+/-- Whether a block covers a task running `model`. An unscoped block covers everything. -/
+def blockApplies (b : Block) (model : Option String) : Bool :=
+  match b.model with
+  | none   => true
+  | some m => modelMatchesScope m model
+
+/-- Whether a block has not yet lifted. One with no expiry never lifts on its own; only proof —
+    a completed run, through `markOk` — retires it. -/
+def blockIsLive (b : Block) (now : Int) : Bool :=
+  match b.untilEpoch with
+  | some u => u > now
+  | none   => true
+
+/-- Whether two block scopes name the same window.
+
+    `none` is the account-wide scope and matches only itself. Two model scopes match when either
+    name contains the other, so the display name a provider writes ("Fable") and the id a task
+    asked for ("claude-fable-5") are recognised as one window rather than accumulating as two
+    blocks that expire independently. -/
+def sameScope : Option String → Option String → Bool
+  | none,   none   => true
+  | some a, some b => modelMatchesScope a (some b) || modelMatchesScope b (some a)
+  | _,      _      => false
+
 /-- A limit that is currently binding: at or over the line, and not yet reset. -/
 private def limitIsBinding (l : Limit) (now : Int) : Bool :=
   if !(l.isActive || l.percent ≥ 100) then false
@@ -667,13 +713,23 @@ def Availability.isAvailable : Availability → Bool
 
 /-- Whether `st` can run a task using `model` right now. -/
 def availabilityOf (st : SourceState) (model : Option String) (now : Int) : Availability := Id.run do
-  if let some b := st.block then
-    let live := match b.untilEpoch with | some u => u > now | none => true
-    let applies := match b.model with
-      | none   => true
-      | some m => modelMatchesScope m model
-    if live && applies then
-      return .blocked b.untilEpoch (if b.reason.isEmpty then "usage limit" else b.reason)
+  -- Of the blocks covering this model, the binding one is whichever lifts *last*. More than one
+  -- can apply now that they are a set — an account-wide window and a longer scoped limit, say —
+  -- and answering with the first in the array would name a reset the source is not free at, so
+  -- the caller waits for it, dispatches, and is turned away again. A block with no expiry
+  -- outlasts every block that has one.
+  let mut binding : Option Block := none
+  for b in st.blocks do
+    if blockIsLive b now && blockApplies b model then
+      binding := match binding with
+        | none      => some b
+        | some best =>
+          match best.untilEpoch, b.untilEpoch with
+          | none,   _      => some best
+          | _,      none   => some b
+          | some x, some y => if y > x then some b else some best
+  if let some b := binding then
+    return .blocked b.untilEpoch (if b.reason.isEmpty then "usage limit" else b.reason)
   for l in st.limits do
     if limitIsBinding l now then
       match l.scopeModel with
@@ -798,13 +854,26 @@ def markLimited (backend label : String) (model : Option String) (reason : Strin
   let untilEpoch :=
     (resetHint.bind parseIso8601).orElse fun _ =>
       fromPoll.orElse fun _ => some (now + defaultBackoffSecs)
-  saveState { st with block := some { untilEpoch, model, reason } }
+  -- Upsert by scope, dropping what has expired on the way past. Two blocks with the same scope
+  -- are two readings of one window, so the newer replaces the older; two with *different* scopes
+  -- are different windows and both stay. Pruning here is what keeps the array bounded by the
+  -- number of scopes rather than by the number of limits ever hit.
+  let kept := st.blocks.filter fun b => !sameScope b.model model && blockIsLive b now
+  saveState { st with blocks := kept.push { untilEpoch, model, reason } }
 
-/-- Clear a block after a run on this source succeeded. The block was a guess about a window we
-    could not see the end of; a completed run is proof it has passed. -/
-def markOk (backend label : String) : IO Unit := do
+/-- Retire the blocks a completed run disproves.
+
+    A run that got all the way through on `model` is proof that every window covering `model` has
+    passed — and proof of nothing at all about the others. Clearing the lot, which is what this
+    did before, let a Sonnet run erase "Fable is spent on this account", so the next Fable task
+    rediscovered that limit the only way left to it: by walking into it, a clone and a token mint
+    and a whole run to learn something already known. What survives is exactly what the run did
+    not exercise. -/
+def markOk (backend label : String) (model : Option String := none) : IO Unit := do
+  let now ← nowEpoch
   let st ← loadState backend label
-  if st.block.isSome then saveState { st with block := none }
+  let kept := st.blocks.filter fun b => blockIsLive b now && !blockApplies b model
+  if kept.size != st.blocks.size then saveState { st with blocks := kept }
 
 /-! ## Polling -/
 
@@ -999,12 +1068,16 @@ def refresh (cfg : AppConfig) (backend label : String) : IO (Except String Bool)
     | .ok limits =>
       let now ← nowEpoch
       let st ← loadState backend label
-      -- A poll that shows nothing binding retires a block we had guessed at: the poll knows the
-      -- real window and this one has passed.
+      -- A poll that shows nothing binding retires the blocks it is *evidence about*, and it is
+      -- evidence only about the windows it can see. The headers carry the session and weekly-all
+      -- windows and nothing model-scoped, so a quiet poll says nothing whatsoever about an
+      -- exhausted Fable week — clearing a scoped block here would forget a limit this poll
+      -- cannot observe, which is exactly how an account comes to look runnable and is not.
       let stillBlocked := limits.any (limitIsBinding · now)
+      let blocks := st.blocks.filter fun b => blockIsLive b now && (stillBlocked || b.model.isSome)
       saveState { st with
         limits, fetchedEpoch := some now, lastError := none, pollAfter := none
-        block := if stillBlocked then st.block else none }
+        blocks }
       -- History is a nicety and monitoring is not, so a history file that cannot be written
       -- reports itself and leaves the poll — which has already been stored — successful.
       try

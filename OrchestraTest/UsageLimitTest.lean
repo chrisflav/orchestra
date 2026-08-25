@@ -15,6 +15,7 @@ The paths that do need those — polling, persistence — are thin wrappers over
 
 deriving instance DecidableEq for LimitKind
 deriving instance DecidableEq for AuthMode
+deriving instance DecidableEq for AgentDef.LimitScope
 
 /-! ## Timestamps
 
@@ -363,10 +364,10 @@ def availability_observedBlockOutranksAQuietPoll : Test := do
   let st : SourceState :=
     { backend := "claude", label := "main"
       limits := #[{ kind := .session, percent := 5 }]
-      block := some { untilEpoch := some (now + 3600), reason := "agent reported a usage limit" } }
+      blocks := #[{ untilEpoch := some (now + 3600), reason := "agent reported a usage limit" }] }
   TestM.assert (!(availabilityOf st (some "claude-opus-4-8") now).isAvailable)
     (msg := "the recorded hit blocks")
-  let expired : SourceState := { st with block := some { st.block.get! with untilEpoch := some (now - 1) } }
+  let expired : SourceState := { st with blocks := #[{ st.blocks[0]! with untilEpoch := some (now - 1) }] }
   TestM.assert ((availabilityOf expired (some "claude-opus-4-8") now).isAvailable)
     (msg := "and stops blocking once its window passes")
 
@@ -374,12 +375,116 @@ def availability_observedBlockOutranksAQuietPoll : Test := do
 def availability_observedBlockCanItselfBeScoped : Test := do
   let st : SourceState :=
     { backend := "claude", label := "main"
-      block := some { untilEpoch := some (now + 3600), model := some "claude-opus-4-8"
-                      reason := "agent reported a usage limit" } }
+      blocks := #[{ untilEpoch := some (now + 3600), model := some "claude-opus-4-8"
+                    reason := "agent reported a usage limit" }] }
   TestM.assert (!(availabilityOf st (some "claude-opus-4-8") now).isAvailable)
     (msg := "blocks the model that hit it")
   TestM.assert ((availabilityOf st (some "claude-sonnet-5") now).isAvailable)
     (msg := "but not a different one")
+
+@[test]
+def availability_twoScopesAreTwoBlocks : Test := do
+  -- The case a single block slot could not hold: an account that is out of Fable for the week
+  -- and out of its session window for the hour. Both are true, and the one that expires first
+  -- must not take the other with it.
+  let st : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[
+        { untilEpoch := some (now + 604800), model := some "Fable", reason := "Fable limit" },
+        { untilEpoch := some (now + 3600), reason := "session limit" }] }
+  TestM.assert (!(availabilityOf st (some "claude-sonnet-5") now).isAvailable)
+    (msg := "the account-wide block covers a model the scoped one does not")
+  let later := now + 7200
+  TestM.assert ((availabilityOf st (some "claude-sonnet-5") later).isAvailable)
+    (msg := "once the session window passes, Sonnet is runnable again")
+  TestM.assert (!(availabilityOf st (some "claude-fable-5") later).isAvailable)
+    (msg := "but Fable is still blocked, and was not forgotten with the session block")
+
+@[test]
+def availability_reportsTheBlockThatLiftsLast : Test := do
+  -- Two blocks can cover one model now. Naming the earlier reset would send the caller back at
+  -- a time the source is still shut, to be turned away and made to wait again.
+  let st : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[
+        { untilEpoch := some (now + 3600), reason := "session limit" },
+        { untilEpoch := some (now + 604800), model := some "Fable", reason := "Fable limit" }] }
+  let reportedReset (s : SourceState) : Option (Option Int) :=
+    match availabilityOf s (some "claude-fable-5") now with
+    | .available   => none
+    | .blocked u _ => some u
+  TestM.assertEqual (reportedReset st) (some (some (now + 604800)))
+    (msg := "the later of the two applicable resets is the one reported")
+  -- Order in the array must not decide it.
+  TestM.assertEqual (reportedReset { st with blocks := st.blocks.reverse })
+    (some (some (now + 604800)))
+    (msg := "and the answer does not depend on insertion order")
+
+@[test]
+def availability_aBlockWithNoExpiryOutlastsOneWithAnExpiry : Test := do
+  let st : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[
+        { untilEpoch := some (now + 3600), reason := "session limit" },
+        { untilEpoch := none, reason := "credit or entitlement problem" }] }
+  match availabilityOf st (some "claude-fable-5") now with
+  | .available   => TestM.fail "an open-ended block still blocks"
+  | .blocked u r => do
+    TestM.assertEqual u none (msg := "no reset time is reported, because there is none to report")
+    TestM.assertEqual r "credit or entitlement problem"
+      (msg := "the reason is the open-ended one, not the window that will pass")
+
+@[test]
+def markOk_retiresOnlyWhatTheRunDisproves : Test := do
+  -- `markOk`'s filter, exercised directly so the interesting case needs no disk. A completed
+  -- Sonnet run proves the account-wide window has passed and proves nothing about Fable; the
+  -- Fable block has to survive, or the next Fable task rediscovers the limit by hitting it.
+  let blocks : Array Block := #[
+    { untilEpoch := some (now + 604800), model := some "Fable", reason := "Fable limit" },
+    { untilEpoch := some (now + 3600), reason := "session limit" }]
+  let afterSonnet := blocks.filter fun b => blockIsLive b now && !blockApplies b (some "claude-sonnet-5")
+  TestM.assertEqual afterSonnet.size 1 (msg := "one block survives a Sonnet success")
+  TestM.assertEqual (afterSonnet[0]!.model) (some "Fable")
+    (msg := "and it is the Fable one")
+  let afterFable := blocks.filter fun b => blockIsLive b now && !blockApplies b (some "claude-fable-5")
+  TestM.assertEqual afterFable.size 0
+    (msg := "a Fable success retires both the Fable block and the account-wide one")
+
+@[test]
+def sameScope_reconcilesDisplayNameAndModelId : Test := do
+  -- `markLimited` upserts by scope. The provider writes "Fable" and a task asks for
+  -- "claude-fable-5"; read as different scopes they would accumulate as two blocks on one
+  -- window, each expiring on its own schedule.
+  TestM.assert (sameScope (some "Fable") (some "claude-fable-5"))
+    (msg := "display name and model id are one scope")
+  TestM.assert (sameScope (some "claude-fable-5") (some "Fable"))
+    (msg := "and in the other order too")
+  TestM.assert (sameScope none none) (msg := "account-wide matches account-wide")
+  TestM.assert (!(sameScope none (some "Fable")))
+    (msg := "account-wide is not the same window as a scoped one")
+  TestM.assert (!(sameScope (some "Opus") (some "claude-fable-5")))
+    (msg := "different families are different scopes")
+
+@[test]
+def sourceState_liftsALegacySingleBlock : Test := do
+  -- State files written before blocks were a set carry one `"block"` object. Dropping it on
+  -- upgrade would forget a live limit and send the next task into it.
+  let legacy := "{\"backend\":\"claude\",\"label\":\"main\",\"limits\":[],\
+    \"block\":{\"until_epoch\":1785351600,\"model\":\"Fable\",\"reason\":\"observed\"}}"
+  match Json.parse legacy >>= fun j => (Lean.FromJson.fromJson? j : Except String SourceState) with
+  | .error e => TestM.fail s!"a legacy state file should still parse: {e}"
+  | .ok st   =>
+    TestM.assertEqual st.blocks.size 1 (msg := "the single block is lifted into the set")
+    TestM.assertEqual (st.blocks[0]!.model) (some "Fable") (msg := "with its scope intact")
+
+@[test]
+def sourceState_absentBlocksStayAbsent : Test := do
+  -- The reason `Block`'s decoder rejects non-objects: `getObjValAs?` reads a missing key as
+  -- `Json.null`, and a block with no expiry reads as "blocked forever".
+  let bare := "{\"backend\":\"claude\",\"label\":\"main\",\"limits\":[]}"
+  match Json.parse bare >>= fun j => (Lean.FromJson.fromJson? j : Except String SourceState) with
+  | .error e => TestM.fail s!"a state file with no block should parse: {e}"
+  | .ok st   => TestM.assertEqual st.blocks.size 0 (msg := "no block means no block")
 
 @[test]
 def modelMatchesScope_matchesAliasAndFullId : Test := do
@@ -696,6 +801,69 @@ def usageLimitError_matchesWhatTheCliActuallySays : Test := do
   TestM.assert (AgentDef.stdUsageLimitError 1
       "{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit.\"}")
     (msg := "the API-key 429 body is recognised")
+
+/-! ### Which limit
+
+Detecting a limit is not enough to record one: the scope decides how much of an account gets
+closed, and the message is the only thing that knows it. -/
+
+@[test]
+def classifyUsageLimit_readsTheFamilyTheProviderNamed : Test := do
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit
+      "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models.")
+    (AgentDef.LimitScope.family "Fable")
+    (msg := "the family in the message, not the model the task asked for")
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit "You've reached your Opus limit for this week.")
+    (AgentDef.LimitScope.family "Opus")
+    (msg := "another family, same shape")
+
+@[test]
+def classifyUsageLimit_anUnscopedWindowIsAccountWide : Test := do
+  -- The direction that costs the most: a Fable task tripping the account-wide session window.
+  -- Scoped to Fable, every other family keeps dispatching into an account with nothing left.
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit "You've reached your usage limit. Try again after 3pm.")
+    AgentDef.LimitScope.account
+    (msg := "a window that names no family closes the account, not one model")
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit
+      "{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit.\"}")
+    AgentDef.LimitScope.account
+    (msg := "a transport-level 429 carries no model scope")
+
+@[test]
+def classifyUsageLimit_creditsAreNotAWindow : Test := do
+  -- anthropics/claude-code#79597: the client refuses Fable on a plan that covers it, because a
+  -- setup-token cannot state the plan. That never clears on a clock, so it must not be recorded
+  -- as a window someone can wait out.
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit "Fable requires usage credits to use. Add credits to continue.")
+    (AgentDef.LimitScope.credits (some "Fable"))
+    (msg := "an entitlement refusal keeps the family and is marked as not-a-window")
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit "Your credit balance is too low to run this request.")
+    (AgentDef.LimitScope.credits none)
+    (msg := "a balance problem with no family named")
+
+@[test]
+def classifyUsageLimit_saysUnknownRatherThanGuessing : Test := do
+  -- `unknown` is what makes this safe to land: the caller falls back to the model the task
+  -- asked for, which is exactly what it did before classification existed.
+  TestM.assertEqual (AgentDef.classifyUsageLimit "quota exceeded")
+    AgentDef.LimitScope.unknown
+    (msg := "a phrase with no scope in it does not invent one")
+
+@[test]
+def classifyUsageLimit_doesNotReadFamiliesOutOfOrdinaryProse : Test := do
+  -- The span between "your" and "limit" is what is searched, not the whole output. A coding
+  -- agent mentions model names routinely, and stderr is part of the text being classified.
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit
+      "I switched the reviewer to Opus. You've reached your usage limit.")
+    AgentDef.LimitScope.account
+    (msg := "a family mentioned elsewhere does not scope the block")
 
 @[test]
 def usageLimitError_doesNotFireOnOrdinaryOutput : Test := do
