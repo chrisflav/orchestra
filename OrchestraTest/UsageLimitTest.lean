@@ -435,6 +435,29 @@ def availability_aBlockWithNoExpiryOutlastsOneWithAnExpiry : Test := do
       (msg := "the reason is the open-ended one, not the window that will pass")
 
 @[test]
+def availability_aScopedHitOnAnUnnamedModelStillHoldsBackUnnamedTasks : Test := do
+  -- The regression that scoping an observed hit to the provider's family would otherwise
+  -- introduce. A queued task names no model, runs the CLI's default family, and is told it has
+  -- reached its Opus limit. Scoped to "Opus" alone the block is invisible to the next task —
+  -- which also names no model, also takes the default, and hits the same wall — because
+  -- `modelMatchesScope` reads "no model named" as matching no scope.
+  let scopedOnly : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[{ untilEpoch := some (now + 3600), model := some "Opus", reason := "Opus" }] }
+  TestM.assert ((availabilityOf scopedOnly none now).isAvailable)
+    (msg := "a poll-derived scoped limit leaves an unnamed task alone, as it always has")
+  let observed : SourceState :=
+    { scopedOnly with
+      blocks := #[{ untilEpoch := some (now + 3600), model := some "Opus", reason := "Opus"
+                    coversUnscoped := true }] }
+  TestM.assert (!(availabilityOf observed none now).isAvailable)
+    (msg := "but an observed hit from an unnamed run holds back the next unnamed run")
+  TestM.assert ((availabilityOf observed (some "claude-sonnet-5") now).isAvailable)
+    (msg := "and still leaves a different family runnable")
+  TestM.assert (!(availabilityOf observed (some "claude-opus-4-8") now).isAvailable)
+    (msg := "and still blocks the family it named")
+
+@[test]
 def markOk_retiresOnlyWhatTheRunDisproves : Test := do
   -- `markOk`'s filter, exercised directly so the interesting case needs no disk. A completed
   -- Sonnet run proves the account-wide window has passed and proves nothing about Fable; the
@@ -854,6 +877,39 @@ def classifyUsageLimit_saysUnknownRatherThanGuessing : Test := do
   TestM.assertEqual (AgentDef.classifyUsageLimit "quota exceeded")
     AgentDef.LimitScope.unknown
     (msg := "a phrase with no scope in it does not invent one")
+
+@[test]
+def classifyUsageLimit_doesNotReadAFamilyOutOfAWholeTranscript : Test := do
+  -- The text classified is a whole run's stderr with the final result appended, not a provider
+  -- message. An unbounded span after a marker phrase would hand the family search the entire
+  -- transcript, and an account-wide failure would be recorded as a one-family block — leaving
+  -- every other family dispatching into a spent account.
+  let transcript :=
+    "reached the maximum number of retries; switching the reviewer to Sonnet and continuing " ++
+    String.ofList (List.replicate 500 'x') ++
+    " This request would exceed your account's rate limit."
+  TestM.assertEqual (AgentDef.classifyUsageLimit transcript)
+    AgentDef.LimitScope.account
+    (msg := "a family named far from any 'limit' does not scope the block")
+  -- The provider's real message lands *after* the stderr, so an early false marker must not
+  -- outvote it: every occurrence is examined, not just the first.
+  let both :=
+    "reached the end of the Sonnet migration notes\n" ++
+    "You've reached your Fable 5 limit."
+  TestM.assertEqual (AgentDef.classifyUsageLimit both)
+    (AgentDef.LimitScope.family "Fable")
+    (msg := "the real message wins over an earlier marker that named nothing")
+
+@[test]
+def classifyUsageLimit_creditsDoesNotScopeItselfFromStrayProse : Test := do
+  -- Same hazard on the credits path, and worse: a wrongly scoped credits block leaves the rest
+  -- of the account dispatching into a hard billing failure that no reset will clear.
+  let transcript :=
+    "I moved the reviewer to Opus.\n" ++ String.ofList (List.replicate 300 'y') ++
+    "\nYour credit balance is too low to run this request."
+  TestM.assertEqual (AgentDef.classifyUsageLimit transcript)
+    (AgentDef.LimitScope.credits none)
+    (msg := "a family mentioned elsewhere in the run does not scope a credits block")
 
 @[test]
 def classifyUsageLimit_doesNotReadFamiliesOutOfOrdinaryProse : Test := do

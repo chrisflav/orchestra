@@ -332,6 +332,16 @@ structure Block where
   untilEpoch : Option Int := none
   model      : Option String := none
   reason     : String := ""
+  /-- Whether this block also covers a task that names no model at all.
+
+      Set when the run that hit the limit named no model itself. `modelMatchesScope` deliberately
+      reads "no model named" as matching no scope, so that one exhausted family does not idle a
+      whole account — and that is right for a limit a *poll* reported, where the other families
+      really are still available. It is wrong for an observed hit on an unnamed model: that run
+      took the CLI's default, the next unnamed run takes the same default, and it will hit the
+      same wall. Without this the scoped block is invisible to exactly the tasks guaranteed to
+      reproduce it. -/
+  coversUnscoped : Bool := false
 deriving Repr, Inhabited
 
 instance : ToJson Block where
@@ -339,6 +349,7 @@ instance : ToJson Block where
     let fields : List (String × Json) := [("reason", Json.str b.reason)]
     let fields := if let some u := b.untilEpoch then fields ++ [("until_epoch", Json.num u)] else fields
     let fields := if let some m := b.model      then fields ++ [("model",       Json.str m)] else fields
+    let fields := if b.coversUnscoped then fields ++ [("covers_unscoped", Json.bool true)] else fields
     Json.mkObj fields
 
 instance : FromJson Block where
@@ -350,7 +361,8 @@ instance : FromJson Block where
     let untilEpoch := (j.getObjValAs? Int "until_epoch").toOption
     let model := (j.getObjValAs? String "model").toOption
     let reason := (j.getObjValAs? String "reason").toOption.getD ""
-    return { untilEpoch, model, reason }
+    let coversUnscoped := (j.getObjValAs? Bool "covers_unscoped").toOption.getD false
+    return { untilEpoch, model, reason, coversUnscoped }
 
 /-- Everything known about one `(backend, label)` authentication source. -/
 structure SourceState where
@@ -670,11 +682,13 @@ def modelMatchesScope (scope : String) (model : Option String) : Bool :=
     let s := scope.toLower
     !s.isEmpty && (m.splitOn s).length > 1
 
-/-- Whether a block covers a task running `model`. An unscoped block covers everything. -/
+/-- Whether a block covers a task running `model`. An unscoped block covers everything; a scoped
+    one covers the family it names, plus a task naming no model when the run that recorded it
+    named none either — see `Block.coversUnscoped`. -/
 def blockApplies (b : Block) (model : Option String) : Bool :=
   match b.model with
   | none   => true
-  | some m => modelMatchesScope m model
+  | some m => modelMatchesScope m model || (model.isNone && b.coversUnscoped)
 
 /-- Whether a block has not yet lifted. One with no expiry never lifts on its own; only proof —
     a completed run, through `markOk` — retires it. -/
@@ -829,6 +843,13 @@ next one regardless of which mode discovered it. -/
     enough not to spin, short enough that a wrong guess costs one poll interval. -/
 def defaultBackoffSecs : Int := 3600
 
+/-- Block length for a limit that is not a window at all — credits, or an entitlement the client
+    refuses to confirm. There is no reset coming, so an hour is the wrong guess in the expensive
+    direction: the same doomed run is retried hourly, forever, against a wall that only a person
+    can take down. Long enough to stop that; still finite, because the condition *can* be fixed
+    from outside and nothing else would ever notice that it had been. -/
+def creditsBackoffSecs : Int := 6 * 3600
+
 /-- Note that a source was just dispatched to. Only used to break ties under `distribute`. -/
 def markUsed (backend label : String) : IO Unit := do
   let tick ← nowDispatchTick
@@ -838,9 +859,15 @@ def markUsed (backend label : String) : IO Unit := do
 
     `resetHint` is a reset time recovered from the agent's own output when it offered one.
     Otherwise the block borrows the reset time of whichever polled limit is already binding, and
-    failing that falls back to `defaultBackoffSecs`. -/
+    failing that falls back to `fallbackBackoff`.
+
+    `coversUnscoped` marks a scoped block as also covering tasks that name no model, which is
+    what an observed hit on an unnamed model is evidence of. `fallbackBackoff` is how long to
+    hold the source when nothing reports a reset; a limit that is not a window wants
+    `creditsBackoffSecs` rather than the hourly default. -/
 def markLimited (backend label : String) (model : Option String) (reason : String)
-    (resetHint : Option String := none) : IO Unit := do
+    (resetHint : Option String := none) (coversUnscoped : Bool := false)
+    (fallbackBackoff : Int := defaultBackoffSecs) : IO Unit := do
   let now ← nowEpoch
   let st ← loadState backend label
   let fromPoll : Option Int :=
@@ -853,13 +880,13 @@ def markLimited (backend label : String) (model : Option String) (reason : Strin
       else acc
   let untilEpoch :=
     (resetHint.bind parseIso8601).orElse fun _ =>
-      fromPoll.orElse fun _ => some (now + defaultBackoffSecs)
+      fromPoll.orElse fun _ => some (now + fallbackBackoff)
   -- Upsert by scope, dropping what has expired on the way past. Two blocks with the same scope
   -- are two readings of one window, so the newer replaces the older; two with *different* scopes
   -- are different windows and both stay. Pruning here is what keeps the array bounded by the
   -- number of scopes rather than by the number of limits ever hit.
   let kept := st.blocks.filter fun b => !sameScope b.model model && blockIsLive b now
-  saveState { st with blocks := kept.push { untilEpoch, model, reason } }
+  saveState { st with blocks := kept.push { untilEpoch, model, reason, coversUnscoped } }
 
 /-- Retire the blocks a completed run disproves.
 

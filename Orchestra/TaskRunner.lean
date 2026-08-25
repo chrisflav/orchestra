@@ -668,18 +668,28 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       -- account-wide session window would close Fable and leave every other family dispatching
       -- into a spent account, and a task that named no model would close the whole account for
       -- a limit that only ever covered one family.
-      let (blockModel, blockReason) := match result.limitScope with
-        | .family m    => (some m, s!"agent reported a {m} usage limit")
-        | .account     => (none, "agent reported an account-wide usage limit")
+      let (blockModel, blockReason, backoff) := match result.limitScope with
+        | .family m    => (some m, s!"agent reported a {m} usage limit", Usage.defaultBackoffSecs)
+        | .account     => (none, "agent reported an account-wide usage limit",
+                           Usage.defaultBackoffSecs)
         | .credits fam =>
-          -- Not a window: an entitlement or balance problem does not reset on a clock. Said
-          -- plainly here because the block's reason is what `orchestra usage` prints, and
+          -- Not a window: an entitlement or balance problem does not reset on a clock, so the
+          -- hourly default would retry the same doomed run against the same wall all week. Held
+          -- longer, and said plainly, because the reason is what `orchestra usage` prints and
           -- "waiting for the reset" is the wrong thing to be waiting for.
-          (fam, "agent reported a credit or entitlement problem, not a window that resets")
-        | .unknown     => (ioTask.model, "agent reported a usage limit")
+          (fam, "agent reported a credit or entitlement problem, which no reset will clear",
+           Usage.creditsBackoffSecs)
+        | .unknown     => (ioTask.model, "agent reported a usage limit", Usage.defaultBackoffSecs)
+      -- A run that named no model took the CLI's default family, and so will the next one. If
+      -- the provider named a family, the block is scoped to it — and would then be invisible to
+      -- exactly the tasks certain to hit it again, because `modelMatchesScope` reads "no model
+      -- named" as matching no scope. Saying that the block also covers unscoped tasks is what
+      -- keeps the guarantee this code had before it knew the family at all.
       if let some label := authLabel then
         Usage.markLimited backendName label blockModel blockReason
           (resetHint := result.rateLimitReset)
+          (coversUnscoped := ioTask.model.isNone)
+          (fallbackBackoff := backoff)
       break
     if !(← RepoConfig.hasValidationScript repoPath) then
       IO.println "  No validation script found, skipping validation."

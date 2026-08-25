@@ -165,21 +165,49 @@ deriving Repr, BEq, Inhabited
 def limitFamilies : List (String × String) :=
   [("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
 
+/-- How much text after a marker phrase may name the family.
+
+    "reached your Fable 5 limit" puts twelve characters between the two. The text being classified
+    is not a provider message but a whole run's stderr with the final result appended, so an
+    unbounded span is the difference between reading a limit message and reading a transcript —
+    and a transcript mentions model names routinely. -/
+def familySpanChars : Nat := 40
+
+private def clampAfter (s : String) : String :=
+  String.ofList (s.toList.take familySpanChars)
+
+private def clampBefore (s : String) : String :=
+  String.ofList (s.toList.reverse.take familySpanChars).reverse
+
 /-- The family named between "your" and "limit", if the message names one.
 
-    Scoped to that span deliberately. A bare search for "fable" anywhere in the output would fire
-    on an agent that merely mentioned the model, and a coding agent mentions models routinely.
-    "reached your Fable 5 limit" is a phrase a provider writes and ordinary output does not — the
-    same reasoning that makes `stdUsageLimitError` match phrases rather than the word "limit". -/
+    Bounded on both sides deliberately, because a bare search for "fable" anywhere in the output
+    would fire on an agent that merely mentioned the model. The span must be short *and* must
+    reach a "limit" inside that distance: the marker phrases are common enough in ordinary prose
+    ("reached the maximum number of retries") that the marker alone is not evidence, and taking
+    everything after it when no "limit" follows would hand the family search the whole run.
+
+    Every occurrence of every marker is considered, not just the first. The provider's message is
+    appended after the run's stderr, so it is the *last* thing in the text; examining only the
+    first match would let an early false positive in the transcript outvote the real one. -/
 def familyNamedIn (output : String) : Option String :=
   let s := output.toLower
-  let spans := ["reached your ", "exceeded your ", "exceed your ", "reached the "].filterMap
+  let spans := ["reached your ", "exceeded your ", "exceed your ", "reached the "].flatMap
     fun marker =>
-      match (s.splitOn marker).drop 1 with
-      | []        => none
-      | rest :: _ => some ((rest.splitOn "limit").headD rest)
+      ((s.splitOn marker).drop 1).filterMap fun rest =>
+        match (clampAfter rest).splitOn "limit" with
+        | span :: _ :: _ => some span
+        | _              => none
   spans.findSome? fun span =>
     (limitFamilies.find? fun (needle, _) => containsCI span needle).map (·.2)
+
+/-- The family named just before `marker`, for phrasings that put it there: "Fable requires usage
+    credits". Bounded the same way and for the same reason. -/
+def familyBefore (output marker : String) : Option String :=
+  match output.toLower.splitOn marker with
+  | before :: _ :: _ =>
+    (limitFamilies.find? fun (needle, _) => containsCI (clampBefore before) needle).map (·.2)
+  | _ => none
 
 /-- Classify a usage-limit message. Only meaningful once `isUsageLimitError` has said there is
     something to classify; on anything else it answers `unknown`, which is the caller's cue to
@@ -192,16 +220,21 @@ def classifyUsageLimit (output : String) : LimitScope :=
   -- reset, not a balance problem. Only the hyphen separates the two today; the phrase does not.
   if containsCI s "insufficient credits" || containsCI s "credit balance"
      || containsCI s "requires usage credits" then
-    -- Credits messages are short, specific, and do not always route the family through a "your
-    -- … limit" span — the Fable entitlement refusal reads "requires usage credits". Inside a
-    -- message already known to be about credits, a bare family search is safe.
-    let bare := (limitFamilies.find? fun (needle, _) => containsCI s needle).map (·.2)
-    .credits (named.orElse fun _ => bare)
+    -- A credits message does not always route the family through a "your … limit" span: the
+    -- entitlement refusal reads "Fable requires usage credits", with the family in front. Read
+    -- that position too — but bounded, like every other read here. Being inside a message about
+    -- credits is not licence to search a whole transcript for a model name, and a wrongly scoped
+    -- credits block leaves the rest of the account dispatching into a hard billing failure.
+    .credits (named.orElse fun _ => familyBefore output "requires usage credits")
   else match named with
   | some f => .family f
   | none   =>
-    -- A transport-level 429 carries no model scope: it is the account being told to slow down.
-    if containsCI s "rate_limit_error" || containsCI s "rate limit exceeded"
+    -- A message that names a limit but no family is about the account. "rate limit" is safe to
+    -- read that way *here* and would not be safe on its own: this branch is only reached once
+    -- `isUsageLimitError` has confirmed a limit, so the agent that merely discussed a rate
+    -- limiter never arrives. Ambiguity resolves toward the account on purpose — over-blocking
+    -- costs an hour of one source, under-blocking costs a clone and a run per queued task.
+    if containsCI s "rate_limit_error" || containsCI s "rate limit"
        || containsCI s "usage limit" || containsCI s "weekly limit" then .account
     else .unknown
 
