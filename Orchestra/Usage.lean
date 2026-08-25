@@ -715,6 +715,34 @@ def blockIsLive (b : Block) (now : Int) : Bool :=
   | some u => u > now
   | none   => true
 
+/-- Fold a second reading of one window into the first.
+
+    A later reading is not a correction, because the readings know different things. Workers run
+    concurrently, so two tasks dispatched to one source before any block existed both report the
+    same limit seconds apart: one named no model and so learned that the block covers unnamed
+    tasks, the other named one and did not. Overwriting would let the later, less informed reading
+    drop `coversUnscoped` — and an interactive session's bare rate-limit event would downgrade a
+    credits block from "no reset will clear this" to an hour. What is known about a window only
+    ever grows.
+
+    The scope keeps the *broader* spelling. "Opus" and "claude-opus-4-8" name one window, but they
+    do not cover the same tasks: a block scoped to the dated id is invisible to a task asking for
+    `opus`, where one scoped to the display name catches both. Taking whichever arrived last would
+    make coverage depend on arrival order, and half the orders lose. The shorter name is the one
+    contained in the other, which is exactly the broader scope. -/
+def mergeBlock (fresh prior : Block) : Block :=
+  { model := match fresh.model, prior.model with
+      | some a, some b => some (if a.length ≤ b.length then a else b)
+      | _,      _      => fresh.model
+    untilEpoch := match fresh.untilEpoch, prior.untilEpoch with
+      | none, _ | _, none => none
+      | some a, some b    => some (max a b)
+    -- Keep the reason that explains the stronger fact: "no reset will clear this" must not be
+    -- replaced by wording implying one will.
+    reason := if fresh.notAWindow || !prior.notAWindow then fresh.reason else prior.reason
+    coversUnscoped := fresh.coversUnscoped || prior.coversUnscoped
+    notAWindow := fresh.notAWindow || prior.notAWindow }
+
 /-- Whether two block scopes name the same window.
 
     `none` is the account-wide scope and matches only itself. Two model scopes match when either
@@ -915,29 +943,16 @@ def markLimited (backend label : String) (model : Option String) (reason : Strin
   -- different windows and both stay. Pruning here is what keeps the array bounded by the number
   -- of scopes rather than by the number of limits ever hit.
   --
-  -- Folded rather than replaced, because a second reading is not a correction. Workers run
-  -- concurrently, so two tasks dispatched to one source before any block existed both report the
-  -- same limit, seconds apart and knowing different things about it: one named no model and so
-  -- learned that the block covers unnamed tasks, the other named one and did not. Overwriting
-  -- would let the later, less informed reading silently drop `coversUnscoped` — and an interactive
-  -- session's bare rate-limit event would downgrade a credits block from "no reset will clear
-  -- this" to an hour. What is known about a window only ever grows; the expiry takes whichever
-  -- reading says it lasts longer, with "no expiry" outlasting every time.
-  let prior := st.blocks.find? fun b => sameScope b.model model && blockIsLive b now
-  let merged : Block := match prior with
-    | none => { untilEpoch, model, reason, coversUnscoped, notAWindow }
-    | some p =>
-      let notAWindow' := notAWindow || p.notAWindow
-      { model
-        untilEpoch := match untilEpoch, p.untilEpoch with
-          | none, _ | _, none => none
-          | some a, some b    => some (max a b)
-        -- Keep the reason that explains the stronger fact: "no reset will clear this" must not be
-        -- replaced by wording that implies one will.
-        reason := if notAWindow || !p.notAWindow then reason else p.reason
-        coversUnscoped := coversUnscoped || p.coversUnscoped
-        notAWindow := notAWindow' }
-  let kept := st.blocks.filter fun b => !sameScope b.model model && blockIsLive b now
+  -- Every live block this reading is about is folded in, not just the first. `sameScope` is not
+  -- transitive: an account can legitimately carry blocks scoped "claude-opus-4-8" and
+  -- "claude-opus-5", which are not the same window as each other, while a fresh hit classified
+  -- "Opus" is the same window as both. Merging with one and dropping the other would discard a
+  -- live limit — including, if it was the longer one, the expiry that mattered.
+  let live := st.blocks.filter (blockIsLive · now)
+  let matching := live.filter fun b => sameScope b.model model
+  let kept := live.filter fun b => !sameScope b.model model
+  let merged := matching.foldl (init := { untilEpoch, model, reason, coversUnscoped, notAWindow })
+    mergeBlock
   saveState { st with blocks := kept.push merged }
 
 /-- Retire the blocks a completed run disproves.

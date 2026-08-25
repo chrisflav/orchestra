@@ -131,7 +131,14 @@ def stdUsageLimitError (exitCode : UInt32) (output : String) : Bool :=
     containsCI s "exceed your" ||
     containsCI s "exceeded your" ||
     containsCI s "insufficient credits" ||
-    containsCI s "credit balance")
+    containsCI s "credit balance" ||
+    -- anthropics/claude-code#79597, verbatim: the client refuses a model the subscription covers
+    -- because a setup-token cannot state the plan, and says it "requires usage credits". Without
+    -- this the run is not a limit at all — it comes back `failed` rather than `unfinished`,
+    -- nothing is recorded against the source, and the next queued task is dispatched straight
+    -- into it again. Not a bare "usage credits": the ordinary limit message ends "Run
+    -- /usage-credits to continue", which is a window with a reset and not this.
+    containsCI s "requires usage credits")
 
 /-! ## What the limit was about
 
@@ -216,10 +223,20 @@ private def familyIn (span : String) : Option String :=
     Both halves of the classification hang off these. The *last* occurrence of any of them is the
     report that ended the run, and everything else is read from a short window around that one
     occurrence — never from the text at large. An agent that discussed a model family, or a credit
-    balance, earlier in its run must not get to decide how much of an account gets closed. -/
+    balance, earlier in its run must not get to decide how much of an account gets closed.
+
+    Every phrase `stdUsageLimitError` detects on belongs here, or a message it recognises would
+    produce no window at all and classify as `unknown` — which falls back to the model the task
+    asked for, and so records an *account-wide* limit like "5-hour limit reached" as a block on
+    whatever family happened to be running.
+
+    "reached the " is deliberately *not* here, though `familyNamedIn` still opens spans on it
+    inside a window. It is the one phrase common in ordinary prose ("reached the maximum number
+    of retries"), so letting it decide *where* the deciding report is would let stray output move
+    the window off the real message. -/
 private def limitMarkers : List String :=
-  ["reached your ", "exceeded your ", "exceed your ", "reached the ",
-   "usage limit", "weekly limit", "rate limit", "rate_limit_error",
+  ["reached your ", "exceeded your ", "exceed your ",
+   "usage limit", "weekly limit", "rate limit", "limit reached", "rate_limit_error",
    "insufficient credits", "credit balance", "requires usage credits"]
 
 /-- The window around the deciding limit report: `familySpanChars` of context either side of the
@@ -286,7 +303,8 @@ def classifyUsageLimit (output : String) : LimitScope :=
     -- arrives. Ambiguity resolves toward the account on purpose — over-blocking costs an hour of
     -- one source, under-blocking costs a clone and a run per queued task.
     if containsCI w "rate_limit_error" || containsCI w "rate limit"
-       || containsCI w "usage limit" || containsCI w "weekly limit" then .account
+       || containsCI w "usage limit" || containsCI w "weekly limit"
+       || containsCI w "limit reached" then .account
     else .unknown
 
 end AgentDef

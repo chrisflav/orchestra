@@ -482,17 +482,10 @@ def markLimited_foldsASecondReadingInsteadOfReplacingIt : Test := do
   let prior : Block :=
     { untilEpoch := some (now + 21600), model := some "Opus"
       reason := "credit or entitlement problem", coversUnscoped := true, notAWindow := true }
-  -- The second reading: a bare rate-limit event, naming a model, knowing neither flag.
+  -- The second reading: a bare rate-limit event, naming a model id, knowing neither flag.
   let fresh : Block :=
-    { untilEpoch := some (now + 3600), model := some "Opus", reason := "usage limit" }
-  let merged : Block :=
-    { model := fresh.model
-      untilEpoch := match fresh.untilEpoch, prior.untilEpoch with
-        | none, _ | _, none => none
-        | some a, some b    => some (max a b)
-      reason := if fresh.notAWindow || !prior.notAWindow then fresh.reason else prior.reason
-      coversUnscoped := fresh.coversUnscoped || prior.coversUnscoped
-      notAWindow := fresh.notAWindow || prior.notAWindow }
+    { untilEpoch := some (now + 3600), model := some "claude-opus-4-8", reason := "usage limit" }
+  let merged := mergeBlock fresh prior
   TestM.assert merged.coversUnscoped
     (msg := "the later reading does not drop that unnamed tasks are covered")
   TestM.assert merged.notAWindow
@@ -501,6 +494,25 @@ def markLimited_foldsASecondReadingInsteadOfReplacingIt : Test := do
     (msg := "and cannot shorten it from six hours to one")
   TestM.assertEqual merged.reason "credit or entitlement problem"
     (msg := "the reason keeps explaining the stronger fact")
+  TestM.assertEqual merged.model (some "Opus")
+    (msg := "the broader spelling survives, or the block stops covering tasks asking for 'opus'")
+  -- And the fold does not depend on which reading arrived first.
+  TestM.assertEqual (mergeBlock prior fresh).model (some "Opus")
+    (msg := "which way round the two readings arrive does not change the scope")
+  TestM.assertEqual (mergeBlock prior fresh).untilEpoch (some (now + 21600))
+    (msg := "nor the expiry")
+
+@[test]
+def mergeBlock_aScopeNarrowedByOrderWouldLoseCoverage : Test := do
+  -- Why the broader spelling matters, stated as the thing that actually breaks.
+  let broad : Block := { untilEpoch := some (now + 3600), model := some "Opus" }
+  let narrow : Block := { untilEpoch := some (now + 3600), model := some "claude-opus-4-8" }
+  TestM.assert (blockApplies broad (some "opus"))
+    (msg := "a block scoped to the display name catches a task asking for the alias")
+  TestM.assert (!(blockApplies narrow (some "opus")))
+    (msg := "one scoped to the dated id does not")
+  TestM.assert (blockApplies (mergeBlock narrow broad) (some "opus"))
+    (msg := "so the merge must keep the broader of the two")
 
 @[test]
 def sameScope_reconcilesDisplayNameAndModelId : Test := do
@@ -962,6 +974,28 @@ def classifyUsageLimit_theMessageThatEndedTheRunWins : Test := do
   TestM.assertEqual (AgentDef.classifyUsageLimit reversed)
     (AgentDef.LimitScope.family "Opus")
     (msg := "position decides, in either direction")
+
+@[test]
+def usageLimitError_catchesTheEntitlementRefusal : Test := do
+  -- anthropics/claude-code#79597. Detection has to fire on this or nothing downstream runs: the
+  -- task comes back `failed` rather than `unfinished`, no block is recorded, and the next queued
+  -- task is dispatched into the same refusal. Every branch built for the credits case was
+  -- unreachable until this phrase was recognised.
+  let refusal := "Fable requires usage credits to use. Add credits to continue."
+  TestM.assert (AgentDef.stdUsageLimitError 1 refusal)
+    (msg := "the entitlement refusal is recognised as a limit at all")
+  TestM.assertEqual (AgentDef.classifyUsageLimit refusal)
+    (AgentDef.LimitScope.credits (some "Fable"))
+    (msg := "and then classifies as credits, scoped to the family it names")
+
+@[test]
+def classifyUsageLimit_anAccountWindowWithoutTheWordUsage : Test := do
+  -- "5-hour limit reached" is a phrase detection already recognised but the marker list did not,
+  -- so it produced no window, classified as unknown, and fell back to the model the task asked
+  -- for — recording an account-wide limit as a block on whichever family happened to be running.
+  TestM.assertEqual (AgentDef.classifyUsageLimit "5-hour limit reached ∙ resets 3pm")
+    AgentDef.LimitScope.account
+    (msg := "an account-wide limit that never says 'usage' is still account-wide")
 
 @[test]
 def classifyUsageLimit_creditsProseDoesNotOutrankTheRealWindow : Test := do
