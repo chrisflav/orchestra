@@ -917,8 +917,13 @@ private def percentOfFraction (s : String) : Option Nat :=
     `limitIsBinding` reads to idle a source, and reading a warning as a rejection idles an account
     that still has a fifth of its week left, for the rest of the week. An unrecognised status is
     therefore usable rather than exhausted: a run that really is refused is caught by `markLimited`
-    the moment it happens, so failing open here costs one rejected request, while failing closed
-    costs days of an idle account. -/
+    the moment it happens, so failing open here costs a rejected request per poll interval, while
+    failing closed costs days of an idle account.
+
+    The match is a lowercased prefix rather than an equality for the same reason `LimitKind` keeps
+    the kinds it cannot name: the status field is an open enum, and a future `rejected_…` spelling
+    is a rejection whatever else it says. Values arrive trimmed but not case-folded —
+    `Utils.Http.header?` lowercases header *names* only. -/
 private def limitFromHeaders (headers : Array (String × String)) (winKey : String)
     (kind : LimitKind) (group : String) : Option Limit := do
   let util ← Utils.Http.header? headers s!"anthropic-ratelimit-unified-{winKey}-utilization"
@@ -932,7 +937,7 @@ private def limitFromHeaders (headers : Array (String × String)) (winKey : Stri
     severity := if percent ≥ 100 then "critical" else if percent ≥ 75 then "warning" else "normal"
     resetsAt
     scopeModel := none
-    isActive := status == "rejected" || percent ≥ 100
+    isActive := status.toLower.startsWith "rejected" || percent ≥ 100
   }
 
 /-- Turn the `anthropic-ratelimit-unified-*` headers into the same `Limit` values the endpoint body

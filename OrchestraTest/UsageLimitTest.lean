@@ -150,9 +150,29 @@ def parseUnifiedHeaders_anUnrecognisedStatusIsNotBinding : Test := do
   | some l => TestM.assert (!l.isActive) (msg := "an unknown status is usable, not exhausted")
 
 @[test]
+def parseUnifiedHeaders_aRejectionBindsBelowTheLine : Test := do
+  -- The status is the only fail-closed signal the poll has that is not the percentage, so it has
+  -- to be pinned on its own: every other rejected fixture here is also at 100%, and would pass
+  -- with the status ignored entirely. Casing and a `rejected_…` spelling are rejections too.
+  for reported in ["rejected", "REJECTED", "rejected_weekly"] do
+    let hs := warningHeaders.map fun (k, v) =>
+      if k == "anthropic-ratelimit-unified-7d-status" then (k, reported) else (k, v)
+    match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
+    | none   => TestM.fail "expected a weekly_all limit"
+    | some l => TestM.assert l.isActive (msg := s!"{reported} at 78% still binds")
+
+@[test]
+def parseUnifiedHeaders_anAbsentStatusIsAllowed : Test := do
+  -- A window that reports a utilisation but no status at all is served, not withheld.
+  let hs := warningHeaders.filter (·.1 != "anthropic-ratelimit-unified-7d-status")
+  match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l => TestM.assert (!l.isActive) (msg := "no status header means allowed")
+
+@[test]
 def parseUnifiedHeaders_hundredPercentBindsWhateverTheStatusSays : Test := do
-  -- The percentage is the backstop: a window reported as full binds even if the status field is
-  -- missing or says something reassuring.
+  -- The percentage is the backstop: a window reported as full binds even when the status field
+  -- says something reassuring.
   let hs := warningHeaders.map fun (k, v) =>
     if k == "anthropic-ratelimit-unified-7d-utilization" then (k, "1") else (k, v)
   match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
