@@ -480,11 +480,19 @@ goal; running without the goal condition."
   -- limit the run recovered from earlier ("reached your Opus limit, now using Sonnet") must not
   -- outrank the one that actually ended it. Detection above reads both at once because either
   -- may hold the evidence; attribution has to prefer the authoritative one.
+  --
+  -- And only when the result text is *itself* limit evidence. `usageLimitHit` was decided over
+  -- both streams at once, so the evidence may live entirely in stderr while the result text is an
+  -- ordinary summary — one that can still mention a model and a limit in the same breath ("I
+  -- reached the Opus limit of four reviewers, so I stopped"). Classifying that would scope an
+  -- account-wide 429 to a single family and leave every other one dispatching into a spent
+  -- account, which is precisely what reading the authoritative stream first is meant to avoid.
   let limitScope :=
     if !usageLimitHit then .unknown
-    else match AgentDef.classifyUsageLimit (resultText.getD "") with
-      | .unknown => AgentDef.classifyUsageLimit stderrContent
-      | scope    => scope
+    else
+      let final := resultText.getD ""
+      if agentDef.isUsageLimitError 1 final then AgentDef.classifyUsageLimit final
+      else AgentDef.classifyUsageLimit stderrContent
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
   return { exitCode, sessionId, usageLimitHit, limitScope, wasCancelled, resultSubtype, resultText,

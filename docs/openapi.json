@@ -1946,7 +1946,7 @@
       },
       "AuthSource": {
         "type": "object",
-        "required": ["label", "backend", "kind", "baseUrl", "isDefault", "pollable", "state", "reason", "availableAt", "pressure", "polledAt", "lastUsedAt", "lastError", "backoffUntil", "limits"],
+        "required": ["label", "backend", "kind", "baseUrl", "isDefault", "pollable", "state", "reason", "availableAt", "pressure", "polledAt", "lastUsedAt", "lastError", "backoffUntil", "limits", "blocks"],
         "properties": {
           "label": { "type": "string" },
           "backend": { "type": "string", "description": "Agent backend this source belongs to." },
@@ -1968,12 +1968,13 @@
       },
       "UsageBlock": {
         "type": "object",
-        "required": ["model", "reason", "until", "coversUnscoped"],
+        "required": ["model", "reason", "until", "coversUnscoped", "notAWindow"],
         "properties": {
           "model": { "type": ["string", "null"], "description": "The model family this block covers, as the provider named it. `null` closes the whole account." },
           "reason": { "type": "string", "description": "What the run reported." },
           "until": { "type": ["string", "null"], "format": "date-time", "description": "When the block lifts, if anything reported or guessed a time." },
-          "coversUnscoped": { "type": "boolean", "description": "Whether this block also holds back tasks that name no model. Set when the run that hit the limit named none either, and so took the same default the next such task will take." }
+          "coversUnscoped": { "type": "boolean", "description": "Whether this block also holds back tasks that name no model. Set when the run that hit the limit named none either, and so took the same default the next such task will take." },
+          "notAWindow": { "type": "boolean", "description": "Credits or an entitlement rather than a window on a clock. No reset is coming: `until` is a backoff, not a reported reset, and only a person can clear the condition." }
         }
       },
       "AuthBackend": {

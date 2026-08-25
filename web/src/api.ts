@@ -300,9 +300,12 @@ export interface AuthSource {
   backoffUntil: string | null;
   limits: UsageLimit[];
   /**
-   * Limits observed by a run and still in force. A source whose only block is scoped to one
-   * model family still reports `state: "available"` — correctly, because the other families run
-   * — so this is the only place that block is visible.
+   * Limits observed by a run and still in force.
+   *
+   * A source whose only block is scoped to one model family usually still reports
+   * `state: "available"` — correctly, because the other families run — so this is the only place
+   * that block is visible. The exception is a block with `coversUnscoped`, which does close the
+   * source for a task naming no model and so does show up in `state`.
    */
   blocks: UsageBlock[];
 }

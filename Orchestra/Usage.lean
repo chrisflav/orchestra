@@ -855,7 +855,14 @@ def select (backend : String) (labels : List String) (mode : AuthMode) (model : 
 /-! ## Recording outcomes
 
 Called on every path that launches an agent, so that what one process learns is visible to the
-next one regardless of which mode discovered it. -/
+next one regardless of which mode discovered it.
+
+Every writer here is load-then-save with no lock across processes, which predates blocks being a
+set and is not made safe by them: two workers recording different scopes on one source in the
+same instant can still lose one of them, and a `markUsed` landing between another writer's load
+and save can drop a block outright. The blast radius is one re-dispatch that rediscovers the
+limit and records it again, which is why this has not been worth a lock file — but it is a real
+race and not a benign one, and it wants fixing before anything here is trusted to be durable. -/
 
 /-- Default block length when a run reports a limit and nothing has told us when it lifts. Long
     enough not to spin, short enough that a wrong guess costs one poll interval. -/
@@ -904,11 +911,34 @@ def markLimited (backend label : String) (model : Option String) (reason : Strin
     else (resetHint.bind parseIso8601).orElse fun _ =>
       fromPoll.orElse fun _ => some (now + defaultBackoffSecs)
   -- Upsert by scope, dropping what has expired on the way past. Two blocks with the same scope
-  -- are two readings of one window, so the newer replaces the older; two with *different* scopes
-  -- are different windows and both stay. Pruning here is what keeps the array bounded by the
-  -- number of scopes rather than by the number of limits ever hit.
+  -- are two readings of one window, so they fold together; two with *different* scopes are
+  -- different windows and both stay. Pruning here is what keeps the array bounded by the number
+  -- of scopes rather than by the number of limits ever hit.
+  --
+  -- Folded rather than replaced, because a second reading is not a correction. Workers run
+  -- concurrently, so two tasks dispatched to one source before any block existed both report the
+  -- same limit, seconds apart and knowing different things about it: one named no model and so
+  -- learned that the block covers unnamed tasks, the other named one and did not. Overwriting
+  -- would let the later, less informed reading silently drop `coversUnscoped` — and an interactive
+  -- session's bare rate-limit event would downgrade a credits block from "no reset will clear
+  -- this" to an hour. What is known about a window only ever grows; the expiry takes whichever
+  -- reading says it lasts longer, with "no expiry" outlasting every time.
+  let prior := st.blocks.find? fun b => sameScope b.model model && blockIsLive b now
+  let merged : Block := match prior with
+    | none => { untilEpoch, model, reason, coversUnscoped, notAWindow }
+    | some p =>
+      let notAWindow' := notAWindow || p.notAWindow
+      { model
+        untilEpoch := match untilEpoch, p.untilEpoch with
+          | none, _ | _, none => none
+          | some a, some b    => some (max a b)
+        -- Keep the reason that explains the stronger fact: "no reset will clear this" must not be
+        -- replaced by wording that implies one will.
+        reason := if notAWindow || !p.notAWindow then reason else p.reason
+        coversUnscoped := coversUnscoped || p.coversUnscoped
+        notAWindow := notAWindow' }
   let kept := st.blocks.filter fun b => !sameScope b.model model && blockIsLive b now
-  saveState { st with blocks := kept.push { untilEpoch, model, reason, coversUnscoped, notAWindow } }
+  saveState { st with blocks := kept.push merged }
 
 /-- Retire the blocks a completed run disproves.
 

@@ -549,9 +549,13 @@ private def blockJson (b : Usage.Block) : Json :=
 
     Which is why the blocks are reported alongside the limits rather than folded into `state`.
     The limit rows come from polls, and a poll cannot see a model-scoped window at all — so an
-    observed "Fable is spent here" appears in neither `state` (correctly available: other
-    families still run) nor `limits`. Without a row of its own it appears nowhere, and an
-    operator asking why one family stopped being dispatched has nothing to look at. -/
+    observed "Fable is spent here" appears in neither `state` (usually available: other families
+    still run) nor `limits`. Without a row of its own it appears nowhere, and an operator asking
+    why one family stopped being dispatched has nothing to look at.
+
+    "Usually", because a scoped block carrying `coversUnscoped` *does* close the source to a task
+    naming no model, which is what judging with no model asks about — so that one shows up in
+    `state` as well as in its row. -/
 private def authSourceJson (backend : String) (src : AuthSource) (isDefault : Bool) (now : Int)
     : IO Json := do
   let st ← Usage.loadState backend src.label

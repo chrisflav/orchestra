@@ -474,6 +474,35 @@ def markOk_retiresOnlyWhatTheRunDisproves : Test := do
     (msg := "a Fable success retires both the Fable block and the account-wide one")
 
 @[test]
+def markLimited_foldsASecondReadingInsteadOfReplacingIt : Test := do
+  -- Workers run concurrently, so two tasks dispatched to one source before any block existed
+  -- both report the same limit, knowing different things about it. The merge is what stops the
+  -- later, less informed reading dropping what the earlier one learned. Exercised as the pure
+  -- fold `markLimited` performs, so no disk or clock is needed.
+  let prior : Block :=
+    { untilEpoch := some (now + 21600), model := some "Opus"
+      reason := "credit or entitlement problem", coversUnscoped := true, notAWindow := true }
+  -- The second reading: a bare rate-limit event, naming a model, knowing neither flag.
+  let fresh : Block :=
+    { untilEpoch := some (now + 3600), model := some "Opus", reason := "usage limit" }
+  let merged : Block :=
+    { model := fresh.model
+      untilEpoch := match fresh.untilEpoch, prior.untilEpoch with
+        | none, _ | _, none => none
+        | some a, some b    => some (max a b)
+      reason := if fresh.notAWindow || !prior.notAWindow then fresh.reason else prior.reason
+      coversUnscoped := fresh.coversUnscoped || prior.coversUnscoped
+      notAWindow := fresh.notAWindow || prior.notAWindow }
+  TestM.assert merged.coversUnscoped
+    (msg := "the later reading does not drop that unnamed tasks are covered")
+  TestM.assert merged.notAWindow
+    (msg := "nor that this is not a window at all")
+  TestM.assertEqual merged.untilEpoch (some (now + 21600))
+    (msg := "and cannot shorten it from six hours to one")
+  TestM.assertEqual merged.reason "credit or entitlement problem"
+    (msg := "the reason keeps explaining the stronger fact")
+
+@[test]
 def sameScope_reconcilesDisplayNameAndModelId : Test := do
   -- `markLimited` upserts by scope. The provider writes "Fable" and a task asks for
   -- "claude-fable-5"; read as different scopes they would accumulate as two blocks on one
@@ -933,6 +962,25 @@ def classifyUsageLimit_theMessageThatEndedTheRunWins : Test := do
   TestM.assertEqual (AgentDef.classifyUsageLimit reversed)
     (AgentDef.LimitScope.family "Opus")
     (msg := "position decides, in either direction")
+
+@[test]
+def classifyUsageLimit_creditsProseDoesNotOutrankTheRealWindow : Test := do
+  -- The credits test used to be a search of the whole text, so an agent that merely wrote
+  -- "credit balance" in its summary turned a one-hour window into a six-hour account-wide block
+  -- with its reset thrown away and a reason telling the operator no reset would clear it.
+  let summary :=
+    "I added a check that refuses the request when the credit balance is too low, " ++
+    "and wired it into the billing page.\n" ++
+    "You've reached your usage limit. Try again after 3pm."
+  TestM.assertEqual (AgentDef.classifyUsageLimit summary)
+    AgentDef.LimitScope.account
+    (msg := "credits prose far from the limit report does not decide it")
+  let entitlement :=
+    "this model requires usage credits before it will run.\n" ++
+    "{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}"
+  TestM.assertEqual (AgentDef.classifyUsageLimit entitlement)
+    AgentDef.LimitScope.account
+    (msg := "and neither does an entitlement phrase the later report has moved past")
 
 @[test]
 def classifyUsageLimit_creditsDoesNotScopeItselfFromStrayProse : Test := do
