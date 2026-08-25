@@ -112,6 +112,73 @@ def parseUnifiedHeaders_bindsARejectedWindowThatIsStillInTheFuture : Test := do
   | .blocked u _ => TestM.assertEqual u (some 1785351600) (msg := "blocked until the 7d reset")
   | .available   => TestM.fail "a rejected weekly window should block the source"
 
+/-- The same account a few days earlier: the weekly window is deep enough into its budget that the
+    server flags it, but every request is still being served. -/
+private def warningHeaders : Array (String × String) := #[
+  ("anthropic-ratelimit-unified-5h-status", "allowed"),
+  ("anthropic-ratelimit-unified-5h-utilization", "0.02"),
+  ("anthropic-ratelimit-unified-5h-reset", "1784867400"),
+  ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+  ("anthropic-ratelimit-unified-7d-utilization", "0.78"),
+  ("anthropic-ratelimit-unified-7d-reset", "1785351600")
+]
+
+@[test]
+def parseUnifiedHeaders_aWarnedWindowIsNotBinding : Test := do
+  -- A window the server is warning about is still a window the server is serving. Reading the
+  -- warning as a rejection idled the account at 78% for the rest of the week.
+  let now := 1785000000
+  let ls := parseUnifiedHeaders warningHeaders
+  match ls.find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l =>
+    TestM.assertEqual l.percent 78 (msg := "0.78 fraction becomes 78 percent")
+    TestM.assertEqual l.severity "warning" (msg := "78% is a warning")
+    TestM.assert (!l.isActive) (msg := "a warned window is not binding")
+  let st : SourceState := { backend := "b", label := "l", limits := ls }
+  TestM.assert (availabilityOf st none now).isAvailable
+    (msg := "a source under its weekly cap stays available")
+
+@[test]
+def parseUnifiedHeaders_anUnrecognisedStatusIsNotBinding : Test := do
+  -- The endpoint already ships states this code has never heard of. One of them appearing must
+  -- not idle the account: an actual refusal is caught by `markLimited` when a run hits it.
+  let hs := warningHeaders.map fun (k, v) =>
+    if k == "anthropic-ratelimit-unified-7d-status" then (k, "queueing") else (k, v)
+  match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l => TestM.assert (!l.isActive) (msg := "an unknown status is usable, not exhausted")
+
+@[test]
+def parseUnifiedHeaders_aRejectionBindsBelowTheLine : Test := do
+  -- The status is the only fail-closed signal the poll has that is not the percentage, so it has
+  -- to be pinned on its own: every other rejected fixture here is also at 100%, and would pass
+  -- with the status ignored entirely. Casing and a `rejected_…` spelling are rejections too.
+  for reported in ["rejected", "REJECTED", "rejected_weekly"] do
+    let hs := warningHeaders.map fun (k, v) =>
+      if k == "anthropic-ratelimit-unified-7d-status" then (k, reported) else (k, v)
+    match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
+    | none   => TestM.fail "expected a weekly_all limit"
+    | some l => TestM.assert l.isActive (msg := s!"{reported} at 78% still binds")
+
+@[test]
+def parseUnifiedHeaders_anAbsentStatusIsAllowed : Test := do
+  -- A window that reports a utilisation but no status at all is served, not withheld.
+  let hs := warningHeaders.filter (·.1 != "anthropic-ratelimit-unified-7d-status")
+  match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l => TestM.assert (!l.isActive) (msg := "no status header means allowed")
+
+@[test]
+def parseUnifiedHeaders_hundredPercentBindsWhateverTheStatusSays : Test := do
+  -- The percentage is the backstop: a window reported as full binds even when the status field
+  -- says something reassuring.
+  let hs := warningHeaders.map fun (k, v) =>
+    if k == "anthropic-ratelimit-unified-7d-utilization" then (k, "1") else (k, v)
+  match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l => TestM.assert l.isActive (msg := "100% binds regardless of status")
+
 @[test]
 def parseUnifiedHeaders_emptyWhenNoUnifiedHeaders : Test := do
   -- A response with no unified headers (a transport error page) yields nothing, and the caller
