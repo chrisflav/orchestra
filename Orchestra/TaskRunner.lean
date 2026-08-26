@@ -697,11 +697,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | some .errorMaxBudgetUsd => .unfinished
       | some (.error _)         => .failed
       | _                       => .completed
-  -- A run that got all the way through is proof the source is usable, which retires any block
-  -- guessed at earlier.
+  -- A run that got all the way through is proof the source is usable *for the model it ran*,
+  -- which retires the blocks that covered that model and leaves the rest standing.
   if finalStatus matches .completed then
     if let some label := authLabel then
-      Usage.markOk (ioTask.backend.getD "claude") label
+      Usage.markOk (ioTask.backend.getD "claude") label ioTask.model
   TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
   -- Release the orchestra-issue claim on terminal status. A worker that succeeded and attached a
   -- PR leaves the issue awaiting review, so only drop the lock (forceRelease) and leave its

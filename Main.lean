@@ -1297,6 +1297,18 @@ private def usageHandler (p : Parsed) : IO UInt32 := do
         | .ok _    => pure ()
       else if pollMode == 1 then
         Usage.ensureFresh appConfig backend label
+      -- The way back from a block that should not be there.
+      --
+      -- An observed block outlives its evidence by design: a poll cannot see a model-scoped
+      -- window or a billing failure, so neither can retire one, and a run that would prove it
+      -- gone is exactly what the block prevents. That is right when the block is right and leaves
+      -- no way out when it is not — a misread message can otherwise only be waited out. This is
+      -- the way out, and it is deliberately manual: nothing infers that a block was wrong.
+      if p.hasFlag "clear_blocks" then
+        let st ← Usage.loadState backend label
+        if !st.blocks.isEmpty then
+          Usage.saveState { st with blocks := #[] }
+          IO.println s!"  {label}: forgot {st.blocks.size} observed block(s)"
       let st ← Usage.loadState backend label
       let verdict := match Usage.availabilityOf st model now with
         | .available          => "available"
@@ -1312,6 +1324,18 @@ private def usageHandler (p : Parsed) : IO UInt32 := do
         if pa > now then
           IO.println s!"    not polling until {Usage.relativeToNow pa now} \
 (the usage endpoint is rate-limiting requests)"
+      -- Blocks before limits, because they are the ones nothing else here can show. The limit
+      -- rows come from polls, and a poll reads the account's own windows only — so a limit
+      -- observed by a run, on one model family, appears in neither the rows below nor the verdict
+      -- above (which is judged for `model`, and defaults to naming none). Without a line of its
+      -- own it appears nowhere, and this is the command an operator asks "why did Fable stop?"
+      for b in st.blocks do
+        if Usage.blockIsLive b now then
+          let scope := match b.model with | some m => m | none => "whole account"
+          let lifts := match b.untilEpoch with
+            | some u => s!", lifts {Usage.relativeToNow u now}"
+            | none   => ""
+          IO.println s!"    observed ({scope}): {b.reason}{lifts}"
       for l in st.limits do
         let scope := match l.scopeModel with | some m => s!" ({m})" | none => ""
         let resets := match l.resetsAt.bind Usage.parseIso8601 with
@@ -1352,6 +1376,7 @@ private def usageCmd : Cmd := `[Cli|
     cached    ;         "Do not poll; report the last stored values"
     refresh   ;         "Force a poll even if the stored values are still fresh"
     select    ;         "Also show which source a task queued now would be dispatched to"
+    clear_blocks;       "Forget limits observed by a run on the selected sources, then report"
     auth_mode : String; "Selection mode to simulate with --select: ordered (default) or distribute"
 ]
 
