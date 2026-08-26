@@ -989,6 +989,19 @@ def usageLimitError_catchesTheEntitlementRefusal : Test := do
     (msg := "and then classifies as credits, scoped to the family it names")
 
 @[test]
+def classifyUsageLimit_readsTheFamilyInEitherWordOrder : Test := do
+  -- The provider writes it both ways. Reading only "reached your <Family> limit" turned
+  -- "<Family> limit reached" into an account-wide block, closing every family on the source for
+  -- a limit that closed one — and for as long as a weekly window runs. Worse than the guess this
+  -- classifier replaced, which at least scoped it to the model the task asked for.
+  TestM.assertEqual (AgentDef.classifyUsageLimit "Opus limit reached · now using Sonnet")
+    (AgentDef.LimitScope.family "Opus")
+    (msg := "family before the phrase")
+  TestM.assertEqual (AgentDef.classifyUsageLimit "You've reached your Opus weekly limit.")
+    (AgentDef.LimitScope.family "Opus")
+    (msg := "the other word order still works")
+
+@[test]
 def classifyUsageLimit_anAccountWindowWithoutTheWordUsage : Test := do
   -- "5-hour limit reached" is a phrase detection already recognised but the marker list did not,
   -- so it produced no window, classified as unknown, and fell back to the model the task asked

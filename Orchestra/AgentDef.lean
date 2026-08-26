@@ -272,7 +272,23 @@ def familyBefore (window marker : String) : Option String :=
 
 /-- Classify a usage-limit message. Only meaningful once `isUsageLimitError` has said there is
     something to classify; on anything else it answers `unknown`, which is the caller's cue to
-    keep whatever it already believed. -/
+    keep whatever it already believed.
+
+    **What this is and is not.** It reads provider prose, so it is a heuristic, and its two
+    verdicts have very different costs when wrong. `family` narrows a block and errs toward
+    dispatching into a wall; `account` and `credits` widen one and err toward idling a source
+    that works — `credits` for six hours that no poll can shorten. `unknown` costs nothing at
+    all, because the caller then does what it did before this existed: scope the block to the
+    model the task asked for.
+
+    So the phrasings it handles are the ones actually observed —
+    "You've reached your Fable 5 limit", the `rate_limit_error` body, "requires usage credits" —
+    plus the mirrored word order, "Opus limit reached". Wordings that put the family somewhere
+    else ("Weekly limit reached for Opus") are read as account-wide, which is the known soft spot:
+    a family name can sit after the phrase in a message that scopes to it *and* in one that
+    merely says what it switched to, and nothing in the text distinguishes those. Widening the
+    search to cover the first would mis-scope the second, so this stops here rather than guessing.
+    Add a case when a real message demands it, not when one can be imagined. -/
 def classifyUsageLimit (output : String) : LimitScope :=
   -- Clamped and lowercased once, here, rather than in each helper: every read below scans this
   -- string, and the caller's input can be a whole run's stderr.
@@ -280,7 +296,11 @@ def classifyUsageLimit (output : String) : LimitScope :=
   match decidingWindow s with
   | none => .unknown
   | some w =>
-  let named := familyNamedIn w
+  -- Both word orders. The provider writes "You've reached your Opus limit" and also "Opus limit
+  -- reached · now using Sonnet", and reading only the first spelling turned the second into an
+  -- account-wide block — closing every family on the source for a limit that closed one, and
+  -- for as long as a weekly window lasts. That is worse than the guess this classifier replaced.
+  let named := (familyNamedIn w).orElse fun _ => familyBefore w "limit reached"
   -- Read from the window, not the text. A credits phrase anywhere in a transcript used to decide
   -- this, which meant an agent that merely wrote "credit balance" in its summary cost the whole
   -- account six hours on a limit that was really a one-hour window — and threw away the reset

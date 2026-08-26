@@ -734,9 +734,15 @@ def mergeBlock (fresh prior : Block) : Block :=
   { model := match fresh.model, prior.model with
       | some a, some b => some (if a.length ≤ b.length then a else b)
       | _,      _      => fresh.model
+    -- A missing expiry is "nobody said", not "never lifts". Treating it as never — which
+    -- `blockIsLive` does, correctly, when that is all a block has — would make it absorbing here:
+    -- one expiry-less block from a hand-edited state file would render every later merge on that
+    -- scope permanent, retirable only by a run that `availabilityOf` will no longer allow.
     untilEpoch := match fresh.untilEpoch, prior.untilEpoch with
-      | none, _ | _, none => none
-      | some a, some b    => some (max a b)
+      | some a, some b => some (max a b)
+      | some a, none   => some a
+      | none,   some b => some b
+      | none,   none   => none
     -- Keep the reason that explains the stronger fact: "no reset will clear this" must not be
     -- replaced by wording implying one will.
     reason := if fresh.notAWindow || !prior.notAWindow then fresh.reason else prior.reason
