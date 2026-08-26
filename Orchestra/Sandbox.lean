@@ -18,6 +18,9 @@ structure LaunchResult where
   sessionId      : Option String
   /-- True if the agent exited because it hit a usage or quota limit. -/
   usageLimitHit  : Bool
+  /-- Which limit the run said it hit. Only meaningful when `usageLimitHit`; `unknown` there
+      means the message named a limit but not which one, and the caller keeps its own guess. -/
+  limitScope     : AgentDef.LimitScope := .unknown
   /-- True if the agent was killed because the cancel token was signalled. -/
   wasCancelled   : Bool := false
   /-- The subtype from the agent's result event, if one was emitted. -/
@@ -469,9 +472,33 @@ goal; running without the goal condition."
       | some (.error _) => 1
       | _               => 0
   let usageLimitHit := agentDef.isUsageLimitError effectiveExit combinedOutput
+  -- Read the same text a second time for *which* limit it was, so the usage store records the
+  -- scope the provider named rather than the model the task happened to ask for.
+  --
+  -- The result event first, and stderr only when it says nothing. The result event *is* the
+  -- provider's message; stderr is the run's own noise that sometimes carries one too, and a
+  -- limit the run recovered from earlier ("reached your Opus limit, now using Sonnet") must not
+  -- outrank the one that actually ended it. Detection above reads both at once because either
+  -- may hold the evidence; attribution has to prefer the authoritative one.
+  --
+  -- And only when the result really is the CLI reporting a failure. `usageLimitHit` was decided
+  -- over both streams at once, so the evidence may live entirely in stderr while the result text
+  -- is an ordinary summary — and a summary written by an agent that spent the run on billing code
+  -- says "credit balance" as readily as a provider does. Testing that textually would use the
+  -- same phrase list that produced the false positive, so the test here is structural instead:
+  -- a subscription limit arrives as an *error* result, and an agent's own summary does not.
+  -- Getting this wrong is expensive in one direction — a summary misread as a credits failure
+  -- closes the whole account for six hours that no poll can shorten.
+  let finalIsProviderError := match resultSubtype with
+    | some (.error _) => true
+    | _               => false
+  let limitScope :=
+    if !usageLimitHit then .unknown
+    else if finalIsProviderError then AgentDef.classifyUsageLimit (resultText.getD "")
+    else AgentDef.classifyUsageLimit stderrContent
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
-  return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype, resultText,
+  return { exitCode, sessionId, usageLimitHit, limitScope, wasCancelled, resultSubtype, resultText,
            rateLimitReset }
 
 /-! ## Streaming mode

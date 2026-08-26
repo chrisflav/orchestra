@@ -1,4 +1,11 @@
-import type { AuthSource, UsageHistory, UsageHistorySource, UsageLimit, UsageWindow } from "../api";
+import type {
+  AuthSource,
+  UsageBlock,
+  UsageHistory,
+  UsageHistorySource,
+  UsageLimit,
+  UsageWindow,
+} from "../api";
 import type { Bar } from "../components/Chart";
 import { Bars } from "../components/Chart";
 import { LivePage, Section } from "../components/Page";
@@ -41,6 +48,28 @@ function Limit({ limit }: { limit: UsageLimit }) {
       <td className="limit-pct">{percent}%</td>
       <td className="limit-reset">{untilTime(limit.resetsAt)}</td>
     </tr>
+  );
+}
+
+/**
+ * One observed block as a line of prose.
+ *
+ * No track, because there is no percentage to draw: a block is not a meter reading but a thing
+ * that happened, and all a reader needs is what closed, why, and until when. It sits above the
+ * limit tracks because it is the fact those tracks cannot show — a poll sees the account's own
+ * windows and nothing scoped to a model family, so a block is the only evidence that one family
+ * has stopped running while the source still reports itself available for the rest.
+ */
+function Block({ block }: { block: UsageBlock }) {
+  const scope = block.model ?? "whole account";
+  return (
+    <li className="source-block">
+      <span className="tag tag-alert">{scope}</span> {block.reason}
+      {block.notAWindow
+        ? " — no reset will clear this"
+        : block.until !== null && ` — lifts ${untilTime(block.until)}`}
+      {block.coversUnscoped && " · also holds back tasks that name no model"}
+    </li>
   );
 }
 
@@ -154,6 +183,14 @@ function Source({
           {source.reason}
           {source.availableAt !== null && ` — frees up ${untilTime(source.availableAt)}`}
         </p>
+      )}
+
+      {source.blocks.length > 0 && (
+        <ul className="source-blocks">
+          {source.blocks.map((block, i) => (
+            <Block key={`${block.model ?? "account"}:${i}`} block={block} />
+          ))}
+        </ul>
       )}
 
       {source.limits.length > 0 ? (

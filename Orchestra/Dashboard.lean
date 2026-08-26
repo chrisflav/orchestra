@@ -531,11 +531,31 @@ private def limitJson (l : Usage.Limit) : Json :=
     ("resetsAt", optNormIso l.resetsAt)
   ]
 
+/-- One recorded block, as the dashboard shows it. -/
+private def blockJson (b : Usage.Block) : Json :=
+  Json.mkObj [
+    ("model",          optStr b.model),
+    ("reason",         Json.str b.reason),
+    ("until",          optEpochIso b.untilEpoch),
+    ("coversUnscoped", Json.bool b.coversUnscoped),
+    ("notAWindow",     Json.bool b.notAWindow)
+  ]
+
 /-- One configured authentication source, joined with whatever the usage store knows about it.
 
     Availability is judged with no model, which is what a reader with no task in hand can ask:
     a `weekly_scoped` limit only closes one model family, so a source carrying nothing but an
-    exhausted scoped limit is genuinely still usable — and the limit rows show it regardless. -/
+    exhausted scoped limit is genuinely still usable.
+
+    Which is why the blocks are reported alongside the limits rather than folded into `state`.
+    The limit rows come from polls, and a poll cannot see a model-scoped window at all — so an
+    observed "Fable is spent here" appears in neither `state` (usually available: other families
+    still run) nor `limits`. Without a row of its own it appears nowhere, and an operator asking
+    why one family stopped being dispatched has nothing to look at.
+
+    "Usually", because a scoped block carrying `coversUnscoped` *does* close the source to a task
+    naming no model, which is what judging with no model asks about — so that one shows up in
+    `state` as well as in its row. -/
 private def authSourceJson (backend : String) (src : AuthSource) (isDefault : Bool) (now : Int)
     : IO Json := do
   let st ← Usage.loadState backend src.label
@@ -566,7 +586,8 @@ private def authSourceJson (backend : String) (src : AuthSource) (isDefault : Bo
     ("lastError",    optStr st.lastError),
     -- Set only while a backoff is still in the future; a lapsed one is not a fact about now.
     ("backoffUntil", optEpochIso (st.pollAfter.filter (· > now))),
-    ("limits",       Json.arr (st.limits.map limitJson))
+    ("limits",       Json.arr (st.limits.map limitJson)),
+    ("blocks",       Json.arr ((st.blocks.filter (Usage.blockIsLive · now)).map blockJson))
   ]
 
 /-- Every configured backend and source, or the reason the config could not be read.

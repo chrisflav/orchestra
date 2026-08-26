@@ -662,9 +662,33 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       -- Record against the source that actually ran, before anything else can be dispatched to
       -- it. The reset time comes from the agent's own `rate_limit_event` when it emitted one;
       -- otherwise `markLimited` falls back to the last poll, then to a default backoff.
+      --
+      -- The *scope* comes from what the provider said, not from what the task asked for. Those
+      -- differ in both directions and both are costly: a Fable task that tripped the
+      -- account-wide session window would close Fable and leave every other family dispatching
+      -- into a spent account, and a task that named no model would close the whole account for
+      -- a limit that only ever covered one family.
+      let (blockModel, blockReason, notAWindow) := match result.limitScope with
+        | .family m    => (some m, s!"agent reported a {m} usage limit", false)
+        | .account     => (none, "agent reported an account-wide usage limit", false)
+        | .credits fam =>
+          -- Not a window: an entitlement or balance problem does not reset on a clock, so the
+          -- hourly default would retry the same doomed run against the same wall all week, and
+          -- a borrowed window reset or a quiet poll would cut it shorter still. Said plainly
+          -- too, because the reason is what `orchestra usage` prints and "waiting for the
+          -- reset" is the wrong thing to be waiting for.
+          (fam, "agent reported a credit or entitlement problem, which no reset will clear", true)
+        | .unknown     => (ioTask.model, "agent reported a usage limit", false)
+      -- A run that named no model took the CLI's default family, and so will the next one. If
+      -- the provider named a family, the block is scoped to it — and would then be invisible to
+      -- exactly the tasks certain to hit it again, because `modelMatchesScope` reads "no model
+      -- named" as matching no scope. Saying that the block also covers unscoped tasks is what
+      -- keeps the guarantee this code had before it knew the family at all.
       if let some label := authLabel then
-        Usage.markLimited backendName label ioTask.model "agent reported a usage limit"
+        Usage.markLimited backendName label blockModel blockReason
           (resetHint := result.rateLimitReset)
+          (coversUnscoped := ioTask.model.isNone)
+          (notAWindow := notAWindow)
       break
     if !(← RepoConfig.hasValidationScript repoPath) then
       IO.println "  No validation script found, skipping validation."
@@ -697,11 +721,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | some .errorMaxBudgetUsd => .unfinished
       | some (.error _)         => .failed
       | _                       => .completed
-  -- A run that got all the way through is proof the source is usable, which retires any block
-  -- guessed at earlier.
+  -- A run that got all the way through is proof the source is usable *for the model it ran*,
+  -- which retires the blocks that covered that model and leaves the rest standing.
   if finalStatus matches .completed then
     if let some label := authLabel then
-      Usage.markOk (ioTask.backend.getD "claude") label
+      Usage.markOk (ioTask.backend.getD "claude") label ioTask.model
   TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
   -- Release the orchestra-issue claim on terminal status. A worker that succeeded and attached a
   -- PR leaves the issue awaiting review, so only drop the lock (forceRelease) and leave its

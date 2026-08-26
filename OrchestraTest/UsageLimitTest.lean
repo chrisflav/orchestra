@@ -15,6 +15,7 @@ The paths that do need those — polling, persistence — are thin wrappers over
 
 deriving instance DecidableEq for LimitKind
 deriving instance DecidableEq for AuthMode
+deriving instance DecidableEq for AgentDef.LimitScope
 
 /-! ## Timestamps
 
@@ -430,10 +431,10 @@ def availability_observedBlockOutranksAQuietPoll : Test := do
   let st : SourceState :=
     { backend := "claude", label := "main"
       limits := #[{ kind := .session, percent := 5 }]
-      block := some { untilEpoch := some (now + 3600), reason := "agent reported a usage limit" } }
+      blocks := #[{ untilEpoch := some (now + 3600), reason := "agent reported a usage limit" }] }
   TestM.assert (!(availabilityOf st (some "claude-opus-4-8") now).isAvailable)
     (msg := "the recorded hit blocks")
-  let expired : SourceState := { st with block := some { st.block.get! with untilEpoch := some (now - 1) } }
+  let expired : SourceState := { st with blocks := #[{ st.blocks[0]! with untilEpoch := some (now - 1) }] }
   TestM.assert ((availabilityOf expired (some "claude-opus-4-8") now).isAvailable)
     (msg := "and stops blocking once its window passes")
 
@@ -441,12 +442,195 @@ def availability_observedBlockOutranksAQuietPoll : Test := do
 def availability_observedBlockCanItselfBeScoped : Test := do
   let st : SourceState :=
     { backend := "claude", label := "main"
-      block := some { untilEpoch := some (now + 3600), model := some "claude-opus-4-8"
-                      reason := "agent reported a usage limit" } }
+      blocks := #[{ untilEpoch := some (now + 3600), model := some "claude-opus-4-8"
+                    reason := "agent reported a usage limit" }] }
   TestM.assert (!(availabilityOf st (some "claude-opus-4-8") now).isAvailable)
     (msg := "blocks the model that hit it")
   TestM.assert ((availabilityOf st (some "claude-sonnet-5") now).isAvailable)
     (msg := "but not a different one")
+
+@[test]
+def availability_twoScopesAreTwoBlocks : Test := do
+  -- The case a single block slot could not hold: an account that is out of Fable for the week
+  -- and out of its session window for the hour. Both are true, and the one that expires first
+  -- must not take the other with it.
+  let st : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[
+        { untilEpoch := some (now + 604800), model := some "Fable", reason := "Fable limit" },
+        { untilEpoch := some (now + 3600), reason := "session limit" }] }
+  TestM.assert (!(availabilityOf st (some "claude-sonnet-5") now).isAvailable)
+    (msg := "the account-wide block covers a model the scoped one does not")
+  let later := now + 7200
+  TestM.assert ((availabilityOf st (some "claude-sonnet-5") later).isAvailable)
+    (msg := "once the session window passes, Sonnet is runnable again")
+  TestM.assert (!(availabilityOf st (some "claude-fable-5") later).isAvailable)
+    (msg := "but Fable is still blocked, and was not forgotten with the session block")
+
+@[test]
+def availability_reportsTheBlockThatLiftsLast : Test := do
+  -- Two blocks can cover one model now. Naming the earlier reset would send the caller back at
+  -- a time the source is still shut, to be turned away and made to wait again.
+  let st : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[
+        { untilEpoch := some (now + 3600), reason := "session limit" },
+        { untilEpoch := some (now + 604800), model := some "Fable", reason := "Fable limit" }] }
+  let reportedReset (s : SourceState) : Option (Option Int) :=
+    match availabilityOf s (some "claude-fable-5") now with
+    | .available   => none
+    | .blocked u _ => some u
+  TestM.assertEqual (reportedReset st) (some (some (now + 604800)))
+    (msg := "the later of the two applicable resets is the one reported")
+  -- Order in the array must not decide it.
+  TestM.assertEqual (reportedReset { st with blocks := st.blocks.reverse })
+    (some (some (now + 604800)))
+    (msg := "and the answer does not depend on insertion order")
+
+@[test]
+def availability_aBlockWithNoExpiryOutlastsOneWithAnExpiry : Test := do
+  let st : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[
+        { untilEpoch := some (now + 3600), reason := "session limit" },
+        { untilEpoch := none, reason := "credit or entitlement problem" }] }
+  match availabilityOf st (some "claude-fable-5") now with
+  | .available   => TestM.fail "an open-ended block still blocks"
+  | .blocked u r => do
+    TestM.assertEqual u none (msg := "no reset time is reported, because there is none to report")
+    TestM.assertEqual r "credit or entitlement problem"
+      (msg := "the reason is the open-ended one, not the window that will pass")
+
+@[test]
+def availability_aScopedHitOnAnUnnamedModelStillHoldsBackUnnamedTasks : Test := do
+  -- The regression that scoping an observed hit to the provider's family would otherwise
+  -- introduce. A queued task names no model, runs the CLI's default family, and is told it has
+  -- reached its Opus limit. Scoped to "Opus" alone the block is invisible to the next task —
+  -- which also names no model, also takes the default, and hits the same wall — because
+  -- `modelMatchesScope` reads "no model named" as matching no scope.
+  let scopedOnly : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[{ untilEpoch := some (now + 3600), model := some "Opus", reason := "Opus" }] }
+  TestM.assert ((availabilityOf scopedOnly none now).isAvailable)
+    (msg := "a poll-derived scoped limit leaves an unnamed task alone, as it always has")
+  let observed : SourceState :=
+    { scopedOnly with
+      blocks := #[{ untilEpoch := some (now + 3600), model := some "Opus", reason := "Opus"
+                    coversUnscoped := true }] }
+  TestM.assert (!(availabilityOf observed none now).isAvailable)
+    (msg := "but an observed hit from an unnamed run holds back the next unnamed run")
+  TestM.assert ((availabilityOf observed (some "claude-sonnet-5") now).isAvailable)
+    (msg := "and still leaves a different family runnable")
+  TestM.assert (!(availabilityOf observed (some "claude-opus-4-8") now).isAvailable)
+    (msg := "and still blocks the family it named")
+
+@[test]
+def markOk_retiresOnlyWhatTheRunDisproves : Test := do
+  -- `markOk`'s filter, exercised directly so the interesting case needs no disk. A completed
+  -- Sonnet run proves the account-wide window has passed and proves nothing about Fable; the
+  -- Fable block has to survive, or the next Fable task rediscovers the limit by hitting it.
+  let blocks : Array Block := #[
+    { untilEpoch := some (now + 604800), model := some "Fable", reason := "Fable limit" },
+    { untilEpoch := some (now + 3600), reason := "session limit" }]
+  let afterSonnet := blocks.filter fun b => blockIsLive b now && !blockApplies b (some "claude-sonnet-5")
+  TestM.assertEqual afterSonnet.size 1 (msg := "one block survives a Sonnet success")
+  TestM.assertEqual (afterSonnet[0]!.model) (some "Fable")
+    (msg := "and it is the Fable one")
+  let afterFable := blocks.filter fun b => blockIsLive b now && !blockApplies b (some "claude-fable-5")
+  TestM.assertEqual afterFable.size 0
+    (msg := "a Fable success retires both the Fable block and the account-wide one")
+
+@[test]
+def markLimited_foldsASecondReadingInsteadOfReplacingIt : Test := do
+  -- Workers run concurrently, so two tasks dispatched to one source before any block existed
+  -- both report the same limit, knowing different things about it. The merge is what stops the
+  -- later, less informed reading dropping what the earlier one learned. Exercised as the pure
+  -- fold `markLimited` performs, so no disk or clock is needed.
+  let prior : Block :=
+    { untilEpoch := some (now + 21600), model := some "Opus"
+      reason := "credit or entitlement problem", coversUnscoped := true, notAWindow := true }
+  -- The second reading: a bare rate-limit event, naming a model id, knowing neither flag.
+  let fresh : Block :=
+    { untilEpoch := some (now + 3600), model := some "claude-opus-4-8", reason := "usage limit" }
+  let merged := mergeBlock fresh prior
+  TestM.assert merged.coversUnscoped
+    (msg := "the later reading does not drop that unnamed tasks are covered")
+  TestM.assert merged.notAWindow
+    (msg := "nor that this is not a window at all")
+  TestM.assertEqual merged.untilEpoch (some (now + 21600))
+    (msg := "and cannot shorten it from six hours to one")
+  TestM.assertEqual merged.reason "credit or entitlement problem"
+    (msg := "the reason keeps explaining the stronger fact")
+  TestM.assertEqual merged.model (some "Opus")
+    (msg := "the broader spelling survives, or the block stops covering tasks asking for 'opus'")
+  -- And the fold does not depend on which reading arrived first.
+  TestM.assertEqual (mergeBlock prior fresh).model (some "Opus")
+    (msg := "which way round the two readings arrive does not change the scope")
+  TestM.assertEqual (mergeBlock prior fresh).untilEpoch (some (now + 21600))
+    (msg := "nor the expiry")
+
+@[test]
+def mergeBlock_aScopeNarrowedByOrderWouldLoseCoverage : Test := do
+  -- Why the broader spelling matters, stated as the thing that actually breaks.
+  let broad : Block := { untilEpoch := some (now + 3600), model := some "Opus" }
+  let narrow : Block := { untilEpoch := some (now + 3600), model := some "claude-opus-4-8" }
+  TestM.assert (blockApplies broad (some "opus"))
+    (msg := "a block scoped to the display name catches a task asking for the alias")
+  TestM.assert (!(blockApplies narrow (some "opus")))
+    (msg := "one scoped to the dated id does not")
+  TestM.assert (blockApplies (mergeBlock narrow broad) (some "opus"))
+    (msg := "so the merge must keep the broader of the two")
+
+@[test]
+def sameScope_reconcilesDisplayNameAndModelId : Test := do
+  -- `markLimited` upserts by scope. The provider writes "Fable" and a task asks for
+  -- "claude-fable-5"; read as different scopes they would accumulate as two blocks on one
+  -- window, each expiring on its own schedule.
+  TestM.assert (sameScope (some "Fable") (some "claude-fable-5"))
+    (msg := "display name and model id are one scope")
+  TestM.assert (sameScope (some "claude-fable-5") (some "Fable"))
+    (msg := "and in the other order too")
+  TestM.assert (sameScope none none) (msg := "account-wide matches account-wide")
+  TestM.assert (!(sameScope none (some "Fable")))
+    (msg := "account-wide is not the same window as a scoped one")
+  TestM.assert (!(sameScope (some "Opus") (some "claude-fable-5")))
+    (msg := "different families are different scopes")
+
+@[test]
+def sourceState_liftsALegacySingleBlock : Test := do
+  -- State files written before blocks were a set carry one `"block"` object. Dropping it on
+  -- upgrade would forget a live limit and send the next task into it.
+  let legacy := "{\"backend\":\"claude\",\"label\":\"main\",\"limits\":[],\
+    \"block\":{\"until_epoch\":1785351600,\"model\":\"Fable\",\"reason\":\"observed\"}}"
+  match Json.parse legacy >>= fun j => (Lean.FromJson.fromJson? j : Except String SourceState) with
+  | .error e => TestM.fail s!"a legacy state file should still parse: {e}"
+  | .ok st   =>
+    TestM.assertEqual st.blocks.size 1 (msg := "the single block is lifted into the set")
+    TestM.assertEqual (st.blocks[0]!.model) (some "Fable") (msg := "with its scope intact")
+
+@[test]
+def sourceState_oneBadBlockDoesNotDropTheRest : Test := do
+  -- Decoding the array as a whole would fail on the bad element, fall through to a `"block"`
+  -- key that is not there, and forget every block the source had — leaving it looking runnable,
+  -- which is the failure the migration exists to prevent, reached by another route.
+  let mixed := "{\"backend\":\"claude\",\"label\":\"main\",\"limits\":[],\"blocks\":[\
+    {\"until_epoch\":1785351600,\"model\":\"Fable\",\"reason\":\"observed\"},\
+    \"not an object\",\
+    {\"until_epoch\":1785351600,\"reason\":\"session\"}]}"
+  match Json.parse mixed >>= fun j => (Lean.FromJson.fromJson? j : Except String SourceState) with
+  | .error e => TestM.fail s!"a partly unreadable block list should still parse: {e}"
+  | .ok st   =>
+    TestM.assertEqual st.blocks.size 2 (msg := "the readable blocks survive the unreadable one")
+    TestM.assertEqual (st.blocks[0]!.model) (some "Fable") (msg := "and keep their scopes")
+
+@[test]
+def sourceState_absentBlocksStayAbsent : Test := do
+  -- The reason `Block`'s decoder rejects non-objects: `getObjValAs?` reads a missing key as
+  -- `Json.null`, and a block with no expiry reads as "blocked forever".
+  let bare := "{\"backend\":\"claude\",\"label\":\"main\",\"limits\":[]}"
+  match Json.parse bare >>= fun j => (Lean.FromJson.fromJson? j : Except String SourceState) with
+  | .error e => TestM.fail s!"a state file with no block should parse: {e}"
+  | .ok st   => TestM.assertEqual st.blocks.size 0 (msg := "no block means no block")
 
 @[test]
 def modelMatchesScope_matchesAliasAndFullId : Test := do
@@ -763,6 +947,175 @@ def usageLimitError_matchesWhatTheCliActuallySays : Test := do
   TestM.assert (AgentDef.stdUsageLimitError 1
       "{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit.\"}")
     (msg := "the API-key 429 body is recognised")
+
+/-! ### Which limit
+
+Detecting a limit is not enough to record one: the scope decides how much of an account gets
+closed, and the message is the only thing that knows it. -/
+
+@[test]
+def classifyUsageLimit_readsTheFamilyTheProviderNamed : Test := do
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit
+      "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models.")
+    (AgentDef.LimitScope.family "Fable")
+    (msg := "the family in the message, not the model the task asked for")
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit "You've reached your Opus limit for this week.")
+    (AgentDef.LimitScope.family "Opus")
+    (msg := "another family, same shape")
+
+@[test]
+def classifyUsageLimit_anUnscopedWindowIsAccountWide : Test := do
+  -- The direction that costs the most: a Fable task tripping the account-wide session window.
+  -- Scoped to Fable, every other family keeps dispatching into an account with nothing left.
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit "You've reached your usage limit. Try again after 3pm.")
+    AgentDef.LimitScope.account
+    (msg := "a window that names no family closes the account, not one model")
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit
+      "{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit.\"}")
+    AgentDef.LimitScope.account
+    (msg := "a transport-level 429 carries no model scope")
+
+@[test]
+def classifyUsageLimit_creditsAreNotAWindow : Test := do
+  -- anthropics/claude-code#79597: the client refuses Fable on a plan that covers it, because a
+  -- setup-token cannot state the plan. That never clears on a clock, so it must not be recorded
+  -- as a window someone can wait out.
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit "Fable requires usage credits to use. Add credits to continue.")
+    (AgentDef.LimitScope.credits (some "Fable"))
+    (msg := "an entitlement refusal keeps the family and is marked as not-a-window")
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit "Your credit balance is too low to run this request.")
+    (AgentDef.LimitScope.credits none)
+    (msg := "a balance problem with no family named")
+
+@[test]
+def classifyUsageLimit_saysUnknownRatherThanGuessing : Test := do
+  -- `unknown` is what makes this safe to land: the caller falls back to the model the task
+  -- asked for, which is exactly what it did before classification existed.
+  TestM.assertEqual (AgentDef.classifyUsageLimit "quota exceeded")
+    AgentDef.LimitScope.unknown
+    (msg := "a phrase with no scope in it does not invent one")
+
+@[test]
+def classifyUsageLimit_doesNotReadAFamilyOutOfAWholeTranscript : Test := do
+  -- The text classified is a whole run's stderr with the final result appended, not a provider
+  -- message. An unbounded span after a marker phrase would hand the family search the entire
+  -- transcript, and an account-wide failure would be recorded as a one-family block — leaving
+  -- every other family dispatching into a spent account.
+  let transcript :=
+    "reached the maximum number of retries; switching the reviewer to Sonnet and continuing " ++
+    String.ofList (List.replicate 500 'x') ++
+    " This request would exceed your account's rate limit."
+  TestM.assertEqual (AgentDef.classifyUsageLimit transcript)
+    AgentDef.LimitScope.account
+    (msg := "a family named far from any 'limit' does not scope the block")
+  -- The provider's real message lands *after* the stderr, so an early false marker must not
+  -- outvote it: every occurrence is examined, not just the first.
+  let both :=
+    "reached the end of the Sonnet migration notes\n" ++
+    "You've reached your Fable 5 limit."
+  TestM.assertEqual (AgentDef.classifyUsageLimit both)
+    (AgentDef.LimitScope.family "Fable")
+    (msg := "the real message wins over an earlier marker that named nothing")
+
+@[test]
+def classifyUsageLimit_theMessageThatEndedTheRunWins : Test := do
+  -- stderr carries a limit the run recovered from and kept going; the result event carries the
+  -- one that actually stopped it. Reading the first match rather than the last would scope an
+  -- account-wide block to Opus and leave every other family dispatching into a spent account.
+  let text :=
+    "You've reached your Opus limit, now using Sonnet\n" ++
+    "You've reached your usage limit."
+  TestM.assertEqual (AgentDef.classifyUsageLimit text)
+    AgentDef.LimitScope.account
+    (msg := "the later message decides, not the earlier one")
+  -- And the other way round, so this is about position and not about preferring `account`.
+  let reversed :=
+    "You've reached your usage limit.\n" ++
+    "You've reached your Opus limit."
+  TestM.assertEqual (AgentDef.classifyUsageLimit reversed)
+    (AgentDef.LimitScope.family "Opus")
+    (msg := "position decides, in either direction")
+
+@[test]
+def usageLimitError_catchesTheEntitlementRefusal : Test := do
+  -- anthropics/claude-code#79597. Detection has to fire on this or nothing downstream runs: the
+  -- task comes back `failed` rather than `unfinished`, no block is recorded, and the next queued
+  -- task is dispatched into the same refusal. Every branch built for the credits case was
+  -- unreachable until this phrase was recognised.
+  let refusal := "Fable requires usage credits to use. Add credits to continue."
+  TestM.assert (AgentDef.stdUsageLimitError 1 refusal)
+    (msg := "the entitlement refusal is recognised as a limit at all")
+  TestM.assertEqual (AgentDef.classifyUsageLimit refusal)
+    (AgentDef.LimitScope.credits (some "Fable"))
+    (msg := "and then classifies as credits, scoped to the family it names")
+
+@[test]
+def classifyUsageLimit_readsTheFamilyInEitherWordOrder : Test := do
+  -- The provider writes it both ways. Reading only "reached your <Family> limit" turned
+  -- "<Family> limit reached" into an account-wide block, closing every family on the source for
+  -- a limit that closed one — and for as long as a weekly window runs. Worse than the guess this
+  -- classifier replaced, which at least scoped it to the model the task asked for.
+  TestM.assertEqual (AgentDef.classifyUsageLimit "Opus limit reached · now using Sonnet")
+    (AgentDef.LimitScope.family "Opus")
+    (msg := "family before the phrase")
+  TestM.assertEqual (AgentDef.classifyUsageLimit "You've reached your Opus weekly limit.")
+    (AgentDef.LimitScope.family "Opus")
+    (msg := "the other word order still works")
+
+@[test]
+def classifyUsageLimit_anAccountWindowWithoutTheWordUsage : Test := do
+  -- "5-hour limit reached" is a phrase detection already recognised but the marker list did not,
+  -- so it produced no window, classified as unknown, and fell back to the model the task asked
+  -- for — recording an account-wide limit as a block on whichever family happened to be running.
+  TestM.assertEqual (AgentDef.classifyUsageLimit "5-hour limit reached ∙ resets 3pm")
+    AgentDef.LimitScope.account
+    (msg := "an account-wide limit that never says 'usage' is still account-wide")
+
+@[test]
+def classifyUsageLimit_creditsProseDoesNotOutrankTheRealWindow : Test := do
+  -- The credits test used to be a search of the whole text, so an agent that merely wrote
+  -- "credit balance" in its summary turned a one-hour window into a six-hour account-wide block
+  -- with its reset thrown away and a reason telling the operator no reset would clear it.
+  let summary :=
+    "I added a check that refuses the request when the credit balance is too low, " ++
+    "and wired it into the billing page.\n" ++
+    "You've reached your usage limit. Try again after 3pm."
+  TestM.assertEqual (AgentDef.classifyUsageLimit summary)
+    AgentDef.LimitScope.account
+    (msg := "credits prose far from the limit report does not decide it")
+  let entitlement :=
+    "this model requires usage credits before it will run.\n" ++
+    "{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}"
+  TestM.assertEqual (AgentDef.classifyUsageLimit entitlement)
+    AgentDef.LimitScope.account
+    (msg := "and neither does an entitlement phrase the later report has moved past")
+
+@[test]
+def classifyUsageLimit_creditsDoesNotScopeItselfFromStrayProse : Test := do
+  -- Same hazard on the credits path, and worse: a wrongly scoped credits block leaves the rest
+  -- of the account dispatching into a hard billing failure that no reset will clear.
+  let transcript :=
+    "I moved the reviewer to Opus.\n" ++ String.ofList (List.replicate 300 'y') ++
+    "\nYour credit balance is too low to run this request."
+  TestM.assertEqual (AgentDef.classifyUsageLimit transcript)
+    (AgentDef.LimitScope.credits none)
+    (msg := "a family mentioned elsewhere in the run does not scope a credits block")
+
+@[test]
+def classifyUsageLimit_doesNotReadFamiliesOutOfOrdinaryProse : Test := do
+  -- The span between "your" and "limit" is what is searched, not the whole output. A coding
+  -- agent mentions model names routinely, and stderr is part of the text being classified.
+  TestM.assertEqual
+    (AgentDef.classifyUsageLimit
+      "I switched the reviewer to Opus. You've reached your usage limit.")
+    AgentDef.LimitScope.account
+    (msg := "a family mentioned elsewhere does not scope the block")
 
 @[test]
 def usageLimitError_doesNotFireOnOrdinaryOutput : Test := do

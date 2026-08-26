@@ -131,7 +131,201 @@ def stdUsageLimitError (exitCode : UInt32) (output : String) : Bool :=
     containsCI s "exceed your" ||
     containsCI s "exceeded your" ||
     containsCI s "insufficient credits" ||
-    containsCI s "credit balance")
+    containsCI s "credit balance" ||
+    -- anthropics/claude-code#79597, verbatim: the client refuses a model the subscription covers
+    -- because a setup-token cannot state the plan, and says it "requires usage credits". Without
+    -- this the run is not a limit at all — it comes back `failed` rather than `unfinished`,
+    -- nothing is recorded against the source, and the next queued task is dispatched straight
+    -- into it again. Not a bare "usage credits": the ordinary limit message ends "Run
+    -- /usage-credits to continue", which is a window with a reset and not this.
+    containsCI s "requires usage credits")
+
+/-! ## What the limit was about
+
+`stdUsageLimitError` answers whether a run hit a limit. That is not enough to record one, because
+the answer decides how much of an account to close: a limit the provider attributed to one model
+family leaves the rest of the account perfectly runnable, an account-wide window closes all of it,
+and an entitlement problem is not a window at all — it does not reset on a clock, so waiting for it
+is waiting forever.
+
+The message says which. It was already being read and thrown away. -/
+
+/-- Which limit a usage-limit message describes. -/
+inductive LimitScope where
+  /-- The provider named a model family: "You've reached your Fable 5 limit." -/
+  | family (name : String)
+  /-- A window that names no model — a session or weekly total, or a transport-level 429. -/
+  | account
+  /-- Credits or entitlement rather than a window, carrying the family when one was named. -/
+  | credits (family : Option String)
+  /-- A limit phrase matched but nothing in it says which limit. The caller falls back to
+      whatever it already assumed, so classifying is never worse than not classifying. -/
+  | unknown
+deriving Repr, BEq, Inhabited
+
+/-- The families a limit message can name, as the lowercase needle to look for and the display
+    name to record.
+
+    Display names rather than model ids, because that is what the usage store scopes by and what
+    the provider writes: the message says "Fable", the task asked for `claude-fable-5`, and
+    `Usage.modelMatchesScope` is what reconciles the two. -/
+def limitFamilies : List (String × String) :=
+  [("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
+
+/-- How much text after a marker phrase may name the family.
+
+    "reached your Fable 5 limit" puts twelve characters between the two. The text being classified
+    is not a provider message but a whole run's stderr with the final result appended, so an
+    unbounded span is the difference between reading a limit message and reading a transcript —
+    and a transcript mentions model names routinely. -/
+def familySpanChars : Nat := 40
+
+/-- How much of the classified text is worth reading at all.
+
+    A limit message is the last thing said, so the tail is where it is. Clamping here is what
+    keeps the rest of this file cheap: the caller may hand it a whole failing run's stderr, which
+    is measured in megabytes, and every helper below would otherwise walk all of it. -/
+def classifyTailChars : Nat := 4096
+
+-- `String.take` and `String.takeEnd` walk only the characters they keep and return a slice
+-- without copying the rest, which is the point: the input here can be a whole failing run's
+-- stderr, and clamping it by materialising a `List Char` of every character first would cost more
+-- than the scan it exists to avoid.
+private def clampAfter (s : String) : String :=
+  (s.take familySpanChars).toString
+
+private def clampBefore (s : String) : String :=
+  (s.takeEnd familySpanChars).toString
+
+/-- The last `classifyTailChars` characters of `s`: where a limit message is, if there is one. -/
+private def clampTail (s : String) : String :=
+  (s.takeEnd classifyTailChars).toString
+
+/-- Every occurrence of `marker` in `s`, as (position, the text before it, the text after it),
+    latest first.
+
+    Position is the whole point. The provider's message is the *last* thing in the text, so a
+    limit notice the run recovered from earlier ("You've reached your Opus limit, now using
+    Sonnet") must not outrank the one that actually ended it. -/
+private def markerHits (s marker : String) : List (Nat × String × String) :=
+  match s.splitOn marker with
+  | []      => []
+  | p :: ps =>
+    (ps.foldl (init := (p.length, p, ([] : List (Nat × String × String))))
+      fun (off, prev, acc) seg =>
+        (off + marker.length + seg.length, seg, (off, prev, seg) :: acc)).2.2
+
+private def familyIn (span : String) : Option String :=
+  (limitFamilies.find? fun (needle, _) => containsCI span needle).map (·.2)
+
+/-- Phrases that mark a limit being reported somewhere in the text.
+
+    Both halves of the classification hang off these. The *last* occurrence of any of them is the
+    report that ended the run, and everything else is read from a short window around that one
+    occurrence — never from the text at large. An agent that discussed a model family, or a credit
+    balance, earlier in its run must not get to decide how much of an account gets closed.
+
+    Every phrase `stdUsageLimitError` detects on belongs here, or a message it recognises would
+    produce no window at all and classify as `unknown` — which falls back to the model the task
+    asked for, and so records an *account-wide* limit like "5-hour limit reached" as a block on
+    whatever family happened to be running.
+
+    "reached the " is deliberately *not* here, though `familyNamedIn` still opens spans on it
+    inside a window. It is the one phrase common in ordinary prose ("reached the maximum number
+    of retries"), so letting it decide *where* the deciding report is would let stray output move
+    the window off the real message. -/
+private def limitMarkers : List String :=
+  ["reached your ", "exceeded your ", "exceed your ",
+   "usage limit", "weekly limit", "rate limit", "limit reached", "rate_limit_error",
+   "insufficient credits", "credit balance", "requires usage credits"]
+
+/-- The window around the deciding limit report: `familySpanChars` of context either side of the
+    last marker occurrence, or `none` when nothing in the text reports a limit at all. -/
+private def decidingWindow (lowered : String) : Option String :=
+  let hits := limitMarkers.flatMap fun m =>
+    (markerHits lowered m).map fun (pos, before, after) =>
+      (pos, clampBefore before ++ m ++ clampAfter after)
+  ((hits.toArray.qsort fun a b => a.1 > b.1).toList.head?).map (·.2)
+
+/-- The family named between "your" and "limit" inside `window`, if it names one.
+
+    Bounded twice over: the window is already short, and within it only the span between the
+    marker and the next "limit" is searched. Both bounds earn their keep — a bare search for
+    "fable" would fire on an agent that merely mentioned the model, and taking everything after a
+    marker when no "limit" follows would hand the search the rest of the window. -/
+def familyNamedIn (window : String) : Option String :=
+  let spans := ["reached your ", "exceeded your ", "exceed your ", "reached the "].flatMap
+    (markerHits window)
+  let ranked := spans.toArray.qsort (fun a b => a.1 > b.1)
+  let lastSpan := ranked.toList.findSome? fun (_, _, after) =>
+    match (clampAfter after).splitOn "limit" with
+    | span :: _ :: _ => some span
+    | _              => none
+  lastSpan.bind familyIn
+
+/-- The family named just before `marker`, for the phrasing that puts it there: "Fable requires
+    usage credits". Bounded the same way and for the same reason. -/
+def familyBefore (window marker : String) : Option String :=
+  match (window.splitOn marker).dropLast.reverse with
+  | []            => none
+  | before :: _   => familyIn (clampBefore before)
+
+/-- Classify a usage-limit message. Only meaningful once `isUsageLimitError` has said there is
+    something to classify; on anything else it answers `unknown`, which is the caller's cue to
+    keep whatever it already believed.
+
+    **What this is and is not.** It reads provider prose, so it is a heuristic, and its two
+    verdicts have very different costs when wrong. `family` narrows a block and errs toward
+    dispatching into a wall; `account` and `credits` widen one and err toward idling a source
+    that works — `credits` for six hours that no poll can shorten. `unknown` costs nothing at
+    all, because the caller then does what it did before this existed: scope the block to the
+    model the task asked for.
+
+    So the phrasings it handles are the ones actually observed —
+    "You've reached your Fable 5 limit", the `rate_limit_error` body, "requires usage credits" —
+    plus the mirrored word order, "Opus limit reached". Wordings that put the family somewhere
+    else ("Weekly limit reached for Opus") are read as account-wide, which is the known soft spot:
+    a family name can sit after the phrase in a message that scopes to it *and* in one that
+    merely says what it switched to, and nothing in the text distinguishes those. Widening the
+    search to cover the first would mis-scope the second, so this stops here rather than guessing.
+    Add a case when a real message demands it, not when one can be imagined. -/
+def classifyUsageLimit (output : String) : LimitScope :=
+  -- Clamped and lowercased once, here, rather than in each helper: every read below scans this
+  -- string, and the caller's input can be a whole run's stderr.
+  let s := (clampTail output).toLower
+  match decidingWindow s with
+  | none => .unknown
+  | some w =>
+  -- Both word orders. The provider writes "You've reached your Opus limit" and also "Opus limit
+  -- reached · now using Sonnet", and reading only the first spelling turned the second into an
+  -- account-wide block — closing every family on the source for a limit that closed one, and
+  -- for as long as a weekly window lasts. That is worse than the guess this classifier replaced.
+  let named := (familyNamedIn w).orElse fun _ => familyBefore w "limit reached"
+  -- Read from the window, not the text. A credits phrase anywhere in a transcript used to decide
+  -- this, which meant an agent that merely wrote "credit balance" in its summary cost the whole
+  -- account six hours on a limit that was really a one-hour window — and threw away the reset
+  -- time that would have lifted it.
+  --
+  -- "requires usage credits", not a bare "usage credits": the ordinary subscription-limit message
+  -- ends "Run /usage-credits to continue or switch models", and that is a window with a reset,
+  -- not a balance problem. Only the hyphen separates the two today; the phrase does not.
+  if containsCI w "insufficient credits" || containsCI w "credit balance"
+     || containsCI w "requires usage credits" then
+    -- A credits message does not always route the family through a "your … limit" span: the
+    -- entitlement refusal reads "Fable requires usage credits", with the family in front.
+    .credits (named.orElse fun _ => familyBefore w "requires usage credits")
+  else match named with
+  | some f => .family f
+  | none   =>
+    -- A message that names a limit but no family is about the account. "rate limit" is safe to
+    -- read that way *here* and would not be safe on its own: this is reached only from inside a
+    -- window built around a limit report, so the agent that merely discussed a rate limiter never
+    -- arrives. Ambiguity resolves toward the account on purpose — over-blocking costs an hour of
+    -- one source, under-blocking costs a clone and a run per queued task.
+    if containsCI w "rate_limit_error" || containsCI w "rate limit"
+       || containsCI w "usage limit" || containsCI w "weekly limit"
+       || containsCI w "limit reached" then .account
+    else .unknown
 
 end AgentDef
 
