@@ -1946,7 +1946,7 @@
       },
       "AuthSource": {
         "type": "object",
-        "required": ["label", "backend", "kind", "baseUrl", "isDefault", "pollable", "state", "reason", "availableAt", "pressure", "polledAt", "lastUsedAt", "lastError", "backoffUntil", "limits"],
+        "required": ["label", "backend", "kind", "baseUrl", "isDefault", "pollable", "state", "reason", "availableAt", "pressure", "polledAt", "lastUsedAt", "lastError", "backoffUntil", "limits", "blocks"],
         "properties": {
           "label": { "type": "string" },
           "backend": { "type": "string", "description": "Agent backend this source belongs to." },
@@ -1962,7 +1962,17 @@
           "lastUsedAt": { "type": ["string", "null"], "format": "date-time" },
           "lastError": { "type": ["string", "null"] },
           "backoffUntil": { "type": ["string", "null"], "format": "date-time", "description": "Set only while a polling backoff is still in the future." },
-          "limits": { "type": "array", "items": { "$ref": "#/components/schemas/UsageLimit" } }
+          "limits": { "type": "array", "items": { "$ref": "#/components/schemas/UsageLimit" } },
+          "blocks": { "type": "array", "items": { "$ref": "#/components/schemas/UsageBlock" }, "description": "Limits observed by a run rather than reported by a poll, and still in force. Reported separately from `limits` because a poll cannot see a model-scoped window at all, and separately from `state` because a source whose only block is scoped to one model family is genuinely still available for the others." }
+        }
+      },
+      "UsageBlock": {
+        "type": "object",
+        "required": ["model", "reason", "until"],
+        "properties": {
+          "model": { "type": ["string", "null"], "description": "The model family this block covers. `null` closes the whole account." },
+          "reason": { "type": "string", "description": "What the run reported." },
+          "until": { "type": ["string", "null"], "format": "date-time", "description": "When the block lifts, if anything reported or guessed a time." }
         }
       },
       "AuthBackend": {
