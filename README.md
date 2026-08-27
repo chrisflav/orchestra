@@ -580,6 +580,9 @@ Fields:
 - `triage_add_labels` / `triage_remove_labels` — labels the `triage` backend applies
 - `project_id` / `issue_id` / `role` — set by the project subsystem; see
   [projects, issues and roles](#projects-issues-and-roles)
+- `spawn_policy` — what this task may itself put on the queue through the `queue_task` tool, and
+  how much of it. Absent means nothing, and the tool is not offered →
+  [queueing tasks from inside a task](docs/queue-task.md)
 
 ## repository-independent tasks
 
@@ -705,6 +708,15 @@ configuration.
 
   The `comment` tool requires the task to carry an `issue_number` (set automatically by the
   listener when triggered from an issue or pull request).
+
+- `queue_task` — put a task on orchestra's queue for an agent to pick up, optionally bound to a
+  taxis issue and claiming it. This is the one tool the `tools` list cannot enable: what it may do
+  — which backends, models, tools and repositories a queued task may be given, how many may be
+  queued, whether an issue may be claimed — is written in the task's `spawn_policy`, and a task
+  without one is not offered the tool at all. Everything the agent omits is inherited from the
+  queueing task, so an empty policy still lets it queue more of itself and nothing else, and a
+  queued task never carries a policy of its own → [queueing tasks from inside a
+  task](docs/queue-task.md)
 
 Three more tool groups — `manage_issues`, `work_issues`, `review_issues` — are available when a
 task carries them in its `tools` list, backing orchestra's project/issue/claim workflow (a taxis

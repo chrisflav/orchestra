@@ -903,7 +903,7 @@
       "post": {
         "tags": ["roles"],
         "summary": "Create a role",
-        "description": "The body is the role document itself, and the name comes from its `name` field. Refuses to overwrite.\n\n`permissions` is checked against the tool groups the sandbox actually grants (`create_pr`, `comment`, `label_issue`, `manage_issues`, `work_issues`, `review_issues`); a typo there is otherwise invisible until a dispatched agent finds itself without the tool it was told to use.",
+        "description": "The body is the role document itself, and the name comes from its `name` field. Refuses to overwrite.\n\n`permissions` is checked against the tool groups the sandbox actually grants (`create_pr`, `comment`, `label_issue`, `manage_issues`, `work_issues`, `review_issues`); a typo there is otherwise invisible until a dispatched agent finds itself without the tool it was told to use.\n\nA `spawn_policy`, if present, is checked against the same list: what a role may hand to a task it queues is bounded by what a role may itself be granted, so `queue_task` cannot become a way around this check.",
         "operationId": "createRole",
         "requestBody": {
           "required": true,
@@ -1619,7 +1619,7 @@
       "QueueEntry": {
         "type": "object",
         "description": "Work waiting or running. Becomes a Task when it is claimed; `taskId` is that run.",
-        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey"],
+        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy"],
         "properties": {
           "id": { "type": "string" },
           "status": { "$ref": "#/components/schemas/QueueStatus" },
@@ -1633,7 +1633,8 @@
           "model": { "type": ["string", "null"] },
           "taskId": { "type": ["string", "null"], "description": "The run this entry became, once claimed." },
           "concertId": { "type": ["string", "null"] },
-          "concertStepKey": { "type": ["string", "null"] }
+          "concertStepKey": { "type": ["string", "null"] },
+          "spawnedBy": { "type": ["string", "null"], "description": "The task that queued this entry with the `queue_task` tool, when one did. Without it an entry that appeared out of a running agent's turn is indistinguishable from one a person added." }
         }
       },
       "Task": {
@@ -1764,7 +1765,8 @@
           "read_only": { "type": "boolean", "default": false },
           "priority": { "type": "integer", "default": 10 },
           "budget": { "type": "number", "description": "Maximum spend in USD." },
-          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" }
+          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" },
+          "spawn_policy": { "$ref": "#/components/schemas/SpawnPolicy" }
         },
         "additionalProperties": true
       },
@@ -1779,9 +1781,29 @@
           "preClaim": { "type": "boolean", "description": "For `has_open_issues` roles: claim the issue at spawn time." }
         }
       },
+      "SpawnPolicy": {
+        "type": "object",
+        "nullable": true,
+        "description": "What a task may itself put on the queue through the `queue_task` MCP tool. Absent (`null`) means nothing, and the tool is not offered at all \u2014 there is no permission label that enables it without a policy, since a label would be a second switch carrying none of the bounds. Every list *widens* what the agent may name; omitting a field always means \"the same as the queueing task's\", so an empty policy still lets a task queue a copy of itself and nothing else.",
+        "properties": {
+          "backends": { "type": "array", "items": { "type": "string" }, "description": "Backends a queued task may be put on. Empty: only the queueing task's own." },
+          "models": { "type": "array", "items": { "type": "string" }, "description": "Models a queued task may be put on. Empty: only the queueing task's own. Not checked against the backend \u2014 orchestra holds no per-backend model list, and one written here would go stale on the vendor's schedule." },
+          "tools": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["create_pr", "comment", "label_issue", "manage_issues", "work_issues", "review_issues"] },
+            "description": "Tools a queued task may be granted, validated against the same vocabulary as a role's `permissions`. May name tools the queueing task does not hold \u2014 a read-only planner queueing an implementor that can open a pull request is the case this exists for \u2014 and what that task already holds is grantable without being listed."
+          },
+          "repos": { "type": "array", "items": { "type": "string" }, "description": "Upstream repositories (`owner/name`) a queued task may run against. Empty: only the queueing task's own. The fork is never named here; it is resolved when the task is queued, by the rule every other dispatch path uses." },
+          "max_tasks": { "type": "integer", "default": 1, "description": "How many tasks one task may queue over its whole run, counted over the queue rather than in memory so a daemon restart cannot reset it. Terminal entries count: the ceiling is on work created, not work still running." },
+          "allow_pre_claim": { "type": "boolean", "default": false, "description": "Whether the tool may claim the issue it binds, taking it out of every dispatcher's candidate set until the queued task ends." },
+          "max_budget": { "type": "number", "description": "Ceiling in USD, and the budget a queued task gets when the agent names none. A budget over it is refused with the ceiling in it rather than silently lowered. Absent means the agent may not name a budget at all \u2014 closed like every other field \u2014 and a queued task takes orchestra's own default." },
+          "priority": { "type": "integer", "default": 10, "description": "Priority of the queued task. Operator-set; the agent has no say, since a priority is only meaningful against every other entry in the queue." },
+          "read_only": { "type": "boolean", "description": "Whether the queued task's workspace is mounted read-only. Absent inherits the queueing task's own answer, so an empty policy cannot hand a read-only task a read-write child." }
+        }
+      },
       "Role": {
         "type": "object",
-        "required": ["name", "permissions", "backend", "model", "priority", "readOnly", "budgetUsd", "dispatch"],
+        "required": ["name", "permissions", "backend", "model", "priority", "readOnly", "budgetUsd", "dispatch", "spawnPolicy"],
         "description": "A global role, as the API renders it.",
         "properties": {
           "name": { "type": "string" },
@@ -1791,7 +1813,8 @@
           "priority": { "type": "integer" },
           "readOnly": { "type": "boolean" },
           "budgetUsd": { "type": ["number", "null"] },
-          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" }
+          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" },
+          "spawnPolicy": { "$ref": "#/components/schemas/SpawnPolicy" }
         }
       },
       "RoleDetail": {
@@ -1881,7 +1904,7 @@
       "ListenerAction": {
         "type": "object",
         "description": "The task a listener enqueues when its source matches.",
-        "required": ["mode", "upstream", "fork", "series", "backend", "model", "workflowPath", "priority", "promptTemplate"],
+        "required": ["mode", "upstream", "fork", "series", "backend", "model", "workflowPath", "priority", "promptTemplate", "spawnPolicy"],
         "properties": {
           "mode": { "type": "string", "enum": ["fork", "pr"] },
           "upstream": { "type": "string" },
@@ -1891,7 +1914,8 @@
           "model": { "type": ["string", "null"] },
           "workflowPath": { "type": ["string", "null"], "description": "Set when the listener enqueues a whole concert." },
           "priority": { "type": "integer" },
-          "promptTemplate": { "type": "string" }
+          "promptTemplate": { "type": "string" },
+          "spawnPolicy": { "$ref": "#/components/schemas/SpawnPolicy" }
         }
       },
       "IssueCounts": {

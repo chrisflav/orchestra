@@ -168,6 +168,25 @@ structure QueueEntry where
   triageRemoveLabels : List String := []
   /-- Name of the listener that created this entry, if any. -/
   listenerName : Option String := none
+  /-- What the task this entry becomes may itself put on the queue (`Orchestra.Spawn`).
+      `none` means nothing, and the `queue_task` tool is not offered to it.
+
+      Deliberately not inherited by a continuation, unlike the fields `TaskStore.TaskRecord`
+      carries across one: `max_tasks` is counted per spawning task id, so a continuation that
+      carried the policy would take a fresh allowance under its new id — the exact reset that
+      counting over the queue rather than in memory exists to prevent. A continuation that should
+      queue work is one to give a policy of its own. -/
+  spawnPolicy : Option SpawnPolicy := none
+  /-- The id of the task that queued this entry through `queue_task`, when one did.
+
+      Provenance, and the counter behind `SpawnPolicy.maxTasks`: the ceiling is enforced by
+      counting the entries carrying a task's id rather than by a tally in memory, so a daemon
+      restart mid-run cannot hand an agent its whole allowance a second time. -/
+  spawnedBy : Option String := none
+  /-- The subtree this entry's task may write at or below, overriding what it would derive from
+      its own issue and project (`Config.IOTask.scopeRoot`). Set only on an entry `queue_task`
+      created, where it holds the queueing task's own scope. -/
+  scopeRoot : Option Taxis.IssueId := none
 
 /-- The pool this entry draws its workspace slot from.
 
@@ -220,6 +239,9 @@ instance : ToJson QueueEntry where
     let fields := if !e.triageAddLabels.isEmpty   then fields ++ [("triage_add_labels",    ToJson.toJson e.triageAddLabels)]   else fields
     let fields := if !e.triageRemoveLabels.isEmpty then fields ++ [("triage_remove_labels", ToJson.toJson e.triageRemoveLabels)] else fields
     let fields := if let some s := e.listenerName then fields ++ [("listener_name", Json.str s)]      else fields
+    let fields := if let some p := e.spawnPolicy  then fields ++ [("spawn_policy",  ToJson.toJson p)] else fields
+    let fields := if let some s := e.spawnedBy    then fields ++ [("spawned_by",    Json.str s)]      else fields
+    let fields := if let some r := e.scopeRoot    then fields ++ [("scope_root",    ToJson.toJson r)]  else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -262,12 +284,20 @@ instance : FromJson QueueEntry where
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
     let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
     let listenerName := j.getObjValAs? String "listener_name"    |>.toOption
+    -- Lenient, unlike the role and listener documents that carry the same field. Those are
+    -- written by hand, so a typo there is worth refusing; a queue entry is written by orchestra
+    -- itself, so nothing here can be typed wrong — and `loadEntry` turns *any* decode failure
+    -- into "no such entry", which for an entry holding a pre-claimed issue would mean a task
+    -- that never runs, never appears in the queue, and a claim nobody ever releases.
+    let spawnPolicy  := (parseSpawnPolicy? j).toOption.getD none
+    let spawnedBy    := j.getObjValAs? String "spawned_by"       |>.toOption
+    let scopeRoot    := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
     return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
-             listenerName }
+             listenerName, spawnPolicy, spawnedBy, scopeRoot }
 
 -- Directories and paths
 

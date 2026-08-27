@@ -339,6 +339,144 @@ instance : FromJson AuthMode where
       | none   => .error s!"expected \"ordered\" or \"distribute\", got \"{s}\""
     | j => .error s!"expected auth mode string, got {j}"
 
+/-- What a task may queue, and how much of it, through the `queue_task` MCP tool. Absent from a
+    task's config means the task cannot queue anything: `queue_task` is not offered at all,
+    rather than offered and always refused.
+
+    Lives here rather than beside the tool for the same reason `AuthMode` does — tasks, queue
+    entries, listener actions and roles all carry one. `Orchestra.Spawn` holds the rules it
+    states and the module doc that explains them.
+
+    Every list is a *widening*: it says what the agent may name instead of inheriting the
+    spawning task's own value. Empty — the default on every field — means it may name nothing,
+    which still leaves it able to queue a copy of itself. -/
+structure SpawnPolicy where
+  /-- Backends a queued task may be put on. Empty: only the spawning task's own. -/
+  backends      : List String := []
+  /-- Models a queued task may be put on. Empty: only the spawning task's own.
+
+      Not checked against the backend — orchestra does not hold a model list per backend, and a
+      policy that named one would go stale on the vendor's schedule rather than the operator's.
+      A model the backend does not know fails when the task runs, the same way it does when a
+      role names one. -/
+  models        : List String := []
+  /-- Tools a queued task may be granted, by the same names a role's `permissions` uses. Empty:
+      only the tools the spawning task itself holds.
+
+      May exceed what the spawning task holds — see the module docs; that is the operator's call
+      to make, and the reason it is written in a config file rather than derived. -/
+  tools         : List String := []
+  /-- Repositories a queued task may run against, as `owner/name` upstreams. Empty: only the
+      spawning task's own repository (and nothing at all, for a repository-independent one).
+
+      The fork is never named here. It is resolved when the task is queued, by the same rule
+      every other dispatch path uses (`GitHub.resolveFork`): the target itself when the App can
+      push to it, a fork in the default organisation otherwise. -/
+  repos         : List Repository := []
+  /-- How many tasks one task may queue over its whole run. Counted over the queue rather than
+      in memory, so a daemon restart mid-run cannot reset it.
+
+      Defaults to 1. A queued task costs an agent run's worth of somebody's money, and the
+      failure of a too-generous default is a queue full of work nobody asked for; the failure of
+      a too-strict one is a refusal with the number in it, which the operator can raise. -/
+  maxTasks      : Nat := 1
+  /-- Whether the tool may claim the issue it binds, for the task it queues.
+
+      Off by default. A claim takes an issue out of every dispatcher's candidate set until the
+      task that holds it ends, which is exactly what you want when the queued task is the one
+      that should do the work — and exactly what you do not want by accident. -/
+  allowPreClaim : Bool := false
+  /-- Ceiling on a queued task's budget in USD, and the budget it gets when the agent names none.
+
+      Both halves matter: without the default, a policy capping the budget at 2.0 would still
+      hand an unbudgeted task the daemon's own default of 4.0. -/
+  maxBudget     : Option Float := none
+  /-- Priority of the queued task. Operator-set: the agent has no say, since a priority is only
+      meaningful relative to every other entry in the queue. -/
+  priority      : Nat := 10
+  /-- Whether the queued task's workspace is mounted read-only. Absent inherits the queueing
+      task's own answer, which is what stops an empty policy from handing a read-only reviewer a
+      read-write child — the one way "queue a copy of itself" could have granted more than the
+      task had. Set it explicitly for the case the tool exists for: a read-only planner queueing
+      an implementor that has to write. -/
+  readOnly      : Option Bool := none
+deriving Repr, Inhabited
+
+instance : ToJson SpawnPolicy where
+  toJson p :=
+    let f : List (String × Json) := []
+    let f := if p.backends.isEmpty then f else f ++ [("backends", ToJson.toJson p.backends)]
+    let f := if p.models.isEmpty   then f else f ++ [("models",   ToJson.toJson p.models)]
+    let f := if p.tools.isEmpty    then f else f ++ [("tools",    ToJson.toJson p.tools)]
+    let f := if p.repos.isEmpty    then f else f ++ [("repos",    ToJson.toJson p.repos)]
+    let f := f ++ [("max_tasks", Json.num p.maxTasks)]
+    let f := if p.allowPreClaim then f ++ [("allow_pre_claim", Json.bool true)] else f
+    let f := match p.maxBudget with
+      | some b => f ++ [("max_budget", ToJson.toJson b)]
+      | none   => f
+    let f := if p.priority != 10 then f ++ [("priority", Json.num p.priority)] else f
+    let f := match p.readOnly with
+      | some b => f ++ [("read_only", Json.bool b)]
+      | none   => f
+    Json.mkObj f
+
+instance : FromJson SpawnPolicy where
+  fromJson? j := do
+    -- Every list is read strictly. A `repos` entry misspelled as `"my-account orchestra"`, or a
+    -- `backends` written as a bare string, would otherwise be swallowed as the empty list — and
+    -- the empty list is not "no opinion" here, it is "the agent may name nothing", so the policy
+    -- would quietly do the opposite of what it says while still parsing.
+    let listOr (key : String) : Except String (List String) :=
+      match j.getObjVal? key with
+      | .error _ => .ok []
+      | .ok v    => FromJson.fromJson? v
+    let backends ← listOr "backends"
+    let models   ← listOr "models"
+    let tools    ← listOr "tools"
+    let repos ← match j.getObjVal? "repos" with
+      | .error _ => pure []
+      | .ok v    => (FromJson.fromJson? v : Except String (List Repository))
+    let maxTasks      := j.getObjValAs? Nat   "max_tasks"       |>.toOption |>.getD 1
+    let allowPreClaim := j.getObjValAs? Bool  "allow_pre_claim" |>.toOption |>.getD false
+    let maxBudget     := j.getObjValAs? Float "max_budget"      |>.toOption
+    let priority      := j.getObjValAs? Nat   "priority"        |>.toOption |>.getD 10
+    let readOnly      := j.getObjValAs? Bool  "read_only"       |>.toOption
+    return { backends, models, tools, repos, maxTasks, allowPreClaim, maxBudget, priority,
+             readOnly }
+
+/-- Read a `spawn_policy` out of the object `j`.
+
+    Absent is fine — most tasks queue nothing. Present and unreadable is not: a policy that
+    failed to parse would leave the tool switched off entirely, and "the agent never called it"
+    looks exactly like "the agent could not see it". -/
+def parseSpawnPolicy? (j : Json) : Except String (Option SpawnPolicy) :=
+  match j.getObjVal? "spawn_policy" with
+  | .error _  => .ok none
+  -- An explicit `null` is how "not set" is serialised — by `Option`'s own `ToJson`, among
+  -- others — so a document this module wrote has to read back as the policy-less task it was.
+  | .ok .null => .ok none
+  | .ok v     => (FromJson.fromJson? v : Except String SpawnPolicy).map some
+
+/-- Whether `p` names only tools that exist, given the vocabulary the caller validates against
+    (`Project.Role.knownPermissions`, which is also what a role's `permissions` are checked
+    against — the tool must not be a way to hand a task something a role could not be given).
+
+    Taken as a parameter because the list lives with the roles, which are defined above this
+    module rather than below it — and because keeping one list is what stops the two checks from
+    disagreeing about what a task may be granted. -/
+def SpawnPolicy.validate (p : SpawnPolicy) (knownTools : List String) : Except String Unit := do
+  let unknown := p.tools.filter (fun t => !knownTools.contains t)
+  unless unknown.isEmpty do
+    .error s!"spawn_policy names unknown tool(s) {String.intercalate ", " unknown}; \
+the tools a queued task may be granted are {String.intercalate ", " knownTools}"
+  if p.maxTasks == 0 then
+    .error "spawn_policy 'max_tasks' is 0, which refuses every call; drop the whole \
+'spawn_policy' block to take the tool away instead"
+  if let some b := p.maxBudget then
+    if b ≤ 0.0 then
+      .error "spawn_policy 'max_budget' must be greater than 0; a task budgeted at nothing \
+cannot run"
+
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
   /-- The repositories this task works on, or `none` for a **repository-independent** task.
@@ -430,6 +568,18 @@ structure IOTask (i o : ResultType) where
   triageAddLabels : List String := []
   /-- Labels to remove from the issue or PR when using the `triage` backend. -/
   triageRemoveLabels : List String := []
+  /-- What this task may put on the queue itself (`Orchestra.Spawn`). `none` — the default —
+      means it may queue nothing, and the `queue_task` tool is not offered to it.
+
+      Never set on a task that was itself queued by that tool: see `Orchestra.Spawn` for why the
+      fan-out is bounded by a rule rather than by a depth counter. -/
+  spawnPolicy : Option SpawnPolicy := none
+  /-- The issue this task may write at or below, when something other than the task's own issue
+      and project decides it. Set only on a task queued by `queue_task`, where it carries the
+      *queueing* task's scope: without it the child re-derives its own from the issue it was
+      bound to (`Project.projectRootOf`), which walks up to the nearest project anchor and can
+      land above the scope the task that queued it was held to — see `writeScopeRoot`. -/
+  scopeRoot : Option Taxis.IssueId := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -571,11 +721,15 @@ instance : FromJson Task where
     let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
     let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
+    -- Strict, unlike the fields above: a policy that fails to parse leaves the task unable to
+    -- queue anything, and nothing on the way says the field was why.
+    let spawnPolicy ← parseSpawnPolicy? j
+    let scopeRoot := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
     return { i, o, ioTask := { repo, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,
-                                triageAddLabels, triageRemoveLabels } }
+                                triageAddLabels, triageRemoveLabels, spawnPolicy, scopeRoot } }
 
 /-- Filesystem paths to expose inside the landrun sandbox. -/
 structure SandboxPaths where

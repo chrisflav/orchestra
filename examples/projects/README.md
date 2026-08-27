@@ -203,6 +203,14 @@ template just produced — becomes the task's goal, and the agent is held to it 
 call agrees it holds. The template is what the agent is told; the goal is what it is judged on, and
 neither is derived from the other. See "goals" in the top-level README.
 
+A role may also carry a `spawn_policy`, which is what lets the agents dispatched for it put
+tasks on the queue themselves (`queue_task`) — a planner that decomposes an epic and queues an
+implementor per leaf, claiming each issue as it goes. It sits on the role rather than on the
+dispatcher's listener because both dispatchers build their entries from the role file, and
+because "a planner may queue implementors" is a statement about planners. What it may name, and
+why a role without one is not offered the tool at all, is in
+[`docs/queue-task.md`](../../docs/queue-task.md).
+
 Examples in `roles/`: `implementor.json`, `reviewer.json`, `planner.json`,
 `maintainer.json`. Each ships with `dispatch.max: 0` so auto-spawn is opt-in — set caps in a
 dispatcher listener config (see `examples/listeners/auto-dispatcher.json`)

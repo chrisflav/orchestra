@@ -1,6 +1,7 @@
 import Lean.Data.Json
 import Orchestra.Project.Basic
 import Orchestra.Project.Claim
+import Orchestra.Spawn
 import Orchestra.TaskStore
 
 open Lean (Json FromJson ToJson)
@@ -82,6 +83,9 @@ inductive ProjectTool where
   -- review_issues
   | listIssuesInReview (projectId : Taxis.IssueId)
   | decideIssue        (issueId : Taxis.IssueId) (decision : ReviewDecision) (notes : String)
+  -- gated on a spawn policy rather than on a permission label (see `Orchestra.Spawn`)
+  /-- Put a task on orchestra's queue, optionally bound to an issue and claiming it. -/
+  | queueTask          (request : SpawnRequest)
   -- always-available (when attached to a project)
   | projectInfo
 deriving Repr, Inhabited
@@ -370,6 +374,56 @@ def toolDefs : List (String × String × Json) :=
             ["issue_id", "decision", "notes"]) ])
   ]
 
+/-- Tool definition for `queue_task`, exposed separately because it is gated on the task having
+    a `SpawnPolicy` rather than on a permission label — see `Orchestra.Spawn` for why the policy
+    is the only switch.
+
+    The schema deliberately says what each field defaults to rather than listing what is allowed:
+    the allowed sets are per task, this definition is not, and a description that named them
+    would be wrong for every task but the one it was written against. A refusal carries the
+    actual list, which is the point at which the agent needs it. -/
+def queueTaskToolDef : Json :=
+  Json.mkObj
+    [ ("name", "queue_task")
+    , ("description",
+        "Put a task on orchestra's queue for an agent to pick up, and optionally bind a taxis " ++
+        "issue to it. Use this to hand off work that is not yours to do — decomposing an epic " ++
+        "and queueing an implementor for each leaf, queueing a second opinion on a change you " ++
+        "cannot judge — rather than doing it yourself in this run.\n\n" ++
+        "What you may choose is configured per task and is usually narrow. Everything you omit " ++
+        "is inherited from this task: same backend, same model, same repository, same tools. " ++
+        "Naming something you are not allowed to name is refused with the list you may pick " ++
+        "from, so ask for what you want and read the refusal.\n\n" ++
+        "Set pre_claim to claim the issue for the queued task, so no dispatcher hands it to " ++
+        "anyone else in the meantime. The queued task cannot queue tasks of its own.")
+    , ("inputSchema", obj
+        [ ("prompt", strProp
+            ("What the queued agent is to do. It starts with no memory of this run, so write " ++
+             "it to stand on its own — the issue you bind is the only other context it gets."))
+        , ("backend", strProp "Agent backend to run it on. Default: the same as this task's.")
+        , ("model", strProp "Model to run it on. Default: the same as this task's.")
+        , ("repo", strProp
+            ("Repository to run it against, as owner/name. Default: the one this task is " ++
+             "working on."))
+        , ("tools", strArrayProp
+            ("Tools to grant it, by the names a role's permissions use (create_pr, comment, " ++
+             "label_issue, manage_issues, work_issues, review_issues). Default: the ones this " ++
+             "task holds. Pass an empty array for a task that needs none."))
+        , ("budget", Json.mkObj
+            [ ("type", "number")
+            , ("description",
+                "Maximum spend in USD. Default: the ceiling this task may queue at, or " ++
+                "orchestra's own default when there is none.") ])
+        , ("issue_id", intProp
+            ("Taxis issue to bind the task to. Must be at or below this task's own issue or " ++
+             "project — the same subtree every other write is confined to."))
+        , ("pre_claim", Json.mkObj
+            [ ("type", "boolean")
+            , ("description",
+                "Claim the bound issue for the queued task, taking it out of every " ++
+                "dispatcher's candidate set until that task ends. Requires issue_id.") ]) ]
+        ["prompt"]) ]
+
 /-- Tool definition for `project_info`, exposed separately because it is
     always-available (no permission gate) when a task is attached to a project. -/
 def projectInfoToolDef : Json :=
@@ -573,6 +627,40 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | "complete" => Except.ok ReviewDecision.complete
         | s => Except.error s!"decision must be 'approve', 'complete' or 'reject', got {repr s}"
       return .decideIssue iid decision notes
+  | "queue_task" =>
+    some <| do
+      let prompt ← args.getObjValAs? String "prompt"
+      -- Optional, and mistyped is reported rather than read as absent: absent means "inherit
+      -- mine", so a `backend: 5` swallowed here would silently queue the task onto this task's
+      -- backend while the agent believed it had chosen another.
+      let backend ← optStrArg args "backend"
+      let model   ← optStrArg args "model"
+      let repo ← match ← optStrArg args "repo" with
+        | none   => pure none
+        | some r => (Repository.parse r).map some
+      -- `none` (inherit) and `[]` (grant nothing) are different answers, so this cannot go
+      -- through a `getD []`.
+      let tools ← match args.getObjVal? "tools" with
+        | .error _  => pure none
+        | .ok .null => pure none
+        | .ok v     => (FromJson.fromJson? v : Except String (List String)).map some
+      let budget ← match args.getObjVal? "budget" with
+        | .error _  => pure none
+        | .ok .null => pure none
+        | .ok _     => (args.getObjValAs? Float "budget").map some
+      -- Strict, like everything above it. `issue_id` as a *string* — which is how ids are
+      -- rendered everywhere an agent reads them — would otherwise queue a task bound to nothing
+      -- and answer `ok`; `pre_claim: "true"` would queue one bound but unclaimed while the agent
+      -- believed the issue was locked for it.
+      let issueId ← match args.getObjVal? "issue_id" with
+        | .error _  => pure none
+        | .ok .null => pure none
+        | .ok _     => (args.getObjValAs? Taxis.IssueId "issue_id").map some
+      let preClaim ← match args.getObjVal? "pre_claim" with
+        | .error _  => pure false
+        | .ok .null => pure false
+        | .ok _     => args.getObjValAs? Bool "pre_claim"
+      return .queueTask { prompt, backend, model, tools, repo, budget, issueId, preClaim }
   | "project_info" => some (.ok .projectInfo)
   | _ => none
 
@@ -607,6 +695,20 @@ structure Env where
   projectId : Option Taxis.IssueId := none
   /-- Orchestra issue this task is working on. Used by `project_info`. -/
   issueId : Option Taxis.IssueId := none
+  /-- What this task may put on the queue itself. `none` — the ordinary case — means the
+      `queue_task` tool is neither offered nor answered. -/
+  spawnPolicy : Option SpawnPolicy := none
+  /-- The spawning task's own shape, which is what every field the agent omits inherits. -/
+  spawnContext : SpawnContext := {}
+  /-- Hook called by `queueTask` to put the approved entry on the queue. Receives the resolved
+      spawn and the id of the task queueing it; returns the new entry's id, or the reason it
+      could not be queued. Set wherever a task actually runs (`TaskRunner.runIOTask`, which is
+      the daemon's path and `orchestra run`'s alike); `none` in the contexts that serve tools
+      without running a queued task, such as an interactive session. -/
+  enqueueTask : Option (ResolvedSpawn → String → IO (Except String String)) := none
+  /-- The subtree this task may write at or below, when it was queued with one
+      (`Config.IOTask.scopeRoot`). Overrides what `writeScopeRoot` would otherwise derive. -/
+  scopeRoot : Option Taxis.IssueId := none
 
 private def deny (perm : String) : String :=
   s!"this task is not authorized for the {perm} tool group"
@@ -629,6 +731,12 @@ private def denyAnyGroup : String :=
     sibling subtrees nobody labelled. Where the project id *is* an anchor — every
     project-dispatcher role — `projectRootOf` returned it unchanged anyway. -/
 private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
+  -- A scope carried on the task wins over anything derived here. It is set only by `queue_task`,
+  -- and it holds the *queueing* task's own root: deriving one from the bound issue instead walks
+  -- up to the nearest project anchor, which for a task scoped to a labelled issue below that
+  -- anchor is strictly wider than the scope the task that queued it was held to. A task must not
+  -- be able to create an agent that writes where it cannot.
+  if let some root := env.scopeRoot then return some root
   match env.issueId, env.projectId with
   | some iid, _ => return some (← projectRootOf iid)
   | none, some pid => return some pid
@@ -1094,6 +1202,49 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
               return content
                 s!"approved {iid.toString}; merger task {mergerTaskId} enqueued. The issue stays \
                    open — use decide_issue with 'complete' when the work is finished. ({notes})"
+  | .queueTask request =>
+    -- No permission label: the policy is the switch, and a task without one is not offered the
+    -- tool at all. Reaching this branch without one means the tool was called by name anyway.
+    let some policy := env.spawnPolicy
+      | return content "this task may not queue tasks: it has no spawn policy" (isError := true)
+    let some enqueue := env.enqueueTask
+      | return content "queueing tasks is not available in this context" (isError := true)
+    let some taskId := env.taskId
+      | return content "no task id in context (a queued task has to record who queued it)"
+          (isError := true)
+    -- Scoped before the policy is consulted: binding an issue is what decides which work the
+    -- queued agent is pointed at, and pre-claiming it writes to taxis. Either outside this
+    -- task's own subtree would be a way to reach past every other write's bound.
+    if let some iid := request.issueId then
+      if let some msg ← refuseOutsideScope env iid "bind that issue to a queued task" then
+        return content msg (isError := true)
+    -- Read once here and carried onto the queued task, rather than left for it to re-derive:
+    -- see `writeScopeRoot`, whose derivation can land above this task's own root.
+    let callerScope ← writeScopeRoot env
+    match policy.resolve env.spawnContext request with
+    | .error e =>
+      IO.println s!"  [mcp] queue_task: refused — {e}"
+      return content e (isError := true)
+    | .ok base =>
+      let resolved := { base with scopeRoot := callerScope }
+      IO.println s!"  [mcp] queue_task: backend={resolved.backend.getD "(inherited)"} \
+        repo={resolved.repo.map (·.toString) |>.getD "(none)"} \
+        issue={resolved.issueId.map (·.toString) |>.getD "none"} \
+        pre_claim={resolved.preClaim}"
+      match ← enqueue resolved taskId with
+      | .error e =>
+        IO.println s!"  [mcp] queue_task: {e}"
+        return content e (isError := true)
+      | .ok entryId =>
+        IO.println s!"  [mcp] queue_task: queued {entryId}"
+        let claimNote := if resolved.preClaim then " and claimed for it" else ""
+        let issueNote := match resolved.issueId with
+          | some iid => s!", bound to issue {iid.toString}{claimNote}"
+          | none     => ""
+        return content (Json.mkObj
+          [ ("ok", true)
+          , ("queue_entry_id", Json.str entryId)
+          , ("note", Json.str s!"queued as {entryId}{issueNote}") ]).compress
   | .projectInfo =>
     IO.println "  [mcp] project_info"
     match env.projectId with

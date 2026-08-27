@@ -97,6 +97,106 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
   catch e =>
     return .error (toString e)
 
+/-- Put a spawn the policy has already approved (`SpawnPolicy.resolve`) on the queue. Used by the
+    `queue_task` tool via the `enqueueTask` hook; `spawnerTaskId` is the task making the call,
+    recorded on the entry as `spawned_by`.
+
+    Everything here needs something the pure resolution cannot reach: the queue, to count what
+    this task has already spawned; GitHub, to resolve a fork for the repository; and taxis, to
+    find the bound issue's project and to claim it. -/
+def enqueueTaskImpl (appConfig : AppConfig) (resolved : ResolvedSpawn) (spawnerTaskId : String) :
+    IO (Except String String) := do
+  try
+    -- Counted over the queue rather than kept in memory: entries outlive the daemon, and an
+    -- allowance that reset on restart is not an allowance. Terminal entries count too — the
+    -- ceiling is on how much work a task may create, not on how much of it is still running.
+    let spawned := (← Queue.loadAllEntries).filter (·.spawnedBy == some spawnerTaskId)
+    if spawned.size ≥ resolved.maxTasks then
+      return .error s!"this task has already queued {spawned.size} task(s), which is all its \
+spawn policy allows ({resolved.maxTasks})"
+    -- Resolved even when the repository was inherited rather than named, so that one rule
+    -- decides where a task pushes no matter how it got here (see `Orchestra.Spawn`).
+    let repo? ← match resolved.repo with
+      | none => pure none
+      | some upstream =>
+        match ← GitHub.resolveFork appConfig upstream with
+        | none => return .error s!"no task was queued: the GitHub App cannot push to \
+{upstream} and could not fork it (see [fork] logs)"
+        | some fork => pure (some ({ upstream, fork } : RepoPair))
+    -- The bound issue's own project, not the spawning task's: an issue below this task's subtree
+    -- can still sit under a different project anchor, and the claim is taken against the anchor
+    -- taxis knows about.
+    let (projectId, issue?) ← match resolved.issueId with
+      | none => pure (resolved.projectId, none)
+      | some iid =>
+        match ← Project.findIssue iid with
+        | none => return .error s!"no task was queued: issue {iid.toString} was not found"
+        | some (project, issue) =>
+          -- Refused whether or not the spawn asked to claim it, and whoever holds it — this task
+          -- included. A queued task's id is written over the claim on the issue it is bound to
+          -- when it starts (`updateClaimTaskId` below) and the claim is released when it ends,
+          -- neither of which checks who held it: binding a claimed issue therefore takes the
+          -- claim off its holder and hands the issue back to the open pool underneath an agent
+          -- still working it. `tryClaim` refuses the same case under the mutex a moment later;
+          -- this is what makes the unclaimed path refuse it too.
+          match ← Project.loadClaim issue.id with
+          | some held =>
+            return .error s!"no task was queued: issue {issue.id.toString} is claimed by task \
+{held.taskId}, and binding it to another task would take the claim off it. Release it first if \
+it is yours to release."
+          | none => pure (some project.id, some issue)
+    let id ← TaskStore.generateId
+    let createdAt ← TaskStore.currentIso8601
+    -- Claimed before the entry is saved, and nothing is queued if the claim fails: an entry
+    -- queued against an issue somebody else holds is a second agent walking into occupied work.
+    let mut claimed : Option (Taxis.IssueId × Taxis.IssueId) := none
+    if resolved.preClaim then
+      match projectId, issue? with
+      | some pid, some issue =>
+        let now ← TaskStore.currentIso8601
+        let agent := resolved.backend.getD "claude"
+        match ← Project.tryClaim globalClaimManager pid issue.id id agent now with
+        | .acquired _ => claimed := some (pid, issue.id)
+        | .alreadyClaimed e =>
+          return .error s!"no task was queued: issue {issue.id.toString} is already claimed \
+by task {e.taskId}"
+        | .invalid r => return .error s!"no task was queued: {r}"
+      | _, _ => return .error "no task was queued: pre_claim needs a bound issue"
+    let entry : Queue.QueueEntry :=
+      { id, createdAt
+      , repo := repo?
+      -- Cosmetic: `tools` is always set below, so nothing falls back to the deprecated `mode`.
+      , mode := .pr
+      , prompt := resolved.prompt
+      , backend := resolved.backend
+      , model := resolved.model
+      -- Always `some`, never `none`: an absent list is what makes a task fall back to `mode` for
+      -- its tools, and a task queued with none on purpose must get none.
+      , tools := some resolved.tools
+      , budget := resolved.budget
+      , readOnly := resolved.readOnly
+      , priority := resolved.priority
+      , projectId
+      , issueId := resolved.issueId
+      -- Never a policy of its own: `queue_task` is one level deep, always (`Orchestra.Spawn`).
+      , spawnPolicy := none
+      , spawnedBy := some spawnerTaskId
+      -- The queueing task's scope, not one derived from the bound issue (`Tools.writeScopeRoot`).
+      , scopeRoot := resolved.scopeRoot }
+    -- A claim taken for an entry that then failed to be written is held by an id no entry has,
+    -- and nothing downstream would ever release it: the daemon releases on behalf of the entry
+    -- it is running, and there would be none.
+    try
+      Queue.saveEntry entry
+    catch e =>
+      if let some (pid, iid) := claimed then
+        let now ← TaskStore.currentIso8601
+        let _ ← Project.release globalClaimManager pid iid .open now
+      return .error s!"no task was queued: {e}"
+    return .ok id
+  catch e =>
+    return .error (toString e)
+
 /-- Run a merger task: checkout the PR branch, run the validation script, then shell out to
     `gh pr merge`. If validation fails the PR is not merged and the reason is recorded as a
     request-changes review on the issue, which returns to the open pool. Skips the entire agent /
@@ -577,6 +677,19 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     issueId   := ioTask.issueId
     enqueueMerger   := some (enqueueMergerImpl appConfig)
     enqueueReviewer := some enqueueReviewerImpl
+    spawnPolicy  := ioTask.spawnPolicy
+    -- What an omitted field in a `queue_task` call inherits. `allowedTools` rather than the
+    -- task's raw `tools`: it is the list the server actually granted, after the repository-scoped
+    -- ones were withheld from a repository-independent task, so a queued task cannot inherit a
+    -- tool this one was refused.
+    spawnContext := { backend := ioTask.backend
+                    , model   := ioTask.model
+                    , repo    := ioTask.repo.map (·.upstream)
+                    , tools   := allowedTools
+                    , readOnly := ioTask.readOnly
+                    , projectId := ioTask.projectId }
+    enqueueTask  := some (enqueueTaskImpl appConfig)
+    scopeRoot    := ioTask.scopeRoot
     prLabels  := ioTask.prLabels
     defaultOrganization := appConfig.defaultOrganization
   }
