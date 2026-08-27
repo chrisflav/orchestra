@@ -31,8 +31,11 @@ described:
 | task file | the task object in `tasks.json` | that task |
 | queue entry | `spawn_policy` on the entry | that entry's run |
 | listener | `action.spawn_policy` | every task the listener queues |
-| role | `spawn_policy` on the role document | every task dispatched for that role |
-| workflow step | `spawn_policy` on the step's task spec | that step |
+| role | `spawn_policy` on the role document | every task dispatched for that role, whether the dispatcher spawned it or `orchestra spawn` did |
+
+A listener that names a `workflow_path` starts a concert instead of queueing a task, and never
+reads its `action` block's policy. The workflow YAML has no `spawn_policy` key of its own, so a
+concert step cannot carry one either.
 
 The two dispatchers (`project-dispatcher`, `label-dispatcher`) build their entries from the
 **role**, not from the listener's `action` block, so a dispatched role takes its policy from its
@@ -77,11 +80,13 @@ same backend, model and repository, and the tools it already holds, and nothing 
   is resolved even when the repository was inherited rather than named, so one rule decides where
   a task pushes no matter how it got there. A repository the App can neither push to nor fork is
   refused, and nothing is queued.
-- **`tools`** — by the same names a role's `permissions` use, and validated against the same
+- **`tools`** — by the same names a role's `permissions` use, and checked against the same
   vocabulary (`create_pr`, `comment`, `label_issue`, `manage_issues`, `work_issues`,
-  `review_issues`), so `queue_task` cannot hand a task something a role could not be given.
-  What the spawning task already holds is grantable without being listed — naming what you
-  already hold reaches nothing new. The list **may** name tools the spawning task does not hold,
+  `review_issues`) wherever a policy is validated (see below), so a policy cannot *list*
+  something a role could not be given. What the spawning task already holds is grantable without
+  being listed — naming what you already hold reaches nothing new, though it does mean a task
+  itself granted `merge_pr` or `create_repository`, neither of which a role may have, can pass
+  them on. The list **may** name tools the spawning task does not hold,
   and that is the point rather than an oversight: a read-only planner queueing an implementor
   that can open a pull request is the case the tool exists for, and the operator writing the
   policy is the one deciding it.
@@ -97,9 +102,16 @@ same backend, model and repository, and the tools it already holds, and nothing 
   none. Both halves matter: without the default, a policy capping spend at 2.0 would still hand
   an unbudgeted task orchestra's own default of 4.0. A budget over the ceiling is refused with
   the ceiling in it rather than silently lowered — a task queued at a quarter of the budget its
-  prompt assumes stops halfway and looks like a failure.
-- **`priority`** / **`read_only`** — the agent has no say in either. A queue-wide priority is a
-  way to starve every other task, and read-only is the sandbox's answer rather than the prompt's.
+  prompt assumes stops halfway and looks like a failure. With no `max_budget` set the agent may
+  not name a budget at all: this field is closed like every other one, so that the ceiling on how
+  many tasks may be queued does not sit beside an unbounded amount each of them may spend.
+- **`priority`** — the agent has no say: a priority is only meaningful against every other entry
+  in the queue, and is a way to starve all of them.
+- **`read_only`** — the agent has no say here either, but unlike `priority` this one *inherits*
+  when the policy omits it. Otherwise an empty policy would hand a read-only reviewer a
+  read-write child, which is the single way "queue a copy of itself" could grant more than the
+  queueing task had. Set it explicitly for the case the tool exists for: a read-only planner
+  queueing an implementor that has to write.
 
 ## what the agent calls
 
@@ -120,15 +132,43 @@ Only `prompt` is required; everything else is inherited when omitted. `tools` di
 absent (inherit the spawning task's set) from `[]` (a task with no optional tools at all), which
 is a thing worth being able to ask for.
 
+**`max_budget` is a ceiling *and* a default; `tools` is a ceiling only.** An agent that omits
+`tools` gets what the queueing task holds, not the policy's whole list — so a planner holding
+only `manage_issues`, under a policy permitting `create_pr`, queues an implementor that cannot
+open a pull request unless it asks for one. Say so in the prompt template if the queued task
+needs the tools the policy went to the trouble of permitting.
+
 A named `issue_id` must be **at or below the spawning task's own issue or project** — the same
 subtree every other write is confined to. Binding an issue is what decides which work the queued
 agent is pointed at, and pre-claiming it writes to taxis; either outside that subtree would be a
-way to reach past every other write's bound.
+way to reach past every other write's bound. The queued task is held to the *queueing* task's
+scope rather than re-deriving its own from the issue it was bound to, so a task cannot create an
+agent that writes where it cannot.
+
+It must also be **unclaimed**, whoever holds it — including the task making the call. A task's
+id is written over the claim on the issue it is bound to when it starts, and the claim is
+released when it ends; binding a claimed issue would therefore take the claim off its holder and
+hand the issue back to the open pool underneath an agent still working it. Release it first if
+it is yours to release.
 
 Refusals carry the list the agent may pick from, which is the point at which it needs it. The
 tool's own description deliberately does not list the allowed sets: they are per task, the
 description is not, and one that named them would be wrong for every task but the one it was
 written against.
+
+## where a policy is checked
+
+A policy's `tools` are checked against the vocabulary a role's `permissions` are checked against,
+and `max_tasks: 0` is refused, when a role or listener is written **through the API** — which is
+what `orchestra role`/`listener` edits and the dashboard use. A role, listener, task file or queue
+entry written straight to disk skips that check: an unknown tool name is then silently ignored
+when the queued task runs, and `max_tasks: 0` becomes a tool that is offered and refuses every
+call. A file that fails to parse at all is reported on stderr and the role or listener is skipped.
+
+`allow_pre_claim` is checked against nothing, because there is nothing to check it against:
+taking a claim is otherwise reached through `claim_issue`, which needs `work_issues`, and a
+policy may set `allow_pre_claim` on a task holding neither. That is deliberate — the queued task
+is the one that will do the work — but it is a capability this field grants on its own.
 
 ## the fan-out is one level deep
 
@@ -153,19 +193,24 @@ task that appeared out of a running agent's turn is indistinguishable from one a
   "name": "planner",
   "permissions": ["manage_issues"],
   "read_only": true,
-  "prompt_template": "Project {{project_name}}. Decompose the open work into leaves, then queue one implementor per leaf with queue_task, binding and claiming its issue.",
+  "prompt_template": "Project {{project_name}}. Decompose the open work into leaves, then queue one implementor per leaf with queue_task, binding and claiming its issue and passing tools: [\"create_pr\", \"work_issues\"].",
   "dispatch": { "trigger": "idle", "max": 1 },
   "spawn_policy": {
     "tools": ["create_pr", "work_issues"],
     "max_tasks": 5,
     "allow_pre_claim": true,
-    "max_budget": 8.0
+    "max_budget": 8.0,
+    "read_only": false
   }
 }
 ```
 
-The planner is read-only and holds only `manage_issues`; the tasks it queues get `create_pr` and
-`work_issues`, run on the planner's own backend, model and repository, are budgeted at 8.0
-apiece, and there are at most five of them per planner run. Each is bound to its issue and
-claimed on the spot, so the dispatcher does not offer the same issue to anyone else on its next
-tick.
+The planner is read-only and holds only `manage_issues`. The tasks it queues *may* be granted
+`create_pr` and `work_issues` — which is why the template tells the agent to ask for them; omit
+them and the implementor inherits `manage_issues` and cannot open a pull request. They run on the
+planner's own backend, model and repository, are budgeted at 8.0 apiece (named or not, since the
+ceiling is also the default), and there are at most five of them per planner run. `read_only` is
+not set, so it inherits — the planner is read-only and its implementors would be too, which is
+why a policy like this one usually sets `"read_only": false` once it has real work to do. Each is
+bound to its issue and claimed on the spot, so the dispatcher does not offer the same issue to
+anyone else on its next tick.

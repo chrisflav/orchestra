@@ -42,10 +42,25 @@ tools the spawning task does not hold, and that is deliberate rather than an ove
 read-only planner queueing an implementor that can open a pull request is the case the tool
 exists for, and the operator writing the policy is the one deciding it.
 
+## Two bounds worth stating, because they are not symmetric
+
+`max_budget` is both a ceiling and the default a queued task gets when the agent names none.
+`tools` is a ceiling only: omitting it inherits what the queueing task holds, it does not hand
+over the policy's whole list. So a policy listing `create_pr` permits an implementor that can
+open a pull request; the agent still has to *ask* for it.
+
+And `allow_pre_claim` grants something the `tools` vocabulary cannot express. Taking a claim is
+otherwise reached through `claim_issue`, which needs `work_issues`; a policy may set
+`allow_pre_claim` on a task holding neither. That is the point — the queued task is the one that
+will do the work, and claiming it at queue time is what stops a dispatcher handing the same issue
+to somebody else in between — but it is a capability granted by this field alone, and no check
+against `Project.Role.knownPermissions` will tell an operator so.
+
 ## What the agent never chooses
 
-`priority` and `read_only` come from the policy alone. A queue-wide priority is a way to starve
-every other task, and read-only is the sandbox's answer rather than the prompt's.
+`priority` comes from the policy alone: a queue-wide priority is only meaningful against every
+other entry in the queue, and is a way to starve all of them. `read_only` is the policy's too,
+but it *inherits* rather than resetting — see the field.
 
 Nor does a spawned task carry a policy of its own: `queue_task` is one level deep, always. That
 is what bounds the fan-out to `max_tasks` instead of `max_tasks` to the power of however many
@@ -75,6 +90,7 @@ structure SpawnContext where
       even when the repository is inherited, so that one rule decides it everywhere. -/
   repo      : Option Repository := none
   tools     : List String := []
+  readOnly  : Bool := false
   projectId : Option Taxis.IssueId := none
 deriving Repr, Inhabited
 
@@ -91,6 +107,11 @@ structure ResolvedSpawn where
   readOnly  : Bool
   projectId : Option Taxis.IssueId
   issueId   : Option Taxis.IssueId
+  /-- The subtree the queued task may write at or below: the *queueing* task's own scope, filled
+      in by the caller because it costs taxis reads to work out. Carried onto the entry so the
+      child cannot re-derive a wider one from the issue it was bound to (`Config.IOTask.scopeRoot`
+      and `Tools.writeScopeRoot`). -/
+  scopeRoot : Option Taxis.IssueId := none
   preClaim  : Bool
   /-- Carried through so the enqueuing side can report the ceiling it enforced with the number
       in it, rather than saying "too many" and leaving the agent to guess. -/
@@ -145,7 +166,12 @@ holds itself" else String.intercalate ", " p.tools}"
       else .ok want
   let budget ← match r.budget, p.maxBudget with
     | none,   ceiling => .ok ceiling
-    | some b, none    => .ok (some b)
+    -- Closed like every other field, rather than open. A budget is the one thing here that
+    -- spends real money, and "the policy said nothing about it" has to mean the agent may not
+    -- name one — otherwise the field that bounds *how many* tasks may be queued would sit next
+    -- to an unbounded amount each of them may spend.
+    | some _, none    =>
+      .error "this task may not choose the budget of a task it queues, only inherit orchestra's default; no 'max_budget' is set in its spawn policy"
     | some b, some c  =>
       -- Refused rather than lowered to the ceiling. A task queued at a quarter of the budget its
       -- prompt assumes stops halfway through and looks like a failure; a refusal with the
@@ -159,7 +185,7 @@ holds itself" else String.intercalate ", " p.tools}"
       .error "this task may not claim an issue for a task it queues; its spawn policy does not \
 set 'allow_pre_claim'"
   return { prompt := r.prompt, backend, model, tools, repo, budget
-         , priority := p.priority, readOnly := p.readOnly
+         , priority := p.priority, readOnly := p.readOnly.getD ctx.readOnly
          , projectId := ctx.projectId, issueId := r.issueId, preClaim := r.preClaim
          , maxTasks := p.maxTasks }
 

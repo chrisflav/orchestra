@@ -450,6 +450,7 @@ its workspace; it will start from a clean checkout."
         triageAddLabels    := entry.triageAddLabels
         triageRemoveLabels := entry.triageRemoveLabels
         spawnPolicy        := entry.spawnPolicy
+        scopeRoot          := entry.scopeRoot
       }
     }
     -- If this entry holds a pre-claimed issue, release it back to open on any

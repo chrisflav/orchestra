@@ -247,3 +247,14 @@ route work is a task that was given the group for shaping the backlog.
 
 A refusal saying the task is not authorized for a group is deliberate, not a bug. Report what you
 needed; do not look for another route to it.
+
+`queue_task` is gated differently: it belongs to no group, and no group grants it. It appears
+only when your task was configured with a spawn policy, and that policy — not your permission
+groups — decides which backend, model, tools and repository a task you queue may have. Everything
+you leave out is inherited from your own task, and a refusal names what you may pick from
+instead, so ask for what you want and read the refusal rather than guessing.
+
+Its `pre_claim` is the one other way a claim is taken. It claims the bound issue for the task you
+are queueing, not for you, and it is refused unless the policy allows it. The issue must be
+unclaimed — including by you: binding an issue you hold would take the claim off your own run.
+Release it first if you mean to hand the work over.

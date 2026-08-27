@@ -648,8 +648,18 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | .error _  => pure none
         | .ok .null => pure none
         | .ok _     => (args.getObjValAs? Float "budget").map some
-      let issueId := args.getObjValAs? Taxis.IssueId "issue_id" |>.toOption
-      let preClaim := args.getObjValAs? Bool "pre_claim" |>.toOption |>.getD false
+      -- Strict, like everything above it. `issue_id` as a *string* — which is how ids are
+      -- rendered everywhere an agent reads them — would otherwise queue a task bound to nothing
+      -- and answer `ok`; `pre_claim: "true"` would queue one bound but unclaimed while the agent
+      -- believed the issue was locked for it.
+      let issueId ← match args.getObjVal? "issue_id" with
+        | .error _  => pure none
+        | .ok .null => pure none
+        | .ok _     => (args.getObjValAs? Taxis.IssueId "issue_id").map some
+      let preClaim ← match args.getObjVal? "pre_claim" with
+        | .error _  => pure false
+        | .ok .null => pure false
+        | .ok _     => args.getObjValAs? Bool "pre_claim"
       return .queueTask { prompt, backend, model, tools, repo, budget, issueId, preClaim }
   | "project_info" => some (.ok .projectInfo)
   | _ => none
@@ -692,8 +702,13 @@ structure Env where
   spawnContext : SpawnContext := {}
   /-- Hook called by `queueTask` to put the approved entry on the queue. Receives the resolved
       spawn and the id of the task queueing it; returns the new entry's id, or the reason it
-      could not be queued. Set by the daemon — `none` outside it, where there is no queue. -/
+      could not be queued. Set wherever a task actually runs (`TaskRunner.runIOTask`, which is
+      the daemon's path and `orchestra run`'s alike); `none` in the contexts that serve tools
+      without running a queued task, such as an interactive session. -/
   enqueueTask : Option (ResolvedSpawn → String → IO (Except String String)) := none
+  /-- The subtree this task may write at or below, when it was queued with one
+      (`Config.IOTask.scopeRoot`). Overrides what `writeScopeRoot` would otherwise derive. -/
+  scopeRoot : Option Taxis.IssueId := none
 
 private def deny (perm : String) : String :=
   s!"this task is not authorized for the {perm} tool group"
@@ -716,6 +731,12 @@ private def denyAnyGroup : String :=
     sibling subtrees nobody labelled. Where the project id *is* an anchor — every
     project-dispatcher role — `projectRootOf` returned it unchanged anyway. -/
 private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
+  -- A scope carried on the task wins over anything derived here. It is set only by `queue_task`,
+  -- and it holds the *queueing* task's own root: deriving one from the bound issue instead walks
+  -- up to the nearest project anchor, which for a task scoped to a labelled issue below that
+  -- anchor is strictly wider than the scope the task that queued it was held to. A task must not
+  -- be able to create an agent that writes where it cannot.
+  if let some root := env.scopeRoot then return some root
   match env.issueId, env.projectId with
   | some iid, _ => return some (← projectRootOf iid)
   | none, some pid => return some pid
@@ -1197,11 +1218,15 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     if let some iid := request.issueId then
       if let some msg ← refuseOutsideScope env iid "bind that issue to a queued task" then
         return content msg (isError := true)
+    -- Read once here and carried onto the queued task, rather than left for it to re-derive:
+    -- see `writeScopeRoot`, whose derivation can land above this task's own root.
+    let callerScope ← writeScopeRoot env
     match policy.resolve env.spawnContext request with
     | .error e =>
       IO.println s!"  [mcp] queue_task: refused — {e}"
       return content e (isError := true)
-    | .ok resolved =>
+    | .ok base =>
+      let resolved := { base with scopeRoot := callerScope }
       IO.println s!"  [mcp] queue_task: backend={resolved.backend.getD "(inherited)"} \
         repo={resolved.repo.map (·.toString) |>.getD "(none)"} \
         issue={resolved.issueId.map (·.toString) |>.getD "none"} \

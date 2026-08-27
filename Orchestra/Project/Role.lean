@@ -169,14 +169,27 @@ def projectRolesDir (pid : Taxis.IssueId) : IO System.FilePath := do
 
 private def roleFileName (name : String) : String := s!"{name}.json"
 
+/-- A role document, or `none` when the file is absent or does not decode.
+
+    A file that is *there* and unreadable says so on stderr, the way a listener config does. Both
+    failures answer `none`, and the caller cannot tell them apart: `orchestra spawn` reports
+    "role not found" and the dispatcher skips the role in silence, neither of which points at the
+    field that caused it. That was survivable while every field a role could get wrong was a
+    required one — a role missing `permissions` is obviously broken — but `spawn_policy` is
+    optional and strict, so one mistyped line inside it can take an otherwise working role off
+    the tracker with nothing said. -/
 private def loadRoleFromFile (path : System.FilePath) : IO (Option Role) := do
   if !(← path.pathExists) then return none
   let contents ← IO.FS.readFile path
   match Json.parse contents with
-  | .error _ => return none
+  | .error e =>
+    IO.eprintln s!"[role] {path}: not valid JSON, so this role is being skipped: {e}"
+    return none
   | .ok j    =>
     match FromJson.fromJson? j with
-    | .error _ => return none
+    | .error e =>
+      IO.eprintln s!"[role] {path}: not a role, so this role is being skipped: {e}"
+      return none
     | .ok r    => return some r
 
 /-- Resolve a role by name. Project-scoped file wins over the global one;

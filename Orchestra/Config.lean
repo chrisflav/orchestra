@@ -394,8 +394,12 @@ structure SpawnPolicy where
   /-- Priority of the queued task. Operator-set: the agent has no say, since a priority is only
       meaningful relative to every other entry in the queue. -/
   priority      : Nat := 10
-  /-- Whether the queued task's workspace is mounted read-only. Operator-set, like `priority`. -/
-  readOnly      : Bool := false
+  /-- Whether the queued task's workspace is mounted read-only. Absent inherits the queueing
+      task's own answer, which is what stops an empty policy from handing a read-only reviewer a
+      read-write child — the one way "queue a copy of itself" could have granted more than the
+      task had. Set it explicitly for the case the tool exists for: a read-only planner queueing
+      an implementor that has to write. -/
+  readOnly      : Option Bool := none
 deriving Repr, Inhabited
 
 instance : ToJson SpawnPolicy where
@@ -411,7 +415,9 @@ instance : ToJson SpawnPolicy where
       | some b => f ++ [("max_budget", ToJson.toJson b)]
       | none   => f
     let f := if p.priority != 10 then f ++ [("priority", Json.num p.priority)] else f
-    let f := if p.readOnly then f ++ [("read_only", Json.bool true)] else f
+    let f := match p.readOnly with
+      | some b => f ++ [("read_only", Json.bool b)]
+      | none   => f
     Json.mkObj f
 
 instance : FromJson SpawnPolicy where
@@ -434,7 +440,7 @@ instance : FromJson SpawnPolicy where
     let allowPreClaim := j.getObjValAs? Bool  "allow_pre_claim" |>.toOption |>.getD false
     let maxBudget     := j.getObjValAs? Float "max_budget"      |>.toOption
     let priority      := j.getObjValAs? Nat   "priority"        |>.toOption |>.getD 10
-    let readOnly      := j.getObjValAs? Bool  "read_only"       |>.toOption |>.getD false
+    let readOnly      := j.getObjValAs? Bool  "read_only"       |>.toOption
     return { backends, models, tools, repos, maxTasks, allowPreClaim, maxBudget, priority,
              readOnly }
 
@@ -568,6 +574,12 @@ structure IOTask (i o : ResultType) where
       Never set on a task that was itself queued by that tool: see `Orchestra.Spawn` for why the
       fan-out is bounded by a rule rather than by a depth counter. -/
   spawnPolicy : Option SpawnPolicy := none
+  /-- The issue this task may write at or below, when something other than the task's own issue
+      and project decides it. Set only on a task queued by `queue_task`, where it carries the
+      *queueing* task's scope: without it the child re-derives its own from the issue it was
+      bound to (`Project.projectRootOf`), which walks up to the nearest project anchor and can
+      land above the scope the task that queued it was held to — see `writeScopeRoot`. -/
+  scopeRoot : Option Taxis.IssueId := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -712,11 +724,12 @@ instance : FromJson Task where
     -- Strict, unlike the fields above: a policy that fails to parse leaves the task unable to
     -- queue anything, and nothing on the way says the field was why.
     let spawnPolicy ← parseSpawnPolicy? j
+    let scopeRoot := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
     return { i, o, ioTask := { repo, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,
-                                triageAddLabels, triageRemoveLabels, spawnPolicy } }
+                                triageAddLabels, triageRemoveLabels, spawnPolicy, scopeRoot } }
 
 /-- Filesystem paths to expose inside the landrun sandbox. -/
 structure SandboxPaths where

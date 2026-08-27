@@ -436,6 +436,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     , tools         := some role.permissions
     , projectId     := some project.id
     , issueId       := mIssue.map (·.id)
+    , spawnPolicy   := role.spawnPolicy
     , role          := some role.name }
   -- 7. Persist the entry. The daemon picks it up on its next poll.
   Queue.saveEntry entry
@@ -460,15 +461,23 @@ def rolesListHandler (p : Parsed) : IO UInt32 := do
   if roles.isEmpty then
     IO.println "No roles defined (looked under <data>/projects/<pid>/roles and <config>/roles)."
     return 0
-  IO.println s!"{padRight "ROLE" 18} {padRight "PERMISSIONS" 36} TRIGGER  MAX  PRE-CLAIM"
-  IO.println (String.ofList (List.replicate 90 '-'))
+  IO.println s!"{padRight "ROLE" 18} {padRight "PERMISSIONS" 36} TRIGGER  MAX  PRE-CLAIM  QUEUES"
+  IO.println (String.ofList (List.replicate 98 '-'))
   for r in roles do
     let perms := String.intercalate "," r.permissions
     let (trig, maxStr, pcStr) := match r.dispatch with
       | none   => ("-", "-", "-")
       | some d => (renderTriggerStr d.trigger, toString d.max,
                    if d.preClaim then "yes" else "no")
-    IO.println s!"{padRight r.name 18} {padRight perms 36} {padRight trig 8} {padRight maxStr 4} {pcStr}"
+    -- What a role's agents may put on the queue themselves belongs beside what they are granted
+    -- and whether they claim: a role that can hand out `create_pr` and claim issues for five
+    -- queued tasks should not read the same as one that cannot. The number is the ceiling; the
+    -- rest of the policy is in the file.
+    let spawnStr := match r.spawnPolicy with
+      | none   => "-"
+      | some sp => s!"{sp.maxTasks}{if sp.allowPreClaim then "+claim" else ""}"
+    IO.println s!"{padRight r.name 18} {padRight perms 36} {padRight trig 8} {padRight maxStr 4} \
+{padRight pcStr 10} {spawnStr}"
   return 0
 
 /-- Default tools granted to a continuation that doesn't override `--tools`.

@@ -1796,9 +1796,9 @@
           "repos": { "type": "array", "items": { "type": "string" }, "description": "Upstream repositories (`owner/name`) a queued task may run against. Empty: only the queueing task's own. The fork is never named here; it is resolved when the task is queued, by the rule every other dispatch path uses." },
           "max_tasks": { "type": "integer", "default": 1, "description": "How many tasks one task may queue over its whole run, counted over the queue rather than in memory so a daemon restart cannot reset it. Terminal entries count: the ceiling is on work created, not work still running." },
           "allow_pre_claim": { "type": "boolean", "default": false, "description": "Whether the tool may claim the issue it binds, taking it out of every dispatcher's candidate set until the queued task ends." },
-          "max_budget": { "type": "number", "description": "Ceiling in USD, and the budget a queued task gets when the agent names none. A budget over it is refused with the ceiling in it rather than silently lowered." },
+          "max_budget": { "type": "number", "description": "Ceiling in USD, and the budget a queued task gets when the agent names none. A budget over it is refused with the ceiling in it rather than silently lowered. Absent means the agent may not name a budget at all \u2014 closed like every other field \u2014 and a queued task takes orchestra's own default." },
           "priority": { "type": "integer", "default": 10, "description": "Priority of the queued task. Operator-set; the agent has no say, since a priority is only meaningful against every other entry in the queue." },
-          "read_only": { "type": "boolean", "default": false, "description": "Whether the queued task's workspace is mounted read-only. Operator-set, like `priority`." }
+          "read_only": { "type": "boolean", "description": "Whether the queued task's workspace is mounted read-only. Absent inherits the queueing task's own answer, so an empty policy cannot hand a read-only task a read-write child." }
         }
       },
       "Role": {
@@ -1904,7 +1904,7 @@
       "ListenerAction": {
         "type": "object",
         "description": "The task a listener enqueues when its source matches.",
-        "required": ["mode", "upstream", "fork", "series", "backend", "model", "workflowPath", "priority", "promptTemplate"],
+        "required": ["mode", "upstream", "fork", "series", "backend", "model", "workflowPath", "priority", "promptTemplate", "spawnPolicy"],
         "properties": {
           "mode": { "type": "string", "enum": ["fork", "pr"] },
           "upstream": { "type": "string" },
@@ -1914,7 +1914,8 @@
           "model": { "type": ["string", "null"] },
           "workflowPath": { "type": ["string", "null"], "description": "Set when the listener enqueues a whole concert." },
           "priority": { "type": "integer" },
-          "promptTemplate": { "type": "string" }
+          "promptTemplate": { "type": "string" },
+          "spawnPolicy": { "$ref": "#/components/schemas/SpawnPolicy" }
         }
       },
       "IssueCounts": {

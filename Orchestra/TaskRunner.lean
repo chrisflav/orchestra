@@ -131,7 +131,20 @@ spawn policy allows ({resolved.maxTasks})"
       | some iid =>
         match ← Project.findIssue iid with
         | none => return .error s!"no task was queued: issue {iid.toString} was not found"
-        | some (project, issue) => pure (some project.id, some issue)
+        | some (project, issue) =>
+          -- Refused whether or not the spawn asked to claim it, and whoever holds it — this task
+          -- included. A queued task's id is written over the claim on the issue it is bound to
+          -- when it starts (`updateClaimTaskId` below) and the claim is released when it ends,
+          -- neither of which checks who held it: binding a claimed issue therefore takes the
+          -- claim off its holder and hands the issue back to the open pool underneath an agent
+          -- still working it. `tryClaim` refuses the same case under the mutex a moment later;
+          -- this is what makes the unclaimed path refuse it too.
+          match ← Project.loadClaim issue.id with
+          | some held =>
+            return .error s!"no task was queued: issue {issue.id.toString} is claimed by task \
+{held.taskId}, and binding it to another task would take the claim off it. Release it first if \
+it is yours to release."
+          | none => pure (some project.id, some issue)
     let id ← TaskStore.generateId
     let createdAt ← TaskStore.currentIso8601
     -- Claimed before the entry is saved, and nothing is queued if the claim fails: an entry
@@ -167,7 +180,9 @@ by task {e.taskId}"
       , issueId := resolved.issueId
       -- Never a policy of its own: `queue_task` is one level deep, always (`Orchestra.Spawn`).
       , spawnPolicy := none
-      , spawnedBy := some spawnerTaskId }
+      , spawnedBy := some spawnerTaskId
+      -- The queueing task's scope, not one derived from the bound issue (`Tools.writeScopeRoot`).
+      , scopeRoot := resolved.scopeRoot }
     -- A claim taken for an entry that then failed to be written is held by an id no entry has,
     -- and nothing downstream would ever release it: the daemon releases on behalf of the entry
     -- it is running, and there would be none.
@@ -671,8 +686,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
                     , model   := ioTask.model
                     , repo    := ioTask.repo.map (·.upstream)
                     , tools   := allowedTools
+                    , readOnly := ioTask.readOnly
                     , projectId := ioTask.projectId }
     enqueueTask  := some (enqueueTaskImpl appConfig)
+    scopeRoot    := ioTask.scopeRoot
     prLabels  := ioTask.prLabels
     defaultOrganization := appConfig.defaultOrganization
   }

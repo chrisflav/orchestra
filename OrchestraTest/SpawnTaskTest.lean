@@ -150,6 +150,17 @@ def budgetOverTheCeilingIsRefused : Test := do
   | .error e =>
     TestM.assert (e.containsSubstr "2.0") s!"the refusal should carry the ceiling, got: {e}"
 
+/-- The one field that could have failed open: with no ceiling configured, naming a budget is
+    refused rather than granted, so the ceiling on how many tasks may be queued does not sit
+    beside an unbounded amount each of them may spend. -/
+@[test]
+def budgetWithNoCeilingIsRefused : Test := do
+  match widensNothing.resolve parent { ask with budget := some 5000.0 } with
+  | .ok r => TestM.fail s!"no max_budget is set, so naming one should be refused (got {repr r.budget})"
+  | .error e =>
+    TestM.assert (e.containsSubstr "max_budget")
+      s!"the refusal should name the field that would allow it, got: {e}"
+
 @[test]
 def budgetUnderTheCeilingIsKept : Test := do
   let p : SpawnPolicy := { maxBudget := some 2.0 }
@@ -188,12 +199,26 @@ def preClaimAllowedWithAnIssue : Test := do
 
 @[test]
 def priorityAndReadOnlyComeFromThePolicy : Test := do
-  let p : SpawnPolicy := { priority := 50, readOnly := true }
+  let p : SpawnPolicy := { priority := 50, readOnly := some true }
   match p.resolve parent (ask) with
   | .error e => TestM.fail s!"resolve: {e}"
   | .ok r =>
     TestM.assertEqual r.priority 50 (msg := "priority from the policy")
     TestM.assert r.readOnly "read_only from the policy"
+
+/-- The one way "queue a copy of itself" could have granted more than the task had: a read-only
+    reviewer under an empty policy must not queue a read-write child. -/
+@[test]
+def readOnlyInheritsWhenThePolicyIsSilent : Test := do
+  match widensNothing.resolve { parent with readOnly := true } (ask) with
+  | .error e => TestM.fail s!"resolve: {e}"
+  | .ok r    => TestM.assert r.readOnly "a read-only task queues a read-only task"
+
+@[test]
+def readOnlyIsLiftedOnlyWhenThePolicySaysSo : Test := do
+  match ({ readOnly := some false } : SpawnPolicy).resolve { parent with readOnly := true } (ask) with
+  | .error e => TestM.fail s!"resolve: {e}"
+  | .ok r    => TestM.assert (!r.readOnly) "the policy may hand a writable workspace to a child"
 
 @[test]
 def maxTasksIsCarriedToTheEnqueuer : Test := do
@@ -215,7 +240,7 @@ def policyRoundTrips : Test := do
   let p : SpawnPolicy :=
     { backends := ["claude"], models := ["opus"], tools := ["create_pr"]
     , repos := [repoOf "acme/widgets"], maxTasks := 3, allowPreClaim := true
-    , maxBudget := some 2.5, priority := 40, readOnly := true }
+    , maxBudget := some 2.5, priority := 40, readOnly := some true }
   match FromJson.fromJson? (ToJson.toJson p) (α := SpawnPolicy) with
   | .error e => TestM.fail s!"round-trip: {e}"
   | .ok got =>
@@ -227,7 +252,16 @@ def policyRoundTrips : Test := do
     TestM.assert got.allowPreClaim "allow_pre_claim"
     TestM.assert (got.maxBudget == some 2.5) "max_budget"
     TestM.assertEqual got.priority 40 (msg := "priority")
-    TestM.assert got.readOnly "read_only"
+    TestM.assert (got.readOnly == some true) "read_only"
+
+/-- `read_only` has three states now, and `false` must survive as `false` rather than collapsing
+    into "inherit" — it is how a policy hands a writable workspace to a read-only task's child. -/
+@[test]
+def readOnlyFalseSurvivesTheRoundTrip : Test := do
+  match FromJson.fromJson? (ToJson.toJson ({ readOnly := some false } : SpawnPolicy))
+      (α := SpawnPolicy) with
+  | .error e => TestM.fail s!"round-trip: {e}"
+  | .ok got  => TestM.assert (got.readOnly == some false) "an explicit false is kept"
 
 /-- A misspelled list must not read as the empty one: empty means "the agent may name nothing",
     so swallowing the error would silently do the opposite of what the file says. -/
@@ -319,6 +353,25 @@ def parseQueueTaskRejectsMistypedBackend : Test := do
   | some (.error _) => TestM.assert true "reported"
   | other => TestM.fail s!"expected an error, got: {repr other}"
 
+/-- An id rendered as a string is the likeliest way to get this wrong — every tool output shows
+    taxis ids as text — and read as absent it would queue a task bound to nothing while answering
+    `ok`. -/
+@[test]
+def parseQueueTaskRejectsStringIssueId : Test := do
+  let args := Json.mkObj [("prompt", "x"), ("issue_id", Json.str "412")]
+  match tryParseToolCall "queue_task" args with
+  | some (.error _) => TestM.assert true "reported"
+  | other => TestM.fail s!"expected an error, got: {repr other}"
+
+/-- Read as absent, `pre_claim: "true"` would queue a task bound but unclaimed while the agent
+    believed the issue was locked for it. -/
+@[test]
+def parseQueueTaskRejectsStringPreClaim : Test := do
+  let args := Json.mkObj [("prompt", "x"), ("issue_id", Json.num 412), ("pre_claim", Json.str "true")]
+  match tryParseToolCall "queue_task" args with
+  | some (.error _) => TestM.assert true "reported"
+  | other => TestM.fail s!"expected an error, got: {repr other}"
+
 @[test]
 def parseQueueTaskRejectsBadRepo : Test := do
   let args := Json.mkObj [("prompt", "x"), ("repo", "not-a-repo")]
@@ -331,6 +384,50 @@ def parseQueueTaskNeedsAPrompt : Test := do
   match tryParseToolCall "queue_task" (Json.mkObj [("backend", "codex")]) with
   | some (.error _) => TestM.assert true "reported"
   | other => TestM.fail s!"expected an error, got: {repr other}"
+
+/-! ## The documents that carry a policy
+
+Nothing here reaches the queue — that needs a daemon — but a policy that does not survive being
+read back off a role or a listener never reaches it either, and that is the half of the plumbing
+a test can hold. -/
+
+@[test]
+def aRoleCarriesItsPolicy : Test := do
+  let raw := "{\"name\": \"planner\", \"permissions\": [\"manage_issues\"], \
+\"prompt_template\": \"plan\", \"spawn_policy\": {\"tools\": [\"create_pr\"], \
+\"max_tasks\": 5, \"allow_pre_claim\": true}}"
+  match validateRole "planner" raw with
+  | .error e => TestM.fail s!"a role with a spawn policy should validate: {e}"
+  | .ok role =>
+    match role.spawnPolicy with
+    | none    => TestM.fail "the policy was dropped between the file and the role"
+    | some sp =>
+      TestM.assertEqual sp.tools ["create_pr"] (msg := "tools")
+      TestM.assertEqual sp.maxTasks 5 (msg := "max_tasks")
+      TestM.assert sp.allowPreClaim "allow_pre_claim"
+
+/-- The role vocabulary bounds what a policy may *list*, so `queue_task` cannot become a way
+    around the check on a role's own permissions. -/
+@[test]
+def aRoleWithAnUnknownPolicyToolIsRefused : Test := do
+  let raw := "{\"name\": \"planner\", \"permissions\": [\"manage_issues\"], \
+\"prompt_template\": \"plan\", \"spawn_policy\": {\"tools\": [\"rm_rf\"]}}"
+  match validateRole "planner" raw with
+  | .ok _    => TestM.fail "'rm_rf' is not a tool a role may be granted"
+  | .error e => TestM.assert (e.containsSubstr "rm_rf") s!"names the offending tool: {e}"
+
+@[test]
+def aListenerActionCarriesItsPolicy : Test := do
+  let raw := "{\"upstream\": \"o/r\", \"fork\": \"o/r\", \"prompt_template\": \"go\", \
+\"spawn_policy\": {\"backends\": [\"claude\"], \"max_tasks\": 2}}"
+  match Json.parse raw >>= FromJson.fromJson? (α := Listener.ActionConfig) with
+  | .error e => TestM.fail s!"an action with a spawn policy should parse: {e}"
+  | .ok a =>
+    match a.spawnPolicy with
+    | none    => TestM.fail "the policy was dropped between the file and the action"
+    | some sp =>
+      TestM.assertEqual sp.backends ["claude"] (msg := "backends")
+      TestM.assertEqual sp.maxTasks 2 (msg := "max_tasks")
 
 /-! ## The tool is offered exactly when it can be answered -/
 

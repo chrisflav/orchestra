@@ -89,6 +89,7 @@ export function Queue() {
                   `priority ${e.priority}`,
                   e.series ? `series ${e.series}` : "",
                   e.concertId ? `concert ${e.concertId}` : "",
+                  e.spawnedBy ? `queued by ${e.spawnedBy}` : "",
                 ]}
               />
             ))

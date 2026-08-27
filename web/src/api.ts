@@ -49,6 +49,8 @@ export interface QueueEntry {
   taskId: string | null;
   concertId: string | null;
   concertStepKey: string | null;
+  /** The task that queued this entry with the `queue_task` tool, when one did. */
+  spawnedBy: string | null;
 }
 
 export interface TaskRecord {

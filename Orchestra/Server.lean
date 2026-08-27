@@ -74,9 +74,12 @@ structure State where
   /-- The running task's own backend, model, repository and tools, which is what every field the
       agent omits in a `queue_task` call inherits. -/
   spawnContext : SpawnContext := {}
-  /-- Hook that puts an approved spawn on the queue, set by the daemon. Plumbed to
+  /-- Hook that puts an approved spawn on the queue. Plumbed to
       `Project.Tools.Env.enqueueTask`. -/
   enqueueTask : Option (ResolvedSpawn → String → IO (Except String String)) := none
+  /-- The subtree this task may write at or below, when it was queued with one. Plumbed to
+      `Project.Tools.Env.scopeRoot`. -/
+  scopeRoot : Option Taxis.IssueId := none
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
   prLabels : List String := []
@@ -957,7 +960,8 @@ created in; there is no other destination this tool will use)"
       , enqueueReviewer := state.enqueueReviewer
       , spawnPolicy     := state.spawnPolicy
       , spawnContext    := state.spawnContext
-      , enqueueTask     := state.enqueueTask }
+      , enqueueTask     := state.enqueueTask
+      , scopeRoot       := state.scopeRoot }
     Project.Tools.evalProjectTool env call
   | .unknown name =>
     log s!"tool {name}: unknown"

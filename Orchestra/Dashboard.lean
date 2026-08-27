@@ -880,7 +880,10 @@ private def actionJson (a : Listener.ActionConfig) : Json :=
     ("model",          optStr a.model),
     ("workflowPath",   optStr a.workflowPath),
     ("priority",       ToJson.toJson a.priority),
-    ("promptTemplate", a.promptTemplate)
+    ("promptTemplate", a.promptTemplate),
+    -- Beside the role view's own `spawnPolicy`, and for the same reason: this is the field that
+    -- says what the tasks a listener queues may themselves put on the queue.
+    ("spawnPolicy",    ToJson.toJson a.spawnPolicy)
   ]
 
 private def listenerDetailApi (name : String) : IO (Option Json) := do
