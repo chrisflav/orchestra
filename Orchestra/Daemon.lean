@@ -449,6 +449,7 @@ its workspace; it will start from a clean checkout."
         prLabels           := entry.prLabels
         triageAddLabels    := entry.triageAddLabels
         triageRemoveLabels := entry.triageRemoveLabels
+        spawnPolicy        := entry.spawnPolicy
       }
     }
     -- If this entry holds a pre-claimed issue, release it back to open on any

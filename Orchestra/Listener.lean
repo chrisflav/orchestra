@@ -268,6 +268,13 @@ structure ActionConfig where
   issueNumber    : Option String := none
   /-- Labels to apply automatically to every PR created via `create_pr` during this task. -/
   prLabels       : List String   := []
+  /-- What the tasks this listener queues may themselves put on the queue (`Orchestra.Spawn`).
+      `none` — the default — means nothing, and they are not offered the `queue_task` tool.
+
+      Not read by the two dispatcher sources: they build their entries from a role rather than
+      from this block (`buildRoleEntry`), so a dispatched role takes its policy from its own
+      `spawn_policy` field. -/
+  spawnPolicy    : Option SpawnPolicy := none
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -294,6 +301,7 @@ instance : ToJson ActionConfig where
     let fields := if let some p := a.workflowPath then fields ++ [("workflow_path",  Json.str p)]          else fields
     let fields := if let some n := a.issueNumber  then fields ++ [("issue_number",   Json.str n)]          else fields
     let fields := if !a.prLabels.isEmpty          then fields ++ [("pr_labels",      ToJson.toJson a.prLabels)] else fields
+    let fields := if let some p := a.spawnPolicy  then fields ++ [("spawn_policy",   ToJson.toJson p)]         else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -329,9 +337,12 @@ instance : FromJson ActionConfig where
     let workflowPath := j.getObjValAs? String "workflow_path" |>.toOption
     let issueNumber  := j.getObjValAs? String "issue_number"  |>.toOption
     let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
+    -- Absent is fine; present and unreadable is not, for the reason `parseSpawnPolicy?` gives:
+    -- a swallowed policy takes the tool away without saying so.
+    let spawnPolicy ← parseSpawnPolicy? j
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
              budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
-             workflowPath, issueNumber, prLabels }
+             workflowPath, issueNumber, prLabels, spawnPolicy }
 
 -- Dispatch rate limits
 
@@ -710,6 +721,11 @@ would spin against its source as fast as the network allows"
   if cfg.rateLimits.any (·.max == 0) then
     return .error "a rate limit of 0 dispatches would stop this listener from ever firing; \
 to switch one off, use 'orchestra listener disable' instead"
+  -- Against the vocabulary a role's permissions are checked against, so that what a listener may
+  -- hand to a task it queues is bounded by the same list — see `Project.Role.knownPermissions`.
+  if let some sp := cfg.action.spawnPolicy then
+    if let .error e := sp.validate Project.Role.knownPermissions then
+      return .error e
   return .ok cfg
 
 /-- Store a listener config verbatim. Validation is the caller's business — see
@@ -865,6 +881,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
     priority     := action.priority
     issueNumber
     prLabels     := action.prLabels
+    spawnPolicy  := action.spawnPolicy
     listenerName
   }
 
@@ -1308,6 +1325,7 @@ def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : P
     , tools         := some role.permissions
     , projectId     := some project.id
     , issueId       := issue?.map (·.id)
+    , spawnPolicy   := role.spawnPolicy
     , role          := some role.name }
 
 -- Source polling

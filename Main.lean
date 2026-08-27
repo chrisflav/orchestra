@@ -455,6 +455,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         readOnly         := task.ioTask.readOnly
         priority         := priorityFlag.getD task.ioTask.priority
         issueNumber      := task.ioTask.issueNumber
+        spawnPolicy      := task.ioTask.spawnPolicy
       }
       let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
       let _ ← daemonRequest req

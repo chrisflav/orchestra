@@ -30,3 +30,4 @@ import OrchestraTest.GoalTest
 import OrchestraTest.ConfigApiTest
 import OrchestraTest.ClaudeAuthEnvTest
 import OrchestraTest.RepolessTaskTest
+import OrchestraTest.SpawnTaskTest

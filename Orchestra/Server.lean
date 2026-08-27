@@ -65,6 +65,18 @@ structure State where
   /-- Optional auto-reviewer hook (F1). Plumbed to `Project.Tools.Env.enqueueReviewer`. -/
   enqueueReviewer : Option (Project.Project → Taxis.IssueId → Project.PRRef →
                             Project.ReviewerTemplate → IO (Except String String)) := none
+  /-- What this task may put on the queue itself (`Orchestra.Spawn`). `none` — the ordinary
+      case — is what keeps `queue_task` out of `tools/list` and out of `evalToolCall` alike.
+
+      Not a member of `allowedTools`: a tool whose entire safety is that somebody wrote down its
+      bounds should not have a second way to be switched on that carries none of them. -/
+  spawnPolicy : Option SpawnPolicy := none
+  /-- The running task's own backend, model, repository and tools, which is what every field the
+      agent omits in a `queue_task` call inherits. -/
+  spawnContext : SpawnContext := {}
+  /-- Hook that puts an approved spawn on the queue, set by the daemon. Plumbed to
+      `Project.Tools.Env.enqueueTask`. -/
+  enqueueTask : Option (ResolvedSpawn → String → IO (Except String String)) := none
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
   prLabels : List String := []
@@ -448,8 +460,14 @@ def toolsList (state : State) : Json :=
     |>.map (·.2)
   let io := ioToolDefs state.inputType state.outputType
   let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
+  -- Gated on the policy rather than on a permission label, and on the hook as well: a queue this
+  -- process cannot write to is a tool that would be listed and always refused.
+  let queueTask :=
+    if state.spawnPolicy.isSome && state.enqueueTask.isSome then #[Project.Tools.queueTaskToolDef]
+    else #[]
   Json.mkObj [("tools",
-    .arr (alwaysAvailableTools state ++ projectInfo ++ optional.toArray ++ project.toArray ++ io))]
+    .arr (alwaysAvailableTools state ++ projectInfo ++ queueTask ++ optional.toArray
+          ++ project.toArray ++ io))]
 
 -- Types
 
@@ -936,7 +954,10 @@ created in; there is no other destination this tool will use)"
       , projectId     := state.projectId
       , issueId       := state.issueId
       , enqueueMerger   := state.enqueueMerger
-      , enqueueReviewer := state.enqueueReviewer }
+      , enqueueReviewer := state.enqueueReviewer
+      , spawnPolicy     := state.spawnPolicy
+      , spawnContext    := state.spawnContext
+      , enqueueTask     := state.enqueueTask }
     Project.Tools.evalProjectTool env call
   | .unknown name =>
     log s!"tool {name}: unknown"

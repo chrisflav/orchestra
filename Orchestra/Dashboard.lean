@@ -484,7 +484,10 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     ("model",          optStr e.model),
     ("taskId",         optStr e.taskId),
     ("concertId",      optStr e.concertId),
-    ("concertStepKey", optStr e.concertStepKey)
+    ("concertStepKey", optStr e.concertStepKey),
+    -- Provenance for an entry an agent queued itself (`queue_task`): without it a task that
+    -- appeared out of a running agent's turn is indistinguishable from one a person added.
+    ("spawnedBy",      optStr e.spawnedBy)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
@@ -941,7 +944,10 @@ private def roleSummaryJson (r : Project.Role) : Json :=
     ("priority",    ToJson.toJson r.priority),
     ("readOnly",    Json.bool r.readOnly),
     ("budgetUsd",   optNum r.budget),
-    ("dispatch",    dispatchJson r.dispatch)
+    ("dispatch",    dispatchJson r.dispatch),
+    -- Verbatim, like `dispatch` above: a client cannot edit what it cannot fetch, and this is
+    -- the field that says what a role's agents may put on the queue themselves.
+    ("spawnPolicy", ToJson.toJson r.spawnPolicy)
   ]
 
 private def rolesApi (p : Page) : IO Json := do
