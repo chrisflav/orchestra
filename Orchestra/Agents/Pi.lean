@@ -74,17 +74,18 @@ private def piParseOutputLine (line : String) : Option Event :=
     | "tool_execution_start" =>
       let toolName := piJStr json "toolName"
       let args := piJVal json "args" |>.getD (Json.mkObj [])
-      some (.assistant (.toolUse toolName args))
+      -- No call id: pi's event carries no field this can be read from.
+      some (.assistant (.toolUse toolName args none))
     | "tool_execution_end" =>
       let result := piJVal json "result" |>.getD (Json.mkObj [])
       let isError := json.getObjValAs? Bool "isError" |>.toOption |>.getD false
       let text := piToolResultText result
       if isError then
-        some (.toolResult "" text)
+        some (.toolResult "" text none)
       else if text.isEmpty then
         some (.unknown s!"tool_execution_end (empty result) raw={result.compress}")
       else
-        some (.toolResult text "")
+        some (.toolResult text "" none)
     | "agent_end" =>
       -- Use the number of messages in the transcript as a proxy for numTurns
       let msgCount := match json.getObjVal? "messages" with
@@ -177,7 +178,7 @@ def pi : AgentDef where
   -- would leave the second task's port in the file for both agents, and the first to finish
   -- would delete or revert the config underneath the other.
   parallelSafe := false
-  parseOutputLine := piParseOutputLine
+  parseOutputLine := fun line => StreamFormat.one (piParseOutputLine line)
   -- The session UUID is captured from the "session" header line emitted to stdout,
   -- so there is nothing left to extract after the run.
   extractSessionId _ := pure none

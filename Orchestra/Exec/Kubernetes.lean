@@ -430,8 +430,11 @@ private def shell (script : String) : IO (UInt32 × String × String) := do
     opposite, since `kubectl exec` merges stdout and stderr as soon as there is a TTY and orchestra
     reads the two for different things. -/
 def execArgs (cfg : Config) (podName : String) (interactive : Bool)
-    (script : String) (command : String) (args : Array String) : Array String :=
-  #["-n", cfg.ns, "exec"] ++ (if interactive then #["-i", "-t"] else #[])
+    (script : String) (command : String) (args : Array String)
+    (stdinOpen : Bool := false) : Array String :=
+  let flags := (if stdinOpen || interactive then #["-i"] else #[]) ++
+               (if interactive then #["-t"] else #[])
+  #["-n", cfg.ns, "exec"] ++ flags
     ++ #[podName, "--", "/bin/sh", "-c", script, "orchestra", command] ++ args
 
 /-- Copy a directory into the pod. Skipped, not failed, when the source is not there: an agent
@@ -572,7 +575,10 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
 [debug] {rendered}"
     start := fun run => do
       let envFile ← nextEnvFile run.env
-      let args := execArgs cfg podName (run.stdio == .inherit)
+      -- `-i` for a stream as well as for a terminal: both need our end of stdin open, and only
+      -- the interactive one wants a TTY.
+      let args := execArgs cfg podName (interactive := run.stdio == .inherit)
+        (stdinOpen := run.stdio != .piped)
         (runnerScript envFile run.workdir.toString (guard := true)) run.command run.args
       match run.stdio with
       | .inherit =>
@@ -591,6 +597,16 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
           stdin := .null, stdout := .piped, stderr := .piped }
         return { Handle.ofPipedChild child with
                  id := s!"pod {cfg.ns}/{podName}", kill := deletePod }
+      | .stream =>
+        -- An interactive session's agent: up for hours, one turn written in at a time. `-i`
+        -- without `-t` is what carries a pipe rather than a terminal, so closing our end reaches
+        -- the agent's stdin as the EOF that tells it there are no more turns — and stdout and
+        -- stderr still arrive apart, which a TTY would merge.
+        let child ← IO.Process.spawn {
+          cmd := cfg.kubectl, args
+          stdin := .piped, stdout := .piped, stderr := .piped }
+        let handle ← Handle.ofStreamChild child
+        return { handle with id := s!"pod {cfg.ns}/{podName}", kill := deletePod }
     runScript := fun script => do
       -- The repository's own scripts, run where the agent works. `bash` because that is what the
       -- daemon used when it ran them itself, and repositories were written against it.
@@ -598,11 +614,12 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
       let args := execArgs cfg podName false
         (runnerScript envFile script.workdir.toString) "bash" #[script.path]
       match script.stdio with
+      -- A repository's script is run, not conversed with; `.stream` is captured like `.piped`.
       | .inherit =>
         let child ← IO.Process.spawn {
           cmd := cfg.kubectl, args, stdin := .null, stdout := .inherit, stderr := .inherit }
         return { exitCode := ← child.wait }
-      | .piped =>
+      | .piped | .stream =>
         let child ← IO.Process.spawn {
           cmd := cfg.kubectl, args, stdin := .null, stdout := .piped, stderr := .piped }
         let stdout ← child.stdout.readToEnd

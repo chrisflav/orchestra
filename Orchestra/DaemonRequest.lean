@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Orchestra.Queue
+import Orchestra.Interactive.Store
 import Taxis.Domain
 
 open Lean (Json FromJson ToJson)
@@ -23,6 +24,18 @@ inductive DaemonRequest where
   | cancel     (id : Option String := none)
   /-- Shut down the daemon, optionally cancelling running tasks first. -/
   | shutdown   (force : Bool := false)
+  /-- Start an interactive session and answer with its id.
+
+      Here rather than over HTTP for the same reason `cancel` is: a session is a live process
+      with a clone slot and an MCP server behind it, and only the daemon can hold one. The API
+      route forwards to this. -/
+  | interactiveStart (spec : Interactive.SessionSpec)
+  /-- Post a turn to a session. -/
+  | interactiveMessage (id : String) (text : String)
+  /-- Abandon the turn a session is working on, keeping the session. -/
+  | interactiveInterrupt (id : String)
+  /-- End a session and release everything it holds. -/
+  | interactiveEnd (id : String)
   /-- Acquire the orchestra-project claim on `issueId` for `taskId`.
       Routed to `ClaimManager.tryClaim` inside the daemon so the in-process
       mutex serialises CLI claims against agent claims. -/
@@ -48,6 +61,27 @@ instance : FromJson DaemonRequest where
     | "shutdown" =>
       let force := j.getObjValAs? Bool "force" |>.toOption |>.getD false
       return .shutdown force
+    | "interactive_start" =>
+      let specJson ← j.getObjVal? "spec"
+      let upstream ← specJson.getObjValAs? Repository "upstream"
+      let fork     ← specJson.getObjValAs? Repository "fork"
+      return .interactiveStart {
+        upstream, fork
+        backend      := specJson.getObjValAs? String "backend"       |>.toOption
+        model        := specJson.getObjValAs? String "model"         |>.toOption
+        budget       := specJson.getObjValAs? Float  "budget"        |>.toOption
+        tools        := (specJson.getObjValAs? (List String) "tools" |>.toOption)
+        systemPrompt := specJson.getObjValAs? String "systemPrompt"  |>.toOption
+        resumeFrom   := specJson.getObjValAs? String "resumeFrom"    |>.toOption
+      }
+    | "interactive_message" =>
+      let id   ← j.getObjValAs? String "id"
+      let text ← j.getObjValAs? String "text"
+      return .interactiveMessage id text
+    | "interactive_interrupt" =>
+      return .interactiveInterrupt (← j.getObjValAs? String "id")
+    | "interactive_end" =>
+      return .interactiveEnd (← j.getObjValAs? String "id")
     | "claim_issue" =>
       let pid    ← j.getObjValAs? Taxis.IssueId "project_id"
       let iid    ← j.getObjValAs? Taxis.IssueId "issue_id"

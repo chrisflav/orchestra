@@ -59,7 +59,7 @@ task, everything runs through it, and it is closed when the task ends, however i
 
 | field | what it does |
 | --- | --- |
-| `start` | run the agent, return a `Handle` |
+| `start` | run the agent, return a `Handle` — headless, TUI, or a stream held open across turns |
 | `runScript` | run one of the repository's own scripts, where the agent works |
 | `close` | bring back what has to come back, release what was held |
 | `describe` | the run as a command a person can read, for `--debug` |
@@ -111,9 +111,16 @@ Neither half can be set without the other.
 
 ### `Handle` — what is running
 
-Stdout and stderr to read (when the spec asked for `.piped`), a `wait` for the exit code, and a
-`kill` for cancellation. Nothing about it says "process": a pod backend satisfies it with a
-followed log stream, a wait on the pod's phase, and a delete.
+Stdout and stderr to read, a `wait` for the exit code, a `tryWait` for asking without waiting, a
+`terminate` that asks the run to stop and a `kill` that does not ask — and, under `.stream`, the
+run's stdin. Nothing about it says "process": the Kubernetes backend satisfies all of it with one
+`kubectl exec`.
+
+`RunSpec.stdio` picks between the three ways an agent is launched, and they differ in nothing
+else: `.piped` for a queued task, `.inherit` for `orchestra interactive`'s TUI, and `.stream` for
+the process an interactive *session* holds open, where turns are written in one line at a time and
+closing stdin is how the conversation ends. That they share a spec is what keeps the sandbox from
+differing by launch mode — and now from differing by where it runs.
 
 Everything above the handle — parsing the agent's event stream, writing the task log, honouring
 the cancel token, deciding whether the run hit a usage limit — stays in `Sandbox` and is written
@@ -178,7 +185,7 @@ The mapping is mechanical, which is the point of the interface:
 | `SessionSpec.grants` marked `.orchestra` | `emptyDir` volumes, filled from the daemon's disk when the session opens |
 | `SessionSpec.grants` marked `.environment` | nothing: `/usr`, `/etc` and the agent's home come from the image |
 | `SessionSpec.image` / `.repo` | which image the pod runs, and the label it carries |
-| `Session.start` | `kubectl exec` — with `-i -t` when the spec asked for the daemon's own terminal |
+| `Session.start` | `kubectl exec` — `-i -t` for a TUI, `-i` for a session's held-open stream, neither for a queued run |
 | `Session.runScript` | `kubectl exec ... bash <script>`, in the same pod |
 | `Session.close` | copy the checkout back, delete the pod |
 | `RunSpec.env` | a file written into the pod and sourced, never a command line or a pod spec |

@@ -148,12 +148,13 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
   let token ← GitHub.createInstallationToken jwt installationId
   GitHub.setupGhAuth token
   let serverState : Server.State := {
-    upstream, fork
+    repo := some { upstream, fork }
+    installationId := some installationId
     allowedTools := if allowPR then ["create_pr"] else []
     appId := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
-    installationId
     pat := appConfig.pat
+    defaultOrganization := appConfig.defaultOrganization
   }
   let (port, _shutdown) ← Server.start serverState
   IO.println s!"MCP server listening on port {port}"
@@ -211,13 +212,18 @@ private def cleanupHandler (_ : Parsed) : IO UInt32 := do
 
 private def cleanupListHandler (_ : Parsed) : IO UInt32 := do
   let clones ← Repo.listClones
-  if clones.isEmpty then
-    IO.println "No repository clones found."
+  let workspaces ← Repo.listWorkspaces
+  if clones.isEmpty && workspaces.isEmpty then
+    IO.println "No repository clones or workspaces found."
     return (0 : UInt32)
   for (mainPath, slots) in clones do
     IO.println s!"  {mainPath}"
     for slot in slots do
       IO.println s!"    slot: {slot}"
+  -- Listed alongside the clones because `cleanup` removes both, and a workspace holding a
+  -- repository-independent task's scratch files is exactly as much disk as a slot.
+  for workspace in workspaces do
+    IO.println s!"  {workspace} (no repository)"
   return (0 : UInt32)
 
 private def tasksHandler (p : Parsed) : IO UInt32 := do
@@ -243,7 +249,7 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
       | some run => run.id
       | none     => ""
     let seriesLabel := r.series.getD ""
-    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork.toString 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
+    IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight (repoLabel r.repo) 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 private def taskShowHandler (p : Parsed) : IO UInt32 := do
@@ -260,8 +266,11 @@ private def taskShowHandler (p : Parsed) : IO UInt32 := do
     IO.println s!"ID:             {r.id}"
     IO.println s!"Created:        {r.createdAt}"
     IO.println s!"Status:         {status}"
-    IO.println s!"Fork:           {r.fork}"
-    IO.println s!"Upstream:       {r.upstream}"
+    match r.repo with
+    | some repo =>
+      IO.println s!"Fork:           {repo.fork}"
+      IO.println s!"Upstream:       {repo.upstream}"
+    | none => IO.println "Repository:     none (repository-independent)"
     IO.println s!"Mode:           {mode}"
     IO.println s!"Series:         {r.series.getD "-"}"
     IO.println s!"Continues from: {r.continuesFrom.getD "-"}"
@@ -320,8 +329,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
   let task : Task := {
     i := .unit, o := .unit
     ioTask := {
-      upstream      := prevRecord.upstream
-      fork          := prevRecord.fork
+      repo          := prevRecord.repo
       mode          := prevRecord.mode
       prompt
       goal          := prevRecord.goal
@@ -386,8 +394,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
     let createdAt ← TaskStore.currentIso8601
     let entry : Queue.QueueEntry := {
       id, createdAt
-      upstream      := prevRecord.upstream
-      fork          := prevRecord.fork
+      repo          := prevRecord.repo
       mode          := prevRecord.mode
       prompt        := promptText
       goal          := prevRecord.goal
@@ -454,8 +461,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       let createdAt ← TaskStore.currentIso8601
       let entry : Queue.QueueEntry := {
         id, createdAt
-        upstream      := task.ioTask.upstream
-        fork          := task.ioTask.fork
+        repo          := task.ioTask.repo
         mode          := task.ioTask.mode
         prompt        := task.ioTask.prompt
         goal          := task.ioTask.goal
@@ -474,6 +480,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         readOnly         := task.ioTask.readOnly
         priority         := priorityFlag.getD task.ioTask.priority
         issueNumber      := task.ioTask.issueNumber
+        spawnPolicy      := task.ioTask.spawnPolicy
       }
       let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
       let _ ← daemonRequest req
@@ -632,7 +639,7 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
       | .unfinished => "unfinished" | .cancelled => "cancelled"
     let concertLabel := e.concertId.getD ""
     let seriesLabel := e.series.getD ""
-    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork.toString 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
+    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight (repoLabel e.repo) 28} {padRight status 10} {padRight (toString e.priority) 4} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
 
 /-! ## Configuration, over the API
@@ -795,6 +802,17 @@ private def listenerShowHandler (p : Parsed) : IO UInt32 := do
       IO.println s!"Interval:     {Client.nat j "intervalSeconds"}s"
       IO.println s!"Last checked: {Client.str j "lastCheckedAt" "never"}"
       IO.println s!"Events seen:  {Client.nat j "eventCount"}"
+      -- Printed only when there are ceilings to print: a listener with none is not paced, and
+      -- "Rate limits: none" is a line that says nothing on every other listener there is.
+      let rateLimits := (j.getObjVal? "rateLimits" |>.toOption).bind (·.getArr?.toOption)
+      if let some rls := rateLimits then
+        if !rls.isEmpty then
+          IO.println "Rate limits:"
+          for r in rls do
+            let nextAt := Client.str r "nextAllowedAt"
+            let when_  := if nextAt.isEmpty then "" else s!", next at {nextAt}"
+            IO.println s!"  {Client.str r "description"} \
+({Client.nat r "used"} used{when_})"
       if let some c := j.getObjVal? "config" |>.toOption then
         IO.println "Config:"
         for line in c.pretty.splitOn "\n" do
@@ -851,7 +869,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
       let status := if e.status == .running then "running" else "pending"
       let concertLabel := e.concertId.getD ""
       let seriesLabel := e.series.getD ""
-      IO.println s!"{padRight e.id 16} {padRight e.fork.toString 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
+      IO.println s!"{padRight e.id 16} {padRight (repoLabel e.repo) 28} {padRight status 9} {padRight (toString e.priority) 8} {padRight seriesLabel 16} {concertLabel}"
   -- Listener status
   let listenerConfigs ← Listener.loadAllListenerConfigs
   if !listenerConfigs.isEmpty then
@@ -938,12 +956,12 @@ private def prepareCmd : Cmd := `[Cli|
 
 private def cleanupListCmd : Cmd := `[Cli|
   list VIA cleanupListHandler; ["0.1.0"]
-  "List all repository clones and their task slots."
+  "List all repository clones and their task slots, plus the scratch workspaces repository-independent tasks run in."
 ]
 
 private def cleanupCmd : Cmd := `[Cli|
   cleanup VIA cleanupHandler; ["0.1.0"]
-  "Manage cloned repositories. Without a subcommand, removes all clones and task slots."
+  "Manage cloned repositories. Without a subcommand, removes all clones, task slots and scratch workspaces."
 
   SUBCOMMANDS:
     cleanupListCmd
@@ -1083,8 +1101,7 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
       | _           => pure entry.continuesFrom
     let newEntry : Queue.QueueEntry := {
       id, createdAt
-      upstream     := entry.upstream
-      fork         := entry.fork
+      repo         := entry.repo
       mode         := entry.mode
       prompt       := entry.prompt
       goal         := entry.goal
@@ -1306,6 +1323,18 @@ private def usageHandler (p : Parsed) : IO UInt32 := do
         | .ok _    => pure ()
       else if pollMode == 1 then
         Usage.ensureFresh appConfig backend label
+      -- The way back from a block that should not be there.
+      --
+      -- An observed block outlives its evidence by design: a poll cannot see a model-scoped
+      -- window or a billing failure, so neither can retire one, and a run that would prove it
+      -- gone is exactly what the block prevents. That is right when the block is right and leaves
+      -- no way out when it is not — a misread message can otherwise only be waited out. This is
+      -- the way out, and it is deliberately manual: nothing infers that a block was wrong.
+      if p.hasFlag "clear_blocks" then
+        let st ← Usage.loadState backend label
+        if !st.blocks.isEmpty then
+          Usage.saveState { st with blocks := #[] }
+          IO.println s!"  {label}: forgot {st.blocks.size} observed block(s)"
       let st ← Usage.loadState backend label
       let verdict := match Usage.availabilityOf st model now with
         | .available          => "available"
@@ -1321,6 +1350,18 @@ private def usageHandler (p : Parsed) : IO UInt32 := do
         if pa > now then
           IO.println s!"    not polling until {Usage.relativeToNow pa now} \
 (the usage endpoint is rate-limiting requests)"
+      -- Blocks before limits, because they are the ones nothing else here can show. The limit
+      -- rows come from polls, and a poll reads the account's own windows only — so a limit
+      -- observed by a run, on one model family, appears in neither the rows below nor the verdict
+      -- above (which is judged for `model`, and defaults to naming none). Without a line of its
+      -- own it appears nowhere, and this is the command an operator asks "why did Fable stop?"
+      for b in st.blocks do
+        if Usage.blockIsLive b now then
+          let scope := match b.model with | some m => m | none => "whole account"
+          let lifts := match b.untilEpoch with
+            | some u => s!", lifts {Usage.relativeToNow u now}"
+            | none   => ""
+          IO.println s!"    observed ({scope}): {b.reason}{lifts}"
       for l in st.limits do
         let scope := match l.scopeModel with | some m => s!" ({m})" | none => ""
         let resets := match l.resetsAt.bind Usage.parseIso8601 with
@@ -1361,6 +1402,7 @@ private def usageCmd : Cmd := `[Cli|
     cached    ;         "Do not poll; report the last stored values"
     refresh   ;         "Force a poll even if the stored values are still fresh"
     select    ;         "Also show which source a task queued now would be dispatched to"
+    clear_blocks;       "Forget limits observed by a run on the selected sources, then report"
     auth_mode : String; "Selection mode to simulate with --select: ordered (default) or distribute"
 ]
 
@@ -1393,12 +1435,326 @@ private def dashboardCmd : Cmd := `[Cli|
 
 -- All optional tool permission tokens recognised by --tools.
 private def allOptionalTools : List String :=
-  ["create_pr", "merge_pr", "label_issue", "comment", "manage_issues", "work_issues",
-   "review_issues"]
+  ["create_pr", "merge_pr", "label_issue", "comment", "create_repository",
+   "manage_issues", "work_issues", "review_issues"]
+
+/-! ## `orchestra chat` — a session on the backend, from a terminal
+
+`orchestra interactive` is unchanged and still local: it drops you into the agent's own TUI on
+the machine you are sitting at. This is the other thing — a conversation the *daemon* holds,
+which the dashboard and a phone can be looking at too, and which survives closing this terminal.
+
+Nothing here executes anything. It posts turns and renders the transcript stream, and every
+event it prints goes through `StreamFormat.format`, the same renderer `orchestra run` prints
+task output with. A chat therefore looks like a run that answers back.
+-/
+
+/-- Render one transcript envelope for a terminal.
+
+    Agent events go through the shared formatter; the kinds the agent's own stream cannot carry
+    are rendered here, because they are this client's news rather than the agent's. -/
+private def renderTranscriptEvent (j : Lean.Json) : Option String :=
+  match Client.str j "kind" with
+  | "user"        => some s!"\n> {Client.str j "text"}"
+  | "agent"       =>
+    match j.getObjVal? "event" |>.toOption with
+    | some ev =>
+      match (Lean.FromJson.fromJson? ev : Except String StreamFormat.Event) with
+      | .ok e    => some (StreamFormat.format e)
+      | .error _ => none
+    | none => none
+  -- Turn boundaries are structure, not content: the prompt below already shows when a turn is
+  -- in flight, and printing both says the same thing twice.
+  | "turnStarted" => none
+  | "turnEnded"   =>
+    let cost := match j.getObjValAs? Float "costUsd" |>.toOption with
+      | some c => s!" | ${c}"
+      | none   => ""
+    some s!"[turn done]{cost}"
+  | "notice"      => some s!"[{Client.str j "level"}] {Client.str j "message"}"
+  | _             => none
+
+/-- Exclusive use of the terminal for one burst of output.
+
+    A chat has two writers — the follower thread printing the transcript, the input loop
+    printing the prompt — and unsynchronised they interleave, putting a line of agent output
+    through the middle of the prompt. It deliberately does not redraw the prompt afterwards:
+    what has been typed so far is held by the terminal's line discipline rather than by this
+    process, and a reprinted prompt would appear empty above characters that are still there. -/
+private def withTerminal (lock : Std.BaseMutex) (act : IO.FS.Stream → IO Unit) : IO Unit := do
+  let out ← IO.getStdout
+  lock.lock
+  try
+    act out
+    out.flush
+  finally
+    lock.unlock
+
+/-- Print every event in one SSE payload, and answer the highest seq it carried.
+
+    Rendered first and printed second, so one frame reaches the terminal as one burst rather
+    than as lines the input loop can get between. -/
+private def renderTranscriptPage (lock : Std.BaseMutex) (payload : Lean.Json) (after : Nat)
+    : IO Nat := do
+  let (items, _) := Client.items payload
+  let mut last := after
+  let mut lines : Array String := #[]
+  for item in items do
+    last := max last (Client.nat item "seq")
+    if let some line := renderTranscriptEvent item then
+      lines := lines.push line
+  unless lines.isEmpty do
+    withTerminal lock fun out => for line in lines do out.putStrLn line
+  return last
+
+private def chatSessionPath (id : String) : String :=
+  s!"/api/v1/interactive/{Client.encodeSegment id}"
+
+/-- Read one transcript stream until it ends, printing as it goes. -/
+private partial def drainTranscript (lock : Std.BaseMutex) (stream : Utils.Http.Stream)
+    (cursor : IO.Ref Nat) : IO Unit := do
+  repeat do
+    let some line ← stream.nextLine | break
+    if let some data := Client.sseData line then
+      if let .ok payload := Lean.Json.parse data then
+        cursor.set (← renderTranscriptPage lock payload (← cursor.get))
+
+/-- Follow a session's transcript for as long as someone is attached, reconnecting from the
+    cursor whenever the stream drops.
+
+    Run on its own thread while the main one reads the keyboard: a chat where you cannot type
+    until the agent has finished talking is not a chat.
+
+    A stream ends for three quite different reasons, and a client that cannot tell them apart is
+    a client that goes quiet and says nothing about it. The conversation is over and the server
+    closed it deliberately; the connection broke, which for a chat left open on a laptop is the
+    common case rather than the exceptional one; or this client detached. Only the last is a
+    reason to stop. Reconnecting from `cursor` is exact in both directions — the server replays
+    what follows it and nothing else — so a reattach costs neither a missed event nor a repeated
+    one.
+
+    Detaching is what `stopped` and `current` are for. This thread spends almost all its time
+    blocked inside `nextLine`, so a flag it polled between frames would be read once per event
+    and never while it mattered; closing the stream from the other thread is what unblocks it,
+    and the flag is what tells it afterwards not to open another. -/
+private partial def followTranscript (cfg : Client.Config) (id : String) (lock : Std.BaseMutex)
+    (cursor : IO.Ref Nat) (current : IO.Ref (Option Utils.Http.Stream))
+    (stopped : IO.Ref Bool) (over : IO.Ref Bool) : IO Unit := do
+  let mut live ← current.get
+  let mut failures := 0
+  repeat do
+    if let some stream := live then
+      try drainTranscript lock stream cursor catch _ => pure ()
+      stream.close
+      live := none
+      current.set none
+    if ← stopped.get then break
+    -- The server closes the stream once the session is terminal. Ask which it was rather than
+    -- reconnecting forever to a conversation that will never say anything again.
+    match ← Client.get cfg (chatSessionPath id) with
+    | .ok j =>
+      let status := Client.str j "status"
+      if status == "ended" || status == "failed" then
+        over.set true
+        withTerminal lock fun out => out.putStrLn s!"\n[session {status}]"
+        break
+    | .error _ => pure ()
+    IO.sleep (500 + 1000 * min failures 4).toUInt32
+    if ← stopped.get then break
+    match ← (try some <$> Client.openTranscript cfg id (← cursor.get) catch _ => pure none) with
+    | none =>
+      failures := failures + 1
+      if failures ≥ 5 then
+        withTerminal lock fun out => out.putStrLn "\n[lost the transcript stream; the session \
+is still on the backend — /quit and reattach with `orchestra chat --session ...`]"
+        break
+    | some next =>
+      -- A clean drop is routine — the server's own connection timeout ends a quiet stream every
+      -- few seconds — and since the cursor makes the reattach exact, there is nothing to say
+      -- about it. Only a reconnect that had to be retried is news.
+      let recovered := failures > 0
+      failures := 0
+      live := some next
+      current.set (some next)
+      -- A detach that landed while this was being opened would otherwise leave a stream running
+      -- with nobody left to close it.
+      if ← stopped.get then
+        next.close
+        live := none
+        current.set none
+        break
+      if recovered then
+        withTerminal lock fun out => out.putStrLn "\n[reconnected]"
+  current.set none
+
+/-- Post turns from standard input until it ends.
+
+    A blank line is not a turn — it is someone pressing enter — and `/quit` detaches without
+    ending the session, because detaching and ending are different things and only one of them
+    can be undone.
+
+    A turn the backend refused becomes the `draft`: it is shown again above the next prompt and
+    an empty line re-sends it. Losing what someone typed because a connection blinked is a poor
+    trade for four lines of state. -/
+private partial def chatInputLoop (cfg : Client.Config) (id : String) (lock : Std.BaseMutex)
+    (draft : Option String) : IO Unit := do
+  let stdin ← IO.getStdin
+  match draft with
+  | none   => withTerminal lock fun out => out.putStr "\nyou> "
+  | some d => withTerminal lock fun out =>
+      out.putStr s!"\n[not sent] {d}\nretry> (enter re-sends it) "
+  let line ← stdin.getLine
+  -- End of input: the terminal closed, or someone typed Ctrl-D. Detach, do not end.
+  if line.isEmpty then return
+  let typed := line.trimAscii.toString
+  let text := if typed.isEmpty then draft.getD "" else typed
+  if text.isEmpty then return ← chatInputLoop cfg id lock none
+  if text == "/quit" || text == "/detach" then return
+  let body := Lean.Json.compress (Lean.Json.mkObj [("text", Lean.Json.str text)])
+  -- The same fifteen minutes the start route gets, and for the same reason: a turn posted to a
+  -- session the daemon has put down wakes it first, which is a clone, a token, an MCP server and
+  -- a sandbox before anything is answered. At the default thirty seconds the client reports a
+  -- failure for a turn that is being delivered, and the retry prompt then sends it twice.
+  match ← Client.post cfg s!"{chatSessionPath id}/messages" body (maxTime := 900) with
+  | .error e =>
+    withTerminal lock fun out => out.putStrLn s!"\nThe turn was not delivered: {e}"
+    chatInputLoop cfg id lock (some text)
+  | .ok _ => chatInputLoop cfg id lock none
+
+private def chatAttach (cfg : Client.Config) (id : String) (after : Nat) : IO UInt32 := do
+  IO.println s!"Attached to session {id}. Type a turn and press enter; /quit detaches without \
+ending it."
+  let lock ← Std.BaseMutex.new
+  let cursor ← IO.mkRef after
+  let stopped ← IO.mkRef false
+  let over ← IO.mkRef false
+  let current ← IO.mkRef (some (← Client.openTranscript cfg id after))
+  let follower ← IO.asTask (prio := .dedicated)
+    (followTranscript cfg id lock cursor current stopped over)
+  try chatInputLoop cfg id lock none
+  finally
+    -- Closing is what stops the follower: it is blocked on a read that only ends when the
+    -- connection does. The flag goes up first, so a reconnect cannot start between the two.
+    -- Waited on afterwards so the last frames are printed before the line below, rather than
+    -- racing it or being lost when the process exits.
+    stopped.set true
+    if let some stream ← current.get then stream.close
+    let _ ← IO.wait follower
+  if ← over.get then
+    IO.println "\nThe conversation is over."
+  else
+    IO.println s!"\nDetached. The session is still running; `orchestra chat --session {id}` \
+picks it up, and `orchestra chat --end {id}` ends it."
+  return 0
+
+private def chatHandler (p : Parsed) : IO UInt32 := do
+  withClient p fun cfg => do
+    -- Four different things to do, and exactly one of them per invocation. Silently preferring
+    -- whichever was checked first is how a mistyped flag becomes "why did that do nothing" —
+    -- `--session x --budget 3` looked like it set a budget and did not, and `--list --end x`
+    -- listed and left the session up.
+    let startFlags := ["upstream", "fork", "backend", "model", "budget", "tools", "resume-from"]
+      |>.filter (fun f => (p.flag? f).isSome)
+      |>.map ("--" ++ ·)
+    let modes := [("--list", p.hasFlag "list"),
+                  ("--end", (p.flag? "end").isSome),
+                  ("--session", (p.flag? "session").isSome),
+                  (", ".intercalate startFlags, !startFlags.isEmpty)]
+      |>.filter (·.2) |>.map (·.1)
+    if modes.length > 1 then
+      IO.eprintln s!"{", ".intercalate modes} are different things; give one of them."
+      return 1
+    -- List
+    if p.hasFlag "list" then
+      return ← apiCall (Client.get cfg "/api/v1/interactive") fun j => do
+        let (rows, total) := Client.items j
+        if rows.isEmpty then
+          IO.println "No sessions."
+        else
+          IO.println s!"{padRight "SESSION" 22} {padRight "STATUS" 9} {padRight "REPO" 28} \
+{padRight "TURNS" 6} TITLE"
+          IO.println (String.ofList (List.replicate 96 '-'))
+          for r in rows do
+            IO.println s!"{padRight (Client.str r "id") 22} \
+{padRight (Client.str r "status") 9} {padRight (Client.str r "fork") 28} \
+{padRight (toString (Client.nat r "turnCount")) 6} {Client.str r "title"}"
+          if total > rows.size then
+            IO.println s!"\n{rows.size} of {total}."
+    -- End
+    if let some idFlag := p.flag? "end" then
+      let id := idFlag.as! String
+      return ← apiCall (Client.delete cfg (chatSessionPath id)) fun _ => do
+        IO.println s!"Session {id} ended."
+    -- Attach to one that exists. The transcript is replayed from the beginning, because a
+    -- person re-attaching wants to see what was said, not an empty screen above a live tail.
+    if let some idFlag := p.flag? "session" then
+      let id := idFlag.as! String
+      match ← Client.get cfg (chatSessionPath id) with
+      | .error e => IO.eprintln e; return 1
+      | .ok _    => return ← chatAttach cfg id 0
+    -- Otherwise start one.
+    let some upstream := p.flag? "upstream" |>.map (·.as! String)
+      | do IO.eprintln "Give --upstream and --fork to start a session, --session to attach to \
+one, --list to see them, or --end to end one."
+           return 1
+    let some fork := p.flag? "fork" |>.map (·.as! String)
+      | do IO.eprintln "A session needs --fork as well as --upstream."
+           return 1
+    let mut fields : List (String × Lean.Json) :=
+      [("upstream", Lean.Json.str upstream), ("fork", Lean.Json.str fork)]
+    if let some b := p.flag? "backend" then
+      fields := fields ++ [("backend", Lean.Json.str (b.as! String))]
+    if let some m := p.flag? "model" then
+      fields := fields ++ [("model", Lean.Json.str (m.as! String))]
+    if let some bud := p.flag? "budget" then
+      -- A budget that did not parse used to be dropped, and the session ran on the 20.0
+      -- default: the one flag whose whole purpose is to bound spending, ignored in silence.
+      let raw := bud.as! String
+      let some v := parseFloat? raw
+        | do IO.eprintln s!"--budget takes an amount in dollars; '{raw}' is not one."
+             return 1
+      fields := fields ++ [("budget", Lean.toJson v)]
+    if let some t := p.flag? "tools" then
+      let names := ((t.as! String).splitOn ",").map (·.trimAscii.toString)
+                     |>.filter (!·.isEmpty)
+      unless names == ["all"] do
+        fields := fields ++ [("tools", Lean.Json.arr (names.map Lean.Json.str).toArray)]
+    if let some r := p.flag? "resume-from" then
+      fields := fields ++ [("resumeFrom", Lean.Json.str (r.as! String))]
+    IO.println "Starting a session; this clones the repository and launches the agent..."
+    -- The default 30 s is a read-a-file-off-disk timeout. This route clones a repository, mints
+    -- a token, starts an MCP server and launches an agent inside the sandbox before it answers,
+    -- and a client that gives up at 30 s reports a failure for a session that is starting
+    -- perfectly well — and then leaves it running with nobody attached.
+    match ← Client.post cfg "/api/v1/interactive"
+            (Lean.Json.compress (Lean.Json.mkObj fields)) (maxTime := 900) with
+    | .error e => IO.eprintln e; return 1
+    | .ok j    => chatAttach cfg (Client.str j "id") 0
+
+private def chatCmd : Cmd := `[Cli|
+  chat VIA chatHandler; ["0.1.0"]
+  "Talk to an agent the backend holds open: a session the dashboard and a phone can see too."
+
+  FLAGS:
+    upstream     : String; "Upstream repository in 'owner/repo' format"
+    fork         : String; "Fork repository in 'owner/repo' format"
+    session      : String; "Attach to an existing session by id instead of starting one"
+    list;                  "List sessions and exit"
+    "end"        : String; "End the session with this id and exit"
+    backend      : String; "Agent backend (default: claude; it is the only one that can host a session)"
+    model        : String; "Model override passed to the agent"
+    budget       : String; "Maximum spend in USD for the whole session (default: 20.0)"
+    tools        : String; "Comma-separated optional tools to enable, or 'all' (default: all)"
+    "resume-from" : String; "Start a session that picks up the conversation of this one"
+    "api-url" : String; "Backend to talk to (default: $ORCHESTRA_API_URL, or \
+http://127.0.0.1:8080)"
+    "api-token" : String; "Shared secret (default: $ORCHESTRA_DASHBOARD_PASSWORD, or the \
+persisted one)"
+]
 
 private def interactiveHandler (p : Parsed) : IO UInt32 := do
-  let upstreamStr := p.flag! "upstream" |>.as! String
-  let forkStr     := p.flag! "fork"     |>.as! String
+  let upstreamStr := p.flag? "upstream" |>.map (·.as! String)
+  let forkStr     := p.flag? "fork"     |>.map (·.as! String)
   let toolsStr    := p.flag? "tools"    |>.map (·.as! String)
   let backend     := p.flag? "backend"  |>.map (·.as! String)
   let model       := p.flag? "model"    |>.map (·.as! String)
@@ -1411,21 +1767,51 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   -- Left as `none` when the flag is absent, so an interactive run takes the backend's
   -- `default_auth_mode` like every other path rather than forcing `ordered` onto a pool.
   let authMode    := (p.flag? "auth_mode" |>.map (·.as! String)).bind AuthMode.ofString?
-  let upstream ← IO.ofExcept (Repository.parse upstreamStr)
-  let fork     ← IO.ofExcept (Repository.parse forkStr)
-  let allowedTools : List String := match toolsStr with
+  -- Both flags or neither, as everywhere else: with neither, this is a repository-independent
+  -- session — a sandbox with the tracker tools and an empty workspace, which is how you get a
+  -- look at what a repository-independent task sees.
+  let repo : Option RepoPair ← match upstreamStr, forkStr with
+    | none, none => pure none
+    | some u, some f =>
+      pure (some { upstream := ← IO.ofExcept (Repository.parse u)
+                 , fork     := ← IO.ofExcept (Repository.parse f) })
+    | _, _ => throw (.userError "--upstream and --fork are given together or not at all")
+  let requested : List String := match toolsStr with
     | none | some "all" => allOptionalTools
     | some s => s.splitOn ","
+  -- The repository-scoped tools are not offered to a session that has no repository; the MCP
+  -- server refuses them anyway, and `--tools all` should not read as a promise it cannot keep.
+  -- Through the same helper a queued task goes through, so `--tools create_pr` typed at a session
+  -- with no repository is reported rather than dropped in silence — but not `--tools all` or its
+  -- absence, which named nothing in particular and would say this on every such session.
+  let namedTools := match toolsStr with
+    | some s => s != "all"
+    | none   => false
+  let allowedTools ← Server.withoutRepoScopedTools repo requested (warn := namedTools)
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let installationId ← match appConfig.installationId with
-    | some id => pure id
-    | none    => GitHub.getInstallationId jwt fork.owner
-  let token ← GitHub.createInstallationToken jwt installationId
-  GitHub.setupGhAuth token
-  IO.println s!"Cloning/updating {fork}..."
-  let repoPath ← Repo.ensureCloned fork upstream
-  IO.println s!"  Repo at {repoPath}"
+  let installationId : Option Nat ← match appConfig.installationId with
+    | some id => pure (some id)
+    | none    =>
+      match repo, appConfig.defaultOrganization with
+      | some r, _      => some <$> GitHub.getInstallationId jwt r.fork.owner
+      | none,   some o => some <$> GitHub.getInstallationId jwt o
+      | none,   none   => pure none
+  let token ← match installationId with
+    | some id => GitHub.createInstallationToken jwt id
+    | none    => pure ""
+  unless token.isEmpty do GitHub.setupGhAuth token
+  let repoPath ← match repo with
+    | some r =>
+      IO.println s!"Cloning/updating {r.fork}..."
+      let p ← Repo.ensureCloned r.fork r.upstream
+      IO.println s!"  Repo at {p}"
+      pure p
+    | none =>
+      IO.println "Preparing the scratch workspace (no repository)..."
+      let p ← Repo.ensureAdhocWorkspace
+      IO.println s!"  Workspace at {p}"
+      pure p
   let backendName := backend.getD "claude"
   let execBackend ← match ← Exec.resolve appConfig.execution with
     | .ok b => pure b
@@ -1434,14 +1820,15 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
       return 1
   let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
   let serverState : Server.State := {
-    upstream, fork
+    repo
+    installationId
     allowedTools
     appId          := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
-    installationId
     pat            := appConfig.pat
     agentBackend   := backendName
-    authToken      := mcpToken
+    authToken           := mcpToken
+    defaultOrganization := appConfig.defaultOrganization
   }
   let (port, shutdown) ← Server.start serverState (bindHost := mcpBind)
     (portRange := mcpPorts)
@@ -1474,7 +1861,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths repoPath
                  false appConfig.pluginDirs #[]
     label   := "interactive"
-    repo    := some fork.toString
+    repo    := repo.map (·.fork.toString)
     image   := repoConfig.image }
   IO.println s!"  Running in: {session.id}"
   IO.println "  Launching agent..."
@@ -1498,8 +1885,8 @@ private def interactiveCmd : Cmd := `[Cli|
   FLAGS:
     c, config   : String; "Path to config file (default: ~/.agent/config.json)"
     d, debug;             "Print the landrun command before executing it"
-    upstream    : String; "Upstream repository in 'owner/repo' format"
-    fork        : String; "Fork repository in 'owner/repo' format"
+    upstream    : String; "Upstream repository in 'owner/repo' format (omit with --fork for a session with no repository)"
+    fork        : String; "Fork repository in 'owner/repo' format (given together with --upstream, or not at all)"
     tools       : String; "Comma-separated optional tools to enable, or 'all' (default: all)"
     backend     : String; "Agent backend: claude (default), vibe, opencode, pi"
     model       : String; "Model override passed to the agent"
@@ -1520,6 +1907,7 @@ def orchestraCmd : Cmd := `[Cli|
   SUBCOMMANDS:
     runCmd';
     interactiveCmd;
+    chatCmd;
     mcpServerCmd;
     prepareCmd;
     cleanupCmd;

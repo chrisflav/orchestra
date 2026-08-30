@@ -14,6 +14,17 @@ export function orDash(value: string | null | undefined): string {
   return value === null || value === undefined || value === "" ? "—" : value;
 }
 
+/**
+ * The repository a task or entry belongs to, as a list reads it.
+ *
+ * `null` is not missing data here: a repository-independent task genuinely has none and runs in
+ * a scratch workspace instead of a checkout. Saying so beats an em dash, which in a row of
+ * repository names looks like a value that failed to load.
+ */
+export function repoLabel(fork: string | null): string {
+  return fork === null || fork === "" ? "no repository" : fork;
+}
+
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;

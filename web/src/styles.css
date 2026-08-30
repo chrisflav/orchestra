@@ -903,6 +903,18 @@ a.row:hover .row-title {
   color: var(--perc);
   margin-bottom: 6px;
 }
+.source-blocks {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.source-block {
+  font-size: 13.5px;
+  color: var(--perc);
+}
 .source-foot {
   margin-top: 12px;
   font-size: 12.5px;
@@ -1294,4 +1306,228 @@ a.row:hover .row-title {
   .limit-track {
     width: 30%;
   }
+}
+
+/* Chat.
+ *
+ * The one page that talks back, so it is the one page with a text field on it. Everything
+ * about it borrows: the transcript is `LogView` for the agent's own output, the same
+ * component a task page uses, and the controls take their shape from the login form, which
+ * is the only other place this console asks for typing.
+ *
+ * What is new is only what the agent's stream cannot say — what the person typed, and what
+ * the daemon did — and each of those gets exactly one visual device. A turn is set flush
+ * against a strings-coloured rule on the left, because it is the one thing on the page a
+ * human wrote; a notice is small and takes its colour from the section vocabulary. */
+.chat-start,
+.chat-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 0;
+}
+.chat-start {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.chat-start input,
+.chat-compose textarea {
+  font-family: var(--data);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  padding: 11px 13px;
+}
+.chat-start input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+/* Optional, and narrower than the two repositories, which are not. Qualified with `input` so it
+   outweighs the `.chat-start input` rule above rather than silently losing to it. */
+.chat-start input.chat-start-model {
+  flex: 0 1 190px;
+}
+.chat-start input.chat-start-budget {
+  flex: 0 1 205px;
+}
+.chat-compose textarea {
+  font-family: var(--ui);
+  resize: vertical;
+  width: 100%;
+  box-sizing: border-box;
+}
+.chat-start input:focus,
+.chat-compose textarea:focus {
+  outline: none;
+  border-color: var(--strings);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--strings) 16%, transparent);
+}
+.chat-compose textarea:disabled {
+  background: var(--sunken);
+  color: var(--mute);
+}
+.chat-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.chat-start button,
+.chat-actions button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 10px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  background: var(--raised);
+  color: var(--text);
+  cursor: pointer;
+}
+/* The affirmative action on each form is the filled one; the rest are outlines, so a page
+   with three buttons on it still has one obvious thing to press. */
+.chat-start button,
+.chat-actions button[type="submit"] {
+  border-color: transparent;
+  background: var(--strings);
+  color: #ffffff;
+}
+.chat-start button:hover:not(:disabled),
+.chat-actions button:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+.chat-start button:disabled,
+.chat-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.chat-actions .chat-end {
+  margin-left: auto;
+  color: var(--perc);
+}
+.chat-error {
+  font-size: 13px;
+  color: var(--perc);
+  padding-bottom: 12px;
+}
+.chat-transcript {
+  display: flex;
+  flex-direction: column;
+}
+/* Nothing in a conversation is sized by what else is in it.
+
+   Kept even though the transcript is no longer height-bounded, because the failure it prevents
+   is silent and the rule costs nothing: a flex item's default `flex-shrink: 1` lets it be
+   squashed to fit a bounded container, and its automatic minimum size — the thing that normally
+   stops that at the height of the content — is zero for any box whose `overflow` is not
+   `visible`. When this container did have a `max-height`, every agent block was compressed to a
+   share of it and clipped there, so a model's answer showed a line and a half and showed less
+   of itself with every turn that arrived after it. */
+.chat-transcript > * {
+  flex: 0 0 auto;
+}
+/* A log drawn as part of someone else's page rather than as a component of its own: no panel
+   around it, no scroll box, and none of the inner `pre` boxes either. A conversation is
+   continuous — the page is the only thing that scrolls, and the agent's words sit at the same
+   left edge as the words of the person it is talking to. */
+.log-plain {
+  margin: 4px 0;
+}
+.log-flow {
+  max-height: none;
+  overflow-y: visible;
+}
+.log-flow .log-body pre {
+  max-height: none;
+  overflow-y: visible;
+}
+/* The 18px inset belongs to the panel; without one it is an indent against the user's turns. */
+.log-flow .log-entry {
+  padding-left: 0;
+  padding-right: 0;
+  border-bottom: none;
+}
+.chat-turn {
+  font-family: var(--ui);
+  font-size: 15px;
+  color: var(--text);
+  margin: 18px 0 10px;
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--strings);
+  white-space: pre-wrap;
+}
+/* A live status, not a line of transcript — so it reads as one: no rule, no timestamp, and a
+   pulse slow enough to say "still going" without asking to be watched. */
+.chat-thinking {
+  font-family: var(--data);
+  font-size: 12px;
+  color: var(--faint);
+  margin: 8px 0;
+  animation: chat-thinking-pulse 1.8s ease-in-out infinite;
+}
+@keyframes chat-thinking-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+/* Someone who has asked not to see motion is asking about this too. */
+@media (prefers-reduced-motion: reduce) {
+  .chat-thinking {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+/* The collapsed run of tool calls: one line that looks like the summary it is. */
+.log-tools {
+  padding: 6px 0;
+}
+/* Sat on the body column, where the agent's words are, rather than across the kind gutter it
+   neither belongs to nor lines up with. `.log-entry` is `92px + 16px gap`, so this is that. */
+.log-flow .log-tools-toggle {
+  margin-left: 108px;
+}
+.log-tools-toggle {
+  font-family: var(--data);
+  font-size: 12px;
+  /* `--mute`, not `--faint`: this is the only way to reach the tool detail, and `--faint` at
+     12px is 3.2:1 against the page — under AA for text you are meant to be able to click. The
+     5px padding takes the box to 24px, which is the smallest target WCAG 2.2 allows. */
+  color: var(--mute);
+  background: none;
+  border: none;
+  padding: 5px 0;
+  cursor: pointer;
+}
+.log-tools-caret {
+  display: inline-block;
+  width: 12px;
+}
+.log-tools-toggle:hover {
+  color: var(--text);
+}
+.log-tools-toggle:focus-visible {
+  outline: 2px solid var(--strings);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.chat-turn-end,
+.chat-notice {
+  font-family: var(--data);
+  font-size: 12px;
+  color: var(--faint);
+  margin: 8px 0;
+}
+.chat-notice-warning {
+  color: var(--brass);
+}
+.chat-notice-error {
+  color: var(--perc);
 }

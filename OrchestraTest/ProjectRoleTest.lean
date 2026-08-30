@@ -299,6 +299,34 @@ def renderSubstitutesIssueComments : Test := do
   TestM.assertEqual (render "[{{issue_comments}}]" noComments) "[]"
     (msg := "no thread renders empty")
 
+/-- The context notes reach an agent through the prompt for the same reason the thread does, and
+    with one more: taxis folds them away, so an agent that does not know they exist will
+    rediscover whatever the last one already worked out. -/
+@[test]
+def renderSubstitutesIssueContext : Test := do
+  let v : RenderVars :=
+    { projectId := "9", projectName := "P", instructions := ""
+    , issueId := some "57", issueTitle := some "t"
+    , issueContext := some "  [12] Repro\n    Fails only with --jobs 1" }
+  let out := render "notes:\n{{issue_context}}" v
+  TestM.assert ((out.splitOn "Fails only with").length > 1) "note body substituted"
+  let noNotes : RenderVars := { projectId := "1", projectName := "P", instructions := "" }
+  TestM.assertEqual (render "[{{issue_context}}]" noNotes) "[]"
+    (msg := "no notes render empty")
+
+/-- Every dispatch path has to pass the notes through `renderVarsFor`, and each one passes them
+    as an optional argument that defaults to `none` — so a caller that forgets loses them
+    silently, rendering the block its template declares as empty forever. -/
+@[test]
+def renderVarsForCarriesTheNotesItIsGiven : Test := do
+  let issue : Issue :=
+    { id := ⟨57⟩, projectId := ⟨9⟩, title := "t", description := "d", status := .open
+    , createdAt := "2026-01-01T00:00:00Z", updatedAt := "2026-01-01T00:00:00Z" }
+  let vars := renderVarsFor (fixtureProject 9) (some issue) ""
+    (comments := some "thread") (context := some "notes")
+  TestM.assertEqual (vars.issueContext.getD "-") "notes"
+  TestM.assertEqual (vars.issueComments.getD "-") "thread"
+
 @[test]
 def shippedWorkerTemplatesCarryTheThread : Test := do
   for name in ["implementor", "reviewer"] do
@@ -308,6 +336,8 @@ def shippedWorkerTemplatesCarryTheThread : Test := do
     | .ok role =>
       TestM.assert ((role.promptTemplate.splitOn "{{issue_comments}}").length > 1)
         s!"the shipped {name} template must carry the issue comment thread"
+      TestM.assert ((role.promptTemplate.splitOn "{{issue_context}}").length > 1)
+        s!"the shipped {name} template must carry the issue's context notes"
 
 /-! ## When an issue can be worked on
 

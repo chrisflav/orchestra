@@ -7,14 +7,18 @@ import Std.Sync
 # Launching an agent, and supervising it while it runs
 
 This module answers *what the run needs* and *what the run said*; it no longer answers *how the
-run is confined*. The first is `RunSpec` (`Orchestra.Exec.Spec`), built here from the task's
+run is confined*. The first is a `RunSpec` (`Orchestra.Exec.Spec`), built here from the task's
 parameters and the agent backend's declared needs. The second is everything below the launch:
 parsing the output stream, writing the logs, honouring the cancel token, and deciding whether the
-run hit a usage limit. Confinement is an `Exec.Backend` — landrun by default — and swapping it
-changes nothing in this file.
+run hit a usage limit. Confinement is an `Exec.Session`, opened for the whole task by whichever
+backend is configured — landrun by default — and swapping it changes nothing in this file.
 
-That split is what makes another execution model tractable: supervision is identical whether the
-agent runs behind Landlock on this machine or in a pod elsewhere, and it is the bulk of the code.
+All three ways to launch an agent go through the same session, and therefore through the same
+environment: headless, the TUI, and the bidirectional stream an interactive session holds open.
+That is the same reason the landrun arguments used to be factored into one place, taken one step
+further — a sandbox that differs by launch mode is a sandbox nobody can reason about, and so is
+one that differs by *where* it runs.
+
 See `docs/execution.md`.
 -/
 
@@ -94,8 +98,14 @@ unbounded."
 
 /-! ## Building the spec
 
-Two pure functions, so that what a task is granted can be checked without launching anything —
-which is the point of having a spec at all. -/
+Three pure functions, so that what a run is granted can be checked without launching anything —
+which is the point of having a spec at all. They are also what keeps the three launch modes
+honest: headless, TUI and streaming differ in their command and their streams, and in nothing
+else.
+
+They replace what used to be one `sandboxArgs` producing landrun flags. Same reasoning, one level
+up: the flags belonged in one place so they could not drift between launch modes, and the *needs*
+belong in one place so they cannot drift between execution backends either. -/
 
 /-- Every path an agent run may touch, in the order they are granted.
 
@@ -109,9 +119,9 @@ def grantsFor (paths additional : SandboxPaths) (repoPath : System.FilePath) (re
   let ofList (scope : Scope) (access : Access) (required : Bool) (ps : List String) :=
     ps.toArray.map fun p => { path := p, access, scope, required : PathGrant }
   let mut grants : Array PathGrant := #[]
-  -- The repository, read-only for review tasks and writable for everything else, and `/tmp`,
-  -- which every agent CLI uses for its own scratch files. Both are required: the run cannot do
-  -- anything useful without them.
+  -- The workspace, read-only for review tasks and writable for everything else, and `/tmp`, which
+  -- every agent CLI uses for its own scratch files. Both are required: the run cannot do anything
+  -- useful without them.
   grants := grants.push
     { path := repoPath.toString, access := if readOnly then .rox else .rwx, required := true
     , from_ := .orchestra }
@@ -152,7 +162,31 @@ def portsFor (paths additional : SandboxPaths) (mcp : McpEndpoint) (extraPorts :
     paths.extraPorts.toArray ++ additional.extraPorts.toArray ++ extraPorts.map UInt16.ofNat
   return { connect := #[mcp.port, 443] ++ extra, bind := extra }
 
-/-! ## Supervising the run -/
+/-- The environment every agent run starts with, whichever way it was launched. -/
+def envFor (ghToken : String) (agentEnv extraEnv : Array (String × Option String))
+    : Array (String × String) :=
+  #[("GH_TOKEN", ghToken), ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")]
+    -- Agent-specific env vars (e.g. VIBE_HOME, MISTRAL_API_KEY), then the caller's.
+    ++ (agentEnv ++ extraEnv).filterMap fun (k, v) => v.map ((k, ·))
+
+/-- Everything an agent run needs except its own command line: the same spec for all three launch
+    modes, which then differ only in `command`, `args` and `stdio`. -/
+def specFor (agentDef : AgentDef) (repoPath : System.FilePath) (mcp : McpEndpoint)
+    (ghToken : String) (agentEnv extraEnv : Array (String × Option String))
+    (pluginDirs memoryDirs : Array String) (readOnly : Bool) (extraPorts : Array Nat)
+    (additionalPaths : SandboxPaths) : RunSpec :=
+  { command := agentDef.command
+    workdir := repoPath
+    grants  := grantsFor agentDef.sandboxPaths additionalPaths repoPath readOnly
+                 pluginDirs memoryDirs
+    ports   := portsFor agentDef.sandboxPaths additionalPaths mcp extraPorts
+    env     := envFor ghToken agentEnv extraEnv
+    -- Inherited by name, not by value: `PATH` and `HOME` mean what they mean wherever the agent
+    -- ends up running, which is not necessarily here.
+    envPassthrough := #["SHELL", "PATH", "HOME", "USER", "TERM"]
+    label   := s!"orchestra-{agentDef.command}" }
+
+/-! ## Supervising a run -/
 
 /-- Kill `handle` if and when `cancelToken` is cancelled.
 
@@ -219,9 +253,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     -- Condition the run is held to: the agent must not stop before it holds. Passed to the
     -- backend on its own, never folded into `prompt` — see `AgentDef.goalArgs`.
     (goal : Option String := none)
-    -- The environment the agent runs in, opened for the whole task by whichever execution
-    -- backend is configured. Defaults to this machine under landrun, which is what a caller that
-    -- has not read `execution.backend` from the config should get.
+    -- The environment the agent runs in, opened for the whole task by whichever execution backend
+    -- is configured. Defaults to this machine under landrun, which is what a caller that has not
+    -- read `execution.backend` from the config should get.
     (session : Exec.Session := Exec.Landrun.session)
     -- Secret the agent must present to the MCP server, when the server had to listen somewhere
     -- other than loopback for this backend to reach it. Minted with the server by
@@ -232,8 +266,10 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- agent's config file.
   let mcp ← session.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
   let (mcpContext, agentEnv) ← agentDef.setupMcp mcp model systemPrompt
+  -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
+  let allPluginDirs := pluginDirs ++ memoryDirs
   -- Enforced here rather than where the prompts are built: every backend and every caller
-  -- reaches the CLI through this one launch, and the limit is a property of `execve`, not of any
+  -- reaches the CLI through this one spawn, and the limit is a property of `execve`, not of any
   -- one template. The system prompt is capped even in interactive mode, where there is no task
   -- prompt but `--append-system-prompt` is still passed.
   let prompt ← capPromptArg "prompt" prompt
@@ -254,31 +290,16 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
         IO.eprintln s!"  [sandbox] warning: backend '{agentDef.command}' cannot be held to a \
 goal; running without the goal condition."
         pure #[]
-  -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
-  let allPluginDirs := pluginDirs ++ memoryDirs
   let agentArgs :=
     if interactiveAgent then
       agentDef.buildInteractiveArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget
     else
       agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
-  let env : Array (String × String) :=
-    #[("GH_TOKEN", ghToken), ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")]
-      -- Agent-specific env vars (e.g. VIBE_HOME, MISTRAL_API_KEY), then the caller's.
-      ++ (agentEnv ++ extraEnv).filterMap fun (k, v) => v.map ((k, ·))
-  let spec : RunSpec := {
-    command := agentDef.command
-    args    := goalArgs ++ agentArgs
-    workdir := repoPath
-    grants  := grantsFor agentDef.sandboxPaths additionalPaths repoPath readOnly
-                 pluginDirs memoryDirs
-    ports   := portsFor agentDef.sandboxPaths additionalPaths mcp extraPorts
-    env
-    -- Inherited by name, not by value: `PATH` and `HOME` mean what they mean wherever the agent
-    -- ends up running, which is not necessarily here.
-    envPassthrough := #["SHELL", "PATH", "HOME", "USER", "TERM"]
-    stdio   := if interactiveAgent then .inherit else .piped
-    label   := s!"orchestra-{agentDef.command}"
-  }
+  let spec : RunSpec :=
+    { specFor agentDef repoPath mcp ghToken agentEnv extraEnv pluginDirs memoryDirs readOnly
+        extraPorts additionalPaths with
+      args  := goalArgs ++ agentArgs
+      stdio := if interactiveAgent then .inherit else .piped }
   if debug then
     IO.eprintln (← session.describe spec)
   let handle ← session.start spec
@@ -324,12 +345,13 @@ goal; running without the goal condition."
         if debug then
           err.putStrLn s!"[raw] {line.trimAscii}"
           err.flush
-        match agentDef.parseOutputLine line with
-        | none =>
-          if debug then
-            err.putStrLn s!"[suppressed] {line.trimAscii}"
-            err.flush
-        | some event =>
+        let events := agentDef.parseOutputLine line
+        if events.isEmpty && debug then
+          err.putStrLn s!"[suppressed] {line.trimAscii}"
+          err.flush
+        -- One line can carry several events — an assistant message that thinks, narrates and
+        -- then calls a tool is three — so each is handled in the order the agent emitted it.
+        for event in events do
           if let .init sid _ := event then
             sessionIdRef.set (some sid)
           if let .result sub _ _ _ res := event then
@@ -393,5 +415,215 @@ goal; running without the goal condition."
   agentDef.cleanup mcpContext
   return { exitCode, sessionId, usageLimitHit, wasCancelled, resultSubtype, resultText,
            rateLimitReset }
+
+/-! ## Streaming mode
+
+The third way to launch an agent, alongside headless and TUI: one process that stays up across
+many turns, reading each as a JSON line on stdin and streaming its events back on stdout. It is
+what an interactive session holds — the sandbox, the clone, the MCP server and the credentials
+are acquired once and kept, and a turn costs a line on a pipe rather than a process start.
+
+Unlike the other two, this one does not block until the agent exits. It hands back a handle, and
+the caller decides when the conversation is over. -/
+
+/-- Ceiling on the stderr a streaming session keeps.
+
+    Unbounded here is not what it is on a one-shot run: this process lives for hours across
+    many turns, and `String.append` is O(n), so an unbounded tail is a leak and quadratic at
+    once. The end is the part worth keeping — a usage limit or a crash reason is written last. -/
+private def maxStderrChars : Nat := 32768
+
+/-- How long `shutdown` gives the agent to go on its own before insisting, in 100ms polls. -/
+private def shutdownGracePolls : Nat := 50
+
+/-- A live agent process: turns go in, events come out, and it stays up in between. -/
+structure StreamingSession where
+  /-- The run, whatever is running it: a process here, an exec into a pod elsewhere. What this
+      needs of it — a stream in, two streams out, and a way to ask it to stop and then insist — is
+      exactly what an `Exec.Handle` promises. -/
+  private handle : Exec.Handle
+  /-- The agent's stdin, held here rather than on the run, and `none` once closed.
+
+      A handle closes when its last reference drops, and a `Child` holds one of its own — so
+      while the child owned this handle nothing could deliver EOF, however hard it tried.
+      `Handle.ofStreamChild` takes it off the child at launch, which is what makes dropping this
+      the last reference; EOF is how a CLI reading turns from a pipe is told there are no more. -/
+  private stdinRef : IO.Ref (Option IO.FS.Handle)
+  /-- Serialises writes to stdin, and the close in `shutdown` against them. Two turns posted at
+      once — one from the CLI, one from a dashboard — would otherwise interleave halfway
+      through a JSON line and give the agent neither of them. -/
+  private stdinLock : Std.BaseMutex
+  /-- The last `maxStderrChars` the process has said on stderr. -/
+  private stderrRef : IO.Ref String
+  /-- Set once `shutdown` has run, so a second call is a no-op rather than a second `cleanup`. -/
+  private closed : IO.Ref Bool
+  /-- The task draining stdout. It finishes when the agent closes it.
+
+      Deliberately *not* what `hasExited` reads: this task can also end because the caller's
+      `onEvent` threw, which says nothing about the process. -/
+  pump : _root_.Task (Except IO.Error Unit)
+  /-- Handed back to `AgentDef.cleanup` at teardown. -/
+  mcpContext : String
+  private agentDef : AgentDef
+
+namespace StreamingSession
+
+/-- Write one line to the agent's stdin, under the lock. -/
+def sendLine (s : StreamingSession) (line : String) : IO Unit := do
+  s.stdinLock.lock
+  try
+    match ← s.stdinRef.get with
+    | none   => throw (.userError "the agent's input is closed")
+    | some h => h.putStrLn line; h.flush
+  finally s.stdinLock.unlock
+
+/-- The tail of what the agent has written to stderr.
+
+    Cumulative across turns, not per turn: it is a diagnostic string for a caller reporting why
+    a session died, and nothing should decide a *turn's* outcome from it. -/
+def stderrSoFar (s : StreamingSession) : IO String := s.stderrRef.get
+
+/-- Whether the agent process has exited.
+
+    Asks the process, not the pump. The pump also ends when `onEvent` throws — a full disk while
+    appending to a transcript — and reading that as "the agent is gone" would have the daemon
+    kill a healthy session mid-conversation. -/
+def hasExited (s : StreamingSession) : IO Bool :=
+  return (← s.handle.tryWait).isSome
+
+/-- Stop the process and release what the backend set up for it.
+
+    Three steps, in this order and for these reasons.
+
+    **Close stdin.** That is the graceful ending: a CLI reading turns from a pipe stops when the
+    pipe does. It is also the only step that works on an agent which is ignoring signals.
+
+    **`SIGTERM`, then poll.** Polling `tryWait` rather than waiting on the pump, because the pump
+    only finishes when the agent closes stdout — precisely what a wedged agent will not do. An
+    earlier version waited on the pump first and then asked whether the process had gone, which
+    made the escalation below unreachable by construction *and* let one stuck agent block the
+    reaper for every session.
+
+    **`SIGKILL`.** Reached now, for an agent that ignored the first two. -/
+def shutdown (s : StreamingSession) : IO Unit := do
+  if ← s.closed.modifyGet (fun c => (c, true)) then return
+  s.stdinLock.lock
+  try s.stdinRef.set none finally s.stdinLock.unlock
+  try s.handle.terminate catch _ => pure ()
+  let mut gone := false
+  for _ in List.range shutdownGracePolls do
+    if (← s.handle.tryWait).isSome then
+      gone := true
+      break
+    IO.sleep 100
+  unless gone do
+    -- `terminate` is the polite signal; `kill` is the one that does not ask. On a backend that
+    -- runs the agent elsewhere the second is also what releases what was holding it.
+    try s.handle.kill catch _ => pure ()
+  let _ ← try s.handle.wait catch _ => pure (0 : UInt32)
+  s.agentDef.cleanup s.mcpContext
+
+end StreamingSession
+
+/-- Launch the agent in bidirectional streaming mode and hand back the live process.
+
+    `opts.mcpContext` is filled in here from the backend's own `setupMcp`; whatever the caller
+    put there is replaced. Everything else in `opts` is the caller's.
+
+    Answers `none` when the backend has no streaming mode — the caller is expected to say so
+    rather than quietly launch something else. -/
+def launchStreaming (agentDef : AgentDef) (repoPath : System.FilePath)
+    (serverPort : UInt16) (ghToken : String)
+    (opts : StreamOptions)
+    (onEvent : StreamFormat.Event → IO Unit)
+    (debug : Bool := false)
+    (extraEnv : Array (String × Option String) := #[])
+    (pluginDirs : Array String := #[])
+    (memoryDirs : Array String := #[])
+    (readOnly : Bool := false)
+    (extraPorts : Array Nat := #[])
+    (additionalPaths : SandboxPaths := {})
+    -- The environment the session's agent lives in, held for as long as the conversation is.
+    (session : Exec.Session := Exec.Landrun.session)
+    -- Secret the agent presents to the MCP server, when the server had to listen off loopback.
+    (mcpToken : Option String := none) : IO (Option StreamingSession) := do
+  let mcp ← session.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
+  let (mcpContext, agentEnv) ← agentDef.setupMcp mcp opts.model opts.systemPrompt
+  -- Capped for the same reason as everywhere else: it is one `execve` argument, and the limit
+  -- belongs to `execve` rather than to any one caller.
+  let systemPrompt ← opts.systemPrompt.mapM (capPromptArg "system prompt")
+  let opts := { opts with
+    mcpContext, systemPrompt
+    -- One list, not two. The sandbox grant and the `--plugin-dir` flag have to name the same
+    -- directories: granted but not passed and the agent silently runs with no plugins and no
+    -- skills; passed but not granted and landrun denies the read. Whatever the caller put in
+    -- `opts.pluginDirs` is replaced for that reason — the parameter is the one that also
+    -- reaches the sandbox. Memory dirs reach the agent as plugin dirs, as on every other path.
+    pluginDirs := pluginDirs ++ memoryDirs }
+  let some agentArgs := agentDef.buildStreamArgs opts | do
+    agentDef.cleanup mcpContext
+    return none
+  let spec : RunSpec :=
+    { specFor agentDef repoPath mcp ghToken agentEnv extraEnv pluginDirs memoryDirs readOnly
+        extraPorts additionalPaths with
+      args  := agentArgs
+      -- The mode that keeps stdin open: a turn is a line written to it, and closing it is how the
+      -- conversation ends.
+      stdio := .stream }
+  if debug then
+    IO.eprintln (← session.describe spec)
+  -- Cleaned up on the way out of a failed start — a missing `landrun`, an unreachable cluster, a
+  -- clone that vanished — which would otherwise leave the backend's temp MCP config behind, one
+  -- per attempt.
+  let handle ← try session.start spec
+    catch e =>
+      agentDef.cleanup mcpContext
+      throw e
+  -- A streaming session needs all three: turns go in, events come out, and a death rattle comes
+  -- out beside them. A backend that cannot supply one says so here rather than handing back a
+  -- session that silently never speaks.
+  let some stdinHandle := handle.stdin | do
+    handle.kill; agentDef.cleanup mcpContext
+    throw (IO.userError "the execution backend gave this session no way to send it turns")
+  let some stdout := handle.stdout | do
+    handle.kill; agentDef.cleanup mcpContext
+    throw (IO.userError "the execution backend gave this session no output to read")
+  let some stderrStream := handle.stderr | do
+    handle.kill; agentDef.cleanup mcpContext
+    throw (IO.userError "the execution backend gave this session no stderr to read")
+  let stderrRef ← IO.mkRef ""
+  -- One line can carry several events, and each is delivered in the order the agent emitted it.
+  -- A throw from `onEvent` ends the pump, which is what closing the transcript file underneath
+  -- it would look like; the process is then still alive but unheard, and `hasExited` says so.
+  let pump ← IO.asTask (prio := .dedicated) do
+    let err ← IO.getStderr
+    repeat do
+      let line ← stdout.getLine
+      if line.isEmpty then return
+      if debug then
+        err.putStrLn s!"[raw] {line.trimAscii}"
+        err.flush
+      for event in agentDef.parseOutputLine line do
+        -- A throw here must not end the pump. Nothing else drains stdout, so an agent whose
+        -- output pipe fills stops working — and since `hasExited` asks the process rather than
+        -- this task, it would do so with nothing reporting it. One event is worth losing; the
+        -- session is not.
+        try onEvent event
+        catch e =>
+          err.putStrLn s!"  [sandbox] dropped an event: {e}"
+          err.flush
+  let _errTask ← IO.asTask (prio := .dedicated) do
+    repeat do
+      let line ← stderrStream.getLine
+      if line.isEmpty then return
+      stderrRef.modify fun acc =>
+        let acc := acc ++ line
+        if acc.length ≤ maxStderrChars then acc else (acc.takeEnd maxStderrChars).toString
+  return some {
+    handle, stderrRef, pump, mcpContext, agentDef
+    stdinRef  := ← IO.mkRef (some stdinHandle)
+    stdinLock := ← Std.BaseMutex.new
+    closed    := ← IO.mkRef false
+  }
 
 end Orchestra.Sandbox

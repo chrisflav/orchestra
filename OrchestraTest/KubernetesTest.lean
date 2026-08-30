@@ -500,10 +500,10 @@ def theClientSendsItsTokenBeforeAnythingElse : Test := do
     "with no backslash escape, which TOML and JSON would read differently"
 
 private def testServerState (token : Option String) : Server.State :=
-  { upstream := { owner := "acme", name := "widgets" }
-    fork := { owner := "acme", name := "widgets" }
+  { repo := some { upstream := { owner := "acme", name := "widgets" }
+                 , fork := { owner := "acme", name := "widgets" } }
     allowedTools := []
-    appId := 0, privateKeyPath := "", installationId := 0, pat := ""
+    appId := 0, privateKeyPath := "", installationId := some 0, pat := ""
     authToken := token }
 
 private def await (p : IO.Promise (Except IO.Error α)) : IO α := do

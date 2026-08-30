@@ -60,8 +60,7 @@ mutual
           id            := stepKey
           createdAt
           status        := .pending
-          upstream      := spec.upstream
-          fork          := spec.fork
+          repo          := spec.repo
           mode          := spec.mode
           prompt        := spec.prompt
           agent         := spec.agent
@@ -78,6 +77,9 @@ mutual
           issueNumber   := spec.issueNumber
           triageAddLabels    := spec.triageAddLabels
           triageRemoveLabels := spec.triageRemoveLabels
+          -- Or the same step would carry a spawn policy when the concert runs in process and
+          -- lose it when the daemon runs it.
+          spawnPolicy   := spec.spawnPolicy
           concertStepKey := some stepKey
           concertId
           inputType     := ResultType.unit

@@ -13,10 +13,9 @@ private instance : ToJson Unit where
   toJson _ := .null
 
 instance {i o : ResultType} : ToJson (IOTask i o) where
-  toJson t := Json.mkObj
-    [ ("upstream",      ToJson.toJson t.upstream)
-    , ("fork",          ToJson.toJson t.fork)
-    , ("mode",          ToJson.toJson t.mode)
+  toJson t := Json.mkObj <|
+    repoPairFields t.repo ++
+    [ ("mode",          ToJson.toJson t.mode)
     , ("prompt",        .str t.prompt)
     , ("agent",         ToJson.toJson t.agent)
     , ("system_prompt", ToJson.toJson t.systemPrompt)
@@ -29,15 +28,15 @@ instance {i o : ResultType} : ToJson (IOTask i o) where
     , ("read_only",     .bool t.readOnly)
     , ("series",        ToJson.toJson t.series)
     , ("pr_labels",     ToJson.toJson t.prLabels)
+    , ("spawn_policy",  ToJson.toJson t.spawnPolicy)
     , ("input_type",    ToJson.toJson i)
     , ("output_type",   ToJson.toJson o)
     ]
 
 instance {i o : ResultType} : FromJson (IOTask i o) where
   fromJson? j := do
-    let upstream     ← j.getObjValAs? Repository "upstream"
-    let fork         ← j.getObjValAs? Repository "fork"
-    let mode         ← j.getObjValAs? TaskMode "mode"
+    let repo         ← parseRepoPair? j
+    let mode         ← parseTaskMode? j
     let prompt       ← j.getObjValAs? String "prompt"
     let agent        := j.getObjValAs? String "agent" |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
@@ -50,8 +49,9 @@ instance {i o : ResultType} : FromJson (IOTask i o) where
     let readOnly     := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let series       := j.getObjValAs? String "series" |>.toOption
     let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
-    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model,
-             budget, memory, authSource, tools, readOnly, series, prLabels }
+    let spawnPolicy  ← parseSpawnPolicy? j
+    return { repo, mode, prompt, agent, systemPrompt, backend, model,
+             budget, memory, authSource, tools, readOnly, series, prLabels, spawnPolicy }
 
 /-- Serialize a `Concert α` to JSON.
     For `run` nodes, the task spec is computed from the current input and the continuation is

@@ -93,7 +93,8 @@ structure Role where
   budget         : Option Float  := none
   /-- Prompt body — supports {{project_id}}, {{project_name}}, {{instructions}},
       and (when an issue is bound) {{issue_id}}, {{issue_title}}, {{issue_description}},
-      {{issue_comments}}, {{target_repo}}, {{target_branch}}, {{pr_number}}, {{pr_branch}},
+      {{issue_comments}}, {{issue_context}}, {{target_repo}}, {{target_branch}}, {{pr_number}},
+      {{pr_branch}},
       {{pr_repo}}.
       Unrecognised placeholders pass through.
 
@@ -102,6 +103,15 @@ structure Role where
   promptTemplate : String
   /-- Optional auto-dispatch policy. `none` = manual-spawn only. -/
   dispatch       : Option DispatchPolicy := none
+  /-- What a task dispatched for this role may itself put on the queue (`Orchestra.Spawn`).
+      `none` — the default — means nothing, and it is not offered the `queue_task` tool.
+
+      On the role rather than on the dispatcher's listener because that is where the rest of a
+      dispatched task's shape is written: both dispatchers build their entries from
+      `Listener.buildRoleEntry`, which reads this file and not the listener's `action` block. A
+      role is also the right granularity for it — "a planner may queue implementors" is a
+      statement about planners, not about the listener that happens to dispatch them. -/
+  spawnPolicy    : Option SpawnPolicy := none
 deriving Repr, Inhabited
 
 instance : ToJson Role where
@@ -119,6 +129,7 @@ instance : ToJson Role where
     let f := if let some s := r.prependPrompt then f ++ [("prepend_prompt", Json.str s)] else f
     let f := if let some b := r.budget        then f ++ [("budget",         ToJson.toJson b)] else f
     let f := if let some d := r.dispatch      then f ++ [("dispatch",       ToJson.toJson d)] else f
+    let f := if let some p := r.spawnPolicy   then f ++ [("spawn_policy",   ToJson.toJson p)] else f
     Json.mkObj f
 
 instance : FromJson Role where
@@ -134,8 +145,11 @@ instance : FromJson Role where
     let priority      := j.getObjValAs? Nat "priority"   |>.toOption |>.getD 10
     let budget        := j.getObjValAs? Float "budget"   |>.toOption
     let dispatch      := j.getObjValAs? DispatchPolicy "dispatch" |>.toOption
+    -- Strict, unlike `dispatch`: a swallowed policy leaves the role's agents without the tool
+    -- and nothing on the way to say the field was the reason.
+    let spawnPolicy   ← parseSpawnPolicy? j
     return { name, permissions, backend, model, systemPrompt, prependPrompt
-           , readOnly, priority, budget, promptTemplate, dispatch }
+           , readOnly, priority, budget, promptTemplate, dispatch, spawnPolicy }
 
 /-! ## Filesystem layout -/
 
@@ -155,14 +169,27 @@ def projectRolesDir (pid : Taxis.IssueId) : IO System.FilePath := do
 
 private def roleFileName (name : String) : String := s!"{name}.json"
 
+/-- A role document, or `none` when the file is absent or does not decode.
+
+    A file that is *there* and unreadable says so on stderr, the way a listener config does. Both
+    failures answer `none`, and the caller cannot tell them apart: `orchestra spawn` reports
+    "role not found" and the dispatcher skips the role in silence, neither of which points at the
+    field that caused it. That was survivable while every field a role could get wrong was a
+    required one — a role missing `permissions` is obviously broken — but `spawn_policy` is
+    optional and strict, so one mistyped line inside it can take an otherwise working role off
+    the tracker with nothing said. -/
 private def loadRoleFromFile (path : System.FilePath) : IO (Option Role) := do
   if !(← path.pathExists) then return none
   let contents ← IO.FS.readFile path
   match Json.parse contents with
-  | .error _ => return none
+  | .error e =>
+    IO.eprintln s!"[role] {path}: not valid JSON, so this role is being skipped: {e}"
+    return none
   | .ok j    =>
     match FromJson.fromJson? j with
-    | .error _ => return none
+    | .error e =>
+      IO.eprintln s!"[role] {path}: not a role, so this role is being skipped: {e}"
+      return none
     | .ok r    => return some r
 
 /-- Resolve a role by name. Project-scoped file wins over the global one;
@@ -240,9 +267,10 @@ def loadGlobalRoleRaw (name : String) : IO (Option String) := do
     tools (health, refresh_token, get_pr_comments) are not listed because naming them grants
     nothing — they are already there.
 
-    `merge_pr` is deliberately absent: a role is a template dispatched at whatever issue comes
-    along, and landing a pull request is not something to grant a whole class of tasks. A task
-    file may still ask for it by name.
+    `merge_pr` and `create_repository` are deliberately absent: a role is a template dispatched
+    at whatever issue comes along, and neither landing a pull request nor creating a repository
+    is something to grant a whole class of tasks. A task file or workflow step may still ask for
+    either by name.
 
     Kept here, beside the field that holds them, so that validating a role does not depend on the
     MCP server's module: the CLI validates before sending and the API validates before storing,
@@ -273,6 +301,10 @@ empty prompt"
   unless unknown.isEmpty do
     .error s!"unknown permission(s) {String.intercalate ", " unknown}; \
 the tools a role may be granted are {String.intercalate ", " knownPermissions}"
+  -- Against the same vocabulary: what a role may hand to a task it queues is bounded by what a
+  -- role may be granted, so `queue_task` cannot become a way around this very check.
+  if let some sp := role.spawnPolicy then
+    sp.validate knownPermissions
   return role
 
 /-- Store a global role verbatim. Validation is the caller's business — see `validateRole`. -/
@@ -296,8 +328,8 @@ def deleteGlobalRole (name : String) : IO Bool := do
 /-- Variables available to a role template. Issue-specific fields are `none`
     for triggers that don't bind to one issue (e.g. planners).
     Supports: {{project_id}}, {{project_name}}, {{instructions}},
-    {{issue_id}}, {{issue_title}}, {{target_repo}}, {{target_branch}},
-    {{pr_number}}, {{pr_branch}}, {{pr_repo}}. -/
+    {{issue_id}}, {{issue_title}}, {{issue_description}}, {{issue_comments}}, {{issue_context}},
+    {{target_repo}}, {{target_branch}}, {{pr_number}}, {{pr_branch}}, {{pr_repo}}. -/
 structure RenderVars where
   projectId    : String
   projectName  : String
@@ -311,6 +343,10 @@ structure RenderVars where
       next, which matters most for a rejection: there is no rejected status, so the
       request-changes review is the only record of what was wrong. -/
   issueComments : Option String := none
+  /-- The issue's context notes: what earlier runs on it worked out. Taxis folds these away, so
+      nothing puts them in front of an agent that does not ask — and an agent that does not know
+      they exist will rediscover what the last one already established. -/
+  issueContext : Option String := none
   targetRepo   : Option String := none
   targetBranch : Option String := none
   prNumber     : Option String := none
@@ -329,6 +365,7 @@ def render (tmpl : String) (v : RenderVars) : String :=
     , ("{{issue_title}}",   v.issueTitle.getD "")
     , ("{{issue_description}}", v.issueDescription.getD "")
     , ("{{issue_comments}}", v.issueComments.getD "")
+    , ("{{issue_context}}", v.issueContext.getD "")
     , ("{{target_repo}}",   v.targetRepo.getD "")
     , ("{{target_branch}}", v.targetBranch.getD "")
     , ("{{pr_number}}",     v.prNumber.getD "")
@@ -345,7 +382,7 @@ def render (tmpl : String) (v : RenderVars) : String :=
     `{{target_branch}}` would render empty in the very prompts that need them. -/
 def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : String)
     (targetOverride : Option RepoTarget := none) (comments : Option String := none)
-    : RenderVars :=
+    (context : Option String := none) : RenderVars :=
   match issue? with
   | none => { projectId := project.id.toString, projectName := project.name, instructions }
   | some i =>
@@ -358,6 +395,7 @@ def renderVarsFor (project : Project) (issue? : Option Issue) (instructions : St
     , issueTitle   := some i.title
     , issueDescription := some i.description
     , issueComments := comments
+    , issueContext := context
     , targetRepo   := target.map (·.repo.toString)
     , targetBranch := target.map (·.branch)
     , prNumber     := pr?.map (fun p => toString p.number)

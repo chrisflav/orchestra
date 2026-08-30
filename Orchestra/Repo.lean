@@ -231,17 +231,20 @@ private def isGitRepo (path : System.FilePath) : IO Bool :=
 private def slotOccupantPath (slot : System.FilePath) : System.FilePath :=
   slot / ".git" / "orchestra-occupant"
 
-/-- The task whose working tree currently sits in slot `slot` of `fork`, if it is known.
+/-- Read an occupant marker.
 
-    `none` covers a slot that does not exist yet, one created before this bookkeeping
-    existed, and one whose marker could not be read — all of which mean the same thing to a
-    caller: do not assume the tree is anybody's in particular. -/
-def slotOccupant (fork : Repository) (slot : Nat) : IO (Option String) := do
-  let path := slotOccupantPath (← slotPath fork slot)
+    `none` covers a slot that does not exist yet, one created before this bookkeeping existed,
+    and one whose marker could not be read — all of which mean the same thing to a caller: do
+    not assume the tree is anybody's in particular. -/
+private def readOccupant (path : System.FilePath) : IO (Option String) := do
   try
     let s := (← IO.FS.readFile path).trimAscii.toString
     return if s.isEmpty then none else some s
   catch _ => return none
+
+/-- The task whose working tree currently sits in slot `slot` of `fork`, if it is known. -/
+def slotOccupant (fork : Repository) (slot : Nat) : IO (Option String) := do
+  readOccupant (slotOccupantPath (← slotPath fork slot))
 
 /-- Record `occupant` as the owner of the tree now sitting in `slot`. -/
 private def setSlotOccupant (slot : System.FilePath) (occupant : Option String) : IO Unit := do
@@ -444,6 +447,154 @@ its session refers to."
   setSlotOccupant sPath assign.occupant
   return sPath
 
+/-- Base directory for the scratch workspaces repository-independent tasks run in.
+
+    A sibling of `workDir` rather than a directory inside it: everything under `workDir` is a
+    clone or a slot of one, and `listClones` walks it expecting exactly that shape. -/
+def workspaceBase : IO System.FilePath :=
+  return (← Dirs.dataBase) / "workspaces"
+
+/-- Directory name of workspace slot `slot`. -/
+private def workspaceSlotName (slot : Nat) : String := s!"slot-{slot}"
+
+/-- Directory name of the workspace a run outside the queue uses.
+
+    Kept apart from the numbered slots the daemon pools, the way a CLI run works in the shared
+    cache clone rather than in one of them: preparing a workspace *empties* it, so sharing a name
+    with the daemon would let `orchestra run` delete the files out from under a task the daemon is
+    in the middle of.
+
+    Two runs outside the queue do still share it, and this is where the analogy with the cache
+    clone stops: `ensureCloned` leaves an existing checkout in place, while this deletes one. A
+    second `orchestra run` or `orchestra interactive` with no repository, started while the first
+    is still going, takes the directory and empties it. Nothing guards that — running several at
+    once is what the queue is for, and there each gets a pooled slot of its own. -/
+private def adhocWorkspaceName : String := "adhoc"
+
+/-- The workspace base a call works under: an explicit one where the caller supplied it, and the
+    installation's own otherwise.
+
+    The override exists for the tests. Preparing a workspace *empties* it, and the directory a test
+    would otherwise land on is the very one `orchestra run` and `orchestra interactive` share — so
+    a test suite that reached the real base would delete the scratch files of a repository-
+    independent run happening to be in progress, and leave its own occupant marker behind for the
+    next continuation to trip over. Nothing outside the tests passes it. -/
+private def resolveWorkspaceBase : Option System.FilePath → IO System.FilePath
+  | some b => pure b
+  | none   => workspaceBase
+
+/-- File recording which task's files currently sit in the workspace named `name`.
+
+    Beside the workspace rather than inside it, because the whole directory is handed to the
+    agent and wiped between tasks — a marker within it would be both visible to the agent and
+    destroyed by the next reset. -/
+private def workspaceOccupantPath (base : System.FilePath) (name : String) : System.FilePath :=
+  base / s!"{name}.occupant"
+
+/-- The task whose files currently sit in workspace slot `slot`, if it is known. -/
+def workspaceOccupant (slot : Nat) (base : Option System.FilePath := none)
+    : IO (Option String) := do
+  readOccupant (workspaceOccupantPath (← resolveWorkspaceBase base) (workspaceSlotName slot))
+
+/-- Who holds slot `slot` of the pool `fork` names, or of the shared repository-independent
+    pool when `fork` is `none`. The one entry point the queue asks, so that a continuation is
+    checked the same way whether or not its predecessor had a repository. -/
+def poolOccupant (fork : Option Repository) (slot : Nat) : IO (Option String) := do
+  match fork with
+  | some f => slotOccupant f slot
+  | none   => workspaceOccupant slot
+
+/-- Ensure the workspace named `name` exists and is empty, and return its path.
+
+    The counterpart of `ensureSlot` for a repository-independent task: same pooling, same
+    occupant bookkeeping, same continuation rule — only with nothing to check out. The agent
+    gets an empty directory it can write in, and reaches whatever it needs (other repositories,
+    the issue tracker) through the tools it was granted.
+
+    Reset means *emptied*, not cleaned selectively. A clone slot keeps gitignored build output
+    between tasks because git can say which files those are; a workspace has nothing that could
+    draw that line, so one task's scratch files would otherwise turn up in the next task's
+    directory with no way to tell them apart from its own. Anything meant to outlive a run
+    belongs in a memory directory, which is mounted separately and persists on purpose. -/
+private def prepareWorkspace (base : System.FilePath) (name : String) (assign : SlotAssignment)
+    : IO System.FilePath := do
+  let path := base / name
+  let marker := workspaceOccupantPath base name
+  -- Same rule as `ensureSlot`: a continuation only inherits the directory if the predecessor's
+  -- files are still the ones sitting in it. Workspaces are pooled, so a free slot is not
+  -- evidence of that.
+  let keep ← match assign.resumeFrom with
+    | none      => pure false
+    | some pred =>
+      match ← readOccupant marker with
+      | some cur =>
+        if cur == pred then pure true
+        else do
+          IO.eprintln s!"  Warning: workspace {name} was last used by {cur}, not {pred}; \
+emptying it. The resumed agent will not find the files its session refers to."
+          pure false
+      | none => do
+        IO.eprintln s!"  Warning: workspace {name} has no recorded occupant, so the files {pred} \
+left cannot be confirmed; emptying it. The resumed agent will not find the files its session \
+refers to."
+        pure false
+  -- Errors are reported, not raised, on both ends: failing to write the marker costs a
+  -- continuation its files, while failing to prepare the directory costs the run itself, and the
+  -- second is not worth risking for the first.
+  let writeMarker (occupant : Option String) : IO Unit := do
+    try
+      match occupant with
+      | some o => IO.FS.writeFile marker o
+      | none   => if ← marker.pathExists then IO.FS.removeFile marker
+    catch e =>
+      IO.eprintln s!"  Warning: could not record the occupant of workspace {name}: {e}"
+  if keep then
+    IO.println s!"  Keeping workspace {name} as-is (continuation of {assign.resumeFrom.getD "?"})"
+  else
+    -- Cleared *before* the directory is emptied, not merely overwritten afterwards. A run that
+    -- died between the two would otherwise leave an empty directory under a marker still naming
+    -- the previous occupant — and the next continuation of *that* task would match it, take the
+    -- branch above, and wake up in an empty directory with nothing on the way to say why.
+    -- Cleared first, the same crash leaves the workspace nobody's, which is the answer every
+    -- caller already handles.
+    writeMarker none
+    if ← path.pathExists then
+      IO.FS.removeDirAll path
+  IO.FS.createDirAll path
+  -- Stamped after preparation, for the same reason as `ensureSlot`: a task that dies while the
+  -- directory is being emptied must not leave it claiming to hold files it never wrote.
+  writeMarker assign.occupant
+  return path
+
+/-- Ensure workspace slot `slot` of the repository-independent pool exists and is empty. -/
+def ensureWorkspace (assign : SlotAssignment) (base : Option System.FilePath := none)
+    : IO System.FilePath := do
+  prepareWorkspace (← resolveWorkspaceBase base) (workspaceSlotName assign.slot) assign
+
+/-- Ensure the workspace for a repository-independent run outside the queue exists, and empty it
+    unless `resumeFrom` names the task whose files are still in it.
+
+    `resumeFrom` is what makes `orchestra continue` on a repository-independent task work: the
+    resumed agent's session describes files it wrote, and without it every continuation would wake
+    up to an emptied directory. It is checked against the recorded occupant like the pooled path's
+    is, so a continuation whose files were taken by an unrelated run in between is told so rather
+    than resumed onto somebody else's.
+
+    See `adhocWorkspaceName` for why this is not one of the pooled slots. -/
+def ensureAdhocWorkspace (occupant : Option String := none)
+    (resumeFrom : Option String := none) (base : Option System.FilePath := none)
+    : IO System.FilePath := do
+  prepareWorkspace (← resolveWorkspaceBase base) adhocWorkspaceName
+    { slot := 0, occupant, resumeFrom }
+
+/-- Every scratch workspace that currently exists, in name order. -/
+def listWorkspaces (base : Option System.FilePath := none) : IO (Array System.FilePath) := do
+  let base ← resolveWorkspaceBase base
+  if !(← base.pathExists) then return #[]
+  let entries ← base.readDir
+  let dirs ← entries.filterM (fun e => e.path.isDir)
+  return dirs.map (·.path) |>.qsort (fun a b => decide (a.toString < b.toString))
+
 /-- Split a slot directory name into the repository it belongs to, e.g.
     `mathlib4-slot-2` ↦ `mathlib4`. Returns none for a non-slot directory.
 
@@ -486,13 +637,15 @@ def listClones : IO (Array (System.FilePath × Array System.FilePath)) := do
       result := result.push (e.path, slots.qsort (fun a b => decide (a.toString < b.toString)))
   return result
 
-/-- Remove all cloned repositories and task slots. -/
+/-- Remove all cloned repositories, task slots and scratch workspaces. -/
 def cleanup : IO Unit := do
-  let base ← workDir
-  if ← base.pathExists then
-    IO.FS.removeDirAll base
-    IO.println s!"Removed {base}"
-  else
+  let mut removed := false
+  for base in [← workDir, ← workspaceBase] do
+    if ← base.pathExists then
+      IO.FS.removeDirAll base
+      IO.println s!"Removed {base}"
+      removed := true
+  if !removed then
     IO.println "Nothing to clean up"
 
 end Orchestra.Repo

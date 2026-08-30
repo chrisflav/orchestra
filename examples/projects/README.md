@@ -20,6 +20,7 @@ error.
 | Dependencies | taxis's native issue-dependency graph — no separate plumbing. A dependency holds its dependent back only while it is still open; completed *or* abandoned releases it. |
 | Claim (which task currently holds an issue) | A `session`-kind artifact on the issue (`{task_id, agent, series?, claimed_at}`) — "claimed" means the issue has one. |
 | Attached PR | A `github-pr`-kind artifact on the issue. |
+| Context note | A `context`-kind artifact on the issue (`{title, text}`) — prose held beside the issue, folded away in the taxis UI. Any number per issue. |
 | Goal | taxis's native `goal` field on the issue — the condition that decides whether it is done. Read as `Issue.goal`; empty when unset. |
 | `RepoTarget` override / reviewer template | Not a native taxis field — encoded as a JSON blob in a trailing ` ```orchestra-meta ` fenced block appended to the issue's description, stripped before a human sees it. |
 
@@ -57,9 +58,34 @@ so `orchestra issue show <project-id>` also works, showing it like any other iss
 
 Tool permission groups (set via the task config's `tools` list):
 
-- `manage_issues` — plan agents: list / create / update issues + sub-issues.
+- `manage_issues` — plan agents: list / create / update issues + sub-issues, and set an issue's
+  labels and assignees.
 - `work_issues` — worker agents: list open issues, claim, attach PR, release, split into sub-issues.
 - `review_issues` — reviewer agents: list issues awaiting review, approve / complete / reject.
+
+### Routing work by label
+
+`update_issue` takes `labels_add` / `labels_remove`, which is how a triaging agent decides what
+happens to an issue next: the label-dispatcher (`Listener.SourceConfig.labelDispatcher`) selects
+the issues it offers, and the role it offers them to, by label. A planner labelling an issue is
+therefore what causes a worker to be spawned on it — and with one listener per label, *which*
+worker, so the same mechanism can choose the model a piece of work gets.
+
+`list_labels` is the vocabulary and it is a closed one: a name the tracker does not already
+define is refused, listing what exists, rather than created. A typo would otherwise mint a label
+that dispatches nothing while looking exactly like one that does.
+
+`o-claimed` and `t-project` are refused outright — orchestra keeps an issue's claim and its
+project marker in that same label array (`statusOf`, `anchorsProject`), and an agent setting
+either by hand puts the tracker and orchestra's reading of it out of step silently.
+
+Labels and assignees are add/remove **deltas**, never a set to write, for the same reason: taxis
+takes the whole array in one `PATCH`, so an agent handed the set wholesale would drop the claim
+label by omission on every call that only meant to add one.
+
+`assignees_add` / `assignees_remove` take emails or display names, resolved against `list_actors`
+(an ambiguous display name is refused rather than guessed). Assigning a person is how an agent
+escalates: it says the issue is waiting on a named human rather than on another agent.
 
 A reviewer is queued for **any open issue with an unmerged pull request attached**, including one
 with children — a container can have a PR of its own. Merge state comes from GitHub, so an issue
@@ -71,6 +97,34 @@ automatically as a native review comment carrying the approve / request-changes 
 all three groups and writing to `work_issues`/`review_issues`, so a rejected issue carries its
 reasoning forward to whoever picks it up next. These are taxis comments, distinct from the
 `comment` tool, which posts to the GitHub issue or PR a task was launched from.
+
+### Context notes: where findings go
+
+An issue accumulates material that is worth keeping and is not worth putting in front of every
+person who opens it — what an earlier run worked out, an approach tried and abandoned, what the
+build environment needs. It has three possible homes and only one right one:
+
+| | Read by | Holds |
+| --- | --- | --- |
+| `description` | Everyone who opens the issue, and every dispatched worker | What the work *is*. One statement, kept current. |
+| Comment thread | Whoever scrolls it | The conversation: review verdicts, questions, decisions and why. |
+| Context notes | Whoever asks, or is handed them in a prompt | Findings and detail for whoever picks the issue up next. |
+
+`add_context` attaches one (a title and a block of markdown), `update_context` rewrites one in
+place, and `list_context` reads them. All three are offered under **all three** groups, reads and
+writes alike: every role that touches an issue learns something the next one would otherwise
+rediscover, and the point of the artifact is that recording it costs the description and the
+thread nothing. Writes are scoped to the agent's own project subtree, the same as `update_issue`.
+
+Taxis folds notes away behind their titles, so they can accumulate over an issue's life without
+crowding a human reader. That is what makes this the answer to an agent appending its results to
+the description: the description stays the one thing a reader has to read, and nothing is lost.
+`get_issue` lists the titles for the same reason — the notes themselves have no bound, so putting
+them in every issue read would make reading an issue cost whatever has been written beside it.
+
+Revising beats accumulating near-duplicates: a note that has gone out of date should be rewritten
+with `update_context`, not contradicted by a second one. Notes are as visible as the issue they
+hang off and nothing more — anything genuinely secret belongs elsewhere.
 
 ## Configuring taxis
 
@@ -131,19 +185,31 @@ $XDG_DATA_HOME/orchestra/projects/<project-id>/roles/<name>.json     -- per-proj
 
 Prompt templates support `{{project_id}}`, `{{project_name}}`, `{{instructions}}`, and — when the
 role is dispatched onto an issue — `{{issue_id}}`, `{{issue_title}}`, `{{issue_description}}`,
-`{{issue_comments}}`, `{{target_repo}}`, `{{target_branch}}`, `{{pr_number}}`, `{{pr_branch}}`,
-`{{pr_repo}}`. Unrecognised placeholders pass through; an absent value renders empty.
+`{{issue_comments}}`, `{{issue_context}}`, `{{target_repo}}`, `{{target_branch}}`,
+`{{pr_number}}`, `{{pr_branch}}`, `{{pr_repo}}`. Unrecognised placeholders pass through; an
+absent value renders empty.
 
-`{{issue_description}}` and `{{issue_comments}}` are the two worth putting in every worker
-template. They are the only way an agent sees what an issue asks for and what a reviewer said
-about it — `get_issue` and `list_issue_comments` render both, but a worker has to know to call
-them, and a rejection lives nowhere else now that there is no rejected status.
+`{{issue_description}}`, `{{issue_comments}}` and `{{issue_context}}` are the three worth
+putting in every worker template. They are the only way an agent sees what the issue asks for,
+what a reviewer said about it, and what the last agent on it worked out — `get_issue`,
+`list_issue_comments` and `list_context` render all three, but a worker has to know to call
+them. A rejection lives nowhere but the thread now that there is no rejected status, and a
+context note is folded away by design, so an agent that does not know it exists will
+rediscover what the last one already established.
 
 A role never carries a goal of its own, and none is rendered from the template. When a role is
 dispatched onto an issue whose taxis `goal` is set, that field — on its own, not the prompt the
 template just produced — becomes the task's goal, and the agent is held to it until a second model
 call agrees it holds. The template is what the agent is told; the goal is what it is judged on, and
 neither is derived from the other. See "goals" in the top-level README.
+
+A role may also carry a `spawn_policy`, which is what lets the agents dispatched for it put
+tasks on the queue themselves (`queue_task`) — a planner that decomposes an epic and queues an
+implementor per leaf, claiming each issue as it goes. It sits on the role rather than on the
+dispatcher's listener because both dispatchers build their entries from the role file, and
+because "a planner may queue implementors" is a statement about planners. What it may name, and
+why a role without one is not offered the tool at all, is in
+[`docs/queue-task.md`](../../docs/queue-task.md).
 
 Examples in `roles/`: `implementor.json`, `reviewer.json`, `planner.json`,
 `maintainer.json`. Each ships with `dispatch.max: 0` so auto-spawn is opt-in — set caps in a

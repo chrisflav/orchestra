@@ -25,8 +25,9 @@ orchestra run --debug workflow.yaml
 name: my-workflow
 description: Optional human-readable description
 
-# Default repository for every step. Both fields are optional if every
-# step supplies its own upstream/fork.
+# Default repository for every step. Both fields are optional if every step supplies its own
+# upstream/fork — or if the workflow works on no repository at all, in which case its steps run
+# repository-independent (see below).
 upstream: owner/repo
 fork: your-org/fork
 
@@ -232,6 +233,7 @@ steps:
 | `merge_pr` | `merge_pr` |
 | `comment` | `comment` — needs `issue-number` on the step too, since that is the issue or PR it posts to |
 | `label_issue` | `label_issue` |
+| `create_repository` | `create_repository` — creates in `default_organization`, so the config must set one |
 | `manage_issues` | the orchestra project/issue tools — but see below |
 | `work_issues` | `claim_issue`, `split_issue`, `attach_pr`, … |
 | `review_issues` | `list_issues_in_review`, `decide_issue`, … |
@@ -241,11 +243,13 @@ pull request it posts to; asking for one without the other is refused at parse
 time.
 
 `manage_issues` is only half useful to a step. Its read tools (`list_issues`,
-`get_issue`) work, but `create_issue` and `update_issue` are scoped by
-`refuseOutsideScope` to the project or issue the task is attached to — and a
-workflow step is attached to neither, since `TaskSpec` has no way to name one.
-Both therefore fail at runtime. `work_issues` and `review_issues` are unaffected:
-they take the project id as a tool argument.
+`get_issue`, `list_labels`, `list_actors`) work, but `create_issue` and
+`update_issue` are scoped by `refuseOutsideScope` to the project or issue the
+task is attached to — and a workflow step is attached to neither, since
+`TaskSpec` has no way to name one. Both therefore fail at runtime, which takes
+setting labels and assignees with them, since those ride on `update_issue`.
+`work_issues` and `review_issues` are unaffected: they take the project id as a
+tool argument.
 
 `health`, `refresh_token` and `get_pr_comments` are always available; naming them
 grants nothing. A name outside the table fails the workflow at parse time rather
@@ -468,7 +472,8 @@ setting `workflow_path`:
 When `workflow_path` is set the listener:
 
 1. Reads and parses the YAML workflow.
-2. Substitutes `upstream` and `fork` from the event into the parsed program.
+2. Substitutes `upstream` and `fork` from the event into the parsed program, where the event
+   has them. A listener with neither leaves the workflow's own values in place.
 3. Spawns a new `IO.asTask` fiber that calls `evalQueued` with the concert
    manager and app config.
 
@@ -497,3 +502,14 @@ steps:
 When absent the program-level `upstream`/`fork` values are used. Steps that
 span different repositories within a single workflow are therefore fully
 supported.
+
+A step with no repository at either level runs **repository-independent**: in a
+scratch workspace, with the repository-scoped tools withheld. That is the shape
+a workflow coordinating several projects through the issue tracker takes, where
+there is no one repository to check out. See
+[repository-independent tasks](../README.md#repository-independent-tasks).
+
+Half a pair is refused rather than half-inherited: an `upstream` from the
+program and a `fork` from the step is a combination somebody meant, but an
+`upstream` with no `fork` anywhere is a workflow missing a line, and the step
+aborts rather than running against a repository nobody named.

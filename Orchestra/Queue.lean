@@ -88,9 +88,10 @@ structure QueueEntry where
   id            : String
   createdAt     : String
   status        : QueueStatus   := .pending
-  upstream      : Repository
-  fork          : Repository
-  mode          : TaskMode
+  /-- Repositories this entry works on, or `none` for a repository-independent entry that runs
+      in a scratch workspace instead of a clone slot (see `IOTask.repo`). -/
+  repo          : Option RepoPair
+  mode          : TaskMode      := .fork
   prompt        : String
   /-- Condition the run is held to (mirrors `IOTask.goal`). Set from the bound issue's taxis
       `goal` field when the entry is built for one, so it survives enqueue → dequeue → run. -/
@@ -167,18 +168,45 @@ structure QueueEntry where
   triageRemoveLabels : List String := []
   /-- Name of the listener that created this entry, if any. -/
   listenerName : Option String := none
+  /-- What the task this entry becomes may itself put on the queue (`Orchestra.Spawn`).
+      `none` means nothing, and the `queue_task` tool is not offered to it.
+
+      Deliberately not inherited by a continuation, unlike the fields `TaskStore.TaskRecord`
+      carries across one: `max_tasks` is counted per spawning task id, so a continuation that
+      carried the policy would take a fresh allowance under its new id — the exact reset that
+      counting over the queue rather than in memory exists to prevent. A continuation that should
+      queue work is one to give a policy of its own. -/
+  spawnPolicy : Option SpawnPolicy := none
+  /-- The id of the task that queued this entry through `queue_task`, when one did.
+
+      Provenance, and the counter behind `SpawnPolicy.maxTasks`: the ceiling is enforced by
+      counting the entries carrying a task's id rather than by a tally in memory, so a daemon
+      restart mid-run cannot hand an agent its whole allowance a second time. -/
+  spawnedBy : Option String := none
+  /-- The subtree this entry's task may write at or below, overriding what it would derive from
+      its own issue and project (`Config.IOTask.scopeRoot`). Set only on an entry `queue_task`
+      created, where it holds the queueing task's own scope. -/
+  scopeRoot : Option Taxis.IssueId := none
+
+/-- The pool this entry draws its workspace slot from.
+
+    One pool per fork repository, plus a single shared pool for repository-independent entries —
+    which therefore share the `--parallel-per-repo` budget with each other, and with nothing
+    else. Spelled without a `/` so it can never collide with an `owner/repo`. -/
+def QueueEntry.slotKey (e : QueueEntry) : String :=
+  match e.repo with
+  | some r => r.fork.toString
+  | none   => "(no repository)"
 
 instance : ToJson QueueEntry where
   toJson e :=
-    let fields : List (String × Json) := [
-      ("id",         e.id),
-      ("created_at", e.createdAt),
-      ("status",     ToJson.toJson e.status),
-      ("upstream",   ToJson.toJson e.upstream),
-      ("fork",       ToJson.toJson e.fork),
-      ("mode",       ToJson.toJson e.mode),
-      ("prompt",     e.prompt)
-    ]
+    let fields : List (String × Json) :=
+      [("id",     Json.str e.id),
+       ("created_at", Json.str e.createdAt),
+       ("status", ToJson.toJson e.status)]
+      ++ repoPairFields e.repo
+      ++ [("mode",   ToJson.toJson e.mode),
+          ("prompt", Json.str e.prompt)]
     let fields := if let some s := e.goal          then fields ++ [("goal",            Json.str s)]      else fields
     let fields := if let some s := e.agent         then fields ++ [("agent",           Json.str s)]      else fields
     let fields := if let some s := e.systemPrompt  then fields ++ [("system_prompt",   Json.str s)]      else fields
@@ -211,6 +239,9 @@ instance : ToJson QueueEntry where
     let fields := if !e.triageAddLabels.isEmpty   then fields ++ [("triage_add_labels",    ToJson.toJson e.triageAddLabels)]   else fields
     let fields := if !e.triageRemoveLabels.isEmpty then fields ++ [("triage_remove_labels", ToJson.toJson e.triageRemoveLabels)] else fields
     let fields := if let some s := e.listenerName then fields ++ [("listener_name", Json.str s)]      else fields
+    let fields := if let some p := e.spawnPolicy  then fields ++ [("spawn_policy",  ToJson.toJson p)] else fields
+    let fields := if let some s := e.spawnedBy    then fields ++ [("spawned_by",    Json.str s)]      else fields
+    let fields := if let some r := e.scopeRoot    then fields ++ [("scope_root",    ToJson.toJson r)]  else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -218,9 +249,8 @@ instance : FromJson QueueEntry where
     let id           ← j.getObjValAs? String "id"
     let createdAt    ← j.getObjValAs? String "created_at"
     let status       ← j.getObjValAs? QueueStatus "status"
-    let upstream     ← j.getObjValAs? Repository "upstream"
-    let fork         ← j.getObjValAs? Repository "fork"
-    let mode         ← j.getObjValAs? TaskMode "mode"
+    let repo         ← parseRepoPair? j
+    let mode         ← parseTaskMode? j
     let prompt       ← j.getObjValAs? String "prompt"
     let goal          := j.getObjValAs? String "goal"           |>.toOption
     let agent         := j.getObjValAs? String "agent"          |>.toOption
@@ -254,12 +284,20 @@ instance : FromJson QueueEntry where
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
     let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
     let listenerName := j.getObjValAs? String "listener_name"    |>.toOption
-    return { id, createdAt, status, upstream, fork, mode, prompt, goal,
+    -- Lenient, unlike the role and listener documents that carry the same field. Those are
+    -- written by hand, so a typo there is worth refusing; a queue entry is written by orchestra
+    -- itself, so nothing here can be typed wrong — and `loadEntry` turns *any* decode failure
+    -- into "no such entry", which for an entry holding a pre-claimed issue would mean a task
+    -- that never runs, never appears in the queue, and a claim nobody ever releases.
+    let spawnPolicy  := (parseSpawnPolicy? j).toOption.getD none
+    let spawnedBy    := j.getObjValAs? String "spawned_by"       |>.toOption
+    let scopeRoot    := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
+    return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
-             listenerName }
+             listenerName, spawnPolicy, spawnedBy, scopeRoot }
 
 -- Directories and paths
 
@@ -313,8 +351,8 @@ def loadAllEntries : IO (Array QueueEntry) := do
 
 /-- Every pending entry that may start now, in the order the daemon should try them.
 
-    `activePerRepo` maps a fork key (owner/name) to the number of tasks currently running on
-    that repository; entries for a repository already at `perRepoLimit` are excluded.
+    `activePerRepo` maps a slot-pool key (`QueueEntry.slotKey`) to the number of tasks currently
+    running in that pool; entries whose pool is already at `perRepoLimit` are excluded.
     Ordering is by priority (higher first), then oldest first — ids are monotonic, so the
     smaller id is the older entry.
 
@@ -326,7 +364,7 @@ def pendingCandidates (all : Array QueueEntry) (activePerRepo : Std.HashMap Stri
     (perRepoLimit : Nat) : Array QueueEntry :=
   let pending := all.filter (fun e =>
     e.status == .pending &&
-    activePerRepo.getD e.fork.toString 0 < perRepoLimit)
+    activePerRepo.getD e.slotKey 0 < perRepoLimit)
   pending.qsort (fun a b =>
     if a.priority != b.priority then a.priority > b.priority else a.id < b.id)
 
@@ -384,7 +422,7 @@ deriving Repr, Inhabited
     rather than a closure over the daemon's `IO.Ref`s, which makes the interesting cases —
     exclusive backends, blocked continuations, per-repo limits — reachable from a test. -/
 structure ClaimContext where
-  /-- Fork key (owner/name) → slot indices currently in use for that repository. -/
+  /-- Slot-pool key (`QueueEntry.slotKey`) → slot indices currently in use in that pool. -/
   occupiedSlots : Std.HashMap String (Array Nat)
   /-- Number of tasks running across all repositories. -/
   total : Nat
@@ -423,7 +461,8 @@ structure Claim where
 
 /-- Pick the entry the daemon should start next, or `none` if nothing can start right now.
 
-    `slotOccupant fork slot` reports which entry's working tree currently sits in a slot. It
+    `slotOccupant fork slot` reports which entry's working tree currently sits in a slot — of
+    the pool `fork` names, or of the shared repository-independent pool when it is `none`. It
     is consulted for continuations only, and it is what makes resuming safe: a predecessor's
     slot being *free* does not mean the predecessor's tree is still in it, because slots are
     pooled and an unrelated task may have taken it and reset it in between. Resuming onto that
@@ -431,7 +470,7 @@ structure Claim where
     conversation describes work that is gone — so when the occupant does not match, the
     continuation is treated as an ordinary entry that resets whatever slot it lands in. -/
 def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
-    (slotOccupant : Repository → Nat → IO (Option String)) : IO (Option Claim) := do
+    (slotOccupant : Option Repository → Nat → IO (Option String)) : IO (Option Claim) := do
   if ctx.total >= ctx.parallelLimit then return none
   -- Once a task on a backend that needs the daemon to itself is running, nothing else may
   -- start alongside it.
@@ -450,9 +489,9 @@ def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
       | none => pure none
       | some (predId, predSlot) =>
         -- Confirm the predecessor's tree is still there before asking to wait for its slot.
-        if (← slotOccupant e.fork predSlot) == some predId then pure (some predSlot)
+        if (← slotOccupant (e.repo.map (·.fork)) predSlot) == some predId then pure (some predSlot)
         else pure none
-    let occupied := ctx.occupiedSlots.getD e.fork.toString #[]
+    let occupied := ctx.occupiedSlots.getD e.slotKey #[]
     let some (slot, reuseTree) := chooseSlot occupied ctx.perRepoLimit preferred | continue
     -- Last, because it is the only check that can cost a network round trip: an entry ruled out
     -- by occupancy never reaches the usage monitor.
@@ -549,6 +588,33 @@ partial def cancelDependents (taskId : String) : IO Unit := do
         if let some tid := entry.taskId then
           cancelDependents tid
 
+/-- Mark the task record behind a dead run `unfinished`, and say whether that changed anything.
+
+    A `TaskRecord` and a `QueueEntry` are two stores describing one run, and only one of them
+    ever gets repaired. The record is stamped `running` the moment the run starts and terminal
+    only when it lands (`TaskRunner`, step 7), so a worker that dies in between leaves the
+    record at `running` for good — which is what the overview reads, while the queue page reads
+    the entry beside it and says something else entirely.
+
+    Only a record still sitting at `running` is touched. Anything already terminal is a run that
+    landed, and a second writer arriving late must not overwrite the verdict it wrote. -/
+def markTaskUnfinished (taskId : String) : IO Bool := do
+  let some record ← TaskStore.loadTask taskId | return false
+  if record.status == .running then
+    TaskStore.saveTask { record with status := .unfinished }
+    return true
+  else
+    return false
+
+/-- Should this entry be reaped: does the queue call it `running` while no worker holds it?
+
+    The daemon's table of in-flight tasks supplies `liveEntryIds` and is the authority on the
+    second half; this is the rule that table is read through. Split out as a function of its
+    inputs, in the way `claimDecision` is, so that the case which matters most — a live run,
+    which must never be reaped — can be pinned by a test without standing a daemon up. -/
+def shouldReap (liveEntryIds : Array String) (entry : QueueEntry) : Bool :=
+  entry.status == .running && !liveEntryIds.contains entry.id
+
 /-- On daemon startup, mark any entries stuck in 'running' state as unfinished.
     These are left over from a previous daemon that was killed mid-task. -/
 def markStaleRunningAsUnfinished : IO Unit := do
@@ -556,6 +622,27 @@ def markStaleRunningAsUnfinished : IO Unit := do
   for entry in all do
     if entry.status == .running then
       saveEntry { entry with status := .unfinished }
+
+/-- Bring task records back in line with the entries that own them, and answer how many needed it.
+
+    An entry that is not `running` is proof that no worker is on that task, which makes a
+    `running` record beside it stale. One pass over that rule repairs both the entries this
+    startup just swept and every record left behind by a daemon that died before any of this
+    existed, which is why there is no separate backfill.
+
+    Records no entry points at are deliberately left alone. Tasks also run outside the daemon —
+    `orchestra run` calls `TaskRunner.runTask` directly and never touches the queue — and from
+    here a live foreground run is indistinguishable from an abandoned one. Stamping those would
+    be this repair inventing exactly the disagreement it exists to remove. -/
+def reconcileStaleTaskRecords : IO Nat := do
+  let entries ← loadAllEntries
+  let mut repaired := 0
+  for entry in entries do
+    if entry.status != .running then
+      if let some taskId := entry.taskId then
+        if ← markTaskUnfinished taskId then
+          repaired := repaired + 1
+  return repaired
 
 /-- On daemon startup, cancel any unfinished concert-linked entries.
     Their concert fibers died with the previous daemon and can never be resumed. -/

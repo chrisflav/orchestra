@@ -7,12 +7,12 @@
    "type": "git",
    "subDir": null,
    "scope": "",
-   "rev": "0b45830f32f6fc4e8a3448e5811b59913e05db47",
+   "rev": "d029b06a912a39fef52734ef90f29537561c7785",
    "name": "Taxis",
    "manifestFile": "lake-manifest.json",
-   "inputRev": "0b45830f32f6fc4e8a3448e5811b59913e05db47",
+   "inputRev": "d029b06a912a39fef52734ef90f29537561c7785",
    "inherited": false,
-   "configFile": "lakefile.toml"
+   "configFile": "lakefile.lean"
   },
   {
    "url": "https://github.com/chrisflav/lean-yaml",

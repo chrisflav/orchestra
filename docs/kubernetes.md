@@ -49,6 +49,13 @@ daemon's own streams handed straight through, so the agent's TUI behaves as it d
 queued run deliberately gets no TTY — `kubectl exec` merges stdout and stderr as soon as there is
 one, and orchestra reads the two for different things.
 
+An interactive **session** — `orchestra chat`, and the dashboard's chat page — is the third shape:
+one `kubectl exec -i` held open for as long as the conversation, with each turn written to the
+agent's stdin as a line and its events streaming back. The pod lives as long as the session does,
+and closing that stdin is how the conversation ends. A session that goes dormant and is later
+woken gets a new pod, so waking one needs `home_claim` for the same reason a continuation does;
+without it the wake is refused rather than starting the conversation over behind the transcript.
+
 Cancelling a task deletes the pod, which ends whatever was running in it. Nothing is copied back
 from a cancelled task.
 
@@ -268,6 +275,7 @@ depends on `home_claim`:
 | --- | --- | --- |
 | retry after failed validation | resumes | resumes |
 | `continues_from` / a series | **refused** | resumes |
+| waking a dormant chat session | **refused** | resumes |
 | memory directories | copied back | copied back |
 | toolchain `init.sh` installed | reinstalled each task | kept |
 

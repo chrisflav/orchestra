@@ -58,6 +58,12 @@ def start (spec : RunSpec) : IO Handle := do
       stdin := .null, stdout := .piped, stderr := .piped
     }
     return Handle.ofPipedChild child
+  | .stream =>
+    let child ← IO.Process.spawn {
+      cmd := spec.command, args := spec.args, cwd := spec.workdir, env
+      stdin := .piped, stdout := .piped, stderr := .piped
+    }
+    Handle.ofStreamChild child
 
 /-- The environment a task gets here: this machine, with nothing between the agent and it. -/
 def session : Session where

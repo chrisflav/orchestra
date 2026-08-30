@@ -47,6 +47,9 @@ export function Layout() {
                 </span>
               )}
             </NavLink>
+            <NavLink to="/chat" className="nav-link">
+              Chat
+            </NavLink>
             <NavLink to="/tasks" className="nav-link">
               Tasks
             </NavLink>

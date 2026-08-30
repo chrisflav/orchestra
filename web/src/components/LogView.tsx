@@ -1,11 +1,15 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { LogEvent } from "../api";
 
-/** Cap on how much of a single stdout/stderr blob is rendered inline. */
+/** Cap on how much of a single stdout/stderr blob is rendered inline.
+
+    Sized for a task log, where a blob is the output of a command and a runaway one would wedge
+    the page. A conversation is the other case — there the blob is the model's prose, and 4000
+    characters is an ordinary long answer — so the chat raises it; see `maxBlob`. */
 const MAX_BLOB = 4000;
 
-function clamp(text: string, max = MAX_BLOB): string {
+function clamp(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n… ${text.length - max} more characters`;
 }
 
@@ -36,7 +40,7 @@ function Entry({ kind, tone = "", children }: { kind: string; tone?: string; chi
  * fields that carry the meaning — the command, the path, the pattern — are pulled out and
  * everything else falls back to compact JSON.
  */
-function ToolInput({ input }: { input: Record<string, unknown> }) {
+function ToolInput({ input, maxBlob }: { input: Record<string, unknown>; maxBlob: number }) {
   const str = (key: string): string => {
     const v = input[key];
     return typeof v === "string" ? v : "";
@@ -50,7 +54,7 @@ function ToolInput({ input }: { input: Record<string, unknown> }) {
     return (
       <>
         {description && <div className="log-meta">{description}</div>}
-        <pre>{clamp(command)}</pre>
+        <pre>{clamp(command, maxBlob)}</pre>
       </>
     );
   }
@@ -60,7 +64,7 @@ function ToolInput({ input }: { input: Record<string, unknown> }) {
   return <pre>{truncate(JSON.stringify(input), 280)}</pre>;
 }
 
-function LogEntry({ event }: { event: LogEvent }) {
+function LogEntry({ event, maxBlob }: { event: LogEvent; maxBlob: number }) {
   switch (event.type) {
     case "init":
       return (
@@ -78,20 +82,20 @@ function LogEntry({ event }: { event: LogEvent }) {
       if (item.type === "thinking")
         return (
           <Entry kind="thinking" tone="k-think">
-            <div className="log-think">{clamp(item.text ?? "")}</div>
+            <div className="log-think">{clamp(item.text ?? "", maxBlob)}</div>
           </Entry>
         );
       if (item.type === "tool_use")
         return (
           <Entry kind="tool" tone="k-tool">
             <span className="log-tool">{item.name ?? "?"}</span>
-            <ToolInput input={item.input ?? {}} />
+            <ToolInput input={item.input ?? {}} maxBlob={maxBlob} />
           </Entry>
         );
       if (item.type === "text")
         return (
           <Entry kind="says" tone="k-text">
-            {clamp(item.text ?? "")}
+            {clamp(item.text ?? "", maxBlob)}
           </Entry>
         );
       return (
@@ -104,11 +108,11 @@ function LogEntry({ event }: { event: LogEvent }) {
       const stderr = event.stderr ?? "";
       return (
         <Entry kind="output">
-          {stdout && <pre>{clamp(stdout)}</pre>}
+          {stdout && <pre>{clamp(stdout, maxBlob)}</pre>}
           {stderr && (
             <>
               <div className="log-meta log-err">stderr</div>
-              <pre>{clamp(stderr)}</pre>
+              <pre>{clamp(stderr, maxBlob)}</pre>
             </>
           )}
         </Entry>
@@ -124,7 +128,7 @@ function LogEntry({ event }: { event: LogEvent }) {
       if (event.total_cost_usd != null) parts.push(`$${event.total_cost_usd}`);
       return (
         <Entry kind={subtype || "result"} tone={failed ? "k-err" : "k-text"}>
-          {event.result && <pre>{clamp(event.result)}</pre>}
+          {event.result && <pre>{clamp(event.result, maxBlob)}</pre>}
           {parts.length > 0 && <div className="log-meta">{parts.join(" · ")}</div>}
         </Entry>
       );
@@ -137,22 +141,77 @@ function LogEntry({ event }: { event: LogEvent }) {
   }
 }
 
+/** Is this event a tool being called, or a tool answering? */
+function isToolwork(event: LogEvent): boolean {
+  return event.type === "tool_result" || (event.type === "assistant" && event.item?.type === "tool_use");
+}
+
+/**
+ * A run of tool calls and their output, behind one line saying how many there were.
+ *
+ * Collapsed by default because in a conversation they are not the conversation: a turn that
+ * reads six files to answer one question is six calls and six blobs of output around one
+ * sentence, and left open the sentence is what you have to hunt for. The count is the part
+ * worth seeing at a glance — that work happened, and how much — with the detail one click away
+ * for when it is what you actually came for.
+ */
+function ToolRun({ events, maxBlob }: { events: LogEvent[]; maxBlob: number }) {
+  const [open, setOpen] = useState(false);
+  const calls = events.filter((e) => e.type === "assistant").length;
+  // A run with results but no calls is a torn transcript, not nothing — but it is not evidence
+  // of calls either, so it says what it actually has.
+  const n = calls > 0 ? calls : events.length;
+  const noun = calls > 0 ? "tool" : "tool result";
+  return (
+    <div className="log-tools">
+      <button
+        type="button"
+        className="log-tools-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
+        <span className="log-tools-caret" aria-hidden="true">
+          {open ? "▾" : "▸"}
+        </span>
+        {`called ${n} ${noun}${n === 1 ? "" : "s"}`}
+      </button>
+      {open && events.map((event, i) => <LogEntry key={i} event={event} maxBlob={maxBlob} />)}
+    </div>
+  );
+}
+
 /**
  * The task log, pinned to the bottom while the reader is already there.
  *
  * A running task appends events every couple of seconds. Scrolling back up to read something
  * must not be undone by the next frame, so the scroll is only forced when the reader was
  * within a few pixels of the end when the update arrived.
+ *
+ * `flow` turns all of that off — the panel, the box, and the pinning — for a caller that draws
+ * several of these as part of its own page. A chat transcript is that caller: a conversation is
+ * continuous prose, and every turn arriving as a bordered card with its own scrollbar reads as a
+ * stack of documents rather than as something someone said. It also costs: each block would read
+ * `scrollHeight` on every frame, a synchronous layout per block, for a page that has exactly one
+ * place worth pinning to — the window.
  */
 export function LogView({
   events,
   total,
   truncated,
   empty = "This task has no log file.",
+  flow = false,
+  collapseTools = false,
+  maxBlob = MAX_BLOB,
 }: {
   events: LogEvent[];
   total: number;
   truncated: boolean;
+  /** Draw as part of the caller's page — no panel, no scroll box, no pinning. */
+  flow?: boolean;
+  /** Fold each run of tool calls and their output behind a line saying how many. */
+  collapseTools?: boolean;
+  /** How much of one blob to render before cutting it. See `MAX_BLOB`. */
+  maxBlob?: number;
   /** What to say when there is nothing to show. Only the page knows why there isn't. */
   empty?: string;
 }) {
@@ -160,9 +219,10 @@ export function LogView({
   const pinned = useRef(true);
 
   useEffect(() => {
+    if (flow) return;
     const el = ref.current;
     if (el && pinned.current) el.scrollTop = el.scrollHeight;
-  }, [events]);
+  }, [events, flow]);
 
   if (events.length === 0) {
     return <p className="empty">{empty}</p>;
@@ -173,19 +233,36 @@ export function LogView({
     if (el) pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
   };
 
+  // Consecutive toolwork becomes one run; everything else stays one entry per event. Without
+  // `collapseTools` nothing is toolwork, so this is a single run rendered one entry per event —
+  // exactly what the task log has always drawn.
+  const runs: { tools: boolean; events: LogEvent[] }[] = [];
+  for (const event of events) {
+    const tools = collapseTools && isToolwork(event);
+    const last = runs[runs.length - 1];
+    if (last && last.tools === tools) last.events.push(event);
+    else runs.push({ tools, events: [event] });
+  }
+
   return (
-    <div className="panel">
+    <div className={flow ? "log-plain" : "panel"}>
       {truncated && (
         <div className="caption">
           Showing the last {events.length} of {total} events. The tail follows as the task runs.
         </div>
       )}
-      <div className="log" ref={ref} onScroll={onScroll}>
-        {events.map((event, i) => (
+      <div className={flow ? "log log-flow" : "log"} ref={ref} onScroll={onScroll}>
+        {runs.map((run, i) =>
           // Log events are append-only and carry no id, so position is a stable key here:
-          // index `i` always names the same event for as long as the tail window holds.
-          <LogEntry key={i} event={event} />
-        ))}
+          // index `i` always names the same run for as long as the tail window holds.
+          run.tools ? (
+            <ToolRun key={i} events={run.events} maxBlob={maxBlob} />
+          ) : (
+            run.events.map((event, j) => (
+              <LogEntry key={`${i}-${j}`} event={event} maxBlob={maxBlob} />
+            ))
+          ),
+        )}
       </div>
     </div>
   );

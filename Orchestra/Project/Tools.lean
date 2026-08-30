@@ -1,6 +1,7 @@
 import Lean.Data.Json
 import Orchestra.Project.Basic
 import Orchestra.Project.Claim
+import Orchestra.Spawn
 import Orchestra.TaskStore
 
 open Lean (Json FromJson ToJson)
@@ -52,6 +53,13 @@ inductive ProjectTool where
   | updateIssue      (issueId : Taxis.IssueId) (title description : Option String)
                      (status : Option IssueStatus) (target : Option RepoTarget)
                      (dependencies : Option (Array Taxis.IssueId) := none)
+                     (labelsAdd labelsRemove : List String := [])
+                     (assigneesAdd assigneesRemove : List String := [])
+  /-- The labels the tracker defines: the vocabulary a relabelling request is resolved against,
+      and the only one it may name. -/
+  | listLabels
+  /-- The actors the tracker knows, so an issue can be handed to a named human. -/
+  | listActors
   -- work_issues
   | listOpenIssues   (projectId : Taxis.IssueId) (targetRepo : Option Repository)
   | claimIssue       (issueId : Taxis.IssueId)
@@ -65,9 +73,19 @@ inductive ProjectTool where
   | listIssueComments  (issueId : Taxis.IssueId)
   /-- Add a comment to an issue's thread. -/
   | commentIssue       (issueId : Taxis.IssueId) (body : String)
+  /-- Read an issue's context notes: what earlier runs on it worked out. -/
+  | listContext        (issueId : Taxis.IssueId)
+  /-- Attach a new context note to an issue. -/
+  | addContext         (issueId : Taxis.IssueId) (title text : String)
+  /-- Rewrite one context note in place, keeping its id. -/
+  | updateContext      (issueId : Taxis.IssueId) (contextId : Taxis.ArtifactId)
+                       (title text : String)
   -- review_issues
   | listIssuesInReview (projectId : Taxis.IssueId)
   | decideIssue        (issueId : Taxis.IssueId) (decision : ReviewDecision) (notes : String)
+  -- gated on a spawn policy rather than on a permission label (see `Orchestra.Spawn`)
+  /-- Put a task on orchestra's queue, optionally bound to an issue and claiming it. -/
+  | queueTask          (request : SpawnRequest)
   -- always-available (when attached to a project)
   | projectInfo
 deriving Repr, Inhabited
@@ -82,6 +100,12 @@ private def strProp (desc : String) : Json :=
 
 private def intProp (desc : String) : Json :=
   Json.mkObj [("type", "integer"), ("description", desc)]
+
+private def strArrayProp (desc : String) : Json :=
+  Json.mkObj
+    [ ("type", "array")
+    , ("description", desc)
+    , ("items", Json.mkObj [("type", "string")]) ]
 
 private def obj (props : List (String × Json)) (required : List String) : Json :=
   Json.mkObj
@@ -112,6 +136,55 @@ private def commentIssueToolDef : Json :=
         , ("body", strProp "Comment text (markdown allowed)") ]
         ["issue_id", "body"]) ]
 
+/-! ### Context notes
+
+Offered under all three groups, reads and writes alike. Every role that touches an issue
+accumulates something the next one would otherwise rediscover — a worker what it tried, a
+reviewer what it checked, a manager what it decided not to do — and the point of the artifact is
+that recording it costs the description and the thread nothing. -/
+
+private def listContextToolDef : Json :=
+  Json.mkObj
+    [ ("name", "list_context")
+    , ("description",
+        "Read the context notes attached to a taxis issue: what an earlier run worked out, an " ++
+        "approach already tried and abandoned, what the build environment needs. Read these " ++
+        "before starting work — this is where the last agent on the issue left its findings. " ++
+        "get_issue shows only their titles and the taxis UI keeps them folded, so this is what " ++
+        "reads the notes themselves.")
+    , ("inputSchema", obj [ ("issue_id", intProp "Issue ID") ] ["issue_id"]) ]
+
+private def addContextToolDef : Json :=
+  Json.mkObj
+    [ ("name", "add_context")
+    , ("description",
+        "Attach a context note to a taxis issue: a title and a block of markdown, held beside " ++
+        "the issue rather than in it. This is where implementation detail, findings and results " ++
+        "belong — not in the description, which states what the work is and is read by every " ++
+        "person who opens the issue, and not in the comment thread, which is discussion and " ++
+        "review. Notes stay folded, so they can accumulate over an issue's life without " ++
+        "crowding either.")
+    , ("inputSchema", obj
+        [ ("issue_id", intProp "Issue ID")
+        , ("title", strProp "Short label for the note — the one line shown before it is unfolded")
+        , ("text", strProp "The note itself (markdown, with $…$ math)") ]
+        ["issue_id", "title", "text"]) ]
+
+private def updateContextToolDef : Json :=
+  Json.mkObj
+    [ ("name", "update_context")
+    , ("description",
+        "Rewrite a context note in place, keeping its id. Title and text replace what was " ++
+        "there — a note is revised whole rather than appended to, so pass the full text you " ++
+        "want it to end up with; list_context gives you the current one. Prefer revising a note " ++
+        "that has gone out of date over attaching a second one that contradicts it.")
+    , ("inputSchema", obj
+        [ ("issue_id", intProp "ID of the issue the note is attached to")
+        , ("context_id", intProp "ID of the note to rewrite (from list_context)")
+        , ("title", strProp "Replacement title")
+        , ("text", strProp "Replacement text (markdown)") ]
+        ["issue_id", "context_id", "title", "text"]) ]
+
 def toolDefs : List (String × String × Json) :=
   [ -- manage_issues
     (manageIssuesPerm, "list_projects",
@@ -131,7 +204,9 @@ def toolDefs : List (String × String × Json) :=
   , (manageIssuesPerm, "get_issue",
       Json.mkObj
         [ ("name", "get_issue")
-        , ("description", "Get full issue detail (children + attached PRs).")
+        , ("description",
+            "Get full issue detail: children, attached PRs, the comment thread, and the " ++
+            "titles of any context notes (read them with list_context).")
         , ("inputSchema", obj
             [ ("issue_id", intProp "Issue ID") ]
             ["issue_id"]) ])
@@ -159,8 +234,10 @@ def toolDefs : List (String × String × Json) :=
       Json.mkObj
         [ ("name", "update_issue")
         , ("description",
-            "Update an issue's title, description, status, target, or dependencies. " ++
-            "Pass dependency_ids to replace the full dependency list; omit to leave it unchanged.")
+            "Update an issue's title, description, status, target, dependencies, labels or " ++
+            "assignees. Pass dependency_ids to replace the full dependency list; omit to leave " ++
+            "it unchanged. Labels and assignees are add/remove lists rather than a set to " ++
+            "write, so a call that adds one label leaves the others alone.")
         , ("inputSchema", obj
             [ ("issue_id", intProp "Issue ID")
             , ("title", strProp "New title")
@@ -171,8 +248,32 @@ def toolDefs : List (String × String × Json) :=
             , ("dependency_ids", Json.mkObj
                 [ ("type", "array")
                 , ("description", "Replace the dependency list with these issue IDs (issues that must be completed before this one is dispatched)")
-                , ("items", Json.mkObj [("type", "integer")]) ]) ]
+                , ("items", Json.mkObj [("type", "integer")]) ])
+            , ("labels_add", strArrayProp
+                ("Taxis labels to put on the issue. These are what the dispatcher routes on, " ++
+                 "so this is how work is marked ready and steered. Only labels the tracker " ++
+                 "already defines (list_labels); orchestra's own o-claimed / t-project are refused."))
+            , ("labels_remove", strArrayProp "Taxis labels to take off the issue.")
+            , ("assignees_add", strArrayProp
+                ("Actors to assign, by email or display name (list_actors). Assigning a human " ++
+                 "is how an issue is escalated to one."))
+            , ("assignees_remove", strArrayProp "Actors to unassign, by email or display name.") ]
             ["issue_id"]) ])
+  , (manageIssuesPerm, "list_labels",
+      Json.mkObj
+        [ ("name", "list_labels")
+        , ("description",
+            "List the labels the taxis tracker defines. These are the only names update_issue " ++
+            "will accept — it creates none — so check here before routing an issue with one. " ++
+            "Not GitHub labels: use label_issue for those.")
+        , ("inputSchema", obj [] []) ])
+  , (manageIssuesPerm, "list_actors",
+      Json.mkObj
+        [ ("name", "list_actors")
+        , ("description",
+            "List the actors (people and bots) the taxis tracker knows, with the email that " ++
+            "names each one uniquely. Use before assigning an issue to a human.")
+        , ("inputSchema", obj [] []) ])
     -- work_issues
   , (workIssuesPerm, "list_open_issues",
       Json.mkObj
@@ -240,6 +341,15 @@ def toolDefs : List (String × String × Json) :=
   , (manageIssuesPerm, "list_issue_comments", commentsToolDef)
   , (workIssuesPerm, "comment_issue", commentIssueToolDef)
   , (reviewIssuesPerm, "comment_issue", commentIssueToolDef)
+  , (workIssuesPerm, "list_context", listContextToolDef)
+  , (reviewIssuesPerm, "list_context", listContextToolDef)
+  , (manageIssuesPerm, "list_context", listContextToolDef)
+  , (workIssuesPerm, "add_context", addContextToolDef)
+  , (reviewIssuesPerm, "add_context", addContextToolDef)
+  , (manageIssuesPerm, "add_context", addContextToolDef)
+  , (workIssuesPerm, "update_context", updateContextToolDef)
+  , (reviewIssuesPerm, "update_context", updateContextToolDef)
+  , (manageIssuesPerm, "update_context", updateContextToolDef)
     -- review_issues
   , (reviewIssuesPerm, "list_issues_in_review",
       Json.mkObj
@@ -264,6 +374,56 @@ def toolDefs : List (String × String × Json) :=
             ["issue_id", "decision", "notes"]) ])
   ]
 
+/-- Tool definition for `queue_task`, exposed separately because it is gated on the task having
+    a `SpawnPolicy` rather than on a permission label — see `Orchestra.Spawn` for why the policy
+    is the only switch.
+
+    The schema deliberately says what each field defaults to rather than listing what is allowed:
+    the allowed sets are per task, this definition is not, and a description that named them
+    would be wrong for every task but the one it was written against. A refusal carries the
+    actual list, which is the point at which the agent needs it. -/
+def queueTaskToolDef : Json :=
+  Json.mkObj
+    [ ("name", "queue_task")
+    , ("description",
+        "Put a task on orchestra's queue for an agent to pick up, and optionally bind a taxis " ++
+        "issue to it. Use this to hand off work that is not yours to do — decomposing an epic " ++
+        "and queueing an implementor for each leaf, queueing a second opinion on a change you " ++
+        "cannot judge — rather than doing it yourself in this run.\n\n" ++
+        "What you may choose is configured per task and is usually narrow. Everything you omit " ++
+        "is inherited from this task: same backend, same model, same repository, same tools. " ++
+        "Naming something you are not allowed to name is refused with the list you may pick " ++
+        "from, so ask for what you want and read the refusal.\n\n" ++
+        "Set pre_claim to claim the issue for the queued task, so no dispatcher hands it to " ++
+        "anyone else in the meantime. The queued task cannot queue tasks of its own.")
+    , ("inputSchema", obj
+        [ ("prompt", strProp
+            ("What the queued agent is to do. It starts with no memory of this run, so write " ++
+             "it to stand on its own — the issue you bind is the only other context it gets."))
+        , ("backend", strProp "Agent backend to run it on. Default: the same as this task's.")
+        , ("model", strProp "Model to run it on. Default: the same as this task's.")
+        , ("repo", strProp
+            ("Repository to run it against, as owner/name. Default: the one this task is " ++
+             "working on."))
+        , ("tools", strArrayProp
+            ("Tools to grant it, by the names a role's permissions use (create_pr, comment, " ++
+             "label_issue, manage_issues, work_issues, review_issues). Default: the ones this " ++
+             "task holds. Pass an empty array for a task that needs none."))
+        , ("budget", Json.mkObj
+            [ ("type", "number")
+            , ("description",
+                "Maximum spend in USD. Default: the ceiling this task may queue at, or " ++
+                "orchestra's own default when there is none.") ])
+        , ("issue_id", intProp
+            ("Taxis issue to bind the task to. Must be at or below this task's own issue or " ++
+             "project — the same subtree every other write is confined to."))
+        , ("pre_claim", Json.mkObj
+            [ ("type", "boolean")
+            , ("description",
+                "Claim the bound issue for the queued task, taking it out of every " ++
+                "dispatcher's candidate set until that task ends. Requires issue_id.") ]) ]
+        ["prompt"]) ]
+
 /-- Tool definition for `project_info`, exposed separately because it is
     always-available (no permission gate) when a task is attached to a project. -/
 def projectInfoToolDef : Json :=
@@ -283,9 +443,27 @@ private def issueStatusOfString? : String → Option IssueStatus
   | "abandoned" => some .abandoned
   | _           => none
 
+/-- Read an optional string argument, telling *absent* from *malformed*.
+
+    A missing key and an explicit `null` — which is how a client serialises "not set" — both mean
+    leave it alone. Anything else that is not a string is the caller's mistake and is reported as
+    one: read as absent instead, a mistyped field is a call that changes nothing while answering
+    as though it had nothing to change. -/
+private def optStrArg (args : Json) (field : String) : Except String (Option String) :=
+  match args.getObjVal? field with
+  | .error _  => .ok none
+  | .ok .null => .ok none
+  | .ok _     =>
+    match args.getObjValAs? String field with
+    | .ok v    => .ok (some v)
+    | .error e => .error s!"{field} must be a string: {e}"
+
 private def parseTarget? (args : Json) : Except String (Option RepoTarget) := do
-  let mRepo  := args.getObjValAs? String "target_repo"   |>.toOption
-  let mBranch := args.getObjValAs? String "target_branch" |>.toOption
+  -- Mistyped rather than lenient, so that "provided together" means what it says: read through
+  -- `.toOption`, `target_repo: 1` was indistinguishable from an absent one, and naming both with
+  -- one of them mistyped was reported as failing to provide both.
+  let mRepo   ← optStrArg args "target_repo"
+  let mBranch ← optStrArg args "target_branch"
   match mRepo, mBranch with
   | none,   none   => return none
   | some r, some b =>
@@ -324,15 +502,51 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
   | "update_issue" =>
     some <| do
       let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
-      let title  := args.getObjValAs? String "title"       |>.toOption
-      let descr  := args.getObjValAs? String "description" |>.toOption
-      let status :=
-        match args.getObjValAs? String "status" |>.toOption with
-        | none => none
-        | some s => issueStatusOfString? s
+      -- Every optional field here distinguishes *absent* from *malformed*. Absent means "leave
+      -- this alone" and is the ordinary case — a retitle names one field and omits six. Malformed
+      -- is a mistake, and reading it as absent is how `labels_add: "auto-work-opus"` (an array
+      -- field given a bare string, the likeliest way to get this wrong) or `status: "done"` used
+      -- to become a call that reported success and changed nothing, which is exactly the silent
+      -- failure a closed label vocabulary exists to prevent.
+      let present (field : String) : Bool :=
+        match args.getObjVal? field with
+        | .error _  => false   -- no such key
+        | .ok .null => false   -- explicit null: how a client spells "not set"
+        | .ok _     => true
+      let title ← optStrArg args "title"
+      let descr ← optStrArg args "description"
+      let status ← do
+        match ← optStrArg args "status" with
+        | none   => pure none
+        | some s =>
+          match issueStatusOfString? s with
+          | some st => pure (some st)
+          | none    =>
+            Except.error s!"status must be open, claimed, completed or abandoned, got {repr s}"
       let target ← parseTarget? args
-      let dependencies := args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" |>.toOption
+      let dependencies ←
+        if !present "dependency_ids" then pure none
+        else match args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" with
+          | .ok v    => pure (some v)
+          | .error e => Except.error s!"dependency_ids must be an array of issue ids: {e}"
+      -- Names are trimmed, and a blank one is refused rather than passed down to be reported as
+      -- `no such label: `. `label_issue` already draws the line here on the GitHub side.
+      let names (field : String) : Except String (List String) :=
+        if !present field then .ok []
+        else match args.getObjValAs? (Array String) field with
+          | .error e => .error s!"{field} must be an array of names: {e}"
+          | .ok a    =>
+            let trimmed := (a.map (·.trimAscii.toString)).toList
+            if trimmed.any (·.isEmpty) then .error s!"{field} contains an empty name"
+            else .ok trimmed
+      let labelsAdd       ← names "labels_add"
+      let labelsRemove    ← names "labels_remove"
+      let assigneesAdd    ← names "assignees_add"
+      let assigneesRemove ← names "assignees_remove"
       return .updateIssue iid title descr status target dependencies
+        labelsAdd labelsRemove assigneesAdd assigneesRemove
+  | "list_labels" => some (.ok .listLabels)
+  | "list_actors" => some (.ok .listActors)
   | "list_open_issues" =>
     some <| do
       let pid ← args.getObjValAs? Taxis.IssueId "project_id"
@@ -381,6 +595,23 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
       let iid  ← args.getObjValAs? Taxis.IssueId "issue_id"
       let body ← args.getObjValAs? String "body"
       return .commentIssue iid body
+  | "list_context" =>
+    some <| do
+      let iid ← args.getObjValAs? Taxis.IssueId "issue_id"
+      return .listContext iid
+  | "add_context" =>
+    some <| do
+      let iid   ← args.getObjValAs? Taxis.IssueId "issue_id"
+      let title ← args.getObjValAs? String "title"
+      let text  ← args.getObjValAs? String "text"
+      return .addContext iid title text
+  | "update_context" =>
+    some <| do
+      let iid   ← args.getObjValAs? Taxis.IssueId "issue_id"
+      let cid   ← args.getObjValAs? Taxis.ArtifactId "context_id"
+      let title ← args.getObjValAs? String "title"
+      let text  ← args.getObjValAs? String "text"
+      return .updateContext iid cid title text
   | "list_issues_in_review" =>
     some <| do
       let pid ← args.getObjValAs? Taxis.IssueId "project_id"
@@ -396,6 +627,40 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | "complete" => Except.ok ReviewDecision.complete
         | s => Except.error s!"decision must be 'approve', 'complete' or 'reject', got {repr s}"
       return .decideIssue iid decision notes
+  | "queue_task" =>
+    some <| do
+      let prompt ← args.getObjValAs? String "prompt"
+      -- Optional, and mistyped is reported rather than read as absent: absent means "inherit
+      -- mine", so a `backend: 5` swallowed here would silently queue the task onto this task's
+      -- backend while the agent believed it had chosen another.
+      let backend ← optStrArg args "backend"
+      let model   ← optStrArg args "model"
+      let repo ← match ← optStrArg args "repo" with
+        | none   => pure none
+        | some r => (Repository.parse r).map some
+      -- `none` (inherit) and `[]` (grant nothing) are different answers, so this cannot go
+      -- through a `getD []`.
+      let tools ← match args.getObjVal? "tools" with
+        | .error _  => pure none
+        | .ok .null => pure none
+        | .ok v     => (FromJson.fromJson? v : Except String (List String)).map some
+      let budget ← match args.getObjVal? "budget" with
+        | .error _  => pure none
+        | .ok .null => pure none
+        | .ok _     => (args.getObjValAs? Float "budget").map some
+      -- Strict, like everything above it. `issue_id` as a *string* — which is how ids are
+      -- rendered everywhere an agent reads them — would otherwise queue a task bound to nothing
+      -- and answer `ok`; `pre_claim: "true"` would queue one bound but unclaimed while the agent
+      -- believed the issue was locked for it.
+      let issueId ← match args.getObjVal? "issue_id" with
+        | .error _  => pure none
+        | .ok .null => pure none
+        | .ok _     => (args.getObjValAs? Taxis.IssueId "issue_id").map some
+      let preClaim ← match args.getObjVal? "pre_claim" with
+        | .error _  => pure false
+        | .ok .null => pure false
+        | .ok _     => args.getObjValAs? Bool "pre_claim"
+      return .queueTask { prompt, backend, model, tools, repo, budget, issueId, preClaim }
   | "project_info" => some (.ok .projectInfo)
   | _ => none
 
@@ -430,9 +695,29 @@ structure Env where
   projectId : Option Taxis.IssueId := none
   /-- Orchestra issue this task is working on. Used by `project_info`. -/
   issueId : Option Taxis.IssueId := none
+  /-- What this task may put on the queue itself. `none` — the ordinary case — means the
+      `queue_task` tool is neither offered nor answered. -/
+  spawnPolicy : Option SpawnPolicy := none
+  /-- The spawning task's own shape, which is what every field the agent omits inherits. -/
+  spawnContext : SpawnContext := {}
+  /-- Hook called by `queueTask` to put the approved entry on the queue. Receives the resolved
+      spawn and the id of the task queueing it; returns the new entry's id, or the reason it
+      could not be queued. Set wherever a task actually runs (`TaskRunner.runIOTask`, which is
+      the daemon's path and `orchestra run`'s alike); `none` in the contexts that serve tools
+      without running a queued task, such as an interactive session. -/
+  enqueueTask : Option (ResolvedSpawn → String → IO (Except String String)) := none
+  /-- The subtree this task may write at or below, when it was queued with one
+      (`Config.IOTask.scopeRoot`). Overrides what `writeScopeRoot` would otherwise derive. -/
+  scopeRoot : Option Taxis.IssueId := none
 
 private def deny (perm : String) : String :=
   s!"this task is not authorized for the {perm} tool group"
+
+/-- Refusal for the tools gated on holding *any* issue group rather than a named one. Naming a
+    single group, as `deny` does, would send an agent looking for the wrong permission. -/
+private def denyAnyGroup : String :=
+  "this task is not authorized for any of the manage_issues, work_issues or review_issues \
+   tool groups"
 
 /-- The issue bounding what this task may create or update: the root of its own project subtree
     (`Project.projectRootOf`). Anchored on the task's issue when it has one, otherwise on its
@@ -446,6 +731,12 @@ private def deny (perm : String) : String :=
     sibling subtrees nobody labelled. Where the project id *is* an anchor — every
     project-dispatcher role — `projectRootOf` returned it unchanged anyway. -/
 private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
+  -- A scope carried on the task wins over anything derived here. It is set only by `queue_task`,
+  -- and it holds the *queueing* task's own root: deriving one from the bound issue instead walks
+  -- up to the nearest project anchor, which for a task scoped to a labelled issue below that
+  -- anchor is strictly wider than the scope the task that queued it was held to. A task must not
+  -- be able to create an agent that writes where it cannot.
+  if let some root := env.scopeRoot then return some root
   match env.issueId, env.projectId with
   | some iid, _ => return some (← projectRootOf iid)
   | none, some pid => return some pid
@@ -463,7 +754,20 @@ private def refuseOutsideScope (env : Env) (target : Taxis.IssueId) (what : Stri
   | some root =>
     if ← isWithinSubtree root target then return none
     return some s!"cannot {what}: issue {target.toString} is outside this task's project \
-      subtree (root {root.toString}); manage_issues may only modify issues at or below it"
+      subtree (root {root.toString}); a task may only write to issues at or below it"
+
+/-- Refuse a context note with a blank field, before taxis does.
+
+    Taxis requires both and rejects a blank one with a 422, which reaches the agent as a thrown
+    `IO.userError` rather than as a tool error: the server catches it by closing the connection,
+    so an empty title costs the task every tool it had. Neither field is optional in any sense
+    worth passing on — a note with no title is one the rail cannot show, and one with no text is
+    not a note. -/
+private def refuseBlankNote (title text : String) : Option String :=
+  if title.trimAscii.isEmpty then some "a context note needs a title: it is the only part of it \
+    shown before someone unfolds it"
+  else if text.trimAscii.isEmpty then some "a context note needs text — there is nothing else to it"
+  else none
 
 private def has (env : Env) (perm : String) : Bool :=
   env.allowedTools.contains perm
@@ -527,6 +831,15 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       let childLines := children.map (fun c => s!"  - {c.id.toString}  [{issueStatusToString c.status}]  {c.title}")
       let depsStr := if i.dependencies.isEmpty then "-"
                      else String.intercalate ", " (i.dependencies.map (·.toString)).toList
+      -- The two fields `Issue` does not carry. Shown because they are what routes the issue —
+      -- which worker the dispatcher offers it to, and which human is on the hook for it — and an
+      -- agent asked to change them can otherwise only guess at what they are.
+      let routing ← issueLabelsAndAssignees iid
+      let orDash (pick : Array String × Array String → Array String) : String :=
+        match routing with
+        | none    => "(could not be read from taxis)"
+        | some rs => let xs := pick rs
+                     if xs.isEmpty then "-" else String.intercalate ", " xs.toList
       let header : Array String := #[
         s!"id:           {i.id.toString}",
         s!"project:      {project.id.toString} ({project.name})",
@@ -534,6 +847,8 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         s!"title:        {i.title}",
         s!"status:       {issueStatusToString i.status}",
         s!"target:       {target}",
+        s!"labels:       {orDash (·.1)}",
+        s!"assignees:    {orDash (·.2)}",
         s!"dependencies: {depsStr}",
         s!"created:      {i.createdAt}",
         s!"updated:      {i.updatedAt}",
@@ -546,6 +861,13 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       if !comments.isEmpty then
         let rendered ← comments.mapM renderComment
         body := body ++ #["comments:"] ++ rendered
+      -- Titles only, as the taxis rail shows them. Notes accumulate over an issue's life and
+      -- are the one part of it with no bound, so listing them whole here would make the cost of
+      -- reading an issue grow with how much has been written beside it.
+      let notes ← loadContext iid
+      if !notes.isEmpty then
+        body := body ++ #["context (read with list_context):"] ++
+          notes.map (fun n => s!"  [{n.id.val}] {n.title}")
       return content (joinLines body)
   | .createIssue pid title descr parent target dependencies =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
@@ -566,23 +888,69 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     let issue ← createIssue pid title descr (parentId := parent) (target := target)
       (dependencies := dependencies)
     return content s!"created issue {issue.id.toString} in project {pid.toString}"
-  | .updateIssue iid title descr status target dependencies =>
+  | .updateIssue iid title descr status target dependencies
+      labelsAdd labelsRemove assigneesAdd assigneesRemove =>
     if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
     if let some msg ← refuseOutsideScope env iid "update that issue" then
       return content msg (isError := true)
     match ← findIssue iid with
     | none => return content s!"issue {iid.toString} not found" (isError := true)
     | some (_, i) =>
-      let updated : Issue :=
-        { i with
-          title        := title.getD i.title
-          description  := descr.getD i.description
-          status       := status.getD i.status
-          target       := match target with | some t => some t | none => i.target
-          dependencies := dependencies.getD i.dependencies
-          updatedAt    := now }
-      saveIssue updated
-      return content s!"updated issue {iid.toString}"
+      let mut done : Array String := #[]
+      -- Only when a field was actually named. `saveIssue` asserts the *whole* issue — including
+      -- `state` and the status labels, both derived from the `i` read a moment ago — so firing it
+      -- for a call that carried only `labels_add` would write back a status nobody mentioned,
+      -- from a read that a worker completing the issue in between has already invalidated.
+      let touchesFields :=
+        title.isSome || descr.isSome || status.isSome || target.isSome || dependencies.isSome
+      if touchesFields then
+        let updated : Issue :=
+          { i with
+            title        := title.getD i.title
+            description  := descr.getD i.description
+            status       := status.getD i.status
+            target       := match target with | some t => some t | none => i.target
+            dependencies := dependencies.getD i.dependencies
+            updatedAt    := now }
+        saveIssue updated
+        done := done.push s!"updated issue {iid.toString}"
+      -- After the field write, not before: `saveIssue` reconciles the status labels against the
+      -- issue as taxis holds it, so a label delta applied first would be read back and rewritten
+      -- from a set that no longer matches.
+      --
+      -- Each half is refused on its own, and a refusal carries whatever already landed with it.
+      -- An unknown label leaves the title change standing, and an agent told only "no such label"
+      -- would reasonably retry the call that made it.
+      -- `soFar` is a parameter and not a capture of `done`: a closure in a `do` block takes the
+      -- value the variable had where the closure was written, so one reading `done` directly
+      -- would report the state before the label write and lose the very line this exists to keep.
+      let failure (soFar : Array String) (e : IO.Error) : Json :=
+        content (joinLines (soFar ++ #[toString e])) (isError := true)
+      unless labelsAdd.isEmpty && labelsRemove.isEmpty do
+        try
+          let change ← setIssueLabels iid labelsAdd labelsRemove
+          done := done.push s!"labels: {change.summary iid.toString}"
+        catch e => return failure done e
+      unless assigneesAdd.isEmpty && assigneesRemove.isEmpty do
+        try
+          let change ← setIssueAssignees iid assigneesAdd assigneesRemove
+          done := done.push s!"assignees: {change.summary iid.toString}"
+        catch e => return failure done e
+      if done.isEmpty then
+        return content s!"issue {iid.toString}: nothing to change — no field, label or assignee \
+          was named"
+      return content (joinLines done)
+  | .listLabels =>
+    if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
+    let names ← listLabelNames
+    if names.isEmpty then return content "The tracker defines no labels."
+    return content (joinLines (names.map (s!"  - {·}")))
+  | .listActors =>
+    if !has env manageIssuesPerm then return content (deny manageIssuesPerm) (isError := true)
+    let actors ← listActorSummaries
+    if actors.isEmpty then return content "The tracker knows no actors."
+    return content (joinLines (actors.map fun (name, email, bot) =>
+      s!"  - {email}  ({name}){if bot then "  [bot]" else ""}"))
   -- ---------------- work_issues ----------------
   | .listOpenIssues pid targetRepo? =>
     if !has env workIssuesPerm then return content (deny workIssuesPerm) (isError := true)
@@ -737,6 +1105,40 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     addComment iid body
     IO.println s!"  [mcp] comment_issue: {iid.toString}"
     return content s!"commented on issue {iid.toString}"
+  -- ---------------- context notes (all three groups) ----------------
+  | .listContext iid =>
+    if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
+      return content denyAnyGroup (isError := true)
+    match ← renderContextNotes iid with
+    | none   => return content s!"No context notes on issue {iid.toString}."
+    | some s => return content s
+  | .addContext iid title text =>
+    if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
+      return content denyAnyGroup (isError := true)
+    if let some msg := refuseBlankNote title text then
+      return content msg (isError := true)
+    if let some msg ← refuseOutsideScope env iid "add a context note there" then
+      return content msg (isError := true)
+    let note ← attachContext iid title text
+    IO.println s!"  [mcp] add_context: {iid.toString} note {note.id.val} — {note.title}"
+    return content s!"context note {note.id.val} attached to issue {iid.toString}"
+  | .updateContext iid cid title text =>
+    if !(has env workIssuesPerm || has env reviewIssuesPerm || has env manageIssuesPerm) then
+      return content denyAnyGroup (isError := true)
+    if let some msg := refuseBlankNote title text then
+      return content msg (isError := true)
+    if let some msg ← refuseOutsideScope env iid "revise a context note there" then
+      return content msg (isError := true)
+    -- Checked against the issue named rather than patched blind: an artifact id is
+    -- tracker-wide, so a stale or guessed one otherwise reaches straight past the scope check
+    -- above into another issue's subtree.
+    let notes ← loadContext iid
+    if !notes.any (·.id == cid) then
+      return content s!"issue {iid.toString} has no context note {cid.val} — list_context \
+        shows the ones it has" (isError := true)
+    reviseContext cid title text
+    IO.println s!"  [mcp] update_context: {iid.toString} note {cid.val}"
+    return content s!"context note {cid.val} on issue {iid.toString} rewritten"
   -- ---------------- review_issues ----------------
   | .listIssuesInReview pid =>
     if !has env reviewIssuesPerm then return content (deny reviewIssuesPerm) (isError := true)
@@ -800,6 +1202,49 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
               return content
                 s!"approved {iid.toString}; merger task {mergerTaskId} enqueued. The issue stays \
                    open — use decide_issue with 'complete' when the work is finished. ({notes})"
+  | .queueTask request =>
+    -- No permission label: the policy is the switch, and a task without one is not offered the
+    -- tool at all. Reaching this branch without one means the tool was called by name anyway.
+    let some policy := env.spawnPolicy
+      | return content "this task may not queue tasks: it has no spawn policy" (isError := true)
+    let some enqueue := env.enqueueTask
+      | return content "queueing tasks is not available in this context" (isError := true)
+    let some taskId := env.taskId
+      | return content "no task id in context (a queued task has to record who queued it)"
+          (isError := true)
+    -- Scoped before the policy is consulted: binding an issue is what decides which work the
+    -- queued agent is pointed at, and pre-claiming it writes to taxis. Either outside this
+    -- task's own subtree would be a way to reach past every other write's bound.
+    if let some iid := request.issueId then
+      if let some msg ← refuseOutsideScope env iid "bind that issue to a queued task" then
+        return content msg (isError := true)
+    -- Read once here and carried onto the queued task, rather than left for it to re-derive:
+    -- see `writeScopeRoot`, whose derivation can land above this task's own root.
+    let callerScope ← writeScopeRoot env
+    match policy.resolve env.spawnContext request with
+    | .error e =>
+      IO.println s!"  [mcp] queue_task: refused — {e}"
+      return content e (isError := true)
+    | .ok base =>
+      let resolved := { base with scopeRoot := callerScope }
+      IO.println s!"  [mcp] queue_task: backend={resolved.backend.getD "(inherited)"} \
+        repo={resolved.repo.map (·.toString) |>.getD "(none)"} \
+        issue={resolved.issueId.map (·.toString) |>.getD "none"} \
+        pre_claim={resolved.preClaim}"
+      match ← enqueue resolved taskId with
+      | .error e =>
+        IO.println s!"  [mcp] queue_task: {e}"
+        return content e (isError := true)
+      | .ok entryId =>
+        IO.println s!"  [mcp] queue_task: queued {entryId}"
+        let claimNote := if resolved.preClaim then " and claimed for it" else ""
+        let issueNote := match resolved.issueId with
+          | some iid => s!", bound to issue {iid.toString}{claimNote}"
+          | none     => ""
+        return content (Json.mkObj
+          [ ("ok", true)
+          , ("queue_entry_id", Json.str entryId)
+          , ("note", Json.str s!"queued as {entryId}{issueNote}") ]).compress
   | .projectInfo =>
     IO.println "  [mcp] project_info"
     match env.projectId with

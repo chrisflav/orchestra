@@ -8,8 +8,8 @@ in a sandbox with credentials the agent never gets to hold.
 
 Three pieces carry everything else.
 
-- A **task** is the unit of work and the only thing that ever runs an agent: a repository pair, a
-  prompt, a set of tools, a budget → [task files](#task-files)
+- A **task** is the unit of work and the only thing that ever runs an agent: a repository pair (or
+  none, for meta-work), a prompt, a set of tools, a budget → [task files](#task-files)
 - The **queue** is where tasks wait for the daemon that runs them, by priority and in parallel →
   [queue mode](#queue-mode)
 - **Listeners** poll an event source and enqueue a task whenever something matches →
@@ -43,6 +43,9 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
   mount its clone read-only, which is what review tasks use. What a task may do is described apart
   from how that is enforced, so another execution model — a container, a cluster — is a backend
   rather than a rewrite → [the execution model](docs/execution.md)
+- **Repository-independent tasks.** A task can name no repository at all and run in a scratch
+  workspace instead of a checkout — for maintenance and coordination that spans every project
+  rather than belonging to one → [repository-independent tasks](#repository-independent-tasks)
 - **Credentials the agent never sees.** A GitHub App installation token is minted per task and
   handed to `gh` for git transport only. The personal access token used for upstream pull
   requests, reviews and comments stays in the MCP server process.
@@ -73,6 +76,13 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
   validation fails.
 - **Recorded history.** Every run is stored, can be grouped into a named series, and resumed with
   a follow-up prompt.
+- **A native app.** One client for macOS, Windows, Linux, iOS and Android that holds *several*
+  backends at once and switches between them — reading the same API the dashboard reads, over a
+  bearer token kept in the OS keychain. Its own repository:
+  [orchestra-app](https://github.com/chrisflav/orchestra-app) → [native app](#native-app)
+- **Chat sessions the backend holds.** A conversation with an agent, in the same sandbox a task
+  gets, reachable over the API from the CLI, the dashboard or a phone — and still running after
+  the client that started it goes away → [interactive sessions](#interactive-sessions)
 
 ## prerequisites
 
@@ -128,9 +138,9 @@ orchestrad dashboard --site web/dist   # the API and the web UI alone
 
 `orchestra` is the client. Its configuration commands — `orchestra config`, `orchestra listener`
 — are HTTP clients of `orchestrad`, so a running daemon picks up a change without a restart and
-there is never a second writer racing it for the same file. Its other commands (`run`,
-`interactive`, `prepare`) execute locally, because what they do is launch a sandbox on the
-machine you are sitting at.
+there is never a second writer racing it for the same file. `orchestra chat` is one too: the
+session it talks to runs on the backend. Its other commands (`run`, `interactive`, `prepare`)
+execute locally, because what they do is launch a sandbox on the machine you are sitting at.
 
 `orchestra queue start` and `orchestra dashboard` still work and still mean what they meant: they
 start `orchestrad`, looked for next to the `orchestra` binary, then at `$ORCHESTRA_SERVER_BIN`,
@@ -170,6 +180,9 @@ fork is what the agent pushes to. If the App cannot push to a target and `defaul
 unset, the task is skipped rather than dispatched at a repository it cannot push to — so set this
 whenever the dispatcher works on repositories the App is not directly installed on. The App must be
 installed on `default_organization` with permission to create repositories.
+
+It is also the destination of the `create_repository` MCP tool, which is the only way an agent
+creates a repository from scratch rather than by forking — and the only owner that tool will use.
 
 **The target must be readable by the App.** A task's token is minted for the *fork's* installation,
 and that token is what fetches the upstream. Public targets are fine. A private target the App is
@@ -229,6 +242,10 @@ orchestra prepare <upstream> <fork> --slots 2
 
 with `--slots` matching `parallel_per_repo`, so each slot's init hook is paid up
 front rather than charged to whichever task lands there first.
+
+[Repository-independent tasks](#repository-independent-tasks) are pooled the same way and under
+the same cap, in one pool they share with each other and with nothing else — their workspaces cost
+a directory each rather than a checkout, and there is nothing to prepare up front.
 
 Two backends always run exclusively regardless of these settings: `pi` and
 `opencode` keep per-run state at a fixed path under `$HOME`, so a second
@@ -538,8 +555,10 @@ Tasks are described in a JSON file:
 
 Fields:
 
-- `upstream` — upstream repository in `owner/repo` format
-- `fork` — fork repository the agent has write access to
+- `upstream` — upstream repository in `owner/repo` format. Omit it together with `fork` for a
+  [repository-independent task](#repository-independent-tasks)
+- `fork` — fork repository the agent has write access to. A task names both repositories or
+  neither; naming one is an error
 - `prompt` — instruction sent to the agent
 - `goal` — condition the run is held to: the agent may not stop before it holds, and a second
   model call decides whether it does. Keep it one short, checkable sentence — it is judged on its
@@ -571,6 +590,64 @@ Fields:
 - `triage_add_labels` / `triage_remove_labels` — labels the `triage` backend applies
 - `project_id` / `issue_id` / `role` — set by the project subsystem; see
   [projects, issues and roles](#projects-issues-and-roles)
+- `spawn_policy` — what this task may itself put on the queue through the `queue_task` tool, and
+  how much of it. Absent means nothing, and the tool is not offered →
+  [queueing tasks from inside a task](docs/queue-task.md)
+
+## repository-independent tasks
+
+A task that names no `upstream` and no `fork` runs with nothing checked out. It is sandboxed like
+any other task, but instead of a clone slot it gets an empty scratch workspace, and the tools that
+act on a repository are withheld from it.
+
+```json
+{
+  "tasks": [
+    {
+      "prompt": "Go through the open issues on the tracker, close the ones that duplicate work already merged elsewhere, and open a coordination issue for anything blocked on another project.",
+      "tools": ["manage_issues"],
+      "budget": 6.0
+    }
+  ]
+}
+```
+
+This is the shape meta-work takes: maintenance across the whole set of projects, coordinating
+efforts on the [taxis](#projects-issues-and-roles) tracker, anything where checking out one
+repository would mean picking an arbitrary one of the several the task is about.
+
+What such a task gets, and what it does not:
+
+- **A scratch workspace** at `~/.local/share/orchestra/workspaces/`, mounted read-write, and
+  `/tmp`. It is *emptied* between tasks rather than cleaned selectively — a clone slot can keep
+  gitignored build output because git says which files those are, and a workspace has nothing
+  that could draw that line. Anything meant to outlive a run belongs in a memory directory.
+- **The project, issue and task tools** — `manage_issues`, `work_issues`, `review_issues`,
+  `get_task_input`, `submit_task_output`, `health`. This is what the task is for.
+- **`create_repository`**, which creates a repository in `default_organization` rather than acting
+  on one the task named, so there is nothing about it a repository-independent task lacks. Starting
+  a project that does not exist yet is meta-work like any other.
+- **No `create_pr`, `merge_pr`, `label_issue` or `comment`.** Asking for one in `tools` is reported
+  on stderr and dropped, and the MCP server refuses the call as well. `get_pr_comments`, which no
+  task has to ask for, is simply not offered — nor is `refresh_token` when there is no
+  installation behind it.
+- **No per-project memory.** There is no upstream to name a directory after, so `memory: "project"`
+  resolves to nothing and `"both"` to the global directory alone — which is the right home for
+  what work spanning projects learns anyway.
+- **A GitHub App token only if the config says which installation.** With `installation_id` or
+  `default_organization` set, one is minted and reaches `gh` in the sandbox as `GH_TOKEN`; with
+  neither, the task runs without GitHub credentials rather than refusing to start.
+
+The `merger` and `triage` backends need a repository by definition and refuse to run without one.
+
+Workspaces are pooled the way clone slots are, so `--parallel-per-repo` bounds how many
+repository-independent tasks run at once — they share one pool with each other, and with nothing
+else. A continuation goes back to its predecessor's workspace and keeps the files there, on the
+same terms as a continuation on a repository.
+
+Listeners and concert workflows can queue these too: a listener whose action names no
+`upstream`/`fork` (and whose event source supplies neither) queues a repository-independent task,
+and so does a workflow step with no repositories at either the step or the program level.
 
 ## sandboxing
 
@@ -619,8 +696,9 @@ agents elsewhere (a container, a Kubernetes pod) involves.
 ## MCP tools
 
 The agent has access to the following tools via the built-in MCP server. `health`, `refresh_token`,
-and `get_pr_comments` are always available; `create_pr`, `merge_pr`, `label_issue` and `comment`
-must be enabled explicitly by adding them to the `tools` list in the task configuration.
+and `get_pr_comments` are always available; `create_pr`, `merge_pr`, `label_issue`, `comment` and
+`create_repository` must be enabled explicitly by adding them to the `tools` list in the task
+configuration.
 
 - `health` — check that the MCP server is running
 - `refresh_token` — refresh the GitHub App installation token
@@ -641,6 +719,21 @@ must be enabled explicitly by adding them to the `tools` list in the task config
   case-insensitively. An addition the issue already carries and a removal it does not are reported
   and skipped, so calling twice changes nothing. Unlike `comment`, it can label any issue, not
   only the one the task was launched from
+- `create_repository` — create a new repository in `default_organization`, the organisation tasks
+  are forked into. Takes `name` plus optional `description`, `private` (default `true`) and
+  `auto_init` (default `false`, i.e. an empty repository ready for a first push). The owner is not
+  an argument: the configured organisation is the one place the operator has already agreed is
+  orchestra's to write to, and the tool refuses when none is set. Unlike forking it is not
+  idempotent — a name the organisation already uses is refused rather than handed back, so a push
+  never lands in a repository the task did not just create. Authenticated by the organisation's own
+  GitHub App installation, which needs the `Administration: read and write` permission. The result
+  carries a token to push with, scoped to the new repository alone and expiring in an hour like
+  every installation token — the agent is given it as a remote URL to use once, not as a `GH_TOKEN`
+  to export, since that variable is what authenticates its work on its own fork. A token from
+  `refresh_token` is minted for whichever installation the task runs under, so it reaches the new
+  repository only when that installation covers `default_organization` — which is the case when
+  the task works on a fork, and not when the App could push to the target directly. Grant it
+  deliberately, like `merge_pr`
 - `comment` — post a comment on the issue or pull request the task was launched from.
   Supports four modes:
   - **regular comment**: provide only `body`
@@ -650,6 +743,15 @@ must be enabled explicitly by adding them to the `tools` list in the task config
 
   The `comment` tool requires the task to carry an `issue_number` (set automatically by the
   listener when triggered from an issue or pull request).
+
+- `queue_task` — put a task on orchestra's queue for an agent to pick up, optionally bound to a
+  taxis issue and claiming it. This is the one tool the `tools` list cannot enable: what it may do
+  — which backends, models, tools and repositories a queued task may be given, how many may be
+  queued, whether an issue may be claimed — is written in the task's `spawn_policy`, and a task
+  without one is not offered the tool at all. Everything the agent omits is inherited from the
+  queueing task, so an empty policy still lets it queue more of itself and nothing else, and a
+  queued task never carries a policy of its own → [queueing tasks from inside a
+  task](docs/queue-task.md)
 
 Three more tool groups — `manage_issues`, `work_issues`, `review_issues` — are available when a
 task carries them in its `tools` list, backing orchestra's project/issue/claim workflow (a taxis
@@ -661,7 +763,8 @@ for the full concept mapping, the `taxis` config section, and a CLI/tool cheat s
 `skills/` is a Claude plugin directory loaded into every agent by default. It carries two skills:
 
 - **`orchestra-pull-requests`** — opening PRs, commenting, reading review feedback.
-- **`orchestra-taxis-issues`** — claiming, splitting, attaching PRs, and managing tracker issues.
+- **`orchestra-taxis-issues`** — claiming, splitting, attaching PRs, managing tracker issues,
+  and keeping an issue's context notes.
 
 Both exist mainly to state one rule the agent cannot infer: **`gh` must never be used for pull
 requests or issues.** Everything goes through the MCP tools, which select the right credential
@@ -719,6 +822,18 @@ get, use its interactive TUI:
 ```
 orchestra interactive --upstream owner/repo --fork your-org/fork
 ```
+
+Leave both flags out for a session with no repository, which is what a
+[repository-independent task](#repository-independent-tasks) sees: an empty workspace, the tracker
+tools, and none of the ones that act on a repository.
+
+```
+orchestra interactive
+```
+
+That one is local: it hands *this* terminal to the agent. For the same conversation held by the
+backend instead — reachable from the dashboard or a phone, and still there after you close the
+terminal — see [interactive sessions](#interactive-sessions).
 
 ## concert workflows
 
@@ -899,11 +1014,18 @@ Fields:
   neither dispatched onto nor counted as work, while still rooting their subtree — so only what
   inherited the label is worked
 - `action.prompt_template` — template rendered with event variables (e.g. `{{upstream}}`, `{{fork}}`, `{{issue_number}}`, `{{body}}`, `{{author}}`)
+- `action.upstream` / `action.fork` — the repositories the queued task works on, as templates.
+  Left out, they fall back to the `{{upstream}}`/`{{fork}}` variables the event source supplies —
+  every GitHub source supplies both. A `shell` source supplies neither, so a listener on one that
+  names neither queues a [repository-independent task](#repository-independent-tasks)
 - `action.workflow_path` — path to a `.yaml` workflow file; when set the listener starts a concert instead of enqueueing a single task
 - `action.auth_sources` / `action.auth_mode` — candidate authentication sources for the tasks this
   listener queues, and how to pick among them. A listener that fires repeatedly is the case
   several accounts exist for: it keeps producing runnable work after one account's weekly window
   closes → [usage limits](#usage-limits)
+- `interval_seconds` — how often the listener *looks*. What it may *do* once it has looked is
+  `rate_limits`, below
+- `rate_limits` — ceilings on how often this listener may dispatch (see below)
 
 To trigger a multi-step workflow from a listener, replace `prompt_template` with `workflow_path`:
 
@@ -933,6 +1055,68 @@ orchestra listener list
 orchestra listener enable <name>
 orchestra listener disable <name>
 ```
+
+### how often a listener may fire
+
+`interval_seconds` says how often a listener looks; it says nothing about how much it may do
+when it looks. A source can hand a listener twenty events in a single tick, and a listener
+watching a busy repository can have something to do on every tick of the day — neither is a
+reason to spend twenty tasks' worth of an account's budget in a minute.
+
+`rate_limits` is the ceiling on the doing. Each entry is a `max` and a window, and a dispatch
+has to fit under all of them:
+
+```json
+{
+  "source": {
+    "type": "github-issues",
+    "repos": [{"upstream": "owner/repo", "fork": "your-org/fork"}],
+    "labels": ["orchestra"]
+  },
+  "action": {
+    "mode": "pr",
+    "prompt_template": "Issue #{{issue_number}}: {{title}}\n\n{{body}}"
+  },
+  "interval_seconds": 300,
+  "rate_limits": [
+    {"max": 5,  "per": "hour"},
+    {"max": 20, "per": "day"}
+  ]
+}
+```
+
+The window is either `per` — a unit (`"second"`, `"minute"`, `"hour"`, `"day"`, `"week"`) or a
+count and a unit (`"6h"`, `"90 minutes"`) — or `per_seconds` for the same thing in seconds. A
+spelling that cannot be read (`"hourly"`, a `max` with no window at all) fails the config rather
+than quietly becoming no ceiling at all. `"max": 0` is refused on the way in too — through the
+API or `orchestra config set`, which is where configs written by a person arrive — because it is
+an off switch and `orchestra listener disable` is a better one, keeping the listener's configured
+pace for when it comes back.
+
+The windows are rolling, not calendar ones: "5 per hour" means five in the last sixty minutes,
+not five since the top of the hour.
+
+**Nothing is dropped.** A listener that is already at a ceiling does not poll at all until the
+window moves — a poll is neither free nor side-effect-free, and for a source that consumes what
+it reads there would be nothing to come back to. When a tick starts with room and fills up
+part-way through, what is left over is *held*: not marked processed, so a later tick offers it
+again. `github-comments`, the one source that pages by time rather than re-deriving what it is
+looking at, keeps its `since` cursor where it was for that tick, so a held comment is still
+there to be found. What a rate limit changes is the pace, not the work.
+
+Where each ceiling stands is visible without reading the log:
+
+```
+$ orchestra listener show nightly
+...
+Rate limits:
+  5 per hour (5 used, next at 2026-08-24T21:12:04Z)
+  20 per day (11 used)
+```
+
+Listeners with no `rate_limits` — which is every listener written before the field existed — are
+unpaced and cost nothing: no clock is read, no timestamps are kept and no check is made. Removing
+the field from a listener that had one drops the timestamps it had kept, too.
 
 See `examples/listeners/` for further listener examples.
 
@@ -1091,15 +1275,19 @@ curl -H "Authorization: Bearer $PASSWORD" \
 
 Three resources are configuration, and all three are writable: **listeners**, **roles** and
 **skills**. Everything else the API serves is a record of something that already happened, or is
-owned by another system, and stays read-only. Nothing here enqueues work — that is the daemon's
-control socket, which is not on the network at all.
+owned by another system, and stays read-only. Nothing here enqueues a *task* — the queue is fed
+over the daemon's control socket, which is not on the network at all.
 
-One route is an action rather than a document, and it is the only one: `POST
-/api/v1/queue/{id}/cancel` stops the one running task that id names. It writes no file; it
-forwards a single message naming the entry to that same control socket, which is where
-[`orchestra queue cancel`](#queue-mode) sends its own. The socket stays off the network — this
-route is the only thing on the HTTP side that speaks to it, and it takes the credential like
-every other non-`GET`.
+Some routes are actions rather than documents. None of them writes a file; each forwards a single
+message to that same control socket, which is where the CLI sends its own. `POST
+/api/v1/queue/{id}/cancel` stops the one running task that id names, and the five
+[interactive session](#interactive-sessions) routes start, drive and end a chat. That second set
+is the one place this API starts an agent — see the note at the end of that section.
+
+Taking the cancel route as the pattern for all of them: it forwards a message naming the entry to
+the socket, which is where [`orchestra queue cancel`](#queue-mode) sends its own. The socket
+stays off the network; these routes are the only things on the HTTP side that speak to it, and
+each takes the credential like every other non-`GET`.
 
 The id may be a queue entry's id or the id of the run it became; both are ids this API hands out
 for the same piece of work, and the server resolves either.
@@ -1159,6 +1347,168 @@ What a write costs: a listener change takes effect on that listener's next tick,
 A role change takes effect on the dispatcher's next tick, since roles are read per dispatch. A
 skill change applies to tasks launched after it. Nothing here needs a restart.
 
+## native app
+
+The dashboard is a view of the backend that served it: a browser page and its API are the same
+origin by construction, and the API sends no CORS headers, so a page loaded from anywhere else
+cannot reach it at all. That is fine for one orchestra and wrong for three — a machine at home, a
+box in a datacentre, a container on the company network.
+
+**[orchestra-app](https://github.com/chrisflav/orchestra-app)** is the client for that, and it
+lives in its own repository: it shares no build with this one — orchestra is Lean and Lake, the
+app is npm and cargo — so there is no reason to check the two out together.
+
+It holds a list of backends, talks to whichever one is selected, and switches between them
+without a reload and without logging in again. Everything the dashboard shows, it shows; the one
+write the dashboard has — cancelling a run — it has too, plus a listener's on/off switch; and the
+chat pages are the same [session routes](#interactive-sessions) `orchestra chat` uses, which is
+what makes a conversation started on a laptop readable from a phone. One codebase for five
+platforms — macOS, Windows and Linux on the desktop, Android and iOS on a handset — on Tauri v2,
+with a Rust core holding the network and the OS keychain, because a webview can do neither
+across origins.
+
+It authenticates with the bearer half of the scheme above: the same password, sent as
+`Authorization: Bearer`, never a cookie. Nothing in this repository has to change for it to work,
+and nothing in it is aware of the app.
+
+Two things here are its contract, and a change to either is a change the app has to follow:
+`docs/openapi.json`, which is the document of record for every payload, and the `Json` builders
+in `Orchestra/Dashboard.lean` that emit them. The app keeps its own copy of those types, which
+the split makes load-bearing rather than incidental — its design document says so at more
+length.
+
+## interactive sessions
+
+A **session** is a conversation with an agent, held open by the daemon and reachable over the
+API. `orchestra chat` talks to one, the dashboard shows one, and a phone can too — all three are
+clients of the same five routes, and nothing in the server is specific to any of them.
+
+This is the third shape orchestra runs an agent in. A [task](#task-files) is one prompt in and
+one run out; [`orchestra interactive`](#running-tasks) is a real conversation but strictly local,
+because it hands your terminal to the agent's own TUI. A session is that conversation without the
+terminal: the agent runs on the backend, in the same sandbox with the same credentials and the
+same MCP tools a task would get, and it stays up between turns rather than being relaunched for
+each one — the clone slot, the MCP server and the process are acquired once and kept, so a second
+turn costs a line on a pipe.
+
+```sh
+orchestra chat --upstream owner/repo --fork your-org/repo
+```
+
+Type a turn, press enter, watch it work. The other three spellings:
+
+```
+orchestra chat --list              # every session, running and finished
+orchestra chat --session <id>      # pick one back up, transcript and all
+orchestra chat --end <id>          # end it and release what it holds
+```
+
+Detaching and ending are different, and only one of them can be undone. `/quit`, Ctrl-D and
+closing the terminal all leave the session on the backend; `--end` is how you end it. That is
+what makes it worth having a session rather than a TUI: you can start one at a desk, close the
+laptop, and pick the same conversation up from the dashboard.
+
+**A session does not expire.** Its *process* does — an agent holding a clone slot, an MCP server
+and a sandbox is expensive to keep up for a conversation nobody is having, so after
+`idle_timeout_seconds` without a turn the daemon stops it and hands the slot back. The session
+goes `dormant`, which is not an ending: the record and the transcript are untouched, and the
+next turn posted to it starts an agent again and resumes the agent-side history where it left
+off. Say something and it comes back, from whichever client is to hand. A daemon restart leaves
+sessions in the same state for the same reason.
+
+The first turn to a dormant session takes as long as starting one does, because it is starting
+one. If the working tree it left behind is still in the slot it gets handed back, that tree is
+kept rather than reset. What ends a session is asking: `orchestra chat --end <id>`, the
+dashboard's **End session**, or spending its budget.
+
+Which model answers is yours to choose when the session starts: `orchestra chat --model <name>`
+on the command line, and the box beside the two repositories on the dashboard's chat page.
+Leaving it empty runs whatever the backend runs by default. The name is passed through to the
+backend's own CLI untouched, so a family alias (`opus`) and a pinned id (`claude-opus-5`) are
+both fine, and orchestra does not keep a list of what is valid — the backend answers that.
+
+The model is a property of the session rather than of a turn, and it is on the record, so one
+that goes dormant wakes on the same model it went to sleep on. To carry a conversation to a
+*different* one, start a new session that resumes the old — repositories and all, since starting
+a session always takes them:
+
+```sh
+orchestra chat --upstream owner/repo --fork your-org/repo --resume-from <id> --model opus
+```
+
+It inherits the old session's history and is launched with the model it was given.
+
+What a session may spend is chosen the same way, and is the whole conversation's budget rather
+than a turn's: `orchestra chat --budget <usd>`, or the box next to the model on the chat page.
+Left alone it is 20 USD, and the API will not accept more than 100 — a bound on the one route
+that spends money, not a policy about what a session should cost. Running out is not a crash:
+the agent reports it, the session ends saying so, and the transcript is kept.
+
+Only backends whose CLI can read turns from standard input can host a session, which today means
+`claude`. Asking for another is refused when the session is created, in a message naming it —
+never quietly substituted, because a backend that answers the first turn and exits looks exactly
+like a session that ended on its own.
+
+Two limits bound them, in an `interactive` block in `config.json`:
+
+```json
+{ "interactive": { "max_sessions": 2, "idle_timeout_seconds": 1800 } }
+```
+
+They are capacity, not access, and they bound processes rather than conversations. A session
+that is awake pins a clone slot — one of the same slots the queue claims from, so a task can
+never take it and reset the working tree mid-conversation — and an abandoned browser tab should
+not hold one forever; `idle_timeout_seconds` is what takes it back, by putting the session to
+sleep rather than ending it. `max_sessions` bounds how many are awake at once, so waking a
+dormant session can be refused when that many already are: end one, or wait. `max_sessions` of
+`0` means a daemon that will not hold sessions at all.
+
+### over HTTP
+
+```sh
+# start one
+ID=$(curl -sX POST -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data '{"upstream":"owner/repo","fork":"your-org/repo"}' \
+     http://127.0.0.1:8080/api/v1/interactive | jq -r .id)
+
+# say something
+curl -X POST -H "Authorization: Bearer $PASSWORD" -H 'Content-Type: application/json' \
+     --data '{"text":"why does the queue stall when nothing is running?"}' \
+     http://127.0.0.1:8080/api/v1/interactive/$ID/messages
+
+# watch it answer
+curl -N -H "Authorization: Bearer $PASSWORD" \
+     "http://127.0.0.1:8080/sse/v1/interactive/$ID/events?after=0"
+```
+
+`POST /api/v1/interactive/{id}/interrupt` abandons the turn in flight without ending the session,
+and `DELETE /api/v1/interactive/{id}` ends it.
+
+The transcript is the one stream in this API that is not a whole document re-read. A conversation
+only grows, so re-sending all of it every time a word is added is quadratic in its length. It
+carries a cursor instead: every frame holds only what follows the last one, and its `id` is the
+last sequence number in it, so a browser reconnecting with `Last-Event-ID` — or anything else
+passing the same number as `?after=` — resumes exactly where it dropped, with nothing seen twice
+and nothing missed.
+
+Reads come off `<data>/interactive/<id>/`, where the daemon writes the session record and an
+append-only transcript. Writes go the other way, forwarded to the daemon's control socket,
+because a session is a live process and only the daemon holds one. That split is why the reads
+answer identically whether the API and the daemon are one process or the two containers the
+[compose deployment](docker/README.md) runs.
+
+### what this changes
+
+`POST /api/v1/interactive` is the first route in this API that **starts an agent**. Everything
+before it read state or edited configuration. It is gated by the same shared secret, the same
+session cookie and the same `Content-Type: application/json` rule as every other write, and by
+nothing else — so a credential that could read the dashboard can now also start an agent with a
+repository, credentials and tools. On a loopback bind that is the same person who could already
+type `orchestra interactive`; on a wider one it is worth knowing before you set `--host`.
+
+The full design — the session lifecycle, what happens on a crash or a daemon restart, and the
+schemas — is in [`docs/interactive.md`](docs/interactive.md).
+
 ## configuration over the API
 
 `orchestra config` is the CLI front end to the routes above. It talks to the backend over HTTP
@@ -1203,6 +1553,7 @@ Two things are deliberately *not* writable through the API:
 orchestra prepare <upstream> <fork>   # clone the fork and configure remotes
 orchestra cleanup                     # remove all cloned repositories
 orchestra cleanup list                # list clones and their task slots
+orchestra chat --upstream <u> --fork <f>   # talk to an agent the backend holds open
 orchestra mcp <upstream> <fork>       # start the MCP server standalone
 orchestra usage                       # usage limits of every configured auth source
 orchestra config list listeners       # read and change configuration through the backend API

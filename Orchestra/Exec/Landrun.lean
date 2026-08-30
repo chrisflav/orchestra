@@ -102,6 +102,12 @@ def start (spec : RunSpec) : IO Handle := do
       stdin := .null, stdout := .piped, stderr := .piped
     }
     return Handle.ofPipedChild child
+  | .stream =>
+    let child ← IO.Process.spawn {
+      cmd := "landrun", args, cwd := spec.workdir
+      stdin := .piped, stdout := .piped, stderr := .piped
+    }
+    Handle.ofStreamChild child
 
 /-- The environment a task gets here: this machine.
 

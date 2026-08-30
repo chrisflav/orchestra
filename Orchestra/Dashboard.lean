@@ -11,7 +11,9 @@ import Orchestra.Project.Claim
 import Orchestra.Usage
 import Orchestra.Secret
 import Orchestra.Skill
+import Orchestra.Interactive.Store
 import Orchestra.Utils.UnixSocket
+import Orchestra.Utils.Files
 
 open Lean (Json ToJson FromJson)
 open Std.Net
@@ -300,6 +302,39 @@ private def defaultLogLimit : Nat := 500
 
 private def maxLogLimit : Nat := 10000
 
+/-- Ceiling on the transcript cursor. Not a bound on anything real — a cursor is a position, not
+    a quantity — but `natParam` takes one, and a value this far past the end of any transcript
+    means the same thing as any other: nothing follows it. -/
+private def maxAfter : Nat := 1000000000
+
+/-- Ceiling on what a caller may set a session's budget to, in USD.
+
+    Not a policy about what a session should cost — that is `config.json`'s default — but the
+    same kind of bound every other parameter in this API carries, so that one request cannot
+    turn into an unbounded bill. -/
+private def maxSessionBudgetUsd : Float := 100.0
+
+/-- An amount of USD as a sentence says it, to the cent.
+
+    `toString` on a `Float` writes six decimal places, and "at most 100.000000 USD" is the kind
+    of message that reads as a machine talking to itself — which matters now that the dashboard's
+    own start form can provoke it.
+
+    Rounded **down**, so a bound rendered through this is always a value the bound itself
+    accepts. To nearest it would not be: `2.675 * 100.0` is `267.4999…` in binary, which rounds
+    to `268`, and a caller who then sends `2.68` would be refused by the very message that told
+    them `2.68` was allowed. Negatives and anything past `UInt64` are not amounts of money and
+    come back as `0`, which is what `Float.toUInt64` saturates them to anyway. -/
+def usdLabel (usd : Float) : String :=
+  let cents := (usd * 100.0).floor.toUInt64.toNat
+  if cents % 100 == 0 then toString (cents / 100)
+  else
+    let frac := cents % 100
+    s!"{cents / 100}.{if frac < 10 then "0" else ""}{frac}"
+
+/-- The session budget ceiling, as a sentence says it. -/
+private def maxSessionBudgetLabel : String := usdLabel maxSessionBudgetUsd
+
 private structure Page where
   limit  : Nat
   offset : Nat
@@ -441,15 +476,18 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     ("status",         qStText e.status),
     ("createdAt",      normIso e.createdAt),
     ("priority",       ToJson.toJson e.priority),
-    ("upstream",       e.upstream.toString),
-    ("fork",           e.fork.toString),
+    ("upstream",       optStr (e.repo.map (·.upstream.toString))),
+    ("fork",           optStr (e.repo.map (·.fork.toString))),
     ("prompt",         e.prompt),
     ("series",         optStr e.series),
     ("backend",        optStr e.backend),
     ("model",          optStr e.model),
     ("taskId",         optStr e.taskId),
     ("concertId",      optStr e.concertId),
-    ("concertStepKey", optStr e.concertStepKey)
+    ("concertStepKey", optStr e.concertStepKey),
+    -- Provenance for an entry an agent queued itself (`queue_task`): without it a task that
+    -- appeared out of a running agent's turn is indistinguishable from one a person added.
+    ("spawnedBy",      optStr e.spawnedBy)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
@@ -457,8 +495,8 @@ private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
     ("id",            r.id),
     ("status",        tStText r.status),
     ("createdAt",     normIso r.createdAt),
-    ("upstream",      r.upstream.toString),
-    ("fork",          r.fork.toString),
+    ("upstream",      optStr (r.repo.map (·.upstream.toString))),
+    ("fork",          optStr (r.repo.map (·.fork.toString))),
     ("prompt",        r.prompt),
     ("series",        optStr r.series),
     ("backend",       optStr r.backend),
@@ -496,11 +534,25 @@ private def limitJson (l : Usage.Limit) : Json :=
     ("resetsAt", optNormIso l.resetsAt)
   ]
 
+/-- One recorded block, as the dashboard shows it. -/
+private def blockJson (b : Usage.Block) : Json :=
+  Json.mkObj [
+    ("model",          optStr b.model),
+    ("reason",         Json.str b.reason),
+    ("until",          optEpochIso b.untilEpoch)
+  ]
+
 /-- One configured authentication source, joined with whatever the usage store knows about it.
 
     Availability is judged with no model, which is what a reader with no task in hand can ask:
     a `weekly_scoped` limit only closes one model family, so a source carrying nothing but an
-    exhausted scoped limit is genuinely still usable — and the limit rows show it regardless. -/
+    exhausted scoped limit is genuinely still usable.
+
+    Which is why the blocks are reported alongside the limits rather than folded into `state`.
+    The limit rows come from polls, and a poll cannot see a model-scoped window at all — so an
+    observed "Fable is spent here" appears in neither `state` (correctly available: other families
+    still run) nor `limits`. Without a row of its own it appears nowhere, and an operator asking
+    why one family stopped being dispatched has nothing to look at. -/
 private def authSourceJson (backend : String) (src : AuthSource) (isDefault : Bool) (now : Int)
     : IO Json := do
   let st ← Usage.loadState backend src.label
@@ -531,7 +583,8 @@ private def authSourceJson (backend : String) (src : AuthSource) (isDefault : Bo
     ("lastError",    optStr st.lastError),
     -- Set only while a backoff is still in the future; a lapsed one is not a fact about now.
     ("backoffUntil", optEpochIso (st.pollAfter.filter (· > now))),
-    ("limits",       Json.arr (st.limits.map limitJson))
+    ("limits",       Json.arr (st.limits.map limitJson)),
+    ("blocks",       Json.arr ((st.blocks.filter (Usage.blockIsLive · now)).map blockJson))
   ]
 
 /-- Every configured backend and source, or the reason the config could not be read.
@@ -776,21 +829,46 @@ private def sourceExtras : Listener.SourceConfig → List (String × String)
       [("authorized users", String.intercalate ", " authU)]
   | _ => []
 
-private def listenerSummaryJson (name : String) (c : Listener.ListenerConfig)
-    (st : Listener.ListenerState) : Json :=
-  let (srcType, _) := sourceSummary c.source
+/-- One dispatch ceiling and where it stands. `nextAllowedAt` is null while the window still has
+    room, which is the same thing `remaining` being non-zero says; it answers *when*, not
+    *whether*. -/
+private def rateLimitJson (s : Listener.RateLimitStatus) : Json :=
   Json.mkObj [
+    ("description",   Json.str s.limit.describe),
+    ("max",           ToJson.toJson s.limit.max),
+    ("windowSeconds", ToJson.toJson s.limit.windowSeconds),
+    ("used",          ToJson.toJson s.used),
+    ("remaining",     ToJson.toJson (s.limit.max - s.used)),
+    ("nextAllowedAt", optEpochIso s.nextAllowedAt)
+  ]
+
+/-- `c`'s ceilings measured against the dispatches `st` has on record, as of now. -/
+private def rateLimitsJson (c : Listener.ListenerConfig) (st : Listener.ListenerState) :
+    IO Json := do
+  if c.rateLimits.isEmpty then return Json.arr #[]
+  -- `Usage.nowEpoch`, not `TaskStore.currentIso8601`: this runs once per paced listener and the
+  -- whole payload is rebuilt every two seconds per SSE client, so a `date` subprocess each time
+  -- adds up to process spawns per second on a handful of listeners and open dashboards.
+  let now ← Usage.nowEpoch
+  let statuses := Listener.rateLimitStatuses c.rateLimits st.dispatches now
+  return Json.arr (statuses.map rateLimitJson).toArray
+
+private def listenerSummaryJson (name : String) (c : Listener.ListenerConfig)
+    (st : Listener.ListenerState) : IO Json := do
+  let (srcType, _) := sourceSummary c.source
+  return Json.mkObj [
     ("name",            name),
     ("enabled",         Json.bool st.enabled),
     ("sourceType",      srcType),
     ("intervalSeconds", ToJson.toJson c.intervalSeconds),
     ("lastCheckedAt",   optNormIso (if st.lastChecked.isEmpty then none else some st.lastChecked)),
-    ("eventCount",      ToJson.toJson st.processedIds.size)
+    ("eventCount",      ToJson.toJson st.processedIds.size),
+    ("rateLimits",      ← rateLimitsJson c st)
   ]
 
 private def listenersApi (p : Page) : IO Json := do
   pageOverUnordered p (← Listener.loadAllListenerConfigs) fun (name, c) => do
-    return listenerSummaryJson name c (← Listener.loadListenerState name)
+    listenerSummaryJson name c (← Listener.loadListenerState name)
 
 private def actionJson (a : Listener.ActionConfig) : Json :=
   Json.mkObj [
@@ -802,7 +880,10 @@ private def actionJson (a : Listener.ActionConfig) : Json :=
     ("model",          optStr a.model),
     ("workflowPath",   optStr a.workflowPath),
     ("priority",       ToJson.toJson a.priority),
-    ("promptTemplate", a.promptTemplate)
+    ("promptTemplate", a.promptTemplate),
+    -- Beside the role view's own `spawnPolicy`, and for the same reason: this is the field that
+    -- says what the tasks a listener queues may themselves put on the queue.
+    ("spawnPolicy",    ToJson.toJson a.spawnPolicy)
   ]
 
 private def listenerDetailApi (name : String) : IO (Option Json) := do
@@ -815,6 +896,9 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
     let extrasJson : Array Json := (extras.filter (fun (_, v) => ! v.isEmpty)).map
       (fun (k, v) => (Json.arr #[Json.str k, Json.str v])) |>.toArray
     let recent := st.processedIds.toList.reverse.take 50
+    -- Newest 50, back in oldest-first order — the order the state file keeps them in, and the
+    -- one a reader following a window forward wants.
+    let recentDispatches := (st.dispatches.toList.reverse.take 50).reverse
     -- The file as stored, `{{secret}}` placeholders intact — this is the document a client edits
     -- and sends back to `PUT`. Everything above it is derived and is what a *display* wants; a
     -- round trip through those fields would lose whatever this version does not model and would
@@ -829,6 +913,8 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
       ("sourceType",      srcType),
       ("sourceDetail",    srcDetail),
       ("sourceExtras",    Json.arr extrasJson),
+      ("rateLimits",      ← rateLimitsJson c st),
+      ("recentDispatches", Json.arr (recentDispatches.map normIso).toArray),
       ("action",          actionJson c.action),
       ("recentEvents",    Json.arr (recent.map Json.str).toArray),
       ("config",          config.getD Json.null)
@@ -861,7 +947,10 @@ private def roleSummaryJson (r : Project.Role) : Json :=
     ("priority",    ToJson.toJson r.priority),
     ("readOnly",    Json.bool r.readOnly),
     ("budgetUsd",   optNum r.budget),
-    ("dispatch",    dispatchJson r.dispatch)
+    ("dispatch",    dispatchJson r.dispatch),
+    -- Verbatim, like `dispatch` above: a client cannot edit what it cannot fetch, and this is
+    -- the field that says what a role's agents may put on the queue themselves.
+    ("spawnPolicy", ToJson.toJson r.spawnPolicy)
   ]
 
 private def rolesApi (p : Page) : IO Json := do
@@ -996,9 +1085,9 @@ private def maxLogAttempts : Nat := 100
     then `<id>.retry1.log`, …), so the attempts are read in order and concatenated. Reading only
     the first would show a trace that stops dead the moment a retry begins, which is
     indistinguishable on screen from an agent that has stopped. -/
-private def loadTaskLog (fork : Repository) (id : String) (limit : Nat)
+private def loadTaskLog (repo : Option RepoPair) (id : String) (limit : Nat)
     : IO (Array Json × Nat) := do
-  let dir := (← Dirs.dataBase) / "logs" / fork.toString
+  let dir := (← Dirs.dataBase) / "logs" / repoLogDir repo
   let readLines (path : System.FilePath) : IO (List String) := do
     let raw ← IO.FS.readFile path
     return (raw.splitOn "\n").filter (!·.trimAscii.isEmpty)
@@ -1033,24 +1122,24 @@ private def taskDetailApi (id : String) (logLimit : Nat) : IO (Option Json) := d
   let record  ← TaskStore.loadTask id
   let entries ← Queue.loadAllEntries
   let qEntry  := entries.find? (·.id == id)
-  let infoOpt : Option (Repository × String × String × String × Option String) :=
+  let infoOpt : Option (Option RepoPair × String × String × String × Option String) :=
     match record with
-    | some r => some (r.fork, tStText r.status, r.createdAt, r.prompt, some r.id)
+    | some r => some (r.repo, tStText r.status, r.createdAt, r.prompt, some r.id)
     | none =>
       match qEntry with
-      | some q => some (q.fork, qStText q.status, q.createdAt, q.prompt, q.taskId)
+      | some q => some (q.repo, qStText q.status, q.createdAt, q.prompt, q.taskId)
       | none   => none
   match infoOpt with
   | none => return none
-  | some (fork, st, createdAt, prompt, taskId) =>
+  | some (repo, st, createdAt, prompt, taskId) =>
     let (log, total) ← match taskId with
-      | some tid => loadTaskLog fork tid logLimit
+      | some tid => loadTaskLog repo tid logLimit
       | none     => pure (#[], 0)
     return some (Json.mkObj [
       ("id",           id),
       ("taskId",       optStr taskId),
       ("status",       st),
-      ("fork",         fork.toString),
+      ("fork",         optStr (repo.map (·.fork.toString))),
       ("createdAt",    normIso createdAt),
       ("prompt",       prompt),
       ("log",          Json.arr log),
@@ -1058,6 +1147,78 @@ private def taskDetailApi (id : String) (logLimit : Nat) : IO (Option Json) := d
       ("logLimit",     ToJson.toJson logLimit),
       ("logTruncated", Json.bool (total > log.size))
     ])
+
+/-! ### Interactive sessions
+
+Read off `<data>/interactive/`, never by asking the daemon. The two may be separate containers,
+and a transcript that could only be read by asking the process that is busy writing it would be
+unreadable exactly when there is most to read. Writes are the other way round — see
+`askDaemon`. -/
+
+/-- One session, as a list entry: enough to tell conversations apart without their transcripts. -/
+private def interactiveSummaryJson (r : Interactive.SessionRecord) : Json :=
+  Json.mkObj [
+    ("id",             Json.str r.id),
+    ("status",         ToJson.toJson r.status),
+    ("createdAt",      normIso r.createdAt),
+    ("lastActivityAt", normIso r.lastActivityAt),
+    ("endedAt",        optNormIso r.endedAt),
+    ("upstream",       Json.str r.upstream.toString),
+    ("fork",           Json.str r.fork.toString),
+    ("backend",        Json.str r.backend),
+    ("model",          optStr r.model),
+    ("turnCount",      ToJson.toJson r.turnCount),
+    ("costUsd",        ToJson.toJson r.costUsd),
+    ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
+    ("title",          optStr r.title),
+    ("error",          optStr r.error)
+  ]
+
+private def interactiveApi (p : Page) : IO Json := do
+  let all ← Interactive.loadAllSessions
+  return pageOver p (·.createdAt) interactiveSummaryJson all
+
+private def interactiveDetailApi (id : String) : IO (Option Json) := do
+  let some r ← Interactive.loadSession id | return none
+  return some <| Json.mkObj [
+    ("id",             Json.str r.id),
+    ("status",         ToJson.toJson r.status),
+    ("createdAt",      normIso r.createdAt),
+    ("lastActivityAt", normIso r.lastActivityAt),
+    ("endedAt",        optNormIso r.endedAt),
+    ("upstream",       Json.str r.upstream.toString),
+    ("fork",           Json.str r.fork.toString),
+    ("backend",        Json.str r.backend),
+    ("model",          optStr r.model),
+    ("budget",         ToJson.toJson r.budget),
+    ("slot",           ToJson.toJson r.slot),
+    ("agentSessionId", optStr r.agentSessionId),
+    ("resumedFrom",    optStr r.resumedFrom),
+    ("turnCount",      ToJson.toJson r.turnCount),
+    ("costUsd",        ToJson.toJson r.costUsd),
+    ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
+    ("title",          optStr r.title),
+    ("error",          optStr r.error)
+  ]
+
+/-- A page of the transcript, from a cursor.
+
+    `after` rather than `offset` because a transcript only grows at the end: a client that has
+    read to seq 40 asks for what follows 40, and gets the same answer whatever has been appended
+    since — where an offset would shift under it. `total` counts what is left after the cursor,
+    so "you are 12 behind" needs no second request.
+
+    `none` for a session that does not exist, so the route is a `404` rather than an empty page,
+    which would tell a client with a mistyped id that it was merely up to date. -/
+private def interactiveEventsApi (id : String) (after : Nat) (limit : Nat) : IO (Option Json) := do
+  let some _ ← Interactive.loadSession id | return none
+  let (items, total) ← Interactive.readEvents id after limit
+  return some <| Json.mkObj [
+    ("items",  Json.arr items),
+    ("total",  ToJson.toJson total),
+    ("limit",  ToJson.toJson limit),
+    ("after",  ToJson.toJson after)
+  ]
 
 /-- Dispatch an `/api/…` or `/sse/…` kind to the matching builder.
 
@@ -1091,6 +1252,7 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
     | .error e => return .badRequest e
     | .ok n    => return ← plain (usageApi configPath n)
   if kind == "queue"     then return ← paged queueApi
+  if kind == "interactive" then return ← paged interactiveApi
   if kind == "concerts"  then return ← paged concertsApi
   if kind == "tasks"     then return ← paged tasksApi
   if kind == "listeners" then return ← unpaged listenersApi
@@ -1111,6 +1273,23 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
   if let some r ← detail "listeners/" listenerDetailApi then return r
   if let some r ← detail "roles/"     roleDetailApi     then return r
   if let some r ← detail "skills/"    skillDetailApi    then return r
+  -- Two detail routes under one prefix, so they are matched before the plain `interactive/{id}`
+  -- that `detail` would otherwise claim the whole of.
+  if kind.startsWith "interactive/" then
+    let rest := (kind.drop "interactive/".length).toString
+    if rest.endsWith "/events" then
+      let idPart := (rest.dropEnd "/events".length).toString
+      let some seg := safeSegment idPart | return .notFound
+      match natParam q "after" 0 maxAfter, natParam q "limit" defaultLimit maxLimit with
+      | .error e, _ | _, .error e => return .badRequest e
+      | .ok after, .ok limit =>
+        match ← interactiveEventsApi seg after limit with
+        | some j => return .ok j
+        | none   => return .notFound
+    let some seg := safeSegment rest | return .notFound
+    match ← interactiveDetailApi seg with
+    | some j => return .ok j
+    | none   => return .notFound
   if kind.startsWith "tasks/" then
     match natParam q "logLimit" defaultLogLimit maxLogLimit with
     | .error e => return .badRequest e
@@ -1257,6 +1436,43 @@ private def deleteSkill (name : String) : IO WriteResult := do
 
 /-! ### Running work -/
 
+/-- Send one request to the daemon's control socket and read its answer.
+
+    Every route that does something rather than storing something goes through here, because
+    "doing" means a live process and this server is not it. The daemon may be another container
+    entirely; the socket is the thing the two share.
+
+    An `error` is a sentence for a `409`: either nothing is listening, or the daemon considered
+    the request and refused it. Both are statements about the daemon rather than about the
+    server answering, which is why neither is a `500`. -/
+private def askDaemon (request : Json) : IO (Except String Json) := do
+  let reply : Except String String ← try
+      let conn ← Orchestra.Utils.UnixSocket.Connection.connect (← Queue.socketFile)
+      -- The round trip is its own `try` so that the descriptor is closed on the way out of a
+      -- failure as well as a success. A daemon that dies mid-request throws here, and a handler
+      -- that leaks a descriptor per attempt is a server that stops answering eventually.
+      let answer : Except String String ← try
+          conn.sendLine request.compress
+          Except.ok <$> conn.recvLine
+        catch e => pure (Except.error (toString e))
+      conn.close
+      pure answer
+    catch e => pure (Except.error (toString e))
+  match reply with
+  -- Nothing is listening on the socket, or something was and stopped mid-request. Either way
+  -- the request did not happen, and it is the daemon that is missing rather than this server.
+  | .error e => return .error s!"could not reach the queue daemon: {e}"
+  | .ok line =>
+    match Json.parse line with
+    | .error _ => return .error "the queue daemon answered with something that is not JSON"
+    | .ok j =>
+      -- The daemon is the only process that knows what it is holding. Its "no" is reported
+      -- rather than smoothed over: to a caller, "refused" and "never happened" are different
+      -- answers, and only that process can tell them apart.
+      if let .ok msg := j.getObjValAs? String "error" then
+        return .error s!"the queue daemon refused the request: {msg}"
+      return .ok j
+
 /-- Ask the queue daemon to cancel the one task `id` names.
 
     `id` is a queue entry's id or the id of the run it became, because both are ids the rest of
@@ -1287,46 +1503,159 @@ private def deleteSkill (name : String) : IO WriteResult := do
     other's `/proc`. The socket is the thing that is actually shared, so opening it is the
     question worth asking.
 
-    Nothing here stamps a status. The worker running the task writes `cancelled` onto the entry
-    as it lands, and a second writer would race it; what comes back is the pair of ids the
-    request resolved to, so a caller can tell which run it just stopped. -/
+    Nothing here stamps a *queue* status. The worker running the task writes `cancelled` onto
+    the entry as it lands, and a second writer would race it; what comes back is the pair of ids
+    the request resolved to, so a caller can tell which run it just stopped.
+
+    The one thing it does write is the task record, and only in the `409` above: an entry that
+    is not running had no worker to race. That case is not hypothetical — it is how this button
+    comes to be on screen at all for a stranded run, because the page renders the control off
+    the record's status and the record is the half that was never repaired. Answering "not
+    running" and leaving the page still saying `running` is a dead end a reader can do nothing
+    with, so the mismatch is closed on the way out. -/
 private def cancelEntry (id : String) : IO WriteResult := do
   let entries ← Queue.loadAllEntries
   let some entry := entries.find? (fun e => e.id == id || e.taskId == some id)
     | return .notFound
   unless entry.status == .running do
+    let repaired ← match entry.taskId with
+      | some taskId => Queue.markTaskUnfinished taskId
+      | none        => pure false
+    if repaired then
+      return .conflict s!"entry {entry.id} is {qStText entry.status}, not running; \
+the task record still said running and has been marked unfinished"
     return .conflict s!"entry {entry.id} is {qStText entry.status}, not running"
-  let request := Json.mkObj [("type", Json.str "cancel"), ("id", Json.str entry.id)]
-  let reply : Except String String ← try
-      let conn ← Orchestra.Utils.UnixSocket.Connection.connect (← Queue.socketFile)
-      -- The round trip is its own `try` so that the descriptor is closed on the way out of a
-      -- failure as well as a success. A daemon that dies mid-request throws here, and a handler
-      -- that leaks a descriptor per attempt is a server that stops answering eventually.
-      let answer : Except String String ← try
-          conn.sendLine request.compress
-          Except.ok <$> conn.recvLine
-        catch e => pure (Except.error (toString e))
-      conn.close
-      pure answer
-    catch e => pure (Except.error (toString e))
-  match reply with
-  -- Nothing is listening on the socket, or something was and stopped mid-request. Either way
-  -- the request did not happen, and it is the daemon that is missing rather than this server.
-  | .error e => return .conflict s!"could not reach the queue daemon: {e}"
-  | .ok line =>
-    match Json.parse line with
-    | .error _ => return .conflict "the queue daemon answered with something that is not JSON"
-    | .ok j =>
-      -- The daemon is the only process that knows whether it holds a token for this entry. An
-      -- entry the queue calls `running` that it is not running is what a daemon that died
-      -- mid-task leaves behind — and, for the width of one write, what a task that is at that
-      -- moment finishing looks like. Its "no" is reported rather than smoothed over.
-      if let .ok msg := j.getObjValAs? String "error" then
-        return .conflict s!"the queue daemon refused the request: {msg}"
-      return .ok (Json.mkObj [
-        ("id",     Json.str entry.id),
-        ("taskId", optStr entry.taskId)
-      ])
+  match ← askDaemon (Json.mkObj [("type", Json.str "cancel"), ("id", Json.str entry.id)]) with
+  | .error why => return .conflict why
+  | .ok _ =>
+    return .ok (Json.mkObj [
+      ("id",     Json.str entry.id),
+      ("taskId", optStr entry.taskId)
+    ])
+
+/-! ### Interactive sessions, the writing half
+
+Four routes, and not one of them stores a file. Every one forwards to the daemon, because a
+session is a live process: starting one, telling it something, interrupting it and ending it are
+all things only the process holding it can do. -/
+
+/-- Start a session. The body is the spec; the daemon answers with the id it minted.
+
+    A `400` for a body that does not name both repositories, and for a backend that cannot host
+    a session — that second one is the daemon's judgement, relayed, because only it knows which
+    backends it was built with. -/
+private def startInteractive (body : String) : IO WriteResult := do
+  let some j := (Json.parse body).toOption | return .badRequest "the body is not JSON"
+  let field (name : String) : Option String := j.getObjValAs? String name |>.toOption
+  let some upstreamStr := field "upstream"
+    | return .badRequest "the body must name an upstream repository as \"upstream\""
+  let some forkStr := field "fork"
+    | return .badRequest "the body must name a fork repository as \"fork\""
+  let .ok upstream := Repository.parse upstreamStr
+    | return .badRequest s!"invalid upstream '{upstreamStr}', expected 'owner/repo'"
+  let .ok fork := Repository.parse forkStr
+    | return .badRequest s!"invalid fork '{forkStr}', expected 'owner/repo'"
+  -- `Repository.parse` only checks for one slash, and both halves become path components of a
+  -- clone directory. This is the first network-reachable route that turns a client-supplied
+  -- repository into a path, so it is the one that has to say no: an owner of `..` resolves a
+  -- clone — and, for a directory that turns out not to be a git repository, a `removeDirAll` —
+  -- outside the work tree.
+  for (what, part) in [("upstream owner", upstream.owner), ("upstream name", upstream.name),
+                       ("fork owner", fork.owner), ("fork name", fork.name)] do
+    if let .error e := Utils.checkConfigName what part then return .badRequest e
+  -- The one id in this feature that does not arrive as a path segment, and so is the one the
+  -- routing layer's `safeSegment` never sees. It becomes a directory name in the session store.
+  if let some resume := field "resumeFrom" then
+    if let .error e := Utils.checkConfigName "resumeFrom session" resume then
+      return .badRequest e
+  -- A ceiling on the one route that spends money. Everything else in this API is scrupulous
+  -- about caps — `maxLimit`, `maxLogLimit`, `maxWindowCount` — precisely so one request cannot
+  -- become an unbounded cost, and `max_sessions` bounds how many sessions there are, never what
+  -- any one of them may spend.
+  --
+  -- Matched on the value present rather than on `getObjValAs? Float`, whose failure is
+  -- indistinguishable from an absent key once it is an `Option`. `{"budget": "1000"}` — which
+  -- is what a shell script interpolating a variable into JSON sends — was neither rejected nor
+  -- honoured: the check was skipped, the daemon's own read failed the same way, and the session
+  -- ran on the default while the caller believed it was capped. The one field whose purpose is
+  -- to bound spending is the one that must not fail quietly, on this side of the wire too.
+  match j.getObjVal? "budget" |>.toOption with
+  | none | some Json.null => pure ()
+  | some v =>
+    match v.getNum? |>.toOption with
+    | none => return .badRequest "'budget' must be a number of USD"
+    | some n =>
+      let budget := n.toFloat
+      -- A floor as well as a ceiling. `--max-budget-usd` reaches the agent through
+      -- `Float.toString`, which writes six decimals, so anything under a microdollar arrives as
+      -- `0.000000` — a session that clones a repository, mints a token, starts an MCP server and
+      -- launches a sandbox in order to refuse its first turn. A cent is the smallest amount that
+      -- means anything.
+      if budget < 0.01 || budget > maxSessionBudgetUsd then
+        return .badRequest
+          s!"'budget' must be at least 0.01 and at most {maxSessionBudgetLabel} USD"
+  -- A blank model is no model. `--model ""` reaches the vendor CLI as an argument it rejects
+  -- outright, and it does so only after the clone, the installation token, the MCP server and
+  -- the sandbox launch — a session that costs everything and answers nothing. Absent is what
+  -- the caller meant, so absent is what the daemon is asked for. Done here rather than in one
+  -- client because every client can send it: the dashboard's box, `orchestra chat --model ""`,
+  -- and whatever asks next.
+  let j := match j.getObjValAs? String "model" |>.toOption with
+    | some m => if m.trimAscii.isEmpty then j.setObjVal! "model" Json.null else j
+    | none   => j
+  match ← askDaemon (Json.mkObj [("type", Json.str "interactive_start"), ("spec", j)]) with
+  -- The daemon's refusals are not all the same kind of thing. A backend that cannot host a
+  -- session, or a repository it will not accept, is permanent and the caller's fault — a `409`
+  -- invites a client to retry something that can never work.
+  | .error why =>
+    if (why.splitOn "cannot host an interactive session").length > 1 then
+      return .badRequest why
+    return .conflict why
+  | .ok reply =>
+    let id := reply.getObjValAs? String "id" |>.toOption |>.getD ""
+    -- The record rather than the bare id: a client that has just created something should not
+    -- have to fetch it to find out what it got.
+    match ← interactiveDetailApi id with
+    | some payload => return .created payload
+    | none         => return .created (Json.mkObj [("id", Json.str id)])
+
+/-- Post a turn.
+
+    Answers the seq the turn was written at, so a client can start reading from exactly there
+    rather than from wherever the transcript happens to be by the time it asks. -/
+private def sendInteractive (id : String) (body : String) : IO WriteResult := do
+  let some j := (Json.parse body).toOption | return .badRequest "the body is not JSON"
+  let some text := j.getObjValAs? String "text" |>.toOption
+    | return .badRequest "the body must carry the turn as \"text\""
+  if text.trimAscii.isEmpty then
+    return .badRequest "the turn is empty"
+  if (← Interactive.loadSession id).isNone then return .notFound
+  match ← askDaemon (Json.mkObj [
+      ("type", Json.str "interactive_message"), ("id", Json.str id), ("text", Json.str text)]) with
+  | .error why => return .conflict why
+  | .ok reply =>
+    let seq := (reply.getObjValAs? String "id" |>.toOption).bind (·.toNat?) |>.getD 0
+    return .ok (Json.mkObj [("id", Json.str id), ("seq", ToJson.toJson seq)])
+
+/-- Abandon the turn in flight. The session stays up; only the turn is over. -/
+private def interruptInteractive (id : String) : IO WriteResult := do
+  if (← Interactive.loadSession id).isNone then return .notFound
+  match ← askDaemon (Json.mkObj [
+      ("type", Json.str "interactive_interrupt"), ("id", Json.str id)]) with
+  | .error why => return .conflict why
+  | .ok _      => return .ok (Json.mkObj [("id", Json.str id)])
+
+/-- End a session and release everything it holds.
+
+    A session the daemon is no longer holding but that is already terminal on disk is a `204`
+    rather than a `409`: ending something that has ended is a request that no longer applies,
+    not a request that failed. -/
+private def endInteractive (id : String) : IO WriteResult := do
+  let some r ← Interactive.loadSession id | return .notFound
+  if r.status.isTerminal then return .noContent
+  match ← askDaemon (Json.mkObj [("type", Json.str "interactive_end"), ("id", Json.str id)]) with
+  | .error why => return .conflict why
+  | .ok _      => return .noContent
 
 /-- Dispatch a non-`GET` `/api/v1/…` request.
 
@@ -1365,6 +1694,13 @@ PUT /api/v1/listeners/{name}")
   -- under it rather than a `PUT` to a thing. The body carries nothing — the entry is named by
   -- the path, and there is no second argument to give.
   | ["queue", id, "cancel"],        .post   => return some (← cancelEntry id)
+  -- The interactive routes. None of them writes a file; each forwards to the daemon, which is
+  -- the only process that can hold a live session. `POST /interactive` is the one route in this
+  -- API that starts an agent — see the module docs.
+  | ["interactive"],                .post   => return some (← startInteractive body)
+  | ["interactive", id],            .delete => return some (← endInteractive id)
+  | ["interactive", id, "messages"], .post  => return some (← sendInteractive id body)
+  | ["interactive", id, "interrupt"], .post => return some (← interruptInteractive id)
   | _, _ => return none
 
 /-! ## Server configuration and session state -/
@@ -1626,9 +1962,14 @@ private def sseFrame (payload : String) : String :=
 /-- Refresh interval for SSE pushes, in milliseconds. -/
 private def sseIntervalMs : Std.Time.Millisecond.Offset := 2000
 
-/-- Ticks between keep-alive comments when nothing has changed. At the 2s interval above this
-    is one line every 30s, which is under the idle timeout of every proxy worth naming. -/
-private def sseKeepAliveTicks : Nat := 15
+/-- Ticks between keep-alive comments when nothing has changed — 8s at the 2s interval above.
+
+    Chosen against the server rather than a proxy, for the reason `transcriptKeepAliveTicks`
+    spells out: `Std.Http`'s `lingeringTimeout` closes a connection ten seconds after the last
+    byte moves, whatever a proxy in front of it would have tolerated. At the previous 30s every
+    quiet dashboard stream was cut at ten seconds and rebuilt by `EventSource`, three requests
+    every ten seconds per open tab, for as long as nothing was happening. -/
+private def sseKeepAliveTicks : Nat := 4
 
 /-- Push `kind` into `out` until the client goes away.
 
@@ -1689,6 +2030,125 @@ private def sseResponse (st : ServeState) (kind : String) (q : Query)
         out.send (Chunk.ofByteArray (sseFrame first).toUTF8)
         sseLoop st out kind q first 0
 
+
+/-! ### The one stream that carries a cursor
+
+Every other stream is a read repeated: re-render the whole payload, send it when it differs. A
+transcript cannot work that way. It only grows, so the whole payload is the whole conversation,
+and re-sending it every time a word is added is quadratic in the length of the chat — with every
+frame after the first mostly what the client already has.
+
+So this one advances a cursor instead. Each frame carries only what follows the last one sent,
+and its `id:` is the last seq in it. A browser reconnects with `Last-Event-ID` and picks up
+exactly there; anything else passes the same number as `?after=`. Neither sees an event twice,
+and neither misses one. -/
+
+/-- How often the transcript stream looks for new events. Faster than the two seconds the
+    dashboard streams use, because this is a conversation and the wait is felt. A tick that
+    finds nothing costs one read of a file that has not changed. -/
+private def transcriptIntervalMs : Std.Time.Millisecond.Offset := 300
+
+/-- Keep-alive after this many quiet ticks — six seconds at the interval above.
+
+    Chosen against the server rather than against a proxy, because the server is the stricter of
+    the two: `Std.Http`'s `lingeringTimeout` closes a connection ten seconds after the last byte
+    moves in either direction, whatever a proxy in front of it would have tolerated. A quiet
+    conversation writes nothing at all, so anything above ten seconds here is a stream that drops
+    on every pause in the conversation — which is most of a chat. Measured, not assumed: a
+    transcript stream fed an event a second stays up indefinitely, and the same stream left quiet
+    was closed at ten seconds exactly. -/
+private def transcriptKeepAliveTicks : Nat := 20
+
+/-- One SSE frame carrying its own `id`, so a reconnect can say where it got to. -/
+private def sseFrameWithId (seq : Nat) (payload : String) : String :=
+  s!"id: {seq}\n" ++ sseFrame payload
+
+/-- The highest seq in a page of transcript events, or `after` when the page is empty. -/
+private def lastSeqOf (payload : Json) (after : Nat) : Nat :=
+  let items := (payload.getObjVal? "items" |>.toOption.bind (·.getArr?.toOption)).getD #[]
+  items.foldl (init := after) fun acc j => max acc (j.getObjValAs? Nat "seq" |>.toOption |>.getD 0)
+
+private def pageIsEmpty (payload : Json) : Bool :=
+  match payload.getObjVal? "items" |>.toOption.bind (·.getArr?.toOption) with
+  | some items => items.isEmpty
+  | none       => true
+
+private partial def transcriptLoop (out : Body.Stream) (id : String) (limit : Nat)
+    (after : Nat) (idleTicks : Nat) : Async Unit := do
+  let outcome ← try
+      Except.ok <$> interactiveEventsApi id after limit
+    catch e => pure (Except.error (toString e))
+  match outcome with
+  -- The session is gone. Nothing improves by waiting, so the stream ends; the client learns by
+  -- it closing, having already had its `200`.
+  | .ok none => return
+  | .error _ =>
+    -- A read that threw is a torn file, or a directory momentarily unreadable. Skip the tick
+    -- rather than close: the next one gets it whole, and closing would set `EventSource`
+    -- reconnecting for as long as the condition lasts. The tick still counts towards the
+    -- keep-alive, so a stream that is failing every time does not also go silent.
+    let (frame, idleTicks) :=
+      if idleTicks + 1 ≥ transcriptKeepAliveTicks then (some ": keep-alive\n\n", 0)
+      else (none, idleTicks + 1)
+    if let some f := frame then
+      out.send (Chunk.ofByteArray f.toUTF8)
+    Std.Async.sleep transcriptIntervalMs
+    transcriptLoop out id limit after idleTicks
+  | .ok (some payload) =>
+    let newAfter := lastSeqOf payload after
+    -- Caught up on a session that has ended: nothing further will ever arrive, so the stream
+    -- has an ending rather than polling a finished conversation for as long as the tab is open.
+    if pageIsEmpty payload then
+      if let some r ← Interactive.loadSession id then
+        if r.status.isTerminal then return
+    let (frame, idleTicks) :=
+      if pageIsEmpty payload then
+        if idleTicks + 1 ≥ transcriptKeepAliveTicks then (some ": keep-alive\n\n", 0)
+        else (none, idleTicks + 1)
+      else (some (sseFrameWithId newAfter (Json.compress payload)), 0)
+    if let some f := frame then
+      out.send (Chunk.ofByteArray f.toUTF8)
+    -- A full page means there is more behind it. Sleeping a whole tick after one would cap the
+    -- stream at `limit` events per interval, and a turn that outran that would fall further
+    -- behind on every tick and never catch up.
+    -- `limit > 0` matters: a client may ask for `?limit=0`, every page would then be "full",
+    -- and the loop would never sleep.
+    let full := limit > 0 && (payload.getObjVal? "items" |>.toOption.bind (·.getArr?.toOption)).any
+      (·.size ≥ limit)
+    unless full do Std.Async.sleep transcriptIntervalMs
+    transcriptLoop out id limit newAfter idleTicks
+
+/-- The transcript stream, or `none` when `kind` does not name one.
+
+    Answers `404` and `400` before committing a `200`, for the same reason `sseResponse` does: a
+    stream that opens and closes immediately tells `EventSource` only to reconnect, which turns a
+    mistyped id into a silent retry loop. -/
+private def transcriptResponse (kind : String) (q : Query) (lastEventId : Option Nat)
+    : Async (Option (Response Body.Any)) := do
+  unless kind.startsWith "interactive/" && kind.endsWith "/events" do return none
+  let idPart := ((kind.drop "interactive/".length).dropEnd "/events".length).toString
+  let some id := safeSegment idPart | return some (← notFoundJsonResp)
+  match natParam q "after" 0 maxAfter, natParam q "limit" defaultLimit maxLimit with
+  | .error e, _ | _, .error e => return some (← errorResp e .badRequest)
+  | .ok after, .ok limit =>
+    -- `EventSource` reconnects to the URL it was constructed with — cursor and all — and says
+    -- where it actually got to in `Last-Event-ID`. Without reading that, every drop replayed
+    -- the conversation from wherever the page happened to load, which for a long chat is
+    -- minutes of re-streaming before anything new can arrive. The larger of the two wins, so a
+    -- client that passes an explicit `after` is never sent backwards either.
+    let after := max after (lastEventId.getD 0)
+    -- The first page goes out on the connection that asked for it, so a client attaching to a
+    -- conversation already in progress sees it without a second request.
+    let some first ← interactiveEventsApi id after limit | return some (← notFoundJsonResp)
+    let firstAfter := lastSeqOf first after
+    return some <| ← (secured Response.ok)
+      |>.header! "Content-Type" "text/event-stream"
+      |>.header! "Cache-Control" "no-store"
+      |>.header! "X-Accel-Buffering" "no"
+      |>.stream fun out => do
+        out.send (Chunk.ofByteArray (sseFrameWithId firstAfter (Json.compress first)).toUTF8)
+        transcriptLoop out id limit firstAfter 0
+
 /-! ## Route dispatch -/
 
 /-! ## The published contract
@@ -1715,6 +2175,11 @@ def apiRoutes : Array (String × Array String) :=
   #[("overview",                 #["get"]),
     ("queue",                    #["get"]),
     ("queue/{id}/cancel",        #["post"]),
+    ("interactive",              #["get", "post"]),
+    ("interactive/{id}",         #["get", "delete"]),
+    ("interactive/{id}/events",  #["get"]),
+    ("interactive/{id}/messages",   #["post"]),
+    ("interactive/{id}/interrupt",  #["post"]),
     ("tasks",                    #["get"]),
     ("tasks/{id}",               #["get"]),
     ("concerts",                 #["get"]),
@@ -1790,6 +2255,11 @@ private def route (st : ServeState) (req : Request Body.Stream) : Async (Respons
 
   if let some kind := apiKind s!"/sse/{apiVersion}/" path then
     unless method == .get do return ← methodNotAllowedResp
+    -- The transcript is the one stream that advances a cursor rather than re-sending its whole
+    -- payload; every other kind falls through to the loop that does.
+    -- `Last-Event-ID` is a request header, so it is read here where the request is.
+    let lastEventId := (reqHeader req "last-event-id").bind (·.trimAscii.toString.toNat?)
+    if let some r ← transcriptResponse kind query lastEventId then return r
     return ← sseResponse st kind query
 
   if isSite then

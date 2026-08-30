@@ -13,17 +13,27 @@ namespace Orchestra.Server
 
 /-- Mutable state for the server, shared with request handlers. -/
 structure State where
-  upstream : Repository
-  fork : Repository
+  /-- Repositories the running task works on, or `none` for a repository-independent task.
+
+      Every tool that names a repository — `create_pr`, `merge_pr`, `label_issue`, `comment`,
+      `get_pr_comments` — is withheld when this is `none`, both from `tools/list` and from
+      `evalToolCall`, since there is no repository for them to act on. What is left is what such a
+      task is for: the taxis project and issue tools, and the typed task input/output. Those
+      reach GitHub in their own right — approving an issue queues a merger — so this gates the
+      tools that would need a repository named here, not everything that can touch one. -/
+  repo : Option RepoPair
   /-- Optional tools enabled for this run.
       Always-available tools (health, refresh_token, get_pr_comments) are never in this list.
-      The names this server itself understands are `"create_pr"`, `"merge_pr"`, `"label_issue"`
-      and `"comment"` (see `optionalToolDefs`); the rest are the permission groups of
-      `Orchestra.Project.Tools`. -/
+      The names this server itself understands are `"create_pr"`, `"merge_pr"`, `"label_issue"`,
+      `"comment"` and `"create_repository"` (see `optionalToolDefs`); the rest are the permission
+      groups of `Orchestra.Project.Tools`. -/
   allowedTools : List String
   appId : Nat
   privateKeyPath : String
-  installationId : Nat
+  /-- Installation the App mints tokens from. `none` when the running task has no repository and
+      the config named no installation of its own, so there is no installation to pick — the
+      `refresh_token` tool is then not offered. -/
+  installationId : Option Nat
   pat : String
   /-- Input type of the current task. When not `.unit`, the `get_task_input` tool is exposed. -/
   inputType : ResultType := .unit
@@ -55,6 +65,21 @@ structure State where
   /-- Optional auto-reviewer hook (F1). Plumbed to `Project.Tools.Env.enqueueReviewer`. -/
   enqueueReviewer : Option (Project.Project → Taxis.IssueId → Project.PRRef →
                             Project.ReviewerTemplate → IO (Except String String)) := none
+  /-- What this task may put on the queue itself (`Orchestra.Spawn`). `none` — the ordinary
+      case — is what keeps `queue_task` out of `tools/list` and out of `evalToolCall` alike.
+
+      Not a member of `allowedTools`: a tool whose entire safety is that somebody wrote down its
+      bounds should not have a second way to be switched on that carries none of them. -/
+  spawnPolicy : Option SpawnPolicy := none
+  /-- The running task's own backend, model, repository and tools, which is what every field the
+      agent omits in a `queue_task` call inherits. -/
+  spawnContext : SpawnContext := {}
+  /-- Hook that puts an approved spawn on the queue. Plumbed to
+      `Project.Tools.Env.enqueueTask`. -/
+  enqueueTask : Option (ResolvedSpawn → String → IO (Except String String)) := none
+  /-- The subtree this task may write at or below, when it was queued with one. Plumbed to
+      `Project.Tools.Env.scopeRoot`. -/
+  scopeRoot : Option Taxis.IssueId := none
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
   prLabels : List String := []
@@ -66,6 +91,15 @@ structure State where
       it opens pull requests, posts comments and merges. Whoever can talk to it can do those
       things as the person who configured it. -/
   authToken : Option String := none
+  /-- The organisation `create_repository` creates repositories in: `default_organization` from
+      the config, the same org tasks are forked into.
+
+      Deliberately the only destination the tool offers. An agent that could name the owner could
+      create repositories anywhere the App is installed, including under the accounts it is
+      working on; the configured fork org is the one place the operator has already agreed is
+      orchestra's to write to. `none` — no `default_organization` — means the tool has nowhere to
+      create anything and refuses. -/
+  defaultOrganization : Option String := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -97,19 +131,23 @@ private def initializeResult : Json :=
     ("serverInfo", Json.mkObj [("name", "agent"), ("version", "0.1.0")])
   ]
 
-private def alwaysAvailableTools : Array Json := #[
+private def healthToolDef : Json :=
   Json.mkObj [
     ("name", "health"),
     ("description", "Check that the agent MCP server is running."),
     ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
-  ],
+  ]
+
+private def refreshTokenToolDef : Json :=
   Json.mkObj [
     ("name", "refresh_token"),
     ("description", "Mint a fresh GitHub App installation token and return it. \
 Export it as GH_TOKEN to use it; it is not applied to the gh CLI for you, because other \
 tasks may be running in the same daemon and share that configuration."),
     ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
-  ],
+  ]
+
+private def getPrCommentsToolDef : Json :=
   Json.mkObj [
     ("name", "get_pr_comments"),
     ("description", "Fetch review comments on a pull request from the upstream repository."),
@@ -132,7 +170,47 @@ tasks may be running in the same daemon and share that configuration."),
       ("required", .arr #["pr_number"])
     ])
   ]
-]
+
+/-- The tools every task gets without asking — as far as it has what they need.
+
+    `refresh_token` mints from an installation, `get_pr_comments` reads a pull request on the
+    upstream: neither exists for a repository-independent task, so neither is offered to one.
+    Listing a tool that can only answer "this task has no repository" would spend an agent's
+    turn to tell it something the tool list already says. -/
+private def alwaysAvailableTools (state : State) : Array Json :=
+  #[healthToolDef]
+    ++ (if state.installationId.isSome then #[refreshTokenToolDef] else #[])
+    ++ (if state.repo.isSome then #[getPrCommentsToolDef] else #[])
+
+/-- Optional tools that act on a repository, and are therefore never granted to a
+    repository-independent task.
+
+    Only the *optional* ones: `get_pr_comments` and `refresh_token` need a repository and an
+    installation too, but no task asks for them by name — `alwaysAvailableTools` is what withholds
+    those. `create_repository` is deliberately absent: it creates a repository in
+    `default_organization` rather than acting on one the task named, which is exactly the kind of
+    thing meta-work does. -/
+def repoScopedTools : List String := ["create_pr", "merge_pr", "label_issue", "comment"]
+
+/-- Drop the tools that act on a repository from a repository-independent run's tool list, naming
+    each one it removes.
+
+    Loud rather than silent: a task file or a `--tools` flag that asks for `create_pr` and names no
+    repository has said two contradictory things, and the one that wins decides whether the run can
+    deliver anything at all. `evalToolCall` refuses these calls as well — this is what keeps them
+    out of the tool list the agent plans against in the first place.
+
+    `warn := false` for a caller whose list was never a request for these in particular:
+    `--tools all` asks for whatever is going and has no opinion about what that includes, so
+    naming what it does not get is noise on every repository-independent session. -/
+def withoutRepoScopedTools (repo : Option RepoPair) (tools : List String)
+    (warn : Bool := true) : IO (List String) := do
+  if repo.isSome then return tools
+  let (dropped, kept) := tools.partition repoScopedTools.contains
+  if warn && !dropped.isEmpty then
+    IO.eprintln s!"  Warning: this run has no repository, so {", ".intercalate dropped} \
+{if dropped.length == 1 then "is" else "are"} not granted — there is no repository to act on."
+  return kept
 
 private def optionalToolDefs : List (String × Json) := [
   ("create_pr", Json.mkObj [
@@ -158,7 +236,7 @@ private def optionalToolDefs : List (String × Json) := [
           ("enum", Json.arr #["upstream", "fork"]),
           ("description",
             "Where to open the PR. \"upstream\" (default) targets " ++
-            "state.upstream via PAT; \"fork\" targets state.fork via the " ++
+            "the task's upstream via PAT; \"fork\" targets its fork via the " ++
             "GitHub App installation token.")
         ])
       ]),
@@ -227,6 +305,48 @@ private def optionalToolDefs : List (String × Json) := [
         ])
       ]),
       ("required", .arr #["issue_number"])
+    ])
+  ]),
+  ("create_repository", Json.mkObj [
+    ("name", "create_repository"),
+    ("description",
+      "Create a new GitHub repository in orchestra's configured organisation (the one tasks " ++
+      "are forked into). Only `name` is required.\n\n" ++
+      "The owner is not yours to choose: the repository is always created in that organisation, " ++
+      "and the tool refuses when none is configured. It is created **private** unless you pass " ++
+      "private=false, and with no commits unless you pass auto_init=true — an empty repository " ++
+      "accepts a push of any history, whereas an auto-initialised one already has a README " ++
+      "commit that a local history would have to be reconciled with.\n\n" ++
+      "Not idempotent, unlike forking: a name the organisation already uses is refused rather " ++
+      "than handed back, so nothing is pushed to a repository other than the one just made. " ++
+      "Pick another name or work on the existing repository.\n\n" ++
+      "The result carries a GitHub token that reaches the new repository and nothing else, and " ++
+      "gives the push command to use it in. Do not export it as GH_TOKEN: that variable is what " ++
+      "authenticates your work on the task's own fork, and this token cannot reach that. It " ++
+      "expires in an hour, like every installation token."),
+    ("inputSchema", Json.mkObj [
+      ("type", "object"),
+      ("properties", Json.mkObj [
+        ("name", Json.mkObj [
+          ("type", "string"),
+          ("description",
+            "Repository name, without an owner. Letters, digits, '-', '_' and '.' only.")
+        ]),
+        ("description", Json.mkObj [
+          ("type", "string"),
+          ("description", "Repository description (default: empty).")
+        ]),
+        ("private", Json.mkObj [
+          ("type", "boolean"),
+          ("description", "Create it private (default: true).")
+        ]),
+        ("auto_init", Json.mkObj [
+          ("type", "boolean"),
+          ("description",
+            "Create an initial commit with a README (default: false, i.e. an empty repository).")
+        ])
+      ]),
+      ("required", .arr #["name"])
     ])
   ]),
   ("comment", Json.mkObj [
@@ -330,9 +450,17 @@ Call this tool exactly once when the task is complete."),
       ]]
   inputTool ++ outputTool
 
-private def toolsList (state : State) : Json :=
+/-- The `tools/list` answer for `state`: the always-available tools, plus every optional one the
+    task was granted.
+
+    Not private, for the same reason `evalToolCall` is not: a tool is offered under one name and
+    gated under another, in two lists written out separately, and a disagreement between them
+    leaves a tool that is listed and always refused — or granted and never offered. That is worth
+    a test, and the test needs no network. -/
+def toolsList (state : State) : Json :=
   let optional := optionalToolDefs.filterMap fun entry =>
-    if state.allowedTools.contains entry.1 then some entry.2 else none
+    if state.allowedTools.contains entry.1
+       && (state.repo.isSome || !repoScopedTools.contains entry.1) then some entry.2 else none
   -- Deduped by name: a tool may be listed under more than one permission group (an issue's
   -- comment thread is readable by workers and reviewers alike), and a task holding two of them
   -- would otherwise be offered the same tool twice.
@@ -343,17 +471,23 @@ private def toolsList (state : State) : Json :=
     |>.map (·.2)
   let io := ioToolDefs state.inputType state.outputType
   let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
+  -- Gated on the policy rather than on a permission label, and on the hook as well: a queue this
+  -- process cannot write to is a tool that would be listed and always refused.
+  let queueTask :=
+    if state.spawnPolicy.isSome && state.enqueueTask.isSome then #[Project.Tools.queueTaskToolDef]
+    else #[]
   Json.mkObj [("tools",
-    .arr (alwaysAvailableTools ++ projectInfo ++ optional.toArray ++ project.toArray ++ io))]
+    .arr (alwaysAvailableTools state ++ projectInfo ++ queueTask ++ optional.toArray
+          ++ project.toArray ++ io))]
 
 -- Types
 
 /-- Where a `create_pr` call should open its PR. -/
 inductive PrTarget where
-  /-- Cross-repo PR: head=`fork.owner:branch`, against `state.upstream`. PAT-auth.
+  /-- Cross-repo PR: head=`fork.owner:branch`, against the task's upstream. PAT-auth.
       This is the default and the original behaviour. -/
   | upstream
-  /-- Same-repo PR: head=bare branch, against `state.fork`. Authenticated by a
+  /-- Same-repo PR: head=bare branch, against the task's fork. Authenticated by a
       freshly-minted GitHub App installation token, no PAT required. -/
   | fork
 deriving Repr, Inhabited
@@ -380,6 +514,8 @@ inductive ToolCall where
   | mergePr (prNumber : Nat) (method : GitHub.MergeMethod) (deleteBranch : Bool)
   /-- Add and remove labels on an issue or pull request of the upstream repository. -/
   | labelIssue (issueNumber : Nat) (add : List String) (remove : List String)
+  /-- Create a repository in the configured `default_organization`. -/
+  | createRepository (name : String) (description : String) (isPrivate : Bool) (autoInit : Bool)
   | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
   | comment (action : CommentAction)
   | getTaskInput
@@ -473,6 +609,21 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
               if add.isEmpty && remove.isEmpty then
                 .parseError "nothing to do: give at least one label in 'add' or 'remove'"
               else .labelIssue numInt.toNat add remove
+  | "create_repository" =>
+    match args.getObjValAs? String "name" |>.toOption with
+    | none => .parseError "missing required argument: name"
+    | some rawName =>
+      let name := rawName.trimAscii.toString
+      match GitHub.repoNameError? name with
+      | some e => .parseError e
+      | none =>
+        let description := args.getObjValAs? String "description" |>.toOption |>.getD ""
+        -- Both default to the cautious answer: a repository that is private and empty can be
+        -- opened up or filled in afterwards, while neither publishing nor an unwanted initial
+        -- commit can be taken back from a caller that simply omitted the argument.
+        let isPrivate := args.getObjValAs? Bool "private"   |>.toOption |>.getD true
+        let autoInit  := args.getObjValAs? Bool "auto_init" |>.toOption |>.getD false
+        .createRepository name description isPrivate autoInit
   | "get_pr_comments" =>
     match args.getObjVal? "pr_number" |>.toOption with
     | none => .parseError "missing required argument: pr_number"
@@ -563,15 +714,24 @@ def parseRequest (msg : Json) : Option Request :=
     without a network. `tools/list` already hides an ungranted tool, but an agent naming it
     anyway must be turned away rather than served. -/
 def evalToolCall (state : State) (call : ToolCall) : IO Json := do
+  -- The refusal a repository-scoped tool gets when the task has no repository. Reaching it
+  -- means a task file granted the tool by name: `TaskRunner` drops these from a
+  -- repository-independent task's tool list, and `toolsList` hides whatever survives that. It
+  -- is still checked here, because a tool that is merely unlisted is not a tool an agent
+  -- cannot name.
+  let noRepo (tool : String) : Json :=
+    toolContent s!"{tool} acts on a repository, and this task runs without one" (isError := true)
   match call with
   | .health =>
     log "tool health"
     return toolContent "ok"
   | .refreshToken =>
     log "tool refresh_token: creating new installation token"
+    let some installationId := state.installationId
+      | return toolContent "no GitHub App installation is configured for this task" (isError := true)
     try
       let jwt ← GitHub.createJWT state.appId state.privateKeyPath
-      let token ← GitHub.createInstallationToken jwt state.installationId
+      let token ← GitHub.createInstallationToken jwt installationId
       -- Returned to the calling agent only, never written to `~/.config/gh/hosts.yml`.
       -- This tool is reachable from inside any task's sandbox at any moment, so a global
       -- `gh auth login` here would swap the credentials out from under every other task
@@ -586,6 +746,7 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     if !state.allowedTools.contains "create_pr" then
       log "tool create_pr: denied (not in allowed tools)"
       return toolContent "PR creation is not enabled for this task" (isError := true)
+    let some repo := state.repo | return noRepo "create_pr"
     match target with
     | .upstream =>
       if state.pat.isEmpty then
@@ -593,23 +754,25 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
         return toolContent
           "github.pat not set in config (required when target=upstream; pass target=\"fork\" to use the App token)"
           (isError := true)
-      log s!"tool create_pr [upstream]: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
+      log s!"tool create_pr [upstream]: {repo.fork}:{head} -> {repo.upstream} base={base} title={repr title}"
       try
-        let result ← GitHub.createPullRequest state.pat state.upstream
-          s!"{state.fork.owner}:{head}" base title body state.prLabels
+        let result ← GitHub.createPullRequest state.pat repo.upstream
+          s!"{repo.fork.owner}:{head}" base title body state.prLabels
         log s!"tool create_pr: ok: {result.trimAscii}"
         return toolContent result
       catch e =>
         log s!"tool create_pr: error: {e}"
         return toolContent (toString e) (isError := true)
     | .fork =>
-      log s!"tool create_pr [fork]: {state.fork}:{head} base={base} title={repr title}"
+      log s!"tool create_pr [fork]: {repo.fork}:{head} base={base} title={repr title}"
+      let some installationId := state.installationId
+        | return toolContent "no GitHub App installation is configured for this task" (isError := true)
       try
         -- Mint a fresh installation token so the PR is attributed to the
         -- GitHub App, not the PAT owner.
         let jwt ← GitHub.createJWT state.appId state.privateKeyPath
-        let token ← GitHub.createInstallationToken jwt state.installationId
-        let result ← GitHub.createPullRequestOnRepo token state.fork
+        let token ← GitHub.createInstallationToken jwt installationId
+        let result ← GitHub.createPullRequestOnRepo token repo.fork
           head base title body state.prLabels
         log s!"tool create_pr: ok: {result.trimAscii}"
         return toolContent result
@@ -625,10 +788,11 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       return toolContent
         "github.pat not set in config (required to merge on the upstream repository)"
         (isError := true)
-    log s!"tool merge_pr: {state.upstream}#{prNumber} {method.flag} \
+    let some repo := state.repo | return noRepo "merge_pr"
+    log s!"tool merge_pr: {repo.upstream}#{prNumber} {method.flag} \
       delete_branch={deleteBranch}"
     try
-      let result ← GitHub.mergePullRequest state.pat state.upstream prNumber method deleteBranch
+      let result ← GitHub.mergePullRequest state.pat repo.upstream prNumber method deleteBranch
       log s!"tool merge_pr: ok: {result.trimAscii}"
       return toolContent result
     catch e =>
@@ -643,21 +807,81 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       return toolContent
         "github.pat not set in config (required to label on the upstream repository)"
         (isError := true)
-    log s!"tool label_issue: {state.upstream}#{issueNumber} \
+    let some repo := state.repo | return noRepo "label_issue"
+    log s!"tool label_issue: {repo.upstream}#{issueNumber} \
       add=[{String.intercalate ", " add}] remove=[{String.intercalate ", " remove}]"
     try
-      let change ← GitHub.setIssueLabels state.pat state.upstream issueNumber add remove
-      let summary := change.summary s!"{state.upstream}#{issueNumber}"
+      let change ← GitHub.setIssueLabels state.pat repo.upstream issueNumber add remove
+      let summary := change.summary s!"{repo.upstream}#{issueNumber}"
       log s!"tool label_issue: ok: {summary}"
       return toolContent summary
     catch e =>
       log s!"tool label_issue: error: {e}"
       return toolContent (toString e) (isError := true)
+  | .createRepository name description isPrivate autoInit =>
+    if !state.allowedTools.contains "create_repository" then
+      log "tool create_repository: denied (not in allowed tools)"
+      return toolContent "creating repositories is not enabled for this task" (isError := true)
+    match state.defaultOrganization with
+    | none =>
+      log "tool create_repository: no default_organization configured"
+      return toolContent
+        "default_organization not set in config (it names the organisation repositories are \
+created in; there is no other destination this tool will use)"
+        (isError := true)
+    | some org =>
+      log s!"tool create_repository: {org}/{name} private={isPrivate} auto_init={autoInit}"
+      try
+        -- Two tokens, both the organisation installation's: the task's own reaches only the
+        -- repositories it was launched against, and the one handed back below is narrowed to the
+        -- new repository. Neither is ever logged — the log line names the repository, not the
+        -- credential.
+        let (repo, pushToken) ← GitHub.createRepoInOrg state.appId state.privateKeyPath org
+          name description isPrivate autoInit
+        let visibility := if isPrivate then "private" else "public"
+        let contents := if autoInit then "initialised with a README commit" else "empty"
+        -- The push token is carried, not thrown, so its failure would otherwise reach the agent
+        -- and nothing else; an operator asked why the agent got no token needs the reason here.
+        -- Neither token is ever logged: these lines name the repository, not the credential.
+        match pushToken with
+        | .ok _    => log s!"tool create_repository: ok: {repo}"
+        | .error e => log s!"tool create_repository: created {repo}, but minting its push token \
+            failed: {e}"
+        -- What `GH_TOKEN` is for, named as the task would recognise it. A repository-independent
+        -- task has no clone for it to authenticate — and, where no installation was resolved,
+        -- no `GH_TOKEN` at all — so it is described by what it is rather than by a repository
+        -- the task never named.
+        let ownCredentials := match state.repo with
+          | some r => s!"your work on {r.fork}"
+          | none   => "this task's own GitHub access"
+        -- The token goes in the URL rather than into `GH_TOKEN`. Exporting `GH_TOKEN` is how the
+        -- sandbox supplies the task's *own* credentials, and `Repo`'s helpers authenticate every
+        -- push and fetch from it, so an agent that overwrites it with a token good for one
+        -- repository loses the one that pushes its actual work. The URL form also needs no
+        -- credential helper, which only the task's own clone is configured with.
+        let credential := match pushToken with
+          | .ok t =>
+            s!"Push with this token, which reaches this repository and no other:\n  \
+              git push https://x-access-token:{t}@github.com/{repo} HEAD:main\n\
+              Do not export it as GH_TOKEN — that is what authenticates \
+              {ownCredentials}, and this token cannot reach that. Like every installation token \
+              it expires in an hour; refresh_token mints the task's own, which reaches this \
+              repository only if that installation covers {org}."
+          | .error e =>
+            s!"The repository exists, but no push token could be minted for it: {e}\n\
+              Do not create it again — it is there. refresh_token mints the task's own token, \
+              which reaches it only if that installation covers {org}."
+        return toolContent s!"created {repo} ({visibility}, {contents})\n\
+          https://github.com/{repo}\n{credential}"
+      catch e =>
+        log s!"tool create_repository: error: {e}"
+        return toolContent (toString e) (isError := true)
   | .getPrComments prNumber unresolvedOnly excludeOutdated =>
     log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
       exclude_outdated={excludeOutdated}"
+    let some repo := state.repo | return noRepo "get_pr_comments"
     try
-      let response ← GitHub.getPrReviewThreads state.upstream prNumber state.pat
+      let response ← GitHub.getPrReviewThreads repo.upstream prNumber state.pat
       let text := GitHub.formatPrReviewThreads response unresolvedOnly excludeOutdated
       log "tool get_pr_comments: ok"
       return toolContent text
@@ -668,6 +892,7 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     if !state.allowedTools.contains "comment" then
       log "tool comment: denied (not in allowed tools)"
       return toolContent "comment tool is not enabled for this task" (isError := true)
+    let some repo := state.repo | return noRepo "comment"
     match state.issueNumber with
     | none =>
       log "tool comment: no issue number configured"
@@ -675,42 +900,42 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     | some n =>
       match action with
       | .issue body =>
-        log s!"tool comment: posting to {state.upstream}#{n}"
+        log s!"tool comment: posting to {repo.upstream}#{n}"
         try
-          let result ← GitHub.createIssueComment state.pat state.upstream n body
+          let result ← GitHub.createIssueComment state.pat repo.upstream n body
           log "tool comment: ok"
           return toolContent result
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
       | .review body inlineComments =>
-        log s!"tool comment: posting review to {state.upstream}#{n} \
+        log s!"tool comment: posting review to {repo.upstream}#{n} \
           ({inlineComments.size} inline comments)"
         try
-          let result ← GitHub.createPrReview state.pat state.upstream n body inlineComments
+          let result ← GitHub.createPrReview state.pat repo.upstream n body inlineComments
           log "tool comment: ok"
           return toolContent result
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
       | .replyInline body cid =>
-        log s!"tool comment: replying to inline comment {cid} on {state.upstream}#{n}"
+        log s!"tool comment: replying to inline comment {cid} on {repo.upstream}#{n}"
         try
-          let cidPr ← GitHub.getPrReviewCommentPrNumber state.pat state.upstream cid
+          let cidPr ← GitHub.getPrReviewCommentPrNumber state.pat repo.upstream cid
           if cidPr ≠ n then
             log s!"tool comment: comment {cid} belongs to PR #{cidPr}, not #{n}"
             return toolContent s!"comment {cid} does not belong to issue #{n}" (isError := true)
-          let result ← GitHub.replyToPrReviewComment state.pat state.upstream n cid body
+          let result ← GitHub.replyToPrReviewComment state.pat repo.upstream n cid body
           log "tool comment: ok"
           return toolContent result
         catch e =>
           log s!"tool comment: error: {e}"
           return toolContent (toString e) (isError := true)
       | .newInline comment =>
-        log s!"tool comment: new inline comment on {state.upstream}#{n} \
+        log s!"tool comment: new inline comment on {repo.upstream}#{n} \
           {comment.path}:{comment.line} ({comment.side})"
         try
-          let result ← GitHub.createPrReviewComment state.pat state.upstream n
+          let result ← GitHub.createPrReviewComment state.pat repo.upstream n
             comment.body comment.path comment.line comment.side
           log "tool comment: ok"
           return toolContent result
@@ -740,7 +965,11 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       , projectId     := state.projectId
       , issueId       := state.issueId
       , enqueueMerger   := state.enqueueMerger
-      , enqueueReviewer := state.enqueueReviewer }
+      , enqueueReviewer := state.enqueueReviewer
+      , spawnPolicy     := state.spawnPolicy
+      , spawnContext    := state.spawnContext
+      , enqueueTask     := state.enqueueTask
+      , scopeRoot       := state.scopeRoot }
     Project.Tools.evalProjectTool env call
   | .unknown name =>
     log s!"tool {name}: unknown"

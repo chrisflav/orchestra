@@ -115,10 +115,15 @@ deriving Repr, BEq, Inhabited
 
 /-- How the run's standard streams are wired. -/
 inductive Stdio where
-  /-- Captured, for orchestra to parse and log. What every queued task uses. -/
+  /-- Output captured, nothing written in. What every queued task uses. -/
   | piped
   /-- Handed to the terminal orchestra was started from, for `orchestra interactive`. -/
   | inherit
+  /-- Output captured *and* input open: the process stays up and turns are written to it, which
+      is what an interactive session holds. The difference from `.piped` is not cosmetic — the
+      run's stdin has to be a pipe the daemon still holds, because closing it is how a CLI reading
+      turns is told there are no more. -/
+  | stream
 deriving Repr, BEq, Inhabited, DecidableEq
 
 /-- Everything one agent run needs, in terms no execution backend is privileged by.

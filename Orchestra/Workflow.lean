@@ -81,15 +81,17 @@ structure TaskSpec where
     The always-available tools (`health`, `refresh_token`, `get_pr_comments`) are left out
     because naming one grants nothing — they are already there.
 
-    This is `Project.Role.knownPermissions` plus `merge_pr`. A role is a template dispatched at
-    whatever issue comes along, so it may not land a pull request; a workflow step is written for
-    one job, and naming the step that merges is a decision the author has already made.
+    This is `Project.Role.knownPermissions` plus `merge_pr` and `create_repository`. A role is a
+    template dispatched at whatever issue comes along, so it may neither land a pull request nor
+    create a repository; a workflow step is written for one job, and naming the step that merges
+    — or the step that creates the repository the rest of the workflow fills — is a decision the
+    author has already made.
 
     Kept beside the field it validates, so the parser does not have to link the MCP server or the
     project tooling to reject a typo — which is the point of validating at all. An unknown name
     is otherwise invisible until the agent finds itself without the tool it was told to use. -/
 def TaskSpec.knownTools : List String :=
-  ["create_pr", "merge_pr", "comment", "label_issue",
+  ["create_pr", "merge_pr", "comment", "label_issue", "create_repository",
    "manage_issues", "work_issues", "review_issues"]
 
 /-- Specifies that a step iterates over a list. -/
@@ -185,16 +187,22 @@ private def writeOutput (stepName : String) (spec : OutputSpec)
 private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSpec)
     (accumulate : Bool := false) : WorkflowM Unit := do
   let (env, _) ← get
-  let upstream ← match spec.upstream <|> prog.upstream with
-    | some r => pure r
-    | none   => StateT.lift Concert.abort
-  let fork ← match spec.fork <|> prog.fork with
-    | some r => pure r
-    | none   => StateT.lift Concert.abort
+  -- A step inherits the program's repositories unless it names its own, and a workflow that
+  -- names neither runs its steps repository-independent: in a scratch workspace, with the
+  -- repository-scoped tools withheld. That is the shape a workflow coordinating several projects
+  -- through the issue tracker takes, where there is no one repository to check out.
+  --
+  -- Half a pair is refused rather than half-inherited. `upstream` from the program and `fork`
+  -- from the step is a combination somebody meant; `upstream` alone, at either level, is a
+  -- workflow missing a line.
+  let repo ← match spec.upstream <|> prog.upstream, spec.fork <|> prog.fork with
+    | none,          none      => pure none
+    | some upstream, some fork => pure (some { upstream, fork : RepoPair })
+    | _,             _         => StateT.lift Concert.abort
   let inputSection := buildInputSection env spec.input
   if spec.output.isEmpty then
     let ioTask : IOTask .unit .unit := {
-      upstream, fork, mode := .fork
+      repo, mode := .fork
       prompt := spec.prompt ++ inputSection
       agent := spec.agent, model := spec.model, budget := spec.budget
       tools := spec.tools
@@ -210,7 +218,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
     let mappingFields := spec.output.map fun o => (o.name, o.type)
     let outInstr := s!"\n\nCommunicate your result by calling the `submit_task_output` MCP tool with a JSON object matching this schema:\n{(ResultType.mapping mappingFields).toJsonSchema.compress}"
     let ioTask : IOTask .unit (.mapping mappingFields) := {
-      upstream, fork, mode := .fork
+      repo, mode := .fork
       prompt := spec.prompt ++ inputSection ++ outInstr
       agent := spec.agent, model := spec.model, budget := spec.budget
       tools := spec.tools

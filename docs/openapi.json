@@ -12,6 +12,10 @@
   ],
   "security": [{ "bearerAuth": [] }, { "sessionCookie": [] }],
   "tags": [
+    {
+      "name": "interactive",
+      "description": "Chat sessions the daemon holds open. A session is a conversation with an agent, bound to a repository and running in the same sandbox with the same credentials and MCP tools a task would get. Unlike a task it stays up between turns: the clone slot, the MCP server and the agent process are acquired once and kept, so a turn costs a line on a pipe rather than a process start.\n\nThe four routes that do something rather than read something forward to the daemon over its control socket, which is not on the network. Each answers `409` when the daemon is not reachable or refuses — a statement about the daemon rather than about this server. The reads come off disk instead, so they answer whether the daemon is busy, restarting or gone."
+    },
     { "name": "session", "description": "Acquiring and releasing a credential." },
     { "name": "queue", "description": "Work waiting, running, and the concerts it belongs to." },
     { "name": "tasks", "description": "Runs that happened, and their logs." },
@@ -22,6 +26,399 @@
     { "name": "auth", "description": "Configured credentials, the usage limits they are under, and what they have spent." }
   ],
   "paths": {
+    "/api/v1/interactive": {
+      "get": {
+        "tags": [
+          "interactive"
+        ],
+        "summary": "Every session, newest first",
+        "description": "Sessions the daemon is holding and sessions that have ended, in one list. Read off disk, so it answers whether the daemon is up or not.",
+        "operationId": "listInteractiveSessions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/limit"
+          },
+          {
+            "$ref": "#/components/parameters/offset"
+          },
+          {
+            "$ref": "#/components/parameters/since"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of sessions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Collection"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "items": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/InteractiveSession"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "interactive"
+        ],
+        "summary": "Start a session",
+        "description": "Asks the daemon to clone the repository, mint a token, start an MCP server and launch an agent that stays up across turns, and answers with the session it created.\n\nThis is the one route in this API that starts an agent. It takes the same credential as every other write.\n\n`400` for a body that does not name both repositories, and for a backend whose CLI cannot host a session — that judgement is the daemon's, relayed, because only it knows which backends it was built with. `409` when the daemon is not reachable, when it is already holding as many sessions as it is configured to, or when the repository has no free clone slot.",
+        "operationId": "startInteractiveSession",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InteractiveCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The session that was started.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InteractiveSessionDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          }
+        }
+      }
+    },
+    "/api/v1/interactive/{id}": {
+      "get": {
+        "tags": [
+          "interactive"
+        ],
+        "summary": "One session",
+        "description": "Everything known about the session, but not its transcript — that is its own path, because it grows.",
+        "operationId": "getInteractiveSession",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The session's id.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InteractiveSessionDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "interactive"
+        ],
+        "summary": "End a session",
+        "description": "Stops the agent and releases the clone slot, the MCP server and the process. The transcript is kept.\n\nA session that has already ended is `204` rather than `409`: ending something that has ended is a request that no longer applies, not one that failed. `409` when the daemon is not reachable.",
+        "operationId": "endInteractiveSession",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The session's id.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The session is over."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/api/v1/interactive/{id}/events": {
+      "get": {
+        "tags": [
+          "interactive"
+        ],
+        "summary": "The transcript, from a cursor",
+        "description": "What the conversation has said since `after`. A cursor rather than an offset because a transcript only grows at the end: a client that has read to seq 40 asks for what follows 40 and gets the same answer whatever has been appended since, where an offset would shift under it.\n\n`total` counts what is left after the cursor, so \"you are twelve behind\" needs no second request. The SSE stream at the same path under `/sse/v1/` is the same thing pushed: each frame carries only what follows the last one sent, and its `id` is the last seq in it, so an `EventSource` reconnect resumes from `Last-Event-ID` without seeing an event twice or missing one.",
+        "operationId": "getInteractiveTranscript",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The session's id.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "description": "Return events whose seq is greater than this. Default 0.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the transcript.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items",
+                    "total",
+                    "limit",
+                    "after"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/InteractiveEvent"
+                      }
+                    },
+                    "total": {
+                      "type": "integer",
+                      "description": "How many events follow the cursor in total, before the window."
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "after": {
+                      "type": "integer",
+                      "description": "The cursor this answered."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/interactive/{id}/messages": {
+      "post": {
+        "tags": [
+          "interactive"
+        ],
+        "summary": "Post a turn",
+        "description": "Sends what the person typed to the agent. Answers the seq the turn was written at, so a client can start reading from exactly there rather than from wherever the transcript happens to be by the time it asks.\n\nA turn posted to a `dormant` session wakes it first — an agent is started and the conversation resumed — so this is also how a session that was put down for being idle, or that outlived a daemon restart, comes back. That first turn takes as long as starting a session does, and is refused if the daemon is already holding as many awake sessions as it may.\n\n`409` when the session is already working on a turn — refused rather than queued, because the agent would take the second line as soon as it finished the first and a person who typed twice would get two answers in an order nobody chose. Interrupt it, or wait. Also `409` when the session has ended, or the daemon is not reachable.",
+        "operationId": "postInteractiveTurn",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The session's id.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "text"
+                ],
+                "properties": {
+                  "text": {
+                    "type": "string",
+                    "description": "The turn."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The turn was delivered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "seq"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "seq": {
+                      "type": "integer",
+                      "description": "Where the turn landed in the transcript."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          }
+        }
+      }
+    },
+    "/api/v1/interactive/{id}/interrupt": {
+      "post": {
+        "tags": [
+          "interactive"
+        ],
+        "summary": "Abandon the turn in flight",
+        "description": "Stops the turn the agent is working on without killing the session: the process, the clone and the conversation all survive, and the next turn can be posted straight away. The turn ends the way every turn ends, with a result on the stream.\n\nThe body carries nothing — the session is named by the path and there is no second argument to give. `409` when no turn is running, or the daemon is not reachable.",
+        "operationId": "interruptInteractiveTurn",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The session's id.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The interrupt was delivered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "id"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          }
+        }
+      }
+    },
     "/api/openapi.json": {
       "get": {
         "tags": ["session"],
@@ -181,7 +578,7 @@
       "post": {
         "tags": ["queue"],
         "summary": "Cancel one running task",
-        "description": "Asks the queue daemon to stop the task this id names, and only that one. Everything else it is running carries on, the queue is untouched, and the entry lands as `cancelled` \u2014 which `orchestra queue retry` re-enqueues.\n\nThe id may be a queue entry's id or the id of the run it became; both are ids this API hands out for the same piece of work. The request carries no arguments beyond it \u2014 the body is an empty JSON object \u2014 because only the daemon holds the cancellation token, and naming the entry is the whole of what it needs.\n\n`404` if no entry and no run carries the id. `409` if it exists and is not running, naming the status it is in; `409` also if the daemon is not running or did not answer, which is a statement about the daemon rather than about this server. The status the entry ends in is written by the worker that was running it, as it lands, not here.",
+        "description": "Asks the queue daemon to stop the task this id names, and only that one. Everything else it is running carries on, the queue is untouched, and the entry lands as `cancelled` \u2014 which `orchestra queue retry` re-enqueues.\n\nThe id may be a queue entry's id or the id of the run it became; both are ids this API hands out for the same piece of work. The request carries no arguments beyond it \u2014 the body is an empty JSON object \u2014 because only the daemon holds the cancellation token, and naming the entry is the whole of what it needs.\n\n`404` if no entry and no run carries the id. `409` if it exists and is not running, naming the status it is in; `409` also if the daemon is not running or did not answer, which is a statement about the daemon rather than about this server. The status the entry ends in is written by the worker that was running it, as it lands, not here.\n\nOne exception, and it is a repair rather than a verdict: a `409` for an entry that is not running also marks the run's own record `unfinished` if that record still says `running`. The two halves can disagree when a worker died without landing its task \u2014 the entry is repaired on the daemon's next sweep, the record was not \u2014 and the reply says so when it has closed that gap.",
         "operationId": "cancelTask",
         "parameters": [
           {
@@ -506,7 +903,7 @@
       "post": {
         "tags": ["roles"],
         "summary": "Create a role",
-        "description": "The body is the role document itself, and the name comes from its `name` field. Refuses to overwrite.\n\n`permissions` is checked against the tool groups the sandbox actually grants (`create_pr`, `comment`, `label_issue`, `manage_issues`, `work_issues`, `review_issues`); a typo there is otherwise invisible until a dispatched agent finds itself without the tool it was told to use.",
+        "description": "The body is the role document itself, and the name comes from its `name` field. Refuses to overwrite.\n\n`permissions` is checked against the tool groups the sandbox actually grants (`create_pr`, `comment`, `label_issue`, `manage_issues`, `work_issues`, `review_issues`); a typo there is otherwise invisible until a dispatched agent finds itself without the tool it was told to use.\n\nA `spawn_policy`, if present, is checked against the same list: what a role may hand to a task it queues is bounded by what a role may itself be granted, so `queue_task` cannot become a way around this check.",
         "operationId": "createRole",
         "requestBody": {
           "required": true,
@@ -869,6 +1266,329 @@
       }
     },
     "schemas": {
+      "InteractiveStatus": {
+        "type": "string",
+        "enum": [
+          "starting",
+          "idle",
+          "running",
+          "dormant",
+          "ended",
+          "failed"
+        ],
+        "description": "Where the session is in its life. `dormant` is not an ending: nothing is running — the agent was stopped for being idle, or the daemon restarted — and the conversation is intact, so posting a turn starts an agent again and resumes it. `ended` and `failed` are the two terminal states and mean different things: a session that was closed or ran out of budget ended; one whose agent died did not."
+      },
+      "InteractiveSession": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "createdAt",
+          "lastActivityAt",
+          "endedAt",
+          "upstream",
+          "fork",
+          "backend",
+          "model",
+          "turnCount",
+          "costUsd",
+          "lastEventSeq",
+          "title",
+          "error"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/InteractiveStatus"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastActivityAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the session last did anything. What the idle timeout measures against."
+          },
+          "endedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "upstream": {
+            "type": "string",
+            "description": "`owner/repo`."
+          },
+          "fork": {
+            "type": "string",
+            "description": "`owner/repo`."
+          },
+          "backend": {
+            "type": "string"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turnCount": {
+            "type": "integer"
+          },
+          "costUsd": {
+            "type": "number",
+            "description": "Spend so far, as the agent reported it."
+          },
+          "lastEventSeq": {
+            "type": "integer",
+            "description": "The last seq written to the transcript. A client that has read this far is current."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The first thing the person said, truncated."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed, when it did."
+          }
+        }
+      },
+      "InteractiveSessionDetail": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "createdAt",
+          "lastActivityAt",
+          "endedAt",
+          "upstream",
+          "fork",
+          "backend",
+          "model",
+          "turnCount",
+          "costUsd",
+          "lastEventSeq",
+          "title",
+          "error",
+          "budget",
+          "slot",
+          "agentSessionId",
+          "resumedFrom"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/InteractiveStatus"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastActivityAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the session last did anything. What the idle timeout measures against."
+          },
+          "endedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "upstream": {
+            "type": "string",
+            "description": "`owner/repo`."
+          },
+          "fork": {
+            "type": "string",
+            "description": "`owner/repo`."
+          },
+          "backend": {
+            "type": "string"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turnCount": {
+            "type": "integer"
+          },
+          "costUsd": {
+            "type": "number",
+            "description": "Spend so far, as the agent reported it."
+          },
+          "lastEventSeq": {
+            "type": "integer",
+            "description": "The last seq written to the transcript. A client that has read this far is current."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The first thing the person said, truncated."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed, when it did."
+          },
+          "budget": {
+            "type": "number",
+            "description": "Maximum spend for the whole session, in USD — not for one turn."
+          },
+          "slot": {
+            "type": "integer",
+            "description": "The clone slot held for this session's lifetime."
+          },
+          "agentSessionId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The agent CLI's own session id. Assigned before the process starts rather than read out of its stream, so a session whose agent died before saying anything can still be picked up."
+          },
+          "resumedFrom": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The session this one resumed, if any."
+          }
+        }
+      },
+      "InteractiveCreate": {
+        "type": "object",
+        "required": [
+          "upstream",
+          "fork"
+        ],
+        "properties": {
+          "upstream": {
+            "type": "string",
+            "description": "`owner/repo`."
+          },
+          "fork": {
+            "type": "string",
+            "description": "`owner/repo`."
+          },
+          "backend": {
+            "type": "string",
+            "description": "Agent backend. Only backends whose CLI can read turns from stdin can host a session; one that cannot is a `400` naming it."
+          },
+          "model": {
+            "type": "string",
+            "description": "Passed to the backend's own CLI untouched, so a family alias and a pinned id are equally valid; orchestra keeps no list of what is. Absent, or blank, runs the backend's default. Fixed for the session's whole life, because the agent process is launched once and kept."
+          },
+          "budget": {
+            "type": "number",
+            "description": "Maximum spend for the whole conversation, in USD — not per turn. Absent runs on the default of 20; more than 100 is a `400`. Reaching it ends the session rather than failing it, with a notice saying so and the transcript kept."
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional MCP tools to grant. Omitted means all of them."
+          },
+          "systemPrompt": {
+            "type": "string"
+          },
+          "resumeFrom": {
+            "type": "string",
+            "description": "Start this session by picking up the conversation another one was having. The old session is not revived; this is a new one that inherits its agent-side history. Checked as a session id: it becomes a directory name."
+          }
+        }
+      },
+      "InteractiveEvent": {
+        "type": "object",
+        "required": [
+          "seq",
+          "occurredAt",
+          "kind"
+        ],
+        "description": "One line of the transcript. `kind` says what happened; the remaining fields depend on it. `agent` wraps an agent stream event unchanged, so a client that renders a task log renders a transcript. The other kinds carry what the agent's own stream cannot say: what the person typed, where a turn began and ended, and what the daemon did.",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "description": "Monotone from 1. The cursor `after` takes."
+          },
+          "occurredAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "user",
+              "agent",
+              "turnStarted",
+              "turnEnded",
+              "notice"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "description": "`user`: what the person said."
+          },
+          "event": {
+            "type": "object",
+            "description": "`agent`: the agent stream event, unchanged."
+          },
+          "turn": {
+            "type": "integer",
+            "description": "`turnStarted`, `turnEnded`."
+          },
+          "subtype": {
+            "type": "string",
+            "description": "`turnEnded`: how the turn ended."
+          },
+          "costUsd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "`turnEnded`."
+          },
+          "durationSeconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "`turnEnded`."
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "info",
+              "warning",
+              "error"
+            ],
+            "description": "`notice`."
+          },
+          "message": {
+            "type": "string",
+            "description": "`notice`."
+          }
+        }
+      },
       "Error": {
         "type": "object",
         "required": ["error"],
@@ -899,21 +1619,22 @@
       "QueueEntry": {
         "type": "object",
         "description": "Work waiting or running. Becomes a Task when it is claimed; `taskId` is that run.",
-        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey"],
+        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy"],
         "properties": {
           "id": { "type": "string" },
           "status": { "$ref": "#/components/schemas/QueueStatus" },
           "createdAt": { "type": "string", "format": "date-time" },
           "priority": { "type": "integer", "description": "Higher runs first." },
-          "upstream": { "type": "string", "description": "`owner/repo` the work targets." },
-          "fork": { "type": "string", "description": "`owner/repo` the agent pushes to." },
+          "upstream": { "type": ["string", "null"], "description": "`owner/repo` the work targets. Null for a repository-independent entry, which runs in a scratch workspace with nothing checked out." },
+          "fork": { "type": ["string", "null"], "description": "`owner/repo` the agent pushes to. Null for a repository-independent entry." },
           "prompt": { "type": "string" },
           "series": { "type": ["string", "null"] },
           "backend": { "type": ["string", "null"], "description": "Agent backend, e.g. `claude`." },
           "model": { "type": ["string", "null"] },
           "taskId": { "type": ["string", "null"], "description": "The run this entry became, once claimed." },
           "concertId": { "type": ["string", "null"] },
-          "concertStepKey": { "type": ["string", "null"] }
+          "concertStepKey": { "type": ["string", "null"] },
+          "spawnedBy": { "type": ["string", "null"], "description": "The task that queued this entry with the `queue_task` tool, when one did. Without it an entry that appeared out of a running agent's turn is indistinguishable from one a person added." }
         }
       },
       "Task": {
@@ -924,8 +1645,8 @@
           "id": { "type": "string" },
           "status": { "$ref": "#/components/schemas/TaskStatus" },
           "createdAt": { "type": "string", "format": "date-time" },
-          "upstream": { "type": "string" },
-          "fork": { "type": "string" },
+          "upstream": { "type": ["string", "null"], "description": "Null for a repository-independent run, which ran in a scratch workspace with nothing checked out." },
+          "fork": { "type": ["string", "null"], "description": "Null for a repository-independent run." },
           "prompt": { "type": "string" },
           "series": { "type": ["string", "null"] },
           "backend": { "type": ["string", "null"] },
@@ -945,7 +1666,7 @@
             "description": "The run the log was read under. A queue entry and the task it becomes are numbered separately, so this is the record's own id when `id` names a task, the entry's run when it names an entry that has one, and null for an entry with no run — one still queued, or one that failed before it started."
           },
           "status": { "type": "string" },
-          "fork": { "type": "string" },
+          "fork": { "type": ["string", "null"], "description": "Null for a repository-independent run." },
           "createdAt": { "type": "string", "format": "date-time" },
           "prompt": { "type": "string" },
           "log": {
@@ -970,16 +1691,34 @@
           "finishedAt": { "type": ["string", "null"], "format": "date-time" }
         }
       },
+      "RateLimitStatus": {
+        "type": "object",
+        "description": "One of a listener's dispatch ceilings and where it stands right now. `nextAllowedAt` answers *when* the window next has room, not *whether* it has any: `remaining` is what says that.",
+        "required": ["description", "max", "windowSeconds", "used", "remaining", "nextAllowedAt"],
+        "properties": {
+          "description": { "type": "string", "description": "The ceiling as a person would say it, e.g. `5 per hour`." },
+          "max": { "type": "integer", "description": "Dispatches allowed in one window." },
+          "windowSeconds": { "type": "integer", "description": "Length of the window." },
+          "used": { "type": "integer", "description": "Dispatches inside the window as of now." },
+          "remaining": { "type": "integer", "description": "Room left in the window. Zero means the listener is holding its events back." },
+          "nextAllowedAt": { "type": ["string", "null"], "format": "date-time", "description": "When the window next has room. `null` while it already has some." }
+        }
+      },
       "Listener": {
         "type": "object",
-        "required": ["name", "enabled", "sourceType", "intervalSeconds", "lastCheckedAt", "eventCount"],
+        "required": ["name", "enabled", "sourceType", "intervalSeconds", "lastCheckedAt", "eventCount", "rateLimits"],
         "properties": {
           "name": { "type": "string" },
           "enabled": { "type": "boolean" },
           "sourceType": { "type": "string", "description": "What the listener polls, e.g. `github-issues`." },
           "intervalSeconds": { "type": "integer", "description": "Poll interval." },
           "lastCheckedAt": { "type": ["string", "null"], "format": "date-time", "description": "`null` if it has never run." },
-          "eventCount": { "type": "integer", "description": "Distinct events processed so far." }
+          "eventCount": { "type": "integer", "description": "Distinct events processed so far." },
+          "rateLimits": {
+            "type": "array",
+            "description": "This listener's dispatch ceilings and where each stands. Empty when it is not paced.",
+            "items": { "$ref": "#/components/schemas/RateLimitStatus" }
+          }
         }
       },
       "ListenerConfig": {
@@ -989,7 +1728,21 @@
         "properties": {
           "source": { "type": "object", "description": "What to watch. `type` selects the variant: `github-issues`, `github-pr-reviews`, `github-comments`, `github-labels`, `github-label-count`, `shell`, `project-dispatcher`, `label-dispatcher`." },
           "action": { "type": "object", "description": "The task to enqueue when it fires. `mode` and `prompt_template` are required." },
-          "interval_seconds": { "type": "integer", "minimum": 1, "default": 60, "description": "Poll interval. Zero is rejected: a listener polling zero seconds apart would spin against its source as fast as the network allows." }
+          "interval_seconds": { "type": "integer", "minimum": 1, "default": 60, "description": "Poll interval. Zero is rejected: a listener polling zero seconds apart would spin against its source as fast as the network allows." },
+          "rate_limits": {
+            "type": "array",
+            "description": "Ceilings on how often this listener may dispatch, all of which a dispatch has to fit under — \"five an hour and twenty a day\" is two of them. Not the same as `interval_seconds`, which says how often it *looks*. What is over a ceiling is held rather than dropped: an event held back is not marked processed, so a later tick offers it again once the window has moved. Absent means the source's own pace is the only limit.",
+            "items": {
+              "type": "object",
+              "required": ["max"],
+              "anyOf": [{ "required": ["per"] }, { "required": ["per_seconds"] }],
+              "properties": {
+                "max": { "type": "integer", "minimum": 1, "description": "Dispatches allowed in one window. Zero is rejected: that is an off switch, and `PUT /api/v1/listeners/{name}/enabled` is a better one." },
+                "per": { "type": "string", "description": "The window, as a unit (`minute`, `hour`, `day`, `week`) or a count and a unit (`6h`, `90 minutes`). A spelling this does not understand is rejected rather than read as no limit at all." },
+                "per_seconds": { "type": "integer", "minimum": 1, "description": "The window in seconds, as an alternative to `per`." }
+              }
+            }
+          }
         },
         "additionalProperties": true
       },
@@ -1012,7 +1765,8 @@
           "read_only": { "type": "boolean", "default": false },
           "priority": { "type": "integer", "default": 10 },
           "budget": { "type": "number", "description": "Maximum spend in USD." },
-          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" }
+          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" },
+          "spawn_policy": { "$ref": "#/components/schemas/SpawnPolicy" }
         },
         "additionalProperties": true
       },
@@ -1027,9 +1781,29 @@
           "preClaim": { "type": "boolean", "description": "For `has_open_issues` roles: claim the issue at spawn time." }
         }
       },
+      "SpawnPolicy": {
+        "type": "object",
+        "nullable": true,
+        "description": "What a task may itself put on the queue through the `queue_task` MCP tool. Absent (`null`) means nothing, and the tool is not offered at all \u2014 there is no permission label that enables it without a policy, since a label would be a second switch carrying none of the bounds. Every list *widens* what the agent may name; omitting a field always means \"the same as the queueing task's\", so an empty policy still lets a task queue a copy of itself and nothing else.",
+        "properties": {
+          "backends": { "type": "array", "items": { "type": "string" }, "description": "Backends a queued task may be put on. Empty: only the queueing task's own." },
+          "models": { "type": "array", "items": { "type": "string" }, "description": "Models a queued task may be put on. Empty: only the queueing task's own. Not checked against the backend \u2014 orchestra holds no per-backend model list, and one written here would go stale on the vendor's schedule." },
+          "tools": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["create_pr", "comment", "label_issue", "manage_issues", "work_issues", "review_issues"] },
+            "description": "Tools a queued task may be granted, validated against the same vocabulary as a role's `permissions`. May name tools the queueing task does not hold \u2014 a read-only planner queueing an implementor that can open a pull request is the case this exists for \u2014 and what that task already holds is grantable without being listed."
+          },
+          "repos": { "type": "array", "items": { "type": "string" }, "description": "Upstream repositories (`owner/name`) a queued task may run against. Empty: only the queueing task's own. The fork is never named here; it is resolved when the task is queued, by the rule every other dispatch path uses." },
+          "max_tasks": { "type": "integer", "default": 1, "description": "How many tasks one task may queue over its whole run, counted over the queue rather than in memory so a daemon restart cannot reset it. Terminal entries count: the ceiling is on work created, not work still running." },
+          "allow_pre_claim": { "type": "boolean", "default": false, "description": "Whether the tool may claim the issue it binds, taking it out of every dispatcher's candidate set until the queued task ends." },
+          "max_budget": { "type": "number", "description": "Ceiling in USD, and the budget a queued task gets when the agent names none. A budget over it is refused with the ceiling in it rather than silently lowered. Absent means the agent may not name a budget at all \u2014 closed like every other field \u2014 and a queued task takes orchestra's own default." },
+          "priority": { "type": "integer", "default": 10, "description": "Priority of the queued task. Operator-set; the agent has no say, since a priority is only meaningful against every other entry in the queue." },
+          "read_only": { "type": "boolean", "description": "Whether the queued task's workspace is mounted read-only. Absent inherits the queueing task's own answer, so an empty policy cannot hand a read-only task a read-write child." }
+        }
+      },
       "Role": {
         "type": "object",
-        "required": ["name", "permissions", "backend", "model", "priority", "readOnly", "budgetUsd", "dispatch"],
+        "required": ["name", "permissions", "backend", "model", "priority", "readOnly", "budgetUsd", "dispatch", "spawnPolicy"],
         "description": "A global role, as the API renders it.",
         "properties": {
           "name": { "type": "string" },
@@ -1039,7 +1813,8 @@
           "priority": { "type": "integer" },
           "readOnly": { "type": "boolean" },
           "budgetUsd": { "type": ["number", "null"] },
-          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" }
+          "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" },
+          "spawnPolicy": { "$ref": "#/components/schemas/SpawnPolicy" }
         }
       },
       "RoleDetail": {
@@ -1090,7 +1865,7 @@
       },
       "ListenerDetail": {
         "type": "object",
-        "required": ["name", "enabled", "intervalSeconds", "lastCheckedAt", "eventCount", "sourceType", "sourceDetail", "sourceExtras", "action", "recentEvents"],
+        "required": ["name", "enabled", "intervalSeconds", "lastCheckedAt", "eventCount", "sourceType", "sourceDetail", "sourceExtras", "rateLimits", "recentDispatches", "action", "recentEvents"],
         "properties": {
           "name": { "type": "string" },
           "enabled": { "type": "boolean" },
@@ -1103,6 +1878,16 @@
             "type": "array",
             "description": "Source-kind-specific fields, as `[label, value]` pairs.",
             "items": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 }
+          },
+          "rateLimits": {
+            "type": "array",
+            "description": "This listener's dispatch ceilings and where each stands. Empty when it is not paced.",
+            "items": { "$ref": "#/components/schemas/RateLimitStatus" }
+          },
+          "recentDispatches": {
+            "type": "array",
+            "description": "The dispatches still inside the longest configured window, oldest first. Empty for a listener with no `rate_limits`, which keeps none.",
+            "items": { "type": "string", "format": "date-time" }
           },
           "action": { "$ref": "#/components/schemas/ListenerAction" },
           "recentEvents": {
@@ -1119,7 +1904,7 @@
       "ListenerAction": {
         "type": "object",
         "description": "The task a listener enqueues when its source matches.",
-        "required": ["mode", "upstream", "fork", "series", "backend", "model", "workflowPath", "priority", "promptTemplate"],
+        "required": ["mode", "upstream", "fork", "series", "backend", "model", "workflowPath", "priority", "promptTemplate", "spawnPolicy"],
         "properties": {
           "mode": { "type": "string", "enum": ["fork", "pr"] },
           "upstream": { "type": "string" },
@@ -1129,7 +1914,8 @@
           "model": { "type": ["string", "null"] },
           "workflowPath": { "type": ["string", "null"], "description": "Set when the listener enqueues a whole concert." },
           "priority": { "type": "integer" },
-          "promptTemplate": { "type": "string" }
+          "promptTemplate": { "type": "string" },
+          "spawnPolicy": { "$ref": "#/components/schemas/SpawnPolicy" }
         }
       },
       "IssueCounts": {
@@ -1184,7 +1970,7 @@
       },
       "AuthSource": {
         "type": "object",
-        "required": ["label", "backend", "kind", "baseUrl", "isDefault", "pollable", "state", "reason", "availableAt", "pressure", "polledAt", "lastUsedAt", "lastError", "backoffUntil", "limits"],
+        "required": ["label", "backend", "kind", "baseUrl", "isDefault", "pollable", "state", "reason", "availableAt", "pressure", "polledAt", "lastUsedAt", "lastError", "backoffUntil", "limits", "blocks"],
         "properties": {
           "label": { "type": "string" },
           "backend": { "type": "string", "description": "Agent backend this source belongs to." },
@@ -1200,7 +1986,17 @@
           "lastUsedAt": { "type": ["string", "null"], "format": "date-time" },
           "lastError": { "type": ["string", "null"] },
           "backoffUntil": { "type": ["string", "null"], "format": "date-time", "description": "Set only while a polling backoff is still in the future." },
-          "limits": { "type": "array", "items": { "$ref": "#/components/schemas/UsageLimit" } }
+          "limits": { "type": "array", "items": { "$ref": "#/components/schemas/UsageLimit" } },
+          "blocks": { "type": "array", "items": { "$ref": "#/components/schemas/UsageBlock" }, "description": "Limits observed by a run rather than reported by a poll, and still in force. Reported separately from `limits` because a poll cannot see a model-scoped window at all, and separately from `state` because a source whose only block is scoped to one model family is genuinely still available for the others." }
+        }
+      },
+      "UsageBlock": {
+        "type": "object",
+        "required": ["model", "reason", "until"],
+        "properties": {
+          "model": { "type": ["string", "null"], "description": "The model family this block covers. `null` closes the whole account." },
+          "reason": { "type": "string", "description": "What the run reported." },
+          "until": { "type": ["string", "null"], "format": "date-time", "description": "When the block lifts, if anything reported or guessed a time." }
         }
       },
       "AuthBackend": {
@@ -1303,7 +2099,7 @@
     }
   },
   "x-sse": {
-    "description": "Every path under `/api/v1/` that answers a `GET` is also a Server-Sent Events stream at the same path under `/sse/v1/`, carrying the identical JSON payload in the `data` field of each `message` event. Query parameters mean the same thing on both.\n\nFrames are pushed every two seconds, but only when the payload has changed since the last one, so an idle daemon costs nothing; a `: keep-alive` comment goes out every thirty seconds of silence to survive idle proxies. A stream whose resource disappears, or whose parameters are rejected, is closed rather than left hanging.\n\nAuthenticate with the session cookie or the bearer header, exactly as for the JSON routes.",
+    "description": "Every path under `/api/v1/` that answers a `GET` is also a Server-Sent Events stream at the same path under `/sse/v1/`, carrying the identical JSON payload in the `data` field of each `message` event. Query parameters mean the same thing on both.\n\nFrames are pushed every two seconds, but only when the payload has changed since the last one, so an idle daemon costs nothing; a `: keep-alive` comment goes out every thirty seconds of silence to survive idle proxies. A stream whose resource disappears, or whose parameters are rejected, is closed rather than left hanging.\n\nAuthenticate with the session cookie or the bearer header, exactly as for the JSON routes.\n\nOne stream is not a repeated whole-document read: `/sse/v1/interactive/{id}/events` carries a cursor. A transcript only grows, so the whole payload is the whole conversation, and re-sending it every time a word is added is quadratic in the length of the chat. Each frame holds only what follows the last one sent, and its `id` is the last seq in it, so a browser's reconnect resumes from `Last-Event-ID` and anything else passes the same number as `after`. It also ticks faster than the rest, because chat latency is felt.",
     "example": "curl -N -H \"Authorization: Bearer $PASSWORD\" http://127.0.0.1:8080/sse/v1/overview"
   }
 }

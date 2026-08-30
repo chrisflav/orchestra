@@ -15,11 +15,12 @@ active-config ref so `Orchestra.Project.*`/`Orchestra.Project.Claim.*` don't nee
 namespace Orchestra.Taxis
 
 export Taxis.Client (Config listIssues createIssue getIssueDetail getIssue updateIssue deleteIssue
-  createArtifact deleteArtifact listComments createComment listLabels createLabel ensureLabel
+  createArtifact updateArtifact deleteArtifact listComments createComment listLabels createLabel
+  ensureLabel
   listActors getMe epochToIso8601)
 
 export _root_.Taxis (Issue IssueDetail IssueInput IssueUpdate IssueState Label LabelId Comment
-  ReviewState Actor Artifact ArtifactView ArtifactDisplay)
+  ReviewState Actor ActorId Artifact ArtifactId ArtifactView ArtifactDisplay)
 
 /-! ## Active configuration
 

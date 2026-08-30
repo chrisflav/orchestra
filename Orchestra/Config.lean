@@ -80,6 +80,60 @@ instance : FromJson Repository where
     let s ← FromJson.fromJson? (α := String) j
     Repository.parse s |>.mapError id
 
+/-- The repositories a task works on: the upstream it targets, and the fork it pushes to.
+
+    The two halves are never separable. An agent holding a fork it can push to but no upstream to
+    open the pull request against — or the reverse — is not a state anything downstream knows what
+    to do with, so they travel as one value and a task either has the pair or has no repository at
+    all. `Option RepoPair` is the only spelling of "no repository"; `parseRepoPair?` is how that is
+    read out of a config. -/
+structure RepoPair where
+  upstream : Repository
+  fork     : Repository
+deriving BEq, Repr, Inhabited
+
+/-- Read the `upstream`/`fork` pair out of the object `j`.
+
+    Both keys or neither. Absent means the task is repository-independent: it runs in a scratch
+    workspace with nothing checked out. That is worth saying explicitly rather than inferring from
+    half a pair — reading a lone `upstream` as "no repository" would send a task that was written
+    to open a pull request into an empty directory, and the failure would surface far from the key
+    that caused it. -/
+def parseRepoPair? (j : Json) : Except String (Option RepoPair) :=
+  match j.getObjVal? "upstream", j.getObjVal? "fork" with
+  | .error _, .error _ => .ok none
+  | .ok u,    .ok f    => do
+    let upstream ← FromJson.fromJson? (α := Repository) u
+    let fork     ← FromJson.fromJson? (α := Repository) f
+    return some { upstream, fork }
+  | .ok _,    .error _ =>
+    .error "'upstream' is set but 'fork' is not; a task names both repositories or neither"
+  | .error _, .ok _    =>
+    .error "'fork' is set but 'upstream' is not; a task names both repositories or neither"
+
+/-- The `upstream`/`fork` JSON fields of a repository pair, and nothing at all when there is none
+    — which is what `parseRepoPair?` reads back as a repository-independent task. -/
+def repoPairFields (repo : Option RepoPair) : List (String × Json) :=
+  match repo with
+  | some p => [("upstream", ToJson.toJson p.upstream), ("fork", ToJson.toJson p.fork)]
+  | none   => []
+
+/-- How a task's repository is named in listings and logs. -/
+def repoLabel (repo : Option RepoPair) : String :=
+  match repo with
+  | some p => p.fork.toString
+  | none   => "(no repository)"
+
+/-- Where a task's per-run logs live, relative to `<data>/logs`.
+
+    A repository's own `owner/repo` — two path components — or one fixed name for every
+    repository-independent task. That name carries no `/`, so it sits at a level no repository's
+    log directory can reach and the two cannot collide. -/
+def repoLogDir (repo : Option RepoPair) : String :=
+  match repo with
+  | some p => p.fork.toString
+  | none   => "no-repository"
+
 inductive TaskMode where
   | fork
   | pr
@@ -95,6 +149,18 @@ instance : ToJson TaskMode where
   toJson
     | .fork => "fork"
     | .pr => "pr"
+
+/-- Read the deprecated `mode` field out of the object `j`.
+
+    Absent reads as `fork` — grant nothing — which is what a task that writes neither `mode` nor
+    `tools` has always got, and the only answer a repository-independent task could have. Present
+    but unreadable is still an error: `"mode": "PR"` swallowed as `fork` would leave a task that
+    was written to open a pull request holding no tools at all, and, because the deprecation
+    warning only fires when the fallback grants something, nothing on the way would say so. -/
+def parseTaskMode? (j : Json) : Except String TaskMode :=
+  match j.getObjVal? "mode" with
+  | .error _ => .ok .fork
+  | .ok v    => FromJson.fromJson? v
 
 /-- Controls which memory directories are made available to the agent.
     - `none`    – no memory directories
@@ -273,15 +339,166 @@ instance : FromJson AuthMode where
       | none   => .error s!"expected \"ordered\" or \"distribute\", got \"{s}\""
     | j => .error s!"expected auth mode string, got {j}"
 
+/-- What a task may queue, and how much of it, through the `queue_task` MCP tool. Absent from a
+    task's config means the task cannot queue anything: `queue_task` is not offered at all,
+    rather than offered and always refused.
+
+    Lives here rather than beside the tool for the same reason `AuthMode` does — tasks, queue
+    entries, listener actions and roles all carry one. `Orchestra.Spawn` holds the rules it
+    states and the module doc that explains them.
+
+    Every list is a *widening*: it says what the agent may name instead of inheriting the
+    spawning task's own value. Empty — the default on every field — means it may name nothing,
+    which still leaves it able to queue a copy of itself. -/
+structure SpawnPolicy where
+  /-- Backends a queued task may be put on. Empty: only the spawning task's own. -/
+  backends      : List String := []
+  /-- Models a queued task may be put on. Empty: only the spawning task's own.
+
+      Not checked against the backend — orchestra does not hold a model list per backend, and a
+      policy that named one would go stale on the vendor's schedule rather than the operator's.
+      A model the backend does not know fails when the task runs, the same way it does when a
+      role names one. -/
+  models        : List String := []
+  /-- Tools a queued task may be granted, by the same names a role's `permissions` uses. Empty:
+      only the tools the spawning task itself holds.
+
+      May exceed what the spawning task holds — see the module docs; that is the operator's call
+      to make, and the reason it is written in a config file rather than derived. -/
+  tools         : List String := []
+  /-- Repositories a queued task may run against, as `owner/name` upstreams. Empty: only the
+      spawning task's own repository (and nothing at all, for a repository-independent one).
+
+      The fork is never named here. It is resolved when the task is queued, by the same rule
+      every other dispatch path uses (`GitHub.resolveFork`): the target itself when the App can
+      push to it, a fork in the default organisation otherwise. -/
+  repos         : List Repository := []
+  /-- How many tasks one task may queue over its whole run. Counted over the queue rather than
+      in memory, so a daemon restart mid-run cannot reset it.
+
+      Defaults to 1. A queued task costs an agent run's worth of somebody's money, and the
+      failure of a too-generous default is a queue full of work nobody asked for; the failure of
+      a too-strict one is a refusal with the number in it, which the operator can raise. -/
+  maxTasks      : Nat := 1
+  /-- Whether the tool may claim the issue it binds, for the task it queues.
+
+      Off by default. A claim takes an issue out of every dispatcher's candidate set until the
+      task that holds it ends, which is exactly what you want when the queued task is the one
+      that should do the work — and exactly what you do not want by accident. -/
+  allowPreClaim : Bool := false
+  /-- Ceiling on a queued task's budget in USD, and the budget it gets when the agent names none.
+
+      Both halves matter: without the default, a policy capping the budget at 2.0 would still
+      hand an unbudgeted task the daemon's own default of 4.0. -/
+  maxBudget     : Option Float := none
+  /-- Priority of the queued task. Operator-set: the agent has no say, since a priority is only
+      meaningful relative to every other entry in the queue. -/
+  priority      : Nat := 10
+  /-- Whether the queued task's workspace is mounted read-only. Absent inherits the queueing
+      task's own answer, which is what stops an empty policy from handing a read-only reviewer a
+      read-write child — the one way "queue a copy of itself" could have granted more than the
+      task had. Set it explicitly for the case the tool exists for: a read-only planner queueing
+      an implementor that has to write. -/
+  readOnly      : Option Bool := none
+deriving Repr, Inhabited
+
+instance : ToJson SpawnPolicy where
+  toJson p :=
+    let f : List (String × Json) := []
+    let f := if p.backends.isEmpty then f else f ++ [("backends", ToJson.toJson p.backends)]
+    let f := if p.models.isEmpty   then f else f ++ [("models",   ToJson.toJson p.models)]
+    let f := if p.tools.isEmpty    then f else f ++ [("tools",    ToJson.toJson p.tools)]
+    let f := if p.repos.isEmpty    then f else f ++ [("repos",    ToJson.toJson p.repos)]
+    let f := f ++ [("max_tasks", Json.num p.maxTasks)]
+    let f := if p.allowPreClaim then f ++ [("allow_pre_claim", Json.bool true)] else f
+    let f := match p.maxBudget with
+      | some b => f ++ [("max_budget", ToJson.toJson b)]
+      | none   => f
+    let f := if p.priority != 10 then f ++ [("priority", Json.num p.priority)] else f
+    let f := match p.readOnly with
+      | some b => f ++ [("read_only", Json.bool b)]
+      | none   => f
+    Json.mkObj f
+
+instance : FromJson SpawnPolicy where
+  fromJson? j := do
+    -- Every list is read strictly. A `repos` entry misspelled as `"my-account orchestra"`, or a
+    -- `backends` written as a bare string, would otherwise be swallowed as the empty list — and
+    -- the empty list is not "no opinion" here, it is "the agent may name nothing", so the policy
+    -- would quietly do the opposite of what it says while still parsing.
+    let listOr (key : String) : Except String (List String) :=
+      match j.getObjVal? key with
+      | .error _ => .ok []
+      | .ok v    => FromJson.fromJson? v
+    let backends ← listOr "backends"
+    let models   ← listOr "models"
+    let tools    ← listOr "tools"
+    let repos ← match j.getObjVal? "repos" with
+      | .error _ => pure []
+      | .ok v    => (FromJson.fromJson? v : Except String (List Repository))
+    let maxTasks      := j.getObjValAs? Nat   "max_tasks"       |>.toOption |>.getD 1
+    let allowPreClaim := j.getObjValAs? Bool  "allow_pre_claim" |>.toOption |>.getD false
+    let maxBudget     := j.getObjValAs? Float "max_budget"      |>.toOption
+    let priority      := j.getObjValAs? Nat   "priority"        |>.toOption |>.getD 10
+    let readOnly      := j.getObjValAs? Bool  "read_only"       |>.toOption
+    return { backends, models, tools, repos, maxTasks, allowPreClaim, maxBudget, priority,
+             readOnly }
+
+/-- Read a `spawn_policy` out of the object `j`.
+
+    Absent is fine — most tasks queue nothing. Present and unreadable is not: a policy that
+    failed to parse would leave the tool switched off entirely, and "the agent never called it"
+    looks exactly like "the agent could not see it". -/
+def parseSpawnPolicy? (j : Json) : Except String (Option SpawnPolicy) :=
+  match j.getObjVal? "spawn_policy" with
+  | .error _  => .ok none
+  -- An explicit `null` is how "not set" is serialised — by `Option`'s own `ToJson`, among
+  -- others — so a document this module wrote has to read back as the policy-less task it was.
+  | .ok .null => .ok none
+  | .ok v     => (FromJson.fromJson? v : Except String SpawnPolicy).map some
+
+/-- Whether `p` names only tools that exist, given the vocabulary the caller validates against
+    (`Project.Role.knownPermissions`, which is also what a role's `permissions` are checked
+    against — the tool must not be a way to hand a task something a role could not be given).
+
+    Taken as a parameter because the list lives with the roles, which are defined above this
+    module rather than below it — and because keeping one list is what stops the two checks from
+    disagreeing about what a task may be granted. -/
+def SpawnPolicy.validate (p : SpawnPolicy) (knownTools : List String) : Except String Unit := do
+  let unknown := p.tools.filter (fun t => !knownTools.contains t)
+  unless unknown.isEmpty do
+    .error s!"spawn_policy names unknown tool(s) {String.intercalate ", " unknown}; \
+the tools a queued task may be granted are {String.intercalate ", " knownTools}"
+  if p.maxTasks == 0 then
+    .error "spawn_policy 'max_tasks' is 0, which refuses every call; drop the whole \
+'spawn_policy' block to take the tool away instead"
+  if let some b := p.maxBudget then
+    if b ≤ 0.0 then
+      .error "spawn_policy 'max_budget' must be greater than 0; a task budgeted at nothing \
+cannot run"
+
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
-  upstream : Repository
-  fork : Repository
+  /-- The repositories this task works on, or `none` for a **repository-independent** task.
+
+      Such a task runs in the sandbox like any other, but with nothing checked out: instead of a
+      clone slot it gets an empty scratch workspace, and the tools that name a repository —
+      `create_pr`, `merge_pr`, `label_issue`, `comment`, `get_pr_comments` — are withheld. It is
+      the shape meta-work takes: coordinating issues across projects on the taxis tracker,
+      maintenance that belongs to no single repository, where cloning one repository would mean
+      picking an arbitrary one of the several the task is about.
+
+      Withholding those tools is a guardrail, not an isolation boundary. Where the config names an
+      installation the task still holds a GitHub App token in its sandbox, and a task granted
+      `review_issues` can still approve an issue, which queues a merger against whatever pull
+      request that issue carries. What it cannot do is act on a repository *this task* named,
+      because it named none. -/
+  repo : Option RepoPair
   /-- Legacy mode field (deprecated). Use `tools` instead.
       If `tools` is absent, this field is used to derive the allowed tools:
       - `fork` → no tools
       - `pr`   → `["create_pr"]` -/
-  mode : TaskMode
+  mode : TaskMode := .fork
   prompt : String
   /-- Condition the run is held to: the agent must not stop before it holds, and a second model
       call — not the agent itself — decides whether it does.
@@ -319,8 +536,8 @@ structure IOTask (i o : ResultType) where
       therefore not the same as `ordered`, and the two must stay distinguishable. -/
   authMode : Option AuthMode := none
   /-- Optional tools to enable beyond the always-available ones (health, refresh_token,
-      get_pr_comments): `"create_pr"`, `"merge_pr"`, `"label_issue"`, `"comment"`, and the
-      project/issue permission groups.
+      get_pr_comments): `"create_pr"`, `"merge_pr"`, `"label_issue"`, `"comment"`,
+      `"create_repository"`, and the project/issue permission groups.
       When absent, the allowed tools are derived from `mode` for backwards compatibility. -/
   tools : Option (List String) := none
   /-- If true, the project folder is mounted read-only in the sandbox.
@@ -351,6 +568,18 @@ structure IOTask (i o : ResultType) where
   triageAddLabels : List String := []
   /-- Labels to remove from the issue or PR when using the `triage` backend. -/
   triageRemoveLabels : List String := []
+  /-- What this task may put on the queue itself (`Orchestra.Spawn`). `none` — the default —
+      means it may queue nothing, and the `queue_task` tool is not offered to it.
+
+      Never set on a task that was itself queued by that tool: see `Orchestra.Spawn` for why the
+      fan-out is bounded by a rule rather than by a depth counter. -/
+  spawnPolicy : Option SpawnPolicy := none
+  /-- The issue this task may write at or below, when something other than the task's own issue
+      and project decides it. Set only on a task queued by `queue_task`, where it carries the
+      *queueing* task's scope: without it the child re-derives its own from the issue it was
+      bound to (`Project.projectRootOf`), which walks up to the nearest project anchor and can
+      land above the scope the task that queued it was held to — see `writeScopeRoot`. -/
+  scopeRoot : Option Taxis.IssueId := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -467,9 +696,8 @@ instance : FromJson Task where
   fromJson? j := do
     let i          := j.getObjValAs? ResultType "input_type"  |>.toOption |>.getD .unit
     let o          := j.getObjValAs? ResultType "output_type" |>.toOption |>.getD .unit
-    let upstream   ← j.getObjValAs? Repository "upstream"
-    let fork       ← j.getObjValAs? Repository "fork"
-    let mode       ← j.getObjValAs? TaskMode "mode"
+    let repo       ← parseRepoPair? j
+    let mode       ← parseTaskMode? j
     let prompt     ← j.getObjValAs? String "prompt"
     let goal       := j.getObjValAs? String "goal"           |>.toOption
     let agent      := j.getObjValAs? String "agent"          |>.toOption
@@ -493,11 +721,15 @@ instance : FromJson Task where
     let prLabels          := j.getObjValAs? (List String) "pr_labels"           |>.toOption |>.getD []
     let triageAddLabels    := j.getObjValAs? (List String) "triage_add_labels"    |>.toOption |>.getD []
     let triageRemoveLabels := j.getObjValAs? (List String) "triage_remove_labels" |>.toOption |>.getD []
-    return { i, o, ioTask := { upstream, fork, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
+    -- Strict, unlike the fields above: a policy that fails to parse leaves the task unable to
+    -- queue anything, and nothing on the way says the field was why.
+    let spawnPolicy ← parseSpawnPolicy? j
+    let scopeRoot := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
+    return { i, o, ioTask := { repo, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,
-                                triageAddLabels, triageRemoveLabels } }
+                                triageAddLabels, triageRemoveLabels, spawnPolicy, scopeRoot } }
 
 /-- Filesystem paths to expose inside the landrun sandbox. -/
 structure SandboxPaths where
@@ -586,6 +818,28 @@ instance : FromJson QueueConfig where
     let parallelPerRepo := j.getObjValAs? Nat "parallel_per_repo" |>.toOption |>.getD 1
     return { parallel := max 1 parallel, parallelPerRepo := max 1 parallelPerRepo }
 
+/-- What bounds interactive sessions: the `interactive` block in `config.json`.
+
+    Both are capacity, not access. A session pins a clone slot and an agent process for as long
+    as it lives, and an abandoned browser tab should not hold either forever. Spelled like the
+    `queue` block above, which bounds the same resources for tasks.
+
+    Zero is allowed here, unlike the queue's limits, and means what it says: a daemon that will
+    not hold interactive sessions at all. -/
+structure InteractiveConfig where
+  /-- Sessions that may be up at once, across all repositories. -/
+  maxSessions : Nat := 2
+  /-- How long a session may sit without a turn before the daemon closes it. -/
+  idleTimeoutSeconds : Nat := 1800
+deriving Repr, Inhabited
+
+instance : FromJson InteractiveConfig where
+  fromJson? j := do
+    let maxSessions := j.getObjValAs? Nat "max_sessions" |>.toOption |>.getD 2
+    let idleTimeoutSeconds :=
+      j.getObjValAs? Nat "idle_timeout_seconds" |>.toOption |>.getD 1800
+    return { maxSessions, idleTimeoutSeconds }
+
 structure AppConfig where
   appId : Nat
   privateKeyPath : String
@@ -625,6 +879,8 @@ structure AppConfig where
   queue : QueueConfig := {}
   /-- Which execution backend runs this instance's agents. -/
   execution : ExecutionConfig := {}
+  /-- What bounds interactive sessions. -/
+  interactive : InteractiveConfig := {}
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -655,10 +911,11 @@ instance : FromJson AppConfig where
     let taxis := j.getObjValAs? Taxis.Config "taxis" |>.toOption
     let queue := j.getObjValAs? QueueConfig "queue" |>.toOption |>.getD {}
     let execution := j.getObjValAs? ExecutionConfig "execution" |>.toOption |>.getD {}
+    let interactive := j.getObjValAs? InteractiveConfig "interactive" |>.toOption |>.getD {}
     let defaultOrganization := j.getObjValAs? String "default_organization" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
-             agentAuthConfigs, additionalSandboxPaths, taxis, queue, execution,
+             agentAuthConfigs, additionalSandboxPaths, taxis, queue, execution, interactive,
              defaultOrganization }
 
 structure TaskFile where

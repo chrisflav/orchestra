@@ -23,12 +23,12 @@ private def repo : Repository := { owner := "o", name := "r" }
 
 private def entryWithGoal (goal : Option String) : Queue.QueueEntry :=
   { id := "e1", createdAt := "2026-01-01T00:00:00Z"
-  , upstream := repo, fork := repo, mode := .pr
+  , repo := some { upstream := repo, fork := repo }, mode := .pr
   , prompt := "do the thing", goal }
 
 private def recordWithGoal (goal : Option String) : TaskStore.TaskRecord :=
   { id := "t1", createdAt := "2026-01-01T00:00:00Z"
-  , upstream := repo, fork := repo, mode := .pr
+  , repo := some { upstream := repo, fork := repo }, mode := .pr
   , prompt := "do the thing", goal }
 
 /-! ## Serialization round-trips -/

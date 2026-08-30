@@ -25,7 +25,9 @@ def parseOpencodeOutput (line : String) : Option Event := do
     let tool := jStr part "tool"
     let state := jVal part "state" |>.getD (Json.mkObj [])
     let input := jVal state "input" |>.getD (Json.mkObj [])
-    some (.assistant (.toolUse tool input))
+    -- No call id: opencode's part carries no field this can be read from, so the pairing
+    -- between a call and its result is unknown rather than invented.
+    some (.assistant (.toolUse tool input none))
   | "reasoning" =>
     let part ← jVal json "part"
     let text := jStr part "text"
@@ -107,7 +109,7 @@ def opencode : AgentDef where
   -- overwrites with this task's MCP port. A second concurrent run either fails to bind the
   -- port or attaches to the first run's server and executes inside its session.
   parallelSafe := false
-  parseOutputLine := parseOpencodeOutput
+  parseOutputLine := fun line => StreamFormat.one (parseOpencodeOutput line)
   extractSessionId _ := pure none
   cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()
   isUsageLimitError := stdUsageLimitError

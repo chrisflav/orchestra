@@ -1,10 +1,16 @@
 import OrchestraTest.TestM
 import OrchestraTest.GitHubFormatTest
 import OrchestraTest.ListenerConfigTest
+import OrchestraTest.ListenerRateLimitTest
 import OrchestraTest.ServerParseTest
 import OrchestraTest.MergePrTest
+import OrchestraTest.CreateRepositoryTest
 import OrchestraTest.LabelIssueTest
 import OrchestraTest.StreamFormatTest
+import OrchestraTest.StreamArgsTest
+import OrchestraTest.InteractiveWireTest
+import OrchestraTest.InteractiveStoreTest
+import OrchestraTest.InteractiveSessionTest
 import OrchestraTest.WorkflowParserTest
 import OrchestraTest.ProjectClaimTest
 import OrchestraTest.ProjectFieldsTest
@@ -15,6 +21,7 @@ import OrchestraTest.KubernetesTest
 import OrchestraTest.LabelDispatcherTest
 import OrchestraTest.DispatchCandidatesTest
 import OrchestraTest.ProjectToolsTest
+import OrchestraTest.TaxisLabelsTest
 import OrchestraTest.ProjectRoleTest
 import OrchestraTest.ParallelQueueTest
 import OrchestraTest.GitHubErrorTest
@@ -24,3 +31,6 @@ import OrchestraTest.DashboardTest
 import OrchestraTest.GoalTest
 import OrchestraTest.ConfigApiTest
 import OrchestraTest.ClaudeAuthEnvTest
+import OrchestraTest.RepolessTaskTest
+import OrchestraTest.SpawnTaskTest
+import OrchestraTest.StaleTaskTest

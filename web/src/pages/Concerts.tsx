@@ -3,7 +3,7 @@ import { Empty, List, Row } from "../components/List";
 import { Facts, LivePage, Section } from "../components/Page";
 import { Status } from "../components/Status";
 import { Time } from "../components/Time";
-import { orDash } from "../format";
+import { orDash, repoLabel } from "../format";
 
 /**
  * A single concert run and the tasks it is stepping through.
@@ -53,7 +53,7 @@ export function ConcertDetail() {
                     to={`/tasks/${encodeURIComponent(s.id)}`}
                     title={s.concertStepKey || s.prompt}
                     end={<Status status={s.status} />}
-                    meta={[s.id, s.fork, <Time key="t" iso={s.createdAt} />]}
+                    meta={[s.id, repoLabel(s.fork), <Time key="t" iso={s.createdAt} />]}
                   />
                 ))
               )}

@@ -1,6 +1,6 @@
 ---
 name: orchestra-taxis-issues
-description: Work with taxis issues from inside an orchestra task — claim one, split it, attach a PR, release it, or create and update issues in the tracker. Use whenever you need to find what to work on, record progress against an issue, or restructure a project's issue tree. Taxis issues are not GitHub issues; `gh` cannot see them.
+description: Work with taxis issues from inside an orchestra task — claim one, split it, attach a PR, release it, create and update issues, and keep the context notes that carry findings from one run to the next. Use whenever you need to find what to work on, record what you worked out, or restructure a project's issue tree. Taxis issues are not GitHub issues; `gh` cannot see them.
 ---
 
 # Taxis issues
@@ -81,9 +81,13 @@ clear; being decomposed is read from the tree.
 
 ```
 list_issues(project_id: 42, status: "open", parent_id: 57)
-get_issue(issue_id: 57)                    full detail: children, attached PRs, dependencies
+get_issue(issue_id: 57)                    full detail: labels, assignees, children, attached PRs
 create_issue(project_id: 42, title: "...", description: "...", parent_id: 57)
 update_issue(issue_id: 57, title/description/status/target_repo/target_branch/dependency_ids)
+update_issue(issue_id: 57, labels_add: [...], labels_remove: [...])
+update_issue(issue_id: 57, assignees_add: [...], assignees_remove: [...])
+list_labels()                              the labels the tracker defines
+list_actors()                              the people and bots it knows, by email
 ```
 
 Ids are **integers**, taxis's own convention — `42`, not `"42"`.
@@ -94,7 +98,36 @@ it guessing.
 `dependency_ids` lists issues that must be finished before this one is dispatched. A dependency
 blocks only while it is still **open** — completing or abandoning it unblocks the dependent, so
 abandoning work does not strand everything downstream. Use this for real ordering constraints
-rather than encoding them in prose.
+rather than encoding them in prose. There is no priority field: ordering *is* the dependency
+graph.
+
+### Labels are how work is routed
+
+A taxis label is not decoration. Orchestra's dispatcher selects the issues it offers, and the
+role it offers them to, by label — so labelling an issue is what causes an agent to be spawned on
+it, and relabelling is what sends it to a different one. Labels are inherited down the tree: a
+label on a project root puts the whole subtree in scope.
+
+Which labels mean what is your instance's configuration, not something to infer from the name.
+`list_labels` is the vocabulary, and it is a closed one: a name the tracker does not already
+define is refused (with the list, so you can pick a real one) rather than created.
+
+Two are refused outright, because orchestra maintains them itself and reads state back off them:
+`o-claimed` *is* an issue's claim, and `t-project` *is* what makes an issue a project. Claim an
+issue with `claim_issue`, not by labelling it.
+
+Labels and assignees are **add/remove deltas**, not a set to write: `labels_add: ["x"]` leaves
+every other label alone. There is no way to set the list wholesale, which is deliberate — taxis
+takes the whole label array in one write, so an agent replacing the set would drop the claim
+label by omission.
+
+### Assignees are how a human is put on the hook
+
+`assignees_add` takes emails or display names (`list_actors` gives both; the email is what is
+unique, and an ambiguous display name is refused rather than guessed). Assigning a person is the
+escalation move: it says this issue is waiting on a named human rather than on an agent. Say what
+you need from them with `comment_issue` in the same pass — an assignment with no question
+attached tells them nothing.
 
 ### Writes are confined to your project subtree
 
@@ -129,6 +162,44 @@ These are comments on the **taxis** issue. Do not confuse them with `comment`, w
 GitHub issue or pull request the task was launched from — a different system, see the
 `orchestra-pull-requests` skill.
 
+## Context notes — where findings go
+
+Besides its description and its thread, an issue carries any number of **context notes**: a title
+and a block of markdown, held beside the issue rather than in it. Taxis keeps them folded behind
+their titles, so they accumulate over an issue's life without any of it competing for a reader's
+attention.
+
+```
+list_context(issue_id: 57)                      read them
+add_context(issue_id: 57, title: …, text: …)    attach one
+update_context(issue_id: 57, context_id: 9, title: …, text: …)   rewrite one in place
+```
+
+This is where implementation detail, findings and results belong. Three places, one right answer
+for each:
+
+| | What belongs there |
+| --- | --- |
+| `description` | What the work *is*. One statement, kept current — what every reader has to read, and what a dispatched worker is shown as its task. |
+| The comment thread | The conversation: review verdicts, questions, decisions and their reasons. |
+| A context note | What the next agent would otherwise rediscover: what you tried, what you measured, which approach failed and why, what the build environment needs. |
+
+**Do not append your results to the description.** Appending run notes to the one field a reader
+is meant to read displaces the task with a log of the work. And do not leave them in a comment:
+the thread is a conversation, and a note dropped into it sinks under everything said since.
+
+**Read them before you start.** `list_context` — or, if your prompt carries `{{issue_context}}`,
+you already have them and need not fetch anything. Whatever the last agent on this issue learned
+is there and nowhere else. Then, when your own work is done, record what you learned that the
+diff does not show.
+
+**Revise rather than pile up.** A note that has gone out of date is rewritten with
+`update_context`, not contradicted by a second one. Title and text replace what was there — a
+note is revised whole, so pass the full text you want it to end up with. `get_issue` shows the
+titles; `list_context` gives you the bodies.
+
+Notes are exactly as visible as the issue they hang off. Nothing secret goes in one.
+
 ## Reviewing
 
 ```
@@ -159,12 +230,31 @@ worker's question or leaving guidance without deciding yet.
 
 Tools are gated per task by permission group:
 
-- `manage_issues` — `list_projects`, `list_issues`, `get_issue`, `create_issue`, `update_issue`
+- `manage_issues` — `list_projects`, `list_issues`, `get_issue`, `create_issue`, `update_issue`,
+  `list_labels`, `list_actors`
 - `work_issues` — `list_open_issues`, `claim_issue`, `release_claim`, `attach_pr`, `split_issue`
 - `review_issues` — `list_issues_in_review`, `decide_issue`
 
 `list_issue_comments` comes with any of the three, and `comment_issue` with `work_issues` or
 `review_issues` — the thread is shared ground between whoever reviews and whoever reworks.
 
+`list_context`, `add_context` and `update_context` come with any of the three, reads and writes
+alike. Every role that touches an issue learns something the next one would otherwise have to
+rediscover.
+
+Labels and assignees ride on `update_issue`, so they belong to `manage_issues`: a task that can
+route work is a task that was given the group for shaping the backlog.
+
 A refusal saying the task is not authorized for a group is deliberate, not a bug. Report what you
 needed; do not look for another route to it.
+
+`queue_task` is gated differently: it belongs to no group, and no group grants it. It appears
+only when your task was configured with a spawn policy, and that policy — not your permission
+groups — decides which backend, model, tools and repository a task you queue may have. Everything
+you leave out is inherited from your own task, and a refusal names what you may pick from
+instead, so ask for what you want and read the refusal rather than guessing.
+
+Its `pre_claim` is the one other way a claim is taken. It claims the bound issue for the task you
+are queueing, not for you, and it is refused unless the policy allows it. The issue must be
+unclaimed — including by you: binding an issue you hold would take the claim off your own run.
+Release it first if you mean to hand the work over.

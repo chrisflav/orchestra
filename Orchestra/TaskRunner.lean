@@ -4,8 +4,8 @@ import Orchestra.Agents.Claude
 import Orchestra.Agents.Opencode
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
-import Orchestra.GitHub
 import Orchestra.Exec
+import Orchestra.GitHub
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.Sandbox
@@ -49,7 +49,7 @@ def enqueueMergerImpl (appConfig : AppConfig) (pid : Taxis.IssueId) (iid : Taxis
     let entry : Queue.QueueEntry :=
       { id, createdAt
       -- Both sides are the PR's repo: the merger works directly in it, never in a fork.
-      , upstream := pr.repo, fork := pr.repo
+      , repo := some { upstream := pr.repo, fork := pr.repo }
       , mode := .pr
       , prompt := s!"merge {pr.repo}#{pr.number}"
       , backend := some "merger"
@@ -82,7 +82,7 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
       -- `review_issues`/`comment`/`get_pr_comments` below and no `create_pr`, so it never pushes
       -- anything. It needs a readable checkout, which the PR's own repo already is. Forking to
       -- give it one would create a repository per reviewed upstream for nothing.
-      , upstream := pr.repo, fork := pr.repo
+      , repo := some { upstream := pr.repo, fork := pr.repo }
       , mode := .pr
       , prompt := renderReviewerPrompt tmpl.promptTemplate pr iid
       , backend := tmpl.backend
@@ -94,6 +94,106 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
       , issueNumber := some pr.number
       , priority := 50 }
     Queue.saveEntry entry
+    return .ok id
+  catch e =>
+    return .error (toString e)
+
+/-- Put a spawn the policy has already approved (`SpawnPolicy.resolve`) on the queue. Used by the
+    `queue_task` tool via the `enqueueTask` hook; `spawnerTaskId` is the task making the call,
+    recorded on the entry as `spawned_by`.
+
+    Everything here needs something the pure resolution cannot reach: the queue, to count what
+    this task has already spawned; GitHub, to resolve a fork for the repository; and taxis, to
+    find the bound issue's project and to claim it. -/
+def enqueueTaskImpl (appConfig : AppConfig) (resolved : ResolvedSpawn) (spawnerTaskId : String) :
+    IO (Except String String) := do
+  try
+    -- Counted over the queue rather than kept in memory: entries outlive the daemon, and an
+    -- allowance that reset on restart is not an allowance. Terminal entries count too — the
+    -- ceiling is on how much work a task may create, not on how much of it is still running.
+    let spawned := (← Queue.loadAllEntries).filter (·.spawnedBy == some spawnerTaskId)
+    if spawned.size ≥ resolved.maxTasks then
+      return .error s!"this task has already queued {spawned.size} task(s), which is all its \
+spawn policy allows ({resolved.maxTasks})"
+    -- Resolved even when the repository was inherited rather than named, so that one rule
+    -- decides where a task pushes no matter how it got here (see `Orchestra.Spawn`).
+    let repo? ← match resolved.repo with
+      | none => pure none
+      | some upstream =>
+        match ← GitHub.resolveFork appConfig upstream with
+        | none => return .error s!"no task was queued: the GitHub App cannot push to \
+{upstream} and could not fork it (see [fork] logs)"
+        | some fork => pure (some ({ upstream, fork } : RepoPair))
+    -- The bound issue's own project, not the spawning task's: an issue below this task's subtree
+    -- can still sit under a different project anchor, and the claim is taken against the anchor
+    -- taxis knows about.
+    let (projectId, issue?) ← match resolved.issueId with
+      | none => pure (resolved.projectId, none)
+      | some iid =>
+        match ← Project.findIssue iid with
+        | none => return .error s!"no task was queued: issue {iid.toString} was not found"
+        | some (project, issue) =>
+          -- Refused whether or not the spawn asked to claim it, and whoever holds it — this task
+          -- included. A queued task's id is written over the claim on the issue it is bound to
+          -- when it starts (`updateClaimTaskId` below) and the claim is released when it ends,
+          -- neither of which checks who held it: binding a claimed issue therefore takes the
+          -- claim off its holder and hands the issue back to the open pool underneath an agent
+          -- still working it. `tryClaim` refuses the same case under the mutex a moment later;
+          -- this is what makes the unclaimed path refuse it too.
+          match ← Project.loadClaim issue.id with
+          | some held =>
+            return .error s!"no task was queued: issue {issue.id.toString} is claimed by task \
+{held.taskId}, and binding it to another task would take the claim off it. Release it first if \
+it is yours to release."
+          | none => pure (some project.id, some issue)
+    let id ← TaskStore.generateId
+    let createdAt ← TaskStore.currentIso8601
+    -- Claimed before the entry is saved, and nothing is queued if the claim fails: an entry
+    -- queued against an issue somebody else holds is a second agent walking into occupied work.
+    let mut claimed : Option (Taxis.IssueId × Taxis.IssueId) := none
+    if resolved.preClaim then
+      match projectId, issue? with
+      | some pid, some issue =>
+        let now ← TaskStore.currentIso8601
+        let agent := resolved.backend.getD "claude"
+        match ← Project.tryClaim globalClaimManager pid issue.id id agent now with
+        | .acquired _ => claimed := some (pid, issue.id)
+        | .alreadyClaimed e =>
+          return .error s!"no task was queued: issue {issue.id.toString} is already claimed \
+by task {e.taskId}"
+        | .invalid r => return .error s!"no task was queued: {r}"
+      | _, _ => return .error "no task was queued: pre_claim needs a bound issue"
+    let entry : Queue.QueueEntry :=
+      { id, createdAt
+      , repo := repo?
+      -- Cosmetic: `tools` is always set below, so nothing falls back to the deprecated `mode`.
+      , mode := .pr
+      , prompt := resolved.prompt
+      , backend := resolved.backend
+      , model := resolved.model
+      -- Always `some`, never `none`: an absent list is what makes a task fall back to `mode` for
+      -- its tools, and a task queued with none on purpose must get none.
+      , tools := some resolved.tools
+      , budget := resolved.budget
+      , readOnly := resolved.readOnly
+      , priority := resolved.priority
+      , projectId
+      , issueId := resolved.issueId
+      -- Never a policy of its own: `queue_task` is one level deep, always (`Orchestra.Spawn`).
+      , spawnPolicy := none
+      , spawnedBy := some spawnerTaskId
+      -- The queueing task's scope, not one derived from the bound issue (`Tools.writeScopeRoot`).
+      , scopeRoot := resolved.scopeRoot }
+    -- A claim taken for an entry that then failed to be written is held by an id no entry has,
+    -- and nothing downstream would ever release it: the daemon releases on behalf of the entry
+    -- it is running, and there would be none.
+    try
+      Queue.saveEntry entry
+    catch e =>
+      if let some (pid, iid) := claimed then
+        let now ← TaskStore.currentIso8601
+        let _ ← Project.release globalClaimManager pid iid .open now
+      return .error s!"no task was queued: {e}"
     return .ok id
   catch e =>
     return .error (toString e)
@@ -135,11 +235,10 @@ private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : S
     IO.eprintln s!"  [merger] pr checkout failed:\n{coStderr}"
     throw (.userError "pr checkout failed")
   -- Run the validation script before merging.
-  --
-  -- The environment is opened *after* the checkout, not before it: a backend that runs things
-  -- elsewhere copies the tree at that moment, and a copy taken before `gh pr checkout` would be of
-  -- the branch the merger is not merging.
   IO.println "  [merger] running validation script"
+  -- The environment is opened *after* the checkout, not before it: a backend that runs things
+  -- elsewhere copies the tree at that moment, and a copy taken before `gh pr checkout` would be
+  -- of the branch the merger is not merging.
   let repoConfig ← RepoConfig.loadRepoConfig repoPath
   let session ← execBackend.openSession {
     workdir := repoPath
@@ -198,17 +297,19 @@ private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : S
 private def runTriage {i o : ResultType} (pat : String) (ioTask : IOTask i o)
     (initialRecord : TaskStore.TaskRecord) : IO Unit := do
   IO.println "  [triage] label backend"
+  let some repo := ioTask.repo
+    | throw (.userError "triage task has no repository; it labels an issue on the upstream one")
   let some issueNumber := ioTask.issueNumber
     | throw (.userError "triage task missing issue_number")
   let addLabels    := ioTask.triageAddLabels
   let removeLabels := ioTask.triageRemoveLabels
   if !addLabels.isEmpty then
-    IO.println s!"  [triage] adding labels {addLabels} to {ioTask.upstream}#{issueNumber}"
-    GitHub.addIssueLabels pat ioTask.upstream issueNumber addLabels
+    IO.println s!"  [triage] adding labels {addLabels} to {repo.upstream}#{issueNumber}"
+    GitHub.addIssueLabels pat repo.upstream issueNumber addLabels
   for label in removeLabels do
-    IO.println s!"  [triage] removing label '{label}' from {ioTask.upstream}#{issueNumber}"
+    IO.println s!"  [triage] removing label '{label}' from {repo.upstream}#{issueNumber}"
     try
-      GitHub.removeIssueLabel pat ioTask.upstream issueNumber label
+      GitHub.removeIssueLabel pat repo.upstream issueNumber label
     catch e =>
       IO.eprintln s!"  [triage] failed to remove label '{label}': {e}"
   TaskStore.saveTask { initialRecord with status := .completed }
@@ -235,7 +336,7 @@ def backendIsParallelSafe (backend : Option String) : Bool :=
     exists (`Dirs.skillsDir`). The skills tell an agent to reach for the MCP tools rather than
     `gh` for anything touching pull requests or taxis issues, which it has no way to know
     otherwise. Silently skipped when not installed. -/
-private def defaultPluginDirs (appConfig : AppConfig) : IO (Array String) := do
+def defaultPluginDirs (appConfig : AppConfig) : IO (Array String) := do
   let skills ← Dirs.skillsDir
   if ← skills.pathExists then
     return #[skills.toString] ++ appConfig.pluginDirs
@@ -245,17 +346,23 @@ private def sanitizeProjectName (upstream : Repository) : String :=
   s!"{upstream.owner}-{upstream.name}"
 
 /-- Return the active memory directories for the given mode and upstream repo.
-    Creates the directories if they do not yet exist. -/
-private def resolveMemoryDirs (mode : MemoryMode) (upstream : Repository) : IO (Array String) := do
+    Creates the directories if they do not yet exist.
+
+    A repository-independent task has no upstream to name a per-project directory after, so it
+    only ever gets the global one — `project` resolves to nothing for it and `both` to the global
+    directory alone. Global memory is the right home for what such a task learns anyway: it is
+    work that spans projects rather than belonging to one. -/
+private def resolveMemoryDirs (mode : MemoryMode) (upstream : Option Repository)
+    : IO (Array String) := do
   let memBase    := (← Dirs.dataBase) / "memory"
   let globalDir  := memBase
-  let projectDir := memBase / sanitizeProjectName upstream
+  let projectDir := upstream.map (memBase / sanitizeProjectName ·)
   let dirs : Array System.FilePath :=
     match mode with
     | .none    => #[]
     | .global  => #[globalDir]
-    | .project => #[projectDir]
-    | .both    => #[globalDir, projectDir]
+    | .project => projectDir.toArray
+    | .both    => #[globalDir] ++ projectDir.toArray
   for dir in dirs do
     IO.FS.createDirAll dir
   return dirs.map (·.toString)
@@ -406,7 +513,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- onto the entry from here so the dashboard can find the log a running agent is filling.
     (onStart : String → IO Unit := fun _ => pure ())
     : IO ((String × TaskStore.TaskStatus) × Option o.Type × Option Lean.Json) := do
-  IO.println s!"=== Task {idx}: {ioTask.fork} ({repr ioTask.mode}) ==="
+  IO.println s!"=== Task {idx}: {repoLabel ioTask.repo} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
   -- TODO: unify queue entry IDs and task IDs. Currently the queue entry gets
   -- one ID at enqueue time and the task gets a second ID here at run time,
@@ -417,7 +524,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let createdAt ← TaskStore.currentIso8601
   let initialRecord : TaskStore.TaskRecord := {
     id := taskId, createdAt
-    upstream := ioTask.upstream, fork := ioTask.fork, mode := ioTask.mode
+    repo := ioTask.repo, mode := ioTask.mode
     prompt := ioTask.prompt, goal := ioTask.goal, continuesFrom, series
     backend := ioTask.backend, model := ioTask.model, agent := ioTask.agent
     systemPrompt := ioTask.systemPrompt, budget := ioTask.budget
@@ -478,49 +585,86 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   IO.println "  Prompt:"
   for line in ioTask.prompt.splitOn "\n" do
     IO.println s!"    {line}"
-  -- 1. Create GitHub App token
+  -- 1. Create GitHub App token.
+  --
+  -- Which installation depends on what the task has to reach. One with a repository looks up the
+  -- installation on its fork's owner; one without has no owner to look up, so it falls back to
+  -- the configured `installation_id` and then to `default_organization` — the org orchestra
+  -- already works in. A repository-independent task with neither runs with no GitHub credentials
+  -- at all rather than refusing to start: its work may be entirely on the issue tracker, and
+  -- failing over a token it would never use is the wrong trade.
   IO.println "  Creating GitHub App token..."
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let forkOwner := ioTask.fork.owner
-  let installationId ← match appConfig.installationId with
-    | some id => pure id
-    | none => GitHub.getInstallationId jwt forkOwner
-  let token ← GitHub.createInstallationToken jwt installationId
+  let installationId : Option Nat ← match appConfig.installationId with
+    | some id => pure (some id)
+    | none    =>
+      match ioTask.repo with
+      | some repo => some <$> GitHub.getInstallationId jwt repo.fork.owner
+      | none      =>
+        match appConfig.defaultOrganization with
+        | some org => some <$> GitHub.getInstallationId jwt org
+        | none     => pure none
+  let token ← match installationId with
+    | some id => GitHub.createInstallationToken jwt id
+    | none    => pure ""
   -- Deliberately no `GitHub.setupGhAuth` here. That writes the token to
   -- `~/.config/gh/hosts.yml`, which every concurrently running task shares, so under
   -- `--parallel > 1` the last task to authenticate supplies the credentials for all of them.
   -- The token is threaded explicitly instead: into `git`/`gh` through `Repo`, and into the
   -- sandbox through `Sandbox.launchAgent`'s `GH_TOKEN`.
-  IO.println "  Token ready"
+  if token.isEmpty then
+    IO.println "  No GitHub App installation for this task; running without a token"
+  else
+    IO.println "  Token ready"
   -- Triage: add/remove labels on an issue or PR. Purely a GitHub API call, so it runs before
   -- any repository work — it needs no checkout, and provisioning a clone slot for it would
   -- mean a full `git clone` plus fetch to change a label.
   if ioTask.backend == some "triage" then
     runTriage appConfig.pat ioTask initialRecord
     return ((taskId, ← finalStatusOf taskId), none, none)
-  -- 2. Prepare the task slot, or clone / update the shared repo when running outside the queue
-  let repoPath ← match slotOverride with
-    | some assign =>
-      IO.println s!"Preparing slot {assign.slot} for {ioTask.fork}..."
-      let p ← Repo.ensureSlot ioTask.fork ioTask.upstream assign (token := some token)
+  -- Checked before anything is provisioned: the merger needs a checkout of the pull request's
+  -- own repository, so a repository-independent one cannot be served by the scratch workspace
+  -- below and should say so rather than have one created for it.
+  if ioTask.backend == some "merger" && ioTask.repo.isNone then
+    throw (.userError "merger task has no repository; it merges a pull request on one")
+  -- 2. Prepare the workspace: the task slot, or the shared repo clone when running outside the
+  -- queue — and for a repository-independent task, an empty scratch directory in place of either.
+  let repoPath ← match ioTask.repo, slotOverride with
+    | some repo, some assign =>
+      IO.println s!"Preparing slot {assign.slot} for {repo.fork}..."
+      let p ← Repo.ensureSlot repo.fork repo.upstream assign (token := some token)
       IO.println s!"  Slot at {p}"
       pure p
-    | none   =>
-      IO.println s!"Cloning/updating {ioTask.fork}..."
-      let p ← Repo.ensureCloned ioTask.fork ioTask.upstream interactive (token := some token)
+    | some repo, none =>
+      IO.println s!"Cloning/updating {repo.fork}..."
+      let p ← Repo.ensureCloned repo.fork repo.upstream interactive (token := some token)
       IO.println s!"  Repo at {p}"
+      pure p
+    | none, some assign =>
+      IO.println s!"Preparing workspace slot {assign.slot} (no repository)..."
+      let p ← Repo.ensureWorkspace assign
+      IO.println s!"  Workspace at {p}"
+      pure p
+    | none, none =>
+      IO.println "Preparing the scratch workspace (no repository)..."
+      -- `continuesFrom` rather than nothing: outside the queue there is no slot record to look a
+      -- predecessor's workspace up by, but there is only one workspace, and the task this run
+      -- continues is exactly the occupant its files would be under. Without it every
+      -- `orchestra continue` on a repository-independent task would restore the conversation onto
+      -- a directory that had just been emptied.
+      let p ← Repo.ensureAdhocWorkspace (occupant := some taskId) (resumeFrom := continuesFrom)
+      IO.println s!"  Workspace at {p}"
       pure p
   -- 3. Open the environment this task runs in.
   --
   -- One session for the whole task, not one per agent launch, because a task is not one command:
   -- `init.sh`, `before.sh`, the agent, `validation.sh`, the agent again if that failed, and
-  -- `after.sh` all have to happen in one place, on one copy of the checkout. For landrun that is
+  -- `after.sh` all have to happen in one place, on one copy of the workspace. For landrun that is
   -- this machine and opening it costs nothing; for a backend that runs the agent elsewhere it is
-  -- what makes validation answer a question about the tree the agent actually worked on, and what
-  -- lets a retry `--resume` the conversation the first attempt started.
+  -- what makes validation answer a question about the tree the agent actually worked on.
   --
-  -- Resolved after the clone (the session is opened on it) and before the merger, which validates
-  -- a pull request and so needs the same environment for the same reason. Checked
+  -- Resolved after the workspace (the session is opened on it) and before the merger, which
+  -- validates a pull request and so needs the same environment for the same reason. Checked
   -- (`Backend.preflight`) while resolving, so a missing `landrun` or `kubectl` is one line naming
   -- the task rather than every attempt failing as `could not execute external process`.
   let execBackend ← match ← Exec.resolve appConfig.execution with
@@ -532,31 +676,31 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       -- claim this task is holding, and a task that returned normally would keep it.
       TaskStore.saveTask { initialRecord with status := .failed }
       throw (IO.userError s!"cannot run the agent: {e}")
-  -- Where the MCP server has to listen for this backend's agents, and the secret they present.
-  -- Loopback and no secret unless the backend runs the agent off this machine.
+  -- Where the MCP server has to listen for this backend's agents, on which ports, and the secret
+  -- they present. Loopback, any port and no secret unless the agent runs off this machine.
   let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
+  -- Merger: checkout the PR branch, run validation, then merge. Shares auth + workspace setup
+  -- with all other backends but skips the MCP server and the agent — and opens its own
+  -- environment for the validation script, once the branch it is merging is checked out.
+  if ioTask.backend == some "merger" then
+    runMerger execBackend token ioTask repoPath initialRecord
+    return ((taskId, ← finalStatusOf taskId), none, none)
   -- What the session is opened with. The grants are the same ones the agent's own launch will be
   -- built from (`Sandbox.grantsFor`): a backend running the agent elsewhere reads them to know
-  -- what to carry there — the checkout, the plugin directories, the memories — and one running it
-  -- here ignores them and builds its ruleset per launch.
+  -- what to carry there — the workspace, the plugin directories, the memories — and one running
+  -- it here ignores them and builds its ruleset per launch.
   let pluginDirs ← defaultPluginDirs appConfig
-  let memoryDirs ← resolveMemoryDirs ioTask.memory ioTask.upstream
+  let memoryDirs ← resolveMemoryDirs ioTask.memory (ioTask.repo.map (·.upstream))
   -- Read before the environment is opened, because one of the things it says is which environment
   -- to open: what a task needs installed is a property of the repository, and the repository is
   -- where that is written down.
   let repoConfig ← RepoConfig.loadRepoConfig repoPath
-  -- Merger: checkout the PR branch, run validation, then merge. Shares auth + clone setup with
-  -- all other backends but skips the MCP server and the agent — and opens its own environment for
-  -- the validation script, once the branch it is merging is checked out.
-  if ioTask.backend == some "merger" then
-    runMerger execBackend token ioTask repoPath initialRecord
-    return ((taskId, ← finalStatusOf taskId), none, none)
   let session ← execBackend.openSession {
     workdir := repoPath
     grants  := Sandbox.grantsFor (agentDefOfBackend ioTask.backend).sandboxPaths
                  appConfig.additionalSandboxPaths repoPath ioTask.readOnly pluginDirs memoryDirs
     label   := taskId
-    repo    := some ioTask.fork.toString
+    repo    := ioTask.repo.map (·.fork.toString)
     image   := repoConfig.image }
   IO.println s!"  Running in: {session.id}"
   try
@@ -570,18 +714,25 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
         | some name => s!"this task continues series '{name}' ({continuesFrom.getD "?"})"
         | none      => s!"this task continues {continuesFrom.getD "another task"}"
       TaskStore.saveTask { initialRecord with status := .failed }
-      throw (IO.userError s!"{what}, whose conversation the agent left in an environment that no longer exists ({session.id} is new for every task). Configure a persistent agent home for this execution backend — execution.options.home_claim for kubernetes — or queue the work as a task of its own.")
+      throw (IO.userError s!"{what}, whose conversation the agent left in an environment that no \
+longer exists ({session.id} is new for every task). Configure a persistent agent home for this \
+execution backend — execution.options.home_claim for kubernetes — or queue the work as a task of \
+its own.")
     -- 4. Start MCP server (runs in this process, outside the sandbox)
     -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
-    let (allowedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
-    if usingModeFallback then
+    let (requestedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
+    -- Only when the fallback actually granted something. `mode` is optional now, so every task
+    -- that writes neither field lands on `fork` — and warning about a deprecated field the task
+    -- never wrote, to say it was read as "grant nothing", is noise on every repository-independent
+    -- run. `pr` is the case that carries meaning and is worth migrating.
+    if usingModeFallback && !requestedTools.isEmpty then
       IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
-        Use 'tools' instead (e.g. {repr allowedTools}) and optionally 'read_only: true/false'."
+        Use 'tools' instead (e.g. {repr requestedTools}) and optionally 'read_only: true/false'."
+    let allowedTools ← Server.withoutRepoScopedTools ioTask.repo requestedTools
     let inputJson := some (ResultType.valueToJson i input)
     let outputRef ← IO.mkRef (none : Option Lean.Json)
     let serverState : Server.State := {
-      upstream := ioTask.upstream
-      fork := ioTask.fork
+      repo := ioTask.repo
       allowedTools
       appId := appConfig.appId
       privateKeyPath := appConfig.privateKeyPath
@@ -600,15 +751,28 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       issueId   := ioTask.issueId
       enqueueMerger   := some (enqueueMergerImpl appConfig)
       enqueueReviewer := some enqueueReviewerImpl
+      spawnPolicy  := ioTask.spawnPolicy
+      -- What an omitted field in a `queue_task` call inherits. `allowedTools` rather than the
+      -- task's raw `tools`: it is the list the server actually granted, after the repository-scoped
+      -- ones were withheld from a repository-independent task, so a queued task cannot inherit a
+      -- tool this one was refused.
+      spawnContext := { backend := ioTask.backend
+                      , model   := ioTask.model
+                      , repo    := ioTask.repo.map (·.upstream)
+                      , tools   := allowedTools
+                      , readOnly := ioTask.readOnly
+                      , projectId := ioTask.projectId }
+      enqueueTask  := some (enqueueTaskImpl appConfig)
+      scopeRoot    := ioTask.scopeRoot
       prLabels  := ioTask.prLabels
+      defaultOrganization := appConfig.defaultOrganization
       authToken := mcpToken
     }
-    let (port, shutdown) ← Server.start serverState (bindHost := mcpBind)
-      (portRange := mcpPorts)
+    let (port, shutdown) ← Server.start serverState (bindHost := mcpBind) (portRange := mcpPorts)
     IO.println s!"  MCP server on port {port}"
     -- 5. Run the init hook, in the session — that is where the agent will work, and where
-    -- `init.sh` installs the toolchain `validation.sh` later needs. The repository's config was
-    -- read before the session was opened, since it says which environment to open.
+    -- `init.sh` installs the toolchain `validation.sh` later needs. The repository's config was read
+    -- before the session was opened, since it says which environment to open.
     RepoConfig.runInitIfNeeded session repoPath
     -- 6. Validation loop: before.sh → agent → validation.sh, retry on failure
     let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
@@ -661,7 +825,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
         else pure none
       let taskLogFile : Option System.FilePath ← do
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-        pure (some ((← Dirs.dataBase) / "logs" / ioTask.fork.toString / s!"{taskId}{suffix}.log"))
+        pure (some ((← Dirs.dataBase) / "logs" / repoLogDir ioTask.repo / s!"{taskId}{suffix}.log"))
       let result ← Sandbox.launchAgent agentDef repoPath prompt port token
         (debug := debug) (pluginDirs := pluginDirs) (memoryDirs := memoryDirs)
         (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
@@ -721,11 +885,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
         | some .errorMaxBudgetUsd => .unfinished
         | some (.error _)         => .failed
         | _                       => .completed
-    -- A run that got all the way through is proof the source is usable, which retires any block
-    -- guessed at earlier.
+    -- A run that got all the way through is proof the source is usable *for the model it ran*,
+    -- which retires the blocks that covered that model and leaves the rest standing.
     if finalStatus matches .completed then
       if let some label := authLabel then
-        Usage.markOk (ioTask.backend.getD "claude") label
+        Usage.markOk (ioTask.backend.getD "claude") label ioTask.model
     TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
     -- Release the orchestra-issue claim on terminal status. A worker that succeeded and attached a
     -- PR leaves the issue awaiting review, so only drop the lock (forceRelease) and leave its
@@ -767,7 +931,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     return ((taskId, finalStatus), typedOutput, outputJson)
   finally
     -- Closed however the task ended, including by exception: for a backend that holds a pod and a
-    -- copy of the checkout, this is what brings the work back and stops paying for it.
+    -- copy of the workspace, this is what brings the work back and stops paying for it.
     session.close
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.

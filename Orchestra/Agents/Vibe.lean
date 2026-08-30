@@ -13,6 +13,12 @@ private def jStr' (j : Json) (key : String) : String :=
 private def jVal' (j : Json) (key : String) : Option Json :=
   j.getObjVal? key |>.toOption
 
+/-- A string field that may be absent, where absent and empty mean the same thing. -/
+private def jStrOpt' (j : Json) (key : String) : Option String :=
+  match j.getObjValAs? String key with
+  | .ok s => if s.isEmpty then none else some s
+  | _     => none
+
 private def jArr' (j : Json) (key : String) : Option (Array Json) :=
   match j.getObjVal? key with
   | .ok (.arr a) => some a
@@ -43,7 +49,10 @@ private def vibeParseOutputLine (line : String) : Option Event :=
               let name := jStr' fn "name"
               let argsStr := jStr' fn "arguments"
               let input := (Json.parse argsStr).toOption |>.getD (Json.mkObj [])
-              some (.assistant (.toolUse name input))
+              -- `id` on a tool call and `tool_call_id` on the message that answers it are the
+              -- OpenAI message shape vibe speaks. Read rather than required: a release that
+              -- stops sending them leaves the pairing unknown, which is what `none` says.
+              some (.assistant (.toolUse name input (jStrOpt' tc "id")))
         match toolCallEvent with
         | some e => some e
         | none =>
@@ -52,7 +61,7 @@ private def vibeParseOutputLine (line : String) : Option Event :=
           if content.isEmpty then none
           else some (.assistant (.text content))
     | "tool" =>
-      some (.toolResult (jStr' json "content") "")
+      some (.toolResult (jStr' json "content") "" (jStrOpt' json "tool_call_id"))
     | _ => none
 
 /-- Read the full session ID from the most recent session log under `vibeHome/logs/session/`. -/
@@ -163,7 +172,7 @@ def vibe : AgentDef where
     if let some sid := resume then
       args := args.push "--resume" |>.push sid
     return args
-  parseOutputLine := vibeParseOutputLine
+  parseOutputLine := fun line => StreamFormat.one (vibeParseOutputLine line)
   extractSessionId := vibeExtractSessionId
   cleanup _ := pure ()
   isUsageLimitError exitCode stderr :=

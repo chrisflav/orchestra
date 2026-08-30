@@ -22,13 +22,29 @@ namespace Orchestra.Exec
     The fields are functions rather than data because a remote backend answers them with API
     calls, not by reading a struct it already has. -/
 structure Handle where
-  /-- The run's stdout, when the spec asked for `.piped`; `none` under `.inherit`, where it went
-      straight to orchestra's own terminal and there is nothing to read. -/
+  /-- The run's stdout, when the spec asked for `.piped` or `.stream`; `none` under `.inherit`,
+      where it went straight to orchestra's own terminal and there is nothing to read. -/
   stdout : Option IO.FS.Handle
   /-- The run's stderr, on the same terms as `stdout`. -/
   stderr : Option IO.FS.Handle
+  /-- The run's stdin, under `.stream` only, and taken off the child so that dropping it is what
+      closes the pipe.
+
+      That detail is the whole point of holding it here: a handle closes when its last reference
+      goes, a spawned child keeps one of its own, and while it does, nothing can deliver EOF —
+      which is how a CLI reading turns from a pipe is told there are no more. -/
+  stdin : Option IO.FS.Handle := none
   /-- Block until the run finishes, and return its exit code. Called once. -/
   wait : IO UInt32
+  /-- Whether the run has finished, without waiting for it. `none` while it is still going.
+
+      Asked of the run itself, never of whatever is draining its output: a task reading stdout can
+      end for reasons of its own, and reading that as "the process is gone" is how a healthy
+      session gets reaped mid-conversation. -/
+  tryWait : IO (Option UInt32) := return none
+  /-- Ask the run to stop, the way a person would: `SIGTERM` and its equivalents. The polite half
+      of `kill`, for a caller that will escalate if it is ignored. -/
+  terminate : IO Unit := pure ()
   /-- Stop the run now, as a cancellation. Best-effort and safe to call on a run that has already
       finished: cancellation races completion by nature, and every caller here would otherwise
       have to guess which one won. -/
@@ -199,21 +215,44 @@ def killPid (pid : UInt32) : IO Unit := do
 /-- A handle over a local child process whose streams orchestra reads. -/
 def ofPipedChild (child : IO.Process.Child { stdin := .null, stdout := .piped, stderr := .piped })
     : Handle :=
-  { stdout := some child.stdout
-    stderr := some child.stderr
-    wait   := child.wait
-    kill   := killPid child.pid
-    id     := s!"pid {child.pid}" }
+  { stdout    := some child.stdout
+    stderr    := some child.stderr
+    wait      := child.wait
+    tryWait   := child.tryWait
+    terminate := (try child.kill catch _ => pure ())
+    kill      := killPid child.pid
+    id        := s!"pid {child.pid}" }
+
+/-- A handle over a local child process orchestra both writes to and reads from.
+
+    `takeStdin` first, so the handle here is the only reference to that pipe and dropping it
+    delivers EOF; a child that still held one would make the close unobservable. -/
+def ofStreamChild
+    (spawned : IO.Process.Child { stdin := .piped, stdout := .piped, stderr := .piped })
+    : IO Handle := do
+  let (stdinHandle, child) ← spawned.takeStdin
+  return {
+      stdout    := some child.stdout
+      stderr    := some child.stderr
+      stdin     := some stdinHandle
+      wait      := child.wait
+      tryWait   := child.tryWait
+      terminate := (try child.kill catch _ => pure ())
+      kill      := killPid child.pid
+      id        := s!"pid {child.pid}" }
+
 
 /-- A handle over a local child process that was given orchestra's own terminal. -/
 def ofInheritChild
     (child : IO.Process.Child { stdin := .inherit, stdout := .inherit, stderr := .inherit })
     : Handle :=
-  { stdout := none
-    stderr := none
-    wait   := child.wait
-    kill   := killPid child.pid
-    id     := s!"pid {child.pid}" }
+  { stdout    := none
+    stderr    := none
+    wait      := child.wait
+    tryWait   := child.tryWait
+    terminate := (try child.kill catch _ => pure ())
+    kill      := killPid child.pid
+    id        := s!"pid {child.pid}" }
 
 end Handle
 
@@ -229,7 +268,9 @@ def hostRunScript (spec : ScriptSpec) : IO ScriptResult := do
       cmd := "bash", args := #[spec.path], cwd := spec.workdir
       stdout := .inherit, stderr := .inherit }
     return { exitCode := ← child.wait }
-  | .piped =>
+  -- `.stream` never reaches here — a repository's script is run, not conversed with — and is
+  -- captured like any other output rather than being a case nobody can hit.
+  | .piped | .stream =>
     let child ← IO.Process.spawn {
       cmd := "bash", args := #[spec.path], cwd := spec.workdir
       stdout := .piped, stderr := .piped }

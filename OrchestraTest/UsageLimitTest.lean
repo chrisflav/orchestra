@@ -112,6 +112,74 @@ def parseUnifiedHeaders_bindsARejectedWindowThatIsStillInTheFuture : Test := do
   | .blocked u _ => TestM.assertEqual u (some 1785351600) (msg := "blocked until the 7d reset")
   | .available   => TestM.fail "a rejected weekly window should block the source"
 
+/-- The same account a few days earlier: the weekly window is deep enough into its budget that the
+    server flags it, but every request is still being served. -/
+private def warningHeaders : Array (String × String) := #[
+  ("anthropic-ratelimit-unified-5h-status", "allowed"),
+  ("anthropic-ratelimit-unified-5h-utilization", "0.02"),
+  ("anthropic-ratelimit-unified-5h-reset", "1784867400"),
+  ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+  ("anthropic-ratelimit-unified-7d-utilization", "0.78"),
+  ("anthropic-ratelimit-unified-7d-reset", "1785351600")
+]
+
+/-- `warningHeaders` with the 7d window's status replaced. -/
+private def withWeeklyStatus (status : String) : Array (String × String) :=
+  warningHeaders.map fun (k, v) =>
+    if k == "anthropic-ratelimit-unified-7d-status" then (k, status) else (k, v)
+
+@[test]
+def parseUnifiedHeaders_aWarnedWindowIsNotBinding : Test := do
+  -- A window the server is warning about is still a window the server is serving. Reading the
+  -- warning as a rejection idled the account at 78% for the rest of the week.
+  let now := 1785000000
+  let ls := parseUnifiedHeaders warningHeaders
+  match ls.find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l =>
+    TestM.assertEqual l.percent 78 (msg := "0.78 fraction becomes 78 percent")
+    TestM.assertEqual l.severity "warning" (msg := "78% is a warning")
+    TestM.assert (!l.isActive) (msg := "a warned window is not binding")
+  let st : SourceState := { backend := "b", label := "l", limits := ls }
+  TestM.assert (availabilityOf st none now).isAvailable
+    (msg := "a source under its weekly cap stays available")
+
+@[test]
+def parseUnifiedHeaders_anUnrecognisedStatusIsNotBinding : Test := do
+  -- The endpoint already ships states this code has never heard of. One of them appearing must
+  -- not idle the account: an actual refusal is caught by `markLimited` when a run hits it.
+  match (parseUnifiedHeaders (withWeeklyStatus "queueing")).find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l => TestM.assert (!l.isActive) (msg := "an unknown status is usable, not exhausted")
+
+@[test]
+def parseUnifiedHeaders_aRejectionBindsBelowTheLine : Test := do
+  -- The status is the only fail-closed signal the poll has that is not the percentage, so it has
+  -- to be pinned on its own: every other rejected fixture here is also at 100%, and would pass
+  -- with the status ignored entirely. Casing and a `rejected_…` spelling are rejections too.
+  for reported in ["rejected", "REJECTED", "rejected_weekly"] do
+    match (parseUnifiedHeaders (withWeeklyStatus reported)).find? (·.kind == .weeklyAll) with
+    | none   => TestM.fail "expected a weekly_all limit"
+    | some l => TestM.assert l.isActive (msg := s!"{reported} at 78% still binds")
+
+@[test]
+def parseUnifiedHeaders_anAbsentStatusIsAllowed : Test := do
+  -- A window that reports a utilisation but no status at all is served, not withheld.
+  let hs := warningHeaders.filter (·.1 != "anthropic-ratelimit-unified-7d-status")
+  match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l => TestM.assert (!l.isActive) (msg := "no status header means allowed")
+
+@[test]
+def parseUnifiedHeaders_hundredPercentBindsWhateverTheStatusSays : Test := do
+  -- The percentage is the backstop: a window reported as full binds even when the status field
+  -- says something reassuring.
+  let hs := warningHeaders.map fun (k, v) =>
+    if k == "anthropic-ratelimit-unified-7d-utilization" then (k, "1") else (k, v)
+  match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
+  | none   => TestM.fail "expected a weekly_all limit"
+  | some l => TestM.assert l.isActive (msg := "100% binds regardless of status")
+
 @[test]
 def parseUnifiedHeaders_emptyWhenNoUnifiedHeaders : Test := do
   -- A response with no unified headers (a transport error page) yields nothing, and the caller
@@ -363,10 +431,10 @@ def availability_observedBlockOutranksAQuietPoll : Test := do
   let st : SourceState :=
     { backend := "claude", label := "main"
       limits := #[{ kind := .session, percent := 5 }]
-      block := some { untilEpoch := some (now + 3600), reason := "agent reported a usage limit" } }
+      blocks := #[{ untilEpoch := some (now + 3600), reason := "agent reported a usage limit" }] }
   TestM.assert (!(availabilityOf st (some "claude-opus-4-8") now).isAvailable)
     (msg := "the recorded hit blocks")
-  let expired : SourceState := { st with block := some { st.block.get! with untilEpoch := some (now - 1) } }
+  let expired : SourceState := { st with blocks := #[{ st.blocks[0]! with untilEpoch := some (now - 1) }] }
   TestM.assert ((availabilityOf expired (some "claude-opus-4-8") now).isAvailable)
     (msg := "and stops blocking once its window passes")
 
@@ -374,12 +442,166 @@ def availability_observedBlockOutranksAQuietPoll : Test := do
 def availability_observedBlockCanItselfBeScoped : Test := do
   let st : SourceState :=
     { backend := "claude", label := "main"
-      block := some { untilEpoch := some (now + 3600), model := some "claude-opus-4-8"
-                      reason := "agent reported a usage limit" } }
+      blocks := #[{ untilEpoch := some (now + 3600), model := some "claude-opus-4-8"
+                    reason := "agent reported a usage limit" }] }
   TestM.assert (!(availabilityOf st (some "claude-opus-4-8") now).isAvailable)
     (msg := "blocks the model that hit it")
   TestM.assert ((availabilityOf st (some "claude-sonnet-5") now).isAvailable)
     (msg := "but not a different one")
+
+@[test]
+def availability_twoScopesAreTwoBlocks : Test := do
+  -- The case a single block slot could not hold: an account that is out of Fable for the week
+  -- and out of its session window for the hour. Both are true, and the one that expires first
+  -- must not take the other with it.
+  let st : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[
+        { untilEpoch := some (now + 604800), model := some "Fable", reason := "Fable limit" },
+        { untilEpoch := some (now + 3600), reason := "session limit" }] }
+  TestM.assert (!(availabilityOf st (some "claude-sonnet-5") now).isAvailable)
+    (msg := "the account-wide block covers a model the scoped one does not")
+  let later := now + 7200
+  TestM.assert ((availabilityOf st (some "claude-sonnet-5") later).isAvailable)
+    (msg := "once the session window passes, Sonnet is runnable again")
+  TestM.assert (!(availabilityOf st (some "claude-fable-5") later).isAvailable)
+    (msg := "but Fable is still blocked, and was not forgotten with the session block")
+
+@[test]
+def availability_reportsTheBlockThatLiftsLast : Test := do
+  -- Two blocks can cover one model now. Naming the earlier reset would send the caller back at
+  -- a time the source is still shut, to be turned away and made to wait again.
+  let st : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[
+        { untilEpoch := some (now + 3600), reason := "session limit" },
+        { untilEpoch := some (now + 604800), model := some "Fable", reason := "Fable limit" }] }
+  let reportedReset (s : SourceState) : Option (Option Int) :=
+    match availabilityOf s (some "claude-fable-5") now with
+    | .available   => none
+    | .blocked u _ => some u
+  TestM.assertEqual (reportedReset st) (some (some (now + 604800)))
+    (msg := "the later of the two applicable resets is the one reported")
+  -- Order in the array must not decide it.
+  TestM.assertEqual (reportedReset { st with blocks := st.blocks.reverse })
+    (some (some (now + 604800)))
+    (msg := "and the answer does not depend on insertion order")
+
+@[test]
+def availability_aBlockWithNoExpiryOutlastsOneWithAnExpiry : Test := do
+  let st : SourceState :=
+    { backend := "claude", label := "main"
+      blocks := #[
+        { untilEpoch := some (now + 3600), reason := "session limit" },
+        { untilEpoch := none, reason := "an observed hit with no reported reset" }] }
+  match availabilityOf st (some "claude-fable-5") now with
+  | .available   => TestM.fail "an open-ended block still blocks"
+  | .blocked u r => do
+    TestM.assertEqual u none (msg := "no reset time is reported, because there is none to report")
+    TestM.assertEqual r "an observed hit with no reported reset"
+      (msg := "the reason is the open-ended one, not the window that will pass")
+
+@[test]
+def markOk_retiresOnlyWhatTheRunDisproves : Test := do
+  -- `markOk`'s filter, exercised directly so the interesting case needs no disk. A completed
+  -- Sonnet run proves the account-wide window has passed and proves nothing about Fable; the
+  -- Fable block has to survive, or the next Fable task rediscovers the limit by hitting it.
+  let blocks : Array Block := #[
+    { untilEpoch := some (now + 604800), model := some "Fable", reason := "Fable limit" },
+    { untilEpoch := some (now + 3600), reason := "session limit" }]
+  let afterSonnet := blocks.filter fun b => blockIsLive b now && !blockApplies b (some "claude-sonnet-5")
+  TestM.assertEqual afterSonnet.size 1 (msg := "one block survives a Sonnet success")
+  TestM.assertEqual (afterSonnet[0]!.model) (some "Fable")
+    (msg := "and it is the Fable one")
+  let afterFable := blocks.filter fun b => blockIsLive b now && !blockApplies b (some "claude-fable-5")
+  TestM.assertEqual afterFable.size 0
+    (msg := "a Fable success retires both the Fable block and the account-wide one")
+
+@[test]
+def markLimited_foldsASecondReadingInsteadOfReplacingIt : Test := do
+  -- Workers run concurrently, so two tasks dispatched to one source before any block existed
+  -- both report the same limit, and one may carry a reset time the other does not. The merge is
+  -- what stops the later, less informed reading shortening a block the earlier one knew ran
+  -- longer. Exercised as the pure fold `markLimited` performs, so no disk or clock is needed.
+  let prior : Block :=
+    { untilEpoch := some (now + 21600), model := some "Opus"
+      reason := "weekly limit, reset reported by the agent" }
+  -- The second reading: a bare rate-limit event with no reset, falling back to the hourly default.
+  let fresh : Block :=
+    { untilEpoch := some (now + 3600), model := some "claude-opus-4-8", reason := "usage limit" }
+  let merged := mergeBlock fresh prior
+  TestM.assertEqual merged.untilEpoch (some (now + 21600))
+    (msg := "the guessed hour cannot shorten the reported six")
+  TestM.assertEqual merged.model (some "Opus")
+    (msg := "the broader spelling survives, or the block stops covering tasks asking for 'opus'")
+  -- And the fold does not depend on which reading arrived first.
+  TestM.assertEqual (mergeBlock prior fresh).model (some "Opus")
+    (msg := "which way round the two readings arrive does not change the scope")
+  TestM.assertEqual (mergeBlock prior fresh).untilEpoch (some (now + 21600))
+    (msg := "nor the expiry")
+
+@[test]
+def mergeBlock_aScopeNarrowedByOrderWouldLoseCoverage : Test := do
+  -- Why the broader spelling matters, stated as the thing that actually breaks.
+  let broad : Block := { untilEpoch := some (now + 3600), model := some "Opus" }
+  let narrow : Block := { untilEpoch := some (now + 3600), model := some "claude-opus-4-8" }
+  TestM.assert (blockApplies broad (some "opus"))
+    (msg := "a block scoped to the display name catches a task asking for the alias")
+  TestM.assert (!(blockApplies narrow (some "opus")))
+    (msg := "one scoped to the dated id does not")
+  TestM.assert (blockApplies (mergeBlock narrow broad) (some "opus"))
+    (msg := "so the merge must keep the broader of the two")
+
+@[test]
+def sameScope_reconcilesDisplayNameAndModelId : Test := do
+  -- `markLimited` upserts by scope. The provider writes "Fable" and a task asks for
+  -- "claude-fable-5"; read as different scopes they would accumulate as two blocks on one
+  -- window, each expiring on its own schedule.
+  TestM.assert (sameScope (some "Fable") (some "claude-fable-5"))
+    (msg := "display name and model id are one scope")
+  TestM.assert (sameScope (some "claude-fable-5") (some "Fable"))
+    (msg := "and in the other order too")
+  TestM.assert (sameScope none none) (msg := "account-wide matches account-wide")
+  TestM.assert (!(sameScope none (some "Fable")))
+    (msg := "account-wide is not the same window as a scoped one")
+  TestM.assert (!(sameScope (some "Opus") (some "claude-fable-5")))
+    (msg := "different families are different scopes")
+
+@[test]
+def sourceState_liftsALegacySingleBlock : Test := do
+  -- State files written before blocks were a set carry one `"block"` object. Dropping it on
+  -- upgrade would forget a live limit and send the next task into it.
+  let legacy := "{\"backend\":\"claude\",\"label\":\"main\",\"limits\":[],\
+    \"block\":{\"until_epoch\":1785351600,\"model\":\"Fable\",\"reason\":\"observed\"}}"
+  match Json.parse legacy >>= fun j => (Lean.FromJson.fromJson? j : Except String SourceState) with
+  | .error e => TestM.fail s!"a legacy state file should still parse: {e}"
+  | .ok st   =>
+    TestM.assertEqual st.blocks.size 1 (msg := "the single block is lifted into the set")
+    TestM.assertEqual (st.blocks[0]!.model) (some "Fable") (msg := "with its scope intact")
+
+@[test]
+def sourceState_oneBadBlockDoesNotDropTheRest : Test := do
+  -- Decoding the array as a whole would fail on the bad element, fall through to a `"block"`
+  -- key that is not there, and forget every block the source had — leaving it looking runnable,
+  -- which is the failure the migration exists to prevent, reached by another route.
+  let mixed := "{\"backend\":\"claude\",\"label\":\"main\",\"limits\":[],\"blocks\":[\
+    {\"until_epoch\":1785351600,\"model\":\"Fable\",\"reason\":\"observed\"},\
+    \"not an object\",\
+    {\"until_epoch\":1785351600,\"reason\":\"session\"}]}"
+  match Json.parse mixed >>= fun j => (Lean.FromJson.fromJson? j : Except String SourceState) with
+  | .error e => TestM.fail s!"a partly unreadable block list should still parse: {e}"
+  | .ok st   =>
+    TestM.assertEqual st.blocks.size 2 (msg := "the readable blocks survive the unreadable one")
+    TestM.assertEqual (st.blocks[0]!.model) (some "Fable") (msg := "and keep their scopes")
+
+@[test]
+def sourceState_absentBlocksStayAbsent : Test := do
+  -- The reason `Block`'s decoder rejects non-objects: `getObjValAs?` reads a missing key as
+  -- `Json.null`, and a block with no expiry reads as "blocked forever".
+  let bare := "{\"backend\":\"claude\",\"label\":\"main\",\"limits\":[]}"
+  match Json.parse bare >>= fun j => (Lean.FromJson.fromJson? j : Except String SourceState) with
+  | .error e => TestM.fail s!"a state file with no block should parse: {e}"
+  | .ok st   => TestM.assertEqual st.blocks.size 0 (msg := "no block means no block")
 
 @[test]
 def modelMatchesScope_matchesAliasAndFullId : Test := do
@@ -696,6 +918,7 @@ def usageLimitError_matchesWhatTheCliActuallySays : Test := do
   TestM.assert (AgentDef.stdUsageLimitError 1
       "{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit.\"}")
     (msg := "the API-key 429 body is recognised")
+
 
 @[test]
 def usageLimitError_doesNotFireOnOrdinaryOutput : Test := do
