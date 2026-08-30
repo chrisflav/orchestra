@@ -123,9 +123,6 @@ What orders records is the wall clock, so that is what these compare. Timestamps
 to the second and ties are routine — a dispatcher enqueues several tasks in one second — so the
 id breaks them. Inside a single second the id is a correct tiebreaker for exactly the reason it
 fails across a reboot: within one boot it is monotone.
-
-A timestamp that will not parse sorts as oldest, so a malformed record stays visible at the end
-of a listing rather than displacing the newest one at the front.
 -/
 
 /-- What a record is ordered by: the instant it was made, with its id to break ties. -/
@@ -134,13 +131,22 @@ abbrev AgeKey := Option Int × String
 /-- The age key of a record with timestamp `timestamp` and id `id`. -/
 def ageKey (timestamp id : String) : AgeKey := (parseIso8601 timestamp, id)
 
-/-- `true` when `a` is strictly older than `b`. Unparseable timestamps count as oldest. -/
-def AgeKey.olderThan (a b : AgeKey) : Bool :=
+/-- `true` when `a` sorts before `b`, `newest` choosing the direction.
+
+    A key whose timestamp did not parse is *unplaceable*, and goes after every key that did — in
+    both directions, which is the one asymmetry here worth stating plainly. Sorted newest first
+    it must not head a listing, where it would read as the most recent record; sorted oldest
+    first it must not head the queue's claim order, where it would preempt every entry that has
+    genuinely been waiting longer. Nothing rewrites a stored timestamp, so either mistake would
+    be permanent. Within the unplaceable group the id still decides, so the answer does not
+    depend on the order `readDir` happened to return. -/
+def AgeKey.before (newest : Bool) (a b : AgeKey) : Bool :=
+  let byId := if newest then a.2 > b.2 else a.2 < b.2
   match a.1, b.1 with
-  | none,   none   => a.2 < b.2
-  | none,   some _ => true
-  | some _, none   => false
-  | some x, some y => if x != y then x < y else a.2 < b.2
+  | some x, some y => if x != y then (if newest then x > y else x < y) else byId
+  | some _, none   => true
+  | none,   some _ => false
+  | none,   none   => byId
 
 /-- Sort records newest first, by `timeOf` with `idOf` breaking ties.
 
@@ -148,11 +154,11 @@ def AgeKey.olderThan (a b : AgeKey) : Bool :=
     the dashboard serves, over every task ever recorded. -/
 def sortNewestFirst (timeOf idOf : α → String) (xs : Array α) : Array α :=
   let keyed := xs.map fun x => (ageKey (timeOf x) (idOf x), x)
-  (keyed.qsort fun a b => AgeKey.olderThan b.1 a.1).map (·.2)
+  (keyed.qsort fun a b => AgeKey.before (newest := true) a.1 b.1).map (·.2)
 
 /-- Sort records oldest first, by `timeOf` with `idOf` breaking ties. -/
 def sortOldestFirst (timeOf idOf : α → String) (xs : Array α) : Array α :=
   let keyed := xs.map fun x => (ageKey (timeOf x) (idOf x), x)
-  (keyed.qsort fun a b => AgeKey.olderThan a.1 b.1).map (·.2)
+  (keyed.qsort fun a b => AgeKey.before (newest := false) a.1 b.1).map (·.2)
 
 end Orchestra.Time

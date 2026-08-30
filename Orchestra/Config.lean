@@ -31,7 +31,7 @@ private def hex4 (n : Nat) : String :=
     agrees with chronological ordering — but only within a single boot. `IO.monoNanosNow`
     counts from an unspecified epoch which on Linux is boot, so a reboot restarts it at zero
     and every id minted afterwards sorts below every id minted before. **Nothing may order
-    records by id.** The stores each record a wall-clock `created_at` and sort on that
+    records by id.** Every store records a wall-clock timestamp beside the id and sorts on that
     (`Orchestra.Time.sortNewestFirst`); an id is a name, and inside one boot a tiebreaker for
     timestamps that only resolve to the second.
 
@@ -53,8 +53,9 @@ def uniqueToken : IO String := do
     if ← uniqueTokenOverflowed.modifyGet (fun seen => (!seen, true)) then
       IO.eprintln s!"Warning: the monotonic clock ({digits} ns) has outgrown the 16-digit id \
 field, so new ids sort before existing ones. Records are ordered by their recorded timestamp \
-rather than by id, so nothing is misordered by this, but ids stop reading as ascending until \
-this host reboots."
+rather than by id, so listings and the queue keep their order; only the tiebreak between two \
+records stamped in the same second inverts. Ids stop reading as ascending until this host \
+reboots."
   let padded := ("0000000000000000" ++ digits).takeEnd 16
   return padded.toString ++ hex4 (n % 65536)
 

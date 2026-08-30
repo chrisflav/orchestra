@@ -351,14 +351,27 @@ def loadAllEntries : IO (Array QueueEntry) := do
         result := result.push e
   return Time.sortNewestFirst (·.createdAt) (·.id) result
 
+/-- Entries in the order the daemon tries them: priority first (higher wins), then oldest.
+
+    Oldest by `created_at`, not by id. Ids are minted from a clock that restarts at boot, so
+    across a reboot the smaller id is the *newer* entry: an entry left pending from before the
+    reboot sorted last and waited behind everything enqueued since, indefinitely.
+
+    Separate from `pendingCandidates` because `orchestra status` wants the order without the
+    slot-availability filter, and reaching it through that filter meant passing a `perRepoLimit`
+    chosen to be inert — which stops being inert the moment the argument grows a second use.
+    Filtering and ordering are two questions; this answers one of them. -/
+def claimOrder (entries : Array QueueEntry) : Array QueueEntry :=
+  let keyed := entries.map fun e => (Time.ageKey e.createdAt e.id, e)
+  (keyed.qsort fun a b =>
+    if a.2.priority != b.2.priority then a.2.priority > b.2.priority
+    else Time.AgeKey.before (newest := false) a.1 b.1).map (·.2)
+
 /-- Every pending entry that may start now, in the order the daemon should try them.
 
     `activePerRepo` maps a slot-pool key (`QueueEntry.slotKey`) to the number of tasks currently
     running in that pool; entries whose pool is already at `perRepoLimit` are excluded.
-    Ordering is by priority (higher first), then oldest first by `created_at`. Not by id: ids
-    are minted from a clock that restarts at boot, so across a reboot the smaller id is the
-    *newer* entry, and an entry left pending from before the reboot would be tried last —
-    starved behind everything enqueued since.
+    Ordered by `claimOrder`.
 
     A list rather than a single entry, because an entry can turn out to be unclaimable for a
     reason only the caller knows — a continuation whose predecessor's slot is still busy, or a
@@ -369,10 +382,7 @@ def pendingCandidates (all : Array QueueEntry) (activePerRepo : Std.HashMap Stri
   let pending := all.filter (fun e =>
     e.status == .pending &&
     activePerRepo.getD e.slotKey 0 < perRepoLimit)
-  let keyed := pending.map fun e => (Time.ageKey e.createdAt e.id, e)
-  (keyed.qsort fun a b =>
-    if a.2.priority != b.2.priority then a.2.priority > b.2.priority
-    else Time.AgeKey.olderThan a.1 b.1).map (·.2)
+  claimOrder pending
 
 /-- Choose the per-repo clone slot a freshly claimed entry should run in.
 

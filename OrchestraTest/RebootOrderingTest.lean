@@ -8,9 +8,9 @@ open Orchestra
 
 Ids come from `uniqueToken`, which reads `IO.monoNanosNow` — a clock that on Linux counts from
 boot. Within one boot those ids ascend, and every store used to sort by them. A reboot restarts
-the clock at zero, so an id minted a minute after a reboot is two orders of magnitude smaller
-than one minted after three weeks of uptime, and an id sort puts every pre-reboot record above
-every record made since.
+the clock at zero, so an id minted 23 seconds after a reboot is nearly five orders of magnitude
+smaller than one minted after three weeks of uptime, and an id sort puts every pre-reboot record
+above every record made since.
 
 What that cost, in the incident this file exists for: the dashboard's task list showed nothing
 newer than the reboot, because the whole first page was the tail of the previous boot; and a
@@ -32,15 +32,7 @@ private def postRebootId : String := "00000234013334180000"
 private def preRebootAt  : String := "2026-08-29T20:03:47Z"
 private def postRebootAt : String := "2026-08-29T20:05:49Z"
 
-private def withTempData (act : IO α) : IO α := do
-  let root := System.FilePath.mk "/tmp" / s!"orchestra-reboot-{← IO.monoNanosNow}"
-  IO.FS.createDirAll root
-  let previous ← Dirs.dataBaseOverride.get
-  Dirs.setDataBaseOverride (some root)
-  try act
-  finally
-    Dirs.setDataBaseOverride previous
-    try IO.FS.removeDirAll root catch _ => pure ()
+private def withTempData (act : IO α) : IO α := Orchestra.withTempData "reboot" act
 
 /-! ## The comparator -/
 
@@ -69,15 +61,21 @@ def theIdBreaksTiesWithinASecond : Test := do
     ["c", "b", "a"]
     (msg := "same second, so the id decides")
 
+private def oldestOrder (xs : List (String × String)) : List String :=
+  (Time.sortOldestFirst (·.1) (·.2) xs.toArray).toList.map (·.2)
+
 @[test]
-def anUnreadableTimestampSortsOldest : Test := do
-  -- Last rather than first: a record whose timestamp cannot be parsed must not displace the
-  -- genuinely newest one at the head of a listing. It stays visible at the tail.
-  TestM.assertEqual
-    (order [("not a timestamp", "broken"), (preRebootAt, preRebootId),
-            (postRebootAt, postRebootId)])
-    [postRebootId, preRebootId, "broken"]
-    (msg := "unparseable sorts oldest, and is still listed")
+def anUnreadableTimestampGoesLastInEitherDirection : Test := do
+  -- Not "oldest" — last, whichever way the sort runs, because nothing rewrites a stored
+  -- timestamp and either head is a place it must not permanently occupy. At the head of a
+  -- listing it would read as the most recent record; at the head of the claim order it would
+  -- preempt every entry that has genuinely been waiting longer.
+  let broken := [("not a timestamp", "broken"), (preRebootAt, preRebootId),
+                 (postRebootAt, postRebootId)]
+  TestM.assertEqual (order broken) [postRebootId, preRebootId, "broken"]
+    (msg := "newest first: last, and still listed rather than dropped")
+  TestM.assertEqual (oldestOrder broken) [preRebootId, postRebootId, "broken"]
+    (msg := "oldest first: still last, so it cannot jump the queue")
 
 /-! ## The stores -/
 
@@ -121,5 +119,18 @@ def priorityStillOutranksAge : Test := do
       anEntry postRebootId postRebootAt (priority := 20)] {} 4
   TestM.assertEqual (picked.map (·.id)).toList [postRebootId, preRebootId]
     (msg := "age only orders entries that share a priority")
+
+@[test]
+def anEntryWithNoReadableTimestampDoesNotJumpTheQueue : Test := do
+  -- `created_at` is required to load at all, so the reachable failure is an empty one:
+  -- `TaskStore.currentIso8601` shells out to `date` and does not check that it produced
+  -- anything. Ordering that entry as the oldest would put it at the head of its priority for
+  -- good — the starvation this whole change exists to remove, re-introduced one entry at a time.
+  let picked := Queue.claimOrder
+    #[anEntry "00000000000000000009" "", anEntry postRebootId postRebootAt,
+      anEntry preRebootId preRebootAt]
+  TestM.assertEqual (picked.map (·.id)).toList
+    [preRebootId, postRebootId, "00000000000000000009"]
+    (msg := "an entry nobody can date waits behind every entry that can be dated")
 
 end OrchestraTest.RebootOrdering

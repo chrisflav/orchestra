@@ -329,7 +329,7 @@ being skipped, and any resource it still holds will not be reclaimed."
 
 /-- Every session on disk, newest first.
 
-    By `created_at`, not by id — a monotone clock restarts at boot, so ids only order sessions
+    By `createdAt`, not by id — a monotone clock restarts at boot, so ids only order sessions
     within one. The same thing `TaskStore.loadAllTasks` does, and for the same reason. -/
 def loadAllSessions : IO (Array SessionRecord) := do
   let dir ← sessionsDir
