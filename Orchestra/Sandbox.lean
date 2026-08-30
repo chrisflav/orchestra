@@ -162,10 +162,15 @@ def portsFor (paths additional : SandboxPaths) (mcp : McpEndpoint) (extraPorts :
     paths.extraPorts.toArray ++ additional.extraPorts.toArray ++ extraPorts.map UInt16.ofNat
   return { connect := #[mcp.port, 443] ++ extra, bind := extra }
 
-/-- The environment every agent run starts with, whichever way it was launched. -/
+/-- The environment every agent run starts with, whichever way it was launched.
+
+    An empty token is left unset rather than exported empty: that is what a task with no GitHub
+    App installation behind it gets, and `gh` treats `GH_TOKEN=` as a credential it must use,
+    failing every call with an authentication error instead of saying it has none. -/
 def envFor (ghToken : String) (agentEnv extraEnv : Array (String × Option String))
     : Array (String × String) :=
-  #[("GH_TOKEN", ghToken), ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")]
+  (if ghToken.isEmpty then #[] else #[("GH_TOKEN", ghToken)])
+    ++ #[("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")]
     -- Agent-specific env vars (e.g. VIBE_HOME, MISTRAL_API_KEY), then the caller's.
     ++ (agentEnv ++ extraEnv).filterMap fun (k, v) => v.map ((k, ·))
 

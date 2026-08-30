@@ -214,4 +214,20 @@ def claudeConnectsToTheEndpointItIsGiven : Test := do
   TestM.assert (AgentDef.containsCI contents "orchestra.internal") "the host reaches the config"
   TestM.assert (AgentDef.containsCI contents "9999") "so does the port"
 
+/-! ## What the agent's environment starts with -/
+
+@[test]
+def anAbsentInstallationTokenIsUnsetRatherThanEmpty : Test := do
+  -- A task with no GitHub App installation behind it runs with `ghToken = ""`. `gh` reads an
+  -- empty `GH_TOKEN` as a credential it must use and fails every call with an authentication
+  -- error, where an unset one lets it fall back to whatever else is configured.
+  let withToken := Sandbox.envFor "ghs_realtoken" #[] #[]
+  TestM.assert (withToken.any fun (k, v) => k == "GH_TOKEN" && v == "ghs_realtoken")
+    "a token that exists is exported"
+  let without := Sandbox.envFor "" #[] #[]
+  TestM.assert (!without.any fun (k, _) => k == "GH_TOKEN")
+    "an empty token is not exported at all"
+  TestM.assert (without.any fun (k, _) => k == "CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+    "the rest of the environment is unaffected"
+
 end OrchestraTest.Exec
