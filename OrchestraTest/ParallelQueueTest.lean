@@ -308,8 +308,9 @@ def uniqueToken_hasFixedWidth : Test := do
 
 @[test]
 def uniqueToken_sortsChronologically : Test := do
-  -- The queue sorts entries by id string and picks the oldest at a given priority, so
-  -- lexicographic order has to agree with issue order.
+  -- Ids break ties between records stamped in the same second, so lexicographic order has to
+  -- agree with issue order within a boot. Across a reboot it does not, which is why nothing
+  -- orders records by id alone — see `RebootOrderingTest`.
   let a ← uniqueToken
   let b ← uniqueToken
   let c ← uniqueToken

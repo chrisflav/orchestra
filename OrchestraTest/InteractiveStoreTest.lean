@@ -64,14 +64,15 @@ def aRecordIsNeverReadHalfWritten : Test := do
 
 @[test]
 def sessionsAreListedNewestFirst : Test := do
+  -- By `created_at`. Ids come from a clock that restarts at boot, so the id here that sorts
+  -- highest belongs to the *oldest* session — which is what a reboot does to a store.
   let ids ← withTempSessions do
-    saveSession (sampleRecord "i-20260821T0900")
-    saveSession (sampleRecord "i-20260821T1100")
-    saveSession (sampleRecord "i-20260821T1000")
+    saveSession { sampleRecord "i-9000" with createdAt := "2026-08-21T09:00:00Z" }
+    saveSession { sampleRecord "i-0002" with createdAt := "2026-08-21T11:00:00Z" }
+    saveSession { sampleRecord "i-0001" with createdAt := "2026-08-21T10:00:00Z" }
     pure ((← loadAllSessions).map (·.id))
-  TestM.assertEqual ids.toList
-    ["i-20260821T1100", "i-20260821T1000", "i-20260821T0900"]
-    (msg := "ids are minted from a monotone clock, so sorting by id is sorting by age")
+  TestM.assertEqual ids.toList ["i-0002", "i-0001", "i-9000"]
+    (msg := "newest first by when the session was made, not by how its id sorts")
 
 /-! ## The cursor
 

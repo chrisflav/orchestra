@@ -292,8 +292,8 @@ def issueShowHandler (p : Parsed) : IO UInt32 := do
       for c in children do
         IO.println s!"  - {c.id.toString}  {issueStatusToString c.status}  {c.title}"
     let allTasks ← TaskStore.loadAllTasks
-    let issueTasks := allTasks.filter (·.issueId == some i.id)
-      |>.toList.mergeSort (·.createdAt < ·.createdAt) |>.toArray
+    let issueTasks := Time.sortOldestFirst (·.createdAt) (·.id)
+      (allTasks.filter (·.issueId == some i.id))
     if issueTasks.isEmpty then
       IO.println "Tasks:        -"
     else
@@ -571,9 +571,8 @@ def issueTasksHandler (p : Parsed) : IO UInt32 := do
     return 0
   IO.println s!"{padRight "TASK ID" 18} {padRight "CREATED" 22} {padRight "STATUS" 11} {padRight "ROLE" 16} SERIES"
   IO.println (String.ofList (List.replicate 90 '-'))
-  -- Sort newest first (TaskStore.loadAllTasks already does this, but be explicit).
-  let sorted := matching.qsort (fun a b => a.id > b.id)
-  for r in sorted do
+  -- Newest first: `loadAllTasks` ordered them and `filter` keeps that order.
+  for r in matching do
     let role   := r.role.getD "-"
     let series := r.series.getD "-"
     IO.println s!"{padRight r.id 18} {padRight r.createdAt 22} \

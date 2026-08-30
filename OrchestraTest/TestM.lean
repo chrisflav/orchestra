@@ -68,6 +68,26 @@ def assertEqual [DecidableEq α] [Repr α] (a b : α)
 
 end TestM
 
+/-! ## A data directory that is not the developer's -/
+
+/-- Run `act` against an empty data root under `/tmp`, named after `label`, and remove it after.
+
+    The stores under `Dirs.dataBase` are not independent — a queue entry names the task record it
+    became — so one override covers the whole root rather than one per store; see
+    `Dirs.dataBaseOverride`. -/
+def withTempData (label : String) (act : IO α) : IO α := do
+  let root := System.FilePath.mk "/tmp" / s!"orchestra-{label}-{← IO.monoNanosNow}"
+  IO.FS.createDirAll root
+  let previous ← Dirs.dataBaseOverride.get
+  Dirs.setDataBaseOverride (some root)
+  try act
+  finally
+    -- Restored rather than cleared: clearing happens to be right only because nothing else
+    -- sets this, and a helper that quietly defeats an outer override is a bad thing to leave
+    -- lying around for whoever adds one.
+    Dirs.setDataBaseOverride previous
+    try IO.FS.removeDirAll root catch _ => pure ()
+
 /-! ## Real-taxis-instance opt-in for taxis-backed tests
 
 `Project.*`/`Claim.*` are backed by a real taxis HTTP API (see the "Migrate Project/Issue data

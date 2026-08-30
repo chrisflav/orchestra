@@ -1,4 +1,5 @@
 import Orchestra.Config
+import Orchestra.Utils.Time
 import Orchestra.Utils.Files
 import Orchestra.Dirs
 import Orchestra.StreamFormat
@@ -328,8 +329,8 @@ being skipped, and any resource it still holds will not be reclaimed."
 
 /-- Every session on disk, newest first.
 
-    Ids are minted from a monotone clock, so sorting by id descending is sorting by age — the
-    same thing `TaskStore.loadAllTasks` relies on, and for the same reason. -/
+    By `createdAt`, not by id — a monotone clock restarts at boot, so ids only order sessions
+    within one. The same thing `TaskStore.loadAllTasks` does, and for the same reason. -/
 def loadAllSessions : IO (Array SessionRecord) := do
   let dir ← sessionsDir
   if !(← dir.pathExists) then return #[]
@@ -337,7 +338,7 @@ def loadAllSessions : IO (Array SessionRecord) := do
   for entry in ← System.FilePath.readDir dir do
     if let some r ← loadSession entry.fileName then
       out := out.push r
-  return out.qsort (fun a b => a.id > b.id)
+  return Time.sortNewestFirst (·.createdAt) (·.id) out
 
 /-! ## Reading and writing the transcript -/
 
