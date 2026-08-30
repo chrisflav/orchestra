@@ -260,12 +260,17 @@ def run (cfg : Config) : IO UInt32 := do
     -- Read-then-act would let an entry claimed between the two — `running` on disk, its row
     -- pushed a moment after this read of the table — be reaped while its worker was starting.
     -- Both facts are therefore re-established here rather than carried in from the scan.
+    --
+    -- The table is this process's, so this is sound only while one daemon runs against a data
+    -- directory, which `daemonRunning` and the pid file already enforce for the queue (the
+    -- compose deployment's second service is `orchestrad dashboard`, which runs no workers).
+    -- Two queue daemons over one directory would each see the other's live entries as
+    -- abandoned and reap them within the tick.
     claimMutex.lock
     try
       let live ← activeTaskTokens.atomically (·.get)
-      if live.any (·.entryId == entryId) then return false
       let some current ← Queue.loadEntry entryId | return false
-      if current.status != .running then return false
+      unless Queue.shouldReap (live.map (·.entryId)) current do return false
       Queue.saveEntry { current with status := .unfinished }
       -- `unfinished` rather than `failed`, matching the startup sweep: nothing here knows
       -- whether the run was going to succeed, and `unfinished` is the status that leaves the
@@ -432,23 +437,28 @@ def run (cfg : Config) : IO UInt32 := do
         activeTaskTokens.atomically (·.modify (·.filter (·.tokenId != tokenId)))
       activeTaskTokens.atomically
         (·.modify (·.push { tokenId, entryId := e.id, token := taskToken }))
-      -- Record the resolved source on the entry, so `orchestra queue list` and any later
-      -- continuation show which account actually ran it.
-      -- A failed write leaves no entry to run, so the row just added would sit in the table
-      -- describing nothing; it comes back out before the exception goes on its way.
+      -- Everything from here to the return is guarded, not only the write. `runEntry`'s
+      -- `finally` is the sole thing that retires a row, and it never runs for a claim that
+      -- threw — so an exception anywhere in this tail would strand the row for the life of the
+      -- daemon. That is worse than the bug the reaper exists to fix rather than an instance of
+      -- it: a stranded row is what tells the reaper the entry is *alive*, so the entry becomes
+      -- unreapable, and `cancel` reports success while cancelling a token nobody holds. The
+      -- realistic thrower is not the write but the `eprintln` below, on a closed log pipe.
       try
+        -- Record the resolved source on the entry, so `orchestra queue list` and any later
+        -- continuation show which account actually ran it.
         Queue.saveEntry { e with
           status := .running, slot := some claim.slot
           authSource := claim.authSource.orElse fun _ => e.authSource }
+        activeSlots.modify (fun m => m.insert e.slotKey (occupied.push claim.slot))
+        totalActive.modify (· + 1)
+        if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
+        if e.continuesFrom.isSome && claim.resumeFrom.isNone then
+          IO.eprintln s!"  Note: queue entry {e.id} continues a previous task but no longer has \
+its workspace; it will start from a clean checkout."
       catch err =>
         dropToken
         throw err
-      activeSlots.modify (fun m => m.insert e.slotKey (occupied.push claim.slot))
-      totalActive.modify (· + 1)
-      if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
-      if e.continuesFrom.isSome && claim.resumeFrom.isNone then
-        IO.eprintln s!"  Note: queue entry {e.id} continues a previous task but no longer has \
-its workspace; it will start from a clean checkout."
       return some (claim, tokenId, taskToken)
     finally
       claimMutex.unlock

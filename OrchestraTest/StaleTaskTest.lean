@@ -18,10 +18,14 @@ refuse to touch: a run that is genuinely still going, and a run this process can
 private def withTempData (act : IO α) : IO α := do
   let root := System.FilePath.mk "/tmp" / s!"orchestra-stale-{← IO.monoNanosNow}"
   IO.FS.createDirAll root
+  let previous ← Dirs.dataBaseOverride.get
   Dirs.setDataBaseOverride (some root)
   try act
   finally
-    Dirs.setDataBaseOverride none
+    -- Restored rather than cleared: clearing happens to be right only because nothing else
+    -- sets this, and a helper that quietly defeats an outer override is a bad thing to leave
+    -- lying around for whoever adds one.
+    Dirs.setDataBaseOverride previous
     try IO.FS.removeDirAll root catch _ => pure ()
 
 private def anEntry (id : String) (status : Queue.QueueStatus)
@@ -63,10 +67,11 @@ def aLandedRecordKeepsItsVerdict : Test := do
   TestM.assertEqual repaired 0 (msg := "nothing to repair")
   TestM.assert (status == some .completed) (msg := "the verdict stands")
 
-/-- The one that would be a disaster to get wrong: an entry that is `running` is a task with a
-    worker on it, and its record is `running` because it is. -/
+/-- An entry that is `running` is one the daemon is working on, and reconciliation must step over
+    it. This pins the reconciliation half only — that a live *worker* is never reaped is
+    `shouldReap` below, which is where that decision actually lives. -/
 @[test]
-def aLiveRunIsNotTouched : Test := do
+def aRunningEntryIsSteppedOver : Test := do
   let (repaired, status) ← withTempData do
     Queue.saveEntry (anEntry "q-1" .running (some "t-1"))
     TaskStore.saveTask (aRecord "t-1" .running)
@@ -114,3 +119,24 @@ def markTaskUnfinishedMovesOnlyRunningRecords : Test := do
   TestM.assert (!movedDone) (msg := "a landed record does not")
   TestM.assert (!movedMissing) (msg := "a record that is not there does not")
   TestM.assert (doneStatus == some .completed) (msg := "and is not rewritten")
+
+/-- The rule the reaper reads its table through, and the half that would be a disaster to get
+    wrong: an entry whose id is in the live set has a worker on it, whatever the queue file says,
+    and must survive. The daemon's ordering is what makes the live set trustworthy here — a row
+    goes up before its entry is written `running` and comes down after it stops being so — but
+    given a set, this is the whole of the decision. -/
+@[test]
+def shouldReapSparesEveryEntryWithAWorker : Test := do
+  let live := #["q-live"]
+  TestM.assert (!Queue.shouldReap live (anEntry "q-live" .running (some "t-live")))
+    (msg := "a running entry with a worker is not reaped")
+  TestM.assert (Queue.shouldReap live (anEntry "q-dead" .running (some "t-dead")))
+    (msg := "a running entry with no worker is")
+  TestM.assert (!Queue.shouldReap live (anEntry "q-done" .done (some "t-done")))
+    (msg := "an entry that already landed is not")
+  TestM.assert (!Queue.shouldReap live (anEntry "q-pending" .pending none))
+    (msg := "nor is one that has not started")
+  TestM.assert (!Queue.shouldReap #[] (anEntry "q-done" .done (some "t-done")))
+    (msg := "an empty table does not make a landed entry reapable")
+  TestM.assert (Queue.shouldReap #[] (anEntry "q-dead" .running none))
+    (msg := "an empty table is what a daemon with no workers looks like")

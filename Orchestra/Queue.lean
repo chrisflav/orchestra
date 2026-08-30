@@ -606,6 +606,16 @@ def markTaskUnfinished (taskId : String) : IO Bool := do
   else
     return false
 
+
+/-- Should this entry be reaped: does the queue call it `running` while no worker holds it?
+
+    The daemon's table of in-flight tasks supplies `liveEntryIds` and is the authority on the
+    second half; this is the rule that table is read through. Split out as a function of its
+    inputs, in the way `claimDecision` is, so that the case which matters most — a live run,
+    which must never be reaped — can be pinned by a test without standing a daemon up. -/
+def shouldReap (liveEntryIds : Array String) (entry : QueueEntry) : Bool :=
+  entry.status == .running && !liveEntryIds.contains entry.id
+
 /-- On daemon startup, mark any entries stuck in 'running' state as unfinished.
     These are left over from a previous daemon that was killed mid-task. -/
 def markStaleRunningAsUnfinished : IO Unit := do
