@@ -63,7 +63,16 @@ structure Config where
     (see `claimNextEntry`). `entryId` is the queue entry's id, which is what a client that wants
     to stop *one* task has: entries are what the queue, the concert steps and the dashboard all
     name a run by. Cancelling by that id rather than by the token id is what keeps this table an
-    implementation detail of the daemon rather than something a caller has to have been told. -/
+    implementation detail of the daemon rather than something a caller has to have been told.
+
+    This table is also the daemon's answer to "is that entry still alive", which the reaper and
+    a failed `cancel` both ask. That reading rests on an invariant worth stating plainly, since
+    it is spread across two places and neither is obviously about the other: **a row exists from
+    before its entry is written `running` to disk until after that entry stops being `running`.**
+    `claimNextEntry` supplies the near end by minting and pushing the token under the same lock
+    that writes the entry; `runEntry`'s `finally` supplies the far end by retiring the row only
+    once the body has finished writing its terminal status. In between, an entry that is
+    `running` on disk and absent from here has no worker and never will again. -/
 structure ActiveTask where
   tokenId : Nat
   entryId : String
@@ -76,6 +85,8 @@ def handleSocketRequest
     (debug            : Bool)
     (shutdownToken    : Std.CancellationToken)
     (activeTaskTokens : Std.Mutex (Array ActiveTask))
+    -- Repairs an entry that is `running` with no worker; see `run`. Answers whether it did.
+    (reapIfAbandoned  : String → IO Bool)
     (interactive      : Interactive.Manager)
     : IO Unit := do
   try
@@ -144,7 +155,18 @@ def handleSocketRequest
               a.token.cancel .cancel
               pure (DaemonRequest.DaemonResponse.withId entryId)
             | none =>
-              pure (DaemonRequest.DaemonResponse.error s!"no running task with id {entryId}")
+              -- Reaching here *is* the discovery that the entry is abandoned: the caller was
+              -- looking at something the queue calls `running`, and this process — the only one
+              -- that could be running it — has no worker for it. Repairing it on the spot is
+              -- what turns a button that reported a contradiction into one that resolves it.
+              -- The reaper would reach the same entry within the interval anyway; this is that
+              -- verdict, arrived at sooner because someone asked.
+              if ← reapIfAbandoned entryId then
+                pure (DaemonRequest.DaemonResponse.error
+                  s!"entry {entryId} was already gone — no worker was running it. \
+Marked unfinished.")
+              else
+                pure (DaemonRequest.DaemonResponse.error s!"no running task with id {entryId}")
         | .shutdown force =>
           if force then
             let actives ← activeTaskTokens.atomically (·.get)
@@ -199,6 +221,13 @@ def run (cfg : Config) : IO UInt32 := do
   Queue.markStaleRunningAsUnfinished
   Queue.cancelStaleConcertEntries
   Queue.cancelStaleRunningConcerts
+  -- After the entry sweeps, not before: the sweep is what makes the entries of the last
+  -- daemon's in-flight tasks non-`running`, and non-`running` is what this reads as proof that
+  -- the record beside them is stale. It repairs the historical backlog in the same pass, since
+  -- an entry that stopped being `running` several daemons ago says exactly the same thing.
+  let repairedRecords ← Queue.reconcileStaleTaskRecords
+  if repairedRecords > 0 then
+    IO.println s!"Marked {repairedRecords} stranded task record(s) unfinished."
   let appConfig ← loadAppConfig (cfg.configPath.map System.FilePath.mk)
   -- Concurrency limits: the `queue` block in config.json, overridden by the flags for a single
   -- run. Resolved here rather than at the top of the handler because it needs the config, and
@@ -222,6 +251,30 @@ def run (cfg : Config) : IO UInt32 := do
   -- Set while a task on a backend that is not parallel-safe holds the daemon exclusively.
   -- Also protected by claimMutex.
   let exclusiveActive ← IO.mkRef false
+  -- Repair one entry that is `running` on disk with no worker behind it, and say whether it
+  -- needed repairing. Defined up here beside the two things it consults, because both the
+  -- reaper fiber and a `cancel` that finds nothing to cancel ask exactly this question — the
+  -- socket handler is spawned long before the reaper is.
+  let reapIfAbandoned (entryId : String) : IO Bool := do
+    -- The decision and the write are one critical section, under the lock a claim also takes.
+    -- Read-then-act would let an entry claimed between the two — `running` on disk, its row
+    -- pushed a moment after this read of the table — be reaped while its worker was starting.
+    -- Both facts are therefore re-established here rather than carried in from the scan.
+    claimMutex.lock
+    try
+      let live ← activeTaskTokens.atomically (·.get)
+      if live.any (·.entryId == entryId) then return false
+      let some current ← Queue.loadEntry entryId | return false
+      if current.status != .running then return false
+      Queue.saveEntry { current with status := .unfinished }
+      -- `unfinished` rather than `failed`, matching the startup sweep: nothing here knows
+      -- whether the run was going to succeed, and `unfinished` is the status that leaves the
+      -- entry retryable instead of passing a verdict the daemon never actually reached.
+      if let some taskId := current.taskId then
+        let _ ← Queue.markTaskUnfinished taskId
+      return true
+    finally
+      claimMutex.unlock
   -- Concert manager: handles suspended concert fibers waiting for task results.
   let concertMgr ← ConcertManager.new
   -- Interactive sessions. Their clone slots come out of the same table the queue claims from,
@@ -266,6 +319,7 @@ def run (cfg : Config) : IO UInt32 := do
         let conn ← server.accept
         let _h ← IO.asTask (prio := .dedicated) do
           handleSocketRequest conn appConfig concertMgr cfg.debug shutdownToken activeTaskTokens
+            reapIfAbandoned
             interactive
     catch _ => pure ()
   -- Signal watcher: turns SIGTERM/SIGINT into the same graceful drain as `queue shutdown`.
@@ -299,14 +353,18 @@ def run (cfg : Config) : IO UInt32 := do
       IO.sleep 200
   -- Helper: atomically claim the next pending entry, marking it as running.
   -- Serialised by claimMutex so that multiple workers cannot claim the same entry.
-  -- Returns (entry, slot, tokenId, reuseTree):
+  -- Returns (entry, slot, tokenId, token, reuseTree):
   --   slot       index of the per-repo task slot reserved for this entry. Slots are
   --              independent clones, so the entry's agent can create any branch name it
   --              likes without colliding with another task running on the same repository.
   --   tokenId    cancellation-token id, allocated here rather than in `runEntry` because
   --              `IO.Ref.modifyGet` is not atomic across workers: two of them racing on it
-  --              are handed the same id, and `removeToken` then drops the other task's
+  --              are handed the same id, and retiring one would then drop the other task's
   --              token, leaving `queue cancel` unable to reach a running task.
+  --   token      the cancellation token itself, minted and registered here rather than by the
+  --              worker, so that it is in `activeTaskTokens` before the entry is `running` on
+  --              disk. The reaper reads the gap between those two as death, so there must not
+  --              be one.
   --   resumeFrom set when this entry continues a previous task and got that task's slot back
   --              *with its tree intact*, naming the predecessor entry.
   -- The decision itself lives in `Queue.claimDecision`, which is a function of its inputs and
@@ -344,7 +402,7 @@ def run (cfg : Config) : IO UInt32 := do
         authWaitNoted.modify (·.insert e.id)
         IO.println s!"  Entry {e.id} waiting on {backend} usage limits: {reason}"
       return .wait reason
-  let claimNextEntry : IO (Option (Queue.Claim × Nat)) := do
+  let claimNextEntry : IO (Option (Queue.Claim × Nat × Std.CancellationToken)) := do
     claimMutex.lock
     try
       let slotMap ← activeSlots.get
@@ -362,18 +420,36 @@ def run (cfg : Config) : IO UInt32 := do
       let e := claim.entry
       let occupied := slotMap.getD e.slotKey #[]
       let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
+      -- The cancellation token goes up *before* the entry is written `running`, and under the
+      -- same lock, because "running on disk, absent from this table" is the whole of the
+      -- reaper's test for an abandoned run. Minting it where the worker starts instead — a
+      -- clone and a config load later — leaves every freshly claimed entry looking exactly
+      -- like an abandoned one for as long as that gap lasts, and the reaper would put healthy
+      -- tasks down at the moment of their birth. In this order the table covers every entry
+      -- that is `running` on disk, with no window and no grace period to tune.
+      let taskToken ← Std.CancellationToken.new
+      let dropToken : IO Unit :=
+        activeTaskTokens.atomically (·.modify (·.filter (·.tokenId != tokenId)))
+      activeTaskTokens.atomically
+        (·.modify (·.push { tokenId, entryId := e.id, token := taskToken }))
       -- Record the resolved source on the entry, so `orchestra queue list` and any later
       -- continuation show which account actually ran it.
-      Queue.saveEntry { e with
-        status := .running, slot := some claim.slot
-        authSource := claim.authSource.orElse fun _ => e.authSource }
+      -- A failed write leaves no entry to run, so the row just added would sit in the table
+      -- describing nothing; it comes back out before the exception goes on its way.
+      try
+        Queue.saveEntry { e with
+          status := .running, slot := some claim.slot
+          authSource := claim.authSource.orElse fun _ => e.authSource }
+      catch err =>
+        dropToken
+        throw err
       activeSlots.modify (fun m => m.insert e.slotKey (occupied.push claim.slot))
       totalActive.modify (· + 1)
       if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
       if e.continuesFrom.isSome && claim.resumeFrom.isNone then
         IO.eprintln s!"  Note: queue entry {e.id} continues a previous task but no longer has \
 its workspace; it will start from a clean checkout."
-      return some (claim, tokenId)
+      return some (claim, tokenId, taskToken)
     finally
       claimMutex.unlock
   -- Helper: release the slot held by a completed entry.
@@ -391,13 +467,9 @@ its workspace; it will start from a clean checkout."
   -- slot: index of the per-repo task slot reserved for this entry by `claimNextEntry`.
   -- The slot directory is prepared (created if absent, otherwise reset to a clean default
   -- branch) inside the try below. The slot is released by `runEntry`, which wraps this.
-  let runEntryBody (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
+  let runEntryBody (entry : Queue.QueueEntry) (slot : Nat)
+      (taskToken : Std.CancellationToken)
       (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
-    let taskToken ← Std.CancellationToken.new
-    let active : ActiveTask := { tokenId, entryId := entry.id, token := taskToken }
-    activeTaskTokens.atomically (·.modify (·.push active))
-    let removeToken : IO Unit :=
-      activeTaskTokens.atomically (·.modify (·.filter (·.tokenId != tokenId)))
     -- Terminal writes go through here rather than saving the claim-time snapshot: a socket
     -- `cancel`, a listener, or a cascade from another worker can rewrite this entry's file
     -- while the task runs, and writing the stale snapshot back would silently revert it.
@@ -421,6 +493,14 @@ its workspace; it will start from a clean checkout."
     -- second time. `finish` can afford the fallback because it always writes `status` itself.
     let announce (taskId : String) : IO Unit := do
       if let some cur ← Queue.loadEntry entry.id then
+        -- A retry points the entry at its new run, and the record of the old one is orphaned
+        -- by that write: nothing references it afterwards, so neither the reaper nor the
+        -- startup reconciliation can ever reach it again. If that run died without landing,
+        -- this is the last moment its record can be told. Only a record still at `running` is
+        -- touched, so a predecessor that finished properly keeps the verdict it earned.
+        if let some previous := cur.taskId then
+          if previous != taskId then
+            let _ ← Queue.markTaskUnfinished previous
         Queue.saveEntry { cur with taskId := some taskId }
     let task : Task := {
       i := entry.inputType, o := entry.outputType
@@ -484,7 +564,6 @@ its workspace; it will start from a clean checkout."
         (slotOverride := some { slot, occupant := some entry.id, resumeFrom })
         (preresolvedAuth := authSource)
         (onStart := announce)
-      removeToken
       -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
       -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.
       -- Check the reason to distinguish the two cases.
@@ -519,7 +598,6 @@ its workspace; it will start from a clean checkout."
           if let some key := entry.concertStepKey then
             ConcertManager.signal concertMgr key outputJson
     catch e =>
-      removeToken
       let explicitlyCancelled := (← taskToken.getCancellationReason) == some .cancel
       if explicitlyCancelled then
         IO.eprintln s!"  Task cancelled (with error: {e})"
@@ -530,14 +608,26 @@ its workspace; it will start from a clean checkout."
         try finish .failed none none catch _ => pure ()
         try releaseClaimOnError catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
-  -- The release wraps the *whole* body, not just the part that runs the task: allocating the
-  -- cancellation token and registering it are themselves IO, and an exception there would
-  -- otherwise escape past the release and leak the slot. A leaked slot is never recovered, so
-  -- a handful of them permanently shrink the pool until the daemon is restarted.
+  -- The release wraps the *whole* body, not just the part that runs the task: an exception
+  -- anywhere in it would otherwise escape past the release and leak the slot. A leaked slot is
+  -- never recovered, so a handful of them permanently shrink the pool until the daemon is
+  -- restarted.
+  --
+  -- Retiring the token is part of that same release, and is the *only* place it happens. The
+  -- body used to drop it on each of its own exit paths, which put the drop before the terminal
+  -- status was written and opened a stretch where a task that had already landed looked, to
+  -- anything reading this table, exactly like one that had died. Here it runs after the body
+  -- has finished writing, in every case including the one where writing itself threw. That is
+  -- the second half of the reaper's invariant: a row is present from before the entry is
+  -- `running` on disk until after it stops being so, and its absence therefore means the run
+  -- is over rather than merely nearly over.
   let runEntry (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
+      (taskToken : Std.CancellationToken)
       (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
-    try runEntryBody entry slot tokenId resumeFrom authSource
-    finally releaseEntry entry slot
+    try runEntryBody entry slot taskToken resumeFrom authSource
+    finally
+      activeTaskTokens.atomically (·.modify (·.filter (·.tokenId != tokenId)))
+      releaseEntry entry slot
   -- Usage poller: refresh every configured OAuth source on a slow cadence.
   --
   -- Claim-time resolution already refreshes what it is about to use, but only for sources it is
@@ -895,6 +985,37 @@ holding the rest of this tick until the window moves"
       for _ in List.range listenerScanSeconds do
         if ← shutdownToken.isCancelled then break
         IO.sleep 1000
+  -- Task reaper: repairs entries this daemon is marked as running but has no worker for.
+  --
+  -- A worker that dies without landing its task — the process killed, the machine rebooted, an
+  -- exception escaping even the handler that writes `failed` — leaves the entry `running` on
+  -- disk and the task record `running` beside it. Until this existed the only thing that ever
+  -- noticed was the next startup sweep, so a daemon that stayed up for a week showed a week of
+  -- dead tasks as live ones, and the dashboard's overview counted them.
+  --
+  -- `activeTaskTokens` is what makes the question answerable without a heartbeat or a timeout:
+  -- by the invariant on `ActiveTask`, every entry that is legitimately `running` on disk has a
+  -- row here, so an entry that is `running` with no row is abandoned. That test is exact, which
+  -- is why nothing below waits for an entry to look dead twice before believing it.
+  --
+  -- Its own fiber, on the interactive reaper's cadence, for the same reason that one is: a
+  -- worker is blocked for as long as its task runs, and a queue full of stranded entries is
+  -- precisely the situation where no worker is coming back to notice anything.
+  let _taskReaper ← IO.asTask (prio := .dedicated) do
+    while !(← shutdownToken.isCancelled) do
+      try
+        -- Scanned outside the lock and confirmed inside it: the scan reads every entry file on
+        -- disk, and holding the claim mutex for that would stall every worker in the pool once
+        -- a queue grew large.
+        for entry in ← Queue.loadAllEntries do
+          if entry.status == .running then
+            if ← reapIfAbandoned entry.id then
+              IO.eprintln s!"  Reaped queue entry {entry.id}: marked running, but no worker \
+holds it. Marked unfinished."
+      catch e => IO.eprintln s!"  Task reaper error: {e}"
+      for _ in List.range 30 do
+        if ← shutdownToken.isCancelled then break
+        IO.sleep 1000
   -- Interactive reaper: closes sessions whose agent has gone and sessions that have sat too
   -- long without a turn. Its own fiber rather than a step in the worker loop, because a worker
   -- blocks for as long as the task it is running and a session waiting to be reaped is holding
@@ -918,8 +1039,8 @@ holding the rest of this tick until the window moves"
       try
         match ← claimNextEntry with
         | none => IO.sleep 1000
-        | some (claim, tokenId) =>
-          runEntry claim.entry claim.slot tokenId claim.resumeFrom claim.authSource
+        | some (claim, tokenId, taskToken) =>
+          runEntry claim.entry claim.slot tokenId taskToken claim.resumeFrom claim.authSource
       catch e =>
         IO.eprintln s!"Queue worker error: {e}"
         IO.sleep 1000

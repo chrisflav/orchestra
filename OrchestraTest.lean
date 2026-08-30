@@ -31,3 +31,4 @@ import OrchestraTest.ConfigApiTest
 import OrchestraTest.ClaudeAuthEnvTest
 import OrchestraTest.RepolessTaskTest
 import OrchestraTest.SpawnTaskTest
+import OrchestraTest.StaleTaskTest

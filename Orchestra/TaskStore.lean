@@ -16,7 +16,7 @@ inductive TaskStatus where
   | unfinished
   /-- The agent run was cancelled by the user via `queue cancel`. -/
   | cancelled
-deriving Repr
+deriving Repr, BEq
 
 instance : ToJson TaskStatus where
   toJson

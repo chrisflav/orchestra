@@ -46,8 +46,20 @@ def configBase : IO System.FilePath := do
 def skillsDir : IO System.FilePath := do
   return (← configBase) / "skills"
 
+/-- Optional override for the data base (tests redirect this).
+
+    One ref for the whole data root rather than one per store, because the stores under it are
+    not independent: a queue entry names the task record it became, and a test that redirected
+    one without the other would be exercising a pairing that cannot occur in production. -/
+initialize dataBaseOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
+
+def setDataBaseOverride (p : Option System.FilePath) : IO Unit :=
+  dataBaseOverride.set p
+
 /-- Data base: always uses the XDG data dir, no legacy fallback. -/
-def dataBase : IO System.FilePath :=
-  orchestraDataDir
+def dataBase : IO System.FilePath := do
+  match ← dataBaseOverride.get with
+  | some p => return p
+  | none   => orchestraDataDir
 
 end Orchestra.Dirs
