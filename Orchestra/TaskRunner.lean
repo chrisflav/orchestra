@@ -700,9 +700,22 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     grants  := Sandbox.grantsFor (agentDefOfBackend ioTask.backend).sandboxPaths
                  appConfig.additionalSandboxPaths repoPath ioTask.readOnly pluginDirs memoryDirs
     label   := taskId
-    repo    := ioTask.repo.map (·.fork.toString)
+    -- The upstream, not the fork: what a repository runs in is a property of the project, and an
+    -- operator writing `execution.options.images` writes down the name the project is known by.
+    -- The fork is per-bot and appears nowhere a person would think to configure. Keyed the same
+    -- way as `resolveMemoryDirs` just above, and as `runMerger`.
+    repo    := ioTask.repo.map (·.upstream.toString)
     image   := repoConfig.image }
   IO.println s!"  Running in: {session.id}"
+  -- The MCP server has to come down however the task ends, not only when it ends well. It holds a
+  -- listening socket with the PAT's authority behind it and — off loopback — one port out of
+  -- `mcp_ports`, a range sized to the queue's parallelism. Leaking it on a throw leaks both for
+  -- the daemon's lifetime, and enough failed tasks would leave no port for any later one.
+  let shutdownRef ← IO.mkRef (none : Option (IO Unit))
+  let shutdownOnce : IO Unit := do
+    match ← shutdownRef.modifyGet fun s => (s, none) with
+    | some stop => stop
+    | none      => pure ()
   try
     -- A task that continues another one is asking the agent to pick up a conversation it had
     -- before, and that conversation is a file the agent CLI wrote where it was running. An
@@ -769,6 +782,7 @@ its own.")
       authToken := mcpToken
     }
     let (port, shutdown) ← Server.start serverState (bindHost := mcpBind) (portRange := mcpPorts)
+    shutdownRef.set (some shutdown)
     IO.println s!"  MCP server on port {port}"
     -- 5. Run the init hook, in the session — that is where the agent will work, and where
     -- `init.sh` installs the toolchain `validation.sh` later needs. The repository's config was read
@@ -871,7 +885,10 @@ its own.")
         IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
     -- 7. Run after hook and shut down MCP server
     RepoConfig.runHook session repoPath "after.sh"
-    shutdown
+    -- Here as well as in the `finally`, so the agent's tool endpoint is gone before the task's
+    -- bookkeeping runs rather than merely by the time the task is over. `shutdownOnce` is what
+    -- makes saying it twice safe.
+    shutdownOnce
     -- 8. Persist final task state
     --
     -- A usage limit is checked before the result subtype, not after: the CLI reports the limit
@@ -930,6 +947,11 @@ its own.")
           pure none
     return ((taskId, finalStatus), typedOutput, outputJson)
   finally
+    -- Both released however the task ended, including by exception. The shutdown is guarded so
+    -- that a listener that refuses to come down cannot also cost us the session close, which is
+    -- the half that brings the agent's work back.
+    try shutdownOnce catch e =>
+      IO.eprintln s!"  Warning: could not shut down the MCP server: {e}"
     -- Closed however the task ended, including by exception: for a backend that holds a pod and a
     -- copy of the workspace, this is what brings the work back and stops paying for it.
     session.close

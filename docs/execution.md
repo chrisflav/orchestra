@@ -61,6 +61,7 @@ task, everything runs through it, and it is closed when the task ends, however i
 | --- | --- |
 | `start` | run the agent, return a `Handle` — headless, TUI, or a stream held open across turns |
 | `runScript` | run one of the repository's own scripts, where the agent works |
+| `provide` | carry an orchestra-supplied path in after the session opened |
 | `close` | bring back what has to come back, release what was held |
 | `describe` | the run as a command a person can read, for `--debug` |
 | `mcpEndpoint` | where the agent should reach the MCP server |
@@ -166,8 +167,11 @@ configuration type learning about any of them.
 4. Make `describe` reproduce what you actually do. `--debug` is the first thing anyone reaches for
    when an agent cannot see a path.
 5. Say where the MCP server has to listen (`exposure`) and where the agent should look for it
-   (`mcpEndpoint`). Getting this wrong is the quiet failure: the agent starts, finds no tools, and
-   does the task without them.
+   (`mcpEndpoint`), and implement `provide` if the agent does not run on this machine. Getting any
+   of the three wrong is the same quiet failure: the agent starts, finds no tools, and does the
+   task without them. `mcpEndpoint` is the address; `provide` is the file that address is written
+   into, which `AgentDef.setupMcp` writes to the daemon's `/tmp` or `$HOME` after the session is
+   already open — so it cannot be staged with the rest and is carried across just before launch.
 6. Test the rendering, not the running. `Landrun.argv` and `Kubernetes.podManifest` are pure
    functions from a spec to what gets sent, for exactly this reason — see
    `OrchestraTest/ExecTest.lean` and `OrchestraTest/KubernetesTest.lean`. A wrong grant is a
@@ -187,10 +191,12 @@ The mapping is mechanical, which is the point of the interface:
 | `SessionSpec.image` / `.repo` | which image the pod runs, and the label it carries |
 | `Session.start` | `kubectl exec` — `-i -t` for a TUI, `-i` for a session's held-open stream, neither for a queued run |
 | `Session.runScript` | `kubectl exec ... bash <script>`, in the same pod |
+| `Session.provide` | `tar` the agent's MCP config in, creating its directory first |
 | `Session.close` | copy the checkout back, delete the pod |
 | `RunSpec.env` | a file written into the pod and sourced, never a command line or a pod spec |
 | `RunSpec.envPassthrough` | nothing: `PATH` and `HOME` are resolved in the image, which is why they travel by name |
-| `Handle.kill` | delete the pod |
+| `Handle.kill` | kill the agent process in the pod, and the local `kubectl`; the pod is `close`'s to delete |
+| `Handle.tryWait` | the local `kubectl` having exited, confirmed against the agent's pid in the pod |
 | `exposure` | `.network`, so the MCP server binds where a pod can reach it and mints a token |
 | `mcpEndpoint` | rewrites the host to the daemon's cluster address, keeping port and token |
 

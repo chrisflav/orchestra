@@ -111,9 +111,12 @@ pods can route to, and set `mcp_ports` to a range that whatever is in between ca
 ```
 
 Without a range the port is ephemeral and different for every task, which no firewall rule, no
-port-forward and no tunnel can be written against. One server runs per task, so the range has to be
-at least as wide as the queue's parallelism; orchestra takes the first free port in it and fails
-the task with a clear message when there is none left.
+port-forward and no tunnel can be written against. A range that cannot be read as one — reversed,
+out of range, not a pair of numbers — is refused when the configuration is read rather than
+dropped, since dropping it would silently give you the ephemeral port the setting exists to avoid.
+One server runs per task, so the range has to be at least as wide as the queue's parallelism;
+orchestra takes the first free port in it and fails the task with a clear message when there is
+none left.
 
 **The daemon outside, with no route in** — a laptop behind NAT, a managed cluster with no path back
 to it. There is nothing to set here: the agent's tools need an inbound connection. The usual
@@ -228,7 +231,7 @@ first task on an image pays for the toolchain and the ones after it do not. That
 arrangement the landrun backend gets for free from the machine it runs on. The claim needs
 `ReadWriteMany`, or `ReadWriteOnce` with every agent pod on one node, since tasks run in parallel.
 The checkout's own build output (`.lake`, `target`, `node_modules`) travels with the checkout
-instead, unless `excludes` leaves it behind.
+instead; `excludes` keeps it off the wire without removing it from the daemon's copy.
 
 ## memory, continuations and series
 
@@ -310,8 +313,13 @@ When the task ends:
   file the agent deleted survives, which is the lesser mistake;
 - **read-only paths**, such as plugin directories, are not copied back at all.
 
-`excludes` keeps build output out of both directions (`.lake`, `target`, `node_modules`). It costs
-a rebuild in the pod and saves copying hundreds of megabytes twice. `sync_back: false` turns the
+`excludes` keeps build output off the wire in both directions (`.lake`, `target`, `node_modules`).
+It costs a rebuild in the pod and saves copying hundreds of megabytes twice. It does not cost you
+the daemon's copy: an excluded path is not transferred, but the checkout is replaced wholesale on
+the way back, so what the old tree had is moved across into the new one before the swap. A warmed
+`.lake` that `orchestra prepare` built survives every task that excludes it. Patterns are matched
+as globs against the checkout root, so they have to be paths or globs — a leading `/` or a `..` is
+refused when the configuration is read. `sync_back: false` turns the
 return trip off entirely — reasonable when the agent pushes and nothing local reads the result,
 since with the hooks and validation now running in the pod, the daemon's copy is mostly there for
 the next task and for anyone looking.
@@ -356,7 +364,7 @@ the cluster was actually asked for.
 | `image` | *required* | image tasks run in, unless something more specific applies |
 | `images` | `{}` | image per repository, by `owner/name`; beats what the repository asks for |
 | `allow_repo_image` | `true` | whether a repository's own `execution.image` is honoured |
-| `mcp_host` | *required* | where the pod reaches this daemon's MCP server |
+| `mcp_host` | *required* | where the pod reaches this daemon's MCP server; a hostname or IP, refused otherwise |
 | `namespace` | `default` | namespace the pod is created in |
 | `kubectl` | `kubectl` | path to the binary |
 | `service_account` | *(namespace default)* | `serviceAccountName` for the pod |
@@ -373,4 +381,5 @@ the cluster was actually asked for.
 | `deadline_seconds` | `14400` | `activeDeadlineSeconds` on the pod |
 | `startup_timeout_seconds` | `600` | how long to wait for the pod to be ready |
 | `sync_back` | `true` | whether the *checkout* is copied back out; memory directories always are |
-| `excludes` | `[]` | `tar --exclude` patterns, applied in both directions |
+| `excludes` | `[]` | `tar --exclude` patterns, applied in both directions; excluded paths stay as they are in the daemon's checkout |
+

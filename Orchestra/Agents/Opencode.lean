@@ -75,13 +75,17 @@ def opencode : AgentDef where
       ])
     ])]
     match ← IO.getEnv "HOME" with
-    | none => return ("", #[])
+    | none => return ("", #[], #[])
     | some home =>
       let configDir := System.FilePath.mk home / ".config" / "opencode"
       IO.FS.createDirAll configDir
       let configPath := configDir / "opencode.json"
       IO.FS.writeFile configPath mcpConfig.compress
-      return (configPath.toString, #[])
+      -- Home-scoped, not the absolute path just written: this is the daemon's `$HOME`, and the
+      -- agent reads it from its own.
+      return (configPath.toString, #[],
+        #[{ path := ".config/opencode/opencode.json", access := .rw, scope := .home
+          , from_ := .orchestra }])
   buildArgs _ctx _pluginDirs _subAgent model _systemPrompt resume _budget prompt := Id.run do
     let mut args : Array String := #[
       "run", "--format", "json",

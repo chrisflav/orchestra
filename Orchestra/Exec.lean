@@ -55,10 +55,12 @@ def resolve (cfg : ExecutionConfig) : IO (Except String Backend) := do
     route to it can be told about in advance.
 
     The token is minted here, once per task, and never written anywhere but the agent's own MCP
-    configuration inside its sandbox. -/
+    configuration inside its sandbox. `randomSecret` and not `randomHex`: this is the only thing
+    standing between a socket on a cluster network and the PAT behind it, so a machine that cannot
+    produce entropy has to fail the task rather than get a guessable one. -/
 def mcpBinding (backend : Backend) : IO (String × Option (UInt16 × UInt16) × Option String) := do
   match backend.exposure with
   | .loopback            => return ("127.0.0.1", none, none)
-  | .network host ports  => return (host, ports, some (← randomHex 24))
+  | .network host ports  => return (host, ports, some (← randomSecret 24))
 
 end Orchestra.Exec

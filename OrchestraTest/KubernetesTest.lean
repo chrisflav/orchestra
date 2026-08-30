@@ -104,6 +104,28 @@ def clusterSpecificSettingsAreReadThrough : Test := do
   TestM.assertEqual (excludeArgs c) #["--exclude", ".lake"] (msg := "excludes become tar flags")
   TestM.assertEqual c.imagePullSecrets #["ghcr"] (msg := "pull secrets")
 
+@[test]
+def anMcpHostHasToBeAHost : Test := do
+  -- It is interpolated into the shell pipeline the agent's MCP client runs, and rendered into
+  -- that client's config in JSON and in TOML. Refused here, where the key can be named.
+  for bad in ["orchestra.svc; id", "orchestra svc", "orchestra\"svc", "$(id)"] do
+    match Config.fromJson (Json.mkObj [("image", .str "i"), ("mcp_host", .str bad)]) with
+    | .ok _    => TestM.fail s!"mcp_host '{bad}' was accepted"
+    | .error e => TestM.assert (AgentDef.containsCI e "mcp_host") "the error names the key"
+
+@[test]
+def anExcludeHasToBeAPathOrAGlob : Test := do
+  -- `syncOut` matches these against the old checkout as globs, unquoted, to carry the excluded
+  -- paths across the wholesale swap. What may appear in one is pinned for that reason.
+  for good in [".lake", "target", "node_modules", "build/*", "*.log"] do
+    match Config.fromJson (options [("excludes", .arr #[.str good])]) with
+    | .ok c    => TestM.assertEqual c.excludes #[good] (msg := s!"'{good}' is a pattern")
+    | .error e => TestM.fail s!"'{good}' was rejected: {e}"
+  for bad in ["/etc", "../../etc", "a; rm -rf /", "$(id)", "a`id`", ""] do
+    match Config.fromJson (options [("excludes", .arr #[.str bad])]) with
+    | .ok _    => TestM.fail s!"exclude '{bad}' was accepted"
+    | .error e => TestM.assert (AgentDef.containsCI e "excludes") "the error names the key"
+
 /-! ## What the daemon has to carry -/
 
 @[test]
@@ -571,12 +593,16 @@ def aDaemonOutsideTheClusterCanBeGivenPortsToLiveOn : Test := do
   | .ok b =>
     let (_, ports, _) ← Exec.mcpBinding b
     TestM.assertEqual ports (some (31000, 31009)) (msg := "and reaches the server that binds it")
-  -- Nonsense is ignored rather than obeyed: a backwards or out-of-range pair would otherwise
-  -- become a server that binds nothing and a task that fails for an unrelated-looking reason.
-  TestM.assertEqual (config [("mcp_ports", .arr #[.num 900, .num 100])]).mcpPorts none
-    (msg := "a backwards range is not a range")
-  TestM.assertEqual (config [("mcp_ports", .arr #[.num 1])]).mcpPorts none
-    (msg := "nor is a single number")
+  -- Nonsense is refused rather than dropped. Dropping it means an ephemeral port — precisely the
+  -- outcome the setting exists to prevent — and the operator learns about it as agents that
+  -- silently reach no MCP server, rather than as one line naming the key.
+  for bad in [Json.arr #[.num 900, .num 100], Json.arr #[.num 1], Json.arr #[.num 0, .num 10],
+              Json.str "31000-31009", Json.num 31000] do
+    match Config.fromJson (options [("mcp_ports", bad)]) with
+    | .ok c    => TestM.fail s!"mcp_ports {bad.compress} was accepted as {repr c.mcpPorts}"
+    | .error e => TestM.assert (AgentDef.containsCI e "mcp_ports") "the error names the key"
+  -- Absent is still absent, and still means an ephemeral port.
+  TestM.assertEqual (config []).mcpPorts none (msg := "no range configured is not an error")
 
 @[test]
 def theServerListensInsideTheRangeItWasGiven : Test := do

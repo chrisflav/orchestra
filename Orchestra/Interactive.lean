@@ -433,7 +433,9 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths
                    repoPath false pluginDirs #[]
       label   := record.id
-      repo    := some fork.toString
+      -- The upstream, not the fork: an operator pinning an image writes the name the project is
+      -- known by, and the fork is per-bot. Same key as the queue path and the merger.
+      repo    := some record.upstream.toString
       image   := repoConfig.image }
     execRef.set (some execSession)
     -- Reviving a dormant conversation asks the agent to resume a session it wrote under its own

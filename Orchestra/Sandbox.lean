@@ -270,7 +270,11 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- and whatever a remote one says instead. Resolved before `setupMcp`, which writes it into the
   -- agent's config file.
   let mcp ← session.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
-  let (mcpContext, agentEnv) ← agentDef.setupMcp mcp model systemPrompt
+  let (mcpContext, agentEnv, mcpFiles) ← agentDef.setupMcp mcp model systemPrompt
+  -- The config `setupMcp` just wrote is on this machine; the agent may not be. It could not be
+  -- staged when the session opened — it did not exist then, since it holds an address that needs
+  -- a server that is started after the session — so it is carried across now, before launch.
+  session.provide mcpFiles
   -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
   let allPluginDirs := pluginDirs ++ memoryDirs
   -- Enforced here rather than where the prompts are built: every backend and every caller
@@ -553,7 +557,10 @@ def launchStreaming (agentDef : AgentDef) (repoPath : System.FilePath)
     -- Secret the agent presents to the MCP server, when the server had to listen off loopback.
     (mcpToken : Option String := none) : IO (Option StreamingSession) := do
   let mcp ← session.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
-  let (mcpContext, agentEnv) ← agentDef.setupMcp mcp opts.model opts.systemPrompt
+  let (mcpContext, agentEnv, mcpFiles) ← agentDef.setupMcp mcp opts.model opts.systemPrompt
+  -- Carried to wherever the agent runs, for the same reason as on the queued path: this file
+  -- holds the address of the tools, and it was written here.
+  session.provide mcpFiles
   -- Capped for the same reason as everywhere else: it is one `execve` argument, and the limit
   -- belongs to `execve` rather than to any one caller.
   let systemPrompt ← opts.systemPrompt.mapM (capPromptArg "system prompt")

@@ -119,6 +119,18 @@ structure Session where
   start : RunSpec → IO Handle
   /-- Run one of the repository's scripts, where the agent works. -/
   runScript : ScriptSpec → IO ScriptResult
+  /-- Carry orchestra-supplied paths into the environment after it was opened.
+
+      `openSession` stages everything the task is granted, but the agent's own MCP configuration
+      does not exist yet at that point: it is written by `AgentDef.setupMcp`, which needs the
+      endpoint, which needs the server, which is started after the session. It is nonetheless
+      `.orchestra` content in the strictest sense — a file on the daemon's disk, in no image — and
+      a backend that runs the agent elsewhere has to carry it there or the agent starts with a
+      `--mcp-config` pointing at nothing and quietly does the task with no tools.
+
+      A no-op for the backends that run the agent on this machine, where the file is already
+      where the agent will look. -/
+  provide : Array PathGrant → IO Unit := fun _ => pure ()
   /-- Finish: bring back anything that has to come back, and release whatever was held. Called once
       per task, including when the task failed. -/
   close : IO Unit
@@ -293,19 +305,46 @@ structure BackendFactory where
   /-- Build the backend from `execution.options`. -/
   make : Lean.Json → Except String Backend
 
-/-- `bytes` random bytes as lowercase hex, for names and secrets that must be unguessable.
+private def hexOf (bs : ByteArray) : String := Id.run do
+  let digits := "0123456789abcdef".toList
+  let mut out := ""
+  for b in bs.toList do
+    out := out.push digits[b.toNat / 16]! |>.push digits[b.toNat % 16]!
+  return out
+
+/-- Exactly `bytes` bytes of `/dev/urandom`, as lowercase hex. Throws rather than return anything
+    less.
+
+    Separate from `randomHex` because the two callers want opposite failure modes. A pod name only
+    has to be unique, so degrading to a clock reading is better than refusing to start a task. A
+    secret that degrades to a clock reading is not a secret, and nothing downstream can tell the
+    difference — so the one caller that mints a credential gets a function that fails loudly.
+
+    The read is repeated rather than trusted once: `Handle.read` is permitted to return fewer
+    bytes than asked for, and a short read here would silently shorten the token. -/
+def randomSecret (bytes : Nat) : IO String := do
+  IO.FS.withFile "/dev/urandom" .read fun h => do
+    let mut acc : ByteArray := .empty
+    -- Bounded so a handle that yields nothing fails with this message instead of spinning.
+    for _ in [0:16] do
+      if acc.size ≥ bytes then break
+      let chunk ← h.read (bytes - acc.size).toUSize
+      if chunk.isEmpty then break
+      acc := acc ++ chunk
+    if acc.size < bytes then
+      throw (IO.userError s!"could not read {bytes} bytes from /dev/urandom (got {acc.size})")
+    return hexOf acc
+
+/-- `bytes` random bytes as lowercase hex, for names that must not collide.
 
     Falls back to the monotonic clock if `/dev/urandom` cannot be read, which keeps a name unique
-    but not unpredictable — fine for a pod name, and the reason a caller minting a credential
-    should care that this is best-effort. -/
+    but not unpredictable. Never use it for a secret — `randomSecret` is that function, and it
+    throws instead of degrading. -/
 def randomHex (bytes : Nat) : IO String := do
-  let digits := "0123456789abcdef".toList
   try
     let h ← IO.FS.Handle.mk "/dev/urandom" .read
     let bs ← h.read bytes.toUSize
-    let mut out := ""
-    for b in bs.toList do
-      out := out.push digits[b.toNat / 16]! |>.push digits[b.toNat % 16]!
+    let out := hexOf bs
     if out.isEmpty then throw (IO.userError "no entropy") else return out
   catch _ =>
     return toString (← IO.monoNanosNow)

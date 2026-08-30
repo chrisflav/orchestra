@@ -130,7 +130,7 @@ def pi : AgentDef where
       ])
     ])]
     match ← IO.getEnv "HOME" with
-    | none => return ("", #[("PI_SKIP_VERSION_CHECK", some "1")])
+    | none => return ("", #[("PI_SKIP_VERSION_CHECK", some "1")], #[])
     | some home => do
       let piAgentDir := System.FilePath.mk home / ".pi" / "agent"
       let mcpJsonPath := piAgentDir / "mcp.json"
@@ -152,7 +152,10 @@ def pi : AgentDef where
           let contents ← try IO.FS.readFile path catch _ => pure "(unreadable)"
           err.putStrLn s!"[pi] config {path}: {contents.trimAscii}"
       err.flush
-      return (backup.getD "", #[("PI_SKIP_VERSION_CHECK", some "1")])
+      -- Home-scoped: written under the daemon's `$HOME`, read from the agent's, which is only the
+      -- same directory when the agent runs here.
+      return (backup.getD "", #[("PI_SKIP_VERSION_CHECK", some "1")],
+        #[{ path := ".pi/agent/mcp.json", access := .rw, scope := .home, from_ := .orchestra }])
   buildArgs _ctx _pluginDirs _subAgent model systemPrompt resume _budget prompt := Id.run do
     -- --print makes pi non-interactive (process prompt and exit);
     -- --mode json outputs all session events as JSON lines to stdout.

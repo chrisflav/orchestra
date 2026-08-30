@@ -194,12 +194,34 @@ namespace McpEndpoint
 
     The token is emitted through `echo` rather than `printf` on purpose: it is written into TOML
     as well as JSON (`vibe`'s config), and a `\n` escape means one thing in one and another in the
-    other. -/
+    other.
+
+    The host is escaped like the token even though `validHost?` has already refused anything that
+    would need it. Two cheap guards rather than one, because they fail differently: validation
+    rejects a bad `mcp_host` at startup with the key named, and escaping means a host that reached
+    here some other way is still a host and not a second command. -/
 def stdioCommand (e : McpEndpoint) : String × Array String :=
   match e.token with
   | none   => ("nc", #[e.host, toString e.port])
   | some t => ("sh", #["-c",
-      "{ echo " ++ shellEscape t ++ "; cat; } | nc " ++ e.host ++ " " ++ toString e.port])
+      "{ echo " ++ shellEscape t ++ "; cat; } | nc "
+        ++ shellEscape e.host ++ " " ++ toString e.port])
+
+/-- `host` if it is something that can be a host at all, otherwise why not.
+
+    Deliberately narrower than the grammar of a hostname: this string is interpolated into a shell
+    pipeline and rendered into the agent's configuration in two different quoting languages, and
+    the set of characters that survive all three unambiguously is exactly the set a DNS name or an
+    IP address is spelled with. An operator who needs something outside it wants a DNS name for
+    it, not an escape. -/
+def validHost? (host : String) : Except String String :=
+  if host.isEmpty then
+    .error "is empty"
+  else if host.all (fun c => c.isAlphanum || c == '.' || c == '-' || c == ':' || c == '_') then
+    .ok host
+  else
+    .error s!"'{host}' is not a hostname or an IP address (letters, digits, '.', '-', ':' and \
+'_' only)"
 
 end McpEndpoint
 

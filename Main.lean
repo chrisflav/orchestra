@@ -197,7 +197,7 @@ private def prepareHandler (p : Parsed) : IO UInt32 := do
       grants  := #[{ path := slotPath.toString, access := .rwx, required := true
                    , from_ := .orchestra }]
       label   := s!"prepare-{slot}"
-      repo    := some fork.toString
+      repo    := some upstream.toString
       image   := repoConfig.image }
     try
       RepoConfig.runInitIfNeeded session slotPath
@@ -1861,7 +1861,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths repoPath
                  false appConfig.pluginDirs #[]
     label   := "interactive"
-    repo    := repo.map (·.fork.toString)
+    repo    := repo.map (·.upstream.toString)
     image   := repoConfig.image }
   IO.println s!"  Running in: {session.id}"
   IO.println "  Launching agent..."

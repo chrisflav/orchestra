@@ -34,7 +34,9 @@ def claude : AgentDef where
     let ts ← uniqueToken
     let path := s!"/tmp/agent-mcp-{ts}.json"
     IO.FS.writeFile (System.FilePath.mk path) mcpConfig.compress
-    return (path, #[])
+    -- `--mcp-config` names this path, so it has to exist wherever the agent runs — which is not
+    -- this machine's `/tmp` under a backend that runs it elsewhere.
+    return (path, #[], #[{ path, access := .ro, from_ := .orchestra }])
   buildArgs mcpConfigPath pluginDirs subAgent model systemPrompt resume budget prompt := Id.run do
     let mut args : Array String := #[
       "--print", "--output-format=stream-json", "--verbose",

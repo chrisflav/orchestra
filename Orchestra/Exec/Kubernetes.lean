@@ -184,10 +184,10 @@ private def jsonStr? (j : Json) (key : String) : Option String :=
 
 /-- Read the backend's settings out of `execution.options`.
 
-    Strict about the two settings that cannot be guessed and loose about the rest: a missing
-    `image` or `mcp_host` is a configuration that cannot work, and finding that out at the first
-    dispatched task — as a pod that runs an agent with no tools — is exactly the failure this
-    refuses to allow. -/
+    Strict about the settings that cannot be guessed and loose about the rest: a missing `image` or
+    `mcp_host`, or an `mcp_ports` that cannot be read, is a configuration that cannot work, and
+    finding that out at the first dispatched task — as a pod that runs an agent with no tools — is
+    exactly the failure this refuses to allow. -/
 def Config.fromJson (j : Json) : Except String Config := do
   let image ← match jsonStr? j "image" with
     | some i => pure i
@@ -198,6 +198,44 @@ def Config.fromJson (j : Json) : Except String Config := do
     | none   => throw "kubernetes: execution.options.mcp_host is required — the address the pod \
 reaches this daemon's MCP server at (a Service name, or the daemon's host). Without it the agent \
 runs with no tools at all"
+  -- Checked here, where the key can be named, rather than trusted at the two places it is
+  -- rendered: this string goes into a shell pipeline (`McpEndpoint.stdioCommand`) and into the
+  -- agent's own configuration file in JSON and in TOML.
+  let mcpHost ← match Exec.McpEndpoint.validHost? mcpHost with
+    | .ok h    => pure h
+    | .error e => throw s!"kubernetes: execution.options.mcp_host {e}"
+  -- A malformed range is refused rather than dropped. Dropping it means an ephemeral port, which
+  -- is the one outcome the setting exists to prevent — whatever routes the pods to this daemon
+  -- was told a fixed range in advance, and a task on a port outside it reaches nothing.
+  let mcpPorts ← match j.getObjVal? "mcp_ports" with
+    | .error _ => pure none
+    | .ok (.arr #[lo, hi]) =>
+      match (fromJson? lo : Except String Nat), (fromJson? hi : Except String Nat) with
+      | .ok l, .ok h =>
+        if l == 0 || h < l || h > 65535 then
+          throw s!"kubernetes: execution.options.mcp_ports is [{l}, {h}], which is not a port \
+range — it must be [from, to] with 0 < from ≤ to ≤ 65535"
+        else pure (some (UInt16.ofNat l, UInt16.ofNat h))
+      | _, _ => throw "kubernetes: execution.options.mcp_ports must be two port numbers, \
+[from, to]"
+    | .ok _ => throw "kubernetes: execution.options.mcp_ports must be an array of two port \
+numbers, [from, to]"
+  -- These reach a shell as globs rather than as quoted words — `syncOut` matches them against the
+  -- old checkout to carry the excluded paths across a wholesale swap — so the pattern language is
+  -- pinned to what a path and a glob are spelled with. A leading `/` or a `..` is refused as well:
+  -- both name something outside the checkout, which `tar --exclude` would ignore and the preserve
+  -- loop would not.
+  let excludes ← (jsonArr? j "excludes").filterMap (fun v =>
+      match v with | .str s => some s | _ => none)
+    |>.mapM fun p =>
+      if p.isEmpty || p.startsWith "/" || (p.splitOn "..").length > 1 then
+        throw s!"kubernetes: execution.options.excludes has '{p}', which is not a path inside the \
+checkout"
+      else if p.all (fun c => c.isAlphanum || "._-*?/[]".any (· == c)) then
+        pure p
+      else
+        throw s!"kubernetes: execution.options.excludes has '{p}', which is not a path or a glob \
+(letters, digits, '.', '_', '-', '/', '*', '?' and '[]' only)"
   let nat (key : String) (dflt : Nat) : Nat :=
     j.getObjValAs? Nat key |>.toOption |>.getD dflt
   return {
@@ -216,18 +254,11 @@ runs with no tools at all"
     extraMounts := jsonArr? j "volume_mounts"
     mcpHost
     mcpBind := (jsonStr? j "mcp_bind").getD "0.0.0.0"
-    mcpPorts := match j.getObjVal? "mcp_ports" with
-      | .ok (.arr #[lo, hi]) => do
-        let l ← (fromJson? lo : Except String Nat).toOption
-        let h ← (fromJson? hi : Except String Nat).toOption
-        if l == 0 || h < l || h > 65535 then none else
-          some (UInt16.ofNat l, UInt16.ofNat h)
-      | _ => none
+    mcpPorts
     deadlineSeconds := nat "deadline_seconds" 14400
     startupTimeoutSeconds := nat "startup_timeout_seconds" 600
     syncBack := j.getObjValAs? Bool "sync_back" |>.toOption |>.getD true
-    excludes := (jsonArr? j "excludes").filterMap fun v =>
-      match v with | .str s => some s | _ => none
+    excludes
     homePath := (jsonStr? j "home_path").getD "/home/agent"
     homeClaim := jsonStr? j "home_claim"
     repoImages := match j.getObjVal? "images" with
@@ -467,6 +498,30 @@ tar -C {shellEscape podDir} -xf -"
   if code != 0 then
     throw (IO.userError s!"kubernetes: could not write {path} in the pod: {err.trimAscii}")
 
+/-- Create a directory in the pod, and everything above it. -/
+private def mkdirInPod (cfg : Config) (podName dir : String) : IO Unit := do
+  let (code, _, err) ← kube cfg #["exec", podName, "--", "mkdir", "-p", dir]
+  if code != 0 then
+    throw (IO.userError s!"kubernetes: could not create {dir} in the pod: {err.trimAscii}")
+
+/-- Carry one path into a pod that is already running, whether it is a file or a directory.
+
+    `stageIn` handles the directories the session was opened with, all of which exist by the time
+    the pod does and all of which are mounted, so their mount point is already there. This is for
+    what arrives afterwards — the agent's MCP configuration, which is often a single file under a
+    directory the image never had a reason to create — so the destination is made first. -/
+private def stagePath (cfg : Config) (podName hostPath podPath : String) : IO Unit := do
+  let host := System.FilePath.mk hostPath
+  -- Missing is not an error, on the same terms as `stageIn`: an agent backend can declare a path
+  -- it only writes under some conditions.
+  unless ← host.pathExists do return ()
+  if ← host.isDir then
+    mkdirInPod cfg podName podPath
+    stageIn cfg podName hostPath podPath
+  else
+    mkdirInPod cfg podName ((System.FilePath.mk podPath).parent.map (·.toString) |>.getD "/")
+    putFile cfg podName podPath (← IO.FS.readFile host)
+
 /-- Copy one directory back out of the pod, replacing what is on disk.
 
     The checkout is swapped rather than extracted over: `tar` never deletes, so extracting on top
@@ -488,18 +543,48 @@ private def syncOut (cfg : Config) (podName hostPath podPath : String) (merge : 
     return ()
   let incoming := hostPath ++ ".orchestra-incoming"
   let previous := hostPath ++ ".orchestra-previous"
+  -- `excludes` means "not carried in either direction". On a tree that is replaced wholesale that
+  -- would read as "deleted here", which is the opposite of what the setting is for: what people
+  -- put in it is build output, and `orchestra prepare` exists to warm exactly that. The old tree
+  -- still has it, so it is moved across into the new one before the swap. Nothing crosses the
+  -- network and nothing is lost.
+  --
+  -- Unescaped on purpose — these are globs, and `Config.fromJson` has already refused any pattern
+  -- with a character that could be anything but one.
+  let preserve := String.join (cfg.excludes.toList.map fun pat =>
+    s!"for src in \"$prev\"/{pat}; do\n\
+  [ -e \"$src\" ] || continue\n\
+  dst=\"$inc/$\{src#\"$prev\"/}\"\n\
+  mkdir -p \"$(dirname \"$dst\")\"\n\
+  rm -rf \"$dst\"\n\
+  mv \"$src\" \"$dst\"\n\
+done\n")
   let script := s!"set -e\n\
-rm -rf {shellEscape incoming} {shellEscape previous}\n\
-mkdir -p {shellEscape incoming}\n\
-{kubectlTar} | tar -C {shellEscape incoming} -xf -\n\
-if [ -d {shellEscape hostPath} ]; then mv {shellEscape hostPath} {shellEscape previous}; fi\n\
-mv {shellEscape incoming} {shellEscape hostPath}\n\
-rm -rf {shellEscape previous}\n"
+inc={shellEscape incoming}\n\
+prev={shellEscape previous}\n\
+rm -rf \"$inc\" \"$prev\"\n\
+mkdir -p \"$inc\"\n\
+{kubectlTar} | tar -C \"$inc\" -xf -\n\
+if [ -d {shellEscape hostPath} ]; then mv {shellEscape hostPath} \"$prev\"; fi\n\
+{preserve}\
+mv \"$inc\" {shellEscape hostPath}\n\
+rm -rf \"$prev\"\n"
   let (code, _, err) ← shell script
   if code != 0 then
-    let _ ← shell s!"rm -rf {shellEscape incoming}"
-    IO.eprintln s!"  [k8s] warning: could not copy the checkout back out of the pod, so \
+    -- Put the checkout back if the failure landed between the two moves. There, `hostPath` does
+    -- not exist at all, and the tree the agent started from is sitting intact under `previous` —
+    -- so restoring it is both possible and the only thing that leaves the slot usable.
+    let recovery := s!"if [ ! -e {shellEscape hostPath} ] && [ -d {shellEscape previous} ]; then \
+mv {shellEscape previous} {shellEscape hostPath}; fi\n\
+rm -rf {shellEscape incoming} {shellEscape previous}\n"
+    let _ ← shell recovery
+    if ← System.FilePath.pathExists (System.FilePath.mk hostPath) then
+      IO.eprintln s!"  [k8s] warning: could not copy the checkout back out of the pod, so \
 {hostPath} still holds what the agent started from: {err.trimAscii}"
+    else
+      IO.eprintln s!"  [k8s] error: could not copy the checkout back out of the pod, and \
+{hostPath} could not be restored either — the slot has to be prepared again before it is used: \
+{err.trimAscii}"
 
 /-- Why a pod never became ready, in as much detail as the cluster will give. What a person needs
     here is the image pull error or the unschedulable message, not "timed out". -/
@@ -509,6 +594,98 @@ private def startupDiagnosis (cfg : Config) (podName : String) : IO String := do
 {.status.containerStatuses[*].state.waiting.message} \
 {.status.conditions[?(@.type=='PodScheduled')].message}"]
   return phase.trimAscii.toString
+
+/-- What the cluster says about a pod's existence, as the three answers that call for three
+    different things.
+
+    Kept apart because `kubectl` exits non-zero for "no such pod" and for "the API server did not
+    answer" alike, and those are opposite situations: the first means the task's environment is
+    gone and there is nothing to copy back, the second means we do not know, and treating not
+    knowing as the first silently discards the work of a run that finished. -/
+inductive PodState where
+  /-- The pod is there, in this phase. -/
+  | present (phase : String)
+  /-- The cluster answered, and there is no such pod. -/
+  | gone
+  /-- The cluster could not be asked. -/
+  | unknown (why : String)
+
+/-- Ask whether the pod is still there.
+
+    `--ignore-not-found` is what makes the distinction possible at all: with it, a pod that does
+    not exist is exit 0 and empty output, so a non-zero exit means the query itself failed. -/
+private def podState (cfg : Config) (podName : String) : IO PodState := do
+  let (code, out, err) ← kube cfg
+    #["get", "pod", podName, "--ignore-not-found", "-o", "jsonpath={.status.phase}"]
+  if code != 0 then
+    return .unknown err.trimAscii.toString
+  else if out.trimAscii.isEmpty then
+    return .gone
+  else
+    return .present out.trimAscii.toString
+
+/-- Whether the process the agent's guard recorded is still running in the pod.
+
+    Asked only once the local `kubectl exec` has exited, and only to tell its two meanings apart:
+    the agent finished, or the connection to it dropped. `runnerScript`'s guard writes the pid for
+    exactly this. A pod that cannot be reached at all answers `false` — the run is not observably
+    alive, and reporting it as running forever would hang the caller. -/
+private def agentAlive (cfg : Config) (podName : String) : IO Bool := do
+  let script := s!"[ -f {agentPidPath} ] || exit 1\n\
+kill -0 \"$(cat {agentPidPath} 2>/dev/null)\" 2>/dev/null\n"
+  try
+    let out ← IO.Process.output {
+      cmd := cfg.kubectl
+      args := #["-n", cfg.ns, "exec", podName, "--", "/bin/sh", "-c", script] }
+    return out.exitCode == 0
+  catch _ => return false
+
+/-- End the run inside the pod, leaving the pod itself alone.
+
+    Cancelling a task is not the same as ending its environment. `after.sh` still has to run, the
+    checkout still has to come back, and the task still has to record that it was cancelled — all
+    of which are `kubectl exec`s into a pod that has to still be there. So this kills the process
+    the guard recorded and lets `close` take the pod down, which is where every other way a task
+    can end already takes it down.
+
+    The local `kubectl` is killed too: its connection would otherwise stay open reading from a
+    process that is gone, and the supervisor is waiting on that. -/
+private def killAgent (cfg : Config) (podName : String) (localPid : UInt32) : IO Unit := do
+  let script := s!"if [ -f {agentPidPath} ]; then\n\
+  pid=\"$(cat {agentPidPath} 2>/dev/null)\"\n\
+  kill -TERM \"$pid\" 2>/dev/null || true\n\
+  for _ in 1 2 3 4 5; do kill -0 \"$pid\" 2>/dev/null || exit 0; sleep 1; done\n\
+  kill -9 \"$pid\" 2>/dev/null || true\n\
+fi\n"
+  try
+    let child ← IO.Process.spawn {
+      cmd := cfg.kubectl
+      args := #["-n", cfg.ns, "exec", podName, "--", "/bin/sh", "-c", script]
+      stdin := .null, stdout := .null, stderr := .null }
+    let _ ← child.wait
+  catch _ => pure ()
+  Handle.killPid localPid
+
+/-- `localTryWait` corrected for the one thing it cannot see.
+
+    `Handle.tryWait` is specified to answer for the run, and a `kubectl exec` child answers for the
+    connection to it — which can die on its own while the agent keeps going. Taking that as "the
+    run is over" is how an interactive conversation gets reaped mid-turn, which is the failure the
+    field's own documentation describes.
+
+    So a local exit is a question rather than an answer, and the pod is asked. The result is
+    remembered: once the agent is known to be gone it stays gone, and the poll costs one `exec`
+    rather than one per call forever. -/
+private def guardedTryWait (cfg : Config) (podName : String) (settled : IO.Ref Bool)
+    (localTryWait : IO (Option UInt32)) : IO (Option UInt32) := do
+  match ← localTryWait with
+  | none      => return none
+  | some code =>
+    if ← settled.get then return some code
+    if ← agentAlive cfg podName then
+      return none
+    settled.set true
+    return some code
 
 /-! ## The session -/
 
@@ -580,6 +757,10 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
       let args := execArgs cfg podName (interactive := run.stdio == .inherit)
         (stdinOpen := run.stdio != .piped)
         (runnerScript envFile run.workdir.toString (guard := true)) run.command run.args
+      -- Cancellation ends the agent, not the pod: `close` is the only thing that takes the pod
+      -- down, because everything that has to happen after a cancelled task — `after.sh`, the
+      -- checkout coming back, the status being written — is another `exec` into it.
+      let settled ← IO.mkRef false
       match run.stdio with
       | .inherit =>
         -- An interactive session: `kubectl exec -i -t` puts a terminal on the connection, and the
@@ -588,7 +769,9 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
           cmd := cfg.kubectl, args
           stdin := .inherit, stdout := .inherit, stderr := .inherit }
         return { Handle.ofInheritChild child with
-                 id := s!"pod {cfg.ns}/{podName}", kill := deletePod }
+                 id := s!"pod {cfg.ns}/{podName}"
+                 tryWait := guardedTryWait cfg podName settled child.tryWait
+                 kill := killAgent cfg podName child.pid }
       | .piped =>
         -- Without a terminal, `kubectl exec` keeps the two streams apart, which is what orchestra
         -- needs: the agent's events are on one and everything else is on the other.
@@ -596,7 +779,9 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
           cmd := cfg.kubectl, args
           stdin := .null, stdout := .piped, stderr := .piped }
         return { Handle.ofPipedChild child with
-                 id := s!"pod {cfg.ns}/{podName}", kill := deletePod }
+                 id := s!"pod {cfg.ns}/{podName}"
+                 tryWait := guardedTryWait cfg podName settled child.tryWait
+                 kill := killAgent cfg podName child.pid }
       | .stream =>
         -- An interactive session's agent: up for hours, one turn written in at a time. `-i`
         -- without `-t` is what carries a pipe rather than a terminal, so closing our end reaches
@@ -605,8 +790,19 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
         let child ← IO.Process.spawn {
           cmd := cfg.kubectl, args
           stdin := .piped, stdout := .piped, stderr := .piped }
+        let localPid := child.pid
         let handle ← Handle.ofStreamChild child
-        return { handle with id := s!"pod {cfg.ns}/{podName}", kill := deletePod }
+        return { handle with
+                 id := s!"pod {cfg.ns}/{podName}"
+                 tryWait := guardedTryWait cfg podName settled handle.tryWait
+                 kill := killAgent cfg podName localPid }
+    provide := fun grants => do
+      -- Only orchestra's own content travels; a grant naming something the image supplies has
+      -- nothing to carry, exactly as when the session was opened.
+      for g in grants do
+        if g.from_ == .orchestra then
+          stagePath cfg podName (PathGrant.resolve home g).path
+            (PathGrant.resolve cfg.homePath g).path
     runScript := fun script => do
       -- The repository's own scripts, run where the agent works. `bash` because that is what the
       -- daemon used when it ran them itself, and repositories were written against it.
@@ -631,13 +827,24 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
       -- ended the task's environment — `deadline_seconds` expiring, an eviction, a node going
       -- away — and the difference between that and a transfer that failed is the difference
       -- between "retry it" and "the work is not there to retry".
-      let (code, out, _) ← kube cfg #["get", "pod", podName, "-o", "jsonpath={.status.phase}"]
-      if code != 0 then
+      --
+      -- Which is why "gone" and "could not ask" are not the same answer. A `kubectl` that fails
+      -- for an API-server hiccup or an expired credential says nothing about whether the pod is
+      -- there, and taking it as "gone" throws away a completed run's checkout and memories
+      -- without ever attempting the copy. So the copy is attempted whenever the pod was not
+      -- positively reported absent; `syncOut` already warns rather than throws if it cannot.
+      let state ← podState cfg podName
+      match state with
+      | .gone =>
         IO.eprintln s!"  [k8s] pod {podName} is gone before the task finished with it — deleted, \
 evicted, or past its {cfg.deadlineSeconds}s deadline_seconds. Nothing was copied back, so \
 {spec.workdir} still holds what the agent started from, and anything the agent wrote to a memory \
 directory is lost."
-      else
+      | .unknown why =>
+        IO.eprintln s!"  [k8s] could not ask the cluster whether pod {podName} is still there \
+({why}) — trying to copy the task's work back anyway, on the chance that it is."
+      | .present _ => pure ()
+      unless state matches .gone do
         for st in staged do
           if st.writable then
             if st.isWorkspace then
@@ -650,7 +857,7 @@ directory is lost."
               -- reason to throw away what it learned, and a memory that does not outlive the pod
               -- is not a memory.
               syncOut cfg podName st.hostPath st.podPath (merge := true)
-        if out.trimAscii.toString == "Failed" then
+        if state matches .present "Failed" then
           IO.eprintln s!"  [k8s] pod {podName} ended in Failed — if the task itself looked fine, \
 check whether it ran past deadline_seconds ({cfg.deadlineSeconds}s)."
       deletePod }

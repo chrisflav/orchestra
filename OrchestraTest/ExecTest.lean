@@ -208,11 +208,17 @@ def claudeConnectsToTheEndpointItIsGiven : Test := do
   -- `vibe` injects its entry into the user's own `~/.vibe/config.toml`, so exercising any of
   -- them here would write to the config of whoever is running the suite.
   let mcp : McpEndpoint := { host := "orchestra.internal", port := 9999 }
-  let (configPath, _) ← AgentDef.claude.setupMcp mcp none none
+  let (configPath, _, files) ← AgentDef.claude.setupMcp mcp none none
   let contents ← IO.FS.readFile (System.FilePath.mk configPath)
   AgentDef.claude.cleanup configPath
   TestM.assert (AgentDef.containsCI contents "orchestra.internal") "the host reaches the config"
   TestM.assert (AgentDef.containsCI contents "9999") "so does the port"
+  -- The right address in the file is no use if the file is not where the agent is. `setupMcp`
+  -- writes to *this* machine's `/tmp`, so it has to declare what it wrote as orchestra's to
+  -- carry — otherwise a backend that runs the agent elsewhere launches it with `--mcp-config`
+  -- pointing at nothing, and it does the task with no tools and no complaint.
+  TestM.assert (files.any fun g => g.path == configPath && g.from_ == .orchestra)
+    "the config it wrote is declared as a path orchestra has to carry"
 
 /-! ## What the agent's environment starts with -/
 
@@ -229,5 +235,28 @@ def anAbsentInstallationTokenIsUnsetRatherThanEmpty : Test := do
     "an empty token is not exported at all"
   TestM.assert (without.any fun (k, _) => k == "CLAUDE_CODE_DISABLE_AUTO_MEMORY")
     "the rest of the environment is unaffected"
+
+/-! ## The MCP host is not a shell -/
+
+@[test]
+def mcpHostIsRefusedUnlessItIsAHost : Test := do
+  -- `stdioCommand` interpolates the host into an `sh -c` pipeline, and `vibe` renders that
+  -- pipeline into TOML. Anything that is not spelled like a hostname is refused where the key can
+  -- be named, rather than reaching either.
+  for good in ["127.0.0.1", "orchestra.internal", "orchestra-mcp.default.svc", "::1"] do
+    TestM.assert (McpEndpoint.validHost? good |>.toOption |>.isSome) s!"'{good}' is a host"
+  for bad in ["", "host; rm -rf /", "host with spaces", "ho\"st", "$(id)", "host`id`"] do
+    TestM.assert (McpEndpoint.validHost? bad |>.toOption |>.isNone) s!"'{bad}' is not a host"
+
+@[test]
+def theTokenTransportEscapesWhatItInterpolates : Test := do
+  -- Belt and braces: even reaching `stdioCommand` directly, the host lands as one word.
+  let (cmd, args) := McpEndpoint.stdioCommand
+    { host := "orchestra.internal", port := 4711, token := some "deadbeef" }
+  TestM.assertEqual cmd "sh" (msg := "a shell, because `nc` cannot send the token first")
+  let script := (args.getD 1 "")
+  TestM.assert (AgentDef.containsCI script "deadbeef") "the token is in the script"
+  TestM.assert (AgentDef.containsCI script "orchestra.internal") "and so is the host"
+  TestM.assert (AgentDef.containsCI script "4711") "and the port"
 
 end OrchestraTest.Exec
