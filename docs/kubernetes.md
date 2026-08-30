@@ -383,3 +383,75 @@ the cluster was actually asked for.
 | `sync_back` | `true` | whether the *checkout* is copied back out; memory directories always are |
 | `excludes` | `[]` | `tar --exclude` patterns, applied in both directions; excluded paths stay as they are in the daemon's checkout |
 
+## keeping the MCP server to one namespace
+
+`mcp_bind` and the firewall decide which *machines* can reach the daemon's MCP server. They cannot
+decide which *namespace* can: every pod's traffic leaves the cluster behind the node's address, so
+a rule written on the daemon's host sees one source for the whole cluster.
+
+That matters because the server is not a small thing to expose. It hands out the authority of the
+PAT the daemon holds — opening pull requests, commenting, claiming issues — and the per-task token
+is the only thing in front of it. A pod in some unrelated namespace should not be able to try.
+
+Inside the cluster it is a `NetworkPolicy`, and the useful shape is the inverse of the obvious one:
+egress is default-allow, so the restriction is written in the namespaces that should *not* reach
+the daemon, as "everywhere except the networks the cluster sits on".
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-egress
+  namespace: default          # every namespace that is not the runners'
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+```
+
+Excluding the private ranges wholesale rather than the daemon's address alone is worth doing: it
+covers the API server, the kubelet and the cloud metadata service in the same breath, and it does
+not have to be revisited when the daemon moves.
+
+Two things this does not do, both worth knowing before relying on it:
+
+- **It has to be repeated per namespace.** There is no cluster-wide `NetworkPolicy`; a namespace
+  created later starts default-allow and can reach the daemon until it is given one of these. If
+  that is not a property you want to maintain by hand, an admission policy that requires it, or a
+  CNI with cluster-scoped policies, is the thing to reach for.
+- **It needs a CNI that enforces policy.** k3s does, through its embedded kube-router; plain
+  flannel elsewhere does not, and a policy no one enforces reads exactly like one that works. Check
+  before trusting it: apply a deny-all-egress policy in a scratch namespace and confirm a pod there
+  loses the network.
+
+Leave `kube-system` alone. It is cluster infrastructure rather than anywhere tasks run, and an
+egress policy there buys nothing against a threat model where the agent is the thing being confined.
+
+## testing it against a real cluster
+
+`OrchestraTest/KubernetesTest.lean` checks what the pod spec *says*, which needs no cluster.
+`OrchestraTest/KubernetesLiveTest.lean` checks what a pod *does* — that a session opens, the
+checkout arrives and comes back, memories merge, `excludes` costs a transfer and not the daemon's
+copy, and that a cancelled task and an evicted pod leave the disk in the state this document
+claims. It opts in through the environment and skips itself otherwise, so the suite stays green on
+a machine with no cluster:
+
+```sh
+ORCHESTRA_TEST_K8S_IMAGE=debian:stable-slim \
+ORCHESTRA_TEST_K8S_NAMESPACE=orchestra-runners \
+lake test
+```
+
+The image needs only `sh`, `bash` and `tar` — the whole of what the session lifecycle uses. `git`
+and `nc` are the agent's own requirements and no test there launches an agent, since that needs the
+pod to reach the daemon's MCP server, which is a fact about a particular network rather than about
+this code. `ORCHESTRA_TEST_K8S_KUBECTL` names the binary when it is not on `PATH`.
+
+Give the tests a namespace of their own, with the RBAC above and nothing else. Each test deletes
+its pod, but a namespace is the cheap way to be sure of what a failing run left behind.
