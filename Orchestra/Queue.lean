@@ -588,6 +588,33 @@ partial def cancelDependents (taskId : String) : IO Unit := do
         if let some tid := entry.taskId then
           cancelDependents tid
 
+/-- Mark the task record behind a dead run `unfinished`, and say whether that changed anything.
+
+    A `TaskRecord` and a `QueueEntry` are two stores describing one run, and only one of them
+    ever gets repaired. The record is stamped `running` the moment the run starts and terminal
+    only when it lands (`TaskRunner`, step 7), so a worker that dies in between leaves the
+    record at `running` for good — which is what the overview reads, while the queue page reads
+    the entry beside it and says something else entirely.
+
+    Only a record still sitting at `running` is touched. Anything already terminal is a run that
+    landed, and a second writer arriving late must not overwrite the verdict it wrote. -/
+def markTaskUnfinished (taskId : String) : IO Bool := do
+  let some record ← TaskStore.loadTask taskId | return false
+  if record.status == .running then
+    TaskStore.saveTask { record with status := .unfinished }
+    return true
+  else
+    return false
+
+/-- Should this entry be reaped: does the queue call it `running` while no worker holds it?
+
+    The daemon's table of in-flight tasks supplies `liveEntryIds` and is the authority on the
+    second half; this is the rule that table is read through. Split out as a function of its
+    inputs, in the way `claimDecision` is, so that the case which matters most — a live run,
+    which must never be reaped — can be pinned by a test without standing a daemon up. -/
+def shouldReap (liveEntryIds : Array String) (entry : QueueEntry) : Bool :=
+  entry.status == .running && !liveEntryIds.contains entry.id
+
 /-- On daemon startup, mark any entries stuck in 'running' state as unfinished.
     These are left over from a previous daemon that was killed mid-task. -/
 def markStaleRunningAsUnfinished : IO Unit := do
@@ -595,6 +622,27 @@ def markStaleRunningAsUnfinished : IO Unit := do
   for entry in all do
     if entry.status == .running then
       saveEntry { entry with status := .unfinished }
+
+/-- Bring task records back in line with the entries that own them, and answer how many needed it.
+
+    An entry that is not `running` is proof that no worker is on that task, which makes a
+    `running` record beside it stale. One pass over that rule repairs both the entries this
+    startup just swept and every record left behind by a daemon that died before any of this
+    existed, which is why there is no separate backfill.
+
+    Records no entry points at are deliberately left alone. Tasks also run outside the daemon —
+    `orchestra run` calls `TaskRunner.runTask` directly and never touches the queue — and from
+    here a live foreground run is indistinguishable from an abandoned one. Stamping those would
+    be this repair inventing exactly the disagreement it exists to remove. -/
+def reconcileStaleTaskRecords : IO Nat := do
+  let entries ← loadAllEntries
+  let mut repaired := 0
+  for entry in entries do
+    if entry.status != .running then
+      if let some taskId := entry.taskId then
+        if ← markTaskUnfinished taskId then
+          repaired := repaired + 1
+  return repaired
 
 /-- On daemon startup, cancel any unfinished concert-linked entries.
     Their concert fibers died with the previous daemon and can never be resumed. -/

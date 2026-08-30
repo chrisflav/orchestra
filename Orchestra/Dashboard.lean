@@ -1503,14 +1503,27 @@ private def askDaemon (request : Json) : IO (Except String Json) := do
     other's `/proc`. The socket is the thing that is actually shared, so opening it is the
     question worth asking.
 
-    Nothing here stamps a status. The worker running the task writes `cancelled` onto the entry
-    as it lands, and a second writer would race it; what comes back is the pair of ids the
-    request resolved to, so a caller can tell which run it just stopped. -/
+    Nothing here stamps a *queue* status. The worker running the task writes `cancelled` onto
+    the entry as it lands, and a second writer would race it; what comes back is the pair of ids
+    the request resolved to, so a caller can tell which run it just stopped.
+
+    The one thing it does write is the task record, and only in the `409` above: an entry that
+    is not running had no worker to race. That case is not hypothetical — it is how this button
+    comes to be on screen at all for a stranded run, because the page renders the control off
+    the record's status and the record is the half that was never repaired. Answering "not
+    running" and leaving the page still saying `running` is a dead end a reader can do nothing
+    with, so the mismatch is closed on the way out. -/
 private def cancelEntry (id : String) : IO WriteResult := do
   let entries ← Queue.loadAllEntries
   let some entry := entries.find? (fun e => e.id == id || e.taskId == some id)
     | return .notFound
   unless entry.status == .running do
+    let repaired ← match entry.taskId with
+      | some taskId => Queue.markTaskUnfinished taskId
+      | none        => pure false
+    if repaired then
+      return .conflict s!"entry {entry.id} is {qStText entry.status}, not running; \
+the task record still said running and has been marked unfinished"
     return .conflict s!"entry {entry.id} is {qStText entry.status}, not running"
   match ← askDaemon (Json.mkObj [("type", Json.str "cancel"), ("id", Json.str entry.id)]) with
   | .error why => return .conflict why
