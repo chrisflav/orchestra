@@ -468,14 +468,42 @@ def execArgs (cfg : Config) (podName : String) (interactive : Bool)
   #["-n", cfg.ns, "exec"] ++ flags
     ++ #[podName, "--", "/bin/sh", "-c", script, "orchestra", command] ++ args
 
+/-- `tar` flags for every extraction that happens *inside* the pod.
+
+    The agent does not run as root there — it cannot, since the CLIs refuse
+    `--dangerously-skip-permissions` under uid 0, and the pod carries no `securityContext` for
+    orchestra to say otherwise with. So the user extracting owns neither the mount points nor the
+    archive's recorded ownership, and plain `tar -x` fails on the first of the three:
+
+      * `--no-overwrite-dir` leaves the metadata of directories that already exist alone. Without
+        it the archive's own `./` entry makes `tar` try to `chmod` and `utime` the mount point,
+        which belongs to root, and the whole extraction fails there.
+      * `--no-same-owner` and `--no-same-permissions` are what an unprivileged `tar` does by
+        default; named anyway, because it is the *daemon's* `tar` on the other side of the pipe
+        that decides what is recorded, and this end should not depend on who runs it. -/
+def extractFlags : String := "--no-overwrite-dir --no-same-owner --no-same-permissions"
+
 /-- Copy a directory into the pod. Skipped, not failed, when the source is not there: an agent
-    backend may declare a plugin directory this machine does not have, exactly as with landrun. -/
+    backend may declare a plugin directory this machine does not have, exactly as with landrun.
+
+    The archive holds the directory's *entries*, not the directory. `tar -cf - .` would record a
+    `./` member, and restoring that member means `chmod` and `utime` on the extraction root — which
+    here is a mount point owned by root, under a `tar` that is not root, so the whole extraction
+    fails on the first thing it does. Nothing wants that member: the mount point already exists,
+    and its mode is the kubelet's business rather than the daemon's. -/
 private def stageIn (cfg : Config) (podName hostPath podPath : String) : IO Unit := do
   unless ← System.FilePath.pathExists (System.FilePath.mk hostPath) do return ()
+  -- An empty directory has no entries to list, and `tar` refuses to create an empty archive.
+  -- There is also nothing to carry: the mount point is already there.
+  if (← (System.FilePath.mk hostPath).readDir).isEmpty then return ()
   let excludes := String.intercalate " " (excludeArgs cfg).toList
-  let script := s!"tar -C {shellEscape hostPath} {excludes} -cf - . | \
+  -- `--exclude` before `-T`, not after: it applies only to names that come after it on the
+  -- command line, so the other order silently carries everything `excludes` names.
+  let script := s!"cd {shellEscape hostPath} && \
+find . -mindepth 1 -maxdepth 1 -print0 | \
+tar {excludes} --null -T - -cf - | \
 {shellEscape cfg.kubectl} -n {shellEscape cfg.ns} exec -i {shellEscape podName} -- \
-tar -C {shellEscape podPath} -xf -"
+tar -C {shellEscape podPath} {extractFlags} -xf -"
   let (code, _, err) ← shell script
   if code != 0 then
     throw (IO.userError s!"kubernetes: could not copy {hostPath} into the pod: {err.trimAscii}")
@@ -492,7 +520,7 @@ private def putFile (cfg : Config) (podName path contents : String) : IO Unit :=
   let podDir := (System.FilePath.mk path).parent.map (·.toString) |>.getD "/"
   let script := s!"tar -C {shellEscape dir.toString} -cf - {shellEscape name} | \
 {shellEscape cfg.kubectl} -n {shellEscape cfg.ns} exec -i {shellEscape podName} -- \
-tar -C {shellEscape podDir} -xf -"
+tar -C {shellEscape podDir} {extractFlags} -xf -"
   let (code, _, err) ← shell script
   try IO.FS.removeDirAll dir catch _ => pure ()
   if code != 0 then
