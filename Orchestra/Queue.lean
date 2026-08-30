@@ -337,7 +337,9 @@ private def stripJsonExt (name : String) : Option String :=
   else
     none
 
-/-- Load all queue entries, sorted by ID descending (newest first). -/
+/-- Load all queue entries, newest first.
+
+    By `created_at` rather than id, for the reason `TaskStore.loadAllTasks` gives. -/
 def loadAllEntries : IO (Array QueueEntry) := do
   let dir ← queueDir
   if !(← dir.pathExists) then return #[]
@@ -347,14 +349,16 @@ def loadAllEntries : IO (Array QueueEntry) := do
     if let some id := stripJsonExt entry.fileName then
       if let some e ← loadEntry id then
         result := result.push e
-  return result.qsort (fun a b => a.id > b.id)
+  return Time.sortNewestFirst (·.createdAt) (·.id) result
 
 /-- Every pending entry that may start now, in the order the daemon should try them.
 
     `activePerRepo` maps a slot-pool key (`QueueEntry.slotKey`) to the number of tasks currently
     running in that pool; entries whose pool is already at `perRepoLimit` are excluded.
-    Ordering is by priority (higher first), then oldest first — ids are monotonic, so the
-    smaller id is the older entry.
+    Ordering is by priority (higher first), then oldest first by `created_at`. Not by id: ids
+    are minted from a clock that restarts at boot, so across a reboot the smaller id is the
+    *newer* entry, and an entry left pending from before the reboot would be tried last —
+    starved behind everything enqueued since.
 
     A list rather than a single entry, because an entry can turn out to be unclaimable for a
     reason only the caller knows — a continuation whose predecessor's slot is still busy, or a
@@ -365,8 +369,10 @@ def pendingCandidates (all : Array QueueEntry) (activePerRepo : Std.HashMap Stri
   let pending := all.filter (fun e =>
     e.status == .pending &&
     activePerRepo.getD e.slotKey 0 < perRepoLimit)
-  pending.qsort (fun a b =>
-    if a.priority != b.priority then a.priority > b.priority else a.id < b.id)
+  let keyed := pending.map fun e => (Time.ageKey e.createdAt e.id, e)
+  (keyed.qsort fun a b =>
+    if a.2.priority != b.2.priority then a.2.priority > b.2.priority
+    else Time.AgeKey.olderThan a.1 b.1).map (·.2)
 
 /-- Choose the per-repo clone slot a freshly claimed entry should run in.
 
@@ -673,7 +679,9 @@ def loadConcertRun (id : String) : IO (Option ConcertRun) := do
     | .error _ => return none
     | .ok r    => return some r
 
-/-- Load all concert runs, sorted by ID descending (newest first). -/
+/-- Load all concert runs, newest first.
+
+    By `started_at` rather than id, for the reason `TaskStore.loadAllTasks` gives. -/
 def loadAllConcertRuns : IO (Array ConcertRun) := do
   let dir ← concertsDir
   if !(← dir.pathExists) then return #[]
@@ -683,7 +691,7 @@ def loadAllConcertRuns : IO (Array ConcertRun) := do
     if let some id := stripJsonExt entry.fileName then
       if let some r ← loadConcertRun id then
         result := result.push r
-  return result.qsort (fun a b => a.id > b.id)
+  return Time.sortNewestFirst (·.startedAt) (·.id) result
 
 /-- On daemon startup, mark any running concert runs as cancelled (the fibers died). -/
 def cancelStaleRunningConcerts : IO Unit := do

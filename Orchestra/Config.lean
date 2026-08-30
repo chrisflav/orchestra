@@ -19,7 +19,7 @@ private def hex4 (n : Nat) : String :=
     if v < 10 then Char.ofNat (v + '0'.toNat) else Char.ofNat (v - 10 + 'a'.toNat)
   String.ofList [digit 3, digit 2, digit 1, digit 0]
 
-/-- A process-wide unique, monotonically increasing identifier.
+/-- A process-wide unique identifier, increasing for as long as the host stays up.
 
     `IO.monoNanosNow` on its own is not sufficient once the queue daemon runs tasks on
     several threads: two workers can read the same nanosecond, and the value names task
@@ -27,17 +27,20 @@ private def hex4 (n : Nat) : String :=
     silently overwriting each other's state. Appending a mutex-guarded counter makes distinct
     calls yield distinct results regardless of clock resolution.
 
-    Both components are fixed-width and zero-padded so that lexicographic ordering on the
-    result still agrees with chronological ordering — the queue relies on that when sorting
-    entries and picking the oldest one at a given priority.
+    Both components are fixed-width and zero-padded, so lexicographic ordering on the result
+    agrees with chronological ordering — but only within a single boot. `IO.monoNanosNow`
+    counts from an unspecified epoch which on Linux is boot, so a reboot restarts it at zero
+    and every id minted afterwards sorts below every id minted before. **Nothing may order
+    records by id.** The stores each record a wall-clock `created_at` and sort on that
+    (`Orchestra.Time.sortNewestFirst`); an id is a name, and inside one boot a tiebreaker for
+    timestamps that only resolve to the second.
 
-    That ordering guarantee has a ceiling: `IO.monoNanosNow` counts from an unspecified epoch
-    which on Linux is boot, and at 10^16 ns — about 116 days of uptime — it outgrows the
-    16-digit field and the padding truncates it, wrapping ids back to `0000…`. Widening the
-    field is not free, because ids are compared against those already on disk and a wider
-    field sorts *below* every existing id, so the discontinuity would be immediate rather
-    than once per 116 days. The width therefore stays, and the overflow is reported instead
-    of passing silently. -/
+    Within a boot the field has a ceiling too: at 10^16 ns — about 116 days of uptime — the
+    clock outgrows the 16 digits and the padding truncates it, wrapping ids back to `0000…`.
+    Widening the field is not free, because ids are compared against those already on disk and
+    a wider field sorts *below* every existing id, so the discontinuity would be immediate
+    rather than once per 116 days. The width therefore stays, and the overflow is reported
+    instead of passing silently. -/
 def uniqueToken : IO String := do
   let nanos ← IO.monoNanosNow
   uniqueTokenMutex.lock
@@ -49,7 +52,8 @@ def uniqueToken : IO String := do
     -- process's life, and the ordering anomaly it describes is a single event, not a stream.
     if ← uniqueTokenOverflowed.modifyGet (fun seen => (!seen, true)) then
       IO.eprintln s!"Warning: the monotonic clock ({digits} ns) has outgrown the 16-digit id \
-field. New ids sort before existing ones, so queue entries may be picked out of order until \
+field, so new ids sort before existing ones. Records are ordered by their recorded timestamp \
+rather than by id, so nothing is misordered by this, but ids stop reading as ascending until \
 this host reboots."
   let padded := ("0000000000000000" ++ digits).takeEnd 16
   return padded.toString ++ hex4 (n % 65536)

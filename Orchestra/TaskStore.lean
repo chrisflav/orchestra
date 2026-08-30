@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Orchestra.Config
+import Orchestra.Utils.Time
 import Init.Data.String.Basic
 
 open Lean (Json FromJson ToJson)
@@ -176,7 +177,10 @@ private def stripJsonExt (name : String) : Option String :=
   else
     none
 
-/-- Load all task records, sorted by ID descending (newest first). -/
+/-- Load all task records, newest first.
+
+    Ordered by `created_at`, not by id: ids come from a clock that restarts at boot, so after a
+    reboot they sort every older record above every newer one. See `Time.sortNewestFirst`. -/
 def loadAllTasks : IO (Array TaskRecord) := do
   let dir ← tasksDir
   if !(← dir.pathExists) then return #[]
@@ -186,7 +190,7 @@ def loadAllTasks : IO (Array TaskRecord) := do
     if let some id := stripJsonExt entry.fileName then
       if let some r ← loadTask id then
         records := records.push r
-  return records.qsort (fun a b => a.id > b.id)
+  return Time.sortNewestFirst (·.createdAt) (·.id) records
 
 -- Series pointers
 

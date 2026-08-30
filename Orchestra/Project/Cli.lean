@@ -571,9 +571,8 @@ def issueTasksHandler (p : Parsed) : IO UInt32 := do
     return 0
   IO.println s!"{padRight "TASK ID" 18} {padRight "CREATED" 22} {padRight "STATUS" 11} {padRight "ROLE" 16} SERIES"
   IO.println (String.ofList (List.replicate 90 '-'))
-  -- Sort newest first (TaskStore.loadAllTasks already does this, but be explicit).
-  let sorted := matching.qsort (fun a b => a.id > b.id)
-  for r in sorted do
+  -- Newest first: `loadAllTasks` ordered them and `filter` keeps that order.
+  for r in matching do
     let role   := r.role.getD "-"
     let series := r.series.getD "-"
     IO.println s!"{padRight r.id 18} {padRight r.createdAt 22} \

@@ -836,10 +836,10 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
     IO.println ""
     IO.println s!"{padRight "ID" 16} {padRight "FORK" 28} {padRight "STATUS" 9} {padRight "PRIORITY" 8} {padRight "SERIES" 16} CONCERT"
     IO.println (String.ofList (List.replicate 102 '-'))
-    -- Show running first, then pending ordered by priority desc, then oldest first
+    -- Running first, then pending in the order the daemon will actually try them.
     let running := active.filter (fun e => e.status == .running)
     let pendingArr := active.filter (fun e => e.status == .pending)
-    let pendingByPriority := pendingArr.qsort (fun a b => a.priority > b.priority)
+    let pendingByPriority := Queue.pendingCandidates pendingArr {} pendingArr.size
     for e in running ++ pendingByPriority do
       let status := if e.status == .running then "running" else "pending"
       let concertLabel := e.concertId.getD ""
