@@ -268,6 +268,14 @@ def run (cfg : Config) : IO UInt32 := do
     -- abandoned and reap them within the tick.
     claimMutex.lock
     try
+      -- The table is read *before* the entry, never after. A live set sampled after a `running`
+      -- snapshot can have lost a row that the snapshot predates — worker lands the task, writes
+      -- the entry terminal, retires its row, all between the two reads — and the resulting pair
+      -- ("running", "no worker") would reap a run that had already finished, reverting a `done`
+      -- entry to `unfinished`. In this order that pair cannot arise: a table still holding the
+      -- row fails `shouldReap`'s second test, and a table that has lost it means the terminal
+      -- write already landed, which fails the first. Neither `finish` nor the retirement takes
+      -- `claimMutex`, so the lock does not stand in for this.
       let live ← activeTaskTokens.atomically (·.get)
       let some current ← Queue.loadEntry entryId | return false
       unless Queue.shouldReap (live.map (·.entryId)) current do return false
@@ -425,6 +433,15 @@ def run (cfg : Config) : IO UInt32 := do
       let e := claim.entry
       let occupied := slotMap.getD e.slotKey #[]
       let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
+      -- Ahead of the token and the write, deliberately. This is the last thing in the claim
+      -- that can realistically throw — a closed log pipe under `docker stop`, ENOSPC — and the
+      -- bookkeeping below it is not rolled back by anything, since `releaseEntry` runs only
+      -- from `runEntry` and a throwing claim never reaches it. Printing here means such a throw
+      -- escapes with the entry still pending, no row registered and no slot taken, instead of
+      -- leaking a clone slot and possibly wedging `exclusiveActive` for the daemon's lifetime.
+      if e.continuesFrom.isSome && claim.resumeFrom.isNone then
+        IO.eprintln s!"  Note: queue entry {e.id} continues a previous task but no longer has \
+its workspace; it will start from a clean checkout."
       -- The cancellation token goes up *before* the entry is written `running`, and under the
       -- same lock, because "running on disk, absent from this table" is the whole of the
       -- reaper's test for an abandoned run. Minting it where the worker starts instead — a
@@ -442,8 +459,9 @@ def run (cfg : Config) : IO UInt32 := do
       -- threw — so an exception anywhere in this tail would strand the row for the life of the
       -- daemon. That is worse than the bug the reaper exists to fix rather than an instance of
       -- it: a stranded row is what tells the reaper the entry is *alive*, so the entry becomes
-      -- unreapable, and `cancel` reports success while cancelling a token nobody holds. The
-      -- realistic thrower is not the write but the `eprintln` below, on a closed log pipe.
+      -- unreapable, and `cancel` reports success while cancelling a token nobody holds. What
+      -- remains below is a file write and three `IO.Ref` updates; the note that could also have
+      -- thrown was moved above the push rather than guarded here.
       try
         -- Record the resolved source on the entry, so `orchestra queue list` and any later
         -- continuation show which account actually ran it.
@@ -453,9 +471,6 @@ def run (cfg : Config) : IO UInt32 := do
         activeSlots.modify (fun m => m.insert e.slotKey (occupied.push claim.slot))
         totalActive.modify (· + 1)
         if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
-        if e.continuesFrom.isSome && claim.resumeFrom.isNone then
-          IO.eprintln s!"  Note: queue entry {e.id} continues a previous task but no longer has \
-its workspace; it will start from a clean checkout."
       catch err =>
         dropToken
         throw err

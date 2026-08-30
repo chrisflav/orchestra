@@ -606,7 +606,6 @@ def markTaskUnfinished (taskId : String) : IO Bool := do
   else
     return false
 
-
 /-- Should this entry be reaped: does the queue call it `running` while no worker holds it?
 
     The daemon's table of in-flight tasks supplies `liveEntryIds` and is the authority on the
