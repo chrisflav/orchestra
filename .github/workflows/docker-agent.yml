@@ -1,0 +1,150 @@
+name: Agent image
+
+# Builds docker/agent.Dockerfile — the image a task runs in under the kubernetes execution
+# backend — and publishes it to GitHub Container Registry as ghcr.io/<owner>/<repo>-agent.
+#
+# Separate from `Docker image` (the daemon) on purpose. That build compiles Lean from source and
+# is allowed 90 minutes; this one is apt and npm and takes a couple, and it has a reason to run
+# that the daemon build does not: a new claude-code release. Sharing a workflow would mean either
+# rebuilding the daemon weekly for nothing, or never picking those releases up.
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+    # Only when the image or its workflow actually changes. Nothing else in the repository is
+    # baked into it — the agent CLI comes from npm, and orchestra itself is not in this image.
+    paths:
+      - 'docker/agent.Dockerfile'
+      - '.github/workflows/docker-agent.yml'
+  pull_request:
+    paths:
+      - 'docker/agent.Dockerfile'
+      - '.github/workflows/docker-agent.yml'
+  # Mondays, 04:17 UTC. The agent CLI is the one thing here that moves without a commit, so the
+  # schedule is what turns a claude-code release into an image. Off-the-hour because every cron
+  # written on the hour runs at the same moment as everyone else's.
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      claude_code_version:
+        description: 'claude-code version to install (a version, or "latest")'
+        required: false
+        default: 'latest'
+
+concurrency:
+  group: docker-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Resolved here rather than left to npm inside the build, for two reasons: the image gets a
+      # tag naming the CLI version it actually contains, and two builds of the same commit produce
+      # the same image instead of quietly differing by whatever `latest` meant that morning.
+      - name: Resolve the claude-code version
+        id: cli
+        run: |
+          set -euo pipefail
+          requested='${{ github.event.inputs.claude_code_version || 'latest' }}'
+          resolved="$(npm view "@anthropic-ai/claude-code@${requested}" version)"
+          # `npm view` prints nothing for a version that does not exist, and a build against an
+          # empty string would install `@latest` under a tag claiming otherwise.
+          if [ -z "$resolved" ]; then
+            echo "no such claude-code version: ${requested}" >&2
+            exit 1
+          fi
+          echo "version=${resolved}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${requested} to ${resolved}"
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-agent
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # Bare commit sha, as in the daemon workflow, so a tag is exactly what
+            # `git rev-parse HEAD` prints.
+            type=sha,format=long,prefix=
+            # The CLI version inside the image. This is the tag to pin: what makes one of these
+            # images differ from another is almost never the Dockerfile.
+            type=raw,value=claude-${{ steps.cli.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/agent.Dockerfile
+          build-args: |
+            CLAUDE_CODE_VERSION=${{ steps.cli.outputs.version }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=agent
+          cache-to: type=gha,mode=max,scope=agent
+
+      # The build succeeding proves the layers assembled, not that the image can do the job. This
+      # is the same fixed list docs/kubernetes.md requires, checked as the unprivileged user the
+      # pod will actually run as — a `USER` line lost in a refactor fails here rather than as
+      # every task dying at launch on someone's cluster.
+      - name: Check the image has what the backend needs
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "CLAUDE_CODE_VERSION=${{ steps.cli.outputs.version }}" \
+            --file docker/agent.Dockerfile --tag agent-check --load .
+          docker run --rm agent-check sh -eu -c '
+            for tool in sh bash tar nc git claude; do
+              command -v "$tool" >/dev/null || { echo "MISSING: $tool"; exit 1; }
+            done
+            [ "$(id -u)" -ne 0 ] || { echo "runs as root; claude refuses that"; exit 1; }
+            [ -w "$HOME" ] || { echo "HOME ($HOME) is not writable"; exit 1; }
+            claude --version
+          '
+
+      - name: Summarise
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "claude-code: ${{ steps.cli.outputs.version }}"
+            echo "digest:      ${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "To use it, set in \`config.json\`:"
+            echo
+            echo '```json'
+            echo '  "execution": { "options": {'
+            echo '    "image": "ghcr.io/${{ github.repository }}-agent:claude-${{ steps.cli.outputs.version }}"'
+            echo '  } }'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

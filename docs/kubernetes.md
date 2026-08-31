@@ -21,7 +21,7 @@ see [the execution model](execution.md) for how the pieces divide.
   "execution": {
     "backend": "kubernetes",
     "options": {
-      "image": "ghcr.io/example/orchestra-agent:latest",
+      "image": "ghcr.io/chrisflav/orchestra-agent:latest",
       "namespace": "orchestra",
       "mcp_host": "orchestra.orchestra.svc.cluster.local",
       "service_account": "orchestra-agent",
@@ -92,6 +92,41 @@ particular is empty at that point and the CLI expects to create its own state di
 
 The daemon does not have to run as that user, or as anyone in particular. Everything it does to
 the pod is a `kubectl exec`, which lands as the image's user whoever the daemon is.
+
+### the image orchestra publishes
+
+You do not have to build one to start. CI builds `docker/agent.Dockerfile` and publishes it, and
+it is what the examples here name:
+
+```
+ghcr.io/chrisflav/orchestra-agent:latest
+ghcr.io/chrisflav/orchestra-agent:claude-2.1.251     # pin the CLI version
+```
+
+It is the floor and nothing more: the Claude CLI, `sh`, `bash`, `tar`, `nc`, `git`, and a non-root
+`agent` user whose home is `/home/agent` — the `home_path` default. Everything above is what the
+list above requires, so `claude` tasks against a repository that needs no toolchain of its own work
+against it unmodified.
+
+**Prefer the `claude-<version>` tag to `latest`.** What changes between two of these images is
+almost always the CLI rather than the Dockerfile, and a weekly build picks up new releases without
+a commit here — so `latest` is a moving target, and pinning is how a run stays reproducible.
+
+**What it deliberately does not carry** is anything a repository needs to build: no Lean, no JDK,
+no Python, no browser — and no Node or npm either, since the CLI ships as a self-contained binary
+and carrying a toolchain nothing in the image uses is exactly the bloat "minimal" is meant to
+avoid. A repository that needs any of that names its own image, or has one pinned for it; see
+[what is installed, when repositories disagree](#what-is-installed-when-repositories-disagree).
+The other three agent CLIs (`vibe`, `opencode`, `pi`) are not in it either — a deployment that runs
+those builds its own, and `docker/agent.Dockerfile` is a reasonable thing to copy.
+
+To build it yourself — a private registry, a different CLI version, extra tooling:
+
+```sh
+docker build -f docker/agent.Dockerfile \
+  --build-arg CLAUDE_CODE_VERSION=2.1.251 \
+  -t registry.internal/orchestra-agent:2.1.251 .
+```
 
 **RBAC** for the daemon's service account, in the namespace the pods run in:
 
@@ -196,7 +231,7 @@ the answer. Three sources, settled in this order:
   "execution": {
     "backend": "kubernetes",
     "options": {
-      "image": "ghcr.io/example/orchestra-agent:latest",
+      "image": "ghcr.io/chrisflav/orchestra-agent:latest",
       "images": {
         "acme/widgets": "ghcr.io/acme/widgets-ci:latest",
         "acme/mobile":  "ghcr.io/acme/android-ci:latest"
