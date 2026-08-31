@@ -80,6 +80,10 @@ structure State where
   /-- The subtree this task may write at or below, when it was queued with one. Plumbed to
       `Project.Tools.Env.scopeRoot`. -/
   scopeRoot : Option Taxis.IssueId := none
+  /-- Serve the taxis tools without a subtree bound, because a person is driving them. Set by
+      the interactive paths only; plumbed to `Project.Tools.Env.unscopedWrites`, which is where
+      the reasoning is. Also what offers `project_info` to a session attached to no project. -/
+  unscopedWrites : Bool := false
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
   prLabels : List String := []
@@ -462,7 +466,12 @@ def toolsList (state : State) : Json :=
         if acc.any (·.1 == name) then acc else acc ++ [(name, def_)]) []
     |>.map (·.2)
   let io := ioToolDefs state.inputType state.outputType
-  let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
+  -- Offered to an unscoped session too, though it has no project to report: there it answers
+  -- with what *is* true — that nothing bounds its writes — which is the thing an agent needs to
+  -- know before it starts hunting for the project it assumes it was given.
+  let projectInfo :=
+    if state.projectId.isSome || state.unscopedWrites then #[Project.Tools.projectInfoToolDef]
+    else #[]
   -- Gated on the policy rather than on a permission label, and on the hook as well: a queue this
   -- process cannot write to is a tool that would be listed and always refused.
   let queueTask :=
@@ -961,7 +970,8 @@ created in; there is no other destination this tool will use)"
       , spawnPolicy     := state.spawnPolicy
       , spawnContext    := state.spawnContext
       , enqueueTask     := state.enqueueTask
-      , scopeRoot       := state.scopeRoot }
+      , scopeRoot       := state.scopeRoot
+      , unscopedWrites  := state.unscopedWrites }
     Project.Tools.evalProjectTool env call
   | .unknown name =>
     log s!"tool {name}: unknown"

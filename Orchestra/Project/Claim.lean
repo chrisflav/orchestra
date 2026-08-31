@@ -222,4 +222,30 @@ o-claimed label: {e}"
   finally
     mgr.mutex.unlock
 
+/-- Release every claim recorded against `holder`, wherever it is, and answer what was released.
+
+    The counterpart to `TaskRunner`'s per-project sweep, for a holder that has no project to
+    sweep: an interactive session is attached to nothing and can claim in any project it can
+    reach, so the only thing tying its claims together is the holder id written into each one.
+    Starts from the `o-claimed` label (`loadClaimedIssueIds`) rather than from a project listing.
+
+    `forceRelease` rather than `release`: there is no status to move the issue on to that this
+    caller could know — a person's session ends without saying whether the work is done — so the
+    claim is dropped and the issue goes back to reading as open, which is what an unfinished
+    claim should look like to the dispatcher.
+
+    Best-effort throughout. It runs during teardown, where throwing would strand the resources
+    still waiting to be released after it. -/
+def releaseClaimsHeldBy (mgr : ClaimManager) (holder : String) : IO (Array Taxis.IssueId) := do
+  let mut released : Array Taxis.IssueId := #[]
+  try
+    for iid in ← loadClaimedIssueIds do
+      match ← loadClaim iid with
+      | some c => if c.taskId == holder then
+          if ← forceRelease mgr iid then released := released.push iid
+      | none => pure ()
+  catch e =>
+    IO.eprintln s!"  Warning: could not sweep claims held by {holder}: {e}"
+  return released
+
 end Orchestra.Project

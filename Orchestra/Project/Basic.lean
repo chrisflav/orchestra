@@ -372,6 +372,18 @@ def loadProject (pid : Taxis.IssueId) : IO (Option Project) := do
   | .error _ => return none
   | .ok raw => return some (← toProject raw)
 
+/-- Every issue currently carrying `o-claimed`, across every project.
+
+    The one query that finds claims without knowing which project they are in. A task always
+    knows its own project and sweeps that (`loadClaims`); an interactive session belongs to no
+    project and may have claimed in several, so releasing what it holds has to start from the
+    label instead. One list request, not one per project. -/
+def loadClaimedIssueIds : IO (Array Taxis.IssueId) := do
+  let cfg ← Orchestra.Taxis.getConfig
+  let ids ← statusLabelIds
+  let raws ← unwrap (← Orchestra.Taxis.listIssues cfg (label := some ids.claimed))
+  return raws.map (·.id)
+
 /-- All projects, newest first by id (matching the old newest-first-by-generated-id ordering). -/
 def loadAllProjects : IO (Array Project) := do
   let cfg ← Orchestra.Taxis.getConfig
@@ -1265,17 +1277,46 @@ def projectsDir : IO System.FilePath := do
 def projectDir (pid : Taxis.IssueId) : IO System.FilePath := do
   return (← projectsDir) / pid.toString
 
-/-- Load the default `AppConfig` and wire its `taxis` section (if any) into
-    `Orchestra.Taxis`'s active config, so every `Project.*`/`Claim.*` function can reach it
-    without every CLI handler threading a `Config` value through — mirrors how `Config.loadAppConfig`
-    itself is already called independently by each of `Main.lean`'s other command handlers. Called
-    once at CLI startup (`Main.main`). Silently does nothing if config.json can't be loaded —
-    commands that don't touch the taxis-backed project subsystem shouldn't fail just because
-    config.json is missing/malformed; a genuinely unconfigured taxis only surfaces as an error once
-    something actually calls `Orchestra.Taxis.getConfig`. -/
-def ensureTaxisConfigured : IO Unit := do
+/-- The `--config`/`-c` path in a raw argument list, before any command has parsed it.
+
+    Startup needs the path earlier than the CLI parser can give it: `ensureTaxisConfigured` runs
+    in `main`, ahead of `validate`, because everything the subcommands then do assumes taxis is
+    already wired. Accepts both spellings the parser accepts (`--config path`, `--config=path`,
+    and the `-c` short form), and answers `none` for a trailing flag with no value rather than
+    reaching past the end of the list. -/
+def configPathInArgs (args : List String) : Option System.FilePath :=
+  let rec go : List String → Option System.FilePath
+    | [] => none
+    | a :: rest =>
+      if a == "--config" || a == "-c" then
+        match rest with
+        | v :: _ => some (System.FilePath.mk v)
+        | []     => none
+      else if a.startsWith "--config=" then
+        some (System.FilePath.mk (a.drop "--config=".length).toString)
+      else if a.startsWith "-c=" then
+        some (System.FilePath.mk (a.drop "-c=".length).toString)
+      else go rest
+  go args
+
+/-- Load the `AppConfig` and wire its `taxis` section (if any) into `Orchestra.Taxis`'s active
+    config, so every `Project.*`/`Claim.*` function can reach it without every CLI handler
+    threading a `Config` value through — mirrors how `Config.loadAppConfig` itself is already
+    called independently by each of `Main.lean`'s other command handlers. Called once at CLI
+    startup (`Main.main`, `Orchestrad.main`). Silently does nothing if config.json can't be
+    loaded — commands that don't touch the taxis-backed project subsystem shouldn't fail just
+    because config.json is missing/malformed; a genuinely unconfigured taxis only surfaces as an
+    error once something actually calls `Orchestra.Taxis.getConfig`.
+
+    `args` are the process's raw arguments, read for `--config`. Passing them is what makes a
+    daemon started with `--config` reach the taxis instance that file names: this used to load
+    the default path unconditionally, so every subcommand honoured the flag except this, and a
+    daemon configured anywhere else served every taxis tool — read and write alike — as "taxis is
+    not configured". That reads exactly like a missing config section, which is the wrong place
+    to go looking. -/
+def ensureTaxisConfigured (args : List String := []) : IO Unit := do
   try
-    let cfg ← loadAppConfig
+    let cfg ← loadAppConfig (configPathInArgs args)
     Orchestra.Taxis.setConfig cfg.taxis
   catch _ => pure ()
 

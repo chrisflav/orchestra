@@ -297,6 +297,26 @@ private def teardown (mgr : Manager) (s : LiveSession) (status : SessionStatus)
   try s.stream.shutdown catch _ => pure ()
   try s.shutdownMcp catch _ => pure ()
   try mgr.releaseSlot s.fork s.slot catch _ => pure ()
+  -- Issues the session claimed go back to the pool, exactly as a finished task's do. Skipped for
+  -- `.dormant` on purpose: a dormant conversation is one this daemon expects to wake with its
+  -- context intact, and an issue it is holding is still the issue it is working on. Releasing
+  -- there would hand the work to the dispatcher while the person who asked for it is still in
+  -- the middle of it.
+  --
+  -- After the slot rather than before it, because it is the one step here that talks to taxis
+  -- over the network: a slow or unreachable tracker must not be what keeps a clone slot out of
+  -- circulation. `releaseClaimsHeldBy` swallows its own errors for the same reason.
+  --
+  -- Only for a session that could have claimed at all. The sweep is a tracker listing plus one
+  -- read per claim outstanding daemon-wide, and paying that on the close of a session never
+  -- granted `work_issues` buys nothing — on a daemon with no taxis configured it would also
+  -- warn, once per session, about failing to sweep claims that could not exist.
+  let couldClaim := ((← s.record.get).tools.getD allOptionalTools).contains "work_issues"
+  if couldClaim && status != .dormant then
+    let released ← Project.releaseClaimsHeldBy TaskRunner.globalClaimManager s.id
+    unless released.isEmpty do
+      IO.println s!"  [session {s.id}] released {released.size} issue claim(s): \
+        {String.intercalate ", " (released.toList.map (·.toString))}"
   let now ← TaskStore.currentIso8601
   try
     update s fun r =>
@@ -411,6 +431,21 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       appId := appConfig.appId, privateKeyPath := appConfig.privateKeyPath
       installationId := some installationId, pat := appConfig.pat
       agentBackend := backendName
+      -- What the issue tools need to be more than a list of names. A session is dispatched to no
+      -- issue and no project, and every one of these was left at its default until now — so the
+      -- three issue groups above were granted, listed, and then refused at call time: every write
+      -- for want of a subtree to scope it to, every claim for want of a holder to record. A person
+      -- asking the agent to file an issue got "this task is attached to no project or issue".
+      unscopedWrites := true
+      -- The session id is the claim holder. It outlives a dormancy and a wake, which a process id
+      -- or a port would not, and `teardown` uses the same string to find what to give back.
+      claimManager := some TaskRunner.globalClaimManager
+      taskId := some record.id
+      -- The daemon is right here, so approving an issue can queue its merger exactly as it does
+      -- for a queued reviewer. Without these `decide_issue approve` reaches the end of its work
+      -- and then cannot ask for the merge.
+      enqueueMerger := some (TaskRunner.enqueueMergerImpl appConfig)
+      enqueueReviewer := some TaskRunner.enqueueReviewerImpl
     }
     shutdownRef.set (some shutdownMcp)
     -- A session goes through the same resolver as a queued run, so an account the daemon has

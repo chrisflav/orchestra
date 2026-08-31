@@ -1789,6 +1789,10 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
       IO.println s!"  Workspace at {p}"
       pure p
   let backendName := backend.getD "claude"
+  -- The holder written into any claim this session takes, and the string the sweep at the end
+  -- looks for. Unique per run: two `orchestra interactive` sessions on one machine are two
+  -- different people's, and a shared holder id would have each releasing the other's issues.
+  let sessionId := s!"interactive-{← Secret.randomHex 8}"
   let serverState : Server.State := {
     repo
     installationId
@@ -1798,6 +1802,16 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     pat            := appConfig.pat
     agentBackend   := backendName
     defaultOrganization := appConfig.defaultOrganization
+    -- The same grant the daemon's chat sessions get, for the same reason: a person is typing
+    -- every request. See `Project.Tools.Env.unscopedWrites`. Without it `--tools all` hands this
+    -- session the three issue groups and every write in them is refused.
+    unscopedWrites := true
+    claimManager := some TaskRunner.globalClaimManager
+    taskId := some sessionId
+    -- Both only write a queue entry, which the daemon picks up later, so they work from a CLI
+    -- that is not the daemon just as well as from inside it.
+    enqueueMerger := some (TaskRunner.enqueueMergerImpl appConfig)
+    enqueueReviewer := some TaskRunner.enqueueReviewerImpl
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"
@@ -1822,13 +1836,28 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     IO.println s!"  Auth source: {label}"
     Usage.markUsed backendName label
   IO.println "  Launching agent..."
+  -- Through `defaultPluginDirs`, not the raw config list, so this session gets orchestra's own
+  -- shipped skills — `orchestra-taxis-issues` among them — exactly as a queued task and a daemon
+  -- chat session do. Reading the config's `plugin_dirs` alone left the one session with a person
+  -- in it as the only place those skills were missing.
+  let pluginDirs ← TaskRunner.defaultPluginDirs appConfig
   let result ← Sandbox.launchAgent agentDef repoPath "" port token
-    (debug := debug) (pluginDirs := appConfig.pluginDirs)
+    (debug := debug) (pluginDirs := pluginDirs)
     (model := model) (budget := budget)
     (extraEnv := apiKeyEnv) (extraPorts := extraPorts)
     (additionalPaths := appConfig.additionalSandboxPaths)
     (interactiveAgent := true)
   IO.println s!"  Agent exited with code {result.exitCode}"
+  -- Give back whatever the agent claimed while the person had it. The daemon's sessions do this
+  -- in `Interactive.teardown`; this path has no manager to do it for them, so it is done here.
+  -- Guarded on `work_issues` for the same reason as there: it is the only group that can take a
+  -- claim, and the sweep costs a tracker listing that a session without it would spend for
+  -- nothing — including on a machine with no taxis configured at all.
+  if allowedTools.contains "work_issues" then
+    let released ← Project.releaseClaimsHeldBy TaskRunner.globalClaimManager sessionId
+    unless released.isEmpty do
+      IO.println s!"  Released {released.size} issue claim(s): \
+        {String.intercalate ", " (released.toList.map (·.toString))}"
   shutdown
   return if result.exitCode == 0 then 0 else 1
 
@@ -1885,5 +1914,5 @@ def orchestraCmd : Cmd := `[Cli|
 def main (args : List String) : IO UInt32 := do
   Utils.unbufferIfPiped
   gRawArgs.set args
-  Project.ensureTaxisConfigured
+  Project.ensureTaxisConfigured args
   orchestraCmd.validate args

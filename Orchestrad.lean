@@ -163,5 +163,5 @@ def orchestradCmd : Cmd := `[Cli|
 
 def main (args : List String) : IO UInt32 := do
   Utils.unbufferIfPiped
-  Project.ensureTaxisConfigured
+  Project.ensureTaxisConfigured args
   orchestradCmd.validate args

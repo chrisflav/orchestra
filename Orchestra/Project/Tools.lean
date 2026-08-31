@@ -709,6 +709,21 @@ structure Env where
   /-- The subtree this task may write at or below, when it was queued with one
       (`Config.IOTask.scopeRoot`). Overrides what `writeScopeRoot` would otherwise derive. -/
   scopeRoot : Option Taxis.IssueId := none
+  /-- Lift the subtree bound entirely, for a context where a person drives every call.
+
+      Write scoping exists to confine an agent nobody is watching to the work it was dispatched
+      for. An interactive session is the other case: there is no dispatch to confine it to, and
+      somebody reads each answer before asking for the next thing.
+
+      A separate field rather than an absence, because the absence already meant something else.
+      Leaving `issueId` and `projectId` unset does not read as "unbounded", it reads as
+      `unattached` and refuses every write — which is exactly what interactive sessions got for
+      as long as they were built by leaving those two fields alone: all three issue tool groups
+      granted, every taxis tool listed, and not one write that worked.
+
+      Never set on a queued task, and never inherited by one: `queue_task` carries the derived
+      root onto what it queues, so an unbounded session still spawns confined agents. -/
+  unscopedWrites : Bool := false
 
 private def deny (perm : String) : String :=
   s!"this task is not authorized for the {perm} tool group"
@@ -719,10 +734,24 @@ private def denyAnyGroup : String :=
   "this task is not authorized for any of the manage_issues, work_issues or review_issues \
    tool groups"
 
+/-- How far a write may reach.
+
+    `unattached` is not a bound but the absence of one: no issue, no project to derive a root
+    from, and no standing licence to do without either. It is the only one of the three that
+    refuses every write. -/
+inductive WriteScope where
+  /-- Confined to `root` and everything below it. -/
+  | subtree (root : Taxis.IssueId)
+  /-- No bound at all — a person is driving every call (`Env.unscopedWrites`). -/
+  | unbounded
+  /-- Nothing to scope to, so nothing may be written. -/
+  | unattached
+deriving Repr, Inhabited, BEq
+
 /-- The issue bounding what this task may create or update: the root of its own project subtree
     (`Project.projectRootOf`). Anchored on the task's issue when it has one, otherwise on its
     project — a role dispatched without an issue (a planner or a maintainer) is still confined to
-    its project. `none` means the task is attached to neither and cannot be scoped at all.
+    its project. `unattached` means the task is attached to neither and cannot be scoped at all.
 
     An issue-less task's `projectId` is taken as the root as given, *not* re-derived: the
     dispatcher already chose it deliberately, and for a label-dispatched maintainer it is the
@@ -730,17 +759,25 @@ private def denyAnyGroup : String :=
     ancestor. Re-deriving would walk up to that ancestor and hand the agent write access to
     sibling subtrees nobody labelled. Where the project id *is* an anchor — every
     project-dispatcher role — `projectRootOf` returned it unchanged anyway. -/
-private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
+-- Not private: the order of the three cases below is what keeps a queued task inside its subtree
+-- when something upstream sets both `scopeRoot` and `unscopedWrites`, and that precedence is
+-- worth a test that needs no tracker to run.
+def writeScopeRoot (env : Env) : IO WriteScope := do
   -- A scope carried on the task wins over anything derived here. It is set only by `queue_task`,
   -- and it holds the *queueing* task's own root: deriving one from the bound issue instead walks
   -- up to the nearest project anchor, which for a task scoped to a labelled issue below that
   -- anchor is strictly wider than the scope the task that queued it was held to. A task must not
   -- be able to create an agent that writes where it cannot.
-  if let some root := env.scopeRoot then return some root
+  --
+  -- Ahead of `unscopedWrites` for that same reason. The only thing that sets `scopeRoot` is a
+  -- task queued by another one, and a bound handed down by the queueing task is not one its
+  -- descendant may lift for itself — whoever set the flag on such a task set it by mistake.
+  if let some root := env.scopeRoot then return .subtree root
+  if env.unscopedWrites then return .unbounded
   match env.issueId, env.projectId with
-  | some iid, _ => return some (← projectRootOf iid)
-  | none, some pid => return some pid
-  | none, none => return none
+  | some iid, _ => return .subtree (← projectRootOf iid)
+  | none, some pid => return .subtree pid
+  | none, none => return .unattached
 
 /-- Reject a write that would land outside the task's subtree. Returns an error string to
     surface, or `none` when the write is allowed. Reads are not scoped — see
@@ -748,10 +785,11 @@ private def writeScopeRoot (env : Env) : IO (Option Taxis.IssueId) := do
 private def refuseOutsideScope (env : Env) (target : Taxis.IssueId) (what : String) :
     IO (Option String) := do
   match ← writeScopeRoot env with
-  | none =>
+  | .unbounded => return none
+  | .unattached =>
     return some s!"cannot {what}: this task is attached to no project or issue, so there is no \
       subtree to scope the change to"
-  | some root =>
+  | .subtree root =>
     if ← isWithinSubtree root target then return none
     return some s!"cannot {what}: issue {target.toString} is outside this task's project \
       subtree (root {root.toString}); a task may only write to issues at or below it"
@@ -1220,7 +1258,13 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         return content msg (isError := true)
     -- Read once here and carried onto the queued task, rather than left for it to re-derive:
     -- see `writeScopeRoot`, whose derivation can land above this task's own root.
-    let callerScope ← writeScopeRoot env
+    -- `unbounded` narrows to `none` on the way out rather than queueing another unbounded task:
+    -- what is queued runs with nobody reading it, and derives its own root from whatever issue
+    -- or project it is dispatched with. A person's licence to write anywhere is not transferable
+    -- to an agent working alone.
+    let callerScope ← match ← writeScopeRoot env with
+      | .subtree root => pure (some root)
+      | .unbounded | .unattached => pure none
     match policy.resolve env.spawnContext request with
     | .error e =>
       IO.println s!"  [mcp] queue_task: refused — {e}"
@@ -1248,7 +1292,15 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
   | .projectInfo =>
     IO.println "  [mcp] project_info"
     match env.projectId with
-    | none => return content "this task is not attached to a project" (isError := true)
+    | none =>
+      -- Not an error for a session that writes unscoped: it is attached to no project because it
+      -- was never dispatched to one, not because something went wrong, and the honest answer is
+      -- the one that says where to look instead. Answering with `isError` would read to the
+      -- agent as a tool it must stop using.
+      if env.unscopedWrites then
+        return content "this session is not attached to a project, and writes are not scoped to \
+          one — every project is reachable. Use list_projects to find one, then list_issues."
+      return content "this task is not attached to a project" (isError := true)
     | some pid =>
       match ← loadProject pid with
       | none => return content s!"project {pid.toString} not found" (isError := true)

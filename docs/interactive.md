@@ -48,11 +48,36 @@ For its whole lifetime, not per turn:
 | the MCP server, which holds the PAT | `Server.start` | its own `shutdown` |
 | a resolved authentication source | `Usage.resolveLabel`, `Usage.markUsed` | — |
 | the agent process | `Sandbox.launchStreaming` | kill, on end or crash |
+| any taxis issue claims the agent took | `claim_issue`, held under the session id | teardown, swept by holder — but not on `dormant` |
 
 Reserving the clone slot for the session — in the same table the queue claims from — is what
 stops a queued task taking the slot and resetting the working tree in the middle of a
 conversation. A session is repository-bound like every other unit of work here: it takes an
 `upstream`/`fork` pair and gets the sandbox, the credentials and the tools a task would get.
+
+### the issue tools, and why a session's writes are not scoped
+
+A queued task may only write to taxis issues at or below the one it was dispatched to. A session
+is dispatched to nothing, so there is no such subtree to confine it to — and for a long time that
+meant every write it attempted was refused, while all three issue tool groups were still listed
+as available. The tools were there and none of them worked.
+
+A session now sets `Server.State.unscopedWrites`, which says outright what
+`Interactive.allOptionalTools` already implied: a person is reading every answer before asking
+for the next thing, so their agent may write anywhere on the tracker. Three consequences worth
+knowing:
+
+- **it is a real widening.** A chat session can edit or delete issues in any project, not just
+  one. That is the trade for a session that is not attached to a project in the first place.
+- **it is not inherited.** `queue_task` carries the *derived* subtree onto what it queues, and an
+  unbounded session derives none — so a task queued from a chat session is scoped by its own
+  issue or project, exactly as any other queued task is. A person's licence to write anywhere
+  does not transfer to an agent working with nobody watching.
+- **claims are held under the session id**, which survives a dormancy and a wake. Teardown sweeps
+  them by that id, skipping `dormant`: a conversation the daemon expects to wake is still working
+  on the issue it claimed.
+
+`queue_task` itself stays off in a session — it needs a `spawn_policy`, and nothing sets one here.
 
 States are `starting → idle → running → idle → … → ended | failed`. A turn begins when a message
 is written to the agent's stdin and ends when its stream emits a result.
