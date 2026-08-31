@@ -110,22 +110,31 @@ jobs:
           cache-from: type=gha,scope=agent
           cache-to: type=gha,mode=max,scope=agent
 
-      # The build succeeding proves the layers assembled, not that the image can do the job. This
-      # is the same fixed list docs/kubernetes.md requires, checked as the unprivileged user the
-      # pod will actually run as — a `USER` line lost in a refactor fails here rather than as
-      # every task dying at launch on someone's cluster.
+      # The build succeeding proves the layers assembled, not that the image can do the job.
+      #
+      # Run as the unprivileged user the pod will actually use, with `$HOME` mounted over — the
+      # two conditions that make a real cluster differ from a bare `docker run`, and between them
+      # the reason every task on a working-looking image can die at launch. `exec` is set because
+      # Docker mounts a tmpfs `noexec` by default and a Kubernetes emptyDir is not; without it this
+      # check fails on a toolchain that would be fine in a pod.
       - name: Check the image has what the backend needs
         run: |
           set -euo pipefail
           docker build \
             --build-arg "CLAUDE_CODE_VERSION=${{ steps.cli.outputs.version }}" \
             --file docker/agent.Dockerfile --tag agent-check --load .
-          docker run --rm agent-check sh -eu -c '
-            for tool in sh bash tar nc git claude; do
+          docker run --rm --tmpfs /home/agent:mode=0777,exec agent-check sh -eu -c '
+            # What the backend invokes, then the package managers a repository reaches for, then
+            # the elan shims — those are symlinks this Dockerfile creates by hand, so they are the
+            # most likely thing to go quietly missing.
+            for tool in sh bash tar nc git claude node npm elan uv uvx lean lake; do
               command -v "$tool" >/dev/null || { echo "MISSING: $tool"; exit 1; }
             done
             [ "$(id -u)" -ne 0 ] || { echo "runs as root; claude refuses that"; exit 1; }
             [ -w "$HOME" ] || { echo "HOME ($HOME) is not writable"; exit 1; }
+            # A manager that cannot write to the mounted $HOME is the failure this image is shaped
+            # to avoid; uv proves it cheaply (elan would mean a multi-gigabyte Lean toolchain).
+            uv python install 3.13 >/dev/null 2>&1 || { echo "uv cannot install into HOME"; exit 1; }
             claude --version
           '
 

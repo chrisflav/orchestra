@@ -103,19 +103,30 @@ ghcr.io/chrisflav/orchestra-agent:latest
 ghcr.io/chrisflav/orchestra-agent:claude-2.1.251     # pin the CLI version
 ```
 
-It is the floor and nothing more: the Claude CLI, `sh`, `bash`, `tar`, `nc`, `git`, and a non-root
-`agent` user whose home is `/home/agent` — the `home_path` default. Everything above is what the
-list above requires, so `claude` tasks against a repository that needs no toolchain of its own work
-against it unmodified.
+It carries what the list above requires — the Claude CLI, `sh`, `bash`, `tar`, `nc`, `git` — under
+a non-root `agent` user whose home is `/home/agent`, the `home_path` default.
 
 **Prefer the `claude-<version>` tag to `latest`.** What changes between two of these images is
 almost always the CLI rather than the Dockerfile, and a weekly build picks up new releases without
 a commit here — so `latest` is a moving target, and pinning is how a run stays reproducible.
 
-**What it deliberately does not carry** is anything a repository needs to build: no Lean, no JDK,
-no Python, no browser — and no Node or npm either, since the CLI ships as a self-contained binary
-and carrying a toolchain nothing in the image uses is exactly the bloat "minimal" is meant to
-avoid. A repository that needs any of that names its own image, or has one pinned for it; see
+**It also carries the package managers, but none of the toolchains** — `npm`, `elan` and `uv`, with
+no Node packages, no Lean and no Python installed. That is where the size is: a Lean toolchain is a
+few gigabytes and a CPython a few hundred megabytes, each wanted by one repository, while the
+managers are tens of megabytes and every repository that needs a toolchain needs one of them first.
+So a repository's `init.sh` can say `elan default stable`, `uv sync` or `npm ci` and have it work,
+without this image guessing which of those it would be.
+
+Where what they install *goes* is the other half of that. `$HOME` is an `emptyDir` mounted over
+whatever the image put at that path, so a toolchain baked in here would be masked and one installed
+at runtime is gone with the pod — **unless `home_claim` points that mount at a volume**, which is
+exactly what it is for. The managers therefore live in `/usr/local` (never masked) and put their
+content under `$HOME`: `~/.elan`, `~/.cache`, `~/.local`. With a claim, the first task on a
+repository pays for the toolchain and the rest do not; without one, every task pays again.
+
+**What it does not carry** is anything a repository needs that a package manager cannot fetch — no
+JDK, no browser, no system libraries beyond the base. A repository that needs those names its own
+image, or has one pinned for it; see
 [what is installed, when repositories disagree](#what-is-installed-when-repositories-disagree).
 The other three agent CLIs (`vibe`, `opencode`, `pi`) are not in it either — a deployment that runs
 those builds its own, and `docker/agent.Dockerfile` is a reasonable thing to copy.
