@@ -70,6 +70,29 @@ repository's scripts are run with it), `tar`, `nc` and `git`. That is the fixed 
 list the daemon's own machine needs, minus `landrun`. What each repository needs on top of it is
 the subject of the next section.
 
+**And a `USER` that is not root.** This is not a preference. Claude Code refuses
+`--dangerously-skip-permissions` under uid 0 — "cannot be used with root/sudo privileges for
+security reasons" — and that flag is how orchestra runs it, so an image that leaves the default
+root user fails every task at the first launch, before the agent has done anything:
+
+```dockerfile
+RUN useradd --create-home agent
+USER agent
+```
+
+The pod carries no `securityContext`, deliberately: `runAsUser` in the manifest would be
+orchestra overriding a decision the image already makes, and getting it wrong means a uid with no
+passwd entry, which several toolchains will not start under. So the image's own `USER` is the only
+thing that decides, and it is the image's job to set it.
+
+Nothing has to be granted for that to work. Every directory orchestra mounts — the checkout,
+`$HOME`, the control directory — is an `emptyDir`, which the kubelet creates world-writable, so an
+unprivileged user can write all three without a `fsGroup` or an init container. `$HOME` in
+particular is empty at that point and the CLI expects to create its own state directory in it.
+
+The daemon does not have to run as that user, or as anyone in particular. Everything it does to
+the pod is a `kubectl exec`, which lands as the image's user whoever the daemon is.
+
 **RBAC** for the daemon's service account, in the namespace the pods run in:
 
 ```yaml
@@ -353,6 +376,12 @@ most of the time, but a long pause between tool calls is the thing to watch if r
 with no error from the agent itself. If the connection does drop, the agent process in the pod
 outlives it — the next attempt kills whatever the last one left behind before starting, so two
 agents never share a checkout.
+
+**Every task failing the same way at the first launch** is almost always the image running as
+root — see "what you need". Two symptoms, depending on how far it gets:
+`--dangerously-skip-permissions cannot be used with root/sudo privileges` from the agent, or
+`tar: .: Cannot change mode` while the checkout is being staged, if something else in the image
+has dropped privileges. Both are the image's `USER`, not the cluster.
 
 **`--debug`** prints the pod manifest and the exec command, which is the quickest way to see what
 the cluster was actually asked for.

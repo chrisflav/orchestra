@@ -39,6 +39,13 @@ Cancelling a task deletes the pod, which ends whatever was running in it.
 the agent CLI, and whatever the repositories being worked on need to build. The same list the
 daemon's own machine needs, minus `landrun`.
 
+And a `USER` that is not root: Claude Code refuses `--dangerously-skip-permissions` under uid 0,
+which is how orchestra runs it, so a root image fails every task before the agent starts. Nothing
+here sets a `securityContext` — the image's own `USER` is what decides, and the volumes mounted
+below are `emptyDir`s, which the kubelet creates world-writable, so an unprivileged user needs
+nothing granted to write the checkout, its home, or the control directory. `docs/kubernetes.md`
+has the reasoning.
+
 ## credentials
 
 Nothing sensitive is passed on a command line or written into the pod's spec, both of which are
