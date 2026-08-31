@@ -69,18 +69,37 @@ private def mountPaths : List String :=
 /-! ## Configuration -/
 
 @[test]
-def theTwoSettingsThatCannotBeGuessedAreRequired : Test := do
-  -- An image that does not exist would be a pod that never starts, which is at least loud. An
-  -- unset `mcp_host` is the quiet one: the pod starts, the agent finds no tools, and it does the
-  -- task by hand — so both are refused before a task can depend on them.
-  match Config.fromJson (Json.mkObj [("mcp_host", .str "h")]) with
-  | .ok _    => TestM.fail "a config with no image was accepted"
-  | .error e => TestM.assert (AgentDef.containsCI e "image") "the error names the missing image"
+def theSettingThatCannotBeGuessedIsRequired : Test := do
+  -- `mcp_host` is the quiet one: nothing can guess where a pod reaches this daemon, and a wrong
+  -- answer is a pod that starts, an agent that finds no tools, and a task done by hand. So it is
+  -- refused before a task can depend on it.
   match Config.fromJson (Json.mkObj [("image", .str "i")]) with
   | .ok _    => TestM.fail "a config with no mcp_host was accepted"
   | .error e =>
     TestM.assert (AgentDef.containsCI e "mcp_host") "the error names the missing mcp_host"
     TestM.assert (AgentDef.containsCI e "no tools") "and says what it costs to leave it out"
+
+@[test]
+def anAbsentImageMeansTheOneOrchestraPublishes : Test := do
+  -- `image` used to be required for the same reason, on the grounds that a guess would be a pod
+  -- that starts and cannot run anything. There is now an image to guess, built and published by
+  -- this repository, so the guess runs.
+  match Config.fromJson (Json.mkObj [("mcp_host", .str "h")]) with
+  | .error e => TestM.fail s!"a config with no image was refused: {e}"
+  | .ok c    =>
+    TestM.assertEqual c.image defaultImage (msg := "an absent image is the published one")
+    TestM.assert (AgentDef.containsCI c.image "orchestra-agent")
+      "and that is orchestra's own agent image"
+  -- Naming one still wins — the default is a fallback, not an override.
+  match Config.fromJson (Json.mkObj [("mcp_host", .str "h"), ("image", .str "registry/mine:1")]) with
+  | .error e => TestM.fail s!"an explicit image was refused: {e}"
+  | .ok c    => TestM.assertEqual c.image "registry/mine:1" (msg := "an explicit image is kept")
+  -- Present-and-unreadable is not "absent". Somebody writing `"image": 3` is trying to name an
+  -- image, and silently running a different one is the failure this field exists to prevent.
+  for bad in [Json.num 3, Json.mkObj [], Json.arr #[.str "i"]] do
+    match Config.fromJson (Json.mkObj [("mcp_host", .str "h"), ("image", bad)]) with
+    | .ok c    => TestM.fail s!"image {bad.compress} was accepted as {c.image}"
+    | .error e => TestM.assert (AgentDef.containsCI e "image") "the error names the key"
 
 @[test]
 def defaultsAreTheOnesAClusterUsuallyWants : Test := do
@@ -635,11 +654,14 @@ def theServerBindsWhatItIsTold : Test := do
 
 @[test]
 def aMisconfiguredBackendFailsBeforeAnyClusterIsContacted : Test := do
+  -- An empty options object is now short exactly one thing — `mcp_host`, the setting nothing can
+  -- guess. The point of the test is unchanged: a configuration mistake is caught where it can be
+  -- reported as one, rather than as a pod that comes up wrong.
   match ← Exec.resolve { backend := "kubernetes", options := Json.mkObj [] } with
-  | .ok _    => TestM.fail "a kubernetes backend with no image was accepted"
+  | .ok _    => TestM.fail "a kubernetes backend with no mcp_host was accepted"
   | .error e =>
     TestM.assert (AgentDef.containsCI e "misconfigured") "it reads as a configuration error"
-    TestM.assert (AgentDef.containsCI e "image") "and names the key to fix"
+    TestM.assert (AgentDef.containsCI e "mcp_host") "and names the key to fix"
 
 @[test]
 def theBackendListNamesKubernetes : Test := do

@@ -70,6 +70,10 @@ repository's scripts are run with it), `tar`, `nc` and `git`. That is the fixed 
 list the daemon's own machine needs, minus `landrun`. What each repository needs on top of it is
 the subject of the next section.
 
+This list is what the image orchestra publishes already satisfies, and that image is the default —
+so read the two requirements below as what a *replacement* has to meet, not as work you have to do
+before the first task runs.
+
 **And a `USER` that is not root.** This is not a preference. Claude Code refuses
 `--dangerously-skip-permissions` under uid 0 — "cannot be used with root/sudo privileges for
 security reasons" — and that flag is how orchestra runs it, so an image that leaves the default
@@ -95,20 +99,23 @@ the pod is a `kubectl exec`, which lands as the image's user whoever the daemon 
 
 ### the image orchestra publishes
 
-You do not have to build one to start. CI builds `docker/agent.Dockerfile` and publishes it, and
-it is what the examples here name:
+You do not have to build one, or name one. CI builds `docker/agent.Dockerfile` and publishes it,
+and **it is what `image` defaults to** — so `mcp_host` is the only option a working configuration
+has to set:
 
 ```
-ghcr.io/chrisflav/orchestra-agent:latest
+ghcr.io/chrisflav/orchestra-agent:latest             # the default
 ghcr.io/chrisflav/orchestra-agent:claude-2.1.251     # pin the CLI version
 ```
 
 It carries what the list above requires — the Claude CLI, `sh`, `bash`, `tar`, `nc`, `git` — under
 a non-root `agent` user whose home is `/home/agent`, the `home_path` default.
 
-**Prefer the `claude-<version>` tag to `latest`.** What changes between two of these images is
-almost always the CLI rather than the Dockerfile, and a weekly build picks up new releases without
-a commit here — so `latest` is a moving target, and pinning is how a run stays reproducible.
+**Set `image` to a `claude-<version>` tag once you are past trying it.** The default has to be a
+floating tag — a version pinned in orchestra's source would name an image older than the one the
+weekly build published, within a week — so `latest` is a moving target and the default is
+convenience rather than the recommendation. Pinning is how a run stays reproducible, and it is a
+decision about your deployment rather than one orchestra can make for you.
 
 **It also carries the package managers, but none of the toolchains** — `npm`, `elan` and `uv`, with
 no Node packages, no Lean and no Python installed. That is where the size is: a Lean toolchain is a
@@ -436,7 +443,7 @@ the cluster was actually asked for.
 
 | key | default | what it does |
 | --- | --- | --- |
-| `image` | *required* | image tasks run in, unless something more specific applies |
+| `image` | `ghcr.io/chrisflav/orchestra-agent:latest` | image tasks run in, unless something more specific applies |
 | `images` | `{}` | image per repository, by `owner/name`; beats what the repository asks for |
 | `allow_repo_image` | `true` | whether a repository's own `execution.image` is honoured |
 | `mcp_host` | *required* | where the pod reaches this daemon's MCP server; a hostname or IP, refused otherwise |

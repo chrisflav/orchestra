@@ -58,17 +58,44 @@ namespace Orchestra.Exec.Kubernetes
 open Lean (Json fromJson?)
 open Orchestra.Exec
 
+/-- The image a task runs in when the configuration names none: the one this repository builds and
+    publishes (`docker/agent.Dockerfile`, `.github/workflows/docker-agent.yml`). It carries the
+    agent CLI and the six tools the backend invokes, plus `npm`, `elan` and `uv` so a repository's
+    `init.sh` can install a toolchain — and none of the toolchains themselves.
+
+    A floating tag, deliberately. Pinning a version here would be a lie within a week: the CLI
+    inside is rebuilt weekly and this file is not, so the pin would name an image older than the
+    one every other part of the deployment is using. An operator who wants a fixed image says so
+    (`execution.options.image`, or a `claude-<version>` tag) — which `docs/kubernetes.md`
+    recommends, because that is a decision about a deployment rather than a default orchestra can
+    make on its behalf. -/
+def defaultImage : String := "ghcr.io/chrisflav/orchestra-agent:latest"
+
 /-! ## Configuration -/
 
 /-- What this backend needs from `execution.options`.
+
+    `mcp_host` is the only one without a default — nothing can guess where a pod reaches this
+    daemon, and a wrong answer is an agent that runs with no tools and says nothing about it:
+
+    ```json
+    "execution": {
+      "backend": "kubernetes",
+      "options": { "mcp_host": "orchestra.orchestra.svc.cluster.local" }
+    }
+    ```
+
+    A deployment past its first task usually names more — the image pinned to a version, the
+    namespace, a home claim so toolchains outlive the pod:
 
     ```json
     "execution": {
       "backend": "kubernetes",
       "options": {
-        "image": "ghcr.io/example/orchestra-agent:latest",
+        "image": "ghcr.io/chrisflav/orchestra-agent:claude-2.1.251",
         "namespace": "orchestra",
-        "mcp_host": "orchestra.orchestra.svc.cluster.local"
+        "mcp_host": "orchestra.orchestra.svc.cluster.local",
+        "home_claim": "orchestra-agent-home"
       }
     }
     ```
@@ -80,12 +107,18 @@ structure Config where
   kubectl : String := "kubectl"
   /-- Namespace the task's pod is created in. -/
   ns : String := "default"
-  /-- Image a task runs in when nothing more specific applies. Required: there is no sensible
-      default, and guessing one would mean a pod that starts and cannot run anything.
+  /-- Image a task runs in when nothing more specific applies. Defaults to `defaultImage`.
+
+      This was required, on the reasoning that guessing would mean a pod that starts and cannot run
+      anything. That was true while there was no image to guess: an operator's first act was to
+      work out what "the agent CLI, sh, bash, tar, nc and git" means as a Dockerfile, and to
+      discover the non-root requirement by watching every task fail at launch. Now that orchestra
+      publishes one, the default is an image that does run something, and the failure it used to
+      prevent is a configuration error nobody has to hit first.
 
       Which build and dev dependencies a task needs varies by repository, so this is the last of
       three answers, not the only one. See `imageFor`. -/
-  image : String
+  image : String := defaultImage
   /-- Image per repository, by `owner/name`, for an operator who would rather decide centrally than
       take what a repository asks for. Beats the repository's own choice. -/
   repoImages : Array (String × String) := #[]
@@ -196,10 +229,14 @@ private def jsonStr? (j : Json) (key : String) : Option String :=
     finding that out at the first dispatched task — as a pod that runs an agent with no tools — is
     exactly the failure this refuses to allow. -/
 def Config.fromJson (j : Json) : Except String Config := do
-  let image ← match jsonStr? j "image" with
-    | some i => pure i
-    | none   => throw "kubernetes: execution.options.image is required — the image tasks run in \
-(it needs the agent CLI, bash, tar, git and nc)"
+  -- Absent means the image orchestra publishes, which is a working answer rather than a guess.
+  -- Present-and-unreadable is still an error: a number or an object here is somebody trying to
+  -- name an image, and quietly running a different one is the failure this whole field is about.
+  let image ← match j.getObjVal? "image" with
+    | .error _      => pure defaultImage
+    | .ok (.str i)  => pure i
+    | .ok other     => throw s!"kubernetes: execution.options.image must be an image reference, \
+not {other.compress}"
   let mcpHost ← match jsonStr? j "mcp_host" with
     | some h => pure h
     | none   => throw "kubernetes: execution.options.mcp_host is required — the address the pod \
