@@ -4,6 +4,7 @@ import Orchestra.Agents.Claude
 import Orchestra.Agents.Opencode
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
+import Orchestra.Exec
 import Orchestra.GitHub
 import Orchestra.Repo
 import Orchestra.RepoConfig
@@ -201,7 +202,8 @@ by task {e.taskId}"
     `gh pr merge`. If validation fails the PR is not merged and the reason is recorded as a
     request-changes review on the issue, which returns to the open pool. Skips the entire agent /
     sandbox / MCP path. Used when `ioTask.backend = some "merger"`. -/
-private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
+private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : String)
+    (ioTask : IOTask i o)
     (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord) : IO Unit := do
   IO.println "  [merger] merge backend"
   -- Bound only to be validated: the merger reaches the issue through `findIssue` below, but a
@@ -234,7 +236,21 @@ private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
     throw (.userError "pr checkout failed")
   -- Run the validation script before merging.
   IO.println "  [merger] running validation script"
-  let (valid, validOutput) ← RepoConfig.runValidation repoPath
+  -- The environment is opened *after* the checkout, not before it: a backend that runs things
+  -- elsewhere copies the tree at that moment, and a copy taken before `gh pr checkout` would be
+  -- of the branch the merger is not merging.
+  let repoConfig ← RepoConfig.loadRepoConfig repoPath
+  let session ← execBackend.openSession {
+    workdir := repoPath
+    grants  := #[{ path := repoPath.toString, access := .rwx, required := true
+                 , from_ := .orchestra }]
+    label   := initialRecord.id
+    repo    := some pr.repo.toString
+    image   := repoConfig.image }
+  let (valid, validOutput) ← try
+      RepoConfig.runValidation session repoPath
+    finally
+      session.close
   if !validOutput.isEmpty then
     IO.println s!"  [merger] validation output:\n{validOutput}"
   if !valid then
@@ -639,221 +655,306 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       let p ← Repo.ensureAdhocWorkspace (occupant := some taskId) (resumeFrom := continuesFrom)
       IO.println s!"  Workspace at {p}"
       pure p
-  -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
-  -- clone setup with all other backends but skips the MCP server and agent.
-  if ioTask.backend == some "merger" then
-    runMerger token ioTask repoPath initialRecord
-    return ((taskId, ← finalStatusOf taskId), none, none)
-  -- 3. Start MCP server (runs in this process, outside the sandbox)
-  -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
-  let (requestedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
-  -- Only when the fallback actually granted something. `mode` is optional now, so every task
-  -- that writes neither field lands on `fork` — and warning about a deprecated field the task
-  -- never wrote, to say it was read as "grant nothing", is noise on every repository-independent
-  -- run. `pr` is the case that carries meaning and is worth migrating.
-  if usingModeFallback && !requestedTools.isEmpty then
-    IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
-      Use 'tools' instead (e.g. {repr requestedTools}) and optionally 'read_only: true/false'."
-  let allowedTools ← Server.withoutRepoScopedTools ioTask.repo requestedTools
-  let inputJson := some (ResultType.valueToJson i input)
-  let outputRef ← IO.mkRef (none : Option Lean.Json)
-  let serverState : Server.State := {
-    repo := ioTask.repo
-    allowedTools
-    appId := appConfig.appId
-    privateKeyPath := appConfig.privateKeyPath
-    installationId
-    pat := appConfig.pat
-    inputType := i
-    outputType := o
-    inputJson
-    outputRef := some outputRef
-    issueNumber := ioTask.issueNumber
-    claimManager := some globalClaimManager
-    taskId := some taskId
-    agentBackend := ioTask.backend.getD "claude"
-    series
-    projectId := ioTask.projectId
-    issueId   := ioTask.issueId
-    enqueueMerger   := some (enqueueMergerImpl appConfig)
-    enqueueReviewer := some enqueueReviewerImpl
-    spawnPolicy  := ioTask.spawnPolicy
-    -- What an omitted field in a `queue_task` call inherits. `allowedTools` rather than the
-    -- task's raw `tools`: it is the list the server actually granted, after the repository-scoped
-    -- ones were withheld from a repository-independent task, so a queued task cannot inherit a
-    -- tool this one was refused.
-    spawnContext := { backend := ioTask.backend
-                    , model   := ioTask.model
-                    , repo    := ioTask.repo.map (·.upstream)
-                    , tools   := allowedTools
-                    , readOnly := ioTask.readOnly
-                    , projectId := ioTask.projectId }
-    enqueueTask  := some (enqueueTaskImpl appConfig)
-    scopeRoot    := ioTask.scopeRoot
-    prLabels  := ioTask.prLabels
-    defaultOrganization := appConfig.defaultOrganization
-  }
-  let (port, shutdown) ← Server.start serverState
-  IO.println s!"  MCP server on port {port}"
-  -- 4. Run init hook and load per-repository config
-  RepoConfig.runInitIfNeeded repoPath
-  let repoConfig ← RepoConfig.loadRepoConfig repoPath
-  -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
-  let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
-  -- 5a. Resolve memory directories and amend system prompt
-  let memoryDirs ← resolveMemoryDirs ioTask.memory (ioTask.repo.map (·.upstream))
-  let systemPrompt :=
-    match baseSystemPrompt, memorySystemPrompt memoryDirs with
-    | none,    none    => none
-    | some sp, none    => some sp
-    | none,    some mp => some mp
-    | some sp, some mp => some (sp ++ "\n\n" ++ mp)
-  -- 5b. Load prepend prompt and apply to task prompt
-  let prependPrompt ← loadPrependPrompt ioTask.prependPrompt
-  let baseTaskPrompt :=
-    match prependPrompt with
-    | none    => ioTask.prompt
-    | some pp => pp ++ "\n\n" ++ ioTask.prompt
-  let mut sessionId : Option String := none
-  let mut usageLimitHit := false
-  let mut wasCancelled := false
-  let mut lastValidationOutput : String := ""
-  let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
-  -- Resolved once, before the first attempt, rather than per attempt: the retries below
-  -- `--resume` the same conversation, and moving that conversation to a different account
-  -- part-way through would hand the agent a session the new account has never seen.
-  -- Marked at the point the choice is made, not here: a caller that resolved for us (the queue
-  -- daemon, under its claim lock) already recorded it, and re-stamping would make two accounts
-  -- look equally recently used when only one of them ran.
-  let authLabel ← match preresolvedAuth with
-    | some l => pure (some l)
-    | none   => do
-      let label ← selectAuthSource appConfig ioTask
-      if let some l := label then Usage.markUsed (ioTask.backend.getD "claude") l
-      pure label
-  let maxAttempts := repoConfig.validation.maxRetries + 1
-  for attempt in List.range maxAttempts do
-    RepoConfig.runHook repoPath "before.sh"
-    let prompt :=
-      if attempt == 0 then baseTaskPrompt
-      else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
-    let resume := if attempt == 0 then initialResume else sessionId
-    IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
-    let agentDef := agentDefOfBackend ioTask.backend
-    let backendName := ioTask.backend.getD "claude"
-    let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName authLabel
-    let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
-      |>.map (·.extraPorts) |>.getD #[]
-    let debugLogFile : Option System.FilePath ←
-      if debug then
-        let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-        pure (some ((← TaskStore.tasksDir) / s!"{taskId}{suffix}.debug.jsonl"))
-      else pure none
-    let taskLogFile : Option System.FilePath ← do
-      let suffix := if attempt == 0 then "" else s!".retry{attempt}"
-      pure (some ((← Dirs.dataBase) / "logs" / repoLogDir ioTask.repo / s!"{taskId}{suffix}.log"))
-    let result ← Sandbox.launchAgent agentDef repoPath prompt port token
-      (debug := debug) (pluginDirs := ← defaultPluginDirs appConfig) (memoryDirs := memoryDirs)
-      (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
-      (resume := resume) (budget := ioTask.budget.getD 4.0) (cancelToken := cancelToken)
-      (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
-      (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
-      (additionalPaths := appConfig.additionalSandboxPaths)
-      (interactiveAgent := interactiveAgent) (goal := ioTask.goal)
-    IO.println s!"  Agent exited with code {result.exitCode}"
-    sessionId := result.sessionId
-    lastResultSubtype := result.resultSubtype
-    if interactiveAgent then
-      break
-    if result.wasCancelled then
-      IO.println "  Agent was cancelled."
-      wasCancelled := true
-      break
-    if result.usageLimitHit then
-      IO.println "  Agent hit usage limit."
-      usageLimitHit := true
-      -- Record against the source that actually ran, before anything else can be dispatched to
-      -- it. The reset time comes from the agent's own `rate_limit_event` when it emitted one;
-      -- otherwise `markLimited` falls back to the last poll, then to a default backoff.
-      if let some label := authLabel then
-        Usage.markLimited backendName label ioTask.model "agent reported a usage limit"
-          (resetHint := result.rateLimitReset)
-      break
-    if !(← RepoConfig.hasValidationScript repoPath) then
-      IO.println "  No validation script found, skipping validation."
-      break
-    IO.println "  Running validation script..."
-    let (valid, validationOutput) ← RepoConfig.runValidation repoPath
-    lastValidationOutput := validationOutput
-    if !validationOutput.isEmpty then
-      IO.println s!"  Validation output:\n{validationOutput}"
-    if valid then
-      IO.println "  Validation passed."
-      break
-    if attempt + 1 < maxAttempts then
-      IO.println s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
-    else
-      IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
-  -- 6. Run after hook and shut down MCP server
-  RepoConfig.runHook repoPath "after.sh"
-  shutdown
-  -- 7. Persist final task state
+  -- 3. Open the environment this task runs in.
   --
-  -- A usage limit is checked before the result subtype, not after: the CLI reports the limit
-  -- *as* an error result, so consulting the subtype first would classify every limited run as
-  -- `failed` — permanently, when the truth is "unfinished, retry after the reset".
-  let finalStatus : TaskStore.TaskStatus :=
-    if wasCancelled then .cancelled
-    else if usageLimitHit then .unfinished
-    else match lastResultSubtype with
-      | some .success           => .completed
-      | some .errorMaxBudgetUsd => .unfinished
-      | some (.error _)         => .failed
-      | _                       => .completed
-  -- A run that got all the way through is proof the source is usable *for the model it ran*,
-  -- which retires the blocks that covered that model and leaves the rest standing.
-  if finalStatus matches .completed then
-    if let some label := authLabel then
-      Usage.markOk (ioTask.backend.getD "claude") label ioTask.model
-  TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
-  -- Release the orchestra-issue claim on terminal status. A worker that succeeded and attached a
-  -- PR leaves the issue awaiting review, so only drop the lock (forceRelease) and leave its
-  -- status alone; anything else hands the issue back to the open pool for another worker.
-  let releaseIssue (iid : Taxis.IssueId) : IO Unit := do
-    match ← Project.findIssue iid with
-    | none => pure ()
-    | some (project, issue) =>
-      let now ← TaskStore.currentIso8601
-      let succeeded := finalStatus matches .completed
-      if succeeded && !issue.attachedPRs.isEmpty then
-        let _ ← Project.forceRelease globalClaimManager iid
+  -- One session for the whole task, not one per agent launch, because a task is not one command:
+  -- `init.sh`, `before.sh`, the agent, `validation.sh`, the agent again if that failed, and
+  -- `after.sh` all have to happen in one place, on one copy of the workspace. For landrun that is
+  -- this machine and opening it costs nothing; for a backend that runs the agent elsewhere it is
+  -- what makes validation answer a question about the tree the agent actually worked on.
+  --
+  -- Resolved after the workspace (the session is opened on it) and before the merger, which
+  -- validates a pull request and so needs the same environment for the same reason. Checked
+  -- (`Backend.preflight`) while resolving, so a missing `landrun` or `kubectl` is one line naming
+  -- the task rather than every attempt failing as `could not execute external process`.
+  let execBackend ← match ← Exec.resolve appConfig.execution with
+    | .ok b => pure b
+    | .error e =>
+      -- Recorded and then thrown, rather than returned as a failed status: this is a setup
+      -- failure like a clone that cannot be created or a token that cannot be minted, and those
+      -- all leave through the same door. The queue daemon's handler is what releases the issue
+      -- claim this task is holding, and a task that returned normally would keep it.
+      TaskStore.saveTask { initialRecord with status := .failed }
+      throw (IO.userError s!"cannot run the agent: {e}")
+  -- Where the MCP server has to listen for this backend's agents, on which ports, and the secret
+  -- they present. Loopback, any port and no secret unless the agent runs off this machine.
+  let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
+  -- Merger: checkout the PR branch, run validation, then merge. Shares auth + workspace setup
+  -- with all other backends but skips the MCP server and the agent — and opens its own
+  -- environment for the validation script, once the branch it is merging is checked out.
+  if ioTask.backend == some "merger" then
+    runMerger execBackend token ioTask repoPath initialRecord
+    return ((taskId, ← finalStatusOf taskId), none, none)
+  -- What the session is opened with. The grants are the same ones the agent's own launch will be
+  -- built from (`Sandbox.grantsFor`): a backend running the agent elsewhere reads them to know
+  -- what to carry there — the workspace, the plugin directories, the memories — and one running
+  -- it here ignores them and builds its ruleset per launch.
+  let pluginDirs ← defaultPluginDirs appConfig
+  let memoryDirs ← resolveMemoryDirs ioTask.memory (ioTask.repo.map (·.upstream))
+  -- Read before the environment is opened, because one of the things it says is which environment
+  -- to open: what a task needs installed is a property of the repository, and the repository is
+  -- where that is written down.
+  let repoConfig ← RepoConfig.loadRepoConfig repoPath
+  let session ← execBackend.openSession {
+    workdir := repoPath
+    grants  := Sandbox.grantsFor (agentDefOfBackend ioTask.backend).sandboxPaths
+                 appConfig.additionalSandboxPaths repoPath ioTask.readOnly pluginDirs memoryDirs
+    label   := taskId
+    -- The upstream, not the fork: what a repository runs in is a property of the project, and an
+    -- operator writing `execution.options.images` writes down the name the project is known by.
+    -- The fork is per-bot and appears nowhere a person would think to configure. Keyed the same
+    -- way as `resolveMemoryDirs` just above, and as `runMerger`.
+    repo    := ioTask.repo.map (·.upstream.toString)
+    image   := repoConfig.image }
+  IO.println s!"  Running in: {session.id}"
+  -- The MCP server has to come down however the task ends, not only when it ends well. It holds a
+  -- listening socket with the PAT's authority behind it and — off loopback — one port out of
+  -- `mcp_ports`, a range sized to the queue's parallelism. Leaking it on a throw leaks both for
+  -- the daemon's lifetime, and enough failed tasks would leave no port for any later one.
+  let shutdownRef ← IO.mkRef (none : Option (IO Unit))
+  let shutdownOnce : IO Unit := do
+    match ← shutdownRef.modifyGet fun s => (s, none) with
+    | some stop => stop
+    | none      => pure ()
+  try
+    -- A task that continues another one is asking the agent to pick up a conversation it had
+    -- before, and that conversation is a file the agent CLI wrote where it was running. An
+    -- environment that is new each task and takes its home with it does not have it, and running
+    -- anyway would answer a follow-up prompt — "now also handle the timeout case" — with a model
+    -- that has never seen what came before. Better to stop and say which knob keeps it.
+    if initialResume.isSome && !session.carriesAgentState then
+      let what := match series with
+        | some name => s!"this task continues series '{name}' ({continuesFrom.getD "?"})"
+        | none      => s!"this task continues {continuesFrom.getD "another task"}"
+      TaskStore.saveTask { initialRecord with status := .failed }
+      throw (IO.userError s!"{what}, whose conversation the agent left in an environment that no \
+longer exists ({session.id} is new for every task). Configure a persistent agent home for this \
+execution backend — execution.options.home_claim for kubernetes — or queue the work as a task of \
+its own.")
+    -- 4. Start MCP server (runs in this process, outside the sandbox)
+    -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
+    let (requestedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
+    -- Only when the fallback actually granted something. `mode` is optional now, so every task
+    -- that writes neither field lands on `fork` — and warning about a deprecated field the task
+    -- never wrote, to say it was read as "grant nothing", is noise on every repository-independent
+    -- run. `pr` is the case that carries meaning and is worth migrating.
+    if usingModeFallback && !requestedTools.isEmpty then
+      IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
+        Use 'tools' instead (e.g. {repr requestedTools}) and optionally 'read_only: true/false'."
+    let allowedTools ← Server.withoutRepoScopedTools ioTask.repo requestedTools
+    let inputJson := some (ResultType.valueToJson i input)
+    let outputRef ← IO.mkRef (none : Option Lean.Json)
+    let serverState : Server.State := {
+      repo := ioTask.repo
+      allowedTools
+      appId := appConfig.appId
+      privateKeyPath := appConfig.privateKeyPath
+      installationId
+      pat := appConfig.pat
+      inputType := i
+      outputType := o
+      inputJson
+      outputRef := some outputRef
+      issueNumber := ioTask.issueNumber
+      claimManager := some globalClaimManager
+      taskId := some taskId
+      agentBackend := ioTask.backend.getD "claude"
+      series
+      projectId := ioTask.projectId
+      issueId   := ioTask.issueId
+      enqueueMerger   := some (enqueueMergerImpl appConfig)
+      enqueueReviewer := some enqueueReviewerImpl
+      spawnPolicy  := ioTask.spawnPolicy
+      -- What an omitted field in a `queue_task` call inherits. `allowedTools` rather than the
+      -- task's raw `tools`: it is the list the server actually granted, after the repository-scoped
+      -- ones were withheld from a repository-independent task, so a queued task cannot inherit a
+      -- tool this one was refused.
+      spawnContext := { backend := ioTask.backend
+                      , model   := ioTask.model
+                      , repo    := ioTask.repo.map (·.upstream)
+                      , tools   := allowedTools
+                      , readOnly := ioTask.readOnly
+                      , projectId := ioTask.projectId }
+      enqueueTask  := some (enqueueTaskImpl appConfig)
+      scopeRoot    := ioTask.scopeRoot
+      prLabels  := ioTask.prLabels
+      defaultOrganization := appConfig.defaultOrganization
+      authToken := mcpToken
+    }
+    let (port, shutdown) ← Server.start serverState (bindHost := mcpBind) (portRange := mcpPorts)
+    shutdownRef.set (some shutdown)
+    IO.println s!"  MCP server on port {port}"
+    -- 5. Run the init hook, in the session — that is where the agent will work, and where
+    -- `init.sh` installs the toolchain `validation.sh` later needs. The repository's config was read
+    -- before the session was opened, since it says which environment to open.
+    RepoConfig.runInitIfNeeded session repoPath
+    -- 6. Validation loop: before.sh → agent → validation.sh, retry on failure
+    let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
+    let systemPrompt :=
+      match baseSystemPrompt, memorySystemPrompt memoryDirs with
+      | none,    none    => none
+      | some sp, none    => some sp
+      | none,    some mp => some mp
+      | some sp, some mp => some (sp ++ "\n\n" ++ mp)
+    -- 6b. Load prepend prompt and apply to task prompt
+    let prependPrompt ← loadPrependPrompt ioTask.prependPrompt
+    let baseTaskPrompt :=
+      match prependPrompt with
+      | none    => ioTask.prompt
+      | some pp => pp ++ "\n\n" ++ ioTask.prompt
+    let mut sessionId : Option String := none
+    let mut usageLimitHit := false
+    let mut wasCancelled := false
+    let mut lastValidationOutput : String := ""
+    let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
+    -- Resolved once, before the first attempt, rather than per attempt: the retries below
+    -- `--resume` the same conversation, and moving that conversation to a different account
+    -- part-way through would hand the agent a session the new account has never seen.
+    -- Marked at the point the choice is made, not here: a caller that resolved for us (the queue
+    -- daemon, under its claim lock) already recorded it, and re-stamping would make two accounts
+    -- look equally recently used when only one of them ran.
+    let authLabel ← match preresolvedAuth with
+      | some l => pure (some l)
+      | none   => do
+        let label ← selectAuthSource appConfig ioTask
+        if let some l := label then Usage.markUsed (ioTask.backend.getD "claude") l
+        pure label
+    let maxAttempts := repoConfig.validation.maxRetries + 1
+    for attempt in List.range maxAttempts do
+      RepoConfig.runHook session repoPath "before.sh"
+      let prompt :=
+        if attempt == 0 then baseTaskPrompt
+        else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
+      let resume := if attempt == 0 then initialResume else sessionId
+      IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
+      let agentDef := agentDefOfBackend ioTask.backend
+      let backendName := ioTask.backend.getD "claude"
+      let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName authLabel
+      let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
+        |>.map (·.extraPorts) |>.getD #[]
+      let debugLogFile : Option System.FilePath ←
+        if debug then
+          let suffix := if attempt == 0 then "" else s!".retry{attempt}"
+          pure (some ((← TaskStore.tasksDir) / s!"{taskId}{suffix}.debug.jsonl"))
+        else pure none
+      let taskLogFile : Option System.FilePath ← do
+        let suffix := if attempt == 0 then "" else s!".retry{attempt}"
+        pure (some ((← Dirs.dataBase) / "logs" / repoLogDir ioTask.repo / s!"{taskId}{suffix}.log"))
+      let result ← Sandbox.launchAgent agentDef repoPath prompt port token
+        (debug := debug) (pluginDirs := pluginDirs) (memoryDirs := memoryDirs)
+        (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
+        (resume := resume) (budget := ioTask.budget.getD 4.0) (cancelToken := cancelToken)
+        (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
+        (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
+        (additionalPaths := appConfig.additionalSandboxPaths)
+        (interactiveAgent := interactiveAgent) (goal := ioTask.goal) (session := session)
+        (mcpToken := mcpToken)
+      IO.println s!"  Agent exited with code {result.exitCode}"
+      sessionId := result.sessionId
+      lastResultSubtype := result.resultSubtype
+      if interactiveAgent then
+        break
+      if result.wasCancelled then
+        IO.println "  Agent was cancelled."
+        wasCancelled := true
+        break
+      if result.usageLimitHit then
+        IO.println "  Agent hit usage limit."
+        usageLimitHit := true
+        -- Record against the source that actually ran, before anything else can be dispatched to
+        -- it. The reset time comes from the agent's own `rate_limit_event` when it emitted one;
+        -- otherwise `markLimited` falls back to the last poll, then to a default backoff.
+        if let some label := authLabel then
+          Usage.markLimited backendName label ioTask.model "agent reported a usage limit"
+            (resetHint := result.rateLimitReset)
+        break
+      if !(← RepoConfig.hasValidationScript repoPath) then
+        IO.println "  No validation script found, skipping validation."
+        break
+      IO.println "  Running validation script..."
+      let (valid, validationOutput) ← RepoConfig.runValidation session repoPath
+      lastValidationOutput := validationOutput
+      if !validationOutput.isEmpty then
+        IO.println s!"  Validation output:\n{validationOutput}"
+      if valid then
+        IO.println "  Validation passed."
+        break
+      if attempt + 1 < maxAttempts then
+        IO.println s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
       else
-        let _ ← Project.release globalClaimManager project.id iid .open now
-  match ioTask.projectId, ioTask.issueId with
-  | some _pid, some iid => releaseIssue iid
-  | some pid, none =>
-    -- An unbound role (`always` trigger) was handed no issue to release, but it may have claimed
-    -- any number of them itself via `claim_issue`. Those claims carry this task's id, and the
-    -- branch above — the only thing that normally releases a claim at task end — never fires for
-    -- them, so without this sweep they would stay `.claimed` for good. One `GET /issues/:id` per
-    -- issue in the project (`loadClaims`), paid once at teardown of an unbound task only.
-    for (iid, claim) in ← Project.loadClaims pid do
-      if claim.taskId == taskId then releaseIssue iid
-  | none, _ => pure ()
-  if let some seriesName := series then
-    TaskStore.updateSeriesPointer seriesName taskId
-  IO.println s!"=== Task {idx} done ===\n"
-  let outputJson ← outputRef.get
-  let typedOutput : Option o.Type ← do
-    match outputJson with
-    | none => pure none
-    | some j =>
-      match ResultType.valueFromJson o j with
-      | .ok v    => pure (some v)
-      | .error e =>
-        IO.eprintln s!"  Warning: failed to parse task output: {e}"
-        pure none
-  return ((taskId, finalStatus), typedOutput, outputJson)
+        IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
+    -- 7. Run after hook and shut down MCP server
+    RepoConfig.runHook session repoPath "after.sh"
+    -- Here as well as in the `finally`, so the agent's tool endpoint is gone before the task's
+    -- bookkeeping runs rather than merely by the time the task is over. `shutdownOnce` is what
+    -- makes saying it twice safe.
+    shutdownOnce
+    -- 8. Persist final task state
+    --
+    -- A usage limit is checked before the result subtype, not after: the CLI reports the limit
+    -- *as* an error result, so consulting the subtype first would classify every limited run as
+    -- `failed` — permanently, when the truth is "unfinished, retry after the reset".
+    let finalStatus : TaskStore.TaskStatus :=
+      if wasCancelled then .cancelled
+      else if usageLimitHit then .unfinished
+      else match lastResultSubtype with
+        | some .success           => .completed
+        | some .errorMaxBudgetUsd => .unfinished
+        | some (.error _)         => .failed
+        | _                       => .completed
+    -- A run that got all the way through is proof the source is usable *for the model it ran*,
+    -- which retires the blocks that covered that model and leaves the rest standing.
+    if finalStatus matches .completed then
+      if let some label := authLabel then
+        Usage.markOk (ioTask.backend.getD "claude") label ioTask.model
+    TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
+    -- Release the orchestra-issue claim on terminal status. A worker that succeeded and attached a
+    -- PR leaves the issue awaiting review, so only drop the lock (forceRelease) and leave its
+    -- status alone; anything else hands the issue back to the open pool for another worker.
+    let releaseIssue (iid : Taxis.IssueId) : IO Unit := do
+      match ← Project.findIssue iid with
+      | none => pure ()
+      | some (project, issue) =>
+        let now ← TaskStore.currentIso8601
+        let succeeded := finalStatus matches .completed
+        if succeeded && !issue.attachedPRs.isEmpty then
+          let _ ← Project.forceRelease globalClaimManager iid
+        else
+          let _ ← Project.release globalClaimManager project.id iid .open now
+    match ioTask.projectId, ioTask.issueId with
+    | some _pid, some iid => releaseIssue iid
+    | some pid, none =>
+      -- An unbound role (`always` trigger) was handed no issue to release, but it may have claimed
+      -- any number of them itself via `claim_issue`. Those claims carry this task's id, and the
+      -- branch above — the only thing that normally releases a claim at task end — never fires for
+      -- them, so without this sweep they would stay `.claimed` for good. One `GET /issues/:id` per
+      -- issue in the project (`loadClaims`), paid once at teardown of an unbound task only.
+      for (iid, claim) in ← Project.loadClaims pid do
+        if claim.taskId == taskId then releaseIssue iid
+    | none, _ => pure ()
+    if let some seriesName := series then
+      TaskStore.updateSeriesPointer seriesName taskId
+    IO.println s!"=== Task {idx} done ===\n"
+    let outputJson ← outputRef.get
+    let typedOutput : Option o.Type ← do
+      match outputJson with
+      | none => pure none
+      | some j =>
+        match ResultType.valueFromJson o j with
+        | .ok v    => pure (some v)
+        | .error e =>
+          IO.eprintln s!"  Warning: failed to parse task output: {e}"
+          pure none
+    return ((taskId, finalStatus), typedOutput, outputJson)
+  finally
+    -- Both released however the task ended, including by exception. The shutdown is guarded so
+    -- that a listener that refuses to come down cannot also cost us the session close, which is
+    -- the half that brings the agent's work back.
+    try shutdownOnce catch e =>
+      IO.eprintln s!"  Warning: could not shut down the MCP server: {e}"
+    -- Closed however the task ended, including by exception: for a backend that holds a pod and a
+    -- copy of the workspace, this is what brings the work back and stops paying for it.
+    session.close
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.
 

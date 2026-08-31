@@ -84,15 +84,25 @@ private def vibeExtractSessionId (vibeHome : String) : IO (Option String) := do
       | none => none
       | some json => json.getObjValAs? String "session_id" |>.toOption
 
+/-- A TOML basic string: the two characters that end it or start an escape, escaped.
+
+    Written out rather than asserted about the caller. What goes in here is a shell command line
+    assembled from an operator's `mcp_host`, and a comment claiming it can never contain a quote
+    is a claim that has to stay true through every later change to how that command is built. -/
+private def tomlBasicString (s : String) : String :=
+  "\"" ++ (s.replace "\\" "\\\\" |>.replace "\"" "\\\"") ++ "\""
+
 /-- Produce a config.toml for the temp VIBE_HOME by injecting the MCP server and optional
     model override into the user's existing config. -/
-private def vibeConfigToml (serverPort : UInt16) (model : Option String) (base : String) : String :=
+private def vibeConfigToml (mcp : Exec.McpEndpoint) (model : Option String) (base : String) : String :=
+  let (cmd, cmdArgs) := mcp.stdioCommand
+  let renderedArgs := String.intercalate ", " (cmdArgs.toList.map tomlBasicString)
   let mcpEntry :=
     "[[mcp_servers]]\n" ++
     "name = \"agent\"\n" ++
     "transport = \"stdio\"\n" ++
-    "command = \"nc\"\n" ++
-    s!"args = [\"127.0.0.1\", \"{serverPort}\"]\n"
+    s!"command = {tomlBasicString cmd}\n" ++
+    s!"args = [{renderedArgs}]\n"
   let withMcp := base.replace "mcp_servers = []" mcpEntry
   match model with
   | none => withMcp
@@ -118,7 +128,7 @@ def vibe : AgentDef where
     homeRw  := [".gitconfig", ".config/gh", ".config/git"]
     homeRwx := [".elan", ".cache"]
   }
-  setupMcp port model systemPrompt := do
+  setupMcp mcp model systemPrompt := do
     let ts ← uniqueToken
     let vibeHome := s!"/tmp/agent-vibe-{ts}"
     let vibeHomePath := System.FilePath.mk vibeHome
@@ -131,7 +141,7 @@ def vibe : AgentDef where
         let src := System.FilePath.mk h / ".vibe" / "config.toml"
         if ← src.pathExists then IO.FS.readFile src else pure ""
       | none => pure ""
-    IO.FS.writeFile (vibeHomePath / "config.toml") (vibeConfigToml port model baseConfig)
+    IO.FS.writeFile (vibeHomePath / "config.toml") (vibeConfigToml mcp model baseConfig)
     -- If a system prompt is provided, write a custom agent profile and prompt file
     if let some sp := systemPrompt then
       IO.FS.createDir (vibeHomePath / "agents")
@@ -141,10 +151,13 @@ def vibe : AgentDef where
       IO.FS.writeFile (vibeHomePath / "prompts" / "task.md") sp
     -- Pass VIBE_HOME and MISTRAL_API_KEY into the sandbox env
     let mistralKey ← IO.getEnv "MISTRAL_API_KEY"
+    -- The whole directory, writable: `VIBE_HOME` names it in the agent's environment, and vibe
+    -- writes its session state back into it. Under a backend that runs the agent elsewhere it has
+    -- to be carried there, or `VIBE_HOME` points at nothing.
     return (vibeHome, #[
       ("VIBE_HOME", some vibeHome),
       ("MISTRAL_API_KEY", mistralKey)
-    ])
+    ], #[{ path := vibeHome, access := .rwx, from_ := .orchestra }])
   buildArgs _ctx _pluginDirs subAgent _model systemPrompt resume _budget prompt := Id.run do
     let mut args : Array String := #["-p", prompt, "--output", "streaming"]
     -- Use the task agent (with custom system prompt) if one was configured in setupMcp,

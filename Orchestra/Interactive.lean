@@ -71,6 +71,12 @@ structure LiveSession where
       events is a transcript a cursor cannot read. -/
   lock : Std.BaseMutex
   stream : Sandbox.StreamingSession
+  /-- The environment the agent lives in, held for as long as the conversation is.
+
+      One session, not one per turn, for the same reason the process is one: a conversation is a
+      thing that continues, and on a backend that runs the agent elsewhere the workspace was
+      carried there once. Released by `teardown`, which is also what brings it back. -/
+  exec : Exec.Session
   /-- What the session had spent before this process started. See `onAgentEvent`. -/
   costBase : Float
   /-- Shuts down this session's MCP server. -/
@@ -295,6 +301,10 @@ private def teardown (mgr : Manager) (s : LiveSession) (status : SessionStatus)
       return false
   unless claimed do return
   try s.stream.shutdown catch _ => pure ()
+  -- After the agent, before the slot: closing the environment is what copies a remote workspace
+  -- back onto the slot this is about to release, and it has nothing to copy while the agent is
+  -- still writing.
+  try s.exec.close catch _ => pure ()
   try s.shutdownMcp catch _ => pure ()
   try mgr.releaseSlot s.fork s.slot catch _ => pure ()
   let now ← TaskStore.currentIso8601
@@ -337,6 +347,10 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
   -- hand — a leaked MCP server is a loopback port still serving `create_pr`, `merge_pr` and
   -- `comment` against a live installation, with no session and no way to reach it.
   let shutdownRef ← IO.mkRef (none : Option (IO Unit))
+  -- The execution environment joins the same guarantee, and for a sharper reason than the MCP
+  -- server: on a backend that runs the agent elsewhere this is a pod holding a copy of the
+  -- workspace, and a failing acquire that left it behind would keep both until its deadline.
+  let execRef ← IO.mkRef (none : Option Exec.Session)
   let recordRef ← IO.mkRef (none : Option SessionRecord)
   -- `fail` is called from inside the `try` as well as from the `catch`, and its own writes can
   -- throw on a full or torn disk — which would land in the `catch` and call it a second time.
@@ -346,6 +360,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
   let dropStarting : IO Unit :=
     mgr.sessions.atomically <| mgr.starting.modify fun n => if n > 0 then n - 1 else 0
   let release : IO Unit := do
+    if let some ex ← execRef.get then try ex.close catch _ => pure ()
     if let some shut ← shutdownRef.get then try shut catch _ => pure ()
     try mgr.releaseSlot fork slot catch _ => pure ()
   let fail (raw : String) : IO (Except String SessionRecord) := do
@@ -405,13 +420,38 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     -- one moment it matters most.
     let repoPath ← Repo.ensureSlot fork record.upstream
       { slot, occupant := some record.id, resumeFrom := resumeSlotOf } (token := some token)
+    -- The environment this conversation happens in, opened before the MCP server because it is
+    -- what decides where that server has to listen and whether it needs a token.
+    let execBackend ← match ← Exec.resolve appConfig.execution with
+      | .ok b     => pure b
+      | .error e  => return ← fail s!"cannot run the agent: {e}"
+    let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
+    let pluginDirs ← TaskRunner.defaultPluginDirs appConfig
+    let repoConfig ← RepoConfig.loadRepoConfig repoPath
+    let execSession ← execBackend.openSession {
+      workdir := repoPath
+      grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths
+                   repoPath false pluginDirs #[]
+      label   := record.id
+      -- The upstream, not the fork: an operator pinning an image writes the name the project is
+      -- known by, and the fork is per-bot. Same key as the queue path and the merger.
+      repo    := some record.upstream.toString
+      image   := repoConfig.image }
+    execRef.set (some execSession)
+    -- Reviving a dormant conversation asks the agent to resume a session it wrote under its own
+    -- home. An environment that is new every time does not have it, and a revived conversation
+    -- that silently starts over is worse than one that says it cannot: the person sees their
+    -- history in the transcript and the agent does not.
+    if resumeAgentSession.isSome && !execSession.carriesAgentState then
+      return ← fail s!"this conversation was left in an environment that no longer exists ({execSession.id} is new every time). Configure a persistent agent home for this execution backend — execution.options.home_claim for kubernetes — to wake sessions on it."
     let (port, shutdownMcp) ← Server.start {
       repo := some { upstream := record.upstream, fork }
       allowedTools := record.tools.getD allOptionalTools
       appId := appConfig.appId, privateKeyPath := appConfig.privateKeyPath
       installationId := some installationId, pat := appConfig.pat
       agentBackend := backendName
-    }
+      authToken := mcpToken
+    } (bindHost := mcpBind) (portRange := mcpPorts)
     shutdownRef.set (some shutdownMcp)
     -- A session goes through the same resolver as a queued run, so an account the daemon has
     -- already found to be out of quota is not handed to a person either.
@@ -443,11 +483,13 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
           resume := resumeAgentSession, sessionId := record.agentSessionId,
           budget := remaining }
         onEvent (debug := debug)
-        (extraEnv := apiKeyEnv) (pluginDirs := ← TaskRunner.defaultPluginDirs appConfig)
+        (extraEnv := apiKeyEnv) (pluginDirs := pluginDirs)
         (extraPorts := extraPorts) (additionalPaths := appConfig.additionalSandboxPaths)
+        (session := execSession) (mcpToken := mcpToken)
       | return ← fail s!"backend '{backendName}' cannot host an interactive session"
     let session : LiveSession := {
       id := record.id, fork, slot, record := recordRef, lock, stream, shutdownMcp
+      exec := execSession
       authLabel, backend := backendName, costBase := record.costUsd
     }
     liveRef.set (some session)
@@ -458,6 +500,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     -- take either back — `teardown` is the only thing that may, and only via the table. A throw
     -- past this point would otherwise hand a running agent's clone slot to the queue.
     shutdownRef.set none
+    execRef.set none
     -- `slot` is written here and nowhere earlier: it is only true once `ensureSlot` has put a
     -- working tree in it, and a record naming a slot a failed acquire merely reserved would send
     -- the next wake looking for its tree in the wrong place — and, finding none, reset the right

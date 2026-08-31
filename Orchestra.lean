@@ -8,6 +8,7 @@ import Orchestra.Agents.Vibe
 import Orchestra.Agents.Opencode
 import Orchestra.Concert
 import Orchestra.Config
+import Orchestra.Exec
 import Orchestra.GitHub
 import Orchestra.Listener
 import Orchestra.Project

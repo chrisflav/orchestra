@@ -1,16 +1,30 @@
 import Orchestra.AgentDef
 import Orchestra.StreamFormat
+import Orchestra.Exec
 import Std.Sync
+
+/-!
+# Launching an agent, and supervising it while it runs
+
+This module answers *what the run needs* and *what the run said*; it no longer answers *how the
+run is confined*. The first is a `RunSpec` (`Orchestra.Exec.Spec`), built here from the task's
+parameters and the agent backend's declared needs. The second is everything below the launch:
+parsing the output stream, writing the logs, honouring the cancel token, and deciding whether the
+run hit a usage limit. Confinement is an `Exec.Session`, opened for the whole task by whichever
+backend is configured — landrun by default — and swapping it changes nothing in this file.
+
+All three ways to launch an agent go through the same session, and therefore through the same
+environment: headless, the TUI, and the bidirectional stream an interactive session holds open.
+That is the same reason the landrun arguments used to be factored into one place, taken one step
+further — a sandbox that differs by launch mode is a sandbox nobody can reason about, and so is
+one that differs by *where* it runs.
+
+See `docs/execution.md`.
+-/
 
 namespace Orchestra.Sandbox
 
-/-- Expand home-relative path strings to absolute FilePaths using $HOME. -/
-private def expandHomePaths (rel : List String) : IO (List System.FilePath) := do
-  match ← IO.getEnv "HOME" with
-  | none   => return []
-  | some h =>
-    let home := System.FilePath.mk h
-    return rel.map (fun r => home / System.FilePath.mk r)
+open Orchestra.Exec
 
 /-- Result of launching an agent. -/
 structure LaunchResult where
@@ -27,18 +41,6 @@ structure LaunchResult where
   /-- Reset timestamp reported by a `rate_limit_event`, if the agent emitted one. Lets the usage
       monitor record when a limit actually lifts instead of falling back to a default backoff. -/
   rateLimitReset : Option String := none
-
-/--
-Launch the coding agent inside a landrun sandbox.
-The agent backend's setupMcp hook runs before launch to configure MCP connectivity.
-Returns a LaunchResult with exit code, session ID, and usage-limit flag.
--/
-private def shellEscape (s : String) : String :=
-  if s.any (fun c => c == ' ' || c == '"' || c == '\'' || c == '\\' || c == '$' || c == '`'
-                   || c == '(' || c == ')' || c == '!' || c == '&' || c == '|'
-                   || c == ';' || c == '\n' || c == '\t') then
-    "'" ++ s.replace "'" "'\\''" ++ "'"
-  else s
 
 /-- Byte ceiling for each prompt every backend passes to its CLI as a single argument: the task
     prompt and the appended system prompt.
@@ -94,139 +96,141 @@ The agent will not see what was cut — check whether a prompt template is expan
 unbounded."
   return truncatePrompt s
 
-/-- The `landrun` command line, up to and including the agent's own executable name: every path
-    rule, every port, and every environment variable, but nothing about what the agent is being
-    asked to do.
+/-! ## Building the spec
 
-    Extracted because there are now three ways to launch an agent — headless, TUI, and the
-    bidirectional stream an interactive session holds open — and the sandbox they run in must be
-    the same one. Copied instead of shared, the path list or the port rules would drift between
-    them, and a sandbox that differs by launch mode is a sandbox nobody can reason about. -/
-private def sandboxArgs (agentDef : AgentDef) (repoPath : System.FilePath)
-    (serverPort : UInt16) (ghToken : String)
-    (agentEnv : Array (String × Option String))
-    (extraEnv : Array (String × Option String) := #[])
-    (pluginDirs : Array String := #[])
-    (memoryDirs : Array String := #[])
-    (readOnly : Bool := false)
-    (extraPorts : Array Nat := #[])
-    (additionalPaths : SandboxPaths := {}) : IO (Array String) := do
-  let paths := agentDef.sandboxPaths
-  let mut args : Array String := #[]
-  -- Repo access: read-only or read-write depending on the task's readOnly flag
-  if readOnly then
-    args := args.push "--rox" |>.push repoPath.toString
-  else
-    args := args.push "--rwx" |>.push repoPath.toString
-  args := args.push "--rw" |>.push "/tmp"
-  -- Read+execute system paths (binaries, libraries)
-  for p in paths.rox do
-    if ← System.FilePath.pathExists p then
-      args := args.push "--rox" |>.push p
-  -- Read-only system paths
-  for p in paths.ro do
-    if ← System.FilePath.pathExists p then
-      args := args.push "--ro" |>.push p
-  -- Read-write system paths (e.g. /dev/null)
-  for p in paths.rw do
-    if ← System.FilePath.pathExists p then
-      args := args.push "--rw" |>.push p
-  -- Home-relative paths with execute
-  for p in ← expandHomePaths paths.homeRox do
-    if ← p.pathExists then
-      args := args.push "--rox" |>.push p.toString
-  -- Home-relative paths read-write (agent config/state).
-  --
-  -- A missing path here is not benign, unlike the system paths above. Landlock can only attach a
-  -- rule to a path that exists, so a missing one is dropped — and since $HOME itself is never
-  -- granted, the agent cannot create it either. It typically reports that it cannot write its
-  -- config directory and then hangs, with nothing in the log to explain why. Warn instead: the
-  -- fix is to create the path in whatever image or machine image is being used.
-  for p in ← expandHomePaths paths.homeRw do
-    if ← p.pathExists then
-      args := args.push "--rw" |>.push p.toString
-    else
-      IO.eprintln s!"  [sandbox] warning: {p} does not exist, so the agent gets no write access \
-        to it and cannot create it — the agent may hang on startup. Create it and retry."
-  -- Home-relative paths needing write *and* execute (toolchain managers — see `SandboxPaths`).
-  for p in ← expandHomePaths paths.homeRwx do
-    if ← p.pathExists then
-      args := args.push "--rwx" |>.push p.toString
-    else
-      IO.eprintln s!"  [sandbox] warning: {p} does not exist, so the agent gets no write access \
-        to it and cannot create it — the agent may hang on startup. Create it and retry."
-  -- Additional paths from global app config
-  for p in additionalPaths.rox do
-    if ← System.FilePath.pathExists p then
-      args := args.push "--rox" |>.push p
-  for p in additionalPaths.ro do
-    if ← System.FilePath.pathExists p then
-      args := args.push "--ro" |>.push p
-  for p in additionalPaths.rw do
-    if ← System.FilePath.pathExists p then
-      args := args.push "--rw" |>.push p
-  for p in ← expandHomePaths additionalPaths.homeRox do
-    if ← p.pathExists then
-      args := args.push "--rox" |>.push p.toString
-  for p in ← expandHomePaths additionalPaths.homeRw do
-    if ← p.pathExists then
-      args := args.push "--rw" |>.push p.toString
-  for p in ← expandHomePaths additionalPaths.homeRwx do
-    if ← p.pathExists then
-      args := args.push "--rwx" |>.push p.toString
-  for p in additionalPaths.extraPorts do
-    args := args.push "--connect-tcp" |>.push (toString p)
-    args := args.push "--bind-tcp" |>.push (toString p)
-  -- Plugin directories (read+execute access)
-  for p in pluginDirs do
-    if ← System.FilePath.pathExists p then
-      args := args.push "--rox" |>.push p
-  -- Memory directories (read-write access so the agent can persist memories)
-  for p in memoryDirs do
-    if ← System.FilePath.pathExists p then
-      args := args.push "--rw" |>.push p
-  -- Network: allow connecting to the local MCP server and external HTTPS
-  args := args.push "--connect-tcp" |>.push (toString serverPort)
-  args := args.push "--connect-tcp" |>.push "443"
-  -- Agent-specific extra ports (e.g. local Ollama on 11434)
-  for p in paths.extraPorts do
-    args := args.push "--connect-tcp" |>.push (toString p)
-    args := args.push "--bind-tcp" |>.push (toString p)
-  -- Task-level extra ports configured in the action/task config
-  for p in extraPorts do
-    args := args.push "--connect-tcp" |>.push (toString p)
-    args := args.push "--bind-tcp" |>.push (toString p)
-  -- Environment variables for the sandboxed command.
-  --
-  -- An empty token is left unset rather than exported empty: that is what a task with no GitHub
-  -- App installation behind it gets, and `gh` treats `GH_TOKEN=` as a credential it must use,
-  -- failing every call with an authentication error instead of saying it has none.
-  if !ghToken.isEmpty then
-    args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
-  args := args.push "--env" |>.push "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"
-  -- Pass through inherited env vars by name
-  for name in ["SHELL", "PATH", "HOME", "USER", "TERM"] do
-    args := args.push "--env" |>.push name
-  -- Agent-specific env vars (e.g. VIBE_HOME, MISTRAL_API_KEY)
-  for (k, v) in agentEnv do
-    match v with
-    | some val => args := args.push "--env" |>.push s!"{k}={val}"
-    | none => pure ()
-  -- Caller-supplied extra env vars
-  for (k, v) in extraEnv do
-    match v with
-    | some val => args := args.push "--env" |>.push s!"{k}={val}"
-    | none => pure ()
-  -- Separator and the actual command; what follows is the agent's own args, which the caller
-  -- appends according to how it is launching.
-  args := args.push "--"
-  args := args.push agentDef.command
-  return args
+Three pure functions, so that what a run is granted can be checked without launching anything —
+which is the point of having a spec at all. They are also what keeps the three launch modes
+honest: headless, TUI and streaming differ in their command and their streams, and in nothing
+else.
+
+They replace what used to be one `sandboxArgs` producing landrun flags. Same reasoning, one level
+up: the flags belonged in one place so they could not drift between launch modes, and the *needs*
+belong in one place so they cannot drift between execution backends either. -/
+
+/-- Every path an agent run may touch, in the order they are granted.
+
+    `paths` is the agent backend's own list and `additional` is the instance-wide
+    `additional_sandbox_paths` from `config.json`. The two are not quite equal in standing: a
+    missing path in the backend's list means the machine is not set up to run that agent, and is
+    reported (`PathGrant.required`), while the configured list is advisory — it exists to grant
+    access to directories that may or may not be there — and stays quiet. -/
+def grantsFor (paths additional : SandboxPaths) (repoPath : System.FilePath) (readOnly : Bool)
+    (pluginDirs memoryDirs : Array String) : Array PathGrant := Id.run do
+  let ofList (scope : Scope) (access : Access) (required : Bool) (ps : List String) :=
+    ps.toArray.map fun p => { path := p, access, scope, required : PathGrant }
+  let mut grants : Array PathGrant := #[]
+  -- The workspace, read-only for review tasks and writable for everything else, and `/tmp`, which
+  -- every agent CLI uses for its own scratch files. Both are required: the run cannot do anything
+  -- useful without them.
+  grants := grants.push
+    { path := repoPath.toString, access := if readOnly then .rox else .rwx, required := true
+    , from_ := .orchestra }
+  grants := grants.push { path := "/tmp", access := .rw, required := true }
+  -- The agent backend's declared needs.
+  grants := grants ++ ofList .absolute .rox false paths.rox
+  grants := grants ++ ofList .absolute .ro  false paths.ro
+  grants := grants ++ ofList .absolute .rw  false paths.rw
+  grants := grants ++ ofList .home     .rox false paths.homeRox
+  grants := grants ++ ofList .home     .rw  true  paths.homeRw
+  grants := grants ++ ofList .home     .rwx true  paths.homeRwx
+  -- This instance's extra paths, on top.
+  grants := grants ++ ofList .absolute .rox false additional.rox
+  grants := grants ++ ofList .absolute .ro  false additional.ro
+  grants := grants ++ ofList .absolute .rw  false additional.rw
+  grants := grants ++ ofList .home     .rox false additional.homeRox
+  grants := grants ++ ofList .home     .rw  false additional.homeRw
+  grants := grants ++ ofList .home     .rwx false additional.homeRwx
+  -- Plugins are read and run; memories are written back by the agent. Both are orchestra's own
+  -- content, like the checkout: they sit on the daemon's disk and in no image, so a backend that
+  -- runs the agent elsewhere has to carry them there — and carry the memories back.
+  grants := grants ++ pluginDirs.map fun p =>
+    { path := p, access := .rox, from_ := .orchestra : PathGrant }
+  grants := grants ++ memoryDirs.map fun p =>
+    { path := p, access := .rw, from_ := .orchestra : PathGrant }
+  return grants
+
+/-- The ports an agent run may use: the MCP server it was started for, HTTPS, and whatever the
+    backend, the instance config and the task itself asked for on top.
+
+    Everything but the MCP port and 443 is granted in both directions, because the reason a port
+    is named here is a local service the agent both starts and talks to (an Ollama, a language
+    server). The two orchestra grants are outbound only: the agent has no business listening on
+    them. -/
+def portsFor (paths additional : SandboxPaths) (mcp : McpEndpoint) (extraPorts : Array Nat)
+    : Ports := Id.run do
+  let extra : Array UInt16 :=
+    paths.extraPorts.toArray ++ additional.extraPorts.toArray ++ extraPorts.map UInt16.ofNat
+  return { connect := #[mcp.port, 443] ++ extra, bind := extra }
+
+/-- The environment every agent run starts with, whichever way it was launched.
+
+    An empty token is left unset rather than exported empty: that is what a task with no GitHub
+    App installation behind it gets, and `gh` treats `GH_TOKEN=` as a credential it must use,
+    failing every call with an authentication error instead of saying it has none. -/
+def envFor (ghToken : String) (agentEnv extraEnv : Array (String × Option String))
+    : Array (String × String) :=
+  (if ghToken.isEmpty then #[] else #[("GH_TOKEN", ghToken)])
+    ++ #[("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")]
+    -- Agent-specific env vars (e.g. VIBE_HOME, MISTRAL_API_KEY), then the caller's.
+    ++ (agentEnv ++ extraEnv).filterMap fun (k, v) => v.map ((k, ·))
+
+/-- Everything an agent run needs except its own command line: the same spec for all three launch
+    modes, which then differ only in `command`, `args` and `stdio`. -/
+def specFor (agentDef : AgentDef) (repoPath : System.FilePath) (mcp : McpEndpoint)
+    (ghToken : String) (agentEnv extraEnv : Array (String × Option String))
+    (pluginDirs memoryDirs : Array String) (readOnly : Bool) (extraPorts : Array Nat)
+    (additionalPaths : SandboxPaths) : RunSpec :=
+  { command := agentDef.command
+    workdir := repoPath
+    grants  := grantsFor agentDef.sandboxPaths additionalPaths repoPath readOnly
+                 pluginDirs memoryDirs
+    ports   := portsFor agentDef.sandboxPaths additionalPaths mcp extraPorts
+    env     := envFor ghToken agentEnv extraEnv
+    -- Inherited by name, not by value: `PATH` and `HOME` mean what they mean wherever the agent
+    -- ends up running, which is not necessarily here.
+    envPassthrough := #["SHELL", "PATH", "HOME", "USER", "TERM"]
+    label   := s!"orchestra-{agentDef.command}" }
+
+/-! ## Supervising a run -/
+
+/-- Kill `handle` if and when `cancelToken` is cancelled.
+
+    Blocks (without polling) on the token in a task of its own. When the run finishes normally the
+    caller signals the token with a custom `"done"` reason, which wakes this task and lets it
+    exit, breaking the reference cycle that would otherwise keep the handle alive. -/
+private def killOnCancel (handle : Handle) (cancelToken : Option Std.CancellationToken)
+    : IO Unit := do
+  let some ct := cancelToken | return ()
+  let _killTask ← IO.asTask (prio := .dedicated) do
+    let asyncTask ← ct.wait
+    match ← IO.wait asyncTask with
+    | .error _ => pure ()             -- token dropped unexpectedly
+    | .ok () =>
+      match ← ct.getCancellationReason with
+      | some .cancel => handle.kill   -- user-requested cancellation
+      | _            => pure ()       -- "done" or other reason: the run already ended
+  return ()
+
+/-- Signal a still-live cancel token that the run is over, so `killOnCancel` can retire. -/
+private def signalDone (cancelToken : Option Std.CancellationToken) : IO Unit := do
+  if let some ct := cancelToken then
+    if !(← ct.isCancelled) then
+      ct.cancel (.custom "done")
+
+/-- Whether the run ended because someone cancelled it, as opposed to any other reason the token
+    may have been signalled for. -/
+private def endedCancelled (cancelToken : Option Std.CancellationToken) : IO Bool := do
+  match cancelToken with
+  | none    => pure false
+  | some ct => pure ((← ct.getCancellationReason) == some .cancel)
 
 /--
-Launch the coding agent inside a landrun sandbox.
-The agent backend's setupMcp hook runs before launch to configure MCP connectivity.
-Returns a LaunchResult with exit code, session ID, and usage-limit flag.
+Launch the coding agent in `session` — the environment the configured execution backend opened for
+this task — and supervise the run.
+
+The agent backend's `setupMcp` hook runs before launch to configure MCP connectivity, at the
+address the session says the MCP server is reachable at. Returns a `LaunchResult` with the exit
+code, session ID, and usage-limit flag.
 -/
 def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : String)
     (serverPort : UInt16)
@@ -253,11 +257,24 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (interactiveAgent : Bool := false)
     -- Condition the run is held to: the agent must not stop before it holds. Passed to the
     -- backend on its own, never folded into `prompt` — see `AgentDef.goalArgs`.
-    (goal : Option String := none) : IO LaunchResult := do
-  -- Run agent-specific MCP setup (writes config files, returns extra env vars)
-  let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
-  let mut args ← sandboxArgs agentDef repoPath serverPort ghToken agentEnv extraEnv
-    pluginDirs memoryDirs readOnly extraPorts additionalPaths
+    (goal : Option String := none)
+    -- The environment the agent runs in, opened for the whole task by whichever execution backend
+    -- is configured. Defaults to this machine under landrun, which is what a caller that has not
+    -- read `execution.backend` from the config should get.
+    (session : Exec.Session := Exec.Landrun.session)
+    -- Secret the agent must present to the MCP server, when the server had to listen somewhere
+    -- other than loopback for this backend to reach it. Minted with the server by
+    -- `Exec.mcpBinding`; `none` for every loopback run.
+    (mcpToken : Option String := none) : IO LaunchResult := do
+  -- Where the agent reaches the MCP server: loopback for a backend that runs it on this machine,
+  -- and whatever a remote one says instead. Resolved before `setupMcp`, which writes it into the
+  -- agent's config file.
+  let mcp ← session.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
+  let (mcpContext, agentEnv, mcpFiles) ← agentDef.setupMcp mcp model systemPrompt
+  -- The config `setupMcp` just wrote is on this machine; the agent may not be. It could not be
+  -- staged when the session opened — it did not exist then, since it holds an address that needs
+  -- a server that is started after the session — so it is carried across now, before launch.
+  session.provide mcpFiles
   -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
   let allPluginDirs := pluginDirs ++ memoryDirs
   -- Enforced here rather than where the prompts are built: every backend and every caller
@@ -287,88 +304,24 @@ goal; running without the goal condition."
       agentDef.buildInteractiveArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget
     else
       agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
-  args := args ++ goalArgs ++ agentArgs
+  let spec : RunSpec :=
+    { specFor agentDef repoPath mcp ghToken agentEnv extraEnv pluginDirs memoryDirs readOnly
+        extraPorts additionalPaths with
+      args  := goalArgs ++ agentArgs
+      stdio := if interactiveAgent then .inherit else .piped }
   if debug then
-    let argsStr := String.intercalate " " (args.toList.map shellEscape)
-    IO.eprintln s!"[debug] cd {shellEscape repoPath.toString} && landrun {argsStr}"
+    IO.eprintln (← session.describe spec)
+  let handle ← session.start spec
+  killOnCancel handle cancelToken
   if interactiveAgent then
-    -- Interactive mode: inherit stdio so the user drops into the agent TUI.
-    -- No stream parsing; just wait for the process to exit.
-    let child ← IO.Process.spawn {
-      cmd := "landrun"
-      args
-      cwd := repoPath
-      stdin := .inherit
-      stdout := .inherit
-      stderr := .inherit
-    }
-    if let some ct := cancelToken then
-      let _killTask ← IO.asTask (prio := .dedicated) do
-        let asyncTask ← ct.wait
-        let result ← IO.wait asyncTask
-        match result with
-        | .error _ => pure ()
-        | .ok () =>
-          match ← ct.getCancellationReason with
-          | some .cancel =>
-            try
-              let killer ← IO.Process.spawn {
-                cmd := "kill"
-                args := #["-9", toString child.pid]
-                stdin := .null
-                stdout := .null
-                stderr := .null
-              }
-              let _ ← killer.wait
-            catch _ => pure ()
-          | _ => pure ()
-    let exitCode ← child.wait
-    if let some ct := cancelToken then
-      if !(← ct.isCancelled) then
-        ct.cancel (.custom "done")
-    let wasCancelled ← match cancelToken with
-      | none => pure false
-      | some ct => do
-        let reason ← ct.getCancellationReason
-        pure (reason == some .cancel)
+    -- Interactive mode: the run has orchestra's own terminal, and the user is looking at the
+    -- agent's TUI. Nothing to parse; just wait for it to exit.
+    let exitCode ← handle.wait
+    signalDone cancelToken
+    let wasCancelled ← endedCancelled cancelToken
     let sessionId ← agentDef.extractSessionId mcpContext
     agentDef.cleanup mcpContext
     return { exitCode, sessionId, usageLimitHit := false, wasCancelled }
-  else
-  -- Non-interactive (headless) mode: pipe stdio and parse the output stream.
-  let child ← IO.Process.spawn {
-    cmd := "landrun"
-    args
-    cwd := repoPath
-    stdin := .null
-    stdout := .piped
-    stderr := .piped
-  }
-  -- If a cancel token is provided, set up an async kill task.
-  -- It blocks (without polling) until the token is cancelled, then kills the child.
-  -- When the child exits normally we signal the token with a custom "done" reason
-  -- so this task wakes up and exits, breaking any reference cycles.
-  if let some ct := cancelToken then
-    let _killTask ← IO.asTask (prio := .dedicated) do
-      let asyncTask ← ct.wait
-      let result ← IO.wait asyncTask
-      match result with
-      | .error _ => pure ()  -- token dropped unexpectedly
-      | .ok () =>
-        match ← ct.getCancellationReason with
-        | some .cancel =>
-          -- User-requested cancellation: kill the child process
-          try
-            let killer ← IO.Process.spawn {
-              cmd := "kill"
-              args := #["-9", toString child.pid]
-              stdin := .null
-              stdout := .null
-              stderr := .null
-            }
-            let _ ← killer.wait
-          catch _ => pure ()
-        | _ => pure ()  -- "done" or other reason: child already exited, nothing to do
   -- Open debug log file if requested (one per task, created fresh)
   let debugHandle : Option IO.FS.Handle ← match debugLogFile with
     | none      => pure none
@@ -385,72 +338,70 @@ goal; running without the goal condition."
   let resultSubtypeRef ← IO.mkRef (none : Option StreamFormat.ResultSubtype)
   let resultTextRef   ← IO.mkRef (none : Option String)
   let rateLimitResetRef ← IO.mkRef (none : Option String)
-  let outTask ← IO.asTask (prio := .dedicated) do
-    let out ← IO.getStdout
-    let err ← IO.getStderr
-    repeat do
-      let line ← child.stdout.getLine
-      if line.isEmpty then return
-      -- Write every raw line to the debug log
-      if let some h := debugHandle then
-        h.putStrLn line
-        h.flush
-      -- When debug is on, echo every raw stdout line to stderr
-      if debug then
-        err.putStrLn s!"[raw] {line.trimAscii}"
-        err.flush
-      let events := agentDef.parseOutputLine line
-      if events.isEmpty && debug then
-        err.putStrLn s!"[suppressed] {line.trimAscii}"
-        err.flush
-      -- One line can carry several events — an assistant message that thinks, narrates and
-      -- then calls a tool is three — so each is handled in the order the agent emitted it.
-      for event in events do
-        if let .init sid _ := event then
-          sessionIdRef.set (some sid)
-        if let .result sub _ _ _ res := event then
-          resultSubtypeRef.set (some sub)
-          unless res.isEmpty do resultTextRef.set (some res)
-        -- Rate-limit events are bookkeeping, not progress: they are recorded for the usage
-        -- monitor but kept off the console, which is what the old `parseOutputLine` returning
-        -- `none` for them achieved before there was anywhere to record them.
-        if let .rateLimit reset := event then
-          if reset.isSome then rateLimitResetRef.set reset
-        else
-          out.putStrLn (StreamFormat.format event)
-          out.flush
-        -- Write the parsed event as a JSON line to the structured log
-        if let some h := logHandle then
-          h.putStrLn (Lean.Json.compress (Lean.ToJson.toJson event))
+  let outTask ← match handle.stdout with
+    | none => pure none
+    | some stdout => some <$> IO.asTask (prio := .dedicated) do
+      let out ← IO.getStdout
+      let err ← IO.getStderr
+      repeat do
+        let line ← stdout.getLine
+        if line.isEmpty then return
+        -- Write every raw line to the debug log
+        if let some h := debugHandle then
+          h.putStrLn line
           h.flush
+        -- When debug is on, echo every raw stdout line to stderr
+        if debug then
+          err.putStrLn s!"[raw] {line.trimAscii}"
+          err.flush
+        let events := agentDef.parseOutputLine line
+        if events.isEmpty && debug then
+          err.putStrLn s!"[suppressed] {line.trimAscii}"
+          err.flush
+        -- One line can carry several events — an assistant message that thinks, narrates and
+        -- then calls a tool is three — so each is handled in the order the agent emitted it.
+        for event in events do
+          if let .init sid _ := event then
+            sessionIdRef.set (some sid)
+          if let .result sub _ _ _ res := event then
+            resultSubtypeRef.set (some sub)
+            unless res.isEmpty do resultTextRef.set (some res)
+          -- Rate-limit events are bookkeeping, not progress: they are recorded for the usage
+          -- monitor but kept off the console, which is what the old `parseOutputLine` returning
+          -- `none` for them achieved before there was anywhere to record them.
+          if let .rateLimit reset := event then
+            if reset.isSome then rateLimitResetRef.set reset
+          else
+            out.putStrLn (StreamFormat.format event)
+            out.flush
+          -- Write the parsed event as a JSON line to the structured log
+          if let some h := logHandle then
+            h.putStrLn (Lean.Json.compress (Lean.ToJson.toJson event))
+            h.flush
   -- Stream stderr to console and capture it for usage-limit detection
   let stderrRef ← IO.mkRef ""
-  let errTask ← IO.asTask (prio := .dedicated) do
-    let err ← IO.getStderr
-    repeat do
-      let line ← child.stderr.getLine
-      if line.isEmpty then return
-      stderrRef.modify (· ++ line)
-      err.putStr line
-      err.flush
-  -- Wait for streams to drain (EOF when child exits), then collect exit code
-  let _ ← IO.wait outTask
-  let _ ← IO.wait errTask
-  let exitCode ← child.wait
+  let errTask ← match handle.stderr with
+    | none => pure none
+    | some stderr => some <$> IO.asTask (prio := .dedicated) do
+      let err ← IO.getStderr
+      repeat do
+        let line ← stderr.getLine
+        if line.isEmpty then return
+        stderrRef.modify (· ++ line)
+        err.putStr line
+        err.flush
+  -- Wait for streams to drain (EOF when the run ends), then collect the exit code
+  if let some t := outTask then let _ ← IO.wait t
+  if let some t := errTask then let _ ← IO.wait t
+  let exitCode ← handle.wait
   -- Signal the kill task to clean up (breaks reference cycle; no-op if already cancelled)
-  if let some ct := cancelToken then
-    if !(← ct.isCancelled) then
-      ct.cancel (.custom "done")
+  signalDone cancelToken
   -- If the stream didn't yield a session ID, ask the backend (e.g. read from log files)
   let sessionId ← match ← sessionIdRef.get with
     | some sid => pure (some sid)
     | none     => agentDef.extractSessionId mcpContext
   -- Determine whether this run ended due to user cancellation
-  let wasCancelled ← match cancelToken with
-    | none => pure false
-    | some ct => do
-      let reason ← ct.getCancellationReason
-      pure (reason == some .cancel)
+  let wasCancelled ← endedCancelled cancelToken
   let resultSubtype ← resultSubtypeRef.get
   let resultText    ← resultTextRef.get
   let rateLimitReset ← rateLimitResetRef.get
@@ -496,15 +447,16 @@ private def shutdownGracePolls : Nat := 50
 
 /-- A live agent process: turns go in, events come out, and it stays up in between. -/
 structure StreamingSession where
-  /-- The child with its stdin *taken out* — see `stdinRef`. -/
-  private child : IO.Process.Child
-    { stdin := .null, stdout := .piped, stderr := .piped : IO.Process.StdioConfig }
-  /-- The agent's stdin, held here rather than on the child, and `none` once closed.
+  /-- The run, whatever is running it: a process here, an exec into a pod elsewhere. What this
+      needs of it — a stream in, two streams out, and a way to ask it to stop and then insist — is
+      exactly what an `Exec.Handle` promises. -/
+  private handle : Exec.Handle
+  /-- The agent's stdin, held here rather than on the run, and `none` once closed.
 
       A handle closes when its last reference drops, and a `Child` holds one of its own — so
       while the child owned this handle nothing could deliver EOF, however hard it tried.
-      `Child.takeStdin` at launch is what makes dropping this the last reference, and EOF is
-      how a CLI reading turns from a pipe is told there are no more. -/
+      `Handle.ofStreamChild` takes it off the child at launch, which is what makes dropping this
+      the last reference; EOF is how a CLI reading turns from a pipe is told there are no more. -/
   private stdinRef : IO.Ref (Option IO.FS.Handle)
   /-- Serialises writes to stdin, and the close in `shutdown` against them. Two turns posted at
       once — one from the CLI, one from a dashboard — would otherwise interleave halfway
@@ -546,7 +498,7 @@ def stderrSoFar (s : StreamingSession) : IO String := s.stderrRef.get
     appending to a transcript — and reading that as "the agent is gone" would have the daemon
     kill a healthy session mid-conversation. -/
 def hasExited (s : StreamingSession) : IO Bool :=
-  return (← s.child.tryWait).isSome
+  return (← s.handle.tryWait).isSome
 
 /-- Stop the process and release what the backend set up for it.
 
@@ -566,24 +518,18 @@ def shutdown (s : StreamingSession) : IO Unit := do
   if ← s.closed.modifyGet (fun c => (c, true)) then return
   s.stdinLock.lock
   try s.stdinRef.set none finally s.stdinLock.unlock
-  try s.child.kill catch _ => pure ()
+  try s.handle.terminate catch _ => pure ()
   let mut gone := false
   for _ in List.range shutdownGracePolls do
-    if (← s.child.tryWait).isSome then
+    if (← s.handle.tryWait).isSome then
       gone := true
       break
     IO.sleep 100
   unless gone do
-    -- `Child.kill` is SIGTERM only, so the escalation still goes through `kill(1)` — the same
-    -- way the cancel path does it.
-    try
-      let killer ← IO.Process.spawn {
-        cmd := "kill", args := #["-9", toString s.child.pid]
-        stdin := .null, stdout := .null, stderr := .null
-      }
-      let _ ← killer.wait
-    catch _ => pure ()
-  let _ ← try s.child.wait catch _ => pure (0 : UInt32)
+    -- `terminate` is the polite signal; `kill` is the one that does not ask. On a backend that
+    -- runs the agent elsewhere the second is also what releases what was holding it.
+    try s.handle.kill catch _ => pure ()
+  let _ ← try s.handle.wait catch _ => pure (0 : UInt32)
   s.agentDef.cleanup s.mcpContext
 
 end StreamingSession
@@ -605,8 +551,16 @@ def launchStreaming (agentDef : AgentDef) (repoPath : System.FilePath)
     (memoryDirs : Array String := #[])
     (readOnly : Bool := false)
     (extraPorts : Array Nat := #[])
-    (additionalPaths : SandboxPaths := {}) : IO (Option StreamingSession) := do
-  let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort opts.model opts.systemPrompt
+    (additionalPaths : SandboxPaths := {})
+    -- The environment the session's agent lives in, held for as long as the conversation is.
+    (session : Exec.Session := Exec.Landrun.session)
+    -- Secret the agent presents to the MCP server, when the server had to listen off loopback.
+    (mcpToken : Option String := none) : IO (Option StreamingSession) := do
+  let mcp ← session.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
+  let (mcpContext, agentEnv, mcpFiles) ← agentDef.setupMcp mcp opts.model opts.systemPrompt
+  -- Carried to wherever the agent runs, for the same reason as on the queued path: this file
+  -- holds the address of the tools, and it was written here.
+  session.provide mcpFiles
   -- Capped for the same reason as everywhere else: it is one `execve` argument, and the limit
   -- belongs to `execve` rather than to any one caller.
   let systemPrompt ← opts.systemPrompt.mapM (capPromptArg "system prompt")
@@ -621,27 +575,34 @@ def launchStreaming (agentDef : AgentDef) (repoPath : System.FilePath)
   let some agentArgs := agentDef.buildStreamArgs opts | do
     agentDef.cleanup mcpContext
     return none
-  let mut args ← sandboxArgs agentDef repoPath serverPort ghToken agentEnv extraEnv
-    pluginDirs memoryDirs readOnly extraPorts additionalPaths
-  args := args ++ agentArgs
+  let spec : RunSpec :=
+    { specFor agentDef repoPath mcp ghToken agentEnv extraEnv pluginDirs memoryDirs readOnly
+        extraPorts additionalPaths with
+      args  := agentArgs
+      -- The mode that keeps stdin open: a turn is a line written to it, and closing it is how the
+      -- conversation ends.
+      stdio := .stream }
   if debug then
-    let argsStr := String.intercalate " " (args.toList.map shellEscape)
-    IO.eprintln s!"[debug] cd {shellEscape repoPath.toString} && landrun {argsStr}"
-  -- Cleaned up on the way out of a failed spawn — a missing `landrun` or a clone that vanished
-  -- would otherwise leave the backend's temp MCP config behind, one per attempt.
-  let spawned ← try
-      IO.Process.spawn {
-        cmd := "landrun"
-        args
-        cwd := repoPath
-        stdin := .piped, stdout := .piped, stderr := .piped
-      }
+    IO.eprintln (← session.describe spec)
+  -- Cleaned up on the way out of a failed start — a missing `landrun`, an unreachable cluster, a
+  -- clone that vanished — which would otherwise leave the backend's temp MCP config behind, one
+  -- per attempt.
+  let handle ← try session.start spec
     catch e =>
       agentDef.cleanup mcpContext
       throw e
-  -- Take stdin off the child so the handle below is the only reference to it. Without this,
-  -- closing it later cannot deliver EOF, because the child still holds one.
-  let (stdinHandle, child) ← spawned.takeStdin
+  -- A streaming session needs all three: turns go in, events come out, and a death rattle comes
+  -- out beside them. A backend that cannot supply one says so here rather than handing back a
+  -- session that silently never speaks.
+  let some stdinHandle := handle.stdin | do
+    handle.kill; agentDef.cleanup mcpContext
+    throw (IO.userError "the execution backend gave this session no way to send it turns")
+  let some stdout := handle.stdout | do
+    handle.kill; agentDef.cleanup mcpContext
+    throw (IO.userError "the execution backend gave this session no output to read")
+  let some stderrStream := handle.stderr | do
+    handle.kill; agentDef.cleanup mcpContext
+    throw (IO.userError "the execution backend gave this session no stderr to read")
   let stderrRef ← IO.mkRef ""
   -- One line can carry several events, and each is delivered in the order the agent emitted it.
   -- A throw from `onEvent` ends the pump, which is what closing the transcript file underneath
@@ -649,7 +610,7 @@ def launchStreaming (agentDef : AgentDef) (repoPath : System.FilePath)
   let pump ← IO.asTask (prio := .dedicated) do
     let err ← IO.getStderr
     repeat do
-      let line ← child.stdout.getLine
+      let line ← stdout.getLine
       if line.isEmpty then return
       if debug then
         err.putStrLn s!"[raw] {line.trimAscii}"
@@ -665,13 +626,13 @@ def launchStreaming (agentDef : AgentDef) (repoPath : System.FilePath)
           err.flush
   let _errTask ← IO.asTask (prio := .dedicated) do
     repeat do
-      let line ← child.stderr.getLine
+      let line ← stderrStream.getLine
       if line.isEmpty then return
       stderrRef.modify fun acc =>
         let acc := acc ++ line
         if acc.length ≤ maxStderrChars then acc else (acc.takeEnd maxStderrChars).toString
   return some {
-    child, stderrRef, pump, mcpContext, agentDef
+    handle, stderrRef, pump, mcpContext, agentDef
     stdinRef  := ← IO.mkRef (some stdinHandle)
     stdinLock := ← Std.BaseMutex.new
     closed    := ← IO.mkRef false

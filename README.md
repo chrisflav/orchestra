@@ -30,7 +30,7 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
           clone + GitHub App token + per-repo hooks
                              │
                              ▼
-              landrun sandbox ──── agent backend
+            execution backend ──── agent backend
                              │           │
                              └► MCP server ◄┘
                               (GitHub + issues)
@@ -40,13 +40,19 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
 
 - **Sandboxed runs.** Every agent runs under landrun: write access to its own clone and `/tmp`,
   read+execute on the toolchain, outbound TCP to HTTPS and the MCP port, nothing else. A task can
-  mount its clone read-only, which is what review tasks use.
+  mount its clone read-only, which is what review tasks use. What a task may do is described apart
+  from how that is enforced, so another execution model — a container, a cluster — is a backend
+  rather than a rewrite → [the execution model](docs/execution.md)
 - **Repository-independent tasks.** A task can name no repository at all and run in a scratch
   workspace instead of a checkout — for maintenance and coordination that spans every project
   rather than belonging to one → [repository-independent tasks](#repository-independent-tasks)
 - **Credentials the agent never sees.** A GitHub App installation token is minted per task and
   handed to `gh` for git transport only. The personal access token used for upstream pull
   requests, reviews and comments stays in the MCP server process.
+- **Agents where you need them.** Every task goes through an execution backend: landrun on this
+  machine by default, or a Kubernetes cluster, one pod per task, running the repository's hooks and
+  validation where the agent works, with the MCP server authenticated per task →
+  [kubernetes](docs/kubernetes.md)
 - **Four agent backends** — `claude` (Claude Code), `vibe` (mistral-vibe), `opencode` and `pi` —
   plus two built-in agent-less backends: `merger`, which lands an approved pull request, and
   `triage`, which applies and removes labels deterministically.
@@ -215,6 +221,10 @@ cache directory:
 
 TCP ports beyond HTTPS and the MCP server are opened per backend, via `extra_ports` on that
 backend's entry in the `agents` array — for a local model server, for instance.
+
+The `execution` block chooses what runs the agent — `landrun` (the default), `local`, which does
+not confine it at all, or `kubernetes`, which runs it in a pod. See
+[other execution backends](#other-execution-backends).
 
 The `queue` block sets how many tasks the daemon runs at once. Both keys default
 to `1`, which is the serial behaviour, and `orchestra queue start --parallel N` /
@@ -658,6 +668,31 @@ involved, so this works inside the Docker image as well. A task's agent gets:
 quickest way to find out why an agent cannot see a path. A path that does not exist cannot be
 granted — orchestra warns about missing `$HOME`-relative paths rather than letting the agent hang.
 
+### other execution backends
+
+What an agent is allowed to do and how that is enforced are two separate things: a task's needs
+are described once, as a backend-neutral spec, and an *execution backend* renders it. `landrun` is
+the default and the one described above. `local` runs the agent with no confinement at all, for
+machines without Landlock — an agent under it can read and write everything the daemon can,
+orchestra's own credentials included, so it is opt-in and says so on every launch. `kubernetes`
+gives each task a pod on a cluster — one per task, reused for every command in it — and runs
+everything there — the repository's hooks, the agent,
+the validation script and its retries — with the checkout copied in when the task starts and back
+out when it ends → [running agents on a Kubernetes cluster](docs/kubernetes.md)
+
+```json
+{
+  "execution": {
+    "backend": "landrun"
+  }
+}
+```
+
+An unknown name, or a backend that cannot run on this machine, fails the task at the start with
+one line saying which — before the clone and the token, and without burning the retry budget.
+[docs/execution.md](docs/execution.md) describes the interface and what adding a backend that runs
+agents elsewhere (a container, a Kubernetes pod) involves.
+
 ## MCP tools
 
 The agent has access to the following tools via the built-in MCP server. `health`, `refresh_token`,
@@ -895,18 +930,32 @@ file:
 - `.orchestra/validation.sh` — run after each agent launch; non-zero exit triggers
   a retry
 - `.orchestra/after.sh` — run after the validation loop completes
-- `.orchestra/config.json` — validation settings:
+- `.orchestra/config.json` — validation settings, and the image the repository's tasks need:
 
 ```json
 {
   "validation": {
     "max_retries": 3,
     "retry_prompt": "Validation failed. Please fix the issues."
+  },
+  "execution": {
+    "image": "ghcr.io/acme/widgets-ci:latest"
   }
 }
 ```
 
 The failing script's output is available to the retry prompt as `{{validation_output}}`.
+
+The hooks run wherever the agent runs: on this machine under the default landrun backend, and
+inside the task's pod under the `kubernetes` one — `validation.sh` decides whether the agent is
+finished, so it has to see the tree the agent worked on and the toolchain that builds it.
+
+`execution.image` is how a repository says what it needs installed, for a backend that runs tasks
+in an image; the landrun backend ignores it, since what is installed on the daemon's machine is
+what is installed. It is an ordinary OCI reference, pulled by the cluster with the cluster's own
+credentials. An operator can pin a repository to an image of their choosing, restrict which
+registries a repository may name, or refuse repository-declared images entirely →
+[running agents on a Kubernetes cluster](docs/kubernetes.md).
 
 ## listeners
 

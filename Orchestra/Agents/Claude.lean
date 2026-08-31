@@ -23,17 +23,20 @@ def claude : AgentDef where
     --            container starts empty, so nothing could cache anything at all.
     homeRwx := [".elan", ".cache"]
   }
-  setupMcp port _ _ := do
+  setupMcp mcp _ _ := do
+    let (cmd, cmdArgs) := mcp.stdioCommand
     let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
       ("agent", Json.mkObj [
-        ("command", .str "nc"),
-        ("args", .arr #[.str "127.0.0.1", .str (toString port)])
+        ("command", .str cmd),
+        ("args", .arr (cmdArgs.map Json.str))
       ])
     ])]
     let ts ← uniqueToken
     let path := s!"/tmp/agent-mcp-{ts}.json"
     IO.FS.writeFile (System.FilePath.mk path) mcpConfig.compress
-    return (path, #[])
+    -- `--mcp-config` names this path, so it has to exist wherever the agent runs — which is not
+    -- this machine's `/tmp` under a backend that runs it elsewhere.
+    return (path, #[], #[{ path, access := .ro, from_ := .orchestra }])
   buildArgs mcpConfigPath pluginDirs subAgent model systemPrompt resume budget prompt := Id.run do
     let mut args : Array String := #[
       "--print", "--output-format=stream-json", "--verbose",
