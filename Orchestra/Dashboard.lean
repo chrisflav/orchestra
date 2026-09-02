@@ -656,9 +656,10 @@ private def maxWindowCount : Nat := 240
 /-- One rolled-up window. `isLatest` says whether it is the newest of its series, which is what
     `open` is mostly a question about.
 
-    `peakPercent` is what the window consumed and `percent` is where it last stood; on a closed
-    window the two usually agree, and on the one still open they say how much of it is already
-    gone.
+    `peakPercent` is the highest reading inside the window and `percent` is where it last
+    stood. They part company whenever the counter has come back down — which a rolling session
+    window does routinely — so a client drawing the window still filling wants `percent`, the
+    same number this source's `limits` report, and the peak as a mark rather than as the value.
 
     Open means "still filling", and that is a fact about the series rather than about the window
     alone: only the newest window of a series can be the one filling. Deciding it from the

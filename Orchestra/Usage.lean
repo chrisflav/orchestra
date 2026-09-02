@@ -388,11 +388,15 @@ structure Window where
       window is only ever seen through the polls that caught it. -/
   startEpoch  : Int := 0
   lastEpoch   : Int := 0
-  /-- The highest reading. Utilisation only climbs inside a window, so this is what the window
-      consumed — and it is the number that survives the reset, which the next poll reports as a
-      fresh low. -/
+  /-- The highest reading, which is what the window has been up to — and the number that
+      survives the reset, which the next poll reports as a fresh low.
+
+      Not the same as `lastPercent`, and not only at a rollover: a session window is a rolling
+      counter, so its reading falls again as usage ages out of it. A reader that shows one of
+      these where the other is meant reports a number the live limit no longer agrees with. -/
   peakPercent : Nat := 0
-  /-- The most recent reading. On the window still open, this is where it stands now. -/
+  /-- The most recent reading. On the window still open, this is where it stands now — the same
+      number the source's `limits` carry, since both come from the same poll. -/
   lastPercent : Nat := 0
   /-- How many polls this window was built from. One is a glimpse of a window rather than a
       measurement of it, and a reader is entitled to say so. -/

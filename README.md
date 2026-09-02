@@ -1182,7 +1182,11 @@ week that ran hot, an account that is always the one at 100%, or a load that is 
 spread the way the pool was meant to spread it are visible as a shape rather than assembled
 from a single percentage. The axis is the limit itself and never the data's own range — half
 height is half a window spent, in every chart on the page — and the bar still filling is drawn
-lighter, because its number is not final. That history has its own endpoint, `/api/v1/usage`,
+lighter, because its number is not final. A closed window is drawn at the peak it reached,
+which is what it consumed; the one still filling is drawn at where the source stands *now*, so
+it is the same number as the limit track above it, with a mark where its peak was. The two
+differ because the session window is a rolling counter that comes back down as usage ages out
+of it. That history has its own endpoint, `/api/v1/usage`,
 so it is readable by anything else too.
 
 ### the API

@@ -1042,6 +1042,26 @@ a.row:hover .row-title {
   height: 100%;
   display: flex;
   align-items: flex-end;
+  /* The peak mark is placed against this column, at the height the bar would have had. */
+  position: relative;
+}
+/* Where a bar has already been. Drawn only on the window still filling, whose counter can come
+   back down: the bar is where the source stands now — the number the tracks above report — and
+   this is the high-water mark that number no longer shows. */
+.chart-peak {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--strings);
+  opacity: 0.45;
+}
+.chart-peak.warn {
+  background: var(--brass);
+}
+.chart-peak.crit {
+  background: var(--perc);
 }
 .chart-bar {
   width: 100%;

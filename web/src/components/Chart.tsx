@@ -11,7 +11,11 @@
  * bury the shape it exists to show, so the figures live in the caption and on hover.
  */
 
-/** One window's consumption. `value` is a percentage of the limit, not of the other bars. */
+/**
+ * One window, as a bar. `value` is what the bar is drawn at — a percentage of the limit, not
+ * of the other bars — which is what a closed window consumed, and where the window still
+ * filling stands right now.
+ */
 export interface Bar {
   key: string;
   value: number;
@@ -19,6 +23,13 @@ export interface Bar {
   title: string;
   /** The window still filling. Its number is not final, and it is drawn as though unfinished. */
   open?: boolean;
+  /**
+   * The window's high-water mark, when the bar is drawn at something lower — which is the
+   * window still filling, drawn at where it stands now. Marked rather than drawn as the bar,
+   * because a counter that can fall has two numbers and only one of them is "how much is
+   * gone right now".
+   */
+  peak?: number;
 }
 
 /** The same three steps the limit tracks use, so a colour means one thing on this page. */
@@ -52,19 +63,21 @@ export function Bars({
     );
   }
 
-  const peak = bars.reduce((worst, bar) => Math.max(worst, bar.value), 0);
-  // The newest bar, named for what it is. Every bar is a window's consumption, so this is what
-  // the most recent window has cost — not where the source stands right now, which is the
-  // limit tracks' job and would be a different number on the window still filling.
-  const newest = bars[bars.length - 1]?.value ?? 0;
+  const peak = bars.reduce((worst, bar) => Math.max(worst, bar.peak ?? bar.value), 0);
+  // The newest bar, named for what it is. A closed window is what it cost; the one still
+  // filling is drawn at where the source stands now, so that it is the same number as the
+  // limit track above it rather than a second, higher one with no way to tell them apart.
+  const last = bars[bars.length - 1];
+  const newest = last?.value ?? 0;
+  const newestLabel = last?.open ? "now" : "newest";
 
   return (
     <div className="chart">
       <div className="chart-head">
         <span className="chart-title">{title}</span>
         <span className="chart-note">
-          {bars.length} {bars.length === 1 ? "window" : "windows"} · highest {peak}% · newest{" "}
-          {newest}%
+          {bars.length} {bars.length === 1 ? "window" : "windows"} · highest {peak}% ·{" "}
+          {newestLabel} {newest}%
         </span>
       </div>
       {/*
@@ -74,10 +87,21 @@ export function Bars({
       <div
         className="chart-plot"
         role="img"
-        aria-label={`${title}: ${bars.length} windows, highest ${peak} percent, newest ${newest} percent`}
+        aria-label={`${title}: ${bars.length} windows, highest ${peak} percent, ${newestLabel} ${newest} percent`}
       >
         {bars.map((bar) => (
           <div className="chart-col" key={bar.key} title={bar.title}>
+            {/*
+              The high-water mark of a bar drawn below it: the window still filling, whose
+              counter has come back down. Without it, redrawing that bar at the current
+              reading would lose what the window has already been up to.
+            */}
+            {bar.peak !== undefined && bar.peak > bar.value && (
+              <div
+                className={["chart-peak", fillOf(bar.peak)].filter(Boolean).join(" ")}
+                style={{ bottom: `${Math.max(2, Math.min(100, bar.peak))}%` }}
+              />
+            )}
             <div
               className={["chart-bar", fillOf(bar.value), bar.open ? "open" : ""]
                 .filter(Boolean)
