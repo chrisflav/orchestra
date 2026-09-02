@@ -156,6 +156,12 @@ task log can render a transcript. The envelope adds what the agent's own stream 
 turns, turn boundaries, and the daemon's notices — a crash, a usage limit, an interrupt, an idle
 reap.
 
+Not every line of the agent's stream becomes an event. The CLI narrates its own progress on the
+same pipe — a token counter emitted once per hundred tokens of reasoning, the slash commands it
+has loaded, the summaries it draws above its own input box — and none of that is anything the
+person in the conversation asked for. `StreamFormat.parseEvents` drops those lines, so what
+reaches the transcript is what was said.
+
 ## driving the agent
 
 One process per session, spawned once inside the sandbox and fed turns over stdin, rather than

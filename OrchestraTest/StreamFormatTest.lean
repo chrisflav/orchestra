@@ -165,3 +165,61 @@ def toolUseIdRoundTripsThroughJson : Test := do
   let j2 := Json.compress (ToJson.toJson noId)
   TestM.assert ((j2.splitOn "\"tool_use_id\":null").length == 2)
     (msg := s!"an absent id is null, not an omitted key; got {j2}")
+
+@[test]
+def theCliSProgressBookkeepingIsNotAnEvent : Test := do
+  -- Captured from `claude --print --output-format stream-json --verbose`, which emits one of
+  -- these per hundred tokens of reasoning. A turn that thinks for a minute produces hundreds,
+  -- and a chat transcript that keeps them is hundreds of lines reading "thinking_tokens" around
+  -- one paragraph of answer.
+  let thinkingTokens :=
+    r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":100,
+       "estimated_tokens_delta":100,"session_id":"s","uuid":"u"}"#
+  TestM.assertEqual (parseEvents thinkingTokens).size 0
+    (msg := "a thinking-token counter is not something the agent said")
+  -- These two land *after* the model's closing prose. Kept, they are what a view pinned to the
+  -- bottom of a conversation shows instead of the answer.
+  let postTurn :=
+    r#"{"type":"system","subtype":"post_turn_summary","summarizes_uuid":"u",
+       "status_category":"review_ready","status_detail":"done","needs_action":""}"#
+  TestM.assertEqual (parseEvents postTurn).size 0 (msg := "nor is a summary of the turn")
+  let taskSummary :=
+    r#"{"type":"system","subtype":"task_summary","detail":"Running python3 -c …"}"#
+  TestM.assertEqual (parseEvents taskSummary).size 0 (msg := "nor a label for the CLI's own UI")
+  let commands :=
+    r#"{"type":"system","subtype":"commands_changed","commands":[{"name":"compact"}]}"#
+  TestM.assertEqual (parseEvents commands).size 0
+    (msg := "nor the slash commands the CLI has loaded")
+
+@[test]
+def aSystemLineThatSaysSomethingSurvives : Test := do
+  -- The filter is a list of names, not "everything but init", because this is a `system` line
+  -- too and it is the only record that a tool was refused.
+  let denied :=
+    r#"{"type":"system","subtype":"permission_denied","tool_name":"Bash",
+       "tool_use_id":"toolu_01","message":"This command requires approval"}"#
+  match parseEvent denied with
+  | some (.system sub) => TestM.assertEqual sub "permission_denied" (msg := "kept, as itself")
+  | _ => TestM.fail "expected a system event"
+  -- And `init` is still lifted out of the `system` family, as it always was.
+  let init := r#"{"type":"system","subtype":"init","session_id":"abc","model":"claude-opus-5"}"#
+  match parseEvent init with
+  | some (.init sid model) => do
+    TestM.assertEqual sid "abc" (msg := "the session id the CLI settled on")
+    TestM.assertEqual model "claude-opus-5" (msg := "and the model it is running")
+  | _ => TestM.fail "expected an init event"
+
+@[test]
+def theCliSOwnStateIsNotAnEvent : Test := do
+  -- Two top-level line types this project has no rendering for; both would otherwise show up in
+  -- the middle of a conversation as `{"type":"unknown","event_type":"…"}`.
+  TestM.assertEqual (parseEvents r#"{"type":"active_goal","value":null}"#).size 0
+    (msg := "whether a /goal is set is not conversation")
+  TestM.assertEqual
+    (parseEvents r#"{"type":"autocompact_state","value":{"enabled":true}}"#).size 0
+    (msg := "nor is how close the context window is to compaction")
+  -- A type nobody has catalogued is still reported rather than dropped: a filter that swallows
+  -- everything it does not recognise is how a real event goes missing without a trace.
+  match parseEvent r#"{"type":"something_new_entirely"}"# with
+  | some (.unknown t) => TestM.assertEqual t "something_new_entirely" (msg := "still surfaced")
+  | _ => TestM.fail "expected an unknown event"

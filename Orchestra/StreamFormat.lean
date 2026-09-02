@@ -221,14 +221,42 @@ private def blockText (block : Json) : String :=
       else none
   | _ => ""
 
-/-- The line types that carry exactly one event. Split out so that `parseEvents` below reads as
-    the dispatch it is: the two interesting cases are the ones that do not answer one event. -/
+/-- `system` subtypes the CLI emits to drive its own status line rather than to say anything.
+
+    `thinking_tokens` is the loud one. It is a counter — one event per hundred tokens of
+    reasoning — so a turn that thinks for a minute arrives as dozens to hundreds of lines that
+    each say only the words "thinking tokens", and in a view that scrolls to its end they are
+    the whole of what is on screen. The answer they surround is still there; nobody can find it.
+    The other three are labels for chrome this project does not draw: the slash commands the CLI
+    has loaded, and the one-line summaries it puts above its own input box — the last of which
+    arrives *after* the model's closing prose, which is what puts the end of a conversation one
+    screen above its bottom.
+
+    Named rather than "every subtype but `init`", because a `system` line is also how the CLI
+    reports something going wrong — `permission_denied` names the tool it refused — and a reader
+    wants those. -/
+private def quietSystemSubtypes : Array String :=
+  #["thinking_tokens", "commands_changed", "task_summary", "post_turn_summary"]
+
+/-- Top-level line types carrying the CLI's own state rather than the conversation: whether a
+    `/goal` is set, and how close the context window is to being compacted.
+
+    Neither has a rendering anywhere in this project, so both would land in a log and in a chat
+    as `.unknown` — a JSON blob naming a type the reader has never heard of, between two things
+    the agent actually said. -/
+private def quietTypes : Array String :=
+  #["active_goal", "autocompact_state"]
+
+/-- The line types that carry at most one event. Split out so that `parseEvents` below reads as
+    the dispatch it is: the interesting case is the one that does not answer one event. -/
 private def parseSingle (line : String) (json : Json) : Option Event :=
   match jStr json "type" with
   | "system" =>
     let sub := jStr json "subtype"
     if sub == "init" then
       some (.init (jStr json "session_id") (jStr json "model"))
+    else if quietSystemSubtypes.contains sub then
+      none
     else
       some (.system sub)
   | "user" =>
@@ -272,7 +300,7 @@ private def parseSingle (line : String) (json : Json) : Option Event :=
   | "rate_limit_event" =>
     some (.rateLimit ((extractStringField line "resets_at").orElse fun _ =>
       extractStringField line "resetsAt"))
-  | other => some (.unknown other)
+  | other => if quietTypes.contains other then none else some (.unknown other)
 
 /-- Parse a stream-json event line into the typed events it carries.
 
