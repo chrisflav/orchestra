@@ -388,11 +388,22 @@ structure Window where
       window is only ever seen through the polls that caught it. -/
   startEpoch  : Int := 0
   lastEpoch   : Int := 0
-  /-- The highest reading. Utilisation only climbs inside a window, so this is what the window
-      consumed — and it is the number that survives the reset, which the next poll reports as a
-      fresh low. -/
+  /-- The highest reading, which is what the window has been up to — and the number that
+      survives the reset, which the next poll reports as a fresh low.
+
+      Not the same as `lastPercent` whenever a reading inside the window came back down. Why one
+      does is upstream's business and not visible from here — reconciled usage, a limit raised
+      under the account, a counter that ages usage out rather than emptying at its reset — so
+      the only safe reading of the pair is "the highest we saw" and "the last we saw". A reader
+      that shows one where the other is meant reports a number the live limit disagrees with. -/
   peakPercent : Nat := 0
-  /-- The most recent reading. On the window still open, this is where it stands now. -/
+  /-- The most recent reading: on the window still open, where the source stood at the poll that
+      last touched this window.
+
+      Normally that is the same poll whose limits `refresh` stored, so this is the number the
+      source's `limits` carry for the same window. It is not a guarantee: a poll that stops
+      reporting a window leaves the record here untouched while `limits` is replaced wholesale,
+      and a history write that fails leaves this one poll behind. -/
   lastPercent : Nat := 0
   /-- How many polls this window was built from. One is a glimpse of a window rather than a
       measurement of it, and a reader is entitled to say so. -/

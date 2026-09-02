@@ -1042,6 +1042,34 @@ a.row:hover .row-title {
   height: 100%;
   display: flex;
   align-items: flex-end;
+  /* The peak mark is placed against this column, at the height the bar would have had. */
+  position: relative;
+}
+/* Where a bar has already been. Drawn only on the window still filling, whose counter can come
+   back down: the bar is where the source stands now — the number the tracks above report — and
+   this is the high-water mark that number no longer shows. */
+.chart-peak {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  /* `bottom` places the mark's *bottom* edge, where `height` on a bar places its *top* one, so
+     the mark would sit its own height above the level it names — three points of a 62px axis,
+     and at 100% it would paint on the ceiling line rather than at it. This lands the top edge
+     on the level, which is where the bar of that height would end. */
+  margin-bottom: -2px;
+  border-radius: 1px;
+  background: var(--strings);
+  /* Not as faint as it looks it should be: the bar no longer carries the peak, so this line is
+     the only place it is visible without a hover, and below about 0.7 it stops reading at 2px
+     against the panel — dimmer than the bar it annotates, which is drawn at 0.55. */
+  opacity: 0.8;
+}
+.chart-peak.warn {
+  background: var(--brass);
+}
+.chart-peak.crit {
+  background: var(--perc);
 }
 .chart-bar {
   width: 100%;

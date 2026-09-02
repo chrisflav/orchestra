@@ -73,28 +73,42 @@ function Block({ block }: { block: UsageBlock }) {
 /**
  * A window as a bar.
  *
- * The peak is what the window consumed: utilisation only climbs inside one, so the highest
- * reading is the whole of it. The exact instants go in the hover line rather than under the
- * bars — sixty of them would be a wall of text where the shape is the thing being read.
+ * A *closed* window is drawn at its peak, which is what it consumed. The one still filling is
+ * drawn at where it stands now, because that is the number the limit tracks above report and a
+ * reader compares the two: a reading that came back down inside the window leaves the peak
+ * stuck above the live number, and two different figures for "this week", with nothing to say
+ * which is which, reads as a bug in the page rather than as the two facts it is. The peak it
+ * has already reached is kept as a mark above the bar, so nothing is lost by drawing the lower
+ * number.
+ *
+ * The exact instants go in the hover line rather than under the bars — sixty of them would be a
+ * wall of text where the shape is the thing being read.
  */
 function barsOf(windows: UsageWindow[]): Bar[] {
-  return windows.map((window) => ({
-    // Keyed by the series as well as the instant: one poll opens every window it reports at the
-    // same `startedAt`, so a kind and a scope are both part of what makes a window itself.
-    key: `${window.kind}:${window.scope ?? "*"}:${window.startedAt}`,
-    value: window.peakPercent,
-    ...(window.open ? { open: true } : {}),
-    title: [
-      window.startedAt,
-      `peak ${window.peakPercent}%`,
-      window.open ? "still filling" : null,
-      // A window built from one poll is a glimpse of it rather than a measurement, and the
-      // bar cannot say so on its own.
-      `${window.samples} ${window.samples === 1 ? "poll" : "polls"}`,
-    ]
-      .filter(Boolean)
-      .join(" · "),
-  }));
+  return windows.map((window) => {
+    const value = window.open ? window.percent : window.peakPercent;
+    return {
+      // Keyed by the series as well as the instant: one poll opens every window it reports at
+      // the same `startedAt`, so a kind and a scope are both part of what makes a window itself.
+      key: `${window.kind}:${window.scope ?? "*"}:${window.startedAt}`,
+      value,
+      ...(window.open ? { open: true } : {}),
+      ...(window.peakPercent > value ? { peak: window.peakPercent } : {}),
+      title: [
+        window.startedAt,
+        // Both numbers on the open window, named: "now" is what the tracks above show, "peak"
+        // is the mark on the bar, and a hover is where the difference between them is settled.
+        window.open ? `now ${window.percent}%` : null,
+        `peak ${window.peakPercent}%`,
+        window.open ? "still filling" : null,
+        // A window built from one poll is a glimpse of it rather than a measurement, and the
+        // bar cannot say so on its own.
+        `${window.samples} ${window.samples === 1 ? "poll" : "polls"}`,
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    };
+  });
 }
 
 /** The ends of the time axis. The open window is "now", which is what it is. */
