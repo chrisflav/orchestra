@@ -1184,9 +1184,9 @@ from a single percentage. The axis is the limit itself and never the data's own 
 height is half a window spent, in every chart on the page — and the bar still filling is drawn
 lighter, because its number is not final. A closed window is drawn at the peak it reached,
 which is what it consumed; the one still filling is drawn at where the source stands *now*, so
-it is the same number as the limit track above it, with a mark where its peak was. The two
-differ because the session window is a rolling counter that comes back down as usage ages out
-of it. That history has its own endpoint, `/api/v1/usage`,
+it is the same number as the limit track above it, with a mark where its peak was. The two are
+different numbers whenever a reading inside the window came back down — why upstream's figure
+falls is not something a poll can see, so the graph reports both rather than choosing. That history has its own endpoint, `/api/v1/usage`,
 so it is readable by anything else too.
 
 ### the API

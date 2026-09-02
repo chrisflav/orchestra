@@ -657,9 +657,16 @@ private def maxWindowCount : Nat := 240
     `open` is mostly a question about.
 
     `peakPercent` is the highest reading inside the window and `percent` is where it last
-    stood. They part company whenever the counter has come back down — which a rolling session
-    window does routinely — so a client drawing the window still filling wants `percent`, the
-    same number this source's `limits` report, and the peak as a mark rather than as the value.
+    stood. They part company whenever a reading inside the window came back down, so a client
+    drawing the window still filling wants `percent` — the number this source's `limits` carry
+    for that window, both being written by the same poll — and the peak as a mark rather than
+    as the value. Drawing the peak there instead reports a number the live limit disagrees
+    with, and the page has no way to say which of the two it is showing.
+
+    "Both from the same poll" is the ordinary case and not an invariant: a poll that stops
+    reporting a window replaces `limits` without touching the record here, and between a reset
+    and the poll that follows it this window is already closed while `limits` still describes
+    it.
 
     Open means "still filling", and that is a fact about the series rather than about the window
     alone: only the newest window of a series can be the one filling. Deciding it from the

@@ -330,9 +330,9 @@ export interface CancelResult {
  * One session or weekly limit window, rolled up from every poll that landed inside it.
  *
  * `peakPercent` is the highest reading inside the window and `percent` is where it last stood.
- * A session window is a rolling counter that comes back down as usage ages out of it, so the
- * two differ whenever the reading has fallen: the peak is what the window has been up to, and
- * `percent` is how much of it is gone right now — the number the source's limit tracks report.
+ * The two differ whenever a reading inside the window came back down: the peak is what the
+ * window has been up to, and `percent` is where the source stood at the poll that last touched
+ * it — the same poll the limit tracks are drawn from, so on the open window it is their number.
  */
 export interface UsageWindow {
   kind: string;

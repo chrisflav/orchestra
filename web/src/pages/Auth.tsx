@@ -75,11 +75,11 @@ function Block({ block }: { block: UsageBlock }) {
  *
  * A *closed* window is drawn at its peak, which is what it consumed. The one still filling is
  * drawn at where it stands now, because that is the number the limit tracks above report and a
- * reader compares the two: a session window is a rolling counter that comes back down as usage
- * ages out of it, so its peak and its current reading are routinely different — and two
- * different numbers for "this week", with nothing to say which is which, reads as a bug in the
- * page rather than as the two facts it is. The peak it has already reached is kept as a mark
- * above the bar, so nothing is lost by drawing the lower number.
+ * reader compares the two: a reading that came back down inside the window leaves the peak
+ * stuck above the live number, and two different figures for "this week", with nothing to say
+ * which is which, reads as a bug in the page rather than as the two facts it is. The peak it
+ * has already reached is kept as a mark above the bar, so nothing is lost by drawing the lower
+ * number.
  *
  * The exact instants go in the hover line rather than under the bars — sixty of them would be a
  * wall of text where the shape is the thing being read.
