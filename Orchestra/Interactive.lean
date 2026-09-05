@@ -409,7 +409,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       repo := some { upstream := record.upstream, fork }
       allowedTools := record.tools.getD allOptionalTools
       appId := appConfig.appId, privateKeyPath := appConfig.privateKeyPath
-      installationId := some installationId, pat := appConfig.pat
+      installationId := some installationId, pat := appConfig.patFor record.upstream
       agentBackend := backendName
     }
     shutdownRef.set (some shutdownMcp)

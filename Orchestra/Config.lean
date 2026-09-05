@@ -812,11 +812,105 @@ instance : FromJson InteractiveConfig where
       j.getObjValAs? Nat "idle_timeout_seconds" |>.toOption |>.getD 1800
     return { maxSessions, idleTimeoutSeconds }
 
+/-- A GitHub personal access token and the repositories it is the right token for.
+
+    Keyed by repository rather than named per task the way `AuthSource` is, because which PAT is
+    *correct* is a property of the repository and not a choice: an orchestra working across two
+    accounts has exactly one token that can see each, and no policy to make about which. Keying it
+    also reaches the dispatch paths that have no field to name a label in — `Listener.buildRoleEntry`
+    sets no candidates on a dispatched role, and a concert step's YAML has nowhere to write one —
+    which under a label scheme would quietly fall back to the wrong account on precisely the
+    repositories a second token was added for.
+
+    This covers only what a PAT does: pull requests against an upstream, reviews, comments, labels
+    and listener polling. Cloning, pushing, forking and merging go through GitHub App installation
+    tokens, so a repository in a new organisation still needs the App installed there (or a fork
+    into `default_organization`); a second PAT does not stand in for that. -/
+structure GitHubAuth where
+  /-- Name for this source. Diagnostics print the label; they never print the token. -/
+  label : String
+  /-- The personal access token. -/
+  token : String
+  /-- Repositories this token covers, as `owner/name`, `owner/*`, or `*`. -/
+  repos : List String
+deriving Repr, Inhabited
+
+/-- The reason `pattern` is not a usable repository pattern, or `none` if it is one.
+
+    Three forms and no more: `*`, `owner/*`, `owner/name`. Glob syntax beyond that is rejected
+    rather than approximated — a pattern that looks like it matches and does not routes a call to
+    the wrong account, and GitHub answers an unauthorised private repository with a 404, so the
+    symptom is "no such repository" rather than "wrong token". -/
+def repoPatternError? (pattern : String) : Option String :=
+  if pattern == "*" then none
+  else match pattern.splitOn "/" with
+    | [owner, name] =>
+      if owner.isEmpty || name.isEmpty then
+        some s!"'{pattern}' has an empty half; write 'owner/name', 'owner/*' or '*'"
+      else if owner == "*" then
+        some s!"'{pattern}' wildcards the owner; write '*' to cover every repository"
+      else if owner.contains '*' || (name != "*" && name.contains '*') then
+        some s!"'{pattern}' is not a supported pattern; write 'owner/name', 'owner/*' or '*'"
+      else none
+    | _ => some s!"'{pattern}' is not 'owner/name', 'owner/*' or '*'"
+
+/-- How specifically `pattern` matches `repo`, or `none` when it does not match.
+
+    Higher is more specific: an exact `owner/name` (2) beats `owner/*` (1) beats `*` (0), so an
+    exception written *below* the wildcard it excepts still wins and the file reads top-down.
+    Matching is case-insensitive, as GitHub's own owner and repository names are. -/
+def matchRepoPattern? (pattern : String) (repo : Repository) : Option Nat :=
+  let pat   := pattern.toLower
+  let owner := repo.owner.toLower
+  let name  := repo.name.toLower
+  if pat == "*" then some 0
+  else match pat.splitOn "/" with
+    | [o, "*"] => if o == owner then some 1 else none
+    | [o, n]   => if o == owner && n == name then some 2 else none
+    | _        => none
+
+/-- The specificity with which `src` covers `repo` — its best-matching pattern — or `none`. -/
+def GitHubAuth.matchScore (src : GitHubAuth) (repo : Repository) : Option Nat :=
+  src.repos.foldl (init := none) fun best p =>
+    match matchRepoPattern? p repo, best with
+    | none,   b      => b
+    | some s, none   => some s
+    | some s, some b => some (max s b)
+
+instance : FromJson GitHubAuth where
+  fromJson? j := do
+    let label ← j.getObjValAs? String "label"
+    let token ← j.getObjValAs? String "token"
+    let repos ← j.getObjValAs? (List String) "repos"
+    if label.isEmpty then
+      throw "a github.pats entry needs a non-empty 'label'"
+    if token.trimAscii.toString.isEmpty then
+      throw s!"github.pats entry '{label}' has an empty 'token'; remove the entry or fill it in"
+    -- An unresolved `{{key}}` is a secret that secrets.json does not define. Left alone it becomes
+    -- a token-shaped string authenticating as nobody, which GitHub reports as a 404 on every
+    -- repository the entry covers — indistinguishable from the repository not existing.
+    if (token.splitOn "{{").length > 1 then
+      throw s!"github.pats entry '{label}' still holds an unsubstituted placeholder; define it in \
+secrets.json"
+    if repos.isEmpty then
+      throw s!"github.pats entry '{label}' covers no repositories; give it at least one 'repos' \
+pattern"
+    for p in repos do
+      if let some e := repoPatternError? p then
+        throw s!"github.pats entry '{label}': {e}"
+    return { label, token, repos }
+
 structure AppConfig where
   appId : Nat
   privateKeyPath : String
   installationId : Option Nat := none
+  /-- The personal access token used wherever `patEntries` covers no repository: the single-token
+      install, and the fallback under a multi-token one. Read `AppConfig.patFor` rather than this
+      field — a call that reads it directly is a call that ignores the per-repository sources. -/
   pat : String := ""
+  /-- Per-repository personal access tokens, most specific match wins (`AppConfig.patFor`).
+      Empty is the ordinary single-token install, where every call falls back to `pat`. -/
+  patEntries : Array GitHubAuth := #[]
   pluginDirs : Array String := #[]
   /-- Long-lived Claude OAuth token set via `claude setup-token`.
       Exposed to the agent as `CLAUDE_CODE_OAUTH_TOKEN`. -/
@@ -863,6 +957,20 @@ instance : FromJson AppConfig where
       let gh ← j.getObjVal? "github"
       gh.getObjValAs? String "pat"
     ) |>.toOption |>.getD ""
+    -- Strict when present, for the reason spelled out at `agents` below: a dropped entry does not
+    -- fail, it silently routes that repository's pull requests, reviews and comments to whichever
+    -- account `github.pat` holds — and GitHub answers the resulting unauthorised read with a 404,
+    -- so the report is "no such repository" rather than "wrong token".
+    let patEntries ← match j.getObjVal? "github" >>= (·.getObjVal? "pats") with
+      | .error _ => pure #[]
+      | .ok v    => (FromJson.fromJson? v : Except String (Array GitHubAuth))
+    -- Labels name a source in diagnostics, and two sources answering to one name make those
+    -- diagnostics unreadable at exactly the moment they are being read.
+    for i in [:patEntries.size] do
+      for k in [:i] do
+        if patEntries[i]!.label == patEntries[k]!.label then
+          throw s!"github.pats has two entries labelled '{patEntries[i]!.label}'; labels must be \
+unique"
     let pluginDirs := j.getObjValAs? (Array String) "plugin_dirs" |>.toOption |>.getD #[]
     let claudeToken := j.getObjValAs? String "claude_token" |>.toOption
     let anthropicApiKey := j.getObjValAs? String "anthropic_api_key" |>.toOption
@@ -882,10 +990,46 @@ instance : FromJson AppConfig where
     let queue := j.getObjValAs? QueueConfig "queue" |>.toOption |>.getD {}
     let interactive := j.getObjValAs? InteractiveConfig "interactive" |>.toOption |>.getD {}
     let defaultOrganization := j.getObjValAs? String "default_organization" |>.toOption
-    return { appId, privateKeyPath, installationId, pat, pluginDirs,
+    return { appId, privateKeyPath, installationId, pat, patEntries, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
              agentAuthConfigs, additionalSandboxPaths, taxis, queue, interactive,
              defaultOrganization }
+
+/-- The configured PAT source covering `repo`, or `none` when only the global `github.pat` does.
+
+    The most specific match wins, and ties go to the entry written first, so a config reads
+    top-down: a broad `owner/*` line, then the individual repositories that are exceptions to it. -/
+def AppConfig.patSourceFor (cfg : AppConfig) (repo : Repository) : Option GitHubAuth :=
+  let winner := cfg.patEntries.foldl (init := (none : Option (GitHubAuth × Nat))) fun best src =>
+    match src.matchScore repo with
+    | none   => best
+    | some s => match best with
+      | none         => some (src, s)
+      | some (_, bs) => if s > bs then some (src, s) else best
+  winner.map (·.1)
+
+/-- The personal access token to authenticate calls about `repo` with.
+
+    Every path that reaches GitHub with a PAT already holds the repository it is acting on, so
+    this is what those call sites use in place of `cfg.pat`. Falls back to `cfg.pat` when no
+    source covers `repo`, which is the whole of a single-token install. -/
+def AppConfig.patFor (cfg : AppConfig) (repo : Repository) : String :=
+  match cfg.patSourceFor repo with
+  | some src => src.token
+  | none     => cfg.pat
+
+/-- Where `patFor` took `repo`'s token from, for diagnostics. Never the token itself. -/
+def AppConfig.patLabelFor (cfg : AppConfig) (repo : Repository) : String :=
+  match cfg.patSourceFor repo with
+  | some src => src.label
+  | none     => "github.pat"
+
+/-- One line per configured PAT source naming what it covers, for the daemon to log at startup.
+
+    Which token a repository resolves to is otherwise invisible until a call fails, and it fails
+    as a 404. Empty for a single-token install, which has nothing to disambiguate. -/
+def AppConfig.patCoverage (cfg : AppConfig) : Array String :=
+  cfg.patEntries.map fun src => s!"{src.label}: {", ".intercalate src.repos}"
 
 structure TaskFile where
   tasks : Array Task

@@ -229,6 +229,15 @@ def run (cfg : Config) : IO UInt32 := do
   if repairedRecords > 0 then
     IO.println s!"Marked {repairedRecords} stranded task record(s) unfinished."
   let appConfig ← loadAppConfig (cfg.configPath.map System.FilePath.mk)
+  -- Which PAT a repository resolves to is otherwise invisible until a call fails, and it fails as
+  -- a 404 — GitHub's answer for a private repository the token cannot see is the same as its
+  -- answer for one that does not exist. Printed once at startup so the mapping is on the record
+  -- before anything goes looking for it. Labels only; the tokens themselves are never logged.
+  unless appConfig.patCoverage.isEmpty do
+    IO.println s!"GitHub PAT sources ({appConfig.patCoverage.size}, most specific match wins; \
+anything uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" else "github.pat"}):"
+    for line in appConfig.patCoverage do
+      IO.println s!"  {line}"
   -- Concurrency limits: the `queue` block in config.json, overridden by the flags for a single
   -- run. Resolved here rather than at the top of the handler because it needs the config, and
   -- `max 1` because zero workers would be a daemon that silently never runs anything.
@@ -742,7 +751,8 @@ its workspace; it will start from a clean checkout."
             IO.println s!"  Listener '{name}': at its rate limit of {hit.describe}; \
 not polling until the window moves"
           else
-          let (events, processedIdsReplacement) ← Listener.pollSource liveCfg.source state appConfig.pat
+          let (events, processedIdsReplacement) ← Listener.pollSource liveCfg.source state
+            appConfig.patFor
             appConfig.authorizedUsers
           let dispatchesRef ← IO.mkRef state.dispatches
           -- Events this tick declined to handle because a ceiling was already full. They are
