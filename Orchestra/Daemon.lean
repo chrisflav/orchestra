@@ -233,10 +233,11 @@ def run (cfg : Config) : IO UInt32 := do
   -- a 404 — GitHub's answer for a private repository the token cannot see is the same as its
   -- answer for one that does not exist. Printed once at startup so the mapping is on the record
   -- before anything goes looking for it. Labels only; the tokens themselves are never logged.
-  unless appConfig.patCoverage.isEmpty do
-    IO.println s!"GitHub PAT sources ({appConfig.patCoverage.size}, most specific match wins; \
-anything uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" else "github.pat"}):"
-    for line in appConfig.patCoverage do
+  let patCoverage := appConfig.patCoverage
+  unless patCoverage.isEmpty do
+    IO.println s!"GitHub PAT sources ({patCoverage.size}, most specific match wins; anything \
+uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" else "github.pat"}):"
+    for line in patCoverage do
       IO.println s!"  {line}"
   -- Concurrency limits: the `queue` block in config.json, overridden by the flags for a single
   -- run. Resolved here rather than at the top of the handler because it needs the config, and

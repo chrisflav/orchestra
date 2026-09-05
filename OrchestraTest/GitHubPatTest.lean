@@ -105,11 +105,18 @@ def patFor_matchesRegardlessOfCase : Test := do
 
 @[test]
 def patFor_takesTheBestPatternWithinOneEntry : Test := do
-  -- An entry's `repos` is a list, and the entry's claim on a repository is its strongest one.
+  -- An entry's `repos` is a list, and the entry's claim on a repository is its strongest match,
+  -- not its first. Both of `["*", "acme/widgets"]` match, and the entry has to be scored on the
+  -- exact one: scored on `*` it would tie with the catch-all above and lose to it for being
+  -- written second, and `acme/widgets` — named as specifically as a config can name it — would
+  -- resolve to the wrong token.
   let c := cfg "global"
     #[ { label := "broad", token := "broad-tok", repos := ["*"] }
-     , { label := "work",  token := "work-tok",  repos := ["other/thing", "acme/widgets"] } ]
+     , { label := "work",  token := "work-tok",  repos := ["*", "acme/widgets"] } ]
   TestM.assertEqual (c.patFor (repo "acme" "widgets")) "work-tok"
+  -- And the entry is still only worth its best match elsewhere: on a repository it covers by the
+  -- catch-all alone, the tie goes to the entry written first.
+  TestM.assertEqual (c.patFor (repo "someone-else" "widgets")) "broad-tok"
 
 /-! ## Patterns
 
@@ -129,6 +136,29 @@ def patterns_partialGlobsAreRefused : Test := do
   TestM.assert (repoPatternError? "acme-*/widgets").isSome "a globbed owner is not supported"
   TestM.assert (repoPatternError? "acme/widget*").isSome "a globbed name is not supported"
   TestM.assert (repoPatternError? "*/widgets").isSome "wildcarding only the owner is not supported"
+
+@[test]
+def patterns_strayWhitespaceIsRefused : Test := do
+  -- What a wrapped JSON string or a stray keystroke leaves behind. No GitHub name can contain a
+  -- space, so a padded pattern is a typo — and one that would otherwise validate and then match
+  -- nothing, which is the same silent 404 the near-glob rejection exists to prevent.
+  TestM.assert (repoPatternError? " acme/*").isSome "a padded owner names no account"
+  TestM.assert (repoPatternError? "acme/widgets ").isSome "a padded name names no repository"
+  TestM.assert (repoPatternError? "acme /widgets").isSome "whitespace is not part of a name"
+
+@[test]
+def patterns_everyAcceptedPatternCanActuallyMatch : Test := do
+  -- The property that makes `repoPatternError?` a gate rather than a formality: what it accepts,
+  -- `matchRepoPattern?` understands. A pattern that passes validation and matches nothing routes
+  -- its repositories to the fallback token with nothing said.
+  let accepted := ["*", "acme/*", "acme/widgets", "a.b-c_d/x.y-z_1"]
+  for p in accepted do
+    TestM.assert (repoPatternError? p).isNone s!"'{p}' should be accepted"
+  TestM.assert (matchRepoPattern? "*" (repo "acme" "widgets")).isSome "'*' matches"
+  TestM.assert (matchRepoPattern? "acme/*" (repo "acme" "widgets")).isSome "'acme/*' matches"
+  TestM.assert (matchRepoPattern? "acme/widgets" (repo "acme" "widgets")).isSome "exact matches"
+  TestM.assert (matchRepoPattern? "a.b-c_d/x.y-z_1" (repo "a.b-c_d" "x.y-z_1")).isSome
+    "the punctuation GitHub allows in a name is matchable"
 
 @[test]
 def patterns_malformedSlugsAreRefused : Test := do

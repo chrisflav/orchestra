@@ -835,12 +835,22 @@ structure GitHubAuth where
   repos : List String
 deriving Repr, Inhabited
 
+/-- The characters GitHub allows in an owner or repository name. Anything else in a pattern half
+    — a `*` mistaken for a glob, or the stray whitespace a wrapped JSON string leaves behind —
+    cannot be part of a name, so it can only be a typo. -/
+private def validSlugChar (c : Char) : Bool :=
+  c.isAlphanum || c == '.' || c == '_' || c == '-'
+
 /-- The reason `pattern` is not a usable repository pattern, or `none` if it is one.
 
-    Three forms and no more: `*`, `owner/*`, `owner/name`. Glob syntax beyond that is rejected
-    rather than approximated — a pattern that looks like it matches and does not routes a call to
-    the wrong account, and GitHub answers an unauthorised private repository with a 404, so the
-    symptom is "no such repository" rather than "wrong token". -/
+    Three forms and no more: `*`, `owner/*`, `owner/name`. Anything else is rejected rather than
+    approximated — a pattern that looks like it matches and does not routes a call to the wrong
+    account, and GitHub answers an unauthorised private repository with a 404, so the symptom is
+    "no such repository" rather than "wrong token".
+
+    Every accepted pattern is one `matchRepoPattern?` can match, which is what makes this a gate
+    rather than a formality: a half that is not a possible GitHub name is refused here, so no
+    config can load holding a pattern that quietly covers nothing. -/
 def repoPatternError? (pattern : String) : Option String :=
   if pattern == "*" then none
   else match pattern.splitOn "/" with
@@ -849,8 +859,9 @@ def repoPatternError? (pattern : String) : Option String :=
         some s!"'{pattern}' has an empty half; write 'owner/name', 'owner/*' or '*'"
       else if owner == "*" then
         some s!"'{pattern}' wildcards the owner; write '*' to cover every repository"
-      else if owner.contains '*' || (name != "*" && name.contains '*') then
-        some s!"'{pattern}' is not a supported pattern; write 'owner/name', 'owner/*' or '*'"
+      else if !owner.all validSlugChar || (name != "*" && !name.all validSlugChar) then
+        some s!"'{pattern}' is not a supported pattern; write 'owner/name', 'owner/*' or '*', \
+with no wildcards inside a name and no spaces"
       else none
     | _ => some s!"'{pattern}' is not 'owner/name', 'owner/*' or '*'"
 

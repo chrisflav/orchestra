@@ -153,7 +153,7 @@ private def mcpServerHandler (p : Parsed) : IO UInt32 := do
     allowedTools := if allowPR then ["create_pr"] else []
     appId := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
-    pat := appConfig.pat
+    pat := appConfig.patFor upstream
     defaultOrganization := appConfig.defaultOrganization
   }
   let (port, _shutdown) ← Server.start serverState
@@ -1795,7 +1795,10 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     allowedTools
     appId          := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
-    pat            := appConfig.pat
+    -- As in `TaskRunner`: one session, one repository, so the token resolves once here. A
+    -- repository-independent session takes `github.pat`, which none of the tools it is left
+    -- holding can spend — `withoutRepoScopedTools` above has already withheld every one.
+    pat            := repo.map (fun r => appConfig.patFor r.upstream) |>.getD appConfig.pat
     agentBackend   := backendName
     defaultOrganization := appConfig.defaultOrganization
   }
