@@ -34,6 +34,10 @@ structure State where
       the config named no installation of its own, so there is no installation to pick — the
       `refresh_token` tool is then not offered. -/
   installationId : Option Nat
+  /-- The personal access token for this server's `repo`, already resolved by
+      `AppConfig.patFor` at construction — a server serves one task, and a task one repository,
+      so there is nothing left to choose between here. Empty means no source covered the
+      repository and `github.pat` is unset; the tools that need one say so and decline. -/
   pat : String
   /-- Input type of the current task. When not `.unit`, the `get_task_input` tool is exposed. -/
   inputType : ResultType := .unit
@@ -744,7 +748,8 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       if state.pat.isEmpty then
         log "tool create_pr: error: PAT not configured (target=upstream)"
         return toolContent
-          "github.pat not set in config (required when target=upstream; pass target=\"fork\" to use the App token)"
+          s!"no GitHub PAT for {repo.upstream}: github.pat is unset and no github.pats entry \
+covers it (required when target=upstream; pass target=\"fork\" to use the App token)"
           (isError := true)
       log s!"tool create_pr [upstream]: {repo.fork}:{head} -> {repo.upstream} base={base} title={repr title}"
       try
@@ -775,12 +780,13 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     if !state.allowedTools.contains "merge_pr" then
       log "tool merge_pr: denied (not in allowed tools)"
       return toolContent "merging pull requests is not enabled for this task" (isError := true)
+    let some repo := state.repo | return noRepo "merge_pr"
     if state.pat.isEmpty then
       log "tool merge_pr: error: PAT not configured"
       return toolContent
-        "github.pat not set in config (required to merge on the upstream repository)"
+        s!"no GitHub PAT for {repo.upstream}: github.pat is unset and no github.pats entry covers \
+it (required to merge on the upstream repository)"
         (isError := true)
-    let some repo := state.repo | return noRepo "merge_pr"
     log s!"tool merge_pr: {repo.upstream}#{prNumber} {method.flag} \
       delete_branch={deleteBranch}"
     try
@@ -794,12 +800,13 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     if !state.allowedTools.contains "label_issue" then
       log "tool label_issue: denied (not in allowed tools)"
       return toolContent "labelling issues is not enabled for this task" (isError := true)
+    let some repo := state.repo | return noRepo "label_issue"
     if state.pat.isEmpty then
       log "tool label_issue: error: PAT not configured"
       return toolContent
-        "github.pat not set in config (required to label on the upstream repository)"
+        s!"no GitHub PAT for {repo.upstream}: github.pat is unset and no github.pats entry covers \
+it (required to label on the upstream repository)"
         (isError := true)
-    let some repo := state.repo | return noRepo "label_issue"
     log s!"tool label_issue: {repo.upstream}#{issueNumber} \
       add=[{String.intercalate ", " add}] remove=[{String.intercalate ", " remove}]"
     try

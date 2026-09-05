@@ -278,11 +278,14 @@ private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
 /-- Run a triage task: add and/or remove labels on a GitHub issue or pull request.
     Skips the entire agent / sandbox / MCP path.
     Used when `ioTask.backend = some "triage"`. -/
-private def runTriage {i o : ResultType} (pat : String) (ioTask : IOTask i o)
+private def runTriage {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (initialRecord : TaskStore.TaskRecord) : IO Unit := do
   IO.println "  [triage] label backend"
   let some repo := ioTask.repo
     | throw (.userError "triage task has no repository; it labels an issue on the upstream one")
+  -- Resolved here rather than passed in: the repository the labels land on is this task's, and
+  -- it is not known until the line above.
+  let pat := appConfig.patFor repo.upstream
   let some issueNumber := ioTask.issueNumber
     | throw (.userError "triage task missing issue_number")
   let addLabels    := ioTask.triageAddLabels
@@ -604,7 +607,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- any repository work — it needs no checkout, and provisioning a clone slot for it would
   -- mean a full `git clone` plus fetch to change a label.
   if ioTask.backend == some "triage" then
-    runTriage appConfig.pat ioTask initialRecord
+    runTriage appConfig ioTask initialRecord
     return ((taskId, ← finalStatusOf taskId), none, none)
   -- Checked before anything is provisioned: the merger needs a checkout of the pull request's
   -- own repository, so a repository-independent one cannot be served by the scratch workspace
@@ -663,7 +666,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     appId := appConfig.appId
     privateKeyPath := appConfig.privateKeyPath
     installationId
-    pat := appConfig.pat
+    -- Resolved once, here, because the server serves one task and the task one repository. A
+    -- repository-independent task falls back to `github.pat`, which no tool it is granted can
+    -- spend: `withoutRepoScopedTools` above has already withheld every one that takes a PAT.
+    pat := ioTask.repo.map (fun r => appConfig.patFor r.upstream) |>.getD appConfig.pat
     inputType := i
     outputType := o
     inputJson

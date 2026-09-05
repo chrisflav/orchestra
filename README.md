@@ -91,7 +91,8 @@ You will also want a personal access token with repo scope. The two are not alte
 task mints an installation token from the App and gives it to `gh` for cloning and pushing, so
 without the App no task runs at all, while the PAT covers what an installation token cannot —
 pull requests against the *upstream* repository, issue comments, PR reviews, and the triage
-backend.
+backend. One PAT is enough until orchestra works across repositories no single token can see;
+then give it several → [per-repository PATs](#per-repository-pats).
 
 Inside the container (or VM), the following must be available (all installed
 automatically when using the provided container image):
@@ -192,7 +193,8 @@ and needs no writable fork at all.
 
 `installation_id` is optional; if omitted it is looked up automatically.
 `pat` is a personal access token used to create pull requests to the upstream
-repository. The agent itself never sees this token.
+repository. The agent itself never sees this token. When one token cannot see every repository
+orchestra works on, add `github.pats` beside it → [per-repository PATs](#per-repository-pats).
 
 `claude_token` is an optional long-lived Claude OAuth token. Claude login
 sessions lapse frequently; a stable token avoids repeated re-authentication.
@@ -262,6 +264,7 @@ configs — can live in `secrets.json` next to it:
 ```json
 {
   "github_pat": "github_pat_...",
+  "work_pat": "github_pat_...",
   "taxis_token": "..."
 }
 ```
@@ -269,6 +272,70 @@ configs — can live in `secrets.json` next to it:
 Every `{{key}}` occurrence in `config.json` and in listener configs is replaced with the
 corresponding value before the file is parsed, so `"pat": "{{github_pat}}"` works in either.
 The file is optional; when absent, nothing is substituted.
+
+A `{{key}}` that `secrets.json` does not define is left standing verbatim, which for most settings
+is a visible mistake. For a token it is not: the entry keeps a non-empty, token-shaped value that
+authenticates as nobody. `github.pats` therefore refuses to load an entry still holding one — see
+below for why that particular failure is worth catching early.
+
+## per-repository PATs
+
+One personal access token covers one account's repositories. When orchestra works across
+repositories that no single token can see — a personal account and an organisation, two
+organisations, a client's repository beside your own — name a token per repository in
+`github.pats`:
+
+```json
+{
+  "github": {
+    "pat": "{{github_pat}}",
+    "pats": [
+      { "label": "work",     "token": "{{work_pat}}",     "repos": ["acme/*", "acme-labs/tooling"] },
+      { "label": "consult",  "token": "{{consult_pat}}",  "repos": ["acme/client-work"] }
+    ]
+  }
+}
+```
+
+Each entry needs a unique `label` (used in diagnostics — orchestra never logs the token itself), a
+`token`, and the `repos` it covers. A pattern is `owner/name`, `owner/*`, or `*` for everything;
+matching is case-insensitive, as GitHub's own names are. Nothing else is a pattern — `acme-*/x`
+and `acme/widget*` are rejected at load rather than silently matching nothing.
+
+**The most specific match wins**, so a config reads top-down: the broad line for an account, then
+the individual repositories that are exceptions to it. Exact `owner/name` beats `owner/*` beats
+`*`, whichever order they are written in; two entries claiming the same repository at the same
+specificity resolve to the one written first. A repository no entry covers falls back to
+`github.pat`, so adding a second token cannot change where an existing repository's calls go.
+
+The token is resolved per repository at every point a PAT is spent: the MCP server's `create_pr`,
+`merge_pr`, `label_issue`, `comment` and `get_pr_comments`, the triage backend, and — per
+repository within a single tick — listener polling and the dispatchers' review classification. A
+listener's `repos` list may therefore span accounts. Because GitHub's rate limits are per token,
+splitting a busy listener across two also raises its ceiling; polling is the heaviest PAT consumer
+there is.
+
+Two things it deliberately does not do. It is not selected per task the way an agent
+[authentication source](#authentication-sources) is: which PAT is *correct* is a property of the
+repository, not a choice, and keying it by repository is what reaches the dispatch paths — a role
+dispatched by a listener, a concert step — that have nowhere to name a label and would otherwise
+fall back to the wrong account. And it does not extend the GitHub App: cloning, pushing, forking
+and merging all run on installation tokens, so a repository in a new organisation still needs the
+App installed there, or `default_organization` set so orchestra can fork into somewhere it can
+push.
+
+Get the mapping wrong and the symptom is misleading: GitHub answers a read a token is not
+entitled to with a **404**, the same answer it gives for a repository that does not exist. So a
+misrouted token reports "no such repository" on a repository that plainly exists. To keep that
+from happening quietly, a `pats` block that is present but unreadable fails the whole config
+rather than being skipped, entries with a blank token or an unsubstituted `{{secret}}` are
+refused, and `orchestrad` prints the coverage — labels and patterns, never tokens — at startup:
+
+```
+GitHub PAT sources (2, most specific match wins; anything uncovered falls back to github.pat):
+  work: acme/*, acme-labs/tooling
+  consult: acme/client-work
+```
 
 ## authentication sources
 

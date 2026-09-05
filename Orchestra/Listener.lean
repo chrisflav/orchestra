@@ -1236,7 +1236,7 @@ def latestReviewRequestsChanges (iid : Taxis.IssueId) : IO Bool := do
     lives here rather than in the pure selection. `isPrMerged` answers `false` when it cannot
     tell, so an unreachable GitHub queues a reviewer that finds nothing to do rather than
     silently dropping review of real work. -/
-def classifyReview (ghToken : String) (issues : Array Project.Issue) :
+def classifyReview (patFor : Repository → String) (issues : Array Project.Issue) :
     IO (Array (Project.Issue × ReviewDisposition)) := do
   let mut out : Array (Project.Issue × ReviewDisposition) := #[]
   for i in issues do
@@ -1244,7 +1244,9 @@ def classifyReview (ghToken : String) (issues : Array Project.Issue) :
     let mut anyUnmerged := false
     for pr in i.attachedPRs do
       unless anyUnmerged do
-        unless ← GitHub.isPrMerged ghToken pr.repo pr.number do anyUnmerged := true
+        -- Per pull request, not per call: the label dispatcher classifies across every project on
+        -- the tracker, so two PRs in one batch can sit in different accounts.
+        unless ← GitHub.isPrMerged (patFor pr.repo) pr.repo pr.number do anyUnmerged := true
     let requestsChanges ← if anyUnmerged then latestReviewRequestsChanges i.id else pure false
     out := out.push (i, dispositionOf anyUnmerged requestsChanges)
   return out
@@ -1341,8 +1343,14 @@ Returns a pair of:
 Event IDs for GitHub sources are prefixed with the upstream slug
 (e.g. `"my-account/orchestra:12345"`) so a single state file
 correctly deduplicates events across multiple repos.
+
+`patFor` is `AppConfig.patFor`: a listener's `repos` can span accounts, and a token is resolved
+per repository at the top of each loop rather than once for the source, so one listener can watch
+repositories no single PAT can see. Polling is also the heaviest PAT consumer there is — every
+tick, per repository — and GitHub's rate limits are per token, so splitting a source across two
+raises its ceiling as well as its reach.
 -/
-def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String)
+def pollSource (source : SourceConfig) (state : ListenerState) (patFor : Repository → String)
     (globalAuthorizedUsers : List String := [])
     : IO (Array (String × List (String × String)) × Option (Array String)) := do
   match source with
@@ -1352,6 +1360,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let labelParam := if labels.isEmpty then "" else "&labels=" ++ ",".intercalate labels
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       let endpoint := s!"/repos/{entry.upstream}/issues?state=open&per_page=100{labelParam}"
       let jsonOpt ← runGhApi endpoint ghToken
       match jsonOpt with
@@ -1387,6 +1396,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       -- Fetch open PRs
       let prJsonOpt ← runGhApi s!"/repos/{entry.upstream}/pulls?state=open&per_page=100" ghToken
       let prArr ← match prJsonOpt with
@@ -1449,6 +1459,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       -- Helper: extract an event from a comment JSON object, react with 🚀, return vars.
       -- `inline = true` handles inline PR review comments (different ID prefix, URL field, and
       -- reaction endpoint) vs regular issue/PR comments.
@@ -1573,7 +1584,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
       if e.projectId != some pid then continue
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
-    let classified ← classifyReview ghToken (← withAttachedPRs pid issues)
+    let classified ← classifyReview patFor (← withAttachedPRs pid issues)
     -- Narrowed here, where every issue in the project is in hand: whether a child or dependency
     -- has closed cannot be told from the workable set itself. The review split then takes the
     -- reviewer's issues back out of it, so no issue is offered to two roles in one tick.
@@ -1621,7 +1632,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     -- `work` and `reviewable` from two independent tests, so an issue that is both a dispatch
     -- candidate and carries a PR appears in both; the split below is what keeps one role from
     -- taking it out from under the other.
-    let classified ← classifyReview ghToken (sets.reviewable.map (·.1))
+    let classified ← classifyReview patFor (sets.reviewable.map (·.1))
     let (issues, reviewable) := splitForDispatch issues classified
     let reworking := classified.filter (·.2 == .changesRequested) |>.size
     let roles ← Project.loadGlobalRoles
@@ -1742,6 +1753,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
   | .githubLabelCount repos labels max kind => do
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       let labelParam := if labels.isEmpty then "" else "&labels=" ++ ",".intercalate labels
       let endpoint := s!"/repos/{entry.upstream}/issues?state=open&per_page=100{labelParam}"
       let jsonOpt ← runGhApi endpoint ghToken
@@ -1775,6 +1787,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     -- processedIds so that a label removal followed by re-application re-triggers).
     let mut currentIds : Array String := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       -- Collect candidate items. One query per label (OR logic); one unlabelled query if empty.
       let mut items : Array Json := #[]
       if labels.isEmpty then
