@@ -34,6 +34,13 @@ private def writeIdentity (name : String) (json : String) : IO Unit := do
     about, without pinning the whole sentence. -/
 private def mentions (hay needle : String) : Bool := (hay.splitOn needle).length > 1
 
+/-- Run `act` against `cfg` as the active taxis configuration, restoring whatever was there. -/
+private def withTaxisConfig (cfg : Taxis.Config) (act : IO α) : IO α := do
+  let previous ← Orchestra.Taxis.configRef.get
+  Orchestra.Taxis.setConfig (some cfg)
+  try act
+  finally Orchestra.Taxis.setConfig previous
+
 /-- Run `act`, returning either its result or the message it threw. -/
 private def outcomeOf (act : IO String) : IO String := do
   try act catch e => return toString e
@@ -200,16 +207,11 @@ def aTaskWithNoIdentityQueuesTasksWithNone : Test := do
     nothing else about where the write goes. -/
 @[test]
 def actingAsAnIdentitySwapsOnlyTheToken : Test := do
-  let (asInstance, asIdentity) ← do
-    let previous ← Orchestra.Taxis.configRef.get
-    Orchestra.Taxis.setConfig
-      (some { url := "http://taxis.example", token := some "instance-token" })
-    try
+  let (asInstance, asIdentity) ←
+    withTaxisConfig { url := "http://taxis.example", token := some "instance-token" } do
       let a ← Orchestra.Taxis.getConfigAs none
       let b ← Orchestra.Taxis.getConfigAs (some "identity-token")
       return ((a.url, a.token), (b.url, b.token))
-    finally
-      Orchestra.Taxis.setConfig previous
   TestM.assertEqual asInstance ("http://taxis.example", some "instance-token")
     (msg := "no identity: orchestra's own token")
   TestM.assertEqual asIdentity ("http://taxis.example", some "identity-token")
