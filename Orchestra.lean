@@ -9,6 +9,7 @@ import Orchestra.Agents.Opencode
 import Orchestra.Concert
 import Orchestra.Config
 import Orchestra.GitHub
+import Orchestra.Identity
 import Orchestra.Listener
 import Orchestra.Project
 import Orchestra.Queue

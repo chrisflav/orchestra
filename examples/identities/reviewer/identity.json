@@ -1,0 +1,4 @@
+{
+  "name": "reviewer",
+  "description": "Reviews the work other agents attach to an issue, and remembers what it has already asked for."
+}

@@ -71,6 +71,12 @@ structure TaskRecord where
   issueId       : Option Taxis.IssueId   := none
   /-- Optional role name. -/
   role          : Option String    := none
+  /-- The identity this run was performed under (`Orchestra.Identity`). Inherited by
+      continuations, which is what it is here for: a continuation built from this record is the
+      same work picked up again, and it has to be picked up by the same somebody. Also the only
+      thing that says, of a run that has since been pruned from the queue, who wrote the comments
+      it left on the tracker. -/
+  identity      : Option String    := none
 deriving Repr
 
 instance : ToJson TaskRecord where
@@ -97,6 +103,7 @@ instance : ToJson TaskRecord where
     let fields := if let some p := r.projectId   then fields ++ [("project_id",       ToJson.toJson p)]    else fields
     let fields := if let some i := r.issueId     then fields ++ [("issue_id",         ToJson.toJson i)]    else fields
     let fields := if let some s := r.role        then fields ++ [("role",             Json.str s)]         else fields
+    let fields := if let some s := r.identity    then fields ++ [("identity",         Json.str s)]         else fields
     Json.mkObj fields
 
 instance : FromJson TaskRecord where
@@ -121,9 +128,10 @@ instance : FromJson TaskRecord where
     let projectId     := j.getObjValAs? Taxis.IssueId "project_id" |>.toOption
     let issueId       := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
     let role          := j.getObjValAs? String    "role"       |>.toOption
+    let identity      := j.getObjValAs? String    "identity"   |>.toOption
     return { id, createdAt, repo, mode, prompt, goal, status, sessionId,
              continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority,
-             projectId, issueId, role }
+             projectId, issueId, role, identity }
 
 -- Directories
 

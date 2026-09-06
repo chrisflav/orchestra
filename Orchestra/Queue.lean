@@ -115,6 +115,12 @@ structure QueueEntry where
   budget        : Option Float  := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory        : MemoryMode    := .both
+  /-- The identity this entry is to be run under, by name (`Orchestra.Identity`).
+
+      Resolved when the entry runs rather than when it is queued, like `authSources` and for a
+      similar reason: an entry can wait hours for a slot, and the record is configuration that
+      may have been rewritten in between. -/
+  identity      : Option String := none
   /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`.
 
       Written back when the daemon resolves `authSources` at claim time, so the entry records
@@ -219,6 +225,7 @@ instance : ToJson QueueEntry where
     let fields := if let some s := e.configPath    then fields ++ [("config_path",     Json.str s)]      else fields
     let fields := if let some b := e.budget        then fields ++ [("budget",          ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson e.memory)]
+    let fields := if let some s := e.identity      then fields ++ [("identity",        Json.str s)]      else fields
     let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
     let fields := if !e.authSources.isEmpty        then fields ++ [("auth_sources",    ToJson.toJson e.authSources)] else fields
     let fields := if let some m := e.authMode      then fields ++ [("auth_mode",       ToJson.toJson m)]             else fields
@@ -264,6 +271,7 @@ instance : FromJson QueueEntry where
     let configPath    := j.getObjValAs? String "config_path"    |>.toOption
     let budget        := j.getObjValAs? Float      "budget"  |>.toOption
     let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
+    let identity      := j.getObjValAs? String "identity"    |>.toOption
     let authSource    := j.getObjValAs? String "auth_source" |>.toOption
     let authSources   := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
     let authMode      := j.getObjValAs? AuthMode "auth_mode" |>.toOption
@@ -294,7 +302,7 @@ instance : FromJson QueueEntry where
     let scopeRoot    := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
     return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
+             budget, memory, identity, authSource, authSources, authMode, tools, readOnly, priority,
              concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
              listenerName, spawnPolicy, spawnedBy, scopeRoot }

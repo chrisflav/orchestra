@@ -1281,6 +1281,7 @@
       "InteractiveSession": {
         "type": "object",
         "required": [
+          "identity",
           "id",
           "status",
           "createdAt",
@@ -1297,6 +1298,10 @@
           "error"
         ],
         "properties": {
+          "identity": {
+            "type": ["string", "null"],
+            "description": "The identity this session is held under: the name of a directory under `<config>/identities/`. Its memory is mounted for the agent, and where the record carries a taxis token, the session's tracker writes are recorded as coming from it rather than from orchestra."
+          },
           "id": {
             "type": "string"
           },
@@ -1366,6 +1371,7 @@
       "InteractiveSessionDetail": {
         "type": "object",
         "required": [
+          "identity",
           "id",
           "status",
           "createdAt",
@@ -1386,6 +1392,10 @@
           "resumedFrom"
         ],
         "properties": {
+          "identity": {
+            "type": ["string", "null"],
+            "description": "The identity this session is held under: the name of a directory under `<config>/identities/`. Its memory is mounted for the agent, and where the record carries a taxis token, the session's tracker writes are recorded as coming from it rather than from orchestra."
+          },
           "id": {
             "type": "string"
           },
@@ -1514,6 +1524,10 @@
           "resumeFrom": {
             "type": "string",
             "description": "Start this session by picking up the conversation another one was having. The old session is not revived; this is a new one that inherits its agent-side history. Checked as a session id: it becomes a directory name."
+          },
+          "identity": {
+            "type": "string",
+            "description": "Hold the session under this identity: the name of a directory under `<config>/identities/`. Its memory is mounted read-write for the agent, and where the record carries a taxis token, the session's tracker writes are recorded as coming from it. One that is not configured is a `400` naming the identities that are."
           }
         }
       },
@@ -1619,7 +1633,7 @@
       "QueueEntry": {
         "type": "object",
         "description": "Work waiting or running. Becomes a Task when it is claimed; `taskId` is that run.",
-        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy"],
+        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity"],
         "properties": {
           "id": { "type": "string" },
           "status": { "$ref": "#/components/schemas/QueueStatus" },
@@ -1634,7 +1648,8 @@
           "taskId": { "type": ["string", "null"], "description": "The run this entry became, once claimed." },
           "concertId": { "type": ["string", "null"] },
           "concertStepKey": { "type": ["string", "null"] },
-          "spawnedBy": { "type": ["string", "null"], "description": "The task that queued this entry with the `queue_task` tool, when one did. Without it an entry that appeared out of a running agent's turn is indistinguishable from one a person added." }
+          "spawnedBy": { "type": ["string", "null"], "description": "The task that queued this entry with the `queue_task` tool, when one did. Without it an entry that appeared out of a running agent's turn is indistinguishable from one a person added." },
+          "identity": { "type": ["string", "null"], "description": "The identity this entry is performed under: the name of a directory under `<config>/identities/`. It gives the run a memory of its own and, where the record carries a taxis token, makes the run's tracker writes come from that identity rather than from orchestra." }
         }
       },
       "Task": {

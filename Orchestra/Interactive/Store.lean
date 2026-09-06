@@ -127,6 +127,13 @@ structure SessionRecord where
   tools : Option (List String) := none
   /-- The system prompt appended at launch, for the same reason. -/
   systemPrompt : Option String := none
+  /-- The identity this session is held under, by name (`Orchestra.Identity`). `none` is the
+      instance itself.
+
+      On the record for the same reason `tools` is: a dormant session is woken from what is on
+      disk, and a conversation that came back as somebody else — writing to the tracker under a
+      different actor, against a different memory — would not be the same session. -/
+  identity : Option String := none
   turnCount : Nat := 0
   /-- Spend so far, as the agent reported it. -/
   costUsd : Float := 0.0
@@ -168,7 +175,8 @@ instance : ToJson SessionRecord where
     ("tools",          match r.tools with
                        | some ts => Json.arr (ts.map Json.str).toArray
                        | none    => Json.null),
-    ("systemPrompt",   optStr r.systemPrompt)
+    ("systemPrompt",   optStr r.systemPrompt),
+    ("identity",       optStr r.identity)
   ]
 
 instance : FromJson SessionRecord where
@@ -196,6 +204,7 @@ instance : FromJson SessionRecord where
       error          := j.getObjValAs? String "error"          |>.toOption
       tools          := j.getObjValAs? (List String) "tools"   |>.toOption
       systemPrompt   := j.getObjValAs? String "systemPrompt"   |>.toOption
+      identity       := j.getObjValAs? String "identity"       |>.toOption
     }
 
 /-- What a caller asks for when it starts a session.
@@ -216,6 +225,8 @@ structure SessionSpec where
       session whose agent died; the old session is not revived, this is a new one that inherits
       its transcript's agent-side history. -/
   resumeFrom : Option String := none
+  /-- The identity to hold the session under (`Orchestra.Identity`). `none` is the instance. -/
+  identity : Option String := none
 
 /-! ## The transcript -/
 

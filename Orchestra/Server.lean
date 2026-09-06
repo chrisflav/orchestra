@@ -3,6 +3,7 @@ import Std.Internal.UV.TCP
 import Std.Net
 import Orchestra.Config
 import Orchestra.GitHub
+import Orchestra.Identity
 import Orchestra.Project.Tools
 
 open Lean (Json)
@@ -84,6 +85,14 @@ structure State where
   /-- The subtree this task may write at or below, when it was queued with one. Plumbed to
       `Project.Tools.Env.scopeRoot`. -/
   scopeRoot : Option Taxis.IssueId := none
+  /-- The identity the running task is performed under, if any (`Orchestra.Identity`). Plumbed to
+      `Project.Tools.Env.identity`, which is what makes the issue tools write to taxis under the
+      identity's own token instead of the instance's.
+
+      A record rather than a name: the server serves one task, the identity was resolved when
+      that task started, and re-reading the configuration per tool call would let a run change
+      author halfway through. -/
+  identity : Option Identity.Identity := none
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
   prLabels : List String := []
@@ -968,7 +977,8 @@ created in; there is no other destination this tool will use)"
       , spawnPolicy     := state.spawnPolicy
       , spawnContext    := state.spawnContext
       , enqueueTask     := state.enqueueTask
-      , scopeRoot       := state.scopeRoot }
+      , scopeRoot       := state.scopeRoot
+      , identity        := state.identity }
     Project.Tools.evalProjectTool env call
   | .unknown name =>
     log s!"tool {name}: unknown"

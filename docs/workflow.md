@@ -59,6 +59,7 @@ steps:
       model: sonnet        # optional model override
       budget: 25           # optional max spend in USD (default: 4.0)
       read-only: true      # mount repo read-only (default: false)
+      identity: maintainer # optional identity to run this step under
       prompt: "Implement feature X."
 
       # Optional MCP tools for this step (default: none). See below.

@@ -487,7 +487,11 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     ("concertStepKey", optStr e.concertStepKey),
     -- Provenance for an entry an agent queued itself (`queue_task`): without it a task that
     -- appeared out of a running agent's turn is indistinguishable from one a person added.
-    ("spawnedBy",      optStr e.spawnedBy)
+    ("spawnedBy",      optStr e.spawnedBy),
+    -- Who the entry runs as (`Orchestra.Identity`). The same provenance question as `spawnedBy`,
+    -- asked of the tracker: an operator reading a comment signed by an identity needs to be able
+    -- to find the run that wrote it.
+    ("identity",       optStr e.identity)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
@@ -1179,7 +1183,10 @@ private def interactiveSummaryJson (r : Interactive.SessionRecord) : Json :=
     ("costUsd",        ToJson.toJson r.costUsd),
     ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
     ("title",          optStr r.title),
-    ("error",          optStr r.error)
+    ("error",          optStr r.error),
+    -- Who the session is being held as (`Orchestra.Identity`), so a list of conversations says
+    -- which of them are speaking on the tracker as somebody other than orchestra.
+    ("identity",       optStr r.identity)
   ]
 
 private def interactiveApi (p : Page) : IO Json := do
@@ -1206,7 +1213,8 @@ private def interactiveDetailApi (id : String) : IO (Option Json) := do
     ("costUsd",        ToJson.toJson r.costUsd),
     ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
     ("title",          optStr r.title),
-    ("error",          optStr r.error)
+    ("error",          optStr r.error),
+    ("identity",       optStr r.identity)
   ]
 
 /-- A page of the transcript, from a cursor.
@@ -1571,10 +1579,20 @@ private def startInteractive (body : String) : IO WriteResult := do
   for (what, part) in [("upstream owner", upstream.owner), ("upstream name", upstream.name),
                        ("fork owner", fork.owner), ("fork name", fork.name)] do
     if let .error e := Utils.checkConfigName what part then return .badRequest e
-  -- The one id in this feature that does not arrive as a path segment, and so is the one the
-  -- routing layer's `safeSegment` never sees. It becomes a directory name in the session store.
+  -- The two ids in this feature that do not arrive as a path segment, and so are the ones the
+  -- routing layer's `safeSegment` never sees. `resumeFrom` becomes a directory name in the
+  -- session store; `identity` becomes one under both `<config>/identities` and
+  -- `<data>/identities`.
+  --
+  -- The store refuses either on its own (`Utils.ensureConfigName`), so this is not what stops a
+  -- traversal. It is what makes the refusal a `400` naming the field, rather than a `409` — the
+  -- daemon reports a start failure as a conflict, and the sentence it carries for a bad name is
+  -- the store's, which quotes the daemon's absolute config path back at the caller.
   if let some resume := field "resumeFrom" then
     if let .error e := Utils.checkConfigName "resumeFrom session" resume then
+      return .badRequest e
+  if let some identity := field "identity" then
+    if let .error e := Utils.checkConfigName "identity" identity then
       return .badRequest e
   -- A ceiling on the one route that spends money. Everything else in this API is scrupulous
   -- about caps — `maxLimit`, `maxLogLimit`, `maxWindowCount` — precisely so one request cannot
@@ -1617,6 +1635,11 @@ private def startInteractive (body : String) : IO WriteResult := do
   -- invites a client to retry something that can never work.
   | .error why =>
     if (why.splitOn "cannot host an interactive session").length > 1 then
+      return .badRequest why
+    -- Same reasoning: an identity that is not configured is a request naming something that does
+    -- not exist, and no amount of retrying will make it. Matched on the sentence because that is
+    -- all the control socket carries back — see `Identity.requireIdentity`, which writes it.
+    if (why.splitOn "no identity named").length > 1 then
       return .badRequest why
     return .conflict why
   | .ok reply =>

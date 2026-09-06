@@ -5,6 +5,7 @@ import Orchestra.Agents.Opencode
 import Orchestra.Agents.Pi
 import Orchestra.Agents.Vibe
 import Orchestra.GitHub
+import Orchestra.Identity
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.Sandbox
@@ -180,6 +181,9 @@ by task {e.taskId}"
       , issueId := resolved.issueId
       -- Never a policy of its own: `queue_task` is one level deep, always (`Orchestra.Spawn`).
       , spawnPolicy := none
+      -- The spawning task's identity, which `SpawnPolicy.resolve` took from the context rather
+      -- than from anything the agent asked for.
+      , identity := resolved.identity
       , spawnedBy := some spawnerTaskId
       -- The queueing task's scope, not one derived from the bound issue (`Tools.writeScopeRoot`).
       , scopeRoot := resolved.scopeRoot }
@@ -202,7 +206,8 @@ by task {e.taskId}"
     request-changes review on the issue, which returns to the open pool. Skips the entire agent /
     sandbox / MCP path. Used when `ioTask.backend = some "merger"`. -/
 private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
-    (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord) : IO Unit := do
+    (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord)
+    (identity : Option Identity.Identity) : IO Unit := do
   IO.println "  [merger] merge backend"
   -- Bound only to be validated: the merger reaches the issue through `findIssue` below, but a
   -- task arriving here without a project is malformed and should say so rather than fail later
@@ -244,9 +249,13 @@ private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
     -- parked in a state nothing dispatches. Failing to record must not swallow the failure
     -- itself, hence the catch.
     try
+      -- Under the merger's own identity when it was given one. A merger dispatched by
+      -- `enqueueMergerImpl` never has one — orchestra queues that task itself, and the verdict is
+      -- orchestra's — but a merger a task file or a role names an identity for is that identity's
+      -- verdict, and it should be signed as such.
       Project.addComment iid
         s!"Validation failed for {prRef}, so it was not merged.\n\n```\n{validOutput}\n```"
-        (review := some .requestChanges)
+        (review := some .requestChanges) (asToken := identity.bind (·.taxisToken))
     catch e => IO.eprintln s!"  [merger] could not record the validation failure: {e}"
     let _ ← Project.forceRelease globalClaimManager iid
     TaskStore.saveTask { initialRecord with status := .failed }
@@ -361,7 +370,7 @@ private def resolveMemoryDirs (mode : MemoryMode) (upstream : Option Repository)
     that safe: two agents appending to a single `MEMORY.md` have no way to see each other's
     write, so the second one to save silently discards the first one's memory. Distinct files
     make concurrent writes disjoint, and reading the directory still reconstructs everything. -/
-private def memorySystemPrompt (memoryDirs : Array String) : Option String :=
+def memorySystemPrompt (memoryDirs : Array String) : Option String :=
   if memoryDirs.isEmpty then none
   else
     let bullet := fun d => s!"- {d}"
@@ -378,6 +387,53 @@ file another run created. Other tasks may be running against this same directory
 and they cannot see your edits — appending to one shared file means whichever agent saves \
 last silently erases what the others wrote. Correcting a memory you find to be wrong is \
 fine; do it by adding a file that supersedes it rather than editing that file in place."
+
+/-- The system-prompt section telling the agent who it is running as.
+
+    Placed before the memory section rather than folded into it, because the two say different
+    things: the memory section is about directories and how to write into them safely, this is
+    about a persistent someone whose memory one of those directories is, and whose name goes on
+    what the run leaves behind on the tracker. An agent told only "here is a directory" has no
+    reason to treat what it finds there as its own past work. -/
+def identitySystemPrompt (idn : Identity.Identity) (memoryDir : Option String) : String :=
+  let who := match idn.description with
+    | some d => s!"You are running as **{idn.name}**. {d}"
+    | none   => s!"You are running as **{idn.name}**."
+  let memory := match memoryDir with
+    | none   => ""
+    | some d => s!"\n\nThis identity outlives this run. Its memory is at `{d}` — listed among \
+the memory directories below, and the one directory there that belongs to this identity alone. \
+It is where the last run as this identity left what it learned, and the only memory that will \
+still be here the next time you run as it. Read it before you start."
+  -- Only when the identity has a token of its own. Without one the writes go out on orchestra's
+  -- token like any other task's, and telling the agent its name is on them would not be true.
+  let remote := if idn.taxisToken.isSome then
+      s!"\n\nWhat you write on the taxis tracker — comments, reviews, issues and context notes \
+— is recorded as coming from {idn.name}, not from orchestra. Write as somebody who will be \
+answering for it the next time this identity picks the work up."
+    else ""
+  s!"## Identity\n\n{who}{memory}{remote}"
+
+/-- The identity's own `AGENTS.md`, as a system-prompt section, or `none` when it has none.
+
+    Its own section rather than folded into `identitySystemPrompt`: that one is written by
+    orchestra and says what running as somebody means, this one is written by the operator and
+    says how this particular somebody works. Keeping them apart means the operator's file arrives
+    verbatim, under a heading naming whose it is, instead of interleaved with orchestra's prose.
+
+    It goes into the system prompt rather than into the checkout, where the agent's CLI would
+    find an `AGENTS.md` on its own. A repository may have one of its own — overwriting it would
+    be orchestra editing the project's instructions — and a file dropped into a working tree is
+    one more thing in `git status` for the agent to not commit. -/
+def identityInstructions (idn : Identity.Identity) : Option String :=
+  match idn.agents with
+  | none      => none
+  | some body =>
+    let body := body.trimAscii.toString
+    if body.isEmpty then none
+    else s!"## {idn.name}'s instructions\n\nThese are {idn.name}'s standing instructions, from \
+its own AGENTS.md. They hold for every run under this identity, and the task below is what this \
+particular run is for.\n\n{body}"
 
 /-- Derive the list of allowed optional tools from a task's `tools` and `mode` fields.
     If `tools` is `some list`, use it directly.
@@ -519,6 +575,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     projectId := ioTask.projectId
     issueId   := ioTask.issueId
     role      := ioTask.role
+    identity  := ioTask.identity
   }
   TaskStore.saveTask initialRecord
   onStart taskId
@@ -569,6 +626,15 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   match ioTask.goal with
   | some g => IO.println s!"  Goal:    {g}"
   | none   => pure ()
+  -- Resolved here, before a token is minted or a clone slot prepared, because a task naming an
+  -- identity that is not configured has to fail rather than fall through to running as the
+  -- instance — with orchestra's own tracker token and none of the memory the run was for
+  -- (`Orchestra.Identity`). Failing early also keeps a misconfigured role from spending a slot.
+  let identity : Option Identity.Identity ← match ioTask.identity with
+    | none      => pure none
+    | some name => some <$> Identity.requireIdentity name
+  if let some idn := identity then
+    IO.println s!"  Identity: {idn.name}"
   IO.println "  Prompt:"
   for line in ioTask.prompt.splitOn "\n" do
     IO.println s!"    {line}"
@@ -645,7 +711,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
   -- clone setup with all other backends but skips the MCP server and agent.
   if ioTask.backend == some "merger" then
-    runMerger token ioTask repoPath initialRecord
+    runMerger token ioTask repoPath initialRecord identity
     return ((taskId, ← finalStatusOf taskId), none, none)
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
@@ -684,6 +750,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     enqueueMerger   := some (enqueueMergerImpl appConfig)
     enqueueReviewer := some enqueueReviewerImpl
     spawnPolicy  := ioTask.spawnPolicy
+    -- What makes the issue tools write as this identity rather than as the instance. Resolved
+    -- above; the server holds the record so every tool call it serves reaches taxis the same way.
+    identity
     -- What an omitted field in a `queue_task` call inherits. `allowedTools` rather than the
     -- task's raw `tools`: it is the list the server actually granted, after the repository-scoped
     -- ones were withheld from a repository-independent task, so a queued task cannot inherit a
@@ -693,7 +762,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
                     , repo    := ioTask.repo.map (·.upstream)
                     , tools   := allowedTools
                     , readOnly := ioTask.readOnly
-                    , projectId := ioTask.projectId }
+                    , projectId := ioTask.projectId
+                    , identity := ioTask.identity }
     enqueueTask  := some (enqueueTaskImpl appConfig)
     scopeRoot    := ioTask.scopeRoot
     prLabels  := ioTask.prLabels
@@ -707,13 +777,25 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
   let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
   -- 5a. Resolve memory directories and amend system prompt
-  let memoryDirs ← resolveMemoryDirs ioTask.memory (ioTask.repo.map (·.upstream))
+  let sharedMemoryDirs ← resolveMemoryDirs ioTask.memory (ioTask.repo.map (·.upstream))
+  -- The identity's own memory is not selected by `memory`: that field chooses among the *shared*
+  -- memories, and an identity's is part of the identity rather than one of them (see
+  -- `Orchestra.Identity`). It is appended to the same array so it is mounted, described and
+  -- governed by the same one-file-per-memory convention as the rest.
+  let identityMemoryDir : Option String ← match identity with
+    | none     => pure none
+    | some idn => pure (some (← Identity.ensureMemoryDir idn.name).toString)
+  let memoryDirs := sharedMemoryDirs ++ identityMemoryDir.toArray
+  -- Ordered: what the operator wrote, then who the agent is, then the directories it may write
+  -- to — the identity section says the memory is its own, and the memory section that follows is
+  -- where that directory is actually listed.
+  let promptSections : List String :=
+    [ baseSystemPrompt
+    , identity.map (identitySystemPrompt · identityMemoryDir)
+    , identity.bind identityInstructions
+    , memorySystemPrompt memoryDirs ].filterMap id
   let systemPrompt :=
-    match baseSystemPrompt, memorySystemPrompt memoryDirs with
-    | none,    none    => none
-    | some sp, none    => some sp
-    | none,    some mp => some mp
-    | some sp, some mp => some (sp ++ "\n\n" ++ mp)
+    if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)
   -- 5b. Load prepend prompt and apply to task prompt
   let prependPrompt ← loadPrependPrompt ioTask.prependPrompt
   let baseTaskPrompt :=

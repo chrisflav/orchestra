@@ -65,6 +65,9 @@ It ships as two binaries. `orchestrad` is the backend — the queue daemon and t
 - **An autonomous project pipeline.** Projects and issues live in a
   [taxis](https://github.com/chrisflav/taxis) tracker; *roles* are task templates a dispatcher
   spawns as work appears, with claim locks so two agents never pick up the same issue.
+- **Persistent identities.** A task can be performed under a named identity: it gets a memory of
+  its own that carries across every run under that name, and — where the identity has a taxis
+  token — writes to the tracker as itself rather than as orchestra → [identities](#identities)
 - **Concert workflows**: YAML multi-step programs with typed step outputs, loops and conditionals.
 - **Per-repository hooks** for setup, validation and teardown, with an automatic retry loop when
   validation fails.
@@ -250,8 +253,8 @@ orchestra separates configuration from state:
 
 | Path | Contents |
 | --- | --- |
-| `$XDG_CONFIG_HOME/orchestra/` (or `~/.config/orchestra/`) | `config.json`, `secrets.json`, `prompts/`, `listeners/`, `roles/`, `skills/` |
-| `$XDG_DATA_HOME/orchestra/` (or `~/.local/share/orchestra/`) | clones, task records, queue entries, logs, per-project role overrides |
+| `$XDG_CONFIG_HOME/orchestra/` (or `~/.config/orchestra/`) | `config.json`, `secrets.json`, `prompts/`, `listeners/`, `roles/`, `skills/`, `identities/` |
+| `$XDG_DATA_HOME/orchestra/` (or `~/.local/share/orchestra/`) | clones, task records, queue entries, logs, per-project role overrides, per-identity memory |
 
 Installations predating this split keep everything in `~/.agent/`; that layout is still read, with
 a deprecation warning. `orchestra migrate` moves it into place.
@@ -637,8 +640,11 @@ Fields:
   `.md`); defaults to `default.md` if present
 - `budget` — maximum spend in USD (default `4.0`)
 - `read_only` — mount the clone read-only; used by review tasks
-- `memory` — which memory directories the agent may persist to: `"none"`, `"global"`,
+- `memory` — which shared memory directories the agent may persist to: `"none"`, `"global"`,
   `"project"`, or `"both"` (default)
+- `identity` — name of the [identity](#identities) this task is performed under. The task gets
+  that identity's own memory, and where the identity has a taxis token, its tracker writes are
+  recorded as coming from it. Naming one that is not configured fails the task
 - `priority` — queue priority, higher runs first (default `10`)
 - `series` — name of the series this run belongs to
 - `issue_number` — GitHub issue or PR the task was launched from; enables the `comment` tool
@@ -823,6 +829,141 @@ Skills are also editable through the API, which is the way to change one on a ma
 sitting at — see [configuration over the API](#configuration-over-the-api). A new or edited skill
 applies to tasks launched after the write; a task already running keeps the skills it started
 with.
+
+## identities
+
+An identity is a persistent someone for a task to be. A task, a role or a listener names one, and
+the run gets a memory that was there before it started — and, where the identity carries a taxis
+token, writes to the tracker as itself rather than as orchestra.
+
+An identity is a directory, because it is a bundle rather than a record:
+
+```
+~/.config/orchestra/identities/maintainer/
+├── identity.json      # who it is to orchestra
+└── AGENTS.md          # how it works — optional
+```
+
+```json
+// identity.json
+{
+  "name": "maintainer",
+  "description": "Keeps the tracker in order: triages what comes in and chases what has gone quiet.",
+  "taxis_token": "{{taxis_maintainer_token}}"
+}
+```
+
+| Field | |
+| --- | --- |
+| `name` | Must match the directory name. Every surface refers to the identity by it |
+| `description` | One or two sentences, shown to the agent as part of who it is |
+| `taxis_token` | API token for the taxis actor this identity is. Optional; `{{secret}}` placeholders are substituted from `secrets.json` |
+
+A `taxis_token` that is present but unusable — blank, not a string, or a `{{placeholder}}` no
+`secrets.json` defines — is refused when the record is read, naming the identity. Two of those
+would otherwise read as *no token*, and an identity with no token authors everything as orchestra:
+the run succeeds and the only way to notice is to look at who signed the comments.
+
+Name it from a task file, a role, or a listener's `action`:
+
+```json
+{ "prompt": "Triage what came in overnight.", "identity": "maintainer" }
+```
+
+A [concert step](docs/workflow.md) takes `identity:` the same way. An
+[interactive session](#interactive-sessions) takes one too, so a conversation you hold with an
+agent can be held as somebody in particular:
+
+```sh
+orchestra chat --upstream owner/repo --fork you/repo --identity maintainer
+```
+
+The identity is fixed for the session's life and is kept on its record, so a session that goes
+dormant and is woken later comes back as the same one. A session gets the identity's memory and
+no other: there is no `memory` field on a session to select the shared ones with.
+
+Naming an identity that is not configured fails the task, rather than running it as the instance:
+the fallback would use the wrong tracker actor and the wrong memory, and look like it had worked.
+
+### what an identity is, and is not
+
+A **role** says what a task does — its prompt, its tools, its model. An **identity** says who does
+it, and it is the half that accumulates: two tasks dispatched for the same role a week apart share
+nothing, while two tasks run under the same identity share everything the first one wrote down.
+
+An identity is **not a permission**. What a task may do is still its `tools`, and where it may
+write is still its project subtree; an identity narrows neither and widens neither. Per-identity
+permissions want an authorization service to hold them and are not here yet.
+
+An identity is **assigned, never chosen**. It is written in configuration, and `queue_task` has no
+field for it — a task queued by a task inherits the identity of the task that queued it, so an
+agent can pass its own on but cannot put on another one.
+
+### AGENTS.md
+
+`AGENTS.md` beside the record is the identity's standing instructions: how this one works, what
+it always checks, which conventions it holds itself to. It is the half of an identity that does
+not change from run to run — the task's prompt is the half that does.
+
+It reaches the agent as a section of its system prompt, under a heading naming whose instructions
+they are, with your file inside it unedited. Deliberately *not* written into the checkout, where
+the agent's CLI would find an `AGENTS.md` on its own: a repository may have one of its own, and
+overwriting it would be orchestra editing the project's instructions — quite apart from leaving a
+file in the working tree that the agent then has to remember not to commit. The repository's own
+`AGENTS.md` is read by the agent as usual; the identity's is added to it, not swapped for it.
+
+A blank file contributes nothing rather than an empty heading, and the whole system prompt is
+capped at 120 KB with a warning on stderr if it has to be cut — so an `AGENTS.md` the length of a
+manual is a thing you will hear about.
+
+`examples/identities/` ships two written out in full.
+
+### the memory
+
+Each identity gets `$XDG_DATA_HOME/orchestra/identities/<name>/memory/`, mounted read-write into
+the sandbox and named in the agent's system prompt as its own.
+
+It sits outside `<data>/memory/` on purpose. That directory *is* the global memory — a task whose
+`memory` is `global` or `both` is handed the root itself — so an identity's memory kept under it
+would be one every ordinary task could read and rewrite. For the same reason `"memory": "none"`
+does not switch it off: that field chooses among the shared memories, and an identity's own is
+part of the identity.
+
+The one-file-per-subject convention of [memory](#task-files) applies here too. Two tasks can run
+under one identity at the same time, and neither can see the other's edits.
+
+Worth knowing: memory directories are also passed to the agent as plugin directories, so a run can
+leave behind a skill that every later run under that identity loads as instructions. That is how
+shared memory has always worked; per-identity memory makes it durable and scoped to one name.
+
+### acting on the tracker
+
+With a `taxis_token`, everything the task's issue tools write — comments, reviews, issues created
+and updated, context notes, labels and assignees — goes out on that token, so taxis records the
+identity as the author. A reviewer identity's request-changes review is signed by the reviewer,
+and the next agent reading the thread can see who asked for what.
+
+Two things stay on orchestra's own token, deliberately:
+
+- **Claims.** `o-claimed` is orchestra's bookkeeping, written and read back by the daemon, and it
+  records a task id rather than an author. Keeping it on the instance token means a claim taken
+  under an identity whose token is later revoked is still one the daemon can release.
+- **GitHub.** Pull requests, comments and reviews on GitHub go out on the App installation token
+  and the configured PAT as before. A pull request an identity opens is opened by orchestra —
+  per-identity GitHub credentials are not part of this.
+
+Mint the token in taxis for an actor of its own (`POST /api/me/tokens` as that actor, or
+`POST /actors/:id/tokens` as an admin — see taxis's README). It needs no admin rights: orchestra
+creates the labels it maintains on its own token.
+
+**One known limit.** The token never enters the sandbox — nothing serializes it, no environment
+variable carries it, and the MCP server that spends it runs in the daemon. But the taxis client
+passes its bearer as a `curl` argument rather than through a config file, and `/proc` is mounted
+read-only in the sandbox, so an agent that watched `/proc/*/cmdline` while a tracker write was in
+flight could read it. That is true of orchestra's own taxis token and of the GitHub tokens today;
+it is a fix in the taxis client (orchestra's own `Utils.Http` already uses `curl -K -` for exactly
+this reason), not here. Do not treat an identity's token as a secret kept *from* the agent
+running as it.
 
 ## running tasks
 
@@ -1147,7 +1288,8 @@ reject, and the built-in `merger` backend lands the pull request. All of it is s
 issues created in the taxis UI behave exactly like ones created through the tools.
 
 A **role** (`<config>/roles/<name>.json`) is a reusable task template: backend, prompt template,
-tool permissions, and a dispatch policy. `examples/projects/roles/` ships `implementor`,
+tool permissions, a dispatch policy, and optionally the [identity](#identities) its agents are
+dispatched under. `examples/projects/roles/` ships `implementor`,
 `reviewer`, `planner` and `maintainer`. A `project-dispatcher` or `label-dispatcher` listener
 spawns them as work appears, up to per-role caps, taking a claim lock so no two agents land on the
 same issue.
@@ -1459,6 +1601,23 @@ orchestra chat --upstream owner/repo --fork your-org/repo --resume-from <id> --m
 ```
 
 It inherits the old session's history and is launched with the model it was given.
+
+A session can also be held under an [identity](#identities), which is how a conversation gets a
+memory that outlasts it:
+
+```sh
+orchestra chat --upstream owner/repo --fork your-org/repo --identity maintainer
+```
+
+The agent is told who it is, the identity's memory directory is mounted read-write, and where the
+identity carries a taxis token the session's tracker writes are recorded as coming from it. The
+record is read when the session starts or wakes, so a rotated token reaches it at its next wake
+rather than mid-conversation. Like
+the model it is a property of the session and lives on the record, so a dormant session wakes as
+the same identity — and, like the model, changing it means starting a new session that resumes the
+old. A session gets the identity's memory and no other: there is no `memory` field on a session to
+select the shared ones with. Naming an identity that is not configured is a `400` listing the ones
+that are, refused before a clone slot is taken.
 
 What a session may spend is chosen the same way, and is the whole conversation's budget rather
 than a turn's: `orchestra chat --budget <usd>`, or the box next to the model on the chat page.
