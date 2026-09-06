@@ -395,10 +395,28 @@ def deleteIssue (iid : Taxis.IssueId) : IO Unit := do
   let cfg ← Orchestra.Taxis.getConfig
   unwrap (← Orchestra.Taxis.deleteIssue cfg iid)
 
+/-! ### Writing as an identity
+
+Every function below that authors something on the tracker — an issue, a comment, a review, a
+context note, a label or assignee change — takes an `asToken`. It is the taxis token the write is
+made with, and `none`, the default, is orchestra's own: what every call site that has no identity
+in hand passes without saying so.
+
+An identity's token is threaded as an argument rather than parked in `Taxis.configRef` because
+the ref is process-wide and the daemon runs several tasks at once, each possibly as somebody
+different. Swapping it for the duration of a call would swap it underneath every other task
+running at that moment, and the failure would be an issue commented on by the wrong actor —
+invisible in the code and visible only in the tracker, weeks later.
+
+Reads are not scoped this way: who fetched an issue is not recorded anywhere, and a read made on
+orchestra's token is the same read. `statusLabelIds` and the claim machinery stay on the
+instance's token on purpose (`Orchestra.Identity`): both are orchestra's own bookkeeping, and one
+of them creates labels, which needs admin the identity has no reason to hold. -/
+
 def createIssue (projectId : Taxis.IssueId) (title description : String)
     (parentId : Option Taxis.IssueId := none) (target : Option RepoTarget := none)
-    (dependencies : Array Taxis.IssueId := #[]) : IO Issue := do
-  let cfg ← Orchestra.Taxis.getConfig
+    (dependencies : Array Taxis.IssueId := #[]) (asToken : Option String := none) : IO Issue := do
+  let cfg ← Orchestra.Taxis.getConfigAs asToken
   let ids ← statusLabelIds
   let metaFields : List (String × Json) :=
     (target.map fun t => [("target", ToJson.toJson t)] : Option _).getD []
@@ -417,8 +435,8 @@ def createIssue (projectId : Taxis.IssueId) (title description : String)
     the only mutation Orchestra ever performs on the set, so it gets its own entry point.
 
     Also does not change `parentId` — nothing in Orchestra re-parents an issue after creation. -/
-def saveIssue (i : Issue) : IO Unit := do
-  let cfg ← Orchestra.Taxis.getConfig
+def saveIssue (i : Issue) (asToken : Option String := none) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfigAs asToken
   let ids ← statusLabelIds
   -- Need the issue's current label set to only touch the status labels, not clobber any others.
   let raw ← unwrap (← Orchestra.Taxis.getIssue cfg i.id)
@@ -536,9 +554,9 @@ def planTaxisLabels (known : Array Orchestra.Taxis.Label)
     dispatcher offers it to a second worker. `saveIssue` has always had the same window; this
     widens it by adding a second writer that a triage role is meant to call regularly. Closing it
     needs optimistic concurrency in taxis, not a change here. -/
-def setIssueLabels (iid : Taxis.IssueId) (add remove : List String) :
-    IO Utils.Labels.LabelChange := do
-  let cfg ← Orchestra.Taxis.getConfig
+def setIssueLabels (iid : Taxis.IssueId) (add remove : List String)
+    (asToken : Option String := none) : IO Utils.Labels.LabelChange := do
+  let cfg ← Orchestra.Taxis.getConfigAs asToken
   let known ← unwrap (← Orchestra.Taxis.listLabels cfg)
   let raw ← unwrap (← Orchestra.Taxis.getIssue cfg iid)
   match planTaxisLabels known raw.labels add remove with
@@ -608,9 +626,9 @@ def planAssignees (known : Array Orchestra.Taxis.Actor)
 
 /-- Assign and unassign taxis actors on `iid`, reporting what changed. Writes nothing when the
     request is a no-op, for the reason `setIssueLabels` does not. -/
-def setIssueAssignees (iid : Taxis.IssueId) (add remove : List String) :
-    IO Utils.Labels.LabelChange := do
-  let cfg ← Orchestra.Taxis.getConfig
+def setIssueAssignees (iid : Taxis.IssueId) (add remove : List String)
+    (asToken : Option String := none) : IO Utils.Labels.LabelChange := do
+  let cfg ← Orchestra.Taxis.getConfigAs asToken
   let known ← unwrap (← Orchestra.Taxis.listActors cfg)
   let detail ← unwrap (← Orchestra.Taxis.getIssueDetail cfg iid)
   match planAssignees known (detail.assignedActors.map (·.id)) add remove with
@@ -1034,8 +1052,9 @@ are exposed to agents, not just to humans in the taxis UI. -/
     what makes it render as one in the taxis UI and count for review-request tracking; plain
     comments leave it `none`. -/
 def addComment (iid : Taxis.IssueId) (body : String)
-    (review : Option Orchestra.Taxis.ReviewState := none) : IO Unit := do
-  let cfg ← Orchestra.Taxis.getConfig
+    (review : Option Orchestra.Taxis.ReviewState := none) (asToken : Option String := none) :
+    IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfigAs asToken
   let _ ← unwrap (← Orchestra.Taxis.createComment cfg iid body (review := review))
 
 /-- An issue's comments, oldest first as taxis returns them. -/
@@ -1108,8 +1127,9 @@ private def contextPayload (title text : String) : Json :=
   Json.mkObj [("title", Json.str title), ("text", Json.str text)]
 
 /-- Attach a new context note to an issue. -/
-def attachContext (iid : Taxis.IssueId) (title text : String) : IO ContextNote := do
-  let cfg ← Orchestra.Taxis.getConfig
+def attachContext (iid : Taxis.IssueId) (title text : String) (asToken : Option String := none) :
+    IO ContextNote := do
+  let cfg ← Orchestra.Taxis.getConfigAs asToken
   let a ← unwrap (← Orchestra.Taxis.createArtifact cfg iid "context" (contextPayload title text))
   return { id := a.id, title, text }
 
@@ -1118,8 +1138,9 @@ def attachContext (iid : Taxis.IssueId) (title text : String) : IO ContextNote :
     In place rather than delete-then-create: the note is meant to be revised as it accumulates,
     and recreating it would renumber it, move it to the end of the rail, and record one edit as a
     removal plus an unrelated addition in the issue's activity log. -/
-def reviseContext (id : Orchestra.Taxis.ArtifactId) (title text : String) : IO Unit := do
-  let cfg ← Orchestra.Taxis.getConfig
+def reviseContext (id : Orchestra.Taxis.ArtifactId) (title text : String)
+    (asToken : Option String := none) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfigAs asToken
   let _ ← unwrap (← Orchestra.Taxis.updateArtifact cfg id (contextPayload title text)
     (kind := "context"))
 

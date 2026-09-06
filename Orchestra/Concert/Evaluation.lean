@@ -70,6 +70,7 @@ mutual
           model         := spec.model
           budget        := spec.budget
           memory        := spec.memory
+          identity      := spec.identity
           authSource    := spec.authSource
           tools         := spec.tools
           readOnly      := spec.readOnly

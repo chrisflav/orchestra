@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Orchestra.Project.Basic
+import Orchestra.Identity
 import Orchestra.Project.Claim
 import Orchestra.Spawn
 import Orchestra.TaskStore
@@ -709,6 +710,14 @@ structure Env where
   /-- The subtree this task may write at or below, when it was queued with one
       (`Config.IOTask.scopeRoot`). Overrides what `writeScopeRoot` would otherwise derive. -/
   scopeRoot : Option Taxis.IssueId := none
+  /-- The identity this task is performed under, if any (`Orchestra.Identity`). What it changes
+      here is authorship: with one, everything these tools write to the tracker is written with
+      the identity's own taxis token, so the comment, review, issue or note is recorded as coming
+      from it rather than from orchestra.
+
+      It is not a permission. Which tools this task holds is `allowedTools`, and which issues it
+      may write to is the scope above; an identity narrows neither and widens neither. -/
+  identity : Option Identity.Identity := none
 
 private def deny (perm : String) : String :=
   s!"this task is not authorized for the {perm} tool group"
@@ -768,6 +777,14 @@ private def refuseBlankNote (title text : String) : Option String :=
     shown before someone unfolds it"
   else if text.trimAscii.isEmpty then some "a context note needs text — there is nothing else to it"
   else none
+
+/-- The taxis token this task's tracker writes go out on: its identity's, when it has one with a
+    token of its own, and otherwise orchestra's (`Project.Basic`'s "Writing as an identity").
+
+    Read once per write rather than resolved anywhere central, so that a call site that authors
+    something and forgets it is a visible omission rather than a silent one. -/
+private def writeToken (env : Env) : Option String :=
+  env.identity.bind (·.taxisToken)
 
 private def has (env : Env) (perm : String) : Bool :=
   env.allowedTools.contains perm
@@ -886,7 +903,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       if (← findIssue parentId).isNone then
         return content s!"parent issue {parentId.toString} not found" (isError := true)
     let issue ← createIssue pid title descr (parentId := parent) (target := target)
-      (dependencies := dependencies)
+      (dependencies := dependencies) (asToken := writeToken env)
     return content s!"created issue {issue.id.toString} in project {pid.toString}"
   | .updateIssue iid title descr status target dependencies
       labelsAdd labelsRemove assigneesAdd assigneesRemove =>
@@ -912,7 +929,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
             target       := match target with | some t => some t | none => i.target
             dependencies := dependencies.getD i.dependencies
             updatedAt    := now }
-        saveIssue updated
+        saveIssue updated (asToken := writeToken env)
         done := done.push s!"updated issue {iid.toString}"
       -- After the field write, not before: `saveIssue` reconciles the status labels against the
       -- issue as taxis holds it, so a label delta applied first would be read back and rewritten
@@ -928,12 +945,13 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         content (joinLines (soFar ++ #[toString e])) (isError := true)
       unless labelsAdd.isEmpty && labelsRemove.isEmpty do
         try
-          let change ← setIssueLabels iid labelsAdd labelsRemove
+          let change ← setIssueLabels iid labelsAdd labelsRemove (asToken := writeToken env)
           done := done.push s!"labels: {change.summary iid.toString}"
         catch e => return failure done e
       unless assigneesAdd.isEmpty && assigneesRemove.isEmpty do
         try
           let change ← setIssueAssignees iid assigneesAdd assigneesRemove
+            (asToken := writeToken env)
           done := done.push s!"assignees: {change.summary iid.toString}"
         catch e => return failure done e
       if done.isEmpty then
@@ -1037,7 +1055,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
               (isError := true)
           -- No status change: an issue is under review because it has an unmerged PR attached,
           -- which is now true by virtue of the attach itself.
-          saveIssue { i with updatedAt := now }
+          saveIssue { i with updatedAt := now } (asToken := writeToken env)
           -- F1: if the project configures an auto-reviewer, enqueue it now.
           let reviewerNote ← match project.reviewer, env.enqueueReviewer with
             | some tmpl, some hook =>
@@ -1078,6 +1096,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           for spec in children do
             let issue ← createIssue project.id spec.title spec.description
               (parentId := some parentId) (target := spec.target <|> inheritedTarget)
+              (asToken := writeToken env)
             IO.println s!"  [mcp] split_issue: created sub-issue {issue.id.toString} \"{spec.title}\""
             createdIds := createdIds.push issue.id
           -- Clear the claim without touching status: the new children are open, which is what
@@ -1102,7 +1121,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
   | .commentIssue iid body =>
     if !(has env workIssuesPerm || has env reviewIssuesPerm) then
       return content (deny reviewIssuesPerm) (isError := true)
-    addComment iid body
+    addComment iid body (asToken := writeToken env)
     IO.println s!"  [mcp] comment_issue: {iid.toString}"
     return content s!"commented on issue {iid.toString}"
   -- ---------------- context notes (all three groups) ----------------
@@ -1119,7 +1138,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       return content msg (isError := true)
     if let some msg ← refuseOutsideScope env iid "add a context note there" then
       return content msg (isError := true)
-    let note ← attachContext iid title text
+    let note ← attachContext iid title text (asToken := writeToken env)
     IO.println s!"  [mcp] add_context: {iid.toString} note {note.id.val} — {note.title}"
     return content s!"context note {note.id.val} attached to issue {iid.toString}"
   | .updateContext iid cid title text =>
@@ -1136,7 +1155,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
     if !notes.any (·.id == cid) then
       return content s!"issue {iid.toString} has no context note {cid.val} — list_context \
         shows the ones it has" (isError := true)
-    reviseContext cid title text
+    reviseContext cid title text (asToken := writeToken env)
     IO.println s!"  [mcp] update_context: {iid.toString} note {cid.val}"
     return content s!"context note {cid.val} on issue {iid.toString} rewritten"
   -- ---------------- review_issues ----------------
@@ -1166,23 +1185,23 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
         -- The verdict belongs on the issue, not just in the tool response: the next worker to
         -- pick this up needs to know why it came back, and the response is seen only by this
         -- reviewer. Failing to record it must not fail the decision itself.
-        try addComment iid notes (review := some .requestChanges)
+        try addComment iid notes (review := some .requestChanges) (asToken := writeToken env)
         catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
         -- Move back to .open and clear any claim. Notes are echoed back; the
         -- comment tool is the right place to post them on the PR if desired.
         if let some mgr := env.claimManager then
           let _ ← release mgr project.id iid .open now
         else
-          saveIssue { i with status := .open, updatedAt := now }
+          saveIssue { i with status := .open, updatedAt := now } (asToken := writeToken env)
         IO.println s!"  [mcp] decide_issue: {iid.toString} moved to open"
         return content s!"rejected {iid.toString}: {notes}"
       | .complete =>
-        try addComment iid notes (review := some .approve)
+        try addComment iid notes (review := some .approve) (asToken := writeToken env)
         catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
         if let some mgr := env.claimManager then
           let _ ← release mgr project.id iid .completed now
         else
-          saveIssue { i with status := .completed, updatedAt := now }
+          saveIssue { i with status := .completed, updatedAt := now } (asToken := writeToken env)
         IO.println s!"  [mcp] decide_issue: {iid.toString} completed"
         return content s!"completed {iid.toString}: {notes}"
       | .approve =>
@@ -1196,7 +1215,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
             match ← hook project.id iid pr with
             | .error msg => return content s!"failed to enqueue merger: {msg}" (isError := true)
             | .ok mergerTaskId =>
-              try addComment iid notes (review := some .approve)
+              try addComment iid notes (review := some .approve) (asToken := writeToken env)
               catch e => IO.eprintln s!"  [mcp] decide_issue: could not record the review: {e}"
               IO.println s!"  [mcp] decide_issue: {iid.toString} approved; merger task {mergerTaskId} enqueued"
               return content

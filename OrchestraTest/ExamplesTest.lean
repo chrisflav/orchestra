@@ -62,4 +62,28 @@ def roleExamplesParse : Test := do
         | .error e => TestM.fail s!"{path}: does not decode as Role: {e}"
         | .ok _ => TestM.assert true
 
+/-- The example identities. `maintainer.json` carries its token as a `{{secret}}` placeholder,
+    which is how a real one should be written — so this also pins that an identity record with an
+    unsubstituted placeholder in it still decodes, since `loadIdentity` substitutes before
+    parsing and an example is read here without any secrets to substitute. -/
+@[test]
+def identityExamplesParse : Test := do
+  match ← jsonFilesIn (examplesDir / "identities") with
+  | none => TestM.fail s!"{examplesDir}/identities not found (wrong working directory?)"
+  | some files =>
+    TestM.assert (!files.isEmpty) "expected at least one identity example"
+    for path in files do
+      let raw ← IO.FS.readFile path
+      match Json.parse raw with
+      | .error e => TestM.fail s!"{path}: invalid JSON: {e}"
+      | .ok j =>
+        match (FromJson.fromJson? j : Except String Identity.Identity) with
+        | .error e => TestM.fail s!"{path}: does not decode as Identity: {e}"
+        | .ok identity =>
+          -- Named by its file, like a listener and for the same reason: an example copied into
+          -- an identities directory unrenamed would be refused by `loadIdentity`.
+          let stem := path.fileStem.getD ""
+          TestM.assertEqual identity.name stem
+            (msg := s!"{path}: the record names '{identity.name}'")
+
 end OrchestraTest.Examples

@@ -487,7 +487,11 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     ("concertStepKey", optStr e.concertStepKey),
     -- Provenance for an entry an agent queued itself (`queue_task`): without it a task that
     -- appeared out of a running agent's turn is indistinguishable from one a person added.
-    ("spawnedBy",      optStr e.spawnedBy)
+    ("spawnedBy",      optStr e.spawnedBy),
+    -- Who the entry runs as (`Orchestra.Identity`). The same provenance question as `spawnedBy`,
+    -- asked of the tracker: an operator reading a comment signed by an identity needs to be able
+    -- to find the run that wrote it.
+    ("identity",       optStr e.identity)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=

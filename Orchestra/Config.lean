@@ -525,6 +525,16 @@ structure IOTask (i o : ResultType) where
   budget : Option Float := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory : MemoryMode := .both
+  /-- The identity this task is performed under, by name (`Orchestra.Identity`). `none` — the
+      default — runs the task as the instance itself: orchestra's own taxis token, and no memory
+      beyond the shared ones `memory` selects.
+
+      Naming one that is not configured fails the task rather than falling back to `none`: the
+      fallback would run the work as the wrong actor, into the wrong memory, and look like it had
+      worked. Held as a name rather than a resolved record because a queue entry carrying one
+      may sit pending for hours, and the record it names is configuration that can change in the
+      meantime — the run should get the identity as it stands when it starts. -/
+  identity : Option String := none
   /-- Label of the authentication source to use for this task.
       Must match a label in the agent's `auth_sources` config. -/
   authSource : Option String := none
@@ -712,6 +722,7 @@ instance : FromJson Task where
     let model      := j.getObjValAs? String "model"          |>.toOption
     let budget     := j.getObjValAs? Float "budget"          |>.toOption
     let memory     := j.getObjValAs? MemoryMode "memory"     |>.toOption |>.getD .both
+    let identity   := j.getObjValAs? String "identity"       |>.toOption
     let authSource := j.getObjValAs? String "auth_source"    |>.toOption
     let authSources := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
     let authMode   := j.getObjValAs? AuthMode "auth_mode"    |>.toOption
@@ -731,7 +742,7 @@ instance : FromJson Task where
     let spawnPolicy ← parseSpawnPolicy? j
     let scopeRoot := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
     return { i, o, ioTask := { repo, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
-                                budget, memory, authSource, authSources, authMode, tools, readOnly,
+                                budget, memory, identity, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,
                                 triageAddLabels, triageRemoveLabels, spawnPolicy, scopeRoot } }

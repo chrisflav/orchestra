@@ -239,6 +239,13 @@ structure ActionConfig where
   budget         : Option Float  := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory         : MemoryMode    := .both
+  /-- The identity tasks queued by this listener are performed under, by name
+      (`Orchestra.Identity`). `none` runs them as the instance itself.
+
+      Not read by the two dispatcher sources, which build their entries from a role rather than
+      from this block (`buildRoleEntry`) and take the identity off the role — an identity belongs
+      with what the agent *is*, and for a dispatched role that is the role. -/
+  identity       : Option String := none
   /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
   authSource     : Option String := none
   /-- Candidate authentication sources for tasks this listener queues, tried per `authMode`.
@@ -292,6 +299,7 @@ instance : ToJson ActionConfig where
     let fields := if let some s := a.systemPrompt then fields ++ [("system_prompt", Json.str s)]      else fields
     let fields := if let some b := a.budget       then fields ++ [("budget",        ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson a.memory)]
+    let fields := if let some s := a.identity     then fields ++ [("identity",      Json.str s)]      else fields
     let fields := if let some s := a.authSource   then fields ++ [("auth_source",   Json.str s)]      else fields
     let fields := if !a.authSources.isEmpty       then fields ++ [("auth_sources",  ToJson.toJson a.authSources)] else fields
     let fields := if let some m := a.authMode     then fields ++ [("auth_mode",     ToJson.toJson m)]             else fields
@@ -328,6 +336,7 @@ instance : FromJson ActionConfig where
           | _ => none
       | _ => none
     let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
+    let identity := j.getObjValAs? String "identity" |>.toOption
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
     let authSources := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
     let authMode := j.getObjValAs? AuthMode "auth_mode" |>.toOption
@@ -341,7 +350,7 @@ instance : FromJson ActionConfig where
     -- a swallowed policy takes the tool away without saying so.
     let spawnPolicy ← parseSpawnPolicy? j
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
+             budget, memory, identity, authSource, authSources, authMode, tools, readOnly, priority,
              workflowPath, issueNumber, prLabels, spawnPolicy }
 
 -- Dispatch rate limits
@@ -873,6 +882,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
     series
     budget       := action.budget
     memory       := action.memory
+    identity     := action.identity
     authSource   := action.authSource
     authSources  := action.authSources
     authMode     := action.authMode
@@ -1328,6 +1338,7 @@ def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : P
     , projectId     := some project.id
     , issueId       := issue?.map (·.id)
     , spawnPolicy   := role.spawnPolicy
+    , identity      := role.identity
     , role          := some role.name }
 
 -- Source polling

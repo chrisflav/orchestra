@@ -551,6 +551,7 @@ its workspace; it will start from a clean checkout."
         model            := entry.model
         budget           := entry.budget
         memory           := entry.memory
+        identity         := entry.identity
         authSource       := entry.authSource
         authSources      := entry.authSources
         authMode         := entry.authMode
