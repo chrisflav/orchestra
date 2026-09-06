@@ -408,10 +408,17 @@ different. Swapping it for the duration of a call would swap it underneath every
 running at that moment, and the failure would be an issue commented on by the wrong actor —
 invisible in the code and visible only in the tracker, weeks later.
 
-Reads are not scoped this way: who fetched an issue is not recorded anywhere, and a read made on
-orchestra's token is the same read. `statusLabelIds` and the claim machinery stay on the
-instance's token on purpose (`Orchestra.Identity`): both are orchestra's own bookkeeping, and one
-of them creates labels, which needs admin the identity has no reason to hold. -/
+Standalone reads do not take one: who fetched an issue is not recorded anywhere, and a read made
+on orchestra's token is the same read. The reads *inside* these functions are a different matter —
+`saveIssue` re-reads the issue's labels, `setIssueLabels` lists the tracker's — and those go out
+on `asToken` along with the write they belong to. That is deliberate: one call, one actor, so a
+write cannot succeed against a set of labels the writer was not allowed to see. It does mean an
+identity's token needs read access to what it writes to, which is what taxis gives an ordinary
+actor anyway.
+
+`statusLabelIds` and the claim machinery stay on the instance's token on purpose
+(`Orchestra.Identity`): both are orchestra's own bookkeeping, and one of them creates labels,
+which needs admin the identity has no reason to hold. -/
 
 def createIssue (projectId : Taxis.IssueId) (title description : String)
     (parentId : Option Taxis.IssueId := none) (target : Option RepoTarget := none)
@@ -673,8 +680,8 @@ def listActorSummaries : IO (Array (String × String × Bool)) := do
     which `PRRef.toJson` alone doesn't produce — `prRefArtifactPayload` adds it on write, and
     `FromJson PRRef` still round-trips the result on read since `repo`/`number`/`branch`/
     `task_id` are included too. -/
-def attachPR (iid : Taxis.IssueId) (pr : PRRef) : IO Unit := do
-  let cfg ← Orchestra.Taxis.getConfig
+def attachPR (iid : Taxis.IssueId) (pr : PRRef) (asToken : Option String := none) : IO Unit := do
+  let cfg ← Orchestra.Taxis.getConfigAs asToken
   let _ ← unwrap (← Orchestra.Taxis.createArtifact cfg iid "github-pr" (prRefArtifactPayload pr))
 
 def loadIssue (pid : Taxis.IssueId) (iid : Taxis.IssueId) : IO (Option Issue) := do

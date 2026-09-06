@@ -101,7 +101,18 @@ structure Identity where
       its own `AGENTS.md` and orchestra has no business overwriting it, or leaving a file in a
       working tree that the agent would then have to remember not to commit. -/
   agents : Option String := none
-deriving Repr, Inhabited
+deriving Inhabited
+
+/-- Hand-written so the token cannot be printed. `deriving Repr` would put it in whatever a
+    `s!"{repr identity}"` in a debug line goes to, which for the daemon is its log — undoing, in
+    one line somebody adds in a hurry, what the `ToJson` instance below is careful about. The
+    fields worth seeing in a debug print are the name and whether there is a token at all. -/
+instance : Repr Identity where
+  reprPrec i _ :=
+    let described := if i.description.isSome then "described" else "no description"
+    let token     := if i.taxisToken.isSome then "token <redacted>" else "no token"
+    let agents    := if i.agents.isSome then "AGENTS.md" else "no AGENTS.md"
+    f!"identity {i.name} ({described}, {token}, {agents})"
 
 instance : ToJson Identity where
   toJson i :=
@@ -121,7 +132,32 @@ instance : FromJson Identity where
   fromJson? j := do
     let name        ← j.getObjValAs? String "name"
     let description := j.getObjValAs? String "description" |>.toOption
-    let taxisToken  := j.getObjValAs? String "taxis_token"  |>.toOption
+    -- Strict where the fields above are lenient, and held to the same three rules
+    -- `github.pats` entries are (`Config.GitHubAuth`), because the failure is the same shape: a
+    -- token that is present but not a usable one authenticates as nobody, and every write the
+    -- identity makes is refused by taxis at the far end of a run that has already been paid for.
+    --
+    -- The silent cases are the ones worth refusing. A number, or the field misspelled as
+    -- `taxisToken` — the name the Lean field carries, so a plausible typo — reads as *no token*,
+    -- and an identity with no token quietly authors everything as orchestra: the run succeeds,
+    -- and the only way to notice is to look at who signed the comments.
+    let taxisToken ← match j.getObjVal? "taxis_token" with
+      | .error _ => pure none
+      | .ok v    =>
+        match (FromJson.fromJson? v : Except String String) with
+        | .error _ => throw s!"identity '{name}': 'taxis_token' must be a string"
+        | .ok t =>
+          if t.trimAscii.toString.isEmpty then
+            throw s!"identity '{name}' has an empty 'taxis_token'; remove the field to act as \
+orchestra, or fill it in"
+          -- An unresolved `{{key}}` is a secret that secrets.json does not define. Left alone it
+          -- becomes a bearer token authenticating as nobody, which taxis answers with a 401 —
+          -- and `decide_issue` records a failed comment as one stderr line and completes the
+          -- issue anyway, so the reviewer's verdict is simply lost.
+          else if (t.splitOn "{{").length > 1 then
+            throw s!"identity '{name}' still holds an unsubstituted placeholder in \
+'taxis_token'; define it in secrets.json"
+          else pure (some t)
     return { name, description, taxisToken }
 
 /-! ## Filesystem layout -/

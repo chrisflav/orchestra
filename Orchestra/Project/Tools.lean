@@ -1049,7 +1049,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
           -- Attach first: if this fails the issue stays claimed rather than looking review-ready
           -- with no PR to review.
           try
-            attachPR iid pr
+            attachPR iid pr (asToken := writeToken env)
           catch e =>
             return content s!"failed to attach {repo}#{number} to {iid.toString}: {e}"
               (isError := true)

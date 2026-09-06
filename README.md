@@ -859,13 +859,19 @@ An identity is a directory, because it is a bundle rather than a record:
 | `description` | One or two sentences, shown to the agent as part of who it is |
 | `taxis_token` | API token for the taxis actor this identity is. Optional; `{{secret}}` placeholders are substituted from `secrets.json` |
 
+A `taxis_token` that is present but unusable — blank, not a string, or a `{{placeholder}}` no
+`secrets.json` defines — is refused when the record is read, naming the identity. Two of those
+would otherwise read as *no token*, and an identity with no token authors everything as orchestra:
+the run succeeds and the only way to notice is to look at who signed the comments.
+
 Name it from a task file, a role, or a listener's `action`:
 
 ```json
 { "prompt": "Triage what came in overnight.", "identity": "maintainer" }
 ```
 
-An [interactive session](#interactive-sessions) takes one too, so a conversation you hold with an
+A [concert step](docs/workflow.md) takes `identity:` the same way. An
+[interactive session](#interactive-sessions) takes one too, so a conversation you hold with an
 agent can be held as somebody in particular:
 
 ```sh
@@ -926,6 +932,10 @@ part of the identity.
 The one-file-per-subject convention of [memory](#task-files) applies here too. Two tasks can run
 under one identity at the same time, and neither can see the other's edits.
 
+Worth knowing: memory directories are also passed to the agent as plugin directories, so a run can
+leave behind a skill that every later run under that identity loads as instructions. That is how
+shared memory has always worked; per-identity memory makes it durable and scoped to one name.
+
 ### acting on the tracker
 
 With a `taxis_token`, everything the task's issue tools write — comments, reviews, issues created
@@ -945,6 +955,15 @@ Two things stay on orchestra's own token, deliberately:
 Mint the token in taxis for an actor of its own (`POST /api/me/tokens` as that actor, or
 `POST /actors/:id/tokens` as an admin — see taxis's README). It needs no admin rights: orchestra
 creates the labels it maintains on its own token.
+
+**One known limit.** The token never enters the sandbox — nothing serializes it, no environment
+variable carries it, and the MCP server that spends it runs in the daemon. But the taxis client
+passes its bearer as a `curl` argument rather than through a config file, and `/proc` is mounted
+read-only in the sandbox, so an agent that watched `/proc/*/cmdline` while a tracker write was in
+flight could read it. That is true of orchestra's own taxis token and of the GitHub tokens today;
+it is a fix in the taxis client (orchestra's own `Utils.Http` already uses `curl -K -` for exactly
+this reason), not here. Do not treat an identity's token as a secret kept *from* the agent
+running as it.
 
 ## running tasks
 
@@ -1591,7 +1610,9 @@ orchestra chat --upstream owner/repo --fork your-org/repo --identity maintainer
 ```
 
 The agent is told who it is, the identity's memory directory is mounted read-write, and where the
-identity carries a taxis token the session's tracker writes are recorded as coming from it. Like
+identity carries a taxis token the session's tracker writes are recorded as coming from it. The
+record is read when the session starts or wakes, so a rotated token reaches it at its next wake
+rather than mid-conversation. Like
 the model it is a property of the session and lives on the record, so a dormant session wakes as
 the same identity — and, like the model, changing it means starting a new session that resumes the
 old. A session gets the identity's memory and no other: there is no `memory` field on a session to

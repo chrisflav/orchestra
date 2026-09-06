@@ -1579,10 +1579,20 @@ private def startInteractive (body : String) : IO WriteResult := do
   for (what, part) in [("upstream owner", upstream.owner), ("upstream name", upstream.name),
                        ("fork owner", fork.owner), ("fork name", fork.name)] do
     if let .error e := Utils.checkConfigName what part then return .badRequest e
-  -- The one id in this feature that does not arrive as a path segment, and so is the one the
-  -- routing layer's `safeSegment` never sees. It becomes a directory name in the session store.
+  -- The two ids in this feature that do not arrive as a path segment, and so are the ones the
+  -- routing layer's `safeSegment` never sees. `resumeFrom` becomes a directory name in the
+  -- session store; `identity` becomes one under both `<config>/identities` and
+  -- `<data>/identities`.
+  --
+  -- The store refuses either on its own (`Utils.ensureConfigName`), so this is not what stops a
+  -- traversal. It is what makes the refusal a `400` naming the field, rather than a `409` — the
+  -- daemon reports a start failure as a conflict, and the sentence it carries for a bad name is
+  -- the store's, which quotes the daemon's absolute config path back at the caller.
   if let some resume := field "resumeFrom" then
     if let .error e := Utils.checkConfigName "resumeFrom session" resume then
+      return .badRequest e
+  if let some identity := field "identity" then
+    if let .error e := Utils.checkConfigName "identity" identity then
       return .badRequest e
   -- A ceiling on the one route that spends money. Everything else in this API is scrupulous
   -- about caps — `maxLimit`, `maxLogLimit`, `maxWindowCount` — precisely so one request cannot

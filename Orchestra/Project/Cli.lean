@@ -437,6 +437,10 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     , projectId     := some project.id
     , issueId       := mIssue.map (·.id)
     , spawnPolicy   := role.spawnPolicy
+    -- As `Listener.buildRoleEntry` does. The two dispatch paths for one role have to agree about
+    -- who the agent is, or a reviewer spawned by hand signs its verdicts as orchestra while the
+    -- same reviewer dispatched by the daemon signs them as itself.
+    , identity      := role.identity
     , role          := some role.name }
   -- 7. Persist the entry. The daemon picks it up on its next poll.
   Queue.saveEntry entry
@@ -529,6 +533,10 @@ def issueContinueHandler (p : Parsed) : IO UInt32 := do
     , priority      := priorityFlag.getD prevRecord.priority
     , projectId     := some project.id
     , issueId       := some issue.id
+    -- Inherited from the run being continued, like backend and model above it: a continuation is
+    -- the same work picked up again, and it is the identity's memory that holds what the first
+    -- attempt learned.
+    , identity      := prevRecord.identity
     , tools         := some (toolsOverride?.getD defaultContinueTools) }
   -- 4. Drop into the queue dir; the running daemon picks it up on next poll.
   --    No daemon-running precheck — the entry persists and runs whenever the

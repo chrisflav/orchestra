@@ -456,6 +456,11 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         priority         := priorityFlag.getD task.ioTask.priority
         issueNumber      := task.ioTask.issueNumber
         spawnPolicy      := task.ioTask.spawnPolicy
+        -- Without this a task file naming an identity runs as it under `orchestra run` and as
+        -- the instance under `orchestra queue add`: the same document, two different actors, and
+        -- nothing on either path to say so. `requireIdentity` cannot catch it — the name never
+        -- reaches the run to be checked.
+        identity         := task.ioTask.identity
       }
       let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
       let _ ← daemonRequest req
@@ -1089,6 +1094,9 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
       series       := entry.series
       configPath   := entry.configPath
       priority     := entry.priority
+      -- A retry is the same work by the same somebody: without this the second half of a run is
+      -- authored by orchestra and reads a different memory than the first half did.
+      identity     := entry.identity
     }
     Queue.saveEntry newEntry
     IO.println newEntry.id

@@ -116,6 +116,59 @@ def listingSkipsWhatItCannotRead : Test := do
   TestM.assertEqual names #["maintainer"]
     (msg := "one unreadable record must not stop the listing answering")
 
+/-! ## The token
+
+    The rules the record is held to, and the one property nothing else guards: that a token which
+    reached the process never leaves it. -/
+
+/-- The security property the `ToJson` instance exists for, asserted rather than trusted. It is
+    what an API listing or a printed record would use, and a token that went out over either
+    would be a credential in somebody's log. -/
+@[test]
+def serializingAnIdentityLeavesTheTokenBehind : Test := do
+  let idn : Identity :=
+    { name := "maintainer", description := some "Keeps the tracker tidy."
+    , taxisToken := some "t-secret", agents := some "instructions" }
+  let rendered := (ToJson.toJson idn).compress
+  TestM.assert (!mentions rendered "t-secret")
+    (msg := s!"the token must not be serialized, got: {rendered}")
+  TestM.assert (mentions rendered "maintainer" && mentions rendered "Keeps the tracker tidy.")
+    (msg := s!"the rest of the record should still be there, got: {rendered}")
+
+/-- Same property for `repr`, which is the other way a record reaches a log. -/
+@[test]
+def printingAnIdentityLeavesTheTokenBehind : Test := do
+  let idn : Identity := { name := "maintainer", taxisToken := some "t-secret" }
+  let printed := toString (repr idn)
+  TestM.assert (!mentions printed "t-secret")
+    (msg := s!"repr must not print the token, got: {printed}")
+
+/-- A token that is present but unusable is refused when the record is read, not discovered at the
+    far end of a paid-for run when taxis answers 401 — and, for the two cases that read as *no
+    token*, not never. -/
+@[test]
+def anUnusableTokenIsRefused : Test := do
+  let refusalFor (record : String) : IO String := withIdentities do
+    writeIdentity "maintainer" record
+    outcomeOf do
+      let _ ← loadIdentity "maintainer"
+      return "loaded"
+  -- Reads as no token, and an identity with no token authors everything as orchestra: the run
+  -- succeeds and only the tracker shows anything is wrong.
+  let notAString ← refusalFor r#"{"name":"maintainer","taxis_token":12345}"#
+  TestM.assert (mentions notAString "must be a string")
+    (msg := s!"a non-string token should be refused, got: {notAString}")
+  -- The camelCase spelling the Lean field carries, which is the likely typo.
+  let misspelled ← refusalFor r#"{"name":"maintainer","taxisToken":"t-123"}"#
+  TestM.assertEqual misspelled "loaded"
+    (msg := "an unknown key is not a token; this one is simply an identity without one")
+  let blank ← refusalFor r#"{"name":"maintainer","taxis_token":"  "}"#
+  TestM.assert (mentions blank "empty")
+    (msg := s!"a blank token should be refused, got: {blank}")
+  let placeholder ← refusalFor r#"{"name":"maintainer","taxis_token":"{{taxis_token}}"}"#
+  TestM.assert (mentions placeholder "unsubstituted placeholder")
+    (msg := s!"an undefined secret should be refused, got: {placeholder}")
+
 /-! ## The standing instructions -/
 
 @[test]
@@ -273,6 +326,20 @@ def aSessionRequestCarriesTheIdentity : Test := do
   | .ok (.interactiveStart spec) =>
       TestM.assertEqual spec.identity (some "maintainer") (msg := "identity on the spec")
   | .ok _ => TestM.fail "decoded as some other request"
+
+/-- The record of a run says who it ran as. It is what a continuation inherits the identity
+    from — `orchestra issue continue` builds its entry from this and nothing else — and the only
+    thing that still says who authored a tracker comment once the queue entry is pruned. -/
+@[test]
+def aTaskRecordRoundTripsTheIdentity : Test := do
+  let record : TaskStore.TaskRecord :=
+    { id := "t1", createdAt := "2026-01-01T00:00:00Z", repo := none, prompt := "go"
+    , identity := some "maintainer" }
+  match (FromJson.fromJson? (ToJson.toJson record) : Except String TaskStore.TaskRecord) with
+  | .error e => TestM.fail s!"task record did not decode: {e}"
+  | .ok back =>
+    TestM.assertEqual back.identity (some "maintainer")
+      (msg := "identity survives the task store")
 
 /-! ## Acting on the tracker as the identity -/
 

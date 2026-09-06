@@ -206,7 +206,8 @@ by task {e.taskId}"
     request-changes review on the issue, which returns to the open pool. Skips the entire agent /
     sandbox / MCP path. Used when `ioTask.backend = some "merger"`. -/
 private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
-    (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord) : IO Unit := do
+    (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord)
+    (identity : Option Identity.Identity) : IO Unit := do
   IO.println "  [merger] merge backend"
   -- Bound only to be validated: the merger reaches the issue through `findIssue` below, but a
   -- task arriving here without a project is malformed and should say so rather than fail later
@@ -248,9 +249,13 @@ private def runMerger {i o : ResultType} (token : String) (ioTask : IOTask i o)
     -- parked in a state nothing dispatches. Failing to record must not swallow the failure
     -- itself, hence the catch.
     try
+      -- Under the merger's own identity when it was given one. A merger dispatched by
+      -- `enqueueMergerImpl` never has one — orchestra queues that task itself, and the verdict is
+      -- orchestra's — but a merger a task file or a role names an identity for is that identity's
+      -- verdict, and it should be signed as such.
       Project.addComment iid
         s!"Validation failed for {prRef}, so it was not merged.\n\n```\n{validOutput}\n```"
-        (review := some .requestChanges)
+        (review := some .requestChanges) (asToken := identity.bind (·.taxisToken))
     catch e => IO.eprintln s!"  [merger] could not record the validation failure: {e}"
     let _ ← Project.forceRelease globalClaimManager iid
     TaskStore.saveTask { initialRecord with status := .failed }
@@ -570,6 +575,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     projectId := ioTask.projectId
     issueId   := ioTask.issueId
     role      := ioTask.role
+    identity  := ioTask.identity
   }
   TaskStore.saveTask initialRecord
   onStart taskId
@@ -705,7 +711,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth +
   -- clone setup with all other backends but skips the MCP server and agent.
   if ioTask.backend == some "merger" then
-    runMerger token ioTask repoPath initialRecord
+    runMerger token ioTask repoPath initialRecord identity
     return ((taskId, ← finalStatusOf taskId), none, none)
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
