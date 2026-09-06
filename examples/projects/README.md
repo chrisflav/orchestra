@@ -211,12 +211,16 @@ because "a planner may queue implementors" is a statement about planners. What i
 why a role without one is not offered the tool at all, is in
 [`docs/queue-task.md`](../../docs/queue-task.md).
 
-A role may carry an `identity`, naming a record in `<config>/identities/`. Every task dispatched
-for the role is then performed under it: the agent gets that identity's own memory — the same one
-every previous run of the role had, so a reviewer remembers what it has already asked for — and,
-where the identity holds a taxis token, its comments and reviews are recorded as coming from that
-identity instead of from orchestra. The identity is *who* the agent is; the role is what it does.
-See "identities" in the top-level README.
+A role may carry an `identity`, naming a directory under `<config>/identities/`. Every task
+dispatched for the role is then performed under it: the agent gets that identity's own memory —
+the same one every previous run of the role had, so a reviewer remembers what it has already asked
+for — its `AGENTS.md` as standing instructions, and, where the identity holds a taxis token,
+comments and reviews recorded as coming from that identity instead of from orchestra.
+
+The identity is *who* the agent is; the role is what it does. Where that line falls in practice:
+the prompt template belongs to the role, because it renders this issue; the standing instructions
+belong to the identity, because they hold whatever the issue is. See "identities" in the top-level
+README.
 
 Examples in `roles/`: `implementor.json`, `reviewer.json`, `planner.json`,
 `maintainer.json`. Each ships with `dispatch.max: 0` so auto-spawn is opt-in — set caps in a

@@ -836,8 +836,16 @@ An identity is a persistent someone for a task to be. A task, a role or a listen
 the run gets a memory that was there before it started — and, where the identity carries a taxis
 token, writes to the tracker as itself rather than as orchestra.
 
+An identity is a directory, because it is a bundle rather than a record:
+
+```
+~/.config/orchestra/identities/maintainer/
+├── identity.json      # who it is to orchestra
+└── AGENTS.md          # how it works — optional
+```
+
 ```json
-// ~/.config/orchestra/identities/maintainer.json
+// identity.json
 {
   "name": "maintainer",
   "description": "Keeps the tracker in order: triages what comes in and chases what has gone quiet.",
@@ -847,7 +855,7 @@ token, writes to the tracker as itself rather than as orchestra.
 
 | Field | |
 | --- | --- |
-| `name` | Must match the filename. Every surface refers to the identity by it |
+| `name` | Must match the directory name. Every surface refers to the identity by it |
 | `description` | One or two sentences, shown to the agent as part of who it is |
 | `taxis_token` | API token for the taxis actor this identity is. Optional; `{{secret}}` placeholders are substituted from `secrets.json` |
 
@@ -884,6 +892,25 @@ permissions want an authorization service to hold them and are not here yet.
 An identity is **assigned, never chosen**. It is written in configuration, and `queue_task` has no
 field for it — a task queued by a task inherits the identity of the task that queued it, so an
 agent can pass its own on but cannot put on another one.
+
+### AGENTS.md
+
+`AGENTS.md` beside the record is the identity's standing instructions: how this one works, what
+it always checks, which conventions it holds itself to. It is the half of an identity that does
+not change from run to run — the task's prompt is the half that does.
+
+It reaches the agent as a section of its system prompt, under a heading naming whose instructions
+they are, with your file inside it unedited. Deliberately *not* written into the checkout, where
+the agent's CLI would find an `AGENTS.md` on its own: a repository may have one of its own, and
+overwriting it would be orchestra editing the project's instructions — quite apart from leaving a
+file in the working tree that the agent then has to remember not to commit. The repository's own
+`AGENTS.md` is read by the agent as usual; the identity's is added to it, not swapped for it.
+
+A blank file contributes nothing rather than an empty heading, and the whole system prompt is
+capped at 120 KB with a warning on stderr if it has to be cut — so an `AGENTS.md` the length of a
+manual is a thing you will hear about.
+
+`examples/identities/` ships two written out in full.
 
 ### the memory
 

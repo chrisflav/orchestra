@@ -15,9 +15,16 @@ is still there afterwards, plus the credentials to act on the tracker as itself 
 the instance.
 
 ```
-<config>/identities/<name>.json     -- the record
-<data>/identities/<name>/memory/    -- its memory, mounted read-write into the sandbox
+<config>/identities/<name>/identity.json   -- the record
+<config>/identities/<name>/AGENTS.md       -- its standing instructions, optional
+<data>/identities/<name>/memory/           -- its memory, mounted read-write into the sandbox
 ```
+
+A directory rather than one file because an identity is a bundle: the record says who it is to
+orchestra, and `AGENTS.md` says how it works, in the format that is already the convention for
+telling an agent that. Keeping the instructions in their own file is what makes them editable as
+prose — a `"prompt"` string inside JSON is a paragraph with `\n` in it that nobody wants to
+maintain.
 
 An identity is *not* a role and the two are worth keeping apart. A role says what a task does —
 its prompt, its tools, its model. An identity says who does it, and it is the half that
@@ -81,6 +88,19 @@ structure Identity where
       orchestra's own token, which is a usable identity — one with a dedicated memory and no
       separate presence on the tracker. -/
   taxisToken : Option String := none
+  /-- The identity's `AGENTS.md`, whole, when it has one.
+
+      Not a field of the JSON record: it is read from the file beside it by `loadIdentity`, the
+      way `Skill.content` is. Instructions are prose and belong in a markdown file the operator
+      edits, not in a string inside a config document.
+
+      What it is *for* is the standing half of an identity — how this one works, what it always
+      checks before it opens a pull request, which conventions it holds itself to — as against
+      the per-run half, which is the task's prompt. It reaches the agent appended to its system
+      prompt (`TaskRunner.identityInstructions`), not written into the checkout: a repository has
+      its own `AGENTS.md` and orchestra has no business overwriting it, or leaving a file in a
+      working tree that the agent would then have to remember not to commit. -/
+  agents : Option String := none
 deriving Repr, Inhabited
 
 instance : ToJson Identity where
@@ -88,6 +108,8 @@ instance : ToJson Identity where
     let fields : List (String × Json) := [("name", Json.str i.name)]
     let fields := if let some d := i.description then fields ++ [("description", Json.str d)]
                   else fields
+    -- `agents` is left out too, but for a duller reason than the token: it is a file, and a
+    -- listing that inlined every identity's instructions would be a listing nobody could read.
     -- The token is deliberately not serialized. This instance is what an API listing and
     -- `orchestra` printing a record would use, and a credential that goes out over either is a
     -- credential in a log. Reading a record back through `FromJson` is therefore not a
@@ -111,15 +133,24 @@ initialize identitiesDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef 
 def setIdentitiesDirOverride (p : Option System.FilePath) : IO Unit :=
   identitiesDirOverride.set p
 
-/-- Where the records live: `<config>/identities`. -/
+/-- Where the identities live: `<config>/identities`. -/
 def identitiesDir : IO System.FilePath := do
   match ← identitiesDirOverride.get with
   | some p => return p
   | none   => return (← Dirs.configBase) / "identities"
 
-def identityFile (name : String) : IO System.FilePath := do
+/-- One identity's directory: `<config>/identities/<name>`. -/
+def identityDir (name : String) : IO System.FilePath := do
   Utils.ensureConfigName "identity" name
-  return (← identitiesDir) / s!"{name}.json"
+  return (← identitiesDir) / name
+
+def identityFile (name : String) : IO System.FilePath := do
+  return (← identityDir name) / "identity.json"
+
+/-- The identity's standing instructions. Absent is fine — an identity is a memory and a name
+    before it is a set of instructions. -/
+def agentsFile (name : String) : IO System.FilePath := do
+  return (← identityDir name) / "AGENTS.md"
 
 /-- The root of one identity's own data: `<data>/identities/<name>`. -/
 def identityDataDir (name : String) : IO System.FilePath := do
@@ -153,16 +184,17 @@ def loadIdentity (name : String) : IO (Option Identity) := do
   if !(← path.pathExists) then return none
   let secrets ← loadSecrets
   let identity ← loadJsonFileWithSecrets Identity path secrets
-  -- The filename is what every other surface names it by, so a record whose `name` disagrees
-  -- would be reachable under one spelling and print itself under another.
+  -- The directory name is what every other surface names it by, so a record whose `name`
+  -- disagrees would be reachable under one spelling and print itself under another.
   unless identity.name == name do
     throw (.userError s!"{path}: this record names the identity '{identity.name}', but it is \
 stored as '{name}'")
-  return some identity
-
-private def stripJsonExt (s : String) : Option String :=
-  let ext := ".json"
-  if s.endsWith ext then some (s.dropEnd ext.length).toString else none
+  -- Read as-is, with no substitution and no validation. It is prose for an agent, and the one
+  -- thing orchestra could check about it — that it is not empty — is worth saying rather than
+  -- refusing over, since a half-written file is still what its author meant to be there.
+  let agentsPath ← agentsFile name
+  let agents ← if ← agentsPath.pathExists then some <$> IO.FS.readFile agentsPath else pure none
+  return some { identity with agents }
 
 /-- Every configured identity, ordered by name so a listing is stable across calls.
 
@@ -174,8 +206,11 @@ def loadAllIdentities : IO (Array Identity) := do
   if !(← dir.pathExists) then return #[]
   let mut names : Array String := #[]
   for entry in ← System.FilePath.readDir dir do
-    if let some name := stripJsonExt entry.fileName then
-      if Utils.validConfigName name then names := names.push name
+    -- A directory holding a record. Anything else under `identities/` — a stray file, a
+    -- directory somebody made and did not finish — is not an identity and is passed over in
+    -- silence, the way the skill store passes over a directory with no `SKILL.md`.
+    if !Utils.validConfigName entry.fileName then continue
+    if ← (entry.path / "identity.json").pathExists then names := names.push entry.fileName
   let mut out : Array Identity := #[]
   for name in names.qsort (· < ·) do
     try

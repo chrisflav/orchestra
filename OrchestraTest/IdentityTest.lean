@@ -25,10 +25,12 @@ private def withIdentities (act : IO α) : IO α := do
     setIdentitiesDirOverride previous
     try IO.FS.removeDirAll root catch _ => pure ()
 
-private def writeIdentity (name : String) (json : String) : IO Unit := do
-  let dir ← identitiesDir
+private def writeIdentity (name : String) (json : String) (agents : Option String := none) :
+    IO Unit := do
+  let dir := (← identitiesDir) / name
   IO.FS.createDirAll dir
-  IO.FS.writeFile (dir / s!"{name}.json") json
+  IO.FS.writeFile (dir / "identity.json") json
+  if let some body := agents then IO.FS.writeFile (dir / "AGENTS.md") body
 
 /-- Whether `needle` occurs in `hay`. Used to check that an error message names the thing it is
     about, without pinning the whole sentence. -/
@@ -113,6 +115,47 @@ def listingSkipsWhatItCannotRead : Test := do
     return ids.map (·.name))
   TestM.assertEqual names #["maintainer"]
     (msg := "one unreadable record must not stop the listing answering")
+
+/-! ## The standing instructions -/
+
+@[test]
+def theAgentsFileIsReadBesideTheRecord : Test := do
+  let got ← (withIdentities do
+    writeIdentity "maintainer" r#"{"name":"maintainer"}"#
+      (agents := some "# maintainer\n\nYou look after the tracker.\n")
+    let record ← loadIdentity "maintainer"
+    return record.bind (·.agents))
+  TestM.assertEqual got (some "# maintainer\n\nYou look after the tracker.\n")
+    (msg := "AGENTS.md arrives verbatim")
+
+@[test]
+def anIdentityNeedNotHaveInstructions : Test := do
+  let got ← (withIdentities do
+    writeIdentity "archivist" r#"{"name":"archivist"}"#
+    let record ← loadIdentity "archivist"
+    return record.bind (·.agents))
+  TestM.assertEqual got none (msg := "a name and a memory is a whole identity")
+
+/-- The instructions reach the agent as a section of its system prompt, under a heading naming
+    whose they are, with the operator's file inside it unedited. -/
+@[test]
+def instructionsBecomeASystemPromptSection : Test := do
+  let idn : Identity := { name := "maintainer", agents := some "Split what is too big." }
+  match TaskRunner.identityInstructions idn with
+  | none         => TestM.fail "an identity with an AGENTS.md should contribute a section"
+  | some section? =>
+    TestM.assert (mentions section? "maintainer's instructions")
+      (msg := s!"the section should name whose instructions these are, got: {section?}")
+    TestM.assert (mentions section? "Split what is too big.")
+      (msg := "the operator's file should arrive verbatim")
+
+/-- A file that is there but blank contributes nothing, rather than a heading with nothing under
+    it — which reads to an agent as instructions it has failed to find. -/
+@[test]
+def blankInstructionsContributeNoSection : Test := do
+  let idn : Identity := { name := "maintainer", agents := some "   \n\n  " }
+  TestM.assert (TaskRunner.identityInstructions idn).isNone
+    (msg := "a blank AGENTS.md is no instructions")
 
 /-- The layout decision, pinned because it is the whole of "dedicated" and nothing else would
     catch it going wrong. Global memory is the memory *root* — `TaskRunner.resolveMemoryDirs`

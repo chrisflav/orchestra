@@ -457,6 +457,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let promptSections : List String :=
       [ record.systemPrompt
       , identity.map (TaskRunner.identitySystemPrompt · identityMemory)
+      , identity.bind TaskRunner.identityInstructions
       , TaskRunner.memorySystemPrompt identityMemory.toArray ].filterMap id
     let systemPrompt :=
       if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)

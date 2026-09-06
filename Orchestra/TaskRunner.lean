@@ -409,6 +409,27 @@ answering for it the next time this identity picks the work up."
     else ""
   s!"## Identity\n\n{who}{memory}{remote}"
 
+/-- The identity's own `AGENTS.md`, as a system-prompt section, or `none` when it has none.
+
+    Its own section rather than folded into `identitySystemPrompt`: that one is written by
+    orchestra and says what running as somebody means, this one is written by the operator and
+    says how this particular somebody works. Keeping them apart means the operator's file arrives
+    verbatim, under a heading naming whose it is, instead of interleaved with orchestra's prose.
+
+    It goes into the system prompt rather than into the checkout, where the agent's CLI would
+    find an `AGENTS.md` on its own. A repository may have one of its own — overwriting it would
+    be orchestra editing the project's instructions — and a file dropped into a working tree is
+    one more thing in `git status` for the agent to not commit. -/
+def identityInstructions (idn : Identity.Identity) : Option String :=
+  match idn.agents with
+  | none      => none
+  | some body =>
+    let body := body.trimAscii.toString
+    if body.isEmpty then none
+    else s!"## {idn.name}'s instructions\n\nThese are {idn.name}'s standing instructions, from \
+its own AGENTS.md. They hold for every run under this identity, and the task below is what this \
+particular run is for.\n\n{body}"
+
 /-- Derive the list of allowed optional tools from a task's `tools` and `mode` fields.
     If `tools` is `some list`, use it directly.
     If `tools` is `none`, fall back to mode-based rules for backwards compatibility:
@@ -765,6 +786,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   let promptSections : List String :=
     [ baseSystemPrompt
     , identity.map (identitySystemPrompt · identityMemoryDir)
+    , identity.bind identityInstructions
     , memorySystemPrompt memoryDirs ].filterMap id
   let systemPrompt :=
     if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)
