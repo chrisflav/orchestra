@@ -365,7 +365,7 @@ private def resolveMemoryDirs (mode : MemoryMode) (upstream : Option Repository)
     that safe: two agents appending to a single `MEMORY.md` have no way to see each other's
     write, so the second one to save silently discards the first one's memory. Distinct files
     make concurrent writes disjoint, and reading the directory still reconstructs everything. -/
-private def memorySystemPrompt (memoryDirs : Array String) : Option String :=
+def memorySystemPrompt (memoryDirs : Array String) : Option String :=
   if memoryDirs.isEmpty then none
   else
     let bullet := fun d => s!"- {d}"
@@ -390,7 +390,7 @@ fine; do it by adding a file that supersedes it rather than editing that file in
     about a persistent someone whose memory one of those directories is, and whose name goes on
     what the run leaves behind on the tracker. An agent told only "here is a directory" has no
     reason to treat what it finds there as its own past work. -/
-private def identitySystemPrompt (idn : Identity.Identity) (memoryDir : Option String) : String :=
+def identitySystemPrompt (idn : Identity.Identity) (memoryDir : Option String) : String :=
   let who := match idn.description with
     | some d => s!"You are running as **{idn.name}**. {d}"
     | none   => s!"You are running as **{idn.name}**."

@@ -857,6 +857,17 @@ Name it from a task file, a role, or a listener's `action`:
 { "prompt": "Triage what came in overnight.", "identity": "maintainer" }
 ```
 
+An [interactive session](#interactive-sessions) takes one too, so a conversation you hold with an
+agent can be held as somebody in particular:
+
+```sh
+orchestra chat --upstream owner/repo --fork you/repo --identity maintainer
+```
+
+The identity is fixed for the session's life and is kept on its record, so a session that goes
+dormant and is woken later comes back as the same one. A session gets the identity's memory and
+no other: there is no `memory` field on a session to select the shared ones with.
+
 Naming an identity that is not configured fails the task, rather than running it as the instance:
 the fallback would use the wrong tracker actor and the wrong memory, and look like it had worked.
 
@@ -1544,6 +1555,21 @@ orchestra chat --upstream owner/repo --fork your-org/repo --resume-from <id> --m
 ```
 
 It inherits the old session's history and is launched with the model it was given.
+
+A session can also be held under an [identity](#identities), which is how a conversation gets a
+memory that outlasts it:
+
+```sh
+orchestra chat --upstream owner/repo --fork your-org/repo --identity maintainer
+```
+
+The agent is told who it is, the identity's memory directory is mounted read-write, and where the
+identity carries a taxis token the session's tracker writes are recorded as coming from it. Like
+the model it is a property of the session and lives on the record, so a dormant session wakes as
+the same identity — and, like the model, changing it means starting a new session that resumes the
+old. A session gets the identity's memory and no other: there is no `memory` field on a session to
+select the shared ones with. Naming an identity that is not configured is a `400` listing the ones
+that are, refused before a clone slot is taken.
 
 What a session may spend is chosen the same way, and is the whole conversation's budget rather
 than a turn's: `orchestra chat --budget <usd>`, or the box next to the model on the chat page.

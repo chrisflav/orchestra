@@ -1183,7 +1183,10 @@ private def interactiveSummaryJson (r : Interactive.SessionRecord) : Json :=
     ("costUsd",        ToJson.toJson r.costUsd),
     ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
     ("title",          optStr r.title),
-    ("error",          optStr r.error)
+    ("error",          optStr r.error),
+    -- Who the session is being held as (`Orchestra.Identity`), so a list of conversations says
+    -- which of them are speaking on the tracker as somebody other than orchestra.
+    ("identity",       optStr r.identity)
   ]
 
 private def interactiveApi (p : Page) : IO Json := do
@@ -1210,7 +1213,8 @@ private def interactiveDetailApi (id : String) : IO (Option Json) := do
     ("costUsd",        ToJson.toJson r.costUsd),
     ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
     ("title",          optStr r.title),
-    ("error",          optStr r.error)
+    ("error",          optStr r.error),
+    ("identity",       optStr r.identity)
   ]
 
 /-- A page of the transcript, from a cursor.
@@ -1621,6 +1625,11 @@ private def startInteractive (body : String) : IO WriteResult := do
   -- invites a client to retry something that can never work.
   | .error why =>
     if (why.splitOn "cannot host an interactive session").length > 1 then
+      return .badRequest why
+    -- Same reasoning: an identity that is not configured is a request naming something that does
+    -- not exist, and no amount of retrying will make it. Matched on the sentence because that is
+    -- all the control socket carries back — see `Identity.requireIdentity`, which writes it.
+    if (why.splitOn "no identity named").length > 1 then
       return .badRequest why
     return .conflict why
   | .ok reply =>

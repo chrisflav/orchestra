@@ -1281,6 +1281,7 @@
       "InteractiveSession": {
         "type": "object",
         "required": [
+          "identity",
           "id",
           "status",
           "createdAt",
@@ -1297,6 +1298,10 @@
           "error"
         ],
         "properties": {
+          "identity": {
+            "type": ["string", "null"],
+            "description": "The identity this session is held under: the name of a record in `<config>/identities/`. Its memory is mounted for the agent, and where the record carries a taxis token, the session's tracker writes are recorded as coming from it rather than from orchestra."
+          },
           "id": {
             "type": "string"
           },
@@ -1366,6 +1371,7 @@
       "InteractiveSessionDetail": {
         "type": "object",
         "required": [
+          "identity",
           "id",
           "status",
           "createdAt",
@@ -1386,6 +1392,10 @@
           "resumedFrom"
         ],
         "properties": {
+          "identity": {
+            "type": ["string", "null"],
+            "description": "The identity this session is held under: the name of a record in `<config>/identities/`. Its memory is mounted for the agent, and where the record carries a taxis token, the session's tracker writes are recorded as coming from it rather than from orchestra."
+          },
           "id": {
             "type": "string"
           },
@@ -1514,6 +1524,10 @@
           "resumeFrom": {
             "type": "string",
             "description": "Start this session by picking up the conversation another one was having. The old session is not revived; this is a new one that inherits its agent-side history. Checked as a session id: it becomes a directory name."
+          },
+          "identity": {
+            "type": "string",
+            "description": "Hold the session under this identity: the name of a record in `<config>/identities/`. Its memory is mounted read-write for the agent, and where the record carries a taxis token, the session's tracker writes are recorded as coming from it. One that is not configured is a `400` naming the identities that are."
           }
         }
       },

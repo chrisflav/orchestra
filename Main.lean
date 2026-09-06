@@ -1629,7 +1629,8 @@ private def chatHandler (p : Parsed) : IO UInt32 := do
     -- whichever was checked first is how a mistyped flag becomes "why did that do nothing" —
     -- `--session x --budget 3` looked like it set a budget and did not, and `--list --end x`
     -- listed and left the session up.
-    let startFlags := ["upstream", "fork", "backend", "model", "budget", "tools", "resume-from"]
+    let startFlags := ["upstream", "fork", "backend", "model", "budget", "tools", "resume-from",
+                       "identity"]
       |>.filter (fun f => (p.flag? f).isSome)
       |>.map ("--" ++ ·)
     let modes := [("--list", p.hasFlag "list"),
@@ -1697,6 +1698,8 @@ one, --list to see them, or --end to end one."
         fields := fields ++ [("tools", Lean.Json.arr (names.map Lean.Json.str).toArray)]
     if let some r := p.flag? "resume-from" then
       fields := fields ++ [("resumeFrom", Lean.Json.str (r.as! String))]
+    if let some idn := p.flag? "identity" then
+      fields := fields ++ [("identity", Lean.Json.str (idn.as! String))]
     IO.println "Starting a session; this clones the repository and launches the agent..."
     -- The default 30 s is a read-a-file-off-disk timeout. This route clones a repository, mints
     -- a token, starts an MCP server and launches an agent inside the sandbox before it answers,
@@ -1722,6 +1725,8 @@ private def chatCmd : Cmd := `[Cli|
     budget       : String; "Maximum spend in USD for the whole session (default: 20.0)"
     tools        : String; "Comma-separated optional tools to enable, or 'all' (default: all)"
     "resume-from" : String; "Start a session that picks up the conversation of this one"
+    identity     : String; "Hold the session under this identity: its memory is mounted for the \
+agent, and where it has a taxis token, the session's tracker writes are recorded as coming from it"
     "api-url" : String; "Backend to talk to (default: $ORCHESTRA_API_URL, or \
 http://127.0.0.1:8080)"
     "api-token" : String; "Shared secret (default: $ORCHESTRA_DASHBOARD_PASSWORD, or the \

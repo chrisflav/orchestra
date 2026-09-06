@@ -201,6 +201,36 @@ def aTaskWithNoIdentityQueuesTasksWithNone : Test := do
   | .error e => TestM.fail s!"the spawn was refused: {e}"
   | .ok r    => TestM.assertEqual r.identity none (msg := "nothing to inherit")
 
+/-- A dormant session is woken from what is on disk, so the identity has to be on the record and
+    not only in the request that started it: a conversation that came back as the instance would
+    carry on writing to the tracker under a different actor than the half already in its
+    transcript. -/
+@[test]
+def aSessionRecordRoundTripsTheIdentity : Test := do
+  let record : Interactive.SessionRecord :=
+    { id := "s1", createdAt := "2026-01-01T00:00:00Z", lastActivityAt := "2026-01-01T00:00:00Z"
+    , upstream := { owner := "o", name := "r" }, fork := { owner := "o", name := "r" }
+    , identity := some "maintainer" }
+  match (FromJson.fromJson? (ToJson.toJson record) : Except String Interactive.SessionRecord) with
+  | .error e => TestM.fail s!"session record did not decode: {e}"
+  | .ok back =>
+    TestM.assertEqual back.identity (some "maintainer")
+      (msg := "identity survives a session going dormant")
+
+/-- `orchestra chat --identity` reaches the daemon as one field of the start request. -/
+@[test]
+def aSessionRequestCarriesTheIdentity : Test := do
+  let body := Json.mkObj
+    [ ("type", Json.str "interactive_start")
+    , ("spec", Json.mkObj
+        [ ("upstream", Json.str "o/r"), ("fork", Json.str "o/r")
+        , ("identity", Json.str "maintainer") ]) ]
+  match (FromJson.fromJson? body : Except String DaemonRequest.DaemonRequest) with
+  | .error e => TestM.fail s!"start request did not decode: {e}"
+  | .ok (.interactiveStart spec) =>
+      TestM.assertEqual spec.identity (some "maintainer") (msg := "identity on the spec")
+  | .ok _ => TestM.fail "decoded as some other request"
+
 /-! ## Acting on the tracker as the identity -/
 
 /-- The one thing running under an identity changes about a tracker write: the bearer token, and
