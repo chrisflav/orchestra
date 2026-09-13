@@ -1,3 +1,4 @@
+import Orchestra.Interactive.Store
 import Orchestra.Queue
 import Orchestra.Store
 import Orchestra.TaskStore
@@ -26,8 +27,8 @@ Files that do not parse are reported and skipped, as their loaders did. The dire
 exactly where they are: the import copies, and says so, so that a deployment that wants the disk
 back deletes them when it is ready rather than having the decision made for it.
 
-Later stages of the port add the interactive sessions and transcripts, the usage state and history
-and the listener state; `run` below is where their importers go.
+Later stages of the port add the usage state and history and the listener state; `run` below is
+where their importers go.
 -/
 
 open Lean (Json FromJson ToJson)
@@ -116,6 +117,73 @@ private def importConcertRuns : IO Unit := do
       HasModel.insert r.toRow
     return runs.size
 
+/-- Read a legacy transcript, tolerating a tail torn mid-character.
+
+    `IO.FS.readFile` throws outright on invalid UTF-8, one level below the per-line recovery
+    below, so it never gets the chance. A daemon killed in the middle of writing a multi-byte
+    character (this repo's own tool output is full of `→` and `✓`) left a transcript that threw
+    on *every* read: not one lost event, the whole conversation unreadable. A truncated code
+    point is at most three bytes short, so trimming back to the last valid boundary recovers
+    everything written before the tear.
+
+    Damage anywhere but the tail is not something that writer could produce; such a file is
+    reported and its session imported without a transcript, rather than taking the whole import
+    down with it. -/
+private def transcriptText? (path : System.FilePath) : IO (Option String) := do
+  let bytes ← IO.FS.readBinFile path
+  if let some s := String.fromUTF8? bytes then return some s
+  for back in [1, 2, 3] do
+    if bytes.size ≥ back then
+      if let some s := String.fromUTF8? (bytes.extract 0 (bytes.size - back)) then
+        return some s
+  IO.eprintln s!"[orchestra] the legacy transcript at {path} is not valid UTF-8, and not merely \
+torn at the end; the session is imported without it."
+  return none
+
+/-- Import the interactive sessions and their transcripts.
+
+    One legacy session was a directory of two files, so the unit here is the directory: anything
+    under `<data>/interactive` holding a `session.json` is a session, and the `events.jsonl`
+    beside it is its transcript. A line that does not parse, or that carries no `seq`, is skipped
+    exactly as `readEvents` skipped it — it can only be a torn write, and a transcript's last
+    line is the one most likely to be one.
+
+    Events are written with `save` rather than `insert`: a legacy transcript is a file that was
+    appended to across restarts, and two lines claiming the same seq are something it could hold.
+    The later one wins, and the import does not fail on the whole store because of one of them.
+
+    The count is of sessions, which is the store's record; the transcript is part of a session
+    rather than a record of its own. -/
+private def importInteractive : IO Unit := do
+  let dir ← Interactive.legacySessionsDir
+  importStore "interactive sessions" dir do
+    let mut sessions := 0
+    for entry in (← dir.readDir) do
+      let recordPath := entry.path / "session.json"
+      unless ← recordPath.pathExists do continue
+      let contents ← IO.FS.readFile recordPath
+      match Json.parse contents >>= FromJson.fromJson? (α := Interactive.SessionRecord) with
+      | .error e =>
+        IO.eprintln s!"[orchestra] legacy session '{entry.fileName}' did not parse: {e}"
+      | .ok record =>
+        HasModel.insert record.toRow
+        sessions := sessions + 1
+        let transcript := entry.path / "events.jsonl"
+        if ← transcript.pathExists then
+          if let some text ← transcriptText? transcript then
+            for line in text.splitOn "\n" do
+              let line := line.trimAscii.toString
+              if line.isEmpty then continue
+              let some j := (Json.parse line).toOption | continue
+              let some seq := j.getObjValAs? Nat "seq" |>.toOption | continue
+              HasModel.save
+                ({ session_id  := record.id
+                   seq         := Int.ofNat seq
+                   occurred_at := j.getObjValAs? String "occurredAt" |>.toOption
+                                    |>.getD record.createdAt
+                   doc         := j.compress } : Orchestra.Store.InteractiveEventRow)
+    return sessions
+
 /-- Carry every legacy directory that is still there into the database.
 
     Called once at startup by both binaries, before anything else reads a record. Silent when
@@ -126,8 +194,9 @@ def run : IO Unit := do
   importSeries
   importQueueEntries
   importConcertRuns
-  -- Later stages: the interactive sessions and their transcripts, the usage source state and
-  -- history, and the listener state. Each is one `importStore` call, and each takes its own
-  -- marker, so the stages can land one at a time on a database an earlier one has imported into.
+  importInteractive
+  -- Later stages: the usage source state and history, and the listener state. Each is one
+  -- `importStore` call, and each takes its own marker, so the stages can land one at a time on a
+  -- database an earlier one has imported into.
 
 end Orchestra.Store.Import
