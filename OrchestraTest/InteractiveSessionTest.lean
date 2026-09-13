@@ -13,14 +13,8 @@ than the happy path: what a restart leaves behind, and what happens when a backe
 something its CLI cannot.
 -/
 
-private def withTempSessions (act : IO α) : IO α := do
-  let root := System.FilePath.mk "/tmp" / s!"orchestra-interactive-mgr-{← IO.monoNanosNow}"
-  IO.FS.createDirAll root
-  setSessionsDirOverride (some root)
-  try act
-  finally
-    setSessionsDirOverride none
-    try IO.FS.removeDirAll root catch _ => pure ()
+private def withTempSessions (act : IO α) : IO α :=
+  Orchestra.withTempData "interactive-mgr" act
 
 private def sampleRecord (id : String) (status : SessionStatus) : SessionRecord := {
   id, status

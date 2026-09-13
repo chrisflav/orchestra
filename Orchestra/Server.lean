@@ -685,7 +685,7 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
   | "get_task_input" => .getTaskInput
   | "submit_task_output" =>
     match args.getObjVal? "value" with
-    | .ok v  => .submitTaskOutput v
+    | .ok j  => .submitTaskOutput j
     | .error _ => .parseError "missing required 'value' argument"
   | _ =>
     match Project.Tools.tryParseToolCall name args with
@@ -1012,7 +1012,7 @@ private def awaitTcp (p : IO.Promise (Except IO.Error α)) : IO α := do
   let result ← IO.wait p.result!
   match result with
   | .error e => throw e
-  | .ok v => return v
+  | .ok a => return a
 
 /--
 Handle one TCP client connection as a JSON-RPC session.

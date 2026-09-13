@@ -13,6 +13,7 @@ import Orchestra.GitHub
 import Orchestra.Listener
 import Orchestra.Migrate
 import Orchestra.Project
+import Orchestra.Store.Import
 import Orchestra.Queue
 import Orchestra.Repo
 import Orchestra.RepoConfig
@@ -86,8 +87,8 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let debug         := p.hasFlag "debug"
   let continuesFrom := p.flag? "continues" |>.map (·.as! String)
   let series        := p.flag? "series"    |>.map (·.as! String)
-  let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
-  let initVars      := p.flag? "vars"      |>.map (fun v => parseVarsJson (v.as! String)) |>.getD []
+  let budgetFlag    := p.flag? "budget"    |>.bind (fun f => parseFloat? (f.as! String))
+  let initVars      := p.flag? "vars"      |>.map (fun f => parseVarsJson (f.as! String)) |>.getD []
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   if isWorkflowFile taskFile then
     let yaml ← IO.FS.readFile taskFile
@@ -202,27 +203,22 @@ private def cleanupListHandler (_ : Parsed) : IO UInt32 := do
   return (0 : UInt32)
 
 private def tasksHandler (p : Parsed) : IO UInt32 := do
-  let limit := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
-  let records := (← TaskStore.loadAllTasks).toList.take limit
+  let atMost := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
+  let records ← TaskStore.recent atMost
   if records.isEmpty then
     IO.println "No tasks found."
     return (0 : UInt32)
-  let queueEntries ← Queue.loadAllEntries
-  let allConcerts ← Queue.loadAllConcertRuns
   IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 11} {padRight "SERIES" 16} CONCERT"
   IO.println (String.ofList (List.replicate 117 '-'))
   for r in records do
     let status := match r.status with
       | .running => "running" | .completed => "completed" | .failed => "failed"
       | .unfinished => "unfinished" | .cancelled => "cancelled"
-    let concertLabel :=
-      let mConcert : Option Queue.ConcertRun := do
-        let e ← queueEntries.find? (fun e => e.taskId == some r.id)
-        let cid ← e.concertId
-        allConcerts.find? (fun cr => cr.id == cid)
-      match mConcert with
-      | some run => run.id
-      | none     => ""
+    -- One lookup for the row being printed, rather than the whole queue and the whole concert
+    -- history read to label at most `atMost` of them.
+    let concertLabel ← do
+      let some cid := (← Queue.entryForTask r.id).bind (·.concertId) | pure ""
+      pure (if (← Queue.loadConcertRun cid).isSome then cid else "")
     let seriesLabel := r.series.getD ""
     IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight (repoLabel r.repo) 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
@@ -256,20 +252,13 @@ private def taskShowHandler (p : Parsed) : IO UInt32 := do
     return (0 : UInt32)
 
 private def seriesHandler (_ : Parsed) : IO UInt32 := do
-  let dir ← TaskStore.seriesDir
-  if !(← dir.pathExists) then
-    IO.println "No series found."
-    return (0 : UInt32)
-  let entries ← System.FilePath.readDir dir
-  let entries := entries.filter (fun e => e.fileName.endsWith ".json")
+  let entries ← TaskStore.allSeries
   if entries.isEmpty then
     IO.println "No series found."
     return (0 : UInt32)
   IO.println s!"{padRight "SERIES" 24} LATEST TASK ID"
   IO.println (String.ofList (List.replicate 42 '-'))
-  for entry in entries do
-    let name := stripExt entry.fileName ".json"
-    let latestId := (← TaskStore.latestInSeries name).getD "?"
+  for (name, latestId) in entries do
     IO.println s!"{padRight name 24} {latestId}"
   return (0 : UInt32)
 
@@ -295,7 +284,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
     throw (.userError "missing required flag: --prompt")
   let configPath  := p.flag? "config"  |>.map (·.as! String)
   let debug       := p.hasFlag "debug"
-  let budgetFlag  := p.flag? "budget"  |>.bind (fun v => parseFloat? (v.as! String))
+  let budgetFlag  := p.flag? "budget"  |>.bind (fun f => parseFloat? (f.as! String))
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   let some prevId ← TaskStore.latestInSeries seriesName
     | throw (.userError s!"series '{seriesName}' not found")
@@ -346,7 +335,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
   let series        := p.flag? "series"    |>.map (·.as! String)
   let resumeSeries  := p.flag? "resume"    |>.map (·.as! String)
   let prompt        := p.flag? "prompt"    |>.map (·.as! String)
-  let budgetFlag    := p.flag? "budget"    |>.bind (fun v => parseFloat? (v.as! String))
+  let budgetFlag    := p.flag? "budget"    |>.bind (fun f => parseFloat? (f.as! String))
   let priorityFlag  := p.flag? "priority"  |>.map (·.as! Nat)
   let taskFile?     := (p.variableArgsAs? String |>.getD #[])[0]?
   match resumeSeries, taskFile? with
@@ -400,7 +389,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         let fp := System.FilePath.mk taskFile
         let absTaskFile ← if fp.isAbsolute then pure taskFile
           else pure ((← IO.currentDir) / taskFile |>.toString)
-        let vars := p.flag? "vars" |>.map (fun v => parseVarsJson (v.as! String)) |>.getD []
+        let vars := p.flag? "vars" |>.map (fun f => parseVarsJson (f.as! String)) |>.getD []
         let varsJson := if vars.isEmpty then Lean.Json.mkObj [] else Lean.Json.mkObj vars
         let req := Lean.Json.mkObj
           [ ("type",          "add_concert")
@@ -563,12 +552,12 @@ private def spawnServerBackground (args : Array String) : IO UInt32 := do
 /-- Re-emit a string flag as the pair `orchestrad` expects, or nothing when it was not given. -/
 private def passFlag (p : Parsed) (name : String) : Array String :=
   match p.flag? name with
-  | some v => #[s!"--{name}", v.as! String]
+  | some f => #[s!"--{name}", f.as! String]
   | none   => #[]
 
 private def passNatFlag (p : Parsed) (name : String) : Array String :=
   match p.flag? name with
-  | some v => #[s!"--{name}", toString (v.as! Nat)]
+  | some f => #[s!"--{name}", toString (f.as! Nat)]
   | none   => #[]
 
 private def passSwitch (p : Parsed) (name : String) : Array String :=
@@ -588,7 +577,7 @@ private def dashboardHandler (p : Parsed) : IO UInt32 := do
   execServer args
 
 private def queueListHandler (p : Parsed) : IO UInt32 := do
-  let limit := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
+  let atMost := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
   if ← Queue.daemonRunning then
     match ← Queue.readPid with
     | some pid => IO.println s!"Daemon running (PID {pid})"
@@ -596,7 +585,7 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
   else
     IO.println "Daemon not running"
   -- Concert run history
-  let concertRuns := (← Queue.loadAllConcertRuns).toList.take limit
+  let (concertRuns, _) ← Queue.concertRunsPage none 0 atMost
   if !concertRuns.isEmpty then
     IO.println ""
     IO.println s!"{padRight "CONCERT ID" 16} {padRight "STARTED" 20} {padRight "STATUS" 9} NAME"
@@ -606,7 +595,7 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
         | .running => "running" | .done => "done" | .failed => "failed" | .cancelled => "cancelled"
       IO.println s!"{padRight r.id 16} {padRight r.startedAt 20} {padRight status 9} {r.name.getD (r.workflowFile.getD "")}"
   -- Queue entries
-  let entries := (← Queue.loadAllEntries).toList.take limit
+  let (entries, _) ← Queue.entriesPage none 0 atMost
   if entries.isEmpty then
     IO.println "No queue entries found."
     return (0 : UInt32)
@@ -820,8 +809,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
   else
     IO.println "Daemon: not running"
   -- Running concerts
-  let allConcerts ← Queue.loadAllConcertRuns
-  let runningConcerts := allConcerts.filter (fun r => r.status == .running)
+  let runningConcerts := (← Queue.loadAllConcertRuns).filter (·.status == .running)
   if !runningConcerts.isEmpty then
     IO.println ""
     IO.println s!"Concerts: {runningConcerts.size} running"
@@ -831,8 +819,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
     for r in runningConcerts do
       IO.println s!"{padRight r.id 16} {padRight r.startedAt 20} {r.name.getD (r.workflowFile.getD "")}"
   -- Running and pending entries only
-  let all ← Queue.loadAllEntries
-  let active := all.filter (fun e => e.status == .running || e.status == .pending)
+  let active ← Queue.activeEntries
   if active.isEmpty then
     IO.println "Queue: empty"
   else
@@ -953,7 +940,7 @@ private def tasksCmd : Cmd := `[Cli|
   "List recent task runs."
 
   FLAGS:
-    limit : Nat; "Maximum number of tasks to show (default: 20)"
+    «limit» : Nat; "Maximum number of tasks to show (default: 20)"
 ]
 
 private def taskCmd : Cmd := `[Cli|
@@ -1261,7 +1248,7 @@ private def queueCmd : Cmd := `[Cli|
   "Manage the task queue."
 
   FLAGS:
-    limit : Nat; "Maximum number of entries to show (default: 20)"
+    «limit» : Nat; "Maximum number of entries to show (default: 20)"
 
   SUBCOMMANDS:
     queueAddCmd;
@@ -1370,7 +1357,7 @@ private def usageHandler (p : Parsed) : IO UInt32 := do
       -- Empty means the config has nothing to choose between — the legacy flat-token install.
       -- Falling back to every known label keeps the line informative there.
       let candidates := if pooled.isEmpty then labels else pooled
-      match ← Usage.select backend candidates mode model with
+      match ← Usage.selectSource backend candidates mode model with
       | .ok label => IO.println s!"  → would select: {label} ({mode.toString})"
       | .error e  => IO.println s!"  → would select: nothing ({e})"
   return 0
@@ -1385,7 +1372,7 @@ private def usageCmd : Cmd := `[Cli|
     model     : String; "Judge availability for this model (affects model-scoped limits)"
     cached    ;         "Do not poll; report the last stored values"
     refresh   ;         "Force a poll even if the stored values are still fresh"
-    select    ;         "Also show which source a task queued now would be dispatched to"
+    «select»  ;         "Also show which source a task queued now would be dispatched to"
     clear_blocks;       "Forget limits observed by a run on the selected sources, then report"
     auth_mode : String; "Selection mode to simulate with --select: ordered (default) or distribute"
 ]
@@ -1695,10 +1682,10 @@ one, --list to see them, or --end to end one."
       -- A budget that did not parse used to be dropped, and the session ran on the 20.0
       -- default: the one flag whose whole purpose is to bound spending, ignored in silence.
       let raw := bud.as! String
-      let some v := parseFloat? raw
+      let some amount := parseFloat? raw
         | do IO.eprintln s!"--budget takes an amount in dollars; '{raw}' is not one."
              return 1
-      fields := fields ++ [("budget", Lean.toJson v)]
+      fields := fields ++ [("budget", Lean.toJson amount)]
     if let some t := p.flag? "tools" then
       let names := ((t.as! String).splitOn ",").map (·.trimAscii.toString)
                      |>.filter (!·.isEmpty)
@@ -1747,7 +1734,7 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let toolsStr    := p.flag? "tools"    |>.map (·.as! String)
   let backend     := p.flag? "backend"  |>.map (·.as! String)
   let model       := p.flag? "model"    |>.map (·.as! String)
-  let budget      := p.flag? "budget"   |>.bind (fun v => parseFloat? (v.as! String)) |>.getD 4.0
+  let budget      := p.flag? "budget"   |>.bind (fun f => parseFloat? (f.as! String)) |>.getD 4.0
   let debug       := p.hasFlag "debug"
   let configPath  := p.flag? "config"   |>.map (·.as! String)
   let authSource  := p.flag? "auth_source" |>.map (·.as! String)
@@ -1902,4 +1889,11 @@ def main (args : List String) : IO UInt32 := do
   Utils.unbufferIfPiped
   gRawArgs.set args
   Project.ensureTaxisConfigured
+  -- The one-time carry-over of the JSON record directories. Before anything reads a record, and
+  -- wrapped: a database that cannot be imported into is a reason to say so, not a reason for the
+  -- binary to refuse to run — every command that does not touch a record still works.
+  try
+    Store.Import.run
+  catch e =>
+    IO.eprintln s!"[orchestra] legacy import failed: {e}"
   orchestraCmd.validate args

@@ -111,9 +111,9 @@ def enqueueTaskImpl (appConfig : AppConfig) (resolved : ResolvedSpawn) (spawnerT
     -- Counted over the queue rather than kept in memory: entries outlive the daemon, and an
     -- allowance that reset on restart is not an allowance. Terminal entries count too — the
     -- ceiling is on how much work a task may create, not on how much of it is still running.
-    let spawned := (← Queue.loadAllEntries).filter (·.spawnedBy == some spawnerTaskId)
-    if spawned.size ≥ resolved.maxTasks then
-      return .error s!"this task has already queued {spawned.size} task(s), which is all its \
+    let spawned ← Queue.countSpawnedBy spawnerTaskId
+    if spawned ≥ resolved.maxTasks then
+      return .error s!"this task has already queued {spawned} task(s), which is all its \
 spawn policy allows ({resolved.maxTasks})"
     -- Resolved even when the repository was inherited rather than named, so that one rule
     -- decides where a task pushes no matter how it got here (see `Orchestra.Spawn`).
@@ -507,7 +507,7 @@ def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
            Available: {", ".intercalate (agentAuth.authSources.toList.map (·.label))}")
     | some src =>
       let vars := agentDef.envVarsOfAuthSource src
-      return vars.map fun (k, v) => (k, some v)
+      return vars.map fun (k, value) => (k, some value)
 
 /-- Read back the status an agent-less backend (`merger`, `triage`) wrote for itself.
 
@@ -937,7 +937,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     | none => pure none
     | some j =>
       match ResultType.valueFromJson o j with
-      | .ok v    => pure (some v)
+      | .ok out  => pure (some out)
       | .error e =>
         IO.eprintln s!"  Warning: failed to parse task output: {e}"
         pure none

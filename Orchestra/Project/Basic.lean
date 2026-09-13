@@ -339,7 +339,7 @@ the way `freshProjectId`/`freshIssueId` used to hand out a locally-generated one
 `createIssue` to make a new one. -/
 
 private def unwrap {α} : Except String α → IO α
-  | .ok v => pure v
+  | .ok x => pure x
   | .error e => throw (.userError s!"taxis: {e}")
 
 /-- Bound on how far an ancestor walk (`findIssue`) follows `parent` pointers before giving up. -/
@@ -1079,7 +1079,7 @@ def renderComment (c : Orchestra.Taxis.Comment) : IO String := do
   let when ← Orchestra.Taxis.epochToIso8601 c.createdAt
   let who := c.authorName.getD "(unknown)"
   let verdict := match c.review with
-    | some v => s!" [review: {repr v}]"
+    | some r => s!" [review: {repr r}]"
     | none => ""
   return s!"  {who} at {when}{verdict}\n{indentBlock c.body}"
 

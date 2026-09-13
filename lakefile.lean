@@ -9,6 +9,10 @@ require Cli from git "https://github.com/leanprover/lean4-cli.git" @ "main"
 require Yaml from git "https://github.com/chrisflav/lean-yaml" @ "master"
 require Taxis from git "https://github.com/chrisflav/taxis" @ "d029b06a912a39fef52734ef90f29537561c7785"
 
+-- The record store's database layer: `Orchestra.Store` is written against it. Pinned to the
+-- revision of its master that merged chrisflav/db#14.
+require db from git "https://github.com/chrisflav/db" @ "179f8eea5c5c2eca0079c23aa54b76277c3cf472"
+
 /-- Compile a single C shim under `ffi/` into a static library of the same name. -/
 private def ffiStaticLib (pkg : Package) (name : String) : FetchM (Job System.FilePath) := do
   let cFile := pkg.dir / "ffi" / s!"{name}.c"

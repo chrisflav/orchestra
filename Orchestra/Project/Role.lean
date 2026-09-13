@@ -366,21 +366,21 @@ deriving Repr, Inhabited
 
 /-- Substitute `{{name}}` placeholders. Unknown placeholders are left in place
     so a template error is loud, not silent. -/
-def render (tmpl : String) (v : RenderVars) : String :=
+def render (tmpl : String) (vars : RenderVars) : String :=
   let subs : List (String × String) :=
-    [ ("{{project_id}}",    v.projectId)
-    , ("{{project_name}}",  v.projectName)
-    , ("{{instructions}}",  v.instructions)
-    , ("{{issue_id}}",      v.issueId.getD "")
-    , ("{{issue_title}}",   v.issueTitle.getD "")
-    , ("{{issue_description}}", v.issueDescription.getD "")
-    , ("{{issue_comments}}", v.issueComments.getD "")
-    , ("{{issue_context}}", v.issueContext.getD "")
-    , ("{{target_repo}}",   v.targetRepo.getD "")
-    , ("{{target_branch}}", v.targetBranch.getD "")
-    , ("{{pr_number}}",     v.prNumber.getD "")
-    , ("{{pr_branch}}",     v.prBranch.getD "")
-    , ("{{pr_repo}}",       v.prRepo.getD "") ]
+    [ ("{{project_id}}",    vars.projectId)
+    , ("{{project_name}}",  vars.projectName)
+    , ("{{instructions}}",  vars.instructions)
+    , ("{{issue_id}}",      vars.issueId.getD "")
+    , ("{{issue_title}}",   vars.issueTitle.getD "")
+    , ("{{issue_description}}", vars.issueDescription.getD "")
+    , ("{{issue_comments}}", vars.issueComments.getD "")
+    , ("{{issue_context}}", vars.issueContext.getD "")
+    , ("{{target_repo}}",   vars.targetRepo.getD "")
+    , ("{{target_branch}}", vars.targetBranch.getD "")
+    , ("{{pr_number}}",     vars.prNumber.getD "")
+    , ("{{pr_branch}}",     vars.prBranch.getD "")
+    , ("{{pr_repo}}",       vars.prRepo.getD "") ]
   subs.foldl (fun acc (k, val) => acc.replace k val) tmpl
 
 /-- Build render vars for a project + optional issue. Pulls the effective

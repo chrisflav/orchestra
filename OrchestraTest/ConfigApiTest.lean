@@ -24,21 +24,22 @@ private def tempRoot (tag : String) : IO System.FilePath := do
   return System.FilePath.mk "/tmp" / s!"orchestra-config-api-{tag}-{← IO.monoNanosNow}"
 
 /-- Run `act` with the listener, role and skill stores redirected into a temporary directory, so
-    that a test writing configuration cannot reach the developer's own. -/
+    that a test writing configuration cannot reach the developer's own.
+
+    Those three are configuration and keep their own overrides. Listener *state* is not
+    configuration — it is a row of `listener_state` — so it travels with the database, which
+    `withTempData` redirects along with the rest of the data directory. -/
 private def withTempStores (act : IO α) : IO α := do
   let root ← tempRoot "stores"
   IO.FS.createDirAll (root / "listeners")
-  IO.FS.createDirAll (root / "listener-state")
   IO.FS.createDirAll (root / "roles")
   IO.FS.createDirAll (root / "skills")
   Listener.setListenersConfigDirOverride (some (root / "listeners"))
-  Listener.setListenerStateDirOverride (some (root / "listener-state"))
   Project.setGlobalRolesDirOverride (some (root / "roles"))
   Skill.setSkillsDirOverride (some (root / "skills"))
-  try act
+  try Orchestra.withTempData "config-api" act
   finally
     Listener.setListenersConfigDirOverride none
-    Listener.setListenerStateDirOverride none
     Project.setGlobalRolesDirOverride none
     Skill.setSkillsDirOverride none
     try IO.FS.removeDirAll root catch _ => pure ()
@@ -281,66 +282,77 @@ def aListenerIsNamedByItsFile : Test := do
   TestM.assert (!byLegacy)
     (msg := "the name the document claims for itself is not a second identity")
 
-@[test]
-def listenerStateFollowsTheConfigToItsFileName : Test := do
-  -- State is the list of event ids already handled. A listener that came back under a new name
-  -- with no state behind it would re-fire every one of them, so the rename carries it over.
-  let (moved, untouched, quiet) ← withTempStores do
-    let legacyNamed := goodListener.replace "{\"interval_seconds\"" "{\"name\": \"opus-nightly\",
-      \"interval_seconds\""
-    Listener.saveListenerConfigRaw "nightly" legacyNamed
-    Listener.saveListenerState "opus-nightly"
-      { lastChecked := "2026-07-25T00:00:00Z", processedIds := #["17"] }
-    -- A second listener whose file and field already agree: nothing to move, and nothing said.
-    Listener.saveListenerConfigRaw "morning" goodListener
-    Listener.saveListenerState "morning" { lastChecked := "", processedIds := #["4"] }
-    Listener.migrateListenerStateNames
-    let moved ← Listener.loadListenerState "nightly"
-    let untouched ← Listener.loadListenerState "morning"
-    -- Idempotent: the second run has nothing left to find.
-    Listener.migrateListenerStateNames
-    let quiet ← Listener.loadListenerState "nightly"
-    return (moved.processedIds, untouched.processedIds, quiet.processedIds)
-  TestM.assertEqual moved #["17"]
-    (msg := "the state arrived under the name the file gives the listener")
-  TestM.assertEqual untouched #["4"] (msg := "a listener that never disagreed is left alone")
-  TestM.assertEqual quiet #["17"] (msg := "and running the migration again changes nothing")
+/-! ### Listener state
+
+A row of `listener_state` keyed by the name the config file gives the listener. It is the list of
+event ids already handled, so what has to hold of it is that nothing in it is lost on the way
+through: a listener that came back with a shorter list re-queues everything the difference
+names. -/
 
 @[test]
-def listenerStateSurvivesADisableIssuedBeforeTheMigrationRan : Test := do
-  -- The API writes a state file the moment someone toggles `enabled`, and since the CLI/backend
-  -- split it can be a process of its own that never runs the migration. So `orchestra listener
-  -- disable nightly` between the upgrade and the daemon's restart leaves a state file with no
-  -- history in it under exactly the name the history is about to move to. Abandoning the history
-  -- on its account is the thing this migration exists to prevent.
-  let (carried, stillDisabled, kept, keptEnabled) ← withTempStores do
-    let legacyNamed := goodListener.replace "{\"interval_seconds\"" "{\"name\": \"opus-nightly\",
-      \"interval_seconds\""
-    Listener.saveListenerConfigRaw "nightly" legacyNamed
-    Listener.saveListenerState "opus-nightly"
-      { lastChecked := "2026-07-25T00:00:00Z", processedIds := #["17"] }
-    -- Exactly what `PUT /api/v1/listeners/nightly/enabled` writes against no prior state.
-    Listener.saveListenerState "nightly" { lastChecked := "", processedIds := #[], enabled := false }
-    -- A second listener whose destination has been polling under its own name: that history is
-    -- someone else's, and the migration must not write over it.
-    let otherLegacy := goodListener.replace "{\"interval_seconds\"" "{\"name\": \"opus-morning\",
-      \"interval_seconds\""
-    Listener.saveListenerConfigRaw "morning" otherLegacy
-    Listener.saveListenerState "opus-morning" { lastChecked := "", processedIds := #["1"] }
-    Listener.saveListenerState "morning"
-      { lastChecked := "2026-07-26T00:00:00Z", processedIds := #["9"], enabled := true }
-    Listener.migrateListenerStateNames
-    let carried ← Listener.loadListenerState "nightly"
-    let kept    ← Listener.loadListenerState "morning"
-    return (carried.processedIds, carried.enabled, kept.processedIds, kept.enabled)
-  TestM.assertEqual carried #["17"]
-    (msg := "the history moved into the state file the disable had already created")
-  TestM.assertEqual stillDisabled false
-    (msg := "and the disable that created it still stands — the history came, the flag stayed")
-  TestM.assertEqual kept #["9"]
-    (msg := "a destination with history of its own belongs to a listener already polling \
-             under that name, and is left alone")
-  TestM.assertEqual keptEnabled true (msg := "including its enabled flag")
+def listenerStateRoundTripsThroughTheStore : Test := do
+  let (loaded, absent) ← withTempStores do
+    let state : Listener.ListenerState := {
+      lastChecked  := "2026-07-25T00:00:00Z"
+      processedIds := #["acme/widgets:17", "acme/widgets:42"]
+      enabled      := false
+      dispatches   := #["2026-07-25T00:00:00Z", "2026-07-25T00:05:00Z"] }
+    Listener.saveListenerState "nightly" state
+    pure (← Listener.loadListenerState "nightly", ← Listener.loadListenerState "never-run")
+  TestM.assertEqual loaded.lastChecked "2026-07-25T00:00:00Z" (msg := "when it last looked")
+  TestM.assertEqual loaded.processedIds #["acme/widgets:17", "acme/widgets:42"]
+    (msg := "every processed id, in order")
+  TestM.assertEqual loaded.enabled false (msg := "the enabled flag the API toggles")
+  TestM.assertEqual loaded.dispatches #["2026-07-25T00:00:00Z", "2026-07-25T00:05:00Z"]
+    (msg := "and the dispatch stamps a rate limit counts")
+  -- A listener that has never run is a blank state rather than an absence every caller handles,
+  -- and it is enabled: a listener nobody has disabled is one that should poll.
+  TestM.assertEqual absent.lastChecked "" (msg := "a listener that has never run")
+  TestM.assert absent.processedIds.isEmpty (msg := "has handled nothing")
+  TestM.assertEqual absent.enabled true (msg := "and is nonetheless enabled")
+
+@[test]
+def savingListenerStateTwiceLeavesOneRow : Test := do
+  let (loaded, listed) ← withTempStores do
+    Listener.saveListenerState "nightly" { lastChecked := "a", processedIds := #["1"] }
+    Listener.saveListenerState "nightly" { lastChecked := "b", processedIds := #["1", "2"] }
+    let rows ← Orchestra.Store.run <|
+      HasModel.fetch (QuerySet.all (α := Orchestra.Store.ListenerStateRow))
+    pure (← Listener.loadListenerState "nightly", rows.size)
+  TestM.assertEqual listed 1 (msg := "one row, not two")
+  TestM.assertEqual loaded.processedIds #["1", "2"] (msg := "and the second write stands")
+
+@[test]
+def listenerStateImportsFromItsLegacyFiles : Test := do
+  -- Keyed by the file's stem, which is the name a listener has. That is also what
+  -- `migrateListenerStateNames` established on every daemon start-up before this import
+  -- replaced it, so a state file written under a config's old in-file name is not carried
+  -- anywhere: it is imported under the file it is in, and the config that matches that file
+  -- finds it.
+  let (nightly, skipped, twice) ← withTempStores do
+    let dir ← Listener.legacyListenerStateDir
+    IO.FS.createDirAll dir
+    IO.FS.writeFile (dir / "nightly.json") (Lean.Json.compress (Lean.ToJson.toJson
+      ({ lastChecked := "2026-07-25T00:00:00Z", processedIds := #["17"], enabled := false
+         dispatches := #["2026-07-25T00:00:00Z"] } : Listener.ListenerState)))
+    -- A stem no config file could match: skipped rather than stored under a key nothing looks up.
+    IO.FS.writeFile (dir / "..json") (Lean.Json.compress (Lean.ToJson.toJson
+      ({ lastChecked := "", processedIds := #["9"] } : Listener.ListenerState)))
+    Orchestra.Store.Import.run
+    let nightly ← Listener.loadListenerState "nightly"
+    -- A second run must not put the file back over what has been polled since.
+    Listener.saveListenerState "nightly" { nightly with processedIds := #["17", "18"] }
+    Orchestra.Store.Import.run
+    let twice ← Listener.loadListenerState "nightly"
+    let rows ← Orchestra.Store.run <|
+      HasModel.fetch (QuerySet.all (α := Orchestra.Store.ListenerStateRow))
+    pure (nightly, rows.size, twice)
+  TestM.assertEqual nightly.processedIds #["17"] (msg := "the processed ids came over")
+  TestM.assertEqual nightly.lastChecked "2026-07-25T00:00:00Z" (msg := "with the stamp")
+  TestM.assertEqual nightly.enabled false (msg := "and the disable that was in force")
+  TestM.assertEqual skipped 1 (msg := "the unusable stem stored nothing")
+  TestM.assertEqual twice.processedIds #["17", "18"]
+    (msg := "and the second import leaves what was polled in between alone")
 
 @[test]
 def roleRoundTrip : Test := do

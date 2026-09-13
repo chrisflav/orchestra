@@ -456,7 +456,7 @@ private def optStrArg (args : Json) (field : String) : Except String (Option Str
   | .ok .null => .ok none
   | .ok _     =>
     match args.getObjValAs? String field with
-    | .ok v    => .ok (some v)
+    | .ok s    => .ok (some s)
     | .error e => .error s!"{field} must be a string: {e}"
 
 private def parseTarget? (args : Json) : Except String (Option RepoTarget) := do
@@ -528,7 +528,7 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
       let dependencies ←
         if !present "dependency_ids" then pure none
         else match args.getObjValAs? (Array Taxis.IssueId) "dependency_ids" with
-          | .ok v    => pure (some v)
+          | .ok ids  => pure (some ids)
           | .error e => Except.error s!"dependency_ids must be an array of issue ids: {e}"
       -- Names are trimmed, and a blank one is refused rather than passed down to be reported as
       -- `no such label: `. `label_issue` already draws the line here on the GitHub side.
@@ -644,7 +644,7 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
       let tools ← match args.getObjVal? "tools" with
         | .error _  => pure none
         | .ok .null => pure none
-        | .ok v     => (FromJson.fromJson? v : Except String (List String)).map some
+        | .ok j     => (FromJson.fromJson? j : Except String (List String)).map some
       let budget ← match args.getObjVal? "budget" with
         | .error _  => pure none
         | .ok .null => pure none

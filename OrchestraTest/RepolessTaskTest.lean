@@ -119,6 +119,12 @@ def aRepositoryStillRoundTrips : Test := do
 
 /-! ## Slot pooling -/
 
+/-- The predecessor lookup `claimDecision` takes, answered out of an array held in memory. The
+    daemon passes `Queue.entryForTask`, which is one indexed query for the same question. -/
+private def predIn (entries : Array Queue.QueueEntry) :
+    String → IO (Option Queue.QueueEntry) :=
+  fun tid => pure (entries.find? (·.taskId == some tid))
+
 @[test]
 def repositoryIndependentEntriesShareOnePool : Test := do
   let a := { entryWithout with id := "0001" }
@@ -139,11 +145,11 @@ def theWorkspacePoolIsBoundedLikeARepository : Test := do
     { occupiedSlots := Std.HashMap.ofList [(entryWithout.slotKey, #[0])]
       total := 1, exclusiveActive := false, parallelLimit := 4, perRepoLimit := 1
       parallelSafe := fun _ => true }
-  let got ← Queue.claimDecision ctx all (fun _ _ => pure none)
+  let got ← Queue.claimDecision ctx all (predIn all) (fun _ _ => pure none)
   TestM.assertEqual (got.map (·.entry.id)) none
     (msg := "the workspace pool is full, so nothing else starts in it")
   let ctx' := { ctx with perRepoLimit := 2 }
-  let got' ← Queue.claimDecision ctx' all (fun _ _ => pure none)
+  let got' ← Queue.claimDecision ctx' all (predIn all) (fun _ _ => pure none)
   TestM.assertEqual (got'.map (·.entry.id)) (some "0002")
     (msg := "a second slot lets the waiting entry start")
   TestM.assertEqual (got'.map (·.slot)) (some 1) (msg := "…in the free slot, not the busy one")
@@ -157,12 +163,13 @@ def aContinuationAsksForTheWorkspaceItsPredecessorLeft : Test := do
   let pred := { entryWithout with
                 id := "0001", taskId := some "task-1", slot := some 3, status := .done }
   let cont := { entryWithout with id := "0002", continuesFrom := some "task-1" }
+  let all := #[pred, cont]
   let ctx : Queue.ClaimContext :=
     { occupiedSlots := Std.HashMap.ofList [], total := 0, exclusiveActive := false
       parallelLimit := 4, perRepoLimit := 4, parallelSafe := fun _ => true }
   let occupant : Option Repository → Nat → IO (Option String) :=
     fun fork slot => pure (if fork.isNone && slot == 3 then some "0001" else none)
-  let got ← Queue.claimDecision ctx #[pred, cont] occupant
+  let got ← Queue.claimDecision ctx all (predIn all) occupant
   TestM.assertEqual (got.map (·.slot)) (some 3) (msg := "back to the predecessor's workspace")
   TestM.assertEqual (got.bind (·.resumeFrom)) (some "0001") (msg := "and it is kept, not emptied")
 

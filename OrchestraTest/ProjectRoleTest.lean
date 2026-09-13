@@ -47,14 +47,14 @@ private def fixtureIssue (id : Int64) (project : Project) (status : IssueStatus 
 
 @[test]
 def renderSubstitutesPlaceholders : Test := do
-  let v : RenderVars :=
+  let vars : RenderVars :=
     { projectId := "p1", projectName := "API",
       instructions := "go", issueId := some "i1",
       issueTitle := some "do x",
       targetRepo := some "o/r", targetBranch := some "main" }
   let out := render
     "[{{project_name}} / {{issue_id}}] {{issue_title}} on {{target_repo}}@{{target_branch}}: {{instructions}}"
-    v
+    vars
   TestM.assertEqual out "[API / i1] do x on o/r@main: go" (msg := "render substitution")
 
 /-- The issue body has to reach the agent through the prompt: `get_issue` is the only tool that
@@ -64,13 +64,13 @@ def renderSubstitutesPlaceholders : Test := do
     implementor template actually uses it. -/
 @[test]
 def renderSubstitutesIssueDescription : Test := do
-  let v : RenderVars :=
+  let vars : RenderVars :=
     { projectId := "9", projectName := "Formal schemes",
       instructions := "", issueId := some "9",
       issueTitle := some "Formal schemes",
       issueDescription := some "Suggested reference EGA I.",
       targetRepo := some "o/r", targetBranch := some "master" }
-  TestM.assertEqual (render "{{issue_description}}" v) "Suggested reference EGA I."
+  TestM.assertEqual (render "{{issue_description}}" vars) "Suggested reference EGA I."
     (msg := "issue_description substitution")
   -- An issue-less render (planner-style) leaves it empty rather than failing.
   let noIssue : RenderVars := { projectId := "1", projectName := "P", instructions := "" }
@@ -288,11 +288,11 @@ def dispatcherEmitsAtMostOnePerRolePerTick : Test := do
     is no rejected status. -/
 @[test]
 def renderSubstitutesIssueComments : Test := do
-  let v : RenderVars :=
+  let vars : RenderVars :=
     { projectId := "9", projectName := "P", instructions := ""
     , issueId := some "57", issueTitle := some "t"
     , issueComments := some "  reviewer at 2026-01-01 [review: requestChanges]\n    fix the proof" }
-  let out := render "thread:\n{{issue_comments}}" v
+  let out := render "thread:\n{{issue_comments}}" vars
   TestM.assert ((out.splitOn "fix the proof").length > 1) "comment body substituted"
   -- Absent thread renders empty rather than leaving the placeholder visible.
   let noComments : RenderVars := { projectId := "1", projectName := "P", instructions := "" }
@@ -304,11 +304,11 @@ def renderSubstitutesIssueComments : Test := do
     rediscover whatever the last one already worked out. -/
 @[test]
 def renderSubstitutesIssueContext : Test := do
-  let v : RenderVars :=
+  let vars : RenderVars :=
     { projectId := "9", projectName := "P", instructions := ""
     , issueId := some "57", issueTitle := some "t"
     , issueContext := some "  [12] Repro\n    Fails only with --jobs 1" }
-  let out := render "notes:\n{{issue_context}}" v
+  let out := render "notes:\n{{issue_context}}" vars
   TestM.assert ((out.splitOn "Fails only with").length > 1) "note body substituted"
   let noNotes : RenderVars := { projectId := "1", projectName := "P", instructions := "" }
   TestM.assertEqual (render "[{{issue_context}}]" noNotes) "[]"

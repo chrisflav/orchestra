@@ -58,7 +58,8 @@ services:
       # Edit it in place afterwards — it is then used as-is and the environment is ignored. The
       # same directory holds listeners/, roles/, prompts/ and secrets.json.
       - ./config:/config
-      # Task history, queue state, cloned repos, per-project roles.
+      # The record database (orchestra.db), cloned repos, task logs, per-project roles. Must be
+      # the same directory the dashboard mounts, and a real local filesystem — see below.
       - ./data:/data
       # GitHub App private key and anything else secret. Mounted read-only, and as a *directory*
       # rather than naming the .pem directly: Docker silently creates a directory in place of a
@@ -74,11 +75,16 @@ services:
   # why a task is stuck. (`orchestrad serve` runs both in one process, which is the right shape
   # for a single-host install and the wrong one here.)
   #
-  # Nothing here dispatches work. It reads the state files the daemon writes, and it writes the
-  # configuration files the daemon reads — listeners, roles and skills — which the daemon picks up
-  # without a restart. It can also ask the daemon to cancel one running task, which travels over
-  # the daemon's control socket in /data rather than over any port: that is why the two share
-  # /data and why cancelling works across the container boundary at all.
+  # Nothing here dispatches work. It reads the records the daemon writes — rows of the SQLite
+  # database at /data/orchestra/orchestra.db — and it writes the configuration files the daemon
+  # reads, listeners, roles and skills, which the daemon picks up without a restart. It can also
+  # ask the daemon to cancel one running task, which travels over the daemon's control socket in
+  # /data rather than over any port.
+  #
+  # That is why both services mount the *same* /data, and why it has to be one ordinary directory
+  # on a real filesystem: the two containers are two processes on one SQLite file, and the WAL
+  # mode that lets them read and write it at the same time does not work over NFS, SMB or any
+  # other network mount.
   dashboard:
     # Same build as above so `docker compose build` produces the one image both services use;
     # Compose builds it once and reuses it.

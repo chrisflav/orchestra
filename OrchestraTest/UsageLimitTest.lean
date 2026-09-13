@@ -125,8 +125,8 @@ private def warningHeaders : Array (String × String) := #[
 
 /-- `warningHeaders` with the 7d window's status replaced. -/
 private def withWeeklyStatus (status : String) : Array (String × String) :=
-  warningHeaders.map fun (k, v) =>
-    if k == "anthropic-ratelimit-unified-7d-status" then (k, status) else (k, v)
+  warningHeaders.map fun (k, value) =>
+    if k == "anthropic-ratelimit-unified-7d-status" then (k, status) else (k, value)
 
 @[test]
 def parseUnifiedHeaders_aWarnedWindowIsNotBinding : Test := do
@@ -174,8 +174,8 @@ def parseUnifiedHeaders_anAbsentStatusIsAllowed : Test := do
 def parseUnifiedHeaders_hundredPercentBindsWhateverTheStatusSays : Test := do
   -- The percentage is the backstop: a window reported as full binds even when the status field
   -- says something reassuring.
-  let hs := warningHeaders.map fun (k, v) =>
-    if k == "anthropic-ratelimit-unified-7d-utilization" then (k, "1") else (k, v)
+  let hs := warningHeaders.map fun (k, value) =>
+    if k == "anthropic-ratelimit-unified-7d-utilization" then (k, "1") else (k, value)
   match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
   | none   => TestM.fail "expected a weekly_all limit"
   | some l => TestM.assert l.isActive (msg := "100% binds regardless of status")
@@ -1104,3 +1104,195 @@ def window_roundTripsThroughJson : Test := do
     TestM.assertEqual back.peakPercent w.peakPercent
     TestM.assertEqual back.lastPercent w.lastPercent
     TestM.assertEqual back.samples w.samples
+
+/-! ## The store underneath
+
+Everything above is the arithmetic, which needs no clock and no disk. This is the other half: the
+state and the history are rows of `usage_source` and `usage_window` now, and what has to hold of
+them is that a source comes back as it went in, that the windows come back in the order they were
+written, and that the poll path folds into what is stored rather than beside it.
+
+Every one of these redirects `Dirs.dataBase`, so the database is a file in a temporary directory
+and the suite never touches the developer's own. -/
+
+private def withUsageData (act : IO α) : IO α := Orchestra.withTempData "usage" act
+
+/-- A state with nothing left at its default: both arrays non-empty, every option set. A field
+    that lost its column on the way through has nowhere to hide in the comparison. -/
+private def fullState : SourceState := {
+  backend      := "claude"
+  label        := "main"
+  fetchedEpoch := some t0
+  limits       := #[{ kind := .session, group := "session", percent := 42, severity := "warning"
+                      resetsAt := some reset1, scopeModel := none, isActive := false },
+                    { kind := .weeklyScoped, group := "weekly", percent := 100
+                      severity := "critical", resetsAt := some reset2, scopeModel := some "Opus"
+                      isActive := true }]
+  blocks       := #[{ untilEpoch := some (t0 + 3600), model := some "Opus"
+                      reason := "observed 429" },
+                    { untilEpoch := none, model := none, reason := "polled" }]
+  lastUsedTick := some 1784851200000000000
+  lastError    := some "the endpoint said 500"
+  pollAfter    := some (t0 + 600)
+}
+
+@[test]
+def usageState_roundTripsThroughTheStore : Test := do
+  let (loaded, absent) ← withUsageData do
+    saveState fullState
+    pure (← loadState "claude" "main", ← loadState "claude" "never-polled")
+  let same := (Lean.ToJson.toJson loaded).compress == (Lean.ToJson.toJson fullState).compress
+  TestM.assert same (msg := s!"every field survives: {(Lean.ToJson.toJson loaded).compress}")
+  TestM.assertEqual loaded.limits.size 2 (msg := "both limits came back")
+  TestM.assertEqual loaded.blocks.size 2 (msg := "both blocks came back")
+  TestM.assertEqual loaded.lastError (some "the endpoint said 500") (msg := "the last error")
+  -- A source nothing has ever polled is a blank state rather than an absence every caller has
+  -- to handle: that is what the missing file used to be.
+  TestM.assertEqual absent.backend "claude" (msg := "an unpolled source names itself")
+  TestM.assertEqual absent.label "never-polled" (msg := "and its label")
+  TestM.assert absent.limits.isEmpty (msg := "with nothing known about it yet")
+
+@[test]
+def usageState_isKeyedByBothBackendAndLabel : Test := do
+  -- One label, two backends: separate rows, or one account's limits would answer for another's.
+  let (a, b) ← withUsageData do
+    saveState { fullState with backend := "claude", lastError := some "claude" }
+    saveState { fullState with backend := "vibe",   lastError := some "vibe" }
+    pure (← loadState "claude" "main", ← loadState "vibe" "main")
+  TestM.assertEqual a.lastError (some "claude") (msg := "the claude row")
+  TestM.assertEqual b.lastError (some "vibe") (msg := "and the vibe row beside it")
+
+@[test]
+def usageState_savingTwiceLeavesOneSource : Test := do
+  let loaded ← withUsageData do
+    saveState fullState
+    saveState { fullState with lastError := none, limits := #[] }
+    loadState "claude" "main"
+  TestM.assertEqual loaded.lastError none (msg := "the second write stands")
+  TestM.assert loaded.limits.isEmpty (msg := "including the array it emptied")
+
+private def windowAt (kind : LimitKind) (stamp : Int) (percent : Nat) : Window :=
+  { kind, scope := none, resetEpoch := some (stamp + 3600), startEpoch := stamp
+    lastEpoch := stamp, peakPercent := percent, lastPercent := percent, samples := 1 }
+
+@[test]
+def usageHistory_comesBackInTheOrderItWasWritten : Test := do
+  -- Order is not decoration: every fold over the history takes the *last* window of a series as
+  -- the open one, so a history that came back shuffled would roll the wrong window over.
+  let (windows, other) ← withUsageData do
+    saveHistory "claude" "main"
+      #[windowAt .session t0 10, windowAt .session (t0 + 18000) 40,
+        windowAt .weeklyAll (t0 + 36000) 75]
+    -- A second source, to pin that a source's history is its own.
+    saveHistory "claude" "spare" #[windowAt .session t0 99]
+    pure (← loadHistory "claude" "main", ← loadHistory "claude" "spare")
+  TestM.assertEqual (windows.map (·.lastEpoch)).toList [t0, t0 + 18000, t0 + 36000]
+    (msg := "oldest first, exactly as written")
+  TestM.assertEqual (windows.map (·.peakPercent)).toList [10, 40, 75] (msg := "with their peaks")
+  TestM.assertEqual windows[2]!.kind LimitKind.weeklyAll (msg := "and their kinds")
+  TestM.assertEqual other.size 1 (msg := "the source beside it kept its own single window")
+
+@[test]
+def usageHistory_aSaveReplacesWhatWasThere : Test := do
+  -- `recordWindows` hands back the whole sequence every time, so a save that appended would
+  -- double the history on every poll.
+  let windows ← withUsageData do
+    saveHistory "claude" "main" #[windowAt .session t0 10, windowAt .session (t0 + 18000) 40]
+    saveHistory "claude" "main" #[windowAt .session (t0 + 18000) 55]
+    loadHistory "claude" "main"
+  TestM.assertEqual windows.size 1 (msg := "one window, not three")
+  TestM.assertEqual windows[0]!.peakPercent 55 (msg := "and it is the one last written")
+
+@[test]
+def usageHistory_survivesAScopedWindowWhole : Test := do
+  let windows ← withUsageData do
+    saveHistory "claude" "main"
+      #[{ kind := .weeklyScoped, scope := some "Opus", resetEpoch := some (t0 + 86400)
+          startEpoch := t0, lastEpoch := t1, peakPercent := 100, lastPercent := 90, samples := 9 }]
+    loadHistory "claude" "main"
+  match windows[0]? with
+  | none   => TestM.fail "the window did not come back"
+  | some w =>
+    TestM.assertEqual w.scope (some "Opus") (msg := "the model scope")
+    TestM.assertEqual w.resetEpoch (some (t0 + 86400)) (msg := "the reset time")
+    TestM.assertEqual w.peakPercent 100 (msg := "the peak")
+    TestM.assertEqual w.lastPercent 90 (msg := "and the last reading, which is not the peak")
+    TestM.assertEqual w.samples 9 (msg := "and how many polls it was built from")
+
+@[test]
+def recordPoll_foldsIntoTheStoredWindows : Test := do
+  -- Two polls of the same window, then one after it has rolled over. What `recordWindows`
+  -- computes out of that is pinned above without a database; this is that the poll path reads
+  -- and writes the rows it computes over.
+  let windows ← withUsageData do
+    recordPoll "claude" "main" #[sessionAt 10 (some reset1)] t0
+    recordPoll "claude" "main" #[sessionAt 40 (some reset1)] (t0 + 1800)
+    recordPoll "claude" "main" #[sessionAt 5 (some reset2)] (t0 + 18000)
+    loadHistory "claude" "main"
+  TestM.assertEqual windows.size 2 (msg := "one window rolled over into a second")
+  TestM.assertEqual windows[0]!.samples 2 (msg := "the first window kept both of its polls")
+  TestM.assertEqual windows[0]!.peakPercent 40 (msg := "at the higher of the two readings")
+  TestM.assertEqual windows[1]!.samples 1 (msg := "and the new window has the third")
+  TestM.assertEqual windows[1]!.peakPercent 5 (msg := "starting from a fresh low")
+
+/-! ### The legacy import
+
+The state files were `<data>/usage/<backend>/<label>.json`, with the history in a
+`<label>.history.json` beside them. -/
+
+private def writeLegacyUsage : IO Unit := do
+  let dir ← Usage.legacyUsageDir
+  IO.FS.createDirAll (dir / "claude")
+  -- The file name is the label flattened to what a filename may hold; the document carries the
+  -- one config actually uses, and that is the one the import has to key on.
+  IO.FS.writeFile (dir / "claude" / "main_spare.json")
+    (Lean.Json.compress (Lean.ToJson.toJson { fullState with label := "main spare" }))
+  IO.FS.writeFile (dir / "claude" / "main_spare.history.json")
+    (Lean.Json.compress (Lean.Json.mkObj [("windows",
+      Lean.ToJson.toJson #[windowAt .session t0 10, windowAt .session (t0 + 18000) 40])]))
+  -- A history with no state file beside it: imported under its stem, since that is all there is
+  -- left to call it by.
+  IO.FS.writeFile (dir / "claude" / "orphan.history.json")
+    (Lean.Json.compress (Lean.Json.mkObj [("windows",
+      Lean.ToJson.toJson #[windowAt .weeklyAll t0 75])]))
+  -- Not a record, and not a directory to descend into either.
+  IO.FS.writeFile (dir / "notes.txt") "left behind by a person"
+
+private def usageMarkers : IO (Array (String × Int)) := do
+  let rows ← Orchestra.Store.run <|
+    HasModel.fetch (QuerySet.all (α := Orchestra.Store.LegacyImportRow))
+  return (rows.filter (·.store == "usage sources")).map fun r => (r.store, r.records)
+
+@[test]
+def usageImport_carriesStateAndHistoryOver : Test := do
+  let (state, history, orphan, marks) ← withUsageData do
+    writeLegacyUsage
+    Orchestra.Store.Import.run
+    pure (← loadState "claude" "main spare", ← loadHistory "claude" "main spare",
+          ← loadHistory "claude" "orphan", ← usageMarkers)
+  TestM.assertEqual state.lastError (some "the endpoint said 500")
+    (msg := "the state came over under the label the document carries, not the file name")
+  TestM.assertEqual state.blocks.size 2 (msg := "with its blocks")
+  TestM.assertEqual (history.map (·.peakPercent)).toList [10, 40]
+    (msg := "and its history, in order")
+  TestM.assertEqual (orphan.map (·.peakPercent)).toList [75]
+    (msg := "a history with no state file is imported under its stem")
+  TestM.assertEqual marks.toList [("usage sources", 1)]
+    (msg := "one source imported, and counted as one")
+
+@[test]
+def usageImport_runsOnlyOnce : Test := do
+  -- The marker is what says the directory has been carried over. A second run that imported
+  -- again would put the file's history back on top of whatever has been polled since.
+  let (state, history, marks) ← withUsageData do
+    writeLegacyUsage
+    Orchestra.Store.Import.run
+    saveState { fullState with label := "main spare", lastError := none }
+    saveHistory "claude" "main spare" #[windowAt .session (t0 + 36000) 88]
+    Orchestra.Store.Import.run
+    pure (← loadState "claude" "main spare", ← loadHistory "claude" "main spare",
+          ← usageMarkers)
+  TestM.assertEqual state.lastError none (msg := "what was saved in between is not clobbered")
+  TestM.assertEqual (history.map (·.peakPercent)).toList [88]
+    (msg := "and the history written since is not doubled by a second import")
+  TestM.assertEqual marks.size 1 (msg := "still one marker")
