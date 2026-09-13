@@ -32,6 +32,7 @@ import Orchestra.Interactive.Store
 import Orchestra.Interactive
 import Orchestra.TaskRunner
 import Orchestra.Store
+import Orchestra.Store.Import
 import Orchestra.TaskStore
 import Orchestra.Usage
 import Orchestra.Workflow
