@@ -313,7 +313,9 @@ def SessionRecord.toRow (r : SessionRecord) : Store.InteractiveSessionRow :=
     fork             := r.fork.toString
     backend          := r.backend
     model            := r.model
-    budget           := r.budget
+    -- NaN and the infinities have no SQL literal; a session's budget and its cost are not
+    -- optional, so an unusable one is stored as zero rather than losing the whole record.
+    budget           := Store.floatColumn r.budget
     slot             := Store.natColumn r.slot
     agent_session_id := r.agentSessionId
     agent_started    := r.agentStarted
@@ -322,7 +324,7 @@ def SessionRecord.toRow (r : SessionRecord) : Store.InteractiveSessionRow :=
     system_prompt    := r.systemPrompt
     identity         := r.identity
     turn_count       := Store.natColumn r.turnCount
-    cost_usd         := r.costUsd
+    cost_usd         := Store.floatColumn r.costUsd
     last_event_seq   := Store.natColumn r.lastEventSeq
     title            := r.title
     error            := r.error }

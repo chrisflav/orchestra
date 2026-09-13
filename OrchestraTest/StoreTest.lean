@@ -151,6 +151,37 @@ def aConcertRunSurvivesTheRoundTrip : Test := do
   | none   => TestM.fail "the run did not come back"
   | some r => TestM.assert (sameJson r run) "every field survives"
 
+/-! ## Numbers a column cannot hold
+
+NaN and the infinities have no SQL literal, so the library's renderer refuses them and a save
+carrying one throws with a syntax error — losing the whole record over a number nothing can act on
+anyway. `toRow` maps them out on the way in. -/
+
+/-- A budget that has gone non-finite still leaves a record that saves and comes back. -/
+@[test]
+def aNonFiniteNumberDoesNotCostTheRecord : Test := do
+  let nan := (0.0 : Float) / 0.0
+  let inf := (1.0 : Float) / 0.0
+  let (task, entry, session) ← withTempData do
+    TaskStore.saveTask { fullTask with budget := some nan }
+    Queue.saveEntry { fullEntry with budget := some inf }
+    Interactive.saveSession {
+      id := "i-nan", createdAt := "2026-09-13T10:04:12Z"
+      lastActivityAt := "2026-09-13T10:04:12Z"
+      upstream := { owner := "acme", name := "widgets" }
+      fork := { owner := "bot", name := "widgets" }
+      budget := inf, costUsd := nan }
+    pure (← TaskStore.loadTask "t-full", ← Queue.loadEntry "q-full",
+          ← Interactive.loadSession "i-nan")
+  match task, entry, session with
+  | some t, some e, some s =>
+    TestM.assert t.budget.isNone "an unusable budget is stored as no budget"
+    TestM.assert e.budget.isNone "and the same on a queue entry"
+    TestM.assert (s.budget == 0.0 && s.costUsd == 0.0)
+      "a session's budget and cost are not optional, so an unusable one is zero"
+  | _, _, _ =>
+    TestM.fail "a non-finite number took the whole record down with it"
+
 /-! ## A save replaces, and does not accumulate -/
 
 @[test]

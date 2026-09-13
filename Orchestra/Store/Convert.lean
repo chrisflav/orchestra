@@ -93,6 +93,20 @@ def rawJsonOfColumn? (field : String) : Option String → Except String (Option 
   | none   => .ok none
   | some s => (Json.parse s).mapError (fun e => s!"{field}: invalid JSON: {e}") |>.map some
 
+/-- A `Float` column value: the number, unless it is not finite.
+
+    NaN and the infinities have no SQL literal, so the library refuses them — a save carrying one
+    throws, and the record it was on is simply not stored. A budget or a cost that has gone
+    non-finite is a number nothing can act on anyway (no comparison against NaN is ever true), so
+    it is written as zero and the record survives. -/
+def floatColumn (x : Float) : Float :=
+  if x.isFinite then x else 0.0
+
+/-- An optional `Float` column value: NULL where the value is not finite, for the reason
+    `floatColumn` gives. Absent is what an unusable budget most nearly means. -/
+def optFloatColumn (x : Option Float) : Option Float :=
+  x.filter Float.isFinite
+
 /-- A `Nat` column value. `Nat` is not a column type; `int` is, and orchestra's counters —
     priorities, slots, sequence numbers — are naturals that no arithmetic here takes below zero. -/
 def natColumn (n : Nat) : Int := Int.ofNat n

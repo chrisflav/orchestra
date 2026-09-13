@@ -377,7 +377,8 @@ def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
     task_id              := e.taskId
     slot                 := e.slot.map Store.natColumn
     config_path          := e.configPath
-    budget               := e.budget
+    -- NaN and the infinities have no SQL literal; an unusable budget is stored as no budget.
+    budget               := Store.optFloatColumn e.budget
     memory               := Store.enumColumn e.memory
     identity             := e.identity
     auth_source          := e.authSource

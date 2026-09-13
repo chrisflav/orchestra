@@ -206,7 +206,8 @@ def TaskRecord.toRow (r : TaskRecord) : Store.TaskRow :=
     agent          := r.agent
     system_prompt  := r.systemPrompt
     prepend_prompt := r.prependPrompt
-    budget         := r.budget
+    -- NaN and the infinities have no SQL literal; an unusable budget is stored as no budget.
+    budget         := Store.optFloatColumn r.budget
     priority       := Int.ofNat r.priority
     project_id     := Store.issueIdColumn r.projectId
     issue_id       := Store.issueIdColumn r.issueId
