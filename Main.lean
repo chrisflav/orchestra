@@ -1364,7 +1364,7 @@ private def usageHandler (p : Parsed) : IO UInt32 := do
       -- Empty means the config has nothing to choose between — the legacy flat-token install.
       -- Falling back to every known label keeps the line informative there.
       let candidates := if pooled.isEmpty then labels else pooled
-      match ← Usage.select backend candidates mode model with
+      match ← Usage.selectSource backend candidates mode model with
       | .ok label => IO.println s!"  → would select: {label} ({mode.toString})"
       | .error e  => IO.println s!"  → would select: nothing ({e})"
   return 0

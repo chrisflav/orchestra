@@ -520,17 +520,17 @@ Two details matter in practice:
 Limits are learned two ways, and the two cover each other: the poll sees a
 limit coming and knows the exact reset time, while a run that comes back
 rate-limited is recorded immediately, before anything else can be dispatched to
-that source. Both write to `<data>/usage/<backend>/<label>.json`, which is
-shared across processes — a limit `orchestra run` discovers in a terminal stops
-the daemon from dispatching to that source too.
+that source. Both write a row of `usage_source` in `<data>/orchestra.db`, which
+is shared across processes — a limit `orchestra run` discovers in a terminal
+stops the daemon from dispatching to that source too.
 
 Every poll is also kept, so the account's past is readable and not only its
 present. It is kept one record per *window* rather than one per poll: a session
 window and a weekly total are counters that fill and then reset, so the peak
-reading inside one is what that session or that week consumed. The records live
-in `<data>/usage/<backend>/<label>.history.json`, they are what the
-[dashboard's](#dashboard) usage graphs are drawn from, and they are bounded —
-240 windows per series, nothing older than six months.
+reading inside one is what that session or that week consumed. The records are
+rows of `usage_window`, they are what the [dashboard's](#dashboard) usage graphs
+are drawn from, and they are bounded — 240 windows per series, nothing older
+than six months.
 
 A window is identified by the reset time every poll inside it reports, so a new
 reset time is a new window; where nothing reports one, utilisation that dropped
