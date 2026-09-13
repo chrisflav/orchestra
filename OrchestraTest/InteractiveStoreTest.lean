@@ -88,7 +88,7 @@ def theCursorReturnsWhatFollowsItAndSaysHowMuchIsLeft : Test := do
       appendEvent "i-3" i "2026-08-21T10:00:00Z" (.user s!"turn {i}")
     let (all, _)   ← readEvents "i-3" (after := 0)
     let (rest, _)  ← readEvents "i-3" (after := 3)
-    let (win, tot) ← readEvents "i-3" (after := 0) (limit := 2)
+    let (win, tot) ← readEvents "i-3" (after := 0) (atMost := 2)
     pure (all, rest, win, tot)
   TestM.assertEqual (seqsOf all) [1, 2, 3, 4, 5] (msg := "everything, in order")
   TestM.assertEqual (seqsOf afterThree) [4, 5]

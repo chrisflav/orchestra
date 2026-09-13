@@ -499,7 +499,7 @@ def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
   -- Once a task on a backend that needs the daemon to itself is running, nothing else may
   -- start alongside it.
   if ctx.exclusiveActive then return none
-  let counts := ctx.occupiedSlots.fold (fun m k v => m.insert k v.size)
+  let counts := ctx.occupiedSlots.fold (fun m k slots => m.insert k slots.size)
     ({} : Std.HashMap String Nat)
   let candidates := pendingCandidates all counts ctx.perRepoLimit
   for e in candidates do

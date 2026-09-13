@@ -492,8 +492,8 @@ private def defaultContinueTools : List String :=
 def issueContinueHandler (p : Parsed) : IO UInt32 := do
   let id      := p.positionalArg! "id" |>.as! String
   let prompt? := p.flag? "prompt" |>.map (·.as! String)
-  let toolsOverride? := p.flag? "tools" |>.map (fun v =>
-    (v.as! String).splitOn "," |>.map (·.trimAscii.toString) |>.filter (fun s => !s.isEmpty))
+  let toolsOverride? := p.flag? "tools" |>.map (fun f =>
+    (f.as! String).splitOn "," |>.map (·.trimAscii.toString) |>.filter (fun s => !s.isEmpty))
   let priorityFlag := p.flag? "priority" |>.map (·.as! Nat)
   let prompt ← match prompt? with
     | some t => pure t

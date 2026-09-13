@@ -92,7 +92,7 @@ mutual
         let resultJson ← IO.wait promise.result!
         let result :=
           match resultJson.bind (ResultType.valueFromJson o · |>.toOption) with
-          | some v => v
+          | some out => out
           | none   => default
         evalQueued mgr appConfig debug cancelToken concertId (k result)
     | .op (.while cond body) k => do

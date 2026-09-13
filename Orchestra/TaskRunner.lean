@@ -507,7 +507,7 @@ def resolveAuthEnv (appConfig : AppConfig) (agentDef : AgentDef)
            Available: {", ".intercalate (agentAuth.authSources.toList.map (·.label))}")
     | some src =>
       let vars := agentDef.envVarsOfAuthSource src
-      return vars.map fun (k, v) => (k, some v)
+      return vars.map fun (k, value) => (k, some value)
 
 /-- Read back the status an agent-less backend (`merger`, `triage`) wrote for itself.
 
@@ -937,7 +937,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     | none => pure none
     | some j =>
       match ResultType.valueFromJson o j with
-      | .ok v    => pure (some v)
+      | .ok out  => pure (some out)
       | .error e =>
         IO.eprintln s!"  Warning: failed to parse task output: {e}"
         pure none

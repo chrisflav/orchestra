@@ -186,15 +186,15 @@ instance : FromJson SourceConfig where
         let pid  ← j.getObjValAs? Taxis.IssueId "project_id"
         let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
         let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
-        let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
-          v.getNat?.toOption.map (k, ·)
+        let caps : List (String × Nat) := pairs.filterMap fun (k, n) =>
+          n.getNat?.toOption.map (k, ·)
         return .projectDispatcher pid caps
     | "label-dispatcher" =>
         let label ← j.getObjValAs? String "label"
         let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
         let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
-        let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
-          v.getNat?.toOption.map (k, ·)
+        let caps : List (String × Nat) := pairs.filterMap fun (k, n) =>
+          n.getNat?.toOption.map (k, ·)
         let limitUnclaimed :=
           j.getObjValAs? Bool "limit_unclaimed_to_open_issues" |>.toOption |>.getD false
         let excludeRoots :=
@@ -494,12 +494,12 @@ def nextProcessedIds (previous newIds held : Array String)
 /-- Where one limit stands right now. Reported by the API and by `orchestra listener show`, so
     that "why has this listener gone quiet" has an answer that does not need the log. -/
 structure RateLimitStatus where
-  limit         : RateLimit
+  rule          : RateLimit
   /-- Dispatches inside this limit's window. -/
   used          : Nat
   /-- When the window next has room, as epoch seconds. `none` when it has room already — or, for
       the degenerate `max: 0` that `validateListenerConfig` refuses to store, when it never
-      will. Read `used < limit.max` for "may dispatch now"; this only answers "when". -/
+      will. Read `used < rule.max` for "may dispatch now"; this only answers "when". -/
   nextAllowedAt : Option Int
 deriving Repr
 
@@ -516,7 +516,7 @@ def rateLimitStatuses (limits : List RateLimit) (dispatches : Array String) (now
     let nextAllowedAt :=
       if used < l.max then none
       else (inWindow.qsort (· < ·))[used - l.max]?.map (· + (l.windowSeconds : Int))
-    { limit := l, used, nextAllowedAt }
+    { rule := l, used, nextAllowedAt }
 
 -- Listener config
 
@@ -561,7 +561,7 @@ instance : FromJson ListenerConfig where
     -- otherwise parse as no limit at all, which is the failure this field exists to prevent.
     let rateLimits ← match j.getObjVal? "rate_limits" with
       | .error _ => pure []
-      | .ok v    => (FromJson.fromJson? v : Except String (List RateLimit))
+      | .ok j    => (FromJson.fromJson? j : Except String (List RateLimit))
     return { source, action, intervalSeconds, rateLimits }
 
 -- Listener state
@@ -834,7 +834,7 @@ A listener is named by its file now; the config's own 'name' field is ignored."
 
 /-- Replace every occurrence of `{{key}}` in `template` with the corresponding value. -/
 def renderTemplate (template : String) (vars : List (String × String)) : String :=
-  vars.foldl (fun acc (k, v) => acc.replace ("{{" ++ k ++ "}}") v) template
+  vars.foldl (fun acc (k, value) => acc.replace ("{{" ++ k ++ "}}") value) template
 
 -- Queue entry builder
 

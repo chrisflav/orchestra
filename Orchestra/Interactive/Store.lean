@@ -394,7 +394,7 @@ private def readTranscriptText (path : System.FilePath) : IO String := do
   throw (.userError s!"the transcript at {path} is not valid UTF-8, and not merely torn at the \
 end; it needs looking at by hand")
 
-/-- The transcript events after `after`, at most `limit` of them, and how many there are in
+/-- The transcript events after `after`, at most `atMost` of them, and how many there are in
     total after `after`.
 
     The total counts what matches before the window, so a client knows whether it is caught up
@@ -410,7 +410,7 @@ end; it needs looking at by hand")
     field written by a newer orchestra survives being read by an older one. A line that does not
     parse, or that carries no seq, is skipped rather than stopping the scan: it can only be a
     torn write, and treating it as a boundary would hide every event before it. -/
-def readEvents (id : String) (after : Nat := 0) (limit : Nat := 500)
+def readEvents (id : String) (after : Nat := 0) (atMost : Nat := 500)
     : IO (Array Json × Nat) := do
   let path ← transcriptPath id
   if !(← path.pathExists) then return (#[], 0)
@@ -422,6 +422,6 @@ def readEvents (id : String) (after : Nat := 0) (limit : Nat := 500)
     let some seq := j.getObjValAs? Nat "seq" |>.toOption | continue
     if seq ≤ after then break
     newer := j :: newer
-  return ((newer.take limit).toArray, newer.length)
+  return ((newer.take atMost).toArray, newer.length)
 
 end Orchestra.Interactive

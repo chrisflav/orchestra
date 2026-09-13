@@ -125,8 +125,8 @@ private def warningHeaders : Array (String × String) := #[
 
 /-- `warningHeaders` with the 7d window's status replaced. -/
 private def withWeeklyStatus (status : String) : Array (String × String) :=
-  warningHeaders.map fun (k, v) =>
-    if k == "anthropic-ratelimit-unified-7d-status" then (k, status) else (k, v)
+  warningHeaders.map fun (k, value) =>
+    if k == "anthropic-ratelimit-unified-7d-status" then (k, status) else (k, value)
 
 @[test]
 def parseUnifiedHeaders_aWarnedWindowIsNotBinding : Test := do
@@ -174,8 +174,8 @@ def parseUnifiedHeaders_anAbsentStatusIsAllowed : Test := do
 def parseUnifiedHeaders_hundredPercentBindsWhateverTheStatusSays : Test := do
   -- The percentage is the backstop: a window reported as full binds even when the status field
   -- says something reassuring.
-  let hs := warningHeaders.map fun (k, v) =>
-    if k == "anthropic-ratelimit-unified-7d-utilization" then (k, "1") else (k, v)
+  let hs := warningHeaders.map fun (k, value) =>
+    if k == "anthropic-ratelimit-unified-7d-utilization" then (k, "1") else (k, value)
   match (parseUnifiedHeaders hs).find? (·.kind == .weeklyAll) with
   | none   => TestM.fail "expected a weekly_all limit"
   | some l => TestM.assert l.isActive (msg := "100% binds regardless of status")
