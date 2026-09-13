@@ -270,17 +270,37 @@ concert listing on the overview — and are one query each.
 
 `Orchestra.Store.Import.run : IO Unit`, called once at startup by `orchestrad` before the daemon
 or the dashboard starts, and by the `orchestra` CLI's `main`. For each store whose legacy
-directory exists and has no row in `legacy_import`: inside one transaction, write the marker row
+directory exists: read the `legacy_import` row for it, and if there is one, stop there — that
+plain select is what every start after the first costs, rather than a write transaction per store
+for the life of the installation. If there is none, inside one transaction write the marker row
 with `insertIfAbsent` — if it was already there another process got here first, so there is
-nothing to do — read every legacy file with the record's existing `FromJson`, and insert the
-rows. Files that do not parse are reported and skipped, as their loaders did. Transcripts are
-imported line by line with the same tolerance `readEvents` used to have, including a tail torn
-mid-character.
+nothing to do — read every legacy file with the record's existing `FromJson`, and store the rows.
+Transcripts are imported line by line with the same tolerance `readEvents` used to have, including
+a tail torn mid-character.
 
-It prints one line per store, saying how many records it carried and that the directory can be
-deleted, and leaves the files exactly where they are: a deployment that wants the disk back
-deletes them when it is ready rather than having the decision made for it. On a fresh
-installation, and on every start after the first, it says nothing.
+**Nothing one record does stops the rest.** A file that does not parse is reported and skipped, as
+its loader did; so is one that cannot be read at all (a permission, a dangling symlink, a name
+that is a directory). A record whose key is already in the database is reported and left alone —
+rows go in with `insertIfAbsent`, and the stored copy is the newer truth, being what a running
+orchestra has written where the file is what it was written from. And each store's import is
+wrapped on its own, so a directory this process cannot read costs that store and not the ones
+after it. The alternative is what it replaced: one unimportable record threw, rolled its store
+back with no marker, and left every store after it unimported — on that start and on every start
+after it, forever.
+
+**A marker is claimed only for a directory that held something.** Two of these directories are
+live: `<data>/queue` is the daemon's own (pid file, socket, log) and `<data>/tasks` holds the
+`--debug` transcripts, and both exist on a fresh installation. An importer therefore answers with
+how many candidate records it found as well as how many it stored, and a store that offered no
+candidates is left unmarked, so that a directory which gains legacy files later — through
+`orchestra migrate`, say — is still picked up.
+
+It prints one line per store that had candidates: how many records it carried over, and that the
+JSON records in that directory are no longer read. A store whose candidates all turned out to be
+already in the database, or unreadable, says that instead. The files are left exactly where they
+are — a deployment that wants the disk back deletes them when it is ready rather than having the
+decision made for it, and which files in a live directory those are is a judgement the import does
+not make for it. On a fresh installation, and on every start after the first, it says nothing.
 
 `orchestra migrate` (the `~/.agent` → XDG copy) is unchanged: it copies the legacy directories,
 which the import then picks up.

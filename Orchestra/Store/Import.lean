@@ -15,19 +15,37 @@ Sits above the stores rather than inside them because it imports all of them: it
 that knows about every legacy directory at once, and each importer is written in terms of the
 record's existing `FromJson` and the store's own `toRow`.
 
-**How "once" is decided.** One row of `legacy_import` per store, written with `insertIfAbsent` at
-the top of the transaction that does the import. `store` is that table's primary key, so a second
-process starting at the same moment blocks on the uncommitted row and then finds it there — it
-imports nothing, rather than importing everything a second time. The counts are written back to
-the same row when the import finishes, so a marker is never a claim about a number that was not
-actually stored.
+**How "once" is decided.** One row of `legacy_import` per store. The marker is *read* first, on a
+plain connection: on every start after the first there is one there, and this then costs one
+indexed select rather than a write transaction per store for the life of the installation. Only
+when it is absent is the transaction entered, and the write is still an `insertIfAbsent` — `store`
+is that table's primary key, so a second process starting at the same moment blocks on the
+uncommitted row and then finds it there, and imports nothing rather than importing everything a
+second time. The counts are written back to the same row when the import finishes, so a marker is
+never a claim about a number that was not actually stored.
+
+**A marker is only claimed for a directory that held something.** Two of these directories are
+live: `<data>/queue` is the daemon's own — its pid file, its socket, its log — and `<data>/tasks`
+holds the `--debug` transcripts. On a fresh installation the daemon creates them, and an import
+that claimed them would be saying it had carried over a store that never existed, and would then
+not notice the legacy files a later `orchestra migrate` copies in. So an importer answers with
+both numbers — how many candidate records it found, and how many of them it stored — and a store
+that offered no candidates at all is left unclaimed for next time.
 
 **Rows are inserted directly, not through `saveEntry`/`saveTask`.** Those open a connection of
 their own, which would put every record outside the transaction that is claiming the store.
 
-Files that do not parse are reported and skipped, as their loaders did. The directories are left
-exactly where they are: the import copies, and says so, so that a deployment that wants the disk
-back deletes them when it is ready rather than having the decision made for it.
+**Nothing here is allowed to take the rest of the import down.** A file that does not parse is
+reported and skipped, as its loader did; so is one that cannot be read at all. A record whose id
+is already in the database is reported and left alone — the database holds the newer truth, and
+the file is what it was written from. And each store's import is wrapped on its own in `run`, so
+that a directory this process cannot read costs that store and not the ones after it. The
+alternative was what this replaced: one bad record, and every later store failed to import on
+every single start, forever.
+
+The directories are left exactly where they are: the import copies, and says so, so that a
+deployment that wants the disk back deletes them when it is ready rather than having the decision
+made for it.
 
 Every store the port covers has its importer here, one `importStore` call each in `run` below.
 -/
@@ -36,87 +54,154 @@ open Lean (Json FromJson ToJson)
 
 namespace Orchestra.Store.Import
 
-/-- Every `<name>.json` in `dir`, as its file stem and parsed content. Anything else in the
-    directory is ignored, and anything that does not parse is reported and skipped — which is
-    exactly what the loaders these replace did with such a file. -/
+/-- Read a legacy file, reporting and skipping one that cannot be read at all.
+
+    Separate from "did not parse": a directory carried over by hand can hold a file this process
+    has no permission for, a dangling symlink, or a name that is itself a directory, and
+    `IO.FS.readFile` throws on each. Unguarded, one such file used to abort the whole import —
+    and with it every store after it — on every single start. -/
+private def readFile? (what : String) (path : System.FilePath) : IO (Option String) := do
+  try
+    return some (← IO.FS.readFile path)
+  catch e =>
+    IO.eprintln s!"[orchestra] legacy {what} '{path}' could not be read: {e}"
+    return none
+
+/-- Every `<name>.json` in `dir`, as its file stem and parsed content, and how many such files
+    there were.
+
+    Anything else in the directory is ignored, and anything that does not read or does not parse
+    is reported and skipped — which is exactly what the loaders these replace did with such a
+    file. The count is of candidates rather than of successes: a directory holding only records
+    this build cannot read still held records, and `importStore` marks it as dealt with rather
+    than reporting the same broken files at every start until someone removes them. -/
 private def legacyFiles (α : Type) [FromJson α] (what : String) (dir : System.FilePath) :
-    IO (Array (String × α)) := do
+    IO (Nat × Array (String × α)) := do
+  let mut candidates := 0
   let mut out : Array (String × α) := #[]
   for entry in (← dir.readDir) do
     unless entry.fileName.endsWith ".json" do continue
+    candidates := candidates + 1
     let stem := (entry.fileName.dropEnd ".json".length).toString
-    let contents ← IO.FS.readFile entry.path
+    let some contents ← readFile? what entry.path | continue
     match Json.parse contents >>= FromJson.fromJson? (α := α) with
     | .ok x    => out := out.push (stem, x)
     | .error e => IO.eprintln s!"[orchestra] legacy {what} '{entry.fileName}' did not parse: {e}"
-  return out
+  return (candidates, out)
 
+/-- Store one legacy record, unless the database already has one under its key.
+
+    The database copy is the newer truth — it is what a running orchestra has been writing, where
+    the file is what it was written from — so a collision leaves it alone and says so. Throwing
+    instead, which is what a plain `insert` does, rolled the store back with no marker and left
+    every later store unimported, on this start and on every one after it. -/
+private def insertNew {α : Type} [HasModel α] (what id : String) (row : α) : Sqlite.M Bool := do
+  if ← HasModel.insertIfAbsent row then
+    return true
+  IO.eprintln s!"[orchestra] legacy {what} '{id}' is already in the database; \
+    leaving the stored record as it is."
+  return false
+
+open Db.Query.DSL in
 /-- Import one store, if its directory is there and nothing has imported it yet.
 
-    `act` does the reading and the inserting and answers how many records it stored; it runs
-    inside the transaction that holds the marker, so a failure half way leaves neither rows nor a
-    marker claiming they are there. -/
-def importStore (store : String) (dir : System.FilePath) (act : Sqlite.M Nat) : IO Unit := do
+    `act` does the reading and the inserting and answers with two numbers: how many candidate
+    records the directory held, and how many of them are now rows. It runs inside the transaction
+    that holds the marker, so a failure half way leaves neither rows nor a marker claiming they
+    are there.
+
+    The marker is read on a plain connection first, so that the start after the import — and
+    every start after that, for the life of the installation — costs a select rather than a write
+    lock per store. It is claimed only for a directory that held at least one candidate: the
+    daemon's own `<data>/queue` and the `--debug` transcripts under `<data>/tasks` are directories
+    that exist on a fresh installation and hold no records at all, and one that gains legacy files
+    later (through `orchestra migrate`, say) is still there to be picked up. -/
+def importStore (store : String) (dir : System.FilePath) (act : Sqlite.M (Nat × Nat)) :
+    IO Unit := do
   unless ← dir.pathExists do return
+  let marker ← Orchestra.Store.run <| HasModel.fetch <| query% do
+    let r ← from Orchestra.Store.LegacyImportRow
+    guard r.store = store
+    select r
+  unless marker.isEmpty do return
   let stamp ← TaskStore.currentIso8601
-  let imported ← Orchestra.Store.transaction do
+  let outcome ← Orchestra.Store.transaction do
     let claimed ← HasModel.insertIfAbsent
       ({ store, imported_at := stamp, records := 0 } : Orchestra.Store.LegacyImportRow)
     -- Somebody else got here first — this process has nothing to do and nothing to say.
     if !claimed then return none
-    let n ← act
-    HasModel.save ({ store, imported_at := stamp, records := Int.ofNat n } :
+    let (candidates, imported) ← act
+    if candidates == 0 then
+      -- Not a legacy directory, or not one yet. Give the marker back rather than claim a store
+      -- that was never there and stop looking at a directory that may still fill up.
+      let _ ← HasModel.delete (α := Orchestra.Store.LegacyImportRow)
+        (.eq (.var Orchestra.Store.LegacyImportRowIndex.store .text) (.text store))
+      return none
+    HasModel.save ({ store, imported_at := stamp, records := Int.ofNat imported } :
       Orchestra.Store.LegacyImportRow)
-    return some n
-  if let some n := imported then
-    IO.println s!"[orchestra] imported {n} {store} from {dir} into the database; \
-      that directory is no longer read and can be deleted."
+    return some (candidates, imported)
+  match outcome with
+  | none => return
+  | some (candidates, imported) =>
+    if imported > 0 then
+      IO.println s!"[orchestra] imported {imported} {store} from {dir} into the database; \
+        the JSON records in that directory are no longer read."
+    else
+      IO.println s!"[orchestra] found {candidates} {store} in {dir} and imported none of them; \
+        the JSON records in that directory are no longer read."
 
-/-- Import the task records. -/
+/-- Import the task records. The directory is the live one — the `--debug` transcripts are
+    written beside them, under names that end in `.jsonl` rather than `.json`. -/
 private def importTasks : IO Unit := do
   let dir ← TaskStore.legacyTasksDir
   importStore "tasks" dir do
-    let records ← legacyFiles TaskStore.TaskRecord "task record" dir
+    let (candidates, records) ← legacyFiles TaskStore.TaskRecord "task record" dir
+    let mut n := 0
     for (_, r) in records do
-      HasModel.insert r.toRow
-    return records.size
+      if ← insertNew "task record" r.id r.toRow then n := n + 1
+    return (candidates, n)
 
 /-- Import the series pointers. The name is the file's stem, which is what the pointer was keyed
     by; the document holds only the id it points at. -/
 private def importSeries : IO Unit := do
   let dir ← TaskStore.legacySeriesDir
   importStore "series" dir do
+    let mut candidates := 0
     let mut n := 0
     for entry in (← dir.readDir) do
       unless entry.fileName.endsWith ".json" do continue
+      candidates := candidates + 1
       let name := (entry.fileName.dropEnd ".json".length).toString
-      let contents ← IO.FS.readFile entry.path
+      let some contents ← readFile? "series pointer" entry.path | continue
       match Json.parse contents >>= (·.getObjValAs? String "latest_task_id") with
       | .ok latest =>
-        HasModel.insert ({ name, latest_task_id := latest } : Orchestra.Store.SeriesRow)
-        n := n + 1
+        if ← insertNew "series pointer" name
+            ({ name, latest_task_id := latest } : Orchestra.Store.SeriesRow) then
+          n := n + 1
       | .error e =>
         IO.eprintln s!"[orchestra] legacy series '{entry.fileName}' did not parse: {e}"
-    return n
+    return (candidates, n)
 
 /-- Import the queue entries. Their directory is the daemon's own, so the pid file, the socket
     and the log are in it too; none of them ends in `.json`. -/
 private def importQueueEntries : IO Unit := do
   let dir ← Queue.queueDir
   importStore "queue entries" dir do
-    let entries ← legacyFiles Queue.QueueEntry "queue entry" dir
+    let (candidates, entries) ← legacyFiles Queue.QueueEntry "queue entry" dir
+    let mut n := 0
     for (_, e) in entries do
-      HasModel.insert e.toRow
-    return entries.size
+      if ← insertNew "queue entry" e.id e.toRow then n := n + 1
+    return (candidates, n)
 
 /-- Import the concert runs. -/
 private def importConcertRuns : IO Unit := do
   let dir ← Queue.legacyConcertsDir
   importStore "concert runs" dir do
-    let runs ← legacyFiles Queue.ConcertRun "concert run" dir
+    let (candidates, runs) ← legacyFiles Queue.ConcertRun "concert run" dir
+    let mut n := 0
     for (_, r) in runs do
-      HasModel.insert r.toRow
-    return runs.size
+      if ← insertNew "concert run" r.id r.toRow then n := n + 1
+    return (candidates, n)
 
 /-- Read a legacy transcript, tolerating a tail torn mid-character.
 
@@ -131,7 +216,13 @@ private def importConcertRuns : IO Unit := do
     reported and its session imported without a transcript, rather than taking the whole import
     down with it. -/
 private def transcriptText? (path : System.FilePath) : IO (Option String) := do
-  let bytes ← IO.FS.readBinFile path
+  let bytes ←
+    try
+      IO.FS.readBinFile path
+    catch e =>
+      IO.eprintln s!"[orchestra] the legacy transcript at {path} could not be read ({e}); the \
+session is imported without it."
+      return none
   if let some s := String.fromUTF8? bytes then return some s
   for back in [1, 2, 3] do
     if bytes.size ≥ back then
@@ -158,16 +249,18 @@ torn at the end; the session is imported without it."
 private def importInteractive : IO Unit := do
   let dir ← Interactive.legacySessionsDir
   importStore "interactive sessions" dir do
+    let mut candidates := 0
     let mut sessions := 0
     for entry in (← dir.readDir) do
       let recordPath := entry.path / "session.json"
       unless ← recordPath.pathExists do continue
-      let contents ← IO.FS.readFile recordPath
+      candidates := candidates + 1
+      let some contents ← readFile? "session" recordPath | continue
       match Json.parse contents >>= FromJson.fromJson? (α := Interactive.SessionRecord) with
       | .error e =>
         IO.eprintln s!"[orchestra] legacy session '{entry.fileName}' did not parse: {e}"
       | .ok record =>
-        HasModel.insert record.toRow
+        unless ← insertNew "session" record.id record.toRow do continue
         sessions := sessions + 1
         let transcript := entry.path / "events.jsonl"
         if ← transcript.pathExists then
@@ -183,7 +276,7 @@ private def importInteractive : IO Unit := do
                    occurred_at := j.getObjValAs? String "occurredAt" |>.toOption
                                     |>.getD record.createdAt
                    doc         := j.compress } : Orchestra.Store.InteractiveEventRow)
-    return sessions
+    return (candidates, sessions)
 
 /-- Insert the windows of one legacy `<stem>.history.json`, in the order the file lists them.
 
@@ -193,7 +286,7 @@ private def importInteractive : IO Unit := do
     unreadable one before. -/
 private def importUsageHistory (path : System.FilePath) (backend label : String) :
     Sqlite.M Unit := do
-  let contents ← IO.FS.readFile path
+  let some contents ← readFile? "usage history" path | return
   match Json.parse contents >>= (·.getObjValAs? (Array Usage.Window) "windows") with
   | .error e =>
     IO.eprintln s!"[orchestra] legacy usage history '{path}' did not parse: {e}"
@@ -214,6 +307,7 @@ private def importUsageHistory (path : System.FilePath) (backend label : String)
 private def importUsage : IO Unit := do
   let dir ← Usage.legacyUsageDir
   importStore "usage sources" dir do
+    let mut candidates := 0
     let mut sources := 0
     for backendEntry in (← dir.readDir) do
       unless ← backendEntry.path.isDir do continue
@@ -223,14 +317,16 @@ private def importUsage : IO Unit := do
       for entry in files do
         unless entry.fileName.endsWith ".json" do continue
         if entry.fileName.endsWith ".history.json" then continue
+        candidates := candidates + 1
         let stem := (entry.fileName.dropEnd ".json".length).toString
         claimed := claimed.insert stem
-        let contents ← IO.FS.readFile entry.path
+        let some contents ← readFile? "usage state" entry.path | continue
         match Json.parse contents >>= FromJson.fromJson? (α := Usage.SourceState) with
         | .error e =>
           IO.eprintln s!"[orchestra] legacy usage state '{entry.fileName}' did not parse: {e}"
         | .ok state =>
-          HasModel.insert state.toRow
+          unless ← insertNew "usage state" s!"{state.backend}/{state.label}" state.toRow do
+            continue
           sources := sources + 1
           let history := backendEntry.path / s!"{stem}.history.json"
           if ← history.pathExists then
@@ -243,11 +339,12 @@ private def importUsage : IO Unit := do
         unless entry.fileName.endsWith ".history.json" do continue
         let stem := (entry.fileName.dropEnd ".history.json".length).toString
         if claimed.contains stem then continue
+        candidates := candidates + 1
         IO.eprintln s!"[orchestra] legacy usage history '{backendEntry.fileName}/{entry.fileName}' \
           has no state file beside it; importing it under '{stem}', which is the file name rather \
           than necessarily the label."
         importUsageHistory entry.path backendEntry.fileName stem
-    return sources
+    return (candidates, sources)
 
 /-- Import the listener state.
 
@@ -259,16 +356,30 @@ private def importUsage : IO Unit := do
 private def importListenerState : IO Unit := do
   let dir ← Listener.legacyListenerStateDir
   importStore "listener states" dir do
-    let states ← legacyFiles Listener.ListenerState "listener state" dir
+    let (candidates, states) ← legacyFiles Listener.ListenerState "listener state" dir
     let mut n := 0
     for (name, state) in states do
       match Utils.checkConfigName "listener" name with
       | .error e =>
         IO.eprintln s!"[orchestra] legacy listener state '{name}.json' is not a listener name: {e}"
       | .ok _ =>
-        HasModel.insert (state.toRow name)
-        n := n + 1
-    return n
+        if ← insertNew "listener state" name (state.toRow name) then n := n + 1
+    return (candidates, n)
+
+/-- Run one store's import, reporting a failure of it rather than passing it on.
+
+    The stores are independent of each other, and the import happens before the daemon or the
+    dashboard has started: a directory that cannot be listed, a disk that fills up half way
+    through one store, is a reason to carry the others over and say what went wrong, not a reason
+    for orchestra not to start. Nothing is half imported by this — each store's work is one
+    transaction, so the one that failed rolled back, marker and all, and will be tried again on
+    the next start. -/
+private def guarded (store : String) (act : IO Unit) : IO Unit := do
+  try
+    act
+  catch e =>
+    IO.eprintln s!"[orchestra] the legacy {store} could not be imported: {e}. \
+      The other stores are unaffected, and this one is tried again on the next start."
 
 /-- Carry every legacy directory that is still there into the database.
 
@@ -276,12 +387,12 @@ private def importListenerState : IO Unit := do
     there is nothing to do, which on a fresh installation and on every start after the first is
     what happens. -/
 def run : IO Unit := do
-  importTasks
-  importSeries
-  importQueueEntries
-  importConcertRuns
-  importInteractive
-  importUsage
-  importListenerState
+  guarded "tasks" importTasks
+  guarded "series" importSeries
+  guarded "queue entries" importQueueEntries
+  guarded "concert runs" importConcertRuns
+  guarded "interactive sessions" importInteractive
+  guarded "usage sources" importUsage
+  guarded "listener states" importListenerState
 
 end Orchestra.Store.Import

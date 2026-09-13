@@ -375,4 +375,78 @@ def aFreshInstallationImportsNothing : Test := do
     markers
   TestM.assertEqual marks.size 0 (msg := "no markers at all")
 
+/-- A live directory that holds no records is not a store that has been carried over.
+
+    `<data>/queue` is the daemon's own — pid file, socket, log — and exists after one start on a
+    fresh installation, as does `<data>/tasks` with the `--debug` transcripts in it. Marking those
+    would claim an import that never happened, and would then ignore the legacy files a later
+    `orchestra migrate` copies into them. -/
+@[test]
+def aDirectoryWithNoRecordsIsNotMarked : Test := do
+  let (first, second, entry) ← withTempData do
+    let base ← Dirs.dataBase
+    IO.FS.createDirAll (base / "queue")
+    IO.FS.writeFile (base / "queue" / "daemon.pid") "4242"
+    IO.FS.writeFile (base / "queue" / "daemon.log") "started\n"
+    Orchestra.Store.Import.run
+    let first ← markers
+    -- What `orchestra migrate` does later: the directory gains the records it did not have.
+    writeJson (base / "queue" / "q-old.json") (ToJson.toJson (stampedEntry "q-old" "2026-01-01T00:00:00Z"))
+    Orchestra.Store.Import.run
+    pure (first, ← markers, ← Queue.loadEntry "q-old")
+  TestM.assertEqual first.size 0 (msg := "the daemon's own directory is not a store to claim")
+  TestM.assert (second.contains ("queue entries", 1))
+    s!"and the directory is still looked at once it holds records: {second.toList}"
+  TestM.assert entry.isSome "so the entry copied in afterwards is imported"
+
+/-- A record the database already has is left as it is, and the import goes on.
+
+    The stored copy is the newer truth — it is what a running orchestra wrote, where the file is
+    what it was written from. Before this the insert threw, which rolled the whole store back with
+    no marker and left every store after it unimported, on that start and on every one after. -/
+@[test]
+def theImportKeepsTheStoredCopy : Test := do
+  let (status, other, marks) ← withTempData do
+    TaskStore.saveTask { stampedTask "t-old" "2026-01-01T00:00:00Z" with status := .completed }
+    writeLegacyFiles
+    Orchestra.Store.Import.run
+    pure ((← TaskStore.loadTask "t-old").map (·.status), ← Queue.loadEntry "q-old", ← markers)
+  TestM.assert (status == some .completed) "the database copy stands"
+  TestM.assert other.isSome "and the stores after the collision are imported all the same"
+  TestM.assert (marks.contains ("tasks", 0))
+    s!"the store is marked, having carried nothing over: {marks.toList}"
+
+/-- A legacy file that cannot be read at all — here a name that is a directory, as a checkout
+    copied by hand can leave behind — costs that record and no more. -/
+@[test]
+def anUnreadableLegacyFileIsSkipped : Test := do
+  let (task, marks) ← withTempData do
+    let base ← Dirs.dataBase
+    writeLegacyFiles
+    IO.FS.createDirAll (base / "tasks" / "t-adirectory.json")
+    Orchestra.Store.Import.run
+    pure (← TaskStore.loadTask "t-old", ← markers)
+  TestM.assert task.isSome "the readable record is still carried over"
+  TestM.assert (marks.contains ("tasks", 1))
+    s!"and only it is counted: {marks.toList}"
+
+/-- One store's import failing does not take the ones after it down.
+
+    A `<data>/tasks` that is a file rather than a directory is the cheapest way to make one fail
+    outright. Every later store used to go unimported because of it — on every start, forever. -/
+@[test]
+def oneStoreFailingLeavesTheOthers : Test := do
+  let (entry, run, marks) ← withTempData do
+    let base ← Dirs.dataBase
+    writeJson (base / "queue" / "q-old.json") (ToJson.toJson (stampedEntry "q-old" "2026-01-01T00:00:00Z"))
+    writeJson (base / "concerts" / "c-old.json")
+      (ToJson.toJson ({ id := "c-old", startedAt := "2026-01-01T00:00:00Z" } : Queue.ConcertRun))
+    IO.FS.writeFile (base / "tasks") "this is not a directory"
+    Orchestra.Store.Import.run
+    pure (← Queue.loadEntry "q-old", ← Queue.loadConcertRun "c-old", ← markers)
+  TestM.assert entry.isSome "the queue entries are imported"
+  TestM.assert run.isSome "and so are the concert runs"
+  TestM.assert (!(marks.map (·.1)).contains "tasks")
+    s!"the store that failed is not marked, so the next start tries it again: {marks.toList}"
+
 end OrchestraTest.StoreTest
