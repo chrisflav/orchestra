@@ -38,13 +38,15 @@ A source therefore accumulates a *set* of blocks, one per scope, not a single on
 independent facts with independent expiries, and a completed run retires only the blocks covering
 the model it ran: proof that Sonnet works on an account says nothing about whether Fable does.
 
-State lives on disk, one file per `(backend, label)`, because the processes that need to agree
-about it are genuinely separate: `orchestra run` in a terminal and the queue daemon are different
-OS processes, and a limit one of them discovers has to stop the other.
+State lives in the database — a row of `usage_source` per `(backend, label)`, and a row of
+`usage_window` per window of recorded history — because the processes that need to agree about it
+are genuinely separate: `orchestra run` in a terminal and the queue daemon are different OS
+processes, and a limit one of them discovers has to stop the other.
 -/
 import Lean.Data.Json
 import Orchestra.Config
 import Orchestra.Dirs
+import Orchestra.Store
 import Orchestra.Utils.Files
 import Orchestra.Utils.Http
 import Orchestra.Utils.Time
@@ -330,30 +332,66 @@ instance : FromJson SourceState where
     let pollAfter := (j.getObjValAs? Int "poll_after").toOption
     return { backend, label, limits, fetchedEpoch, blocks, lastUsedTick, lastError, pollAfter }
 
-def usageDir : IO System.FilePath :=
+/-- Where the JSON state and history files lived before the database: `<data>/usage`, holding a
+    `<backend>/<label>.json` and a `<backend>/<label>.history.json` per source. Read once, by
+    `Orchestra.Store.Import`, and then left alone — the import copies, it does not delete.
+
+    The label in those file names was flattened to what a filename may hold, which is lossy; the
+    state document beside it carries the real one, and that is the one the import keys on. -/
+def legacyUsageDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "usage"
 
-/-- A label as a filename. Labels come from config and are used as filenames, so anything that
-    could escape the directory is flattened rather than trusted. -/
-private def safeLabel (label : String) : String :=
-  label.map fun c => if c.isAlphanum || c == '-' || c == '_' then c else '_'
+/-- The state as a row of `usage_source`, keyed by the pair that names the source.
 
-private def statePath (backend label : String) : IO System.FilePath := do
-  return (← usageDir) / backend / s!"{safeLabel label}.json"
+    `limits` and `blocks` are the compressed JSON their own instances write: they are arrays of
+    documents with no scalar form, and storing them as text is what keeps a limit kind this
+    build has never heard of readable by the build that has. -/
+def SourceState.toRow (s : SourceState) : Store.UsageSourceRow :=
+  { backend        := s.backend
+    label          := s.label
+    fetched_epoch  := s.fetchedEpoch
+    limits         := Store.jsonColumn s.limits
+    blocks         := Store.jsonColumn s.blocks
+    last_used_tick := s.lastUsedTick
+    last_error     := s.lastError
+    poll_after     := s.pollAfter }
 
+/-- The state a row holds, or why this build cannot read it. -/
+def SourceState.ofRow? (row : Store.UsageSourceRow) : Except String SourceState := do
+  let limits ← Store.jsonOfColumn? "limits" row.limits
+  let blocks ← Store.jsonOfColumn? "blocks" row.blocks
+  return { backend      := row.backend
+           label        := row.label
+           fetchedEpoch := row.fetched_epoch
+           limits       := limits
+           blocks       := blocks
+           lastUsedTick := row.last_used_tick
+           lastError    := row.last_error
+           pollAfter    := row.poll_after }
+
+open Db.Query.DSL in
+/-- What is known about one source, or a blank state for one nothing has polled yet.
+
+    A source with no row and a source whose row this build cannot read come back the same way,
+    which is what the file store did with a missing and an unparseable file: this is a cache of
+    what the provider last said, the next poll refills it, and a daemon that refused to dispatch
+    because a cache entry was unreadable would have its priorities backwards. -/
 def loadState (backend label : String) : IO SourceState := do
-  let path ← statePath backend label
-  if !(← path.pathExists) then return { backend, label }
-  match Json.parse (← IO.FS.readFile path) with
-  | .error _ => return { backend, label }
-  | .ok j    => match FromJson.fromJson? j with
-    | .error _ => return { backend, label }
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let s ← from Store.UsageSourceRow
+    guard s.backend = backend
+    guard s.label = label
+    select s
+  match rows[0]? with
+  | none     => return { backend, label }
+  | some row => match SourceState.ofRow? row with
     | .ok s    => return s
+    | .error e =>
+      IO.eprintln s!"[usage] {backend}/{label}: state row unreadable ({e}); starting again"
+      return { backend, label }
 
-def saveState (s : SourceState) : IO Unit := do
-  let path ← statePath s.backend s.label
-  if let some dir := path.parent then IO.FS.createDirAll dir
-  IO.FS.writeFile path (Json.compress (ToJson.toJson s))
+def saveState (s : SourceState) : IO Unit :=
+  Store.run <| HasModel.save s.toRow
 
 private def modifyState (backend label : String) (f : SourceState → SourceState) : IO Unit := do
   saveState (f (← loadState backend label))
@@ -368,9 +406,9 @@ asked about.
 What is kept is one record per *window* rather than one per poll. The session and weekly limits
 are counters that fill and then reset, so the window is the unit that carries meaning: the peak
 a closed session window reached is what that session consumed, and the peak of a week is what
-that week did. Rolling polls up as they arrive is also what keeps the file small enough to read
-on every dashboard tick — a poll every five minutes is eight thousand samples a month, and the
-same month is a few hundred windows.
+that week did. Rolling polls up as they arrive is also what keeps the number of rows small enough
+to read on every dashboard tick — a poll every five minutes is eight thousand samples a month, and
+the same month is a few hundred windows.
 
 Only polls are recorded. An observed hit (`markLimited`) establishes that *a* limit was reached
 but neither which counter reached it nor where that counter stood, so folding it in would
@@ -437,6 +475,37 @@ instance : FromJson Window where
     let lastPercent := (j.getObjValAs? Nat "last_percent").toOption.getD peakPercent
     let samples := (j.getObjValAs? Nat "samples").toOption.getD 0
     return { kind, scope, resetEpoch, startEpoch, lastEpoch, peakPercent, lastPercent, samples }
+
+/-- The window as a row of `usage_window`, under the source it was recorded for.
+
+    The source is not on the window — a window is a reading, and which account it is a reading of
+    is the store's business — so it is supplied here rather than carried. `id` is left at zero:
+    it is an `AutoKey`, which the insert leaves out for the database to assign, and it is that
+    assignment which makes `ORDER BY id` the insertion order `loadHistory` reads back. -/
+def Window.toRow (backend label : String) (w : Window) : Store.UsageWindowRow :=
+  { id           := 0
+    backend      := backend
+    label        := label
+    kind         := Store.enumColumn w.kind
+    scope        := w.scope
+    reset_epoch  := w.resetEpoch
+    start_epoch  := w.startEpoch
+    last_epoch   := w.lastEpoch
+    peak_percent := Store.natColumn w.peakPercent
+    last_percent := Store.natColumn w.lastPercent
+    samples      := Store.natColumn w.samples }
+
+/-- The window a row holds, or why this build cannot read it. -/
+def Window.ofRow? (row : Store.UsageWindowRow) : Except String Window := do
+  let kind ← Store.enumOfColumn? "kind" row.kind
+  return { kind        := kind
+           scope       := row.scope
+           resetEpoch  := row.reset_epoch
+           startEpoch  := row.start_epoch
+           lastEpoch   := row.last_epoch
+           peakPercent := row.peak_percent.toNat
+           lastPercent := row.last_percent.toNat
+           samples     := row.samples.toNat }
 
 /-- Nominal length of a window. Used only to decide whether two polls that reported no reset
     time can have been inside the same one. -/
@@ -530,47 +599,51 @@ def pruneWindows (windows : Array Window) (now : Int) : Array Window := Id.run d
     if seen < maxWindowsPerSeries then kept := kept.push w
   return kept.reverse
 
-private def historyPath (backend label : String) : IO System.FilePath := do
-  return (← usageDir) / backend / s!"{safeLabel label}.history.json"
-
+open Db.Query.DSL in
 /-- The recorded windows for one source, oldest first.
 
-    Unreadable history is empty history: it is a record of the past, nothing about the present
-    depends on it, and a monitor that refused to run because a graph's data file was corrupt
-    would have its priorities backwards. -/
+    Oldest first is `ORDER BY id`, the order they were inserted in, which `saveHistory` writes
+    them in — the windows are a sequence rather than a set, and every function that folds over
+    them relies on the open window of a series being the last one in it.
+
+    A row this build cannot read is reported and left out, as a record that did not parse always
+    was: history is a record of the past, nothing about the present depends on it, and a monitor
+    that refused to run because one row of a graph was unreadable would have its priorities
+    backwards. -/
 def loadHistory (backend label : String) : IO (Array Window) := do
-  let path ← historyPath backend label
-  if !(← path.pathExists) then return #[]
-  match Json.parse (← IO.FS.readFile path) with
-  | .error _ => return #[]
-  | .ok j    => return (j.getObjValAs? (Array Window) "windows").toOption.getD #[]
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let w ← from Store.UsageWindowRow
+    guard w.backend = backend
+    guard w.label = label
+    select w
+    order_by w.id
+  Store.keepConvertible "usage window" (fun r => s!"{r.backend}/{r.label}#{r.id}")
+    Window.ofRow? rows
 
-/-- Wrapped in an object rather than written as a bare array, so a later version can add a
-    field beside `windows` without every reader of this file having to change.
+/-- Replace a source's history with `windows`, in order.
 
-    Written through a rename, unlike the state file beside it: the dashboard re-reads this one
-    on every tick of an open page, and a reader that caught a half-written file would find it
-    unparseable — which `loadHistory` treats as no history at all, and the next poll would then
-    write that emptiness back as the truth. -/
-def saveHistory (backend label : String) (windows : Array Window) : IO Unit := do
-  let path ← historyPath backend label
-  Utils.writeFileAtomically path (Json.compress (Json.mkObj [("windows", ToJson.toJson windows)]))
+    Delete and insert rather than a row-by-row reconciliation: `recordWindows` and `pruneWindows`
+    hand back the whole sequence, an entry of which may have been folded into, dropped by the
+    retention rule, or added — and telling those apart afterwards would be inventing identities
+    for rows that have none of their own. One transaction, so no reader ever sees the gap between
+    the delete and the inserts. -/
+def saveHistory (backend label : String) (windows : Array Window) : IO Unit :=
+  Store.transaction do
+    let _ ← HasModel.delete (α := Store.UsageWindowRow)
+      (.and (.eq (.var Store.UsageWindowRowIndex.backend .text) (.text backend))
+            (.eq (.var Store.UsageWindowRowIndex.label .text) (.text label)))
+    for w in windows do
+      HasModel.insert (w.toRow backend label)
 
 /-- Fold one poll's limits into the stored history. Called on every successful poll, and by
     nothing else.
 
-    Load, fold, save, unserialised — like the state file beside it. Two polls for the same
-    source that interleave lose one of the two readings: the window survives either way, and
-    what it costs is a `samples` tick and, at worst, a peak that only the losing poll saw. A
-    lock on a path three processes reach would cost more than that. -/
+    Load, fold, save, unserialised — like the state row beside it. Two polls for the same source
+    that interleave lose one of the two readings: the window survives either way, and what it
+    costs is a `samples` tick and, at worst, a peak that only the losing poll saw. A lock on a
+    table three processes reach would cost more than that. -/
 def recordPoll (backend label : String) (limits : Array Limit) (now : Int) : IO Unit := do
   let windows ← loadHistory backend label
-  -- A file that exists and read as nothing is one this is about to replace with a single
-  -- window. That is the right thing to do — history that cannot be read is not history — but
-  -- it is not a thing to do silently, and the poll path is the only place it can be said
-  -- without a reader repeating it on every dashboard tick.
-  if windows.isEmpty && (← (← historyPath backend label).pathExists) then
-    IO.eprintln s!"[usage] {backend}/{label}: history was unreadable or empty; starting again"
   saveHistory backend label (pruneWindows (recordWindows windows limits now) now)
 
 /-! ## Availability
@@ -759,7 +832,7 @@ def chooseFrom (mode : AuthMode) (candidates : Array Candidate) (now : Int := 0)
     return .ok best.label
 
 /-- Build the candidate list for `labels` from persisted state and choose one. -/
-def select (backend : String) (labels : List String) (mode : AuthMode) (model : Option String)
+def selectSource (backend : String) (labels : List String) (mode : AuthMode) (model : Option String)
     : IO (Except String String) := do
   let now ← nowEpoch
   let mut candidates : Array Candidate := #[]
@@ -901,8 +974,8 @@ def FetchError.backoffSecs : FetchError → Int
     reading `Wed, 22 Jul 2026 …` as a number would produce a nonsense backoff — so anything that
     is not a plain count of seconds is reported as absent and the default is used instead. -/
 def retryAfterSecs (headers : Array (String × String)) : Option Int :=
-  (Utils.Http.header? headers "retry-after").bind fun v =>
-    v.trimAscii.toString.toNat?.map Int.ofNat
+  (Utils.Http.header? headers "retry-after").bind fun raw =>
+    raw.trimAscii.toString.toNat?.map Int.ofNat
 
 /-- What a non-2xx response with no usage headers means, or `none` on a 200. Only reached as a
     fallback — the usage numbers ride on the rate-limit headers of the inference call itself, and a
@@ -1192,7 +1265,7 @@ def resolveLabel (cfg : AppConfig) (backend : String) (authSources : List String
   if candidates.isEmpty then return .ok none
   for label in candidates do
     ensureFresh cfg backend label
-  match ← select backend candidates mode model with
+  match ← selectSource backend candidates mode model with
   | .ok label => return .ok (some label)
   | .error e  => return .error e
 

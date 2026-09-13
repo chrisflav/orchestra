@@ -908,7 +908,7 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
     let extrasJson : Array Json := (extras.filter (fun (_, value) => ! value.isEmpty)).map
       (fun (k, value) => (Json.arr #[Json.str k, Json.str value])) |>.toArray
     let recent := st.processedIds.toList.reverse.take 50
-    -- Newest 50, back in oldest-first order — the order the state file keeps them in, and the
+    -- Newest 50, back in oldest-first order — the order the state keeps them in, and the
     -- one a reader following a window forward wants.
     let recentDispatches := (st.dispatches.toList.reverse.take 50).reverse
     -- The file as stored, `{{secret}}` placeholders intact — this is the document a client edits
