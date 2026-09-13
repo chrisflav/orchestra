@@ -257,6 +257,43 @@ def anUnreadableRowIsSkippedNotFatal : Test := do
   TestM.assertEqual (all.map (·.id)).toList ["t-good"] (msg := "the readable row still comes back")
   TestM.assert direct.isNone "and the unreadable one reads as absent rather than throwing"
 
+/-- The columns `FromJson QueueEntry` reads leniently are read leniently here too: a value this
+    build cannot make sense of costs that column, and not the entry.
+
+    `loadEntry` turns a failure into "no such entry", and an entry holding a pre-claimed issue
+    that cannot be loaded is a task that never runs and a claim nobody ever releases — which is
+    why the JSON instance degrades these to their defaults rather than refusing the document. -/
+@[test]
+def aBadValueInALenientColumnCostsThatColumnOnly : Test := do
+  let loaded ← withTempData do
+    Orchestra.Store.run <| HasModel.insert { (stampedEntry "q-bad" "2026-09-13T10:00:00Z").toRow with
+      tools                := some "not json at all"
+      auth_sources         := "{"
+      pr_labels            := "7"
+      triage_add_labels    := "{"
+      triage_remove_labels := "{"
+      input_type           := "\"no such type\""
+      output_type          := "{"
+      project_id           := some "not a number"
+      issue_id             := some "not a number"
+      scope_root           := some "not a number"
+      spawn_policy         := some "{" }
+    Queue.loadEntry "q-bad"
+  match loaded with
+  | none   => TestM.fail "the entry read as absent, which is what a claim nobody releases looks like"
+  | some e =>
+    TestM.assertEqual e.tools none (msg := "tools")
+    TestM.assertEqual e.authSources [] (msg := "auth_sources")
+    TestM.assertEqual e.prLabels [] (msg := "pr_labels")
+    TestM.assertEqual e.triageAddLabels [] (msg := "triage_add_labels")
+    TestM.assertEqual e.triageRemoveLabels [] (msg := "triage_remove_labels")
+    TestM.assert (e.inputType == .unit && e.outputType == .unit) "the declared types"
+    TestM.assertEqual e.projectId none (msg := "project_id")
+    TestM.assertEqual e.issueId none (msg := "issue_id")
+    TestM.assertEqual e.scopeRoot none (msg := "scope_root")
+    TestM.assert e.spawnPolicy.isNone "the spawn policy"
+    TestM.assertEqual e.prompt "p" (msg := "and the strict columns are still what was written")
+
 /-! ## The schema and the migrations say the same thing -/
 
 /-- A model change without a migration fails here rather than on a deployment. -/

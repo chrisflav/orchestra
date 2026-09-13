@@ -407,29 +407,38 @@ def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
 
 /-- The entry a row holds, or why this build cannot read it.
 
-    The spawn policy is the one field read leniently, as `FromJson QueueEntry` reads it and for
-    the same reason: `loadEntry` turning a decode failure into "no such entry" would, for an
-    entry holding a pre-claimed issue, mean a task that never runs and a claim nobody releases. -/
+    Lenient column by column exactly where `FromJson QueueEntry` is lenient about the same field,
+    and for the reason that instance gives: `loadEntry` turns *any* failure here into "no such
+    entry", and for an entry holding a pre-claimed issue that means a task that never runs and a
+    claim nobody ever releases. So a value this build cannot read in one of those columns costs
+    that column — it falls back to the default the JSON instance would have given it — rather
+    than the whole entry. The id, the timestamp, the status, the mode, the repository pair and
+    the memory mode are the strict ones, there as in the JSON. -/
 def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := do
   let repo               ← Store.repoOfColumns? row.upstream row.fork
   let status             ← Store.enumOfColumn? "status" row.status
   let mode               ← Store.enumOfColumn? "mode" row.mode
   let memory             ← Store.enumOfColumn? "memory" row.memory
   let authMode           ← row.auth_mode.mapM (Store.enumOfColumn? (α := AuthMode) "auth_mode")
-  let authSources        ← Store.jsonOfColumn? (α := List String) "auth_sources" row.auth_sources
-  let tools              ← row.tools.mapM (Store.jsonOfColumn? (α := List String) "tools")
-  let inputType          ← Store.jsonOfColumn? (α := ResultType) "input_type" row.input_type
-  let outputType         ← Store.jsonOfColumn? (α := ResultType) "output_type" row.output_type
+  let authSources        := (Store.jsonOfColumn? (α := List String) "auth_sources"
+                              row.auth_sources).toOption.getD []
+  let tools              := row.tools.bind fun s =>
+                              (Store.jsonOfColumn? (α := List String) "tools" s).toOption
+  let inputType          := (Store.jsonOfColumn? (α := ResultType) "input_type"
+                              row.input_type).toOption.getD .unit
+  let outputType         := (Store.jsonOfColumn? (α := ResultType) "output_type"
+                              row.output_type).toOption.getD .unit
   let inputJson          ← Store.rawJsonOfColumn? "input_json" row.input_json
   let outputJson         ← Store.rawJsonOfColumn? "output_json" row.output_json
-  let projectId          ← Store.issueIdOfColumn? "project_id" row.project_id
-  let issueId            ← Store.issueIdOfColumn? "issue_id" row.issue_id
-  let scopeRoot          ← Store.issueIdOfColumn? "scope_root" row.scope_root
-  let prLabels           ← Store.jsonOfColumn? (α := List String) "pr_labels" row.pr_labels
-  let triageAddLabels    ← Store.jsonOfColumn? (α := List String) "triage_add_labels"
-                             row.triage_add_labels
-  let triageRemoveLabels ← Store.jsonOfColumn? (α := List String) "triage_remove_labels"
-                             row.triage_remove_labels
+  let projectId          := (Store.issueIdOfColumn? "project_id" row.project_id).toOption.getD none
+  let issueId            := (Store.issueIdOfColumn? "issue_id" row.issue_id).toOption.getD none
+  let scopeRoot          := (Store.issueIdOfColumn? "scope_root" row.scope_root).toOption.getD none
+  let prLabels           := (Store.jsonOfColumn? (α := List String) "pr_labels"
+                              row.pr_labels).toOption.getD []
+  let triageAddLabels    := (Store.jsonOfColumn? (α := List String) "triage_add_labels"
+                              row.triage_add_labels).toOption.getD []
+  let triageRemoveLabels := (Store.jsonOfColumn? (α := List String) "triage_remove_labels"
+                              row.triage_remove_labels).toOption.getD []
   let spawnPolicy        := row.spawn_policy.bind fun s =>
                               (Store.jsonOfColumn? (α := SpawnPolicy) "spawn_policy" s).toOption
   return { id := row.id
