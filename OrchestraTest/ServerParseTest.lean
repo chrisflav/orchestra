@@ -37,7 +37,7 @@ def parseToolCall_unknown : Test := do
 def parseToolCall_submitTaskOutput : Test := do
   let args := Json.mkObj [("value", .str "result")]
   match parseToolCall "submit_task_output" args with
-  | .submitTaskOutput v => TestM.assertEqual v.compress "\"result\"" (msg := "value")
+  | .submitTaskOutput j => TestM.assertEqual j.compress "\"result\"" (msg := "value")
   | _ => TestM.fail "expected .submitTaskOutput"
 
 @[test]

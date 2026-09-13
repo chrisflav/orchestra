@@ -336,8 +336,8 @@ def usdLabel (usd : Float) : String :=
 private def maxSessionBudgetLabel : String := usdLabel maxSessionBudgetUsd
 
 private structure Page where
-  limit  : Nat
-  offset : Nat
+  size   : Nat
+  skip   : Nat
   /-- Keep only items created at or after this instant, as epoch seconds. -/
   since  : Option Int
 
@@ -357,23 +357,23 @@ private def refuse (q : Query) (name : String) (why : String) : Except String Un
 
 /-- Parse the page for a collection ordered by time. -/
 private def parsePage (q : Query) : Except String Page := do
-  let limit  ← natParam q "limit" defaultLimit maxLimit
-  let offset ← natParam q "offset" 0 maxLimit
+  let size   ← natParam q "limit" defaultLimit maxLimit
+  let skip   ← natParam q "offset" 0 maxLimit
   let since ← match q.get "since" with
     | none     => pure none
     | some raw =>
       match Usage.parseIso8601 raw with
       | some e => pure (some e)
       | none   => .error s!"'since' must be an RFC 3339 timestamp, got '{raw}'"
-  return { limit, offset, since }
+  return { size, skip, since }
 
 /-- Parse the page for a collection that has no time order — a listener or a project is
     configuration, not an event, so `since` would have nothing to compare against. -/
 private def parseUnorderedPage (q : Query) : Except String Page := do
   refuse q "since" "is not supported by this collection, which is not ordered by time"
-  let limit  ← natParam q "limit" defaultLimit maxLimit
-  let offset ← natParam q "offset" 0 maxLimit
-  return { limit, offset, since := none }
+  let size   ← natParam q "limit" defaultLimit maxLimit
+  let skip   ← natParam q "offset" 0 maxLimit
+  return { size, skip, since := none }
 
 /-- The one collection envelope.
 
@@ -384,25 +384,19 @@ private def collection (p : Page) (total : Nat) (items : Array Json) : Json :=
   Json.mkObj [
     ("items",  Json.arr items),
     ("total",  ToJson.toJson total),
-    ("limit",  ToJson.toJson p.limit),
-    ("offset", ToJson.toJson p.offset)
+    ("limit",  ToJson.toJson p.size),
+    ("offset", ToJson.toJson p.skip)
   ]
 
-/-- Filter by `since`, take the window, and render. `createdAt` names the field the collection
-    is ordered by. -/
-private def pageOver (p : Page) (createdAt : α → String) (render : α → Json)
-    (items : Array α) : Json :=
-  let kept := match p.since with
-    | none   => items
-    | some s => items.filter fun i =>
-        match Usage.parseIso8601 (createdAt i) with
-        | some e => e ≥ s
-        | none   => false
-  collection p kept.size ((kept.toList.drop p.offset |>.take p.limit).toArray.map render)
+/-- The same, for a collection with no time order.
 
-/-- The same, for a collection with no time order. -/
+    The collections that *are* ordered by time are record stores, and they page in the database:
+    `TaskStore.page`, `Queue.entriesPage`, `Queue.concertRunsPage`, `Interactive.sessionsPage`
+    each take the `since`, the offset and the limit and answer with the window and the total.
+    What is left here is configuration — listeners, roles, skills, projects — which is read from
+    files whole because there is no other way to read it. -/
 private def pageOverUnordered (p : Page) (items : Array α) (render : α → IO Json) : IO Json := do
-  let window := (items.toList.drop p.offset |>.take p.limit).toArray
+  let window := (items.toList.drop p.skip |>.take p.size).toArray
   return collection p items.size (← window.mapM render)
 
 /-! ## Wire conventions
@@ -759,45 +753,47 @@ private def taxisUrl (configPath : Option System.FilePath) : IO (Option String) 
   catch _ => return none
 
 private def overviewApi (configPath : Option System.FilePath) : IO Json := do
-  let entries  ← Queue.loadAllEntries
-  let tasks    ← TaskStore.loadAllTasks
+  -- The counts are counted by the database and the two listings are the two the page shows.
+  -- This used to read the whole queue and the whole task history to render eight numbers and
+  -- ten rows, on every poll of every open tab.
+  let byStatus ← Queue.countByStatus
+  let entries  ← Queue.activeEntries
   let lsCfgs   ← Listener.loadAllListenerConfigs
   let concerts ← Queue.loadAllConcertRuns
   let (authFree, authTotal) ← authCounts configPath
-  let running := entries.filter (·.status == .running)
-  let pending := entries.filter (·.status == .pending)
-  let failed  := entries.filter (·.status == .failed)
   let rConcerts := concerts.filter (·.status == .running)
-  let active := running ++ pending
-  let recent := tasks.toList.take 10
+  -- Running first, then pending, each newest first — the order the panel is read in.
+  let active := entries.filter (·.status == .running) ++ entries.filter (·.status == .pending)
+  let recent ← TaskStore.recent 10
   return Json.mkObj [
     ("counts", Json.mkObj [
-      ("running",    ToJson.toJson running.size),
-      ("pending",    ToJson.toJson pending.size),
-      ("failed",     ToJson.toJson failed.size),
+      ("running",    ToJson.toJson (byStatus .running)),
+      ("pending",    ToJson.toJson (byStatus .pending)),
+      ("failed",     ToJson.toJson (byStatus .failed)),
       ("concerts",   ToJson.toJson rConcerts.size),
       ("listeners",  ToJson.toJson lsCfgs.size),
-      ("totalTasks", ToJson.toJson tasks.size),
+      ("totalTasks", ToJson.toJson (← TaskStore.count)),
       ("authFree",   ToJson.toJson authFree),
       ("authTotal",  ToJson.toJson authTotal)
     ]),
     ("activeQueue", Json.arr (active.map queueEntryJson)),
-    ("recentTasks", Json.arr (recent.map taskRecJson).toArray),
+    ("recentTasks", Json.arr (recent.map taskRecJson)),
     ("taxisUrl",    optStr (← taxisUrl configPath))
   ]
 
 private def queueApi (p : Page) : IO Json := do
-  return pageOver p (·.createdAt) queueEntryJson (← Queue.loadAllEntries)
+  let (entries, total) ← Queue.entriesPage p.since p.skip p.size
+  return collection p total (entries.map queueEntryJson)
 
 private def concertsApi (p : Page) : IO Json := do
-  return pageOver p (·.startedAt) concertRunJson (← Queue.loadAllConcertRuns)
+  let (runs, total) ← Queue.concertRunsPage p.since p.skip p.size
+  return collection p total (runs.map concertRunJson)
 
 private def concertDetailApi (id : String) : IO (Option Json) := do
   match ← Queue.loadConcertRun id with
   | none => return none
   | some r =>
-    let entries ← Queue.loadAllEntries
-    let steps := entries.filter (fun e => e.concertId == some id)
+    let steps ← Queue.entriesOfConcert id
     return some (Json.mkObj [
       ("concert", concertRunJson r),
       ("steps",   Json.arr (steps.map queueEntryJson))
@@ -846,11 +842,11 @@ private def sourceExtras : Listener.SourceConfig → List (String × String)
     *whether*. -/
 private def rateLimitJson (s : Listener.RateLimitStatus) : Json :=
   Json.mkObj [
-    ("description",   Json.str s.limit.describe),
-    ("max",           ToJson.toJson s.limit.max),
-    ("windowSeconds", ToJson.toJson s.limit.windowSeconds),
+    ("description",   Json.str s.rule.describe),
+    ("max",           ToJson.toJson s.rule.max),
+    ("windowSeconds", ToJson.toJson s.rule.windowSeconds),
     ("used",          ToJson.toJson s.used),
-    ("remaining",     ToJson.toJson (s.limit.max - s.used)),
+    ("remaining",     ToJson.toJson (s.rule.max - s.used)),
     ("nextAllowedAt", optEpochIso s.nextAllowedAt)
   ]
 
@@ -905,10 +901,10 @@ private def listenerDetailApi (name : String) : IO (Option Json) := do
     let st ← Listener.loadListenerState name
     let (srcType, srcDetail) := sourceSummary c.source
     let extras := sourceExtras c.source
-    let extrasJson : Array Json := (extras.filter (fun (_, v) => ! v.isEmpty)).map
-      (fun (k, v) => (Json.arr #[Json.str k, Json.str v])) |>.toArray
+    let extrasJson : Array Json := (extras.filter (fun (_, value) => ! value.isEmpty)).map
+      (fun (k, value) => (Json.arr #[Json.str k, Json.str value])) |>.toArray
     let recent := st.processedIds.toList.reverse.take 50
-    -- Newest 50, back in oldest-first order — the order the state file keeps them in, and the
+    -- Newest 50, back in oldest-first order — the order the state keeps them in, and the
     -- one a reader following a window forward wants.
     let recentDispatches := (st.dispatches.toList.reverse.take 50).reverse
     -- The file as stored, `{{secret}}` placeholders intact — this is the document a client edits
@@ -1013,7 +1009,8 @@ private def skillDetailApi (name : String) : IO (Option Json) := do
   return some ((skillSummaryJson s).mergeObj (Json.mkObj [("content", Json.str s.content)]))
 
 private def tasksApi (p : Page) : IO Json := do
-  return pageOver p (·.createdAt) taskRecJson (← TaskStore.loadAllTasks)
+  let (tasks, total) ← TaskStore.page p.since p.skip p.size
+  return collection p total (tasks.map taskRecJson)
 
 -- Projects & issues
 
@@ -1090,14 +1087,14 @@ private def projectDetailApi (id : String) : IO (Option Json) := do
     rather than one anybody tunes against. -/
 private def maxLogAttempts : Nat := 100
 
-/-- Parse the per-task structured JSONL log, keeping only the last `limit` events. Returns the
+/-- Parse the per-task structured JSONL log, keeping only the last `atMost` events. Returns the
     kept events and the total number present, so a caller can tell a tail from the whole.
 
     A run retried after a failed validation writes each attempt to its own file (`<id>.log`,
     then `<id>.retry1.log`, …), so the attempts are read in order and concatenated. Reading only
     the first would show a trace that stops dead the moment a retry begins, which is
     indistinguishable on screen from an agent that has stopped. -/
-private def loadTaskLog (repo : Option RepoPair) (id : String) (limit : Nat)
+private def loadTaskLog (repo : Option RepoPair) (id : String) (atMost : Nat)
     : IO (Array Json × Nat) := do
   let dir := (← Dirs.dataBase) / "logs" / repoLogDir repo
   let readLines (path : System.FilePath) : IO (List String) := do
@@ -1114,7 +1111,7 @@ private def loadTaskLog (repo : Option RepoPair) (id : String) (limit : Nat)
     attempts := attempts.push (← readLines path)
   let lines := attempts.toList.flatten
   let total := lines.length
-  let kept := if total ≤ limit then lines else lines.drop (total - limit)
+  let kept := if total ≤ atMost then lines else lines.drop (total - atMost)
   let mut out : Array Json := #[]
   for line in kept do
     match Json.parse line with
@@ -1132,8 +1129,7 @@ private def loadTaskLog (repo : Option RepoPair) (id : String) (limit : Nat)
     one that failed before it could start. Either way, null means there is no trace to read. -/
 private def taskDetailApi (id : String) (logLimit : Nat) : IO (Option Json) := do
   let record  ← TaskStore.loadTask id
-  let entries ← Queue.loadAllEntries
-  let qEntry  := entries.find? (·.id == id)
+  let qEntry  ← Queue.findEntry id
   let infoOpt : Option (Option RepoPair × String × String × String × Option String) :=
     match record with
     | some r => some (r.repo, tStText r.status, r.createdAt, r.prompt, some r.id)
@@ -1190,8 +1186,8 @@ private def interactiveSummaryJson (r : Interactive.SessionRecord) : Json :=
   ]
 
 private def interactiveApi (p : Page) : IO Json := do
-  let all ← Interactive.loadAllSessions
-  return pageOver p (·.createdAt) interactiveSummaryJson all
+  let (sessions, total) ← Interactive.sessionsPage p.since p.skip p.size
+  return collection p total (sessions.map interactiveSummaryJson)
 
 private def interactiveDetailApi (id : String) : IO (Option Json) := do
   let some r ← Interactive.loadSession id | return none
@@ -1226,13 +1222,13 @@ private def interactiveDetailApi (id : String) : IO (Option Json) := do
 
     `none` for a session that does not exist, so the route is a `404` rather than an empty page,
     which would tell a client with a mistyped id that it was merely up to date. -/
-private def interactiveEventsApi (id : String) (after : Nat) (limit : Nat) : IO (Option Json) := do
+private def interactiveEventsApi (id : String) (after : Nat) (atMost : Nat) : IO (Option Json) := do
   let some _ ← Interactive.loadSession id | return none
-  let (items, total) ← Interactive.readEvents id after limit
+  let (items, total) ← Interactive.readEvents id after atMost
   return some <| Json.mkObj [
     ("items",  Json.arr items),
     ("total",  ToJson.toJson total),
-    ("limit",  ToJson.toJson limit),
+    ("limit",  ToJson.toJson atMost),
     ("after",  ToJson.toJson after)
   ]
 
@@ -1298,8 +1294,8 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
       let some seg := safeSegment idPart | return .notFound
       match natParam q "after" 0 maxAfter, natParam q "limit" defaultLimit maxLimit with
       | .error e, _ | _, .error e => return .badRequest e
-      | .ok after, .ok limit =>
-        match ← interactiveEventsApi seg after limit with
+      | .ok after, .ok atMost =>
+        match ← interactiveEventsApi seg after atMost with
         | some j => return .ok j
         | none   => return .notFound
     let some seg := safeSegment rest | return .notFound
@@ -1309,9 +1305,9 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
   if kind.startsWith "tasks/" then
     match natParam q "logLimit" defaultLogLimit maxLogLimit with
     | .error e => return .badRequest e
-    | .ok limit =>
+    | .ok atMost =>
       let some seg := safeSegment (kind.drop "tasks/".length).toString | return .notFound
-      match ← taskDetailApi seg limit with
+      match ← taskDetailApi seg atMost with
       | some j => return .ok j
       | none   => return .notFound
   return .notFound
@@ -1530,8 +1526,7 @@ private def askDaemon (request : Json) : IO (Except String Json) := do
     running" and leaving the page still saying `running` is a dead end a reader can do nothing
     with, so the mismatch is closed on the way out. -/
 private def cancelEntry (id : String) : IO WriteResult := do
-  let entries ← Queue.loadAllEntries
-  let some entry := entries.find? (fun e => e.id == id || e.taskId == some id)
+  let some entry ← Queue.findEntry id
     | return .notFound
   unless entry.status == .running do
     let repaired ← match entry.taskId with
@@ -1607,8 +1602,8 @@ private def startInteractive (body : String) : IO WriteResult := do
   -- to bound spending is the one that must not fail quietly, on this side of the wire too.
   match j.getObjVal? "budget" |>.toOption with
   | none | some Json.null => pure ()
-  | some v =>
-    match v.getNum? |>.toOption with
+  | some b =>
+    match b.getNum? |>.toOption with
     | none => return .badRequest "'budget' must be a number of USD"
     | some n =>
       let budget := n.toFloat
@@ -1793,9 +1788,9 @@ private def requestSession (req : Request Body.Stream) : Option String :=
 /-- Whether a request may reach the API: a valid session cookie, or the shared secret as a
     bearer token. Both comparisons are constant-time. -/
 private def authenticated (st : ServeState) (req : Request Body.Stream) : IO Bool := do
-  if let some v := reqHeader req "authorization" then
-    if v.startsWith "Bearer " then
-      if constantTimeEq (v.drop "Bearer ".length).trimAscii.toString st.cfg.password then
+  if let some auth := reqHeader req "authorization" then
+    if auth.startsWith "Bearer " then
+      if constantTimeEq (auth.drop "Bearer ".length).trimAscii.toString st.cfg.password then
         return true
   if let some sid := requestSession req then
     return ← sessionValid st sid
@@ -1951,8 +1946,8 @@ private def maxWriteBytes : UInt64 := 262144
     `OrchestraTest.Dashboard` pins directly. -/
 def isJsonContentType : Option String → Bool
   | none   => false
-  | some v =>
-    let ty := ((v.splitOn ";").headD "").trimAscii.toString.toLower
+  | some raw =>
+    let ty := ((raw.splitOn ";").headD "").trimAscii.toString.toLower
     ty == "application/json" || (ty.startsWith "application/" && ty.endsWith "+json")
 
 private def jsonContentType (req : Request Body.Stream) : Bool :=
@@ -2104,10 +2099,10 @@ private def pageIsEmpty (payload : Json) : Bool :=
   | some items => items.isEmpty
   | none       => true
 
-private partial def transcriptLoop (out : Body.Stream) (id : String) (limit : Nat)
+private partial def transcriptLoop (out : Body.Stream) (id : String) (atMost : Nat)
     (after : Nat) (idleTicks : Nat) : Async Unit := do
   let outcome ← try
-      Except.ok <$> interactiveEventsApi id after limit
+      Except.ok <$> interactiveEventsApi id after atMost
     catch e => pure (Except.error (toString e))
   match outcome with
   -- The session is gone. Nothing improves by waiting, so the stream ends; the client learns by
@@ -2124,7 +2119,7 @@ private partial def transcriptLoop (out : Body.Stream) (id : String) (limit : Na
     if let some f := frame then
       out.send (Chunk.ofByteArray f.toUTF8)
     Std.Async.sleep transcriptIntervalMs
-    transcriptLoop out id limit after idleTicks
+    transcriptLoop out id atMost after idleTicks
   | .ok (some payload) =>
     let newAfter := lastSeqOf payload after
     -- Caught up on a session that has ended: nothing further will ever arrive, so the stream
@@ -2140,14 +2135,14 @@ private partial def transcriptLoop (out : Body.Stream) (id : String) (limit : Na
     if let some f := frame then
       out.send (Chunk.ofByteArray f.toUTF8)
     -- A full page means there is more behind it. Sleeping a whole tick after one would cap the
-    -- stream at `limit` events per interval, and a turn that outran that would fall further
+    -- stream at `atMost` events per interval, and a turn that outran that would fall further
     -- behind on every tick and never catch up.
-    -- `limit > 0` matters: a client may ask for `?limit=0`, every page would then be "full",
+    -- `atMost > 0` matters: a client may ask for `?limit=0`, every page would then be "full",
     -- and the loop would never sleep.
-    let full := limit > 0 && (payload.getObjVal? "items" |>.toOption.bind (·.getArr?.toOption)).any
-      (·.size ≥ limit)
+    let full := atMost > 0 && (payload.getObjVal? "items" |>.toOption.bind (·.getArr?.toOption)).any
+      (·.size ≥ atMost)
     unless full do Std.Async.sleep transcriptIntervalMs
-    transcriptLoop out id limit newAfter idleTicks
+    transcriptLoop out id atMost newAfter idleTicks
 
 /-- The transcript stream, or `none` when `kind` does not name one.
 
@@ -2161,7 +2156,7 @@ private def transcriptResponse (kind : String) (q : Query) (lastEventId : Option
   let some id := safeSegment idPart | return some (← notFoundJsonResp)
   match natParam q "after" 0 maxAfter, natParam q "limit" defaultLimit maxLimit with
   | .error e, _ | _, .error e => return some (← errorResp e .badRequest)
-  | .ok after, .ok limit =>
+  | .ok after, .ok atMost =>
     -- `EventSource` reconnects to the URL it was constructed with — cursor and all — and says
     -- where it actually got to in `Last-Event-ID`. Without reading that, every drop replayed
     -- the conversation from wherever the page happened to load, which for a long chat is
@@ -2170,7 +2165,7 @@ private def transcriptResponse (kind : String) (q : Query) (lastEventId : Option
     let after := max after (lastEventId.getD 0)
     -- The first page goes out on the connection that asked for it, so a client attaching to a
     -- conversation already in progress sees it without a second request.
-    let some first ← interactiveEventsApi id after limit | return some (← notFoundJsonResp)
+    let some first ← interactiveEventsApi id after atMost | return some (← notFoundJsonResp)
     let firstAfter := lastSeqOf first after
     return some <| ← (secured Response.ok)
       |>.header! "Content-Type" "text/event-stream"
@@ -2178,7 +2173,7 @@ private def transcriptResponse (kind : String) (q : Query) (lastEventId : Option
       |>.header! "X-Accel-Buffering" "no"
       |>.stream fun out => do
         out.send (Chunk.ofByteArray (sseFrameWithId firstAfter (Json.compress first)).toUTF8)
-        transcriptLoop out id limit firstAfter 0
+        transcriptLoop out id atMost firstAfter 0
 
 /-! ## Route dispatch -/
 

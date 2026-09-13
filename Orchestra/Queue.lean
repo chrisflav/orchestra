@@ -1,6 +1,24 @@
 import Lean.Data.Json
 import Orchestra.Config
+import Orchestra.Store
 import Orchestra.TaskStore
+
+/-!
+# The queue
+
+What is waiting to run, what is running, and what a run of a concert workflow has got to. Rows of
+the `queue_entry` and `concert_run` tables of `<data>/orchestra.db` (`Orchestra.Store`); what is
+left in `<data>/queue` is the daemon's pid file, its socket and its log.
+
+An entry is a task's whole launch configuration, written once when it is queued and written back
+when it is claimed — the slot it got, the authentication source it drew, the task it became. Three
+processes write here at once (the daemon's workers, its claim loop, a CLI enqueueing), which is
+what the busy timeout on every connection is for; every save is a single statement.
+
+Below the storage sit the pure decisions the daemon makes out of these records — the claim order,
+the slot choice, the reaping rules — which are ordinary functions over the entries and are tested
+as such.
+-/
 
 open Lean (Json FromJson ToJson)
 
@@ -309,6 +327,9 @@ instance : FromJson QueueEntry where
 
 -- Directories and paths
 
+/-- `<data>/queue`, which no longer holds the entries — those are rows in the `queue_entry`
+    table. What is still here is the daemon's own furniture: its pid file, its socket and its
+    log, none of which is a record. -/
 def queueDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "queue"
 
@@ -321,43 +342,178 @@ def socketFile : IO System.FilePath :=
 def daemonLogFile : IO System.FilePath :=
   return (← queueDir) / "daemon.log"
 
+/-- Where the JSON concert runs lived before the database. Read once, by
+    `Orchestra.Store.Import`, and then left alone. The entries' own legacy directory is
+    `queueDir` itself, which is why that one has no `legacy` twin. -/
+def legacyConcertsDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "concerts"
+
+-- The rows an entry and a concert run are stored as
+
+/-- The entry as a row of the `queue_entry` table.
+
+    Everything that is not a scalar goes into a `text` column as the compressed JSON its own
+    instance writes — the label lists, the declared input and output types, the spawn policy, and
+    the task input and output, which are whatever those types say and so have nothing to be
+    decoded into here. An empty list is `[]` rather than NULL: `tools` is the one field where
+    absent and empty differ, and it is the one that is nullable. -/
+def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
+  let (upstream, fork) := Store.repoColumns e.repo
+  { id                   := e.id
+    created_at           := e.createdAt
+    status               := Store.enumColumn e.status
+    upstream             := upstream
+    fork                 := fork
+    mode                 := Store.enumColumn e.mode
+    prompt               := e.prompt
+    goal                 := e.goal
+    agent                := e.agent
+    system_prompt        := e.systemPrompt
+    prepend_prompt       := e.prependPrompt
+    backend              := e.backend
+    model                := e.model
+    continues_from       := e.continuesFrom
+    series               := e.series
+    task_id              := e.taskId
+    slot                 := e.slot.map Store.natColumn
+    config_path          := e.configPath
+    budget               := e.budget
+    memory               := Store.enumColumn e.memory
+    identity             := e.identity
+    auth_source          := e.authSource
+    auth_sources         := Store.jsonColumn e.authSources
+    auth_mode            := e.authMode.map Store.enumColumn
+    tools                := e.tools.map Store.jsonColumn
+    read_only            := e.readOnly
+    priority             := Store.natColumn e.priority
+    concert_step_key     := e.concertStepKey
+    concert_id           := e.concertId
+    input_type           := Store.jsonColumn e.inputType
+    output_type          := Store.jsonColumn e.outputType
+    input_json           := Store.rawJsonColumn e.inputJson
+    output_json          := Store.rawJsonColumn e.outputJson
+    issue_number         := e.issueNumber.map Store.natColumn
+    project_id           := Store.issueIdColumn e.projectId
+    issue_id             := Store.issueIdColumn e.issueId
+    role                 := e.role
+    pr_labels            := Store.jsonColumn e.prLabels
+    triage_add_labels    := Store.jsonColumn e.triageAddLabels
+    triage_remove_labels := Store.jsonColumn e.triageRemoveLabels
+    listener_name        := e.listenerName
+    spawn_policy         := e.spawnPolicy.map Store.jsonColumn
+    spawned_by           := e.spawnedBy
+    scope_root           := Store.issueIdColumn e.scopeRoot }
+
+/-- The entry a row holds, or why this build cannot read it.
+
+    The spawn policy is the one field read leniently, as `FromJson QueueEntry` reads it and for
+    the same reason: `loadEntry` turning a decode failure into "no such entry" would, for an
+    entry holding a pre-claimed issue, mean a task that never runs and a claim nobody releases. -/
+def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := do
+  let repo               ← Store.repoOfColumns? row.upstream row.fork
+  let status             ← Store.enumOfColumn? "status" row.status
+  let mode               ← Store.enumOfColumn? "mode" row.mode
+  let memory             ← Store.enumOfColumn? "memory" row.memory
+  let authMode           ← row.auth_mode.mapM (Store.enumOfColumn? (α := AuthMode) "auth_mode")
+  let authSources        ← Store.jsonOfColumn? (α := List String) "auth_sources" row.auth_sources
+  let tools              ← row.tools.mapM (Store.jsonOfColumn? (α := List String) "tools")
+  let inputType          ← Store.jsonOfColumn? (α := ResultType) "input_type" row.input_type
+  let outputType         ← Store.jsonOfColumn? (α := ResultType) "output_type" row.output_type
+  let inputJson          ← Store.rawJsonOfColumn? "input_json" row.input_json
+  let outputJson         ← Store.rawJsonOfColumn? "output_json" row.output_json
+  let projectId          ← Store.issueIdOfColumn? "project_id" row.project_id
+  let issueId            ← Store.issueIdOfColumn? "issue_id" row.issue_id
+  let scopeRoot          ← Store.issueIdOfColumn? "scope_root" row.scope_root
+  let prLabels           ← Store.jsonOfColumn? (α := List String) "pr_labels" row.pr_labels
+  let triageAddLabels    ← Store.jsonOfColumn? (α := List String) "triage_add_labels"
+                             row.triage_add_labels
+  let triageRemoveLabels ← Store.jsonOfColumn? (α := List String) "triage_remove_labels"
+                             row.triage_remove_labels
+  let spawnPolicy        := row.spawn_policy.bind fun s =>
+                              (Store.jsonOfColumn? (α := SpawnPolicy) "spawn_policy" s).toOption
+  return { id := row.id
+           createdAt := row.created_at
+           status, repo, mode
+           prompt := row.prompt
+           goal := row.goal
+           agent := row.agent
+           systemPrompt := row.system_prompt
+           prependPrompt := row.prepend_prompt
+           backend := row.backend
+           model := row.model
+           continuesFrom := row.continues_from
+           series := row.series
+           taskId := row.task_id
+           slot := row.slot.map Int.toNat
+           configPath := row.config_path
+           budget := row.budget
+           memory
+           identity := row.identity
+           authSource := row.auth_source
+           authSources, authMode, tools
+           readOnly := row.read_only
+           priority := row.priority.toNat
+           concertStepKey := row.concert_step_key
+           concertId := row.concert_id
+           inputType, outputType, inputJson, outputJson
+           issueNumber := row.issue_number.map Int.toNat
+           projectId, issueId
+           role := row.role
+           prLabels, triageAddLabels, triageRemoveLabels
+           listenerName := row.listener_name
+           spawnPolicy
+           spawnedBy := row.spawned_by
+           scopeRoot }
+
+/-- The concert run as a row of the `concert_run` table. -/
+def ConcertRun.toRow (r : ConcertRun) : Store.ConcertRunRow :=
+  { id            := r.id
+    started_at    := r.startedAt
+    status        := Store.enumColumn r.status
+    name          := r.name
+    workflow_file := r.workflowFile
+    finished_at   := r.finishedAt }
+
+/-- The concert run a row holds, or why this build cannot read it. -/
+def ConcertRun.ofRow? (row : Store.ConcertRunRow) : Except String ConcertRun := do
+  let status ← Store.enumOfColumn? "status" row.status
+  return { id           := row.id
+           startedAt    := row.started_at
+           status       := status
+           name         := row.name
+           workflowFile := row.workflow_file
+           finishedAt   := row.finished_at }
+
 -- Storage
 
-def saveEntry (entry : QueueEntry) : IO Unit := do
-  let dir ← queueDir
-  IO.FS.createDirAll dir
-  IO.FS.writeFile (dir / s!"{entry.id}.json") (Lean.Json.compress (ToJson.toJson entry))
+open Db.Query.DSL in
+/-- Write the entry, replacing whatever is under its id.
 
+    One statement. Entries are written by the daemon's workers, by its claim loop and by a CLI
+    enqueueing, all at once; the busy timeout on each connection is what orders them, and a
+    transaction around a single write would only make the others wait longer. -/
+def saveEntry (entry : QueueEntry) : IO Unit :=
+  Store.run <| HasModel.save entry.toRow
+
+open Db.Query.DSL in
 def loadEntry (id : String) : IO (Option QueueEntry) := do
-  let path := (← queueDir) / s!"{id}.json"
-  if !(← path.pathExists) then return none
-  let contents ← IO.FS.readFile path
-  match Json.parse contents with
-  | .error _ => return none
-  | .ok j    =>
-    match FromJson.fromJson? j with
-    | .error _ => return none
-    | .ok e    => return some e
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.id = id
+    select e
+  return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
 
-private def stripJsonExt (name : String) : Option String :=
-  if name.endsWith ".json" then
-    some (name.dropEnd ".json".length).toString
-  else
-    none
-
+open Db.Query.DSL in
 /-- Load all queue entries, newest first.
 
     By `created_at` rather than id, for the reason `TaskStore.loadAllTasks` gives. -/
 def loadAllEntries : IO (Array QueueEntry) := do
-  let dir ← queueDir
-  if !(← dir.pathExists) then return #[]
-  let entries ← System.FilePath.readDir dir
-  let mut result : Array QueueEntry := #[]
-  for entry in entries do
-    if let some id := stripJsonExt entry.fileName then
-      if let some e ← loadEntry id then
-        result := result.push e
-  return Time.sortNewestFirst (·.createdAt) (·.id) result
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    select e
+    order_by_desc e.created_at
+    order_by_desc e.id
+  Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
 
 /-- Entries in the order the daemon tries them: priority first (higher wins), then oldest.
 
@@ -391,6 +547,155 @@ def pendingCandidates (all : Array QueueEntry) (activePerRepo : Std.HashMap Stri
     e.status == .pending &&
     activePerRepo.getD e.slotKey 0 < perRepoLimit)
   claimOrder pending
+
+/-! ## Query-shaped access
+
+Everything below is a question the callers used to answer by loading the whole queue and
+filtering the array: what is pending, what is active, whose entry a task is, how many entries a
+task has spawned. Each is one statement against an index `Store.target` declares for exactly it,
+inside one `Store.run`.
+
+They sit here rather than up with `saveEntry` because the first of them hands its rows back in
+`claimOrder`, the pure ordering just above. -/
+
+open Db.Query.DSL in
+/-- Every pending entry, in the order the daemon should try them.
+
+    The order is `claimOrder`'s and is computed here rather than asked of the database: it turns
+    on `Time.ageKey`, which decides what an unparseable timestamp is worth, and a record store
+    that ordered one way in SQL and another way in memory would be two orders to keep in step.
+    The query's business is the filter, which is what used to cost a pass over every entry. -/
+def pendingEntries : IO (Array QueueEntry) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.status = Store.enumColumn QueueStatus.pending
+    select e
+  return claimOrder (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)
+
+open Db.Query.DSL in
+/-- Every entry that is pending or running, newest first.
+
+    "Active" in the sense every caller of it means: work the daemon either holds or still owes.
+    The listener caps, `orchestra status` and the project health check all count over exactly
+    this set. -/
+def activeEntries : IO (Array QueueEntry) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.status = Store.enumColumn QueueStatus.pending
+       ∨ e.status = Store.enumColumn QueueStatus.running
+    select e
+    order_by_desc e.created_at
+    order_by_desc e.id
+  Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
+
+open Db.Query.DSL in
+/-- Every entry the queue calls `running`, newest first. What the task reaper sweeps. -/
+def runningEntries : IO (Array QueueEntry) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.status = Store.enumColumn QueueStatus.running
+    select e
+    order_by_desc e.created_at
+    order_by_desc e.id
+  Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
+
+open Db.Query.DSL in
+/-- The entry whose run became task `taskId`, if there is one.
+
+    A task and the entry it came from are numbered separately, so this is how a continuation
+    finds the entry its predecessor was — the lookup the claim loop used to do with
+    `all.find? (·.taskId == some tid)` over every entry in the queue. -/
+def entryForTask (taskId : String) : IO (Option QueueEntry) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.task_id = some taskId
+    select e
+  return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
+
+open Db.Query.DSL in
+/-- The entry addressed by either of the two ids it answers to: its own, or the task its run
+    became.
+
+    The dashboard's task detail and its cancel button are both reached from a link that may carry
+    either id, and neither knows which it has. One query over both columns rather than a load of
+    the whole queue and a `find?` over it. -/
+def findEntry (id : String) : IO (Option QueueEntry) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.id = id ∨ e.task_id = some id
+    select e
+  let entries ← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
+  -- The entry's own id wins: an entry can carry a task id that is some *other* entry's id only
+  -- by accident, and a caller that named an entry meant that entry.
+  return entries.find? (·.id == id) |>.orElse fun _ => entries[0]?
+
+open Db.Query.DSL in
+/-- How many entries task `taskId` has put on the queue.
+
+    Counted by the database. Terminal entries count too: the spawn policy's ceiling is on how
+    much work a task may create, not on how much of it is still running. -/
+def countSpawnedBy (taskId : String) : IO Nat := do
+  let n ← Store.run <| HasModel.count <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.spawned_by = some taskId
+    select e
+  return n.toNat
+
+open Db.Query.DSL in
+/-- The steps of one concert run, newest first. -/
+def entriesOfConcert (concertId : String) : IO (Array QueueEntry) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.concert_id = some concertId
+    select e
+    order_by_desc e.created_at
+    order_by_desc e.id
+  Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
+
+/-- Every status the queue has, which is what `countByStatus` counts over. -/
+def allStatuses : List QueueStatus :=
+  [.pending, .running, .done, .failed, .unfinished, .cancelled]
+
+open Db.Query.DSL in
+/-- How many entries are in each status.
+
+    Six counts on one connection, which is what the overview needs and all it needs: it prints
+    three of them and a total, and used to read every entry in the queue to get them. Returned as
+    a function rather than a record so that a status added later is a case here and nowhere
+    else. -/
+def countByStatus : IO (QueueStatus → Nat) := do
+  let counts ← Store.run do
+    let mut acc : Std.HashMap String Nat := {}
+    for status in allStatuses do
+      let name := Store.enumColumn status
+      let n ← HasModel.count <| query% do
+        let e ← from Store.QueueEntryRow
+        guard e.status = name
+        select e
+      acc := acc.insert name n.toNat
+    pure acc
+  return fun status => counts.getD (Store.enumColumn status) 0
+
+open Db.Query.DSL in
+/-- One page of the queue, newest first, and how many entries the filter matched.
+
+    `since?` is epoch seconds and keeps the entries created at or after it; `skip` and `take` are
+    the window. The total is counted *before* the window, which is the arithmetic the dashboard's
+    collection envelope reports and the only thing that makes an offset usable. -/
+def entriesPage (since? : Option Int) (skip take : Nat) :
+    IO (Array QueueEntry × Nat) := do
+  let bound := Store.sinceBound since?
+  let matching : QuerySet Store.QueueEntryRow := query% do
+    let e ← from Store.QueueEntryRow
+    guard e.created_at ≥ bound
+    select e
+    order_by_desc e.created_at
+    order_by_desc e.id
+  let (rows, total) ← Store.run do
+    let rows ← HasModel.fetch (matching.offset skip |>.limit take)
+    let total ← HasModel.count matching
+    pure (rows, total)
+  return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows, total.toNat)
 
 /-- Choose the per-repo clone slot a freshly claimed entry should run in.
 
@@ -485,6 +790,14 @@ structure Claim where
 
 /-- Pick the entry the daemon should start next, or `none` if nothing can start right now.
 
+    `pending` is the entries that are waiting — `pendingEntries` for the daemon, a literal array
+    for a test; the per-repo limit is applied to them here, since only the context knows it.
+
+    `predecessorOf tid` is the entry whose run became task `tid`, which is what a continuation
+    has to find before it can ask for its workspace back. A lookup rather than the whole queue:
+    the daemon passes `entryForTask`, one indexed query for the one continuation being
+    considered, where reading every entry to answer it was most of what a claim used to cost.
+
     `slotOccupant fork slot` reports which entry's working tree currently sits in a slot — of
     the pool `fork` names, or of the shared repository-independent pool when it is `none`. It
     is consulted for continuations only, and it is what makes resuming safe: a predecessor's
@@ -493,22 +806,25 @@ structure Claim where
     tree would silently hand the agent someone else's branch and edits while its restored
     conversation describes work that is gone — so when the occupant does not match, the
     continuation is treated as an ordinary entry that resets whatever slot it lands in. -/
-def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
+def claimDecision (ctx : ClaimContext) (pending : Array QueueEntry)
+    (predecessorOf : String → IO (Option QueueEntry))
     (slotOccupant : Option Repository → Nat → IO (Option String)) : IO (Option Claim) := do
   if ctx.total >= ctx.parallelLimit then return none
   -- Once a task on a backend that needs the daemon to itself is running, nothing else may
   -- start alongside it.
   if ctx.exclusiveActive then return none
-  let counts := ctx.occupiedSlots.fold (fun m k v => m.insert k v.size)
+  let counts := ctx.occupiedSlots.fold (fun m k slots => m.insert k slots.size)
     ({} : Std.HashMap String Nat)
-  let candidates := pendingCandidates all counts ctx.perRepoLimit
+  let candidates := pendingCandidates pending counts ctx.perRepoLimit
   for e in candidates do
     -- A backend that keeps per-run state at a fixed global path only starts when nothing else
     -- is running. `total == 0` means the daemon is idle.
     if !ctx.parallelSafe e.backend && ctx.total > 0 then continue
     -- The predecessor entry, and the slot it recorded — the workspace this entry was queued
     -- to build on.
-    let predecessor := e.continuesFrom.bind fun tid => all.find? (·.taskId == some tid)
+    let predecessor ← match e.continuesFrom with
+      | none     => pure none
+      | some tid => predecessorOf tid
     let preferred ← match predecessor.bind (fun p => p.slot.map (p.id, ·)) with
       | none => pure none
       | some (predId, predSlot) =>
@@ -530,9 +846,7 @@ def claimDecision (ctx : ClaimContext) (all : Array QueueEntry)
 
 /-- Return true if any entry created by `name` is currently pending or running. -/
 def hasActiveEntryForListener (name : String) : IO Bool := do
-  let entries ← loadAllEntries
-  return entries.any fun e =>
-    (e.status == .pending || e.status == .running) && e.listenerName == some name
+  return (← activeEntries).any (·.listenerName == some name)
 
 -- PID file management
 
@@ -593,7 +907,7 @@ def daemonRunning : IO Bool := do
 /-- Cancel `id` if it is *still* pending, and report whether it was.
 
     The re-read is what makes cascade cancellation safe under a parallel daemon. The caller
-    iterates over a snapshot from `loadAllEntries`, and a worker can claim and start any entry in
+    iterates over a snapshot from `pendingEntries`, and a worker can claim and start any entry in
     that snapshot while the loop is still running; writing the snapshot's version back would
     stamp `cancelled` onto an entry that is at that moment executing. -/
 private def cancelIfStillPending (id : String) : IO Bool := do
@@ -604,9 +918,8 @@ private def cancelIfStillPending (id : String) : IO Bool := do
 
 /-- Cancel all pending entries that have continuesFrom = taskId, then recurse. -/
 partial def cancelDependents (taskId : String) : IO Unit := do
-  let all ← loadAllEntries
-  for entry in all do
-    if entry.status == .pending && entry.continuesFrom == some taskId then
+  for entry in ← pendingEntries do
+    if entry.continuesFrom == some taskId then
       if ← cancelIfStillPending entry.id then
         -- If this entry already ran and has a taskId, cascade further
         if let some tid := entry.taskId then
@@ -642,10 +955,8 @@ def shouldReap (liveEntryIds : Array String) (entry : QueueEntry) : Bool :=
 /-- On daemon startup, mark any entries stuck in 'running' state as unfinished.
     These are left over from a previous daemon that was killed mid-task. -/
 def markStaleRunningAsUnfinished : IO Unit := do
-  let all ← loadAllEntries
-  for entry in all do
-    if entry.status == .running then
-      saveEntry { entry with status := .unfinished }
+  for entry in ← runningEntries do
+    saveEntry { entry with status := .unfinished }
 
 /-- Bring task records back in line with the entries that own them, and answer how many needed it.
 
@@ -675,41 +986,51 @@ def cancelStaleConcertEntries : IO Unit := do
   for entry in all do
     if entry.status == .unfinished && entry.concertStepKey.isSome then
       saveEntry { entry with status := .cancelled }
-
 -- Concert run persistence
 
-def concertsDir : IO System.FilePath :=
-  return (← Dirs.dataBase) / "concerts"
+open Db.Query.DSL in
+def saveConcertRun (run : ConcertRun) : IO Unit :=
+  Store.run <| HasModel.save run.toRow
 
-def saveConcertRun (run : ConcertRun) : IO Unit := do
-  let dir ← concertsDir
-  IO.FS.createDirAll dir
-  IO.FS.writeFile (dir / s!"{run.id}.json") (Lean.Json.compress (ToJson.toJson run))
-
+open Db.Query.DSL in
 def loadConcertRun (id : String) : IO (Option ConcertRun) := do
-  let path := (← concertsDir) / s!"{id}.json"
-  if !(← path.pathExists) then return none
-  let contents ← IO.FS.readFile path
-  match Json.parse contents with
-  | .error _ => return none
-  | .ok j    =>
-    match FromJson.fromJson? j with
-    | .error _ => return none
-    | .ok r    => return some r
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let c ← from Store.ConcertRunRow
+    guard c.id = id
+    select c
+  return (← Store.keepConvertible "concert run" (·.id) ConcertRun.ofRow? rows)[0]?
 
+open Db.Query.DSL in
 /-- Load all concert runs, newest first.
 
     By `started_at` rather than id, for the reason `TaskStore.loadAllTasks` gives. -/
 def loadAllConcertRuns : IO (Array ConcertRun) := do
-  let dir ← concertsDir
-  if !(← dir.pathExists) then return #[]
-  let entries ← System.FilePath.readDir dir
-  let mut result : Array ConcertRun := #[]
-  for entry in entries do
-    if let some id := stripJsonExt entry.fileName then
-      if let some r ← loadConcertRun id then
-        result := result.push r
-  return Time.sortNewestFirst (·.startedAt) (·.id) result
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let c ← from Store.ConcertRunRow
+    select c
+    order_by_desc c.started_at
+    order_by_desc c.id
+  Store.keepConvertible "concert run" (·.id) ConcertRun.ofRow? rows
+
+open Db.Query.DSL in
+/-- One page of the concert history, newest first, and how many runs the filter matched.
+
+    As `entriesPage`, over `started_at` — which is the column a concert run is ordered by and the
+    one the dashboard's `since` is meant to compare against. -/
+def concertRunsPage (since? : Option Int) (skip take : Nat) :
+    IO (Array ConcertRun × Nat) := do
+  let bound := Store.sinceBound since?
+  let matching : QuerySet Store.ConcertRunRow := query% do
+    let c ← from Store.ConcertRunRow
+    guard c.started_at ≥ bound
+    select c
+    order_by_desc c.started_at
+    order_by_desc c.id
+  let (rows, total) ← Store.run do
+    let rows ← HasModel.fetch (matching.offset skip |>.limit take)
+    let total ← HasModel.count matching
+    pure (rows, total)
+  return (← Store.keepConvertible "concert run" (·.id) ConcertRun.ofRow? rows, total.toNat)
 
 /-- On daemon startup, mark any running concert runs as cancelled (the fibers died). -/
 def cancelStaleRunningConcerts : IO Unit := do

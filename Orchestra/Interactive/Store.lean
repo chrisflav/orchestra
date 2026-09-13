@@ -2,6 +2,7 @@ import Orchestra.Config
 import Orchestra.Utils.Time
 import Orchestra.Utils.Files
 import Orchestra.Dirs
+import Orchestra.Store
 import Orchestra.StreamFormat
 import Orchestra.TaskStore
 import Lean.Data.Json
@@ -9,21 +10,27 @@ import Lean.Data.Json
 open Lean (Json ToJson FromJson)
 
 /-!
-# Where a session lives on disk
+# Where a session is kept
 
-`<data>/interactive/<id>/` holds two files:
+Two tables of `<data>/orchestra.db` (`Orchestra.Store`):
 
-  * `session.json` — the record, rewritten on every state change.
-  * `events.jsonl` — the transcript, appended to and flushed per event.
+  * `interactive_session` — one row per session, the record rewritten on every state change.
+  * `interactive_event` — one row per transcript line, keyed by `(session_id, seq)`.
 
-Split that way because the daemon writes both and the API reads both, and in the compose
-deployment those are two containers with nothing between them but this directory. A socket
-round-trip for every read would make the transcript unreadable whenever the daemon is busy;
-files are readable whether the daemon is busy, restarting, or gone.
+Two tables rather than one document because they are written at different rates and read for
+different reasons: the record changes on every state change and is read whole, while the
+transcript only grows and is read a window at a time from wherever a client's cursor is. The
+daemon writes both and the API reads both, and in the compose deployment those are two
+containers with nothing between them but this database.
 
-The transcript is append-only and carries a monotone `seq`. That is what makes it cheap to tail
-from another process — a reader keeps a cursor and asks for what follows it — and what makes a
-dropped stream lossless to resume, since "what did I miss" has an exact answer.
+The transcript's `seq` is still monotone, and still handed out by whoever holds the session's
+lock, and that is what makes tailing cheap and a dropped stream lossless to resume: a reader
+keeps a cursor, "what did I miss" is the range after it, and the answer is a range of a key
+rather than a file read to the end. It is also what keeps an event in one place — `(session_id,
+seq)` is the row's primary key, so a seq handed out twice replaces its row instead of leaving
+the conversation with two events claiming the same position in it. The torn-line and
+torn-character recovery the file transcript needed went away with the file; what is left of it
+lives in `Orchestra.Store.Import`, which reads the old `events.jsonl` once.
 -/
 
 namespace Orchestra.Interactive
@@ -269,159 +276,208 @@ instance : ToJson TranscriptEvent where
         [("kind", .str "notice"), ("level", .str level), ("message", .str msg)]
     Json.mkObj (base ++ rest)
 
-/-! ## Paths -/
+/-! ## Where a session lives -/
 
-/-- Redirects the session root, so a test writing sessions cannot reach the developer's own.
-    The same device `Skill.skillsDirOverride` and `Project.globalRolesDirOverride` use. -/
-initialize sessionsDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
+/-- `<data>/interactive`, where a session used to be a directory of two files. Read once, by
+    `Orchestra.Store.Import`, and then left alone: the import copies, it does not delete. -/
+def legacySessionsDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "interactive"
 
-def setSessionsDirOverride (p : Option System.FilePath) : IO Unit :=
-  sessionsDirOverride.set p
+/-- Refuse an id that is not a name.
 
-def sessionsDir : IO System.FilePath := do
-  match ← sessionsDirOverride.get with
-  | some p => return p
-  | none   => return (← Dirs.dataBase) / "interactive"
-
-/-- The directory a session's files live in.
-
-    Every path in this module goes through here, and here is where the id is checked. That
-    placement is deliberate and the codebase has been bitten before: `Utils.ensureConfigName`
+    The store used to hold this because every path went through it and `Utils.ensureConfigName`
     exists precisely because a store that trusted its callers wrote a file outside its root and
-    answered `201`. Not every id reaching this module comes from a path segment the HTTP layer
-    already checked — `resumeFrom` arrives in a request *body* — so the property is held here
-    rather than assumed. -/
-def sessionDir (id : String) : IO System.FilePath := do
+    answered `201`. A row key cannot escape anything, but the property is worth keeping for a
+    different reason: an id is a name every other surface can also name — a directory of logs, a
+    URL path segment, a line of `orchestra interactive list` — and the check is what says so. Not
+    every id reaching this module comes from a path segment the HTTP layer has already looked at;
+    `resumeFrom` arrives in a request *body*. -/
+private def checkId (id : String) : IO Unit :=
   Utils.ensureConfigName "session" id
-  return (← sessionsDir) / id
 
-def recordPath (id : String) : IO System.FilePath :=
-  return (← sessionDir id) / "session.json"
+/-! ## The record as a row -/
 
-def transcriptPath (id : String) : IO System.FilePath :=
-  return (← sessionDir id) / "events.jsonl"
+/-- The record as a row of the `interactive_session` table.
+
+    Total, and spelled the way the record's own JSON is: the status name, `"owner/repo"` for each
+    half of the repository pair, the tools as the compressed JSON array they are on the wire. The
+    legacy import builds a row straight out of a `session.json` it has parsed, so anything that
+    does not round-trip here is a conversation that changed shape on its way into the database. -/
+def SessionRecord.toRow (r : SessionRecord) : Store.InteractiveSessionRow :=
+  { id               := r.id
+    status           := Store.enumColumn r.status
+    created_at       := r.createdAt
+    last_activity_at := r.lastActivityAt
+    ended_at         := r.endedAt
+    upstream         := r.upstream.toString
+    fork             := r.fork.toString
+    backend          := r.backend
+    model            := r.model
+    budget           := r.budget
+    slot             := Store.natColumn r.slot
+    agent_session_id := r.agentSessionId
+    agent_started    := r.agentStarted
+    resumed_from     := r.resumedFrom
+    tools            := r.tools.map Store.jsonColumn
+    system_prompt    := r.systemPrompt
+    identity         := r.identity
+    turn_count       := Store.natColumn r.turnCount
+    cost_usd         := r.costUsd
+    last_event_seq   := Store.natColumn r.lastEventSeq
+    title            := r.title
+    error            := r.error }
+
+/-- The record a row holds, or why this build cannot read it.
+
+    Fails rather than guessing. A status name this build does not know belongs to a session a
+    newer orchestra is running, and calling it `ended` would have the reaper give away the clone
+    slot of a conversation that is still going. The callers report and skip, which is what a
+    `session.json` that would not parse cost. -/
+def SessionRecord.ofRow? (row : Store.InteractiveSessionRow) : Except String SessionRecord := do
+  let status   ← Store.enumOfColumn? "status" row.status
+  let upstream ← Repository.parse row.upstream
+  let fork     ← Repository.parse row.fork
+  let tools ← match row.tools with
+    | none   => pure none
+    | some s => some <$> Store.jsonOfColumn? (α := List String) "tools" s
+  return { id             := row.id
+           status         := status
+           createdAt      := row.created_at
+           lastActivityAt := row.last_activity_at
+           endedAt        := row.ended_at
+           upstream       := upstream
+           fork           := fork
+           backend        := row.backend
+           model          := row.model
+           budget         := row.budget
+           slot           := row.slot.toNat
+           agentSessionId := row.agent_session_id
+           agentStarted   := row.agent_started
+           resumedFrom    := row.resumed_from
+           tools          := tools
+           systemPrompt   := row.system_prompt
+           identity       := row.identity
+           turnCount      := row.turn_count.toNat
+           costUsd        := row.cost_usd
+           lastEventSeq   := row.last_event_seq.toNat
+           title          := row.title
+           error          := row.error }
 
 /-! ## Reading and writing the record -/
 
-/-- Write the record, creating the session's directory if this is the first time.
+/-- Write the record, replacing whatever is under its id.
 
-    Write-and-rename, so a reader in the other container never sees half a record. The transcript
-    beside it is appended to instead, which has the same property for a different reason: a line
-    is either fully written and flushed or not there. -/
+    One statement, so a reader in the other container never sees half a record — which is what
+    the write-and-rename this replaces was for. -/
 def saveSession (r : SessionRecord) : IO Unit := do
-  let dir ← sessionDir r.id
-  IO.FS.createDirAll dir
-  let path ← recordPath r.id
-  -- Named uniquely rather than `session.json.tmp`: two writers sharing one temp file interleave
-  -- their writes and the later rename publishes the splice.
-  let tmp := dir / s!"session.json.{← uniqueToken}.tmp"
-  IO.FS.writeFile tmp (Json.compress (ToJson.toJson r))
-  IO.FS.rename tmp path
+  checkId r.id
+  Store.run <| HasModel.save r.toRow
 
+open Db.Query.DSL in
 /-- The record, or `none` when there is none.
 
-    A record that exists but cannot be read is reported before it is dropped. Silence there is
+    A row that exists but cannot be read is reported before it is dropped. Silence there is
     expensive in a specific way: `loadAllSessions` feeds the startup reconciliation, so a record
-    an older binary cannot parse — a status added by a newer one, say — would be a session that
+    an older binary cannot read — a status added by a newer one, say — would be a session that
     never gets closed and a clone slot pinned for the life of the daemon, with nothing said. -/
 def loadSession (id : String) : IO (Option SessionRecord) := do
-  let path ← recordPath id
-  if !(← path.pathExists) then return none
-  let complain (why : String) : IO (Option SessionRecord) := do
-    IO.eprintln s!"  Warning: the session record at {path} could not be read ({why}); it is \
-being skipped, and any resource it still holds will not be reclaimed."
-    return none
-  match Json.parse (← IO.FS.readFile path) with
-  | .error e => complain e
-  | .ok j    =>
-    match (FromJson.fromJson? j : Except String SessionRecord) with
-    | .ok r    => return some r
-    | .error e => complain e
+  checkId id
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let s ← from Store.InteractiveSessionRow
+    guard s.id = id
+    select s
+  return (← Store.keepConvertible "session" (·.id) SessionRecord.ofRow? rows)[0]?
 
-/-- Every session on disk, newest first.
+open Db.Query.DSL in
+/-- Every session, newest first.
 
-    By `createdAt`, not by id — a monotone clock restarts at boot, so ids only order sessions
-    within one. The same thing `TaskStore.loadAllTasks` does, and for the same reason. -/
+    By `created_at`, not by id — a monotone clock restarts at boot, so ids only order sessions
+    within one, and the id is here only to break ties. The same thing `TaskStore.loadAllTasks`
+    does, and for the same reason. -/
 def loadAllSessions : IO (Array SessionRecord) := do
-  let dir ← sessionsDir
-  if !(← dir.pathExists) then return #[]
-  let mut out : Array SessionRecord := #[]
-  for entry in ← System.FilePath.readDir dir do
-    if let some r ← loadSession entry.fileName then
-      out := out.push r
-  return Time.sortNewestFirst (·.createdAt) (·.id) out
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let s ← from Store.InteractiveSessionRow
+    select s
+    order_by_desc s.created_at
+    order_by_desc s.id
+  Store.keepConvertible "session" (·.id) SessionRecord.ofRow? rows
+
+open Db.Query.DSL in
+/-- One page of the session list, newest first, and how many sessions the filter matched.
+
+    `since?` is epoch seconds and keeps the sessions created at or after it; `skip` and `take`
+    are the window, and the total counts what `since?` matched before the window was applied. The
+    same shape as `TaskStore.page`, and for the same caller. -/
+def sessionsPage (since? : Option Int) (skip take : Nat) :
+    IO (Array SessionRecord × Nat) := do
+  let bound := Store.sinceBound since?
+  let matching : QuerySet Store.InteractiveSessionRow := query% do
+    let s ← from Store.InteractiveSessionRow
+    guard s.created_at ≥ bound
+    select s
+    order_by_desc s.created_at
+    order_by_desc s.id
+  let (rows, total) ← Store.run do
+    let rows ← HasModel.fetch (matching.offset skip |>.limit take)
+    let total ← HasModel.count matching
+    pure (rows, total)
+  return (← Store.keepConvertible "session" (·.id) SessionRecord.ofRow? rows, total.toNat)
 
 /-! ## Reading and writing the transcript -/
 
 /-- Append one event.
 
-    The seq comes from the record's `lastEventSeq`, so the caller holding the session is the
-    only thing that hands them out and they cannot collide. Flushed per line, because the reader
-    is another process and an unflushed line is a line that did not happen.
+    The seq comes from the record's `lastEventSeq`, so the caller holding the session is the only
+    thing that hands them out and they cannot collide; `(session_id, seq)` is the row's key, and a
+    seq handed out twice replaces its row rather than leaving the transcript with two events
+    claiming the same place in it.
 
-    The newline goes *before* the record, not after it, and that is the whole of what makes a
-    torn write cost one event instead of two. A daemon killed mid-write leaves a fragment at the
-    end of the file; with a trailing-newline format the next append lands straight onto that
-    fragment and splices the two into a line that parses as neither, so the crash takes the next
-    event with it. A leading newline bounds the fragment instead: it is skipped, and everything
-    appended afterwards is read normally. -/
+    `doc` is the whole event as JSON — exactly the text a transcript line held — rather than a
+    column per field, so a reader hands the document straight back to the client and a field a
+    newer orchestra writes is not lost on the way through. -/
 def appendEvent (id : String) (seq : Nat) (occurredAt : String) (kind : TranscriptKind)
     : IO Unit := do
-  let dir ← sessionDir id
-  IO.FS.createDirAll dir
-  let h ← IO.FS.Handle.mk (← transcriptPath id) .append
-  h.putStr ("\n" ++ Json.compress (ToJson.toJson ({ seq, occurredAt, kind } : TranscriptEvent)))
-  h.flush
+  checkId id
+  Store.run <| HasModel.save
+    ({ session_id  := id
+       seq         := Store.natColumn seq
+       occurred_at := occurredAt
+       doc         := Json.compress (ToJson.toJson ({ seq, occurredAt, kind } : TranscriptEvent)) } :
+      Store.InteractiveEventRow)
 
-/-- The transcript as text, tolerating a tail torn mid-character.
-
-    `IO.FS.readFile` throws outright on invalid UTF-8 — one level below the per-line recovery in
-    `readEvents`, so it never gets the chance. A daemon killed in the middle of writing a
-    multi-byte character (this repo's own tool output is full of `→` and `✓`) would leave a
-    transcript that throws on *every* subsequent read: not one lost event, the whole
-    conversation unreadable, permanently. A truncated code point is at most three bytes short,
-    so trimming back to the last valid boundary recovers everything written before the tear.
-
-    Damage anywhere but the tail is not something this writer can produce, and is reported
-    rather than papered over. -/
-private def readTranscriptText (path : System.FilePath) : IO String := do
-  let bytes ← IO.FS.readBinFile path
-  if let some s := String.fromUTF8? bytes then return s
-  for back in [1, 2, 3] do
-    if bytes.size ≥ back then
-      if let some s := String.fromUTF8? (bytes.extract 0 (bytes.size - back)) then
-        return s
-  throw (.userError s!"the transcript at {path} is not valid UTF-8, and not merely torn at the \
-end; it needs looking at by hand")
-
-/-- The transcript events after `after`, at most `limit` of them, and how many there are in
+open Db.Query.DSL in
+/-- The transcript events after `after`, at most `atMost` of them, and how many there are in
     total after `after`.
 
     The total counts what matches before the window, so a client knows whether it is caught up
-    without asking a second time — the same envelope arithmetic every collection in the API
-    uses.
+    without asking a second time — the same envelope arithmetic every collection in the API uses.
 
-    Walked backwards, and stopped at the first event the caller already has. Seqs only increase,
-    so everything past that point is behind the cursor by construction; scanning forward instead
-    meant parsing the entire conversation on every poll — three times a second, per attached
-    client — to answer "nothing new". A cursor that costs the whole file is not a cursor.
+    One query and one count, where this used to read the whole file backwards on every poll,
+    three times a second per attached client. The seq is monotone and indexed by the row's key,
+    so "anything after N" is a range the database walks rather than a conversation this has to
+    parse to the cursor.
 
-    Lines are handed back as parsed JSON rather than re-serialised from a typed value, so a
-    field written by a newer orchestra survives being read by an older one. A line that does not
-    parse, or that carries no seq, is skipped rather than stopping the scan: it can only be a
-    torn write, and treating it as a boundary would hide every event before it. -/
-def readEvents (id : String) (after : Nat := 0) (limit : Nat := 500)
+    Documents are handed back as parsed JSON rather than re-serialised from a typed value, so a
+    field written by a newer orchestra survives being read by an older one. One that does not
+    parse is skipped rather than refused, as a torn line was. -/
+def readEvents (id : String) (after : Nat := 0) (atMost : Nat := 500)
     : IO (Array Json × Nat) := do
-  let path ← transcriptPath id
-  if !(← path.pathExists) then return (#[], 0)
-  let mut newer : List Json := []
-  for line in (← readTranscriptText path).splitOn "\n" |>.reverse do
-    let line := line.trimAscii.toString
-    if line.isEmpty then continue
-    let some j := (Json.parse line).toOption | continue
-    let some seq := j.getObjValAs? Nat "seq" |>.toOption | continue
-    if seq ≤ after then break
-    newer := j :: newer
-  return ((newer.take limit).toArray, newer.length)
+  checkId id
+  let afterSeq : Int := Store.natColumn after
+  let (rows, total) ← Store.run do
+    let matching := query% do
+      let e ← from Store.InteractiveEventRow
+      guard e.session_id = id
+      guard e.seq > afterSeq
+      select e
+      order_by e.seq
+    let rows ← HasModel.fetch (matching.limit atMost)
+    let total ← HasModel.count matching
+    return (rows, total)
+  let mut docs : Array Json := #[]
+  for row in rows do
+    if let .ok j := Json.parse row.doc then
+      docs := docs.push j
+  return (docs, total.toNat)
 
 end Orchestra.Interactive
