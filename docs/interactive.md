@@ -17,7 +17,7 @@ on the daemon's host. A session is the conversation without the terminal.
   orchestra chat  ┐
   dashboard       ├─ HTTPS ─► orchestrad dashboard ─┬─ writes ─► daemon.sock ─┐
   mobile app      ┘                                 │                         │
-                                                    └─ reads ──► <data>/interactive/<id>/
+                                                    └─ reads ──► <data>/orchestra.db
                                                                         ▲     │
                                                  orchestrad queue ──────┘     │
                                                  (session manager) ◄──────────┘
@@ -27,11 +27,11 @@ on the daemon's host. A session is the conversation without the terminal.
                                                         └─ MCP server, clone slot, GitHub token
 ```
 
-Two processes, one filesystem. `orchestrad dashboard` and `orchestrad queue` are separate
-containers in the compose deployment, and that split dictates the design: **writes travel over
-the daemon's control socket**, because only the daemon holds a live process handle, and **reads
-come off disk**, so they answer identically whether the API and the daemon are one process or
-two.
+Two processes, one database. `orchestrad dashboard` and `orchestrad queue` are separate
+containers in the compose deployment sharing `/data`, and that split dictates the design:
+**writes travel over the daemon's control socket**, because only the daemon holds a live process
+handle, and **reads are queries**, so they answer identically whether the API and the daemon are
+one process or two.
 
 There is no new transport. Server-Sent Events already carry the session cookie, survive proxies
 and work on mobile; `Std.Http` is an HTTP/1.1 server with no WebSocket upgrade, and a socket
@@ -88,25 +88,29 @@ sent, with `id: <seq>` on every frame, so a browser's `EventSource` reconnect se
 `Last-Event-ID` and resumes exactly where it dropped. `?after=` is the same thing for clients
 that are not browsers. It ticks faster than the dashboard streams, because chat latency is felt.
 
-## on disk
+## where a session is kept
 
-`<data>/interactive/<id>/`, written by the daemon and read by the API:
+Two tables of `<data>/orchestra.db`, written by the daemon and read by the API (see
+[storage.md](storage.md)):
 
-| file | contents |
+| table | contents |
 |---|---|
-| `session.json` | the session record, rewritten on every state change |
-| `events.jsonl` | the transcript, appended and flushed per event |
+| `interactive_session` | the session record, one row, rewritten on every state change |
+| `interactive_event` | the transcript, one row per event, keyed `(session_id, seq)` |
 
-Append-only JSONL with a monotone `seq` is what makes the transcript cheap to tail from another
-process with a cursor, and what makes a dropped stream lossless to resume. A reader walks it
-backwards and stops at the cursor, so a poll that finds nothing new costs one line rather than
-the whole conversation.
+A monotone `seq` is what makes the transcript cheap to tail from another process with a cursor,
+and what makes a dropped stream lossless to resume: `readEvents id after atMost` is `WHERE
+session_id = id AND seq > after ORDER BY seq LIMIT atMost`, so a poll that finds nothing new
+costs an index probe rather than the whole conversation.
 
-Two details of the format are there to bound what a crash costs. The newline goes *before* each
-record rather than after it, so a daemon killed mid-write leaves a fragment the next append
-cannot splice itself onto — one lost event instead of two. And the file is decoded tolerantly at
-the tail: a kill in the middle of a multi-byte character would otherwise make the whole
-conversation unreadable rather than costing it one line.
+Both writes are single statements, so there is no half-written record and no torn line for a
+reader to step over — which is what the write-and-rename and the tolerant tail decoding of the
+files this replaced were for. That tolerance survives only in the one-time import of a legacy
+`events.jsonl`, which is the one place a line torn by a killed daemon can still turn up.
+
+A transcript row stores the whole event as JSON in one `doc` column rather than a column per
+field, so a reader hands the document straight back to the client and a field a newer orchestra
+writes is not lost on the way through.
 
 ### the session record
 
@@ -141,7 +145,7 @@ sessions reads as a list of conversations rather than of ids.
 
 ### the transcript
 
-One envelope per line, `seq` monotone from 1:
+One envelope per event, `seq` monotone from 1, stored whole in the row's `doc` column:
 
 ```json
 {"seq":12,"occurredAt":"…","kind":"user","text":"add a test for the retry path"}
@@ -190,9 +194,9 @@ the caller asked for.
 | the agent process crashes | a notice carrying the exit code, session `failed`, transcript kept, everything released |
 | a usage limit mid-turn | recorded against the resolved source, a notice, session `ended` |
 | the budget is exhausted | a notice, session `ended` — said distinctly from a crash |
-| the daemon restarts | the processes are gone; every non-terminal session on disk is reconciled to `ended` at startup. A dead session never reads as a live one |
+| the daemon restarts | the processes are gone; every non-terminal session in the database is reconciled to `ended` at startup. A dead session never reads as a live one |
 | reviving a session | not resurrection: a new session with `resumeFrom` inherits the repository and settings and `--resume`s the old agent session |
-| the daemon is down, the API up | writes are `409` naming the daemon; reads keep working off disk |
+| the daemon is down, the API up | writes are `409` naming the daemon; reads keep working, straight off the database |
 | a session sits idle too long | a notice, session `ended`, the slot released |
 
 A session pins a clone slot and an agent process, so two limits bound them — a cap on concurrent

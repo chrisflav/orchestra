@@ -254,10 +254,17 @@ orchestra separates configuration from state:
 | Path | Contents |
 | --- | --- |
 | `$XDG_CONFIG_HOME/orchestra/` (or `~/.config/orchestra/`) | `config.json`, `secrets.json`, `prompts/`, `listeners/`, `roles/`, `skills/`, `identities/` |
-| `$XDG_DATA_HOME/orchestra/` (or `~/.local/share/orchestra/`) | clones, task records, queue entries, logs, per-project role overrides, per-identity memory |
+| `$XDG_DATA_HOME/orchestra/` (or `~/.local/share/orchestra/`) | `orchestra.db`, clones, logs, per-project role overrides, per-identity memory |
+
+The records — task history, queue entries, concert runs, interactive sessions and their
+transcripts, usage history, listener state — are rows of `orchestra.db`, one SQLite file. They
+used to be directories of one JSON file per record; a binary that finds those directories still
+there imports them once, says so, and leaves them where they are. See
+[docs/storage.md](docs/storage.md).
 
 Installations predating this split keep everything in `~/.agent/`; that layout is still read, with
-a deprecation warning. `orchestra migrate` moves it into place.
+a deprecation warning. `orchestra migrate` moves it into place, and the import then picks the
+records up.
 
 ### secrets
 
@@ -1672,8 +1679,8 @@ last sequence number in it, so a browser reconnecting with `Last-Event-ID` — o
 passing the same number as `?after=` — resumes exactly where it dropped, with nothing seen twice
 and nothing missed.
 
-Reads come off `<data>/interactive/<id>/`, where the daemon writes the session record and an
-append-only transcript. Writes go the other way, forwarded to the daemon's control socket,
+Reads come off the database, where the daemon writes the session record and appends the
+transcript a line per row. Writes go the other way, forwarded to the daemon's control socket,
 because a session is a live process and only the daemon holds one. That split is why the reads
 answer identically whether the API and the daemon are one process or the two containers the
 [compose deployment](docker/README.md) runs.
