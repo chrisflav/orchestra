@@ -182,6 +182,27 @@ private def importUsage : IO Unit := do
         importUsageHistory entry.path backendEntry.fileName stem
     return sources
 
+/-- Import the listener state.
+
+    Keyed by the file's stem, which is the name a listener has: the config file names the
+    listener, and `migrateListenerStateNames` — which carried state written under a config's old
+    in-file `name` over to its file name — ran at every daemon start-up until this import
+    replaced it. A stem that could not be a listener name is one no config file could match, so
+    it is skipped rather than stored under a key nothing will ever look up. -/
+private def importListenerState : IO Unit := do
+  let dir ← Listener.legacyListenerStateDir
+  importStore "listener states" dir do
+    let states ← legacyFiles Listener.ListenerState "listener state" dir
+    let mut n := 0
+    for (name, state) in states do
+      match Utils.checkConfigName "listener" name with
+      | .error e =>
+        IO.eprintln s!"[orchestra] legacy listener state '{name}.json' is not a listener name: {e}"
+      | .ok _ =>
+        HasModel.insert (state.toRow name)
+        n := n + 1
+    return n
+
 /-- Carry every legacy directory that is still there into the database.
 
     Called once at startup by both binaries, before anything else reads a record. Silent when
@@ -193,6 +214,7 @@ def run : IO Unit := do
   importQueueEntries
   importConcertRuns
   importUsage
+  importListenerState
   -- Later stages: the interactive sessions and their transcripts. Each is one `importStore`
   -- call, and each takes its own marker, so the stages can land one at a time on a database an
   -- earlier one has imported into.

@@ -700,12 +700,6 @@ its workspace; it will start from a clean checkout."
   -- listeners directory holds a handful of small files, an inotify watch would be a second
   -- mechanism to get wrong, and fifteen seconds is far inside the interval of any listener.
   let listenerScanSeconds : Nat := 15
-  -- Before the first fiber polls anything. A listener used to be named by a `name` field inside
-  -- its config and is named by its file now, so one whose two spellings disagreed is about to be
-  -- known by a name with no state behind it — and would re-fire every event it has already
-  -- handled unless its state comes with it.
-  try Listener.migrateListenerStateNames
-  catch e => IO.eprintln s!"Listener state migration failed: {e}"
   let listenerFibers ← IO.mkRef ({} : Std.HashSet String)
   let spawnListener (name : String) : IO Unit := do
     let _listenerTask ← IO.asTask (prio := .dedicated) do
