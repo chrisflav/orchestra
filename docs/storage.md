@@ -135,11 +135,26 @@ The mapping:
 - Timestamps stay the RFC 3339 UTC strings the records carry (`YYYY-MM-DDTHH:MM:SSZ`, all from
   `TaskStore.currentIso8601`). That format orders lexicographically, so `ORDER BY created_at
   DESC, id DESC` is the newest-first order `Time.sortNewestFirst` computed in memory, and a
-  `since` filter is a string comparison against `Time.secsToIso8601 since`.
+  `since` filter is a string comparison against `Time.secsToIso8601 since`. That it orders
+  lexicographically is load-bearing now rather than a convenience: `Time.sortNewestFirst` parsed
+  the stamp, and would have sorted a non-canonical one sensibly, where the database sorts and
+  pages the column as text — a record carrying a local-time or a fractional-second stamp would
+  land somewhere arbitrary in the history. Every stamp orchestra writes comes from
+  `TaskStore.currentIso8601`, which is the one spelling, and the import carries over stamps
+  written by the same function.
 
 Ordering is by the timestamp and not by the id. Ids come from a monotone clock that restarts at
 boot, so across a reboot the smaller id is the *newer* record; the id is only there to break
 ties.
+
+One field is stored that was not stored before: a queue entry's `slot`, the index of the per-repo
+clone slot the entry ran in. `ToJson`/`FromJson QueueEntry` never wrote or read it, so the JSON
+store dropped it on every write and every entry came back out of the directory with `slot = none`;
+the `slot` column keeps it. That is what the field's docstring has always described — it is
+"persisted rather than kept in daemon memory so that a continuation entry can find the workspace
+its predecessor left behind even across a daemon restart" — so after a restart a continuation now
+really does ask for its predecessor's slot, and reuses that clone, where before the restart quietly
+sent it to a fresh one.
 
 ## tables
 

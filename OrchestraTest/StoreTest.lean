@@ -137,6 +137,10 @@ def aFullQueueEntrySurvivesTheRoundTrip : Test := do
     TestM.assert (e.tools == some ["create_pr", "comment"]) "the tool list came back"
     TestM.assert (e.spawnPolicy.isSome) "the spawn policy came back"
     TestM.assert (e.inputJson == some (Json.str "go")) "the task input came back"
+    -- Not covered by the comparison above: `slot` is in neither JSON instance, so the whole-record
+    -- check would pass on an entry that lost it. The column is what a continuation asks for to
+    -- find the clone its predecessor left behind, and it has to survive a daemon restart.
+    TestM.assertEqual e.slot (some 3) (msg := "the clone slot the entry ran in")
 
 @[test]
 def aConcertRunSurvivesTheRoundTrip : Test := do

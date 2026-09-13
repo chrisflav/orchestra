@@ -614,12 +614,17 @@ open Db.Query.DSL in
 
     A task and the entry it came from are numbered separately, so this is how a continuation
     finds the entry its predecessor was — the lookup the claim loop used to do with
-    `all.find? (·.taskId == some tid)` over every entry in the queue. -/
+    `all.find? (·.taskId == some tid)` over every entry in the queue.
+
+    Ordered, like `findEntry`, so that the one it answers with is the newest of however many
+    entries name that task rather than whichever the database happened to hand back first. -/
 def entryForTask (taskId : String) : IO (Option QueueEntry) := do
   let rows ← Store.run <| HasModel.fetch <| query% do
     let e ← from Store.QueueEntryRow
     guard e.task_id = some taskId
     select e
+    order_by_desc e.created_at
+    order_by_desc e.id
   return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
 
 open Db.Query.DSL in
@@ -634,6 +639,8 @@ def findEntry (id : String) : IO (Option QueueEntry) := do
     let e ← from Store.QueueEntryRow
     guard e.id = id ∨ e.task_id = some id
     select e
+    order_by_desc e.created_at
+    order_by_desc e.id
   let entries ← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
   -- The entry's own id wins: an entry can carry a task id that is some *other* entry's id only
   -- by accident, and a caller that named an entry meant that entry.
@@ -996,6 +1003,7 @@ def cancelStaleConcertEntries : IO Unit := do
   for entry in all do
     if entry.status == .unfinished && entry.concertStepKey.isSome then
       saveEntry { entry with status := .cancelled }
+
 -- Concert run persistence
 
 open Db.Query.DSL in
