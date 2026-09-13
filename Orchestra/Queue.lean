@@ -1,6 +1,24 @@
 import Lean.Data.Json
 import Orchestra.Config
+import Orchestra.Store
 import Orchestra.TaskStore
+
+/-!
+# The queue
+
+What is waiting to run, what is running, and what a run of a concert workflow has got to. Rows of
+the `queue_entry` and `concert_run` tables of `<data>/orchestra.db` (`Orchestra.Store`); what is
+left in `<data>/queue` is the daemon's pid file, its socket and its log.
+
+An entry is a task's whole launch configuration, written once when it is queued and written back
+when it is claimed — the slot it got, the authentication source it drew, the task it became. Three
+processes write here at once (the daemon's workers, its claim loop, a CLI enqueueing), which is
+what the busy timeout on every connection is for; every save is a single statement.
+
+Below the storage sit the pure decisions the daemon makes out of these records — the claim order,
+the slot choice, the reaping rules — which are ordinary functions over the entries and are tested
+as such.
+-/
 
 open Lean (Json FromJson ToJson)
 
@@ -309,6 +327,9 @@ instance : FromJson QueueEntry where
 
 -- Directories and paths
 
+/-- `<data>/queue`, which no longer holds the entries — those are rows in the `queue_entry`
+    table. What is still here is the daemon's own furniture: its pid file, its socket and its
+    log, none of which is a record. -/
 def queueDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "queue"
 
@@ -321,43 +342,178 @@ def socketFile : IO System.FilePath :=
 def daemonLogFile : IO System.FilePath :=
   return (← queueDir) / "daemon.log"
 
+/-- Where the JSON concert runs lived before the database. Read once, by
+    `Orchestra.Store.Import`, and then left alone. The entries' own legacy directory is
+    `queueDir` itself, which is why that one has no `legacy` twin. -/
+def legacyConcertsDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "concerts"
+
+-- The rows an entry and a concert run are stored as
+
+/-- The entry as a row of the `queue_entry` table.
+
+    Everything that is not a scalar goes into a `text` column as the compressed JSON its own
+    instance writes — the label lists, the declared input and output types, the spawn policy, and
+    the task input and output, which are whatever those types say and so have nothing to be
+    decoded into here. An empty list is `[]` rather than NULL: `tools` is the one field where
+    absent and empty differ, and it is the one that is nullable. -/
+def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
+  let (upstream, fork) := Store.repoColumns e.repo
+  { id                   := e.id
+    created_at           := e.createdAt
+    status               := Store.enumColumn e.status
+    upstream             := upstream
+    fork                 := fork
+    mode                 := Store.enumColumn e.mode
+    prompt               := e.prompt
+    goal                 := e.goal
+    agent                := e.agent
+    system_prompt        := e.systemPrompt
+    prepend_prompt       := e.prependPrompt
+    backend              := e.backend
+    model                := e.model
+    continues_from       := e.continuesFrom
+    series               := e.series
+    task_id              := e.taskId
+    slot                 := e.slot.map Store.natColumn
+    config_path          := e.configPath
+    budget               := e.budget
+    memory               := Store.enumColumn e.memory
+    identity             := e.identity
+    auth_source          := e.authSource
+    auth_sources         := Store.jsonColumn e.authSources
+    auth_mode            := e.authMode.map Store.enumColumn
+    tools                := e.tools.map Store.jsonColumn
+    read_only            := e.readOnly
+    priority             := Store.natColumn e.priority
+    concert_step_key     := e.concertStepKey
+    concert_id           := e.concertId
+    input_type           := Store.jsonColumn e.inputType
+    output_type          := Store.jsonColumn e.outputType
+    input_json           := Store.rawJsonColumn e.inputJson
+    output_json          := Store.rawJsonColumn e.outputJson
+    issue_number         := e.issueNumber.map Store.natColumn
+    project_id           := Store.issueIdColumn e.projectId
+    issue_id             := Store.issueIdColumn e.issueId
+    role                 := e.role
+    pr_labels            := Store.jsonColumn e.prLabels
+    triage_add_labels    := Store.jsonColumn e.triageAddLabels
+    triage_remove_labels := Store.jsonColumn e.triageRemoveLabels
+    listener_name        := e.listenerName
+    spawn_policy         := e.spawnPolicy.map Store.jsonColumn
+    spawned_by           := e.spawnedBy
+    scope_root           := Store.issueIdColumn e.scopeRoot }
+
+/-- The entry a row holds, or why this build cannot read it.
+
+    The spawn policy is the one field read leniently, as `FromJson QueueEntry` reads it and for
+    the same reason: `loadEntry` turning a decode failure into "no such entry" would, for an
+    entry holding a pre-claimed issue, mean a task that never runs and a claim nobody releases. -/
+def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := do
+  let repo               ← Store.repoOfColumns? row.upstream row.fork
+  let status             ← Store.enumOfColumn? "status" row.status
+  let mode               ← Store.enumOfColumn? "mode" row.mode
+  let memory             ← Store.enumOfColumn? "memory" row.memory
+  let authMode           ← row.auth_mode.mapM (Store.enumOfColumn? (α := AuthMode) "auth_mode")
+  let authSources        ← Store.jsonOfColumn? (α := List String) "auth_sources" row.auth_sources
+  let tools              ← row.tools.mapM (Store.jsonOfColumn? (α := List String) "tools")
+  let inputType          ← Store.jsonOfColumn? (α := ResultType) "input_type" row.input_type
+  let outputType         ← Store.jsonOfColumn? (α := ResultType) "output_type" row.output_type
+  let inputJson          ← Store.rawJsonOfColumn? "input_json" row.input_json
+  let outputJson         ← Store.rawJsonOfColumn? "output_json" row.output_json
+  let projectId          ← Store.issueIdOfColumn? "project_id" row.project_id
+  let issueId            ← Store.issueIdOfColumn? "issue_id" row.issue_id
+  let scopeRoot          ← Store.issueIdOfColumn? "scope_root" row.scope_root
+  let prLabels           ← Store.jsonOfColumn? (α := List String) "pr_labels" row.pr_labels
+  let triageAddLabels    ← Store.jsonOfColumn? (α := List String) "triage_add_labels"
+                             row.triage_add_labels
+  let triageRemoveLabels ← Store.jsonOfColumn? (α := List String) "triage_remove_labels"
+                             row.triage_remove_labels
+  let spawnPolicy        := row.spawn_policy.bind fun s =>
+                              (Store.jsonOfColumn? (α := SpawnPolicy) "spawn_policy" s).toOption
+  return { id := row.id
+           createdAt := row.created_at
+           status, repo, mode
+           prompt := row.prompt
+           goal := row.goal
+           agent := row.agent
+           systemPrompt := row.system_prompt
+           prependPrompt := row.prepend_prompt
+           backend := row.backend
+           model := row.model
+           continuesFrom := row.continues_from
+           series := row.series
+           taskId := row.task_id
+           slot := row.slot.map Int.toNat
+           configPath := row.config_path
+           budget := row.budget
+           memory
+           identity := row.identity
+           authSource := row.auth_source
+           authSources, authMode, tools
+           readOnly := row.read_only
+           priority := row.priority.toNat
+           concertStepKey := row.concert_step_key
+           concertId := row.concert_id
+           inputType, outputType, inputJson, outputJson
+           issueNumber := row.issue_number.map Int.toNat
+           projectId, issueId
+           role := row.role
+           prLabels, triageAddLabels, triageRemoveLabels
+           listenerName := row.listener_name
+           spawnPolicy
+           spawnedBy := row.spawned_by
+           scopeRoot }
+
+/-- The concert run as a row of the `concert_run` table. -/
+def ConcertRun.toRow (r : ConcertRun) : Store.ConcertRunRow :=
+  { id            := r.id
+    started_at    := r.startedAt
+    status        := Store.enumColumn r.status
+    name          := r.name
+    workflow_file := r.workflowFile
+    finished_at   := r.finishedAt }
+
+/-- The concert run a row holds, or why this build cannot read it. -/
+def ConcertRun.ofRow? (row : Store.ConcertRunRow) : Except String ConcertRun := do
+  let status ← Store.enumOfColumn? "status" row.status
+  return { id           := row.id
+           startedAt    := row.started_at
+           status       := status
+           name         := row.name
+           workflowFile := row.workflow_file
+           finishedAt   := row.finished_at }
+
 -- Storage
 
-def saveEntry (entry : QueueEntry) : IO Unit := do
-  let dir ← queueDir
-  IO.FS.createDirAll dir
-  IO.FS.writeFile (dir / s!"{entry.id}.json") (Lean.Json.compress (ToJson.toJson entry))
+open Db.Query.DSL in
+/-- Write the entry, replacing whatever is under its id.
 
+    One statement. Entries are written by the daemon's workers, by its claim loop and by a CLI
+    enqueueing, all at once; the busy timeout on each connection is what orders them, and a
+    transaction around a single write would only make the others wait longer. -/
+def saveEntry (entry : QueueEntry) : IO Unit :=
+  Store.run <| HasModel.save entry.toRow
+
+open Db.Query.DSL in
 def loadEntry (id : String) : IO (Option QueueEntry) := do
-  let path := (← queueDir) / s!"{id}.json"
-  if !(← path.pathExists) then return none
-  let contents ← IO.FS.readFile path
-  match Json.parse contents with
-  | .error _ => return none
-  | .ok j    =>
-    match FromJson.fromJson? j with
-    | .error _ => return none
-    | .ok e    => return some e
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.id = id
+    select e
+  return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
 
-private def stripJsonExt (name : String) : Option String :=
-  if name.endsWith ".json" then
-    some (name.dropEnd ".json".length).toString
-  else
-    none
-
+open Db.Query.DSL in
 /-- Load all queue entries, newest first.
 
     By `created_at` rather than id, for the reason `TaskStore.loadAllTasks` gives. -/
 def loadAllEntries : IO (Array QueueEntry) := do
-  let dir ← queueDir
-  if !(← dir.pathExists) then return #[]
-  let entries ← System.FilePath.readDir dir
-  let mut result : Array QueueEntry := #[]
-  for entry in entries do
-    if let some id := stripJsonExt entry.fileName then
-      if let some e ← loadEntry id then
-        result := result.push e
-  return Time.sortNewestFirst (·.createdAt) (·.id) result
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    select e
+    order_by_desc e.created_at
+    order_by_desc e.id
+  Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
 
 /-- Entries in the order the daemon tries them: priority first (higher wins), then oldest.
 
@@ -675,41 +831,31 @@ def cancelStaleConcertEntries : IO Unit := do
   for entry in all do
     if entry.status == .unfinished && entry.concertStepKey.isSome then
       saveEntry { entry with status := .cancelled }
-
 -- Concert run persistence
 
-def concertsDir : IO System.FilePath :=
-  return (← Dirs.dataBase) / "concerts"
+open Db.Query.DSL in
+def saveConcertRun (run : ConcertRun) : IO Unit :=
+  Store.run <| HasModel.save run.toRow
 
-def saveConcertRun (run : ConcertRun) : IO Unit := do
-  let dir ← concertsDir
-  IO.FS.createDirAll dir
-  IO.FS.writeFile (dir / s!"{run.id}.json") (Lean.Json.compress (ToJson.toJson run))
-
+open Db.Query.DSL in
 def loadConcertRun (id : String) : IO (Option ConcertRun) := do
-  let path := (← concertsDir) / s!"{id}.json"
-  if !(← path.pathExists) then return none
-  let contents ← IO.FS.readFile path
-  match Json.parse contents with
-  | .error _ => return none
-  | .ok j    =>
-    match FromJson.fromJson? j with
-    | .error _ => return none
-    | .ok r    => return some r
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let c ← from Store.ConcertRunRow
+    guard c.id = id
+    select c
+  return (← Store.keepConvertible "concert run" (·.id) ConcertRun.ofRow? rows)[0]?
 
+open Db.Query.DSL in
 /-- Load all concert runs, newest first.
 
     By `started_at` rather than id, for the reason `TaskStore.loadAllTasks` gives. -/
 def loadAllConcertRuns : IO (Array ConcertRun) := do
-  let dir ← concertsDir
-  if !(← dir.pathExists) then return #[]
-  let entries ← System.FilePath.readDir dir
-  let mut result : Array ConcertRun := #[]
-  for entry in entries do
-    if let some id := stripJsonExt entry.fileName then
-      if let some r ← loadConcertRun id then
-        result := result.push r
-  return Time.sortNewestFirst (·.startedAt) (·.id) result
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let c ← from Store.ConcertRunRow
+    select c
+    order_by_desc c.started_at
+    order_by_desc c.id
+  Store.keepConvertible "concert run" (·.id) ConcertRun.ofRow? rows
 
 /-- On daemon startup, mark any running concert runs as cancelled (the fibers died). -/
 def cancelStaleRunningConcerts : IO Unit := do

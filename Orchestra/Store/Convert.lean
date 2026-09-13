@@ -80,6 +80,22 @@ def issueIdOfColumn? (field : String) : Option String → Except String (Option 
     | some id => .ok (some id)
     | none    => .error s!"{field}: not an issue id: '{s}'"
 
+
+/-- A JSON document as its column value, exactly as it was handed over: a queue entry's task
+    input and output are whatever the task's declared types say, so there is nothing to decode
+    them into here and nothing that should be lost on the way through. -/
+def rawJsonColumn (j : Option Lean.Json) : Option String :=
+  j.map Lean.Json.compress
+
+/-- Read such a document back. -/
+def rawJsonOfColumn? (field : String) : Option String → Except String (Option Json)
+  | none   => .ok none
+  | some s => (Json.parse s).mapError (fun e => s!"{field}: invalid JSON: {e}") |>.map some
+
+/-- A `Nat` column value. `Nat` is not a column type; `int` is, and orchestra's counters —
+    priorities, slots, sequence numbers — are naturals that no arithmetic here takes below zero. -/
+def natColumn (n : Nat) : Int := Int.ofNat n
+
 /-- Convert the rows of a listing, reporting the ones that do not convert and leaving them out.
 
     A row this build cannot read is one record missing from a listing, which is what a file that
