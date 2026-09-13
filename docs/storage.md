@@ -272,9 +272,8 @@ stays off.
 two processes on one SQLite file, and WAL mode needs a filesystem that supports it rather than a
 network mount.
 
-While the library's `orchestra-support` branch is unpushed, orchestra's `lakefile.lean` requires
-it by path (`/home/christian/db-orchestra`); the comment above that line gives the `require db
-from git` form it becomes once the branch is on GitHub.
+`lakefile.lean` pins the library to a revision of its `orchestra-support` branch (chrisflav/db#14);
+move the pin forward when that branch lands on the library's master.
 
 ## what the library gained
 

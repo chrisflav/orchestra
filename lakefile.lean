@@ -9,12 +9,9 @@ require Cli from git "https://github.com/leanprover/lean4-cli.git" @ "main"
 require Yaml from git "https://github.com/chrisflav/lean-yaml" @ "master"
 require Taxis from git "https://github.com/chrisflav/taxis" @ "d029b06a912a39fef52734ef90f29537561c7785"
 
--- The record store's database layer: `Orchestra.Store` is written against it.
---
--- A path dependency while the library's `orchestra-support` branch is unpushed; once it is on
--- GitHub this line becomes
---   require db from git "https://github.com/chrisflav/db" @ "<rev>"
-require db from "/home/christian/db-orchestra"
+-- The record store's database layer: `Orchestra.Store` is written against it. Pinned to the tip of
+-- the library's `orchestra-support` branch (chrisflav/db#14).
+require db from git "https://github.com/chrisflav/db" @ "46d983ab20a4a6675d09492bb401024ad80fae47"
 
 /-- Compile a single C shim under `ffi/` into a static library of the same name. -/
 private def ffiStaticLib (pkg : Package) (name : String) : FetchM (Job System.FilePath) := do
