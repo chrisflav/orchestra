@@ -1,9 +1,14 @@
-{
- "version": "1.2.0",
+{"version": "1.2.0",
  "packagesDir": ".lake/packages",
- "packages": [
-  {
-   "url": "https://github.com/chrisflav/taxis",
+ "packages":
+ [{"type": "path",
+   "scope": "",
+   "name": "db",
+   "manifestFile": "lake-manifest.json",
+   "inherited": false,
+   "dir": "/home/christian/db-orchestra",
+   "configFile": "lakefile.lean"},
+  {"url": "https://github.com/chrisflav/taxis",
    "type": "git",
    "subDir": null,
    "scope": "",
@@ -12,10 +17,8 @@
    "manifestFile": "lake-manifest.json",
    "inputRev": "d029b06a912a39fef52734ef90f29537561c7785",
    "inherited": false,
-   "configFile": "lakefile.lean"
-  },
-  {
-   "url": "https://github.com/chrisflav/lean-yaml",
+   "configFile": "lakefile.lean"},
+  {"url": "https://github.com/chrisflav/lean-yaml",
    "type": "git",
    "subDir": null,
    "scope": "",
@@ -24,10 +27,8 @@
    "manifestFile": "lake-manifest.json",
    "inputRev": "master",
    "inherited": false,
-   "configFile": "lakefile.toml"
-  },
-  {
-   "url": "https://github.com/leanprover/lean4-cli.git",
+   "configFile": "lakefile.toml"},
+  {"url": "https://github.com/leanprover/lean4-cli.git",
    "type": "git",
    "subDir": null,
    "scope": "",
@@ -36,22 +37,28 @@
    "manifestFile": "lake-manifest.json",
    "inputRev": "main",
    "inherited": false,
-   "configFile": "lakefile.toml"
-  },
-  {
-   "url": "https://github.com/leanprover/leansqlite",
+   "configFile": "lakefile.toml"},
+  {"url": "https://github.com/leanprover/leansqlite",
    "type": "git",
    "subDir": null,
    "scope": "",
    "rev": "0be4df908d1a8e75b58961041e2b4973692623df",
    "name": "leansqlite",
    "manifestFile": "lake-manifest.json",
+   "inputRev": "0be4df908d1a8e75b58961041e2b4973692623df",
+   "inherited": true,
+   "configFile": "lakefile.lean"},
+  {"url": "https://github.com/leanprover-community/quote4",
+   "type": "git",
+   "subDir": null,
+   "scope": "",
+   "rev": "f46324995fca5f0483b742e4eb4daec7f4ee50d2",
+   "name": "quot4",
+   "manifestFile": "lake-manifest.json",
    "inputRev": "v4.31.0",
    "inherited": true,
-   "configFile": "lakefile.lean"
-  },
-  {
-   "url": "https://github.com/fgdorais/lean4-parser",
+   "configFile": "lakefile.toml"},
+  {"url": "https://github.com/fgdorais/lean4-parser",
    "type": "git",
    "subDir": null,
    "scope": "",
@@ -60,10 +67,8 @@
    "manifestFile": "lake-manifest.json",
    "inputRev": null,
    "inherited": true,
-   "configFile": "lakefile.toml"
-  },
-  {
-   "url": "https://github.com/fgdorais/lean4-unicode-basic",
+   "configFile": "lakefile.toml"},
+  {"url": "https://github.com/fgdorais/lean4-unicode-basic",
    "type": "git",
    "subDir": null,
    "scope": "",
@@ -72,10 +77,8 @@
    "manifestFile": "lake-manifest.json",
    "inputRev": "main",
    "inherited": true,
-   "configFile": "lakefile.lean"
-  },
-  {
-   "url": "https://github.com/leanprover-community/batteries",
+   "configFile": "lakefile.lean"},
+  {"url": "https://github.com/leanprover-community/batteries",
    "type": "git",
    "subDir": null,
    "scope": "",
@@ -84,10 +87,7 @@
    "manifestFile": "lake-manifest.json",
    "inputRev": "main",
    "inherited": true,
-   "configFile": "lakefile.toml"
-  }
- ],
+   "configFile": "lakefile.toml"}],
  "name": "orchestra",
  "lakeDir": ".lake",
- "fixedToolchain": false
-}
+ "fixedToolchain": false}
