@@ -35,3 +35,4 @@ import OrchestraTest.StaleTaskTest
 import OrchestraTest.RebootOrderingTest
 import OrchestraTest.GitHubPatTest
 import OrchestraTest.IdentityTest
+import OrchestraTest.StoreTest
