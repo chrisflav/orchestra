@@ -1,4 +1,5 @@
 import Orchestra.Store.Schema
+import Orchestra.Store.Convert
 import Orchestra.Store.Connection
 
 /-!

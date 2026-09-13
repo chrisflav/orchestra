@@ -1,7 +1,19 @@
 import Lean.Data.Json
 import Orchestra.Config
+import Orchestra.Store
 import Orchestra.Utils.Time
 import Init.Data.String.Basic
+
+/-!
+# Task records
+
+What orchestra remembers of a run once the daemon has started it: the prompt, the repositories,
+the backend and identity it ran under, and how it ended. Rows of the `task` table of
+`<data>/orchestra.db` (`Orchestra.Store`), keyed by the id `generateId` mints.
+
+A record is the unit a continuation is built from, so every field a continuation inherits is on
+it, and a series pointer — a row of `series` — is how `--series` finds the run to continue.
+-/
 
 open Lean (Json FromJson ToJson)
 
@@ -135,10 +147,18 @@ instance : FromJson TaskRecord where
 
 -- Directories
 
+/-- `<data>/tasks`, which is no longer where task records live — they are rows in the `task`
+    table. What is still written here is the per-run debug transcript `--debug` asks for
+    (`TaskRunner`), which is a stream of text and not a record. -/
 def tasksDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "tasks"
 
-def seriesDir : IO System.FilePath :=
+/-- Where the JSON task records lived before the database. Read once, by
+    `Orchestra.Store.Import`, and then left alone: the import copies, it does not delete. -/
+def legacyTasksDir : IO System.FilePath := tasksDir
+
+/-- Where the JSON series pointers lived before the database. As `legacyTasksDir`. -/
+def legacySeriesDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "series"
 
 -- ID generation: the nanosecond monotonic clock plus a counter, so that two tasks starting
@@ -160,60 +180,129 @@ def currentIso8601 : IO String := do
   let _   ← child.wait
   return out.trimAscii.toString
 
+-- The row a task record is stored as
+
+/-- The record as a row of the `task` table.
+
+    Total: every field of the record has a column, and the ones that are not scalars go through
+    the spelling their JSON instances already use — the status name, `"owner/repo"`, the decimal
+    form of a taxis id — so that a row is readable and the legacy import can build one out of a
+    file it has parsed without going through the record at all. -/
+def TaskRecord.toRow (r : TaskRecord) : Store.TaskRow :=
+  let (upstream, fork) := Store.repoColumns r.repo
+  { id             := r.id
+    created_at     := r.createdAt
+    upstream       := upstream
+    fork           := fork
+    mode           := Store.enumColumn r.mode
+    prompt         := r.prompt
+    goal           := r.goal
+    session_id     := r.sessionId
+    status         := Store.enumColumn r.status
+    continues_from := r.continuesFrom
+    series         := r.series
+    backend        := r.backend
+    model          := r.model
+    agent          := r.agent
+    system_prompt  := r.systemPrompt
+    prepend_prompt := r.prependPrompt
+    budget         := r.budget
+    priority       := Int.ofNat r.priority
+    project_id     := Store.issueIdColumn r.projectId
+    issue_id       := Store.issueIdColumn r.issueId
+    role           := r.role
+    identity       := r.identity }
+
+/-- The record a row holds, or why this build cannot read it.
+
+    Fails rather than guessing: a status name orchestra does not know is a record written by
+    something else, and a listing that silently called it `failed` would be lying about a task
+    that may well still be running. The callers report and skip. -/
+def TaskRecord.ofRow? (row : Store.TaskRow) : Except String TaskRecord := do
+  let repo      ← Store.repoOfColumns? row.upstream row.fork
+  let mode      ← Store.enumOfColumn? "mode" row.mode
+  let status    ← Store.enumOfColumn? "status" row.status
+  let projectId ← Store.issueIdOfColumn? "project_id" row.project_id
+  let issueId   ← Store.issueIdOfColumn? "issue_id" row.issue_id
+  return { id            := row.id
+           createdAt     := row.created_at
+           repo          := repo
+           mode          := mode
+           prompt        := row.prompt
+           goal          := row.goal
+           sessionId     := row.session_id
+           status        := status
+           continuesFrom := row.continues_from
+           series        := row.series
+           backend       := row.backend
+           model         := row.model
+           agent         := row.agent
+           systemPrompt  := row.system_prompt
+           prependPrompt := row.prepend_prompt
+           budget        := row.budget
+           priority      := row.priority.toNat
+           projectId     := projectId
+           issueId       := issueId
+           role          := row.role
+           identity      := row.identity }
+
 -- Storage
 
-def saveTask (record : TaskRecord) : IO Unit := do
-  let dir ← tasksDir
-  IO.FS.createDirAll dir
-  IO.FS.writeFile (dir / s!"{record.id}.json") (Lean.Json.compress (ToJson.toJson record))
+open Db.Query.DSL in
+/-- Write the record, replacing whatever is under its id.
 
+    One statement, deliberately: a task record is saved from several threads of the daemon and
+    from the CLI at once, and a transaction around a single write would only lengthen the window
+    the others wait on. -/
+def saveTask (record : TaskRecord) : IO Unit :=
+  Store.run <| HasModel.save record.toRow
+
+open Db.Query.DSL in
 def loadTask (id : String) : IO (Option TaskRecord) := do
-  let path := (← tasksDir) / s!"{id}.json"
-  if !(← path.pathExists) then return none
-  let contents ← IO.FS.readFile path
-  match Json.parse contents with
-  | .error _ => return none
-  | .ok j    =>
-    match FromJson.fromJson? j with
-    | .error _ => return none
-    | .ok r    => return some r
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let t ← from Store.TaskRow
+    guard t.id = id
+    select t
+  return (← Store.keepConvertible "task" (·.id) TaskRecord.ofRow? rows)[0]?
 
-private def stripJsonExt (name : String) : Option String :=
-  let ext := ".json"
-  if name.endsWith ext then
-    some (name.dropEnd ext.length).toString
-  else
-    none
-
+open Db.Query.DSL in
 /-- Load all task records, newest first.
 
     Ordered by `created_at`, not by id: ids come from a clock that restarts at boot, so after a
-    reboot they sort every older record above every newer one. See `Time.sortNewestFirst`. -/
+    reboot they sort every older record above every newer one. The id only breaks ties, which is
+    what `Time.sortNewestFirst` did in memory and what the `(created_at, id)` index is for. -/
 def loadAllTasks : IO (Array TaskRecord) := do
-  let dir ← tasksDir
-  if !(← dir.pathExists) then return #[]
-  let entries ← System.FilePath.readDir dir
-  let mut records : Array TaskRecord := #[]
-  for entry in entries do
-    if let some id := stripJsonExt entry.fileName then
-      if let some r ← loadTask id then
-        records := records.push r
-  return Time.sortNewestFirst (·.createdAt) (·.id) records
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let t ← from Store.TaskRow
+    select t
+    order_by_desc t.created_at
+    order_by_desc t.id
+  Store.keepConvertible "task" (·.id) TaskRecord.ofRow? rows
 
 -- Series pointers
 
+open Db.Query.DSL in
 def latestInSeries (seriesName : String) : IO (Option String) := do
-  let path := (← seriesDir) / s!"{seriesName}.json"
-  if !(← path.pathExists) then return none
-  let contents ← IO.FS.readFile path
-  match Json.parse contents with
-  | .error _ => return none
-  | .ok j    => return j.getObjValAs? String "latest_task_id" |>.toOption
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let s ← from Store.SeriesRow
+    guard s.name = seriesName
+    select s
+  return rows[0]?.map (·.latest_task_id)
 
-def updateSeriesPointer (seriesName taskId : String) : IO Unit := do
-  let dir ← seriesDir
-  IO.FS.createDirAll dir
-  let path := dir / s!"{seriesName}.json"
-  IO.FS.writeFile path (Lean.Json.compress (Json.mkObj [("latest_task_id", taskId)]))
+def updateSeriesPointer (seriesName taskId : String) : IO Unit :=
+  Store.run <| HasModel.save ({ name := seriesName, latest_task_id := taskId } : Store.SeriesRow)
+
+open Db.Query.DSL in
+/-- Every series and the task it last pointed at, by name.
+
+    New with the database. `orchestra series` used to answer this by listing the directory the
+    pointers were files in; there is no directory to list any more, and one query is what the
+    listing costs now. -/
+def allSeries : IO (Array (String × String)) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let s ← from Store.SeriesRow
+    select s
+    order_by s.name
+  return rows.map fun r => (r.name, r.latest_task_id)
 
 end Orchestra.TaskStore
