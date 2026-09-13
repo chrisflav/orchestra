@@ -23,10 +23,15 @@ error either of them has to handle.
 **The schema, once per path per process.** The first `run` against a given path applies the
 declared migrations and sets the two pragmas that persist in the file. Remembered per path rather
 than globally because `Dirs.setDataBaseOverride` moves the database: a test that switches to a
-fresh temporary directory gets a fresh schema, and production pays for it once. Two processes
-migrating at the same time is safe by the library's design — the migration's record is written
-first, under the primary key of the tracking table, so the second one fails on the duplicate
-before it has applied a step.
+fresh temporary directory gets a fresh schema, and production pays for it once.
+
+**Two processes migrating at the same time.** The library writes the migration's record first,
+inside the migration's own transaction and under the primary key of the tracking table, so the
+loser of that race does not apply a step twice — it fails, with `UNIQUE constraint failed:
+db_migrations.name`. That failure is the daemon's first `Store.run`, after it has already written
+its pid file, so it is not one to let escape: `ensureSchema` catches it and migrates once more.
+The second pass finds the migration recorded and does nothing. A failure that is not the race
+fails the same way the second time, and that one is rethrown.
 -/
 
 namespace Orchestra.Store
@@ -58,7 +63,13 @@ private def withConnection {α : Type} (p : System.FilePath) (x : Sqlite.M α) :
 
     Idempotent and cheap after the first call: a `Std.HashSet` lookup. The check inside the lock
     is the one that decides — the one outside it only keeps every later call from taking the
-    lock at all. -/
+    lock at all.
+
+    The mutex orders this process's own threads; another process starting at the same moment on a
+    fresh database is ordered by nothing, and the loser of that race fails on the tracking table's
+    primary key. A second pass finds the migration recorded and applies nothing, so that is what a
+    failure gets — once. The path is marked as done only if one of the two passes succeeded; a
+    `run` that throws here leaves the next one to try again. -/
 private def ensureSchema (p : System.FilePath) : IO Unit := do
   if (← initialized.get).contains p.toString then return
   initMutex.lock
@@ -67,7 +78,7 @@ private def ensureSchema (p : System.FilePath) : IO Unit := do
     if let some parent := p.parent then
       IO.FS.createDirAll parent
     let now := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
-    withConnection p do
+    let bringUpToDate : IO Unit := withConnection p do
       let db ← read
       -- Both persist in the file; setting them on every open would be harmless but pointless.
       -- WAL is what lets a reader and a writer be in the file at the same time, which is the
@@ -75,6 +86,13 @@ private def ensureSchema (p : System.FilePath) : IO Unit := do
       db.exec "PRAGMA journal_mode=WAL"
       db.exec "PRAGMA synchronous=NORMAL"
       let _ ← Db.Migration.migrate migrations now
+    try
+      bringUpToDate
+    catch _ =>
+      -- Most likely another process applying the same migration a moment earlier. Whatever it
+      -- was, the second pass either finds nothing left to do or fails the same way again, and
+      -- that failure is the caller's.
+      bringUpToDate
     initialized.modify (·.insert p.toString)
   finally
     initMutex.unlock

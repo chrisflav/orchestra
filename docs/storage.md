@@ -69,9 +69,17 @@ reading a directory of JSON files is what was slow, not this.
 migrations (`Db.Migration.migrate`) and sets `journal_mode=WAL` and `synchronous=NORMAL`, both of
 which persist in the file. It is guarded by a mutex and remembered per path rather than globally,
 so that a test which switches `Dirs.dataBase` gets a fresh schema and production pays for it
-once. Two processes migrating at the same moment is safe by the library's design: the migration's
-record is written first, under the primary key of the tracking table, so the second one fails on
-the duplicate before it has applied a step.
+once.
+
+Two processes starting on a fresh database both reach the migration. The library writes the
+tracking row first, inside the migration's own transaction and under the primary key of
+`db_migrations`, so neither applies a step twice — but the loser of that race does not merely do
+nothing, it *fails*, with `UNIQUE constraint failed: db_migrations.name`. Left alone that
+exception comes out of the daemon's first `Store.run`, after it has written its pid file. So
+`ensureSchema` catches a failed `migrate` and runs it once more: the second pass finds the
+migration recorded and applies nothing. A failure that was not the race fails the same way again
+and is rethrown, and a path whose migration threw is not marked as initialised, so the next `run`
+tries again.
 
 **Migrations, not `autoUpdate`.** The schema is a list of declared migrations, applied at
 startup. The first and so far only one is `0001_initial`, in
