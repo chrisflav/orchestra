@@ -365,7 +365,6 @@ def SessionRecord.ofRow? (row : Store.InteractiveSessionRow) : Except String Ses
 
 /-! ## Reading and writing the record -/
 
-open Db.Query.DSL in
 /-- Write the record, replacing whatever is under its id.
 
     One statement, so a reader in the other container never sees half a record — which is what
@@ -422,7 +421,7 @@ def appendEvent (id : String) (seq : Nat) (occurredAt : String) (kind : Transcri
     ({ session_id  := id
        seq         := Store.natColumn seq
        occurred_at := occurredAt
-       doc := Json.compress (ToJson.toJson ({ seq, occurredAt, kind } : TranscriptEvent)) } :
+       doc         := Json.compress (ToJson.toJson ({ seq, occurredAt, kind } : TranscriptEvent)) } :
       Store.InteractiveEventRow)
 
 open Db.Query.DSL in
