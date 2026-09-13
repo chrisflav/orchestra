@@ -1,6 +1,7 @@
 import Lean.Data.Json
 import Orchestra.Config
 import Orchestra.Store.Schema
+import Orchestra.Utils.Time
 
 /-!
 # Between a record and its row
@@ -95,6 +96,18 @@ def rawJsonOfColumn? (field : String) : Option String → Except String (Option 
 /-- A `Nat` column value. `Nat` is not a column type; `int` is, and orchestra's counters —
     priorities, slots, sequence numbers — are naturals that no arithmetic here takes below zero. -/
 def natColumn (n : Nat) : Int := Int.ofNat n
+
+/-- The lower bound a paged listing compares its timestamp column against.
+
+    Timestamps are the RFC 3339 UTC strings the records carry, and that format orders
+    lexicographically, so "created at or after this instant" is a string comparison against
+    `Time.secsToIso8601`. No filter at all is the empty string: no timestamp is empty, so every
+    row is at or above it, and a listing stays one query of one shape instead of two spellings
+    picked at runtime. -/
+def sinceBound (since? : Option Int) : String :=
+  match since? with
+  | none   => ""
+  | some s => Time.secsToIso8601 s
 
 /-- Convert the rows of a listing, reporting the ones that do not convert and leaving them out.
 

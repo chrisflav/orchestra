@@ -438,8 +438,9 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
         parallelSafe    := TaskRunner.backendIsParallelSafe
         resolveAuth     := resolveEntryAuth
       }
-      let allEntries ← Queue.loadAllEntries
-      let some claim ← Queue.claimDecision ctx allEntries Repo.poolOccupant | return none
+      let pending ← Queue.pendingEntries
+      let some claim ← Queue.claimDecision ctx pending Queue.entryForTask Repo.poolOccupant
+        | return none
       let e := claim.entry
       let occupied := slotMap.getD e.slotKey #[]
       let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
@@ -1035,13 +1036,11 @@ holding the rest of this tick until the window moves"
   let _taskReaper ← IO.asTask (prio := .dedicated) do
     while !(← shutdownToken.isCancelled) do
       try
-        -- Scanned outside the lock and confirmed inside it: the scan reads every entry file on
-        -- disk, and holding the claim mutex for that would stall every worker in the pool once
-        -- a queue grew large.
-        for entry in ← Queue.loadAllEntries do
-          if entry.status == .running then
-            if ← reapIfAbandoned entry.id then
-              IO.eprintln s!"  Reaped queue entry {entry.id}: marked running, but no worker \
+        -- Scanned outside the lock and confirmed inside it: holding the claim mutex across the
+        -- scan would stall every worker in the pool for as long as it took.
+        for entry in ← Queue.runningEntries do
+          if ← reapIfAbandoned entry.id then
+            IO.eprintln s!"  Reaped queue entry {entry.id}: marked running, but no worker \
 holds it. Marked unfinished."
       catch e => IO.eprintln s!"  Task reaper error: {e}"
       for _ in List.range 30 do

@@ -111,25 +111,26 @@ def projectListHandler (_ : Parsed) : IO UInt32 := do
     claims that need clearing, and the ones an unbound `always` role produces if its teardown
     sweep does not run. A pre-claimed issue whose task has not started yet has no record at all
     (the claim carries the queue-entry id until `updateClaimTaskId` retags it); the caller's
-    `onQueue` check is what covers that window. -/
-private def claimTaskRunning (allTasks : Array TaskStore.TaskRecord) (taskId : Option String) :
-    Bool :=
-  taskId.any fun tid => allTasks.any fun t => t.id == tid && t.status matches .running
+    `onQueue` check is what covers that window.
+
+    One record read by its id, rather than the whole history read to find it: a project's claims
+    are a handful and the history is everything orchestra has ever run. -/
+private def claimTaskRunning (taskId : Option String) : IO Bool := do
+  let some tid := taskId | return false
+  let some record ← TaskStore.loadTask tid | return false
+  return record.status matches .running
 
 /-- Find all claimed issues in `pid` whose claiming task is no longer running and which have no
     active queue entry. Returns an array of `(issue, staleTaskId)` pairs. -/
 private def findOrphanedIssues (pid : Taxis.IssueId) : IO (Array (Issue × String)) := do
   let issues ← loadIssues pid
   let claimed := issues.filter (·.status == .claimed)
-  let allTasks ← TaskStore.loadAllTasks
-  let allEntries ← Queue.loadAllEntries
-  let activeEntries := allEntries.filter fun e =>
-    e.status == .pending || e.status == .running
+  let activeEntries ← Queue.activeEntries
   let mut orphans : Array (Issue × String) := #[]
   for issue in claimed do
     let claim ← Project.loadClaim issue.id
     let taskId := claim.map (·.taskId)
-    let hasTask := claimTaskRunning allTasks taskId
+    let hasTask ← claimTaskRunning taskId
     let onQueue := activeEntries.any (·.issueId == some issue.id)
     if !hasTask && !onQueue then
       orphans := orphans.push (issue, taskId.getD "(no claim)")
@@ -148,15 +149,12 @@ def projectHealthHandler (p : Parsed) : IO UInt32 := do
     if claimed.isEmpty then
       IO.println "All issues healthy (no claimed issues)."
       return (0 : UInt32)
-    let allTasks ← TaskStore.loadAllTasks
-    let allEntries ← Queue.loadAllEntries
-    let activeEntries := allEntries.filter fun e =>
-      e.status == .pending || e.status == .running
+    let activeEntries ← Queue.activeEntries
     let mut ok := true
     for issue in claimed do
       let claim ← Project.loadClaim issue.id
       let taskId := claim.map (·.taskId)
-      let hasTask := claimTaskRunning allTasks taskId
+      let hasTask ← claimTaskRunning taskId
       if hasTask then
         IO.println s!"[ok]      {issue.id.toString}  {issue.title}"
       else if activeEntries.any (·.issueId == some issue.id) then
@@ -291,9 +289,7 @@ def issueShowHandler (p : Parsed) : IO UInt32 := do
       IO.println "Children:"
       for c in children do
         IO.println s!"  - {c.id.toString}  {issueStatusToString c.status}  {c.title}"
-    let allTasks ← TaskStore.loadAllTasks
-    let issueTasks := Time.sortOldestFirst (·.createdAt) (·.id)
-      (allTasks.filter (·.issueId == some i.id))
+    let issueTasks := Time.sortOldestFirst (·.createdAt) (·.id) (← TaskStore.tasksForIssue i.id)
     if issueTasks.isEmpty then
       IO.println "Tasks:        -"
     else
@@ -572,14 +568,13 @@ def issueTasksHandler (p : Parsed) : IO UInt32 := do
   let some iid ← parseIssueIdArg "orchestra issue tasks" id | return 1
   let some (_project, issue) ← findIssue iid
     | IO.eprintln s!"Issue '{id}' not found"; return 1
-  let all ← TaskStore.loadAllTasks
-  let matching := all.filter (fun r => r.issueId == some issue.id)
+  let matching ← TaskStore.tasksForIssue issue.id
   if matching.isEmpty then
     IO.println s!"No tasks recorded for issue {issue.id.toString}."
     return 0
   IO.println s!"{padRight "TASK ID" 18} {padRight "CREATED" 22} {padRight "STATUS" 11} {padRight "ROLE" 16} SERIES"
   IO.println (String.ofList (List.replicate 90 '-'))
-  -- Newest first: `loadAllTasks` ordered them and `filter` keeps that order.
+  -- Newest first, which is the order `tasksForIssue` asks the database for.
   for r in matching do
     let role   := r.role.getD "-"
     let series := r.series.getD "-"

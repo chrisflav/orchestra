@@ -402,6 +402,27 @@ def loadAllSessions : IO (Array SessionRecord) := do
     order_by_desc s.id
   Store.keepConvertible "session" (·.id) SessionRecord.ofRow? rows
 
+open Db.Query.DSL in
+/-- One page of the session list, newest first, and how many sessions the filter matched.
+
+    `since?` is epoch seconds and keeps the sessions created at or after it; `skip` and `take`
+    are the window, and the total counts what `since?` matched before the window was applied. The
+    same shape as `TaskStore.page`, and for the same caller. -/
+def sessionsPage (since? : Option Int) (skip take : Nat) :
+    IO (Array SessionRecord × Nat) := do
+  let bound := Store.sinceBound since?
+  let matching : QuerySet Store.InteractiveSessionRow := query% do
+    let s ← from Store.InteractiveSessionRow
+    guard s.created_at ≥ bound
+    select s
+    order_by_desc s.created_at
+    order_by_desc s.id
+  let (rows, total) ← Store.run do
+    let rows ← HasModel.fetch (matching.offset skip |>.limit take)
+    let total ← HasModel.count matching
+    pure (rows, total)
+  return (← Store.keepConvertible "session" (·.id) SessionRecord.ofRow? rows, total.toNat)
+
 /-! ## Reading and writing the transcript -/
 
 /-- Append one event.

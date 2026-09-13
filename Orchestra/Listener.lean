@@ -1563,11 +1563,8 @@ def pollSource (source : SourceConfig) (state : ListenerState) (patFor : Reposit
     let issues ← Project.loadIssues pid
     let roles  ← Project.loadAllRoles pid
     -- Count active per-role queue entries scoped to this project.
-    let allEntries ← Queue.loadAllEntries
     let mut active : Std.HashMap String Nat := {}
-    for e in allEntries do
-      let isActive := e.status == .pending || e.status == .running
-      if !isActive then continue
+    for e in ← Queue.activeEntries do
       if e.projectId != some pid then continue
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
@@ -1644,8 +1641,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (patFor : Reposit
     -- Cap counting is scoped to the labelled set, so the caps bound concurrent work *on labelled
     -- issues* rather than colliding with per-project dispatchers running the same role names.
     let labelled : Array Taxis.IssueId := issues.map (·.id) ++ reviewable.map (·.id)
-    let allEntries ← Queue.loadAllEntries
-    let activeEntries := allEntries.filter fun e => e.status == .pending || e.status == .running
+    let activeEntries ← Queue.activeEntries
     let mut active : Std.HashMap String Nat := {}
     for e in activeEntries do
       let some eIid := e.issueId | continue
@@ -1725,7 +1721,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (patFor : Reposit
             to {cap'} by limit_unclaimed_to_open_issues: it claims nothing at spawn, and this \
             root has {openHere} open issue(s) in scope"
         let rootInput : DispatcherInput :=
-          { activeByRole := unboundActiveByRole allEntries root.id
+          { activeByRole := unboundActiveByRole activeEntries root.id
           , issues := #[], reviewable := #[], caps := rootCaps, roles }
         for d in dispatcherDecisions rootInput do
           IO.println s!"[dispatcher] root {root.id.toString} \"{root.title}\": {renderDecision d}"

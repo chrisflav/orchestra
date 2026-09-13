@@ -36,3 +36,4 @@ import OrchestraTest.RebootOrderingTest
 import OrchestraTest.GitHubPatTest
 import OrchestraTest.IdentityTest
 import OrchestraTest.StoreTest
+import OrchestraTest.QueryTest

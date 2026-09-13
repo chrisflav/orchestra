@@ -388,19 +388,13 @@ private def collection (p : Page) (total : Nat) (items : Array Json) : Json :=
     ("offset", ToJson.toJson p.skip)
   ]
 
-/-- Filter by `since`, take the window, and render. `createdAt` names the field the collection
-    is ordered by. -/
-private def pageOver (p : Page) (createdAt : α → String) (render : α → Json)
-    (items : Array α) : Json :=
-  let kept := match p.since with
-    | none   => items
-    | some s => items.filter fun i =>
-        match Usage.parseIso8601 (createdAt i) with
-        | some e => e ≥ s
-        | none   => false
-  collection p kept.size ((kept.toList.drop p.skip |>.take p.size).toArray.map render)
+/-- The same, for a collection with no time order.
 
-/-- The same, for a collection with no time order. -/
+    The collections that *are* ordered by time are record stores, and they page in the database:
+    `TaskStore.page`, `Queue.entriesPage`, `Queue.concertRunsPage`, `Interactive.sessionsPage`
+    each take the `since`, the offset and the limit and answer with the window and the total.
+    What is left here is configuration — listeners, roles, skills, projects — which is read from
+    files whole because there is no other way to read it. -/
 private def pageOverUnordered (p : Page) (items : Array α) (render : α → IO Json) : IO Json := do
   let window := (items.toList.drop p.skip |>.take p.size).toArray
   return collection p items.size (← window.mapM render)
@@ -759,45 +753,47 @@ private def taxisUrl (configPath : Option System.FilePath) : IO (Option String) 
   catch _ => return none
 
 private def overviewApi (configPath : Option System.FilePath) : IO Json := do
-  let entries  ← Queue.loadAllEntries
-  let tasks    ← TaskStore.loadAllTasks
+  -- The counts are counted by the database and the two listings are the two the page shows.
+  -- This used to read the whole queue and the whole task history to render eight numbers and
+  -- ten rows, on every poll of every open tab.
+  let byStatus ← Queue.countByStatus
+  let entries  ← Queue.activeEntries
   let lsCfgs   ← Listener.loadAllListenerConfigs
   let concerts ← Queue.loadAllConcertRuns
   let (authFree, authTotal) ← authCounts configPath
-  let running := entries.filter (·.status == .running)
-  let pending := entries.filter (·.status == .pending)
-  let failed  := entries.filter (·.status == .failed)
   let rConcerts := concerts.filter (·.status == .running)
-  let active := running ++ pending
-  let recent := tasks.toList.take 10
+  -- Running first, then pending, each newest first — the order the panel is read in.
+  let active := entries.filter (·.status == .running) ++ entries.filter (·.status == .pending)
+  let recent ← TaskStore.recent 10
   return Json.mkObj [
     ("counts", Json.mkObj [
-      ("running",    ToJson.toJson running.size),
-      ("pending",    ToJson.toJson pending.size),
-      ("failed",     ToJson.toJson failed.size),
+      ("running",    ToJson.toJson (byStatus .running)),
+      ("pending",    ToJson.toJson (byStatus .pending)),
+      ("failed",     ToJson.toJson (byStatus .failed)),
       ("concerts",   ToJson.toJson rConcerts.size),
       ("listeners",  ToJson.toJson lsCfgs.size),
-      ("totalTasks", ToJson.toJson tasks.size),
+      ("totalTasks", ToJson.toJson (← TaskStore.count)),
       ("authFree",   ToJson.toJson authFree),
       ("authTotal",  ToJson.toJson authTotal)
     ]),
     ("activeQueue", Json.arr (active.map queueEntryJson)),
-    ("recentTasks", Json.arr (recent.map taskRecJson).toArray),
+    ("recentTasks", Json.arr (recent.map taskRecJson)),
     ("taxisUrl",    optStr (← taxisUrl configPath))
   ]
 
 private def queueApi (p : Page) : IO Json := do
-  return pageOver p (·.createdAt) queueEntryJson (← Queue.loadAllEntries)
+  let (entries, total) ← Queue.entriesPage p.since p.skip p.size
+  return collection p total (entries.map queueEntryJson)
 
 private def concertsApi (p : Page) : IO Json := do
-  return pageOver p (·.startedAt) concertRunJson (← Queue.loadAllConcertRuns)
+  let (runs, total) ← Queue.concertRunsPage p.since p.skip p.size
+  return collection p total (runs.map concertRunJson)
 
 private def concertDetailApi (id : String) : IO (Option Json) := do
   match ← Queue.loadConcertRun id with
   | none => return none
   | some r =>
-    let entries ← Queue.loadAllEntries
-    let steps := entries.filter (fun e => e.concertId == some id)
+    let steps ← Queue.entriesOfConcert id
     return some (Json.mkObj [
       ("concert", concertRunJson r),
       ("steps",   Json.arr (steps.map queueEntryJson))
@@ -1013,7 +1009,8 @@ private def skillDetailApi (name : String) : IO (Option Json) := do
   return some ((skillSummaryJson s).mergeObj (Json.mkObj [("content", Json.str s.content)]))
 
 private def tasksApi (p : Page) : IO Json := do
-  return pageOver p (·.createdAt) taskRecJson (← TaskStore.loadAllTasks)
+  let (tasks, total) ← TaskStore.page p.since p.skip p.size
+  return collection p total (tasks.map taskRecJson)
 
 -- Projects & issues
 
@@ -1132,8 +1129,7 @@ private def loadTaskLog (repo : Option RepoPair) (id : String) (atMost : Nat)
     one that failed before it could start. Either way, null means there is no trace to read. -/
 private def taskDetailApi (id : String) (logLimit : Nat) : IO (Option Json) := do
   let record  ← TaskStore.loadTask id
-  let entries ← Queue.loadAllEntries
-  let qEntry  := entries.find? (·.id == id)
+  let qEntry  ← Queue.findEntry id
   let infoOpt : Option (Option RepoPair × String × String × String × Option String) :=
     match record with
     | some r => some (r.repo, tStText r.status, r.createdAt, r.prompt, some r.id)
@@ -1190,8 +1186,8 @@ private def interactiveSummaryJson (r : Interactive.SessionRecord) : Json :=
   ]
 
 private def interactiveApi (p : Page) : IO Json := do
-  let all ← Interactive.loadAllSessions
-  return pageOver p (·.createdAt) interactiveSummaryJson all
+  let (sessions, total) ← Interactive.sessionsPage p.since p.skip p.size
+  return collection p total (sessions.map interactiveSummaryJson)
 
 private def interactiveDetailApi (id : String) : IO (Option Json) := do
   let some r ← Interactive.loadSession id | return none
@@ -1530,8 +1526,7 @@ private def askDaemon (request : Json) : IO (Except String Json) := do
     running" and leaving the page still saying `running` is a dead end a reader can do nothing
     with, so the mismatch is closed on the way out. -/
 private def cancelEntry (id : String) : IO WriteResult := do
-  let entries ← Queue.loadAllEntries
-  let some entry := entries.find? (fun e => e.id == id || e.taskId == some id)
+  let some entry ← Queue.findEntry id
     | return .notFound
   unless entry.status == .running do
     let repaired ← match entry.taskId with

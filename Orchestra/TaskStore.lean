@@ -279,6 +279,76 @@ def loadAllTasks : IO (Array TaskRecord) := do
     order_by_desc t.id
   Store.keepConvertible "task" (·.id) TaskRecord.ofRow? rows
 
+/-! ## Query-shaped access
+
+The history is the collection that grows without bound, and every one of these used to be a read
+of all of it followed by a `filter` or a `take`. Each is now one statement inside one
+`Store.run`, against an index `Store.target` declares for it. -/
+
+open Db.Query.DSL in
+/-- How many task records there are, counted by the database. -/
+def count : IO Nat := do
+  let n ← Store.run <| HasModel.count (QuerySet.all (α := Store.TaskRow))
+  return n.toNat
+
+open Db.Query.DSL in
+/-- The `n` most recent task records, newest first.
+
+    The overview shows ten of them. It used to read the whole history to find those ten. -/
+def recent (n : Nat) : IO (Array TaskRecord) := do
+  let rows ← Store.run <| HasModel.fetch <| (query% do
+    let t ← from Store.TaskRow
+    select t
+    order_by_desc t.created_at
+    order_by_desc t.id).limit n
+  Store.keepConvertible "task" (·.id) TaskRecord.ofRow? rows
+
+open Db.Query.DSL in
+/-- One page of the history, newest first, and how many records the filter matched.
+
+    `since?` is epoch seconds and keeps the records created at or after it; `skip` and `take` are
+    the window. The total counts everything `since?` matched, before the window — which is what
+    lets the dashboard say "50 of 812" rather than "the last 50 that exist". -/
+def page (since? : Option Int) (skip take : Nat) : IO (Array TaskRecord × Nat) := do
+  let bound := Store.sinceBound since?
+  let matching : QuerySet Store.TaskRow := query% do
+    let t ← from Store.TaskRow
+    guard t.created_at ≥ bound
+    select t
+    order_by_desc t.created_at
+    order_by_desc t.id
+  let (rows, total) ← Store.run do
+    let rows ← HasModel.fetch (matching.offset skip |>.limit take)
+    let total ← HasModel.count matching
+    pure (rows, total)
+  return (← Store.keepConvertible "task" (·.id) TaskRecord.ofRow? rows, total.toNat)
+
+open Db.Query.DSL in
+/-- Every task recorded against an issue, newest first.
+
+    The issue detail and `orchestra issue tasks` both want exactly this, and an issue's tasks are
+    a handful out of a history of thousands. -/
+def tasksForIssue (issueId : Taxis.IssueId) : IO (Array TaskRecord) := do
+  let wanted := issueId.toString
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let t ← from Store.TaskRow
+    guard t.issue_id = some wanted
+    select t
+    order_by_desc t.created_at
+    order_by_desc t.id
+  Store.keepConvertible "task" (·.id) TaskRecord.ofRow? rows
+
+open Db.Query.DSL in
+/-- Every task in a named series, newest first. -/
+def tasksInSeries (seriesName : String) : IO (Array TaskRecord) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let t ← from Store.TaskRow
+    guard t.series = some seriesName
+    select t
+    order_by_desc t.created_at
+    order_by_desc t.id
+  Store.keepConvertible "task" (·.id) TaskRecord.ofRow? rows
+
 -- Series pointers
 
 open Db.Query.DSL in

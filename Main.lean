@@ -204,26 +204,21 @@ private def cleanupListHandler (_ : Parsed) : IO UInt32 := do
 
 private def tasksHandler (p : Parsed) : IO UInt32 := do
   let atMost := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
-  let records := (← TaskStore.loadAllTasks).toList.take atMost
+  let records ← TaskStore.recent atMost
   if records.isEmpty then
     IO.println "No tasks found."
     return (0 : UInt32)
-  let queueEntries ← Queue.loadAllEntries
-  let allConcerts ← Queue.loadAllConcertRuns
   IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 11} {padRight "SERIES" 16} CONCERT"
   IO.println (String.ofList (List.replicate 117 '-'))
   for r in records do
     let status := match r.status with
       | .running => "running" | .completed => "completed" | .failed => "failed"
       | .unfinished => "unfinished" | .cancelled => "cancelled"
-    let concertLabel :=
-      let mConcert : Option Queue.ConcertRun := do
-        let e ← queueEntries.find? (fun e => e.taskId == some r.id)
-        let cid ← e.concertId
-        allConcerts.find? (fun cr => cr.id == cid)
-      match mConcert with
-      | some run => run.id
-      | none     => ""
+    -- One lookup for the row being printed, rather than the whole queue and the whole concert
+    -- history read to label at most `atMost` of them.
+    let concertLabel ← do
+      let some cid := (← Queue.entryForTask r.id).bind (·.concertId) | pure ""
+      pure (if (← Queue.loadConcertRun cid).isSome then cid else "")
     let seriesLabel := r.series.getD ""
     IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight (repoLabel r.repo) 28} {padRight status 11} {padRight seriesLabel 16} {concertLabel}"
   return (0 : UInt32)
@@ -590,7 +585,7 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
   else
     IO.println "Daemon not running"
   -- Concert run history
-  let concertRuns := (← Queue.loadAllConcertRuns).toList.take atMost
+  let (concertRuns, _) ← Queue.concertRunsPage none 0 atMost
   if !concertRuns.isEmpty then
     IO.println ""
     IO.println s!"{padRight "CONCERT ID" 16} {padRight "STARTED" 20} {padRight "STATUS" 9} NAME"
@@ -600,7 +595,7 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
         | .running => "running" | .done => "done" | .failed => "failed" | .cancelled => "cancelled"
       IO.println s!"{padRight r.id 16} {padRight r.startedAt 20} {padRight status 9} {r.name.getD (r.workflowFile.getD "")}"
   -- Queue entries
-  let entries := (← Queue.loadAllEntries).toList.take atMost
+  let (entries, _) ← Queue.entriesPage none 0 atMost
   if entries.isEmpty then
     IO.println "No queue entries found."
     return (0 : UInt32)
@@ -814,8 +809,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
   else
     IO.println "Daemon: not running"
   -- Running concerts
-  let allConcerts ← Queue.loadAllConcertRuns
-  let runningConcerts := allConcerts.filter (fun r => r.status == .running)
+  let runningConcerts := (← Queue.loadAllConcertRuns).filter (·.status == .running)
   if !runningConcerts.isEmpty then
     IO.println ""
     IO.println s!"Concerts: {runningConcerts.size} running"
@@ -825,8 +819,7 @@ private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
     for r in runningConcerts do
       IO.println s!"{padRight r.id 16} {padRight r.startedAt 20} {r.name.getD (r.workflowFile.getD "")}"
   -- Running and pending entries only
-  let all ← Queue.loadAllEntries
-  let active := all.filter (fun e => e.status == .running || e.status == .pending)
+  let active ← Queue.activeEntries
   if active.isEmpty then
     IO.println "Queue: empty"
   else

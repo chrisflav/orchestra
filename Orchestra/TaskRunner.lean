@@ -111,9 +111,9 @@ def enqueueTaskImpl (appConfig : AppConfig) (resolved : ResolvedSpawn) (spawnerT
     -- Counted over the queue rather than kept in memory: entries outlive the daemon, and an
     -- allowance that reset on restart is not an allowance. Terminal entries count too — the
     -- ceiling is on how much work a task may create, not on how much of it is still running.
-    let spawned := (← Queue.loadAllEntries).filter (·.spawnedBy == some spawnerTaskId)
-    if spawned.size ≥ resolved.maxTasks then
-      return .error s!"this task has already queued {spawned.size} task(s), which is all its \
+    let spawned ← Queue.countSpawnedBy spawnerTaskId
+    if spawned ≥ resolved.maxTasks then
+      return .error s!"this task has already queued {spawned} task(s), which is all its \
 spawn policy allows ({resolved.maxTasks})"
     -- Resolved even when the repository was inherited rather than named, so that one rule
     -- decides where a task pushes no matter how it got here (see `Orchestra.Spawn`).

@@ -113,6 +113,12 @@ private def ctx (parallelLimit perRepoLimit : Nat)
 /-- No slot anywhere has a recorded occupant. -/
 private def noOccupants : Option Repository → Nat → IO (Option String) := fun _ _ => pure none
 
+/-- The predecessor lookup `claimDecision` takes, answered out of an array held in memory. The
+    daemon passes `Queue.entryForTask`, which is one indexed query for the same question. -/
+private def predIn (entries : Array Queue.QueueEntry) :
+    String → IO (Option Queue.QueueEntry) :=
+  fun tid => pure (entries.find? (·.taskId == some tid))
+
 /-- Slot `slot` of any repository holds the tree `owner` left behind. -/
 private def occupantIs (slot : Nat) (owner : String) : Option Repository → Nat → IO (Option String) :=
   fun _ s => pure (if s == slot then some owner else none)
@@ -120,13 +126,14 @@ private def occupantIs (slot : Nat) (owner : String) : Option Repository → Nat
 @[test]
 def claimDecision_stopsAtTheGlobalLimit : Test := do
   let all := #[mkEntry "0001" "a"]
-  let got ← Queue.claimDecision (ctx 2 1 (total := 2)) all noOccupants
+  let got ← Queue.claimDecision (ctx 2 1 (total := 2)) all (predIn all) noOccupants
   TestM.assertEqual (got.map (·.entry.id)) none (msg := "nothing starts once --parallel is full")
 
 @[test]
 def claimDecision_nothingStartsBesideAnExclusiveTask : Test := do
   let all := #[mkEntry "0001" "a"]
-  let got ← Queue.claimDecision (ctx 4 1 (total := 1) (exclusiveActive := true)) all noOccupants
+  let got ← Queue.claimDecision (ctx 4 1 (total := 1) (exclusiveActive := true)) all
+    (predIn all) noOccupants
   TestM.assertEqual (got.map (·.entry.id)) none (msg := "an exclusive backend holds the daemon")
 
 @[test]
@@ -135,14 +142,15 @@ def claimDecision_exclusiveBackendIsSkippedWhileBusy : Test := do
   -- past it — rather than giving up for the round — is what keeps repo `b` moving.
   let all := #[ { mkEntry "0001" "a" with backend := some "pi" }
               , mkEntry "0002" "b" ]
-  let got ← Queue.claimDecision (ctx 4 1 (occupied := [("a/r", #[])]) (total := 1)) all noOccupants
+  let got ← Queue.claimDecision (ctx 4 1 (occupied := [("a/r", #[])]) (total := 1)) all
+    (predIn all) noOccupants
   TestM.assertEqual (got.map (·.entry.id)) (some "0002")
     (msg := "the blocked exclusive entry does not stall the queue behind it")
 
 @[test]
 def claimDecision_exclusiveBackendStartsWhenIdle : Test := do
   let all := #[{ mkEntry "0001" "a" with backend := some "pi" }]
-  let got ← Queue.claimDecision (ctx 4 1) all noOccupants
+  let got ← Queue.claimDecision (ctx 4 1) all (predIn all) noOccupants
   TestM.assertEqual (got.map (·.entry.id)) (some "0001") (msg := "idle daemon admits it")
 
 @[test]
@@ -150,7 +158,8 @@ def claimDecision_continuationResumesItsPredecessorsTree : Test := do
   let pred := { mkEntry "0001" "a" (status := .done) with
                 taskId := some "t1", slot := some 1 }
   let cont := { mkEntry "0002" "a" with continuesFrom := some "t1" }
-  let got ← Queue.claimDecision (ctx 4 3) #[pred, cont] (occupantIs 1 "0001")
+  let all := #[pred, cont]
+  let got ← Queue.claimDecision (ctx 4 3) all (predIn all) (occupantIs 1 "0001")
   match got with
   | some c =>
     TestM.assertEqual c.slot 1 (msg := "back to the predecessor's slot")
@@ -166,7 +175,8 @@ def claimDecision_continuationResetsWhenAnotherTaskTookItsSlot : Test := do
   let pred := { mkEntry "0001" "a" (status := .done) with
                 taskId := some "t1", slot := some 1 }
   let cont := { mkEntry "0002" "a" with continuesFrom := some "t1" }
-  let got ← Queue.claimDecision (ctx 4 3) #[pred, cont] (occupantIs 1 "0009")
+  let all := #[pred, cont]
+  let got ← Queue.claimDecision (ctx 4 3) all (predIn all) (occupantIs 1 "0009")
   match got with
   | some c =>
     TestM.assertEqual c.resumeFrom none (msg := "the tree is not the predecessor's, so reset")
@@ -179,8 +189,9 @@ def claimDecision_continuationWaitsWhenItsSlotIsBusy : Test := do
   let pred := { mkEntry "0001" "a" (status := .done) with
                 taskId := some "t1", slot := some 1 }
   let cont := { mkEntry "0002" "a" with continuesFrom := some "t1" }
+  let all := #[pred, cont]
   let got ← Queue.claimDecision (ctx 4 3 (occupied := [("a/r", #[1])]) (total := 1))
-    #[pred, cont] (occupantIs 1 "0001")
+    all (predIn all) (occupantIs 1 "0001")
   TestM.assertEqual (got.map (·.entry.id)) none (msg := "waits for its own workspace")
 
 @[test]
@@ -189,8 +200,9 @@ def claimDecision_blockedContinuationDoesNotStallOtherRepos : Test := do
                 taskId := some "t1", slot := some 1 }
   let cont := { mkEntry "0002" "a" (priority := 90) with continuesFrom := some "t1" }
   let other := mkEntry "0003" "b" (priority := 10)
+  let all := #[pred, cont, other]
   let got ← Queue.claimDecision (ctx 4 3 (occupied := [("a/r", #[1])]) (total := 1))
-    #[pred, cont, other] (occupantIs 1 "0001")
+    all (predIn all) (occupantIs 1 "0001")
   TestM.assertEqual (got.map (·.entry.id)) (some "0003")
     (msg := "a higher-priority entry waiting on its slot is skipped, not blocking")
 
@@ -200,7 +212,8 @@ def claimDecision_continuationWithNoRecordedSlotJustResets : Test := do
   -- to. Starting cleanly is all that is left; the daemon logs a note.
   let pred := { mkEntry "0001" "a" (status := .done) with taskId := some "t1" }
   let cont := { mkEntry "0002" "a" with continuesFrom := some "t1" }
-  let got ← Queue.claimDecision (ctx 4 3) #[pred, cont] noOccupants
+  let all := #[pred, cont]
+  let got ← Queue.claimDecision (ctx 4 3) all (predIn all) noOccupants
   match got with
   | some c => TestM.assertEqual c.resumeFrom none (msg := "no predecessor slot, no resume")
   | none   => TestM.fail "expected a claim"
