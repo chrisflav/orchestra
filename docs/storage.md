@@ -315,8 +315,8 @@ stays off.
 two processes on one SQLite file, and WAL mode needs a filesystem that supports it rather than a
 network mount.
 
-`lakefile.lean` pins the library to a revision of its `orchestra-support` branch (chrisflav/db#14);
-move the pin forward when that branch lands on the library's master.
+`lakefile.lean` pins the library to the revision of its master that merged chrisflav/db#14;
+move the pin forward as the library gains what orchestra needs.
 
 ## what the library gained
 
