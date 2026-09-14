@@ -7,7 +7,7 @@ import Orchestra.TaskStore
 # The queue
 
 What is waiting to run, what is running, and what a run of a concert workflow has got to. Rows of
-the `queue_entry` and `concert_run` tables of `<data>/orchestra.db` (`Orchestra.Store`); what is
+the `queue_entry` and `concert_run` tables of the record database (`Orchestra.Store`); what is
 left in `<data>/queue` is the daemon's pid file, its socket and its log.
 
 An entry is a task's whole launch configuration, written once when it is queued and written back

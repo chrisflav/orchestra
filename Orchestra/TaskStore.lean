@@ -9,7 +9,7 @@ import Init.Data.String.Basic
 
 What orchestra remembers of a run once the daemon has started it: the prompt, the repositories,
 the backend and identity it ran under, and how it ended. Rows of the `task` table of
-`<data>/orchestra.db` (`Orchestra.Store`), keyed by the id `generateId` mints.
+the record database (`Orchestra.Store`), keyed by the id `generateId` mints.
 
 A record is the unit a continuation is built from, so every field a continuation inherits is on
 it, and a series pointer — a row of `series` — is how `--series` finds the run to continue.

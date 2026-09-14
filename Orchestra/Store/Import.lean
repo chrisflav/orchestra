@@ -95,7 +95,7 @@ private def legacyFiles (α : Type) [FromJson α] (what : String) (dir : System.
     the file is what it was written from — so a collision leaves it alone and says so. Throwing
     instead, which is what a plain `insert` does, rolled the store back with no marker and left
     every later store unimported, on this start and on every one after it. -/
-private def insertNew {α : Type} [HasModel α] (what id : String) (row : α) : Sqlite.M Bool := do
+private def insertNew {α : Type} [HasModel α] (what id : String) (row : α) : PostgreSQL.M Bool := do
   if ← HasModel.insertIfAbsent row then
     return true
   IO.eprintln s!"[orchestra] legacy {what} '{id}' is already in the database; \
@@ -116,7 +116,7 @@ open Db.Query.DSL in
     daemon's own `<data>/queue` and the `--debug` transcripts under `<data>/tasks` are directories
     that exist on a fresh installation and hold no records at all, and one that gains legacy files
     later (through `orchestra migrate`, say) is still there to be picked up. -/
-def importStore (store : String) (dir : System.FilePath) (act : Sqlite.M (Nat × Nat)) :
+def importStore (store : String) (dir : System.FilePath) (act : PostgreSQL.M (Nat × Nat)) :
     IO Unit := do
   unless ← dir.pathExists do return
   let marker ← Orchestra.Store.run <| HasModel.fetch <| query% do
@@ -285,7 +285,7 @@ private def importInteractive : IO Unit := do
     does not parse leaves the source with no history, which is what `loadHistory` made of an
     unreadable one before. -/
 private def importUsageHistory (path : System.FilePath) (backend label : String) :
-    Sqlite.M Unit := do
+    PostgreSQL.M Unit := do
   let some contents ← readFile? "usage history" path | return
   match Json.parse contents >>= (·.getObjValAs? (Array Usage.Window) "windows") with
   | .error e =>

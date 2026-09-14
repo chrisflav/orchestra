@@ -12,7 +12,7 @@ open Lean (Json ToJson FromJson)
 /-!
 # Where a session is kept
 
-Two tables of `<data>/orchestra.db` (`Orchestra.Store`):
+Two tables of the record database (`Orchestra.Store`):
 
   * `interactive_session` — one row per session, the record rewritten on every state change.
   * `interactive_event` — one row per transcript line, keyed by `(session_id, seq)`.
