@@ -11,6 +11,35 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # The record store is PostgreSQL (Orchestra/Store/Connection.lean), and most of the suite is
+    # above it: `withTempData` gives each case a schema of its own inside this server and drops it
+    # afterwards. The tests fail rather than skip without one, so this service is not optional —
+    # see the reasoning in OrchestraTest/TestM.lean.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: orchestra_test
+        ports:
+          - 5432:5432
+        # Without this the job can reach the step below while the cluster is still initialising,
+        # which fails as a connection error rather than as a wait.
+        options: >-
+          --health-cmd "pg_isready -U testuser -d orchestra_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ORCHESTRA_TEST_DATABASE_URL: postgresql://testuser:secret@localhost:5432/orchestra_test
+
     steps:
       - uses: actions/checkout@v5
+      # libpq-dev carries the header the PostgreSQL FFI shim compiles against and the `libpq.so`
+      # the executables link by absolute path; pkg-config is how `libpqLinkArgs` in lakefile.lean
+      # finds where that is. The runner has neither by default.
+      - name: Install libpq
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpq-dev pkg-config
       - uses: leanprover/lean-action@v1
