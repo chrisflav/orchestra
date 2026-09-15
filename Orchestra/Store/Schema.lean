@@ -4,7 +4,7 @@ import Orchestra.Store.Migrations.Initial
 /-!
 # The shape of orchestra's database
 
-One `@[model]` structure per table of `<data>/orchestra.db`, the indexes those tables carry, and
+One `@[model]` structure per table of the record database, the indexes those tables carry, and
 the list of migrations that builds them.
 
 Every table is declared here, including the ones whose stores still write files: the schema is a

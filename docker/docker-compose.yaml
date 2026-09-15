@@ -4,6 +4,11 @@ name: orchestra
 # whichever container starts first renders config.json from it (see docker/entrypoint.sh), and
 # the dashboard reads the same file to list authentication sources.
 x-orchestra-env: &orchestra-env
+  # The record store. Required, and with no default: every task, queue entry, concert run and
+  # listener state is a row in this database, and there is no file to fall back to. The `db`
+  # service below is what this points at out of the box; point it elsewhere to use a server you
+  # already run, in which case you can remove that service and its volume.
+  ORCHESTRA_DATABASE_URL: ${ORCHESTRA_DATABASE_URL:-postgresql://orchestra:orchestra@db:5432/orchestra}
   # taxis instance backing projects/issues/claims. Required — every project, issue and claim
   # operation fails without it. This compose file expects taxis to be running elsewhere; point
   # the URL at it. If taxis runs in its own compose project on the same host, use its
@@ -39,6 +44,12 @@ services:
     # the foreground) cancels the running tasks rather than waiting for them.
     stop_grace_period: ${ORCHESTRA_STOP_GRACE_PERIOD:-30m}
     environment: *orchestra-env
+    # `service_healthy`, not the bare form: a first `up` creates the cluster, and the daemon's
+    # first act is to apply its schema. Starting it against a server that is still initialising
+    # buys a failed start and a thirty-second restart wait for nothing.
+    depends_on:
+      db:
+        condition: service_healthy
     # Upstream resolvers, when the host's own are unusable from a container — see
     # docker/README.md's "error connecting to api.github.com". Empty (the default) changes
     # nothing.
@@ -58,8 +69,10 @@ services:
       # Edit it in place afterwards — it is then used as-is and the environment is ignored. The
       # same directory holds listeners/, roles/, prompts/ and secrets.json.
       - ./config:/config
-      # The record database (orchestra.db), cloned repos, task logs, per-project roles. Must be
-      # the same directory the dashboard mounts, and a real local filesystem — see below.
+      # Cloned repos, task logs, per-project roles, the dashboard secret. The records themselves
+      # are not here any more — they are rows in the `db` service — but this still has to be the
+      # same directory the dashboard mounts, because the dashboard serves task logs out of it and
+      # reaches the daemon's control socket through it.
       - ./data:/data
       # GitHub App private key and anything else secret. Mounted read-only, and as a *directory*
       # rather than naming the .pem directly: Docker silently creates a directory in place of a
@@ -75,16 +88,16 @@ services:
   # why a task is stuck. (`orchestrad serve` runs both in one process, which is the right shape
   # for a single-host install and the wrong one here.)
   #
-  # Nothing here dispatches work. It reads the records the daemon writes — rows of the SQLite
-  # database at /data/orchestra/orchestra.db — and it writes the configuration files the daemon
-  # reads, listeners, roles and skills, which the daemon picks up without a restart. It can also
-  # ask the daemon to cancel one running task, which travels over the daemon's control socket in
-  # /data rather than over any port.
+  # Nothing here dispatches work. It reads the records the daemon writes — rows of the `db`
+  # service — and it writes the configuration files the daemon reads, listeners, roles and skills,
+  # which the daemon picks up without a restart. It can also ask the daemon to cancel one running
+  # task, which travels over the daemon's control socket in /data rather than over any port.
   #
-  # That is why both services mount the *same* /data, and why it has to be one ordinary directory
-  # on a real filesystem: the two containers are two processes on one SQLite file, and the WAL
-  # mode that lets them read and write it at the same time does not work over NFS, SMB or any
-  # other network mount.
+  # Two clients of one database, which is a thing a database is for; this used to be two processes
+  # on one SQLite file, which is a thing a file is not, and the arrangement needed /data to be one
+  # ordinary local directory — no NFS, no SMB — for WAL to work across them at all. What is left
+  # of that constraint is much weaker: both still mount the same /data, because the console serves
+  # task logs out of it and finds the daemon's socket in it.
   dashboard:
     # Same build as above so `docker compose build` produces the one image both services use;
     # Compose builds it once and reuses it.
@@ -119,6 +132,10 @@ services:
     # entrypoint also skips rendering config.json in this container precisely because it does
     # not hold the rest (see docker/entrypoint.sh).
     environment:
+      # The exception to the paragraph above, and not a credential the daemon holds: this
+      # container's whole job is reading the records, so it needs the database the records are
+      # in. The same URL as the daemon's, because it is the same database.
+      ORCHESTRA_DATABASE_URL: ${ORCHESTRA_DATABASE_URL:-postgresql://orchestra:orchestra@db:5432/orchestra}
       ORCHESTRA_TAXIS_URL: ${ORCHESTRA_TAXIS_URL:-}
       ORCHESTRA_TAXIS_TOKEN: ${ORCHESTRA_TAXIS_TOKEN:-}
       # The password the dashboard asks for. Leave it unset to have one generated and persisted
@@ -129,7 +146,10 @@ services:
     # never writes one. Compose only orders the *starts*, so the dashboard can come up before
     # config.json exists — the auth page re-reads it per request and fills in on its own.
     depends_on:
-      - orchestra
+      orchestra:
+        condition: service_started
+      db:
+        condition: service_healthy
     volumes:
       # Read-write since taxis #433: the API this container serves is how listeners, roles and
       # skills are edited, and those live under /config. It still never writes config.json itself
@@ -138,3 +158,36 @@ services:
       - ./config:/config
       # Task history, queue state, and the persisted dashboard secret.
       - ./data:/data
+
+  # The record store.
+  #
+  # Here so that `docker compose up` is the whole of getting an installation running, the way it
+  # was when the records were a file under ./data. Point ORCHESTRA_DATABASE_URL at a server you
+  # already run and this service and its volume can go; nothing else refers to them.
+  #
+  # Publishes no port. Both clients reach it by service name on the project's default network,
+  # which is the only place it needs to be reachable from — the credentials below are defaults
+  # precisely because nothing outside this network can use them.
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${ORCHESTRA_DB_USER:-orchestra}
+      POSTGRES_PASSWORD: ${ORCHESTRA_DB_PASSWORD:-orchestra}
+      POSTGRES_DB: ${ORCHESTRA_DB_NAME:-orchestra}
+    # A named volume rather than a bind mount, unlike ./config and ./data: those two are meant to
+    # be read and edited by hand, and this one is a database's own storage, which is not. Removing
+    # it is `docker compose down -v`, deliberately harder than deleting a directory.
+    volumes:
+      - orchestra-db:/var/lib/postgresql/data
+    # `pg_isready` rather than a TCP probe: the container accepts connections briefly during
+    # initialisation, while it is still creating the cluster, and a daemon that connected then
+    # would fail its first query rather than wait.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ORCHESTRA_DB_USER:-orchestra} -d ${ORCHESTRA_DB_NAME:-orchestra}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  orchestra-db:
