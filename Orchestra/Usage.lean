@@ -38,15 +38,18 @@ A source therefore accumulates a *set* of blocks, one per scope, not a single on
 independent facts with independent expiries, and a completed run retires only the blocks covering
 the model it ran: proof that Sonnet works on an account says nothing about whether Fable does.
 
-State lives on disk, one file per `(backend, label)`, because the processes that need to agree
-about it are genuinely separate: `orchestra run` in a terminal and the queue daemon are different
-OS processes, and a limit one of them discovers has to stop the other.
+State lives in the database — a row of `usage_source` per `(backend, label)`, and a row of
+`usage_window` per window of recorded history — because the processes that need to agree about it
+are genuinely separate: `orchestra run` in a terminal and the queue daemon are different OS
+processes, and a limit one of them discovers has to stop the other.
 -/
 import Lean.Data.Json
 import Orchestra.Config
 import Orchestra.Dirs
+import Orchestra.Store
 import Orchestra.Utils.Files
 import Orchestra.Utils.Http
+import Orchestra.Utils.Time
 import Std.Time
 
 open Lean (Json FromJson ToJson)
@@ -55,104 +58,13 @@ namespace Orchestra.Usage
 
 /-! ## Time
 
-Reset times come back as RFC 3339 with a fractional part and a numeric offset
-(`2026-07-22T18:59:59.573616+00:00`), while orchestra's own timestamps are `date -u`'s
-`2026-07-22T18:59:59Z`. Comparing those as strings gives the wrong answer, so both are parsed to
-epoch seconds. Parsing is pure so the interesting cases are reachable from a test without a
-clock. -/
+The RFC 3339 parser and formatter live in `Orchestra.Time`, below this module, because the
+stores need them to order their records too. Re-exported here: `Usage.parseIso8601` is how the
+rest of the daemon has always spelled it, and a limit's `resetsAt` is a usage concern wherever
+the parsing happens.
+-/
 
-private def charAt (cs : List Char) (i : Nat) : Option Char :=
-  (cs.drop i).head?
-
-private def digitsAt (cs : List Char) (start len : Nat) : Option Nat :=
-  let sub := (cs.drop start).take len
-  if sub.length != len || !sub.all Char.isDigit then none
-  else some (sub.foldl (fun acc c => acc * 10 + (c.toNat - '0'.toNat)) 0)
-
-/-- Days between 1970-01-01 and `y-m-d`, by Howard Hinnant's `days_from_civil`. Valid for any
-    proleptic Gregorian date at or after year 1, which covers every timestamp a server will
-    hand us. -/
-private def daysFromCivil (y0 m d : Nat) : Int :=
-  let y := if m ≤ 2 then y0 - 1 else y0
-  let era := y / 400
-  let yoe := y - era * 400
-  let mp := if m > 2 then m - 3 else m + 9
-  let doy := (153 * mp + 2) / 5 + d - 1
-  let doe := yoe * 365 + yoe / 4 - yoe / 100 + doy
-  (↑(era * 146097 + doe) : Int) - 719468
-
-/-- Parse an ISO 8601 / RFC 3339 timestamp to epoch seconds.
-
-    Accepts `Z`, `±hh:mm`, `±hhmm`, and a missing offset (read as UTC), and ignores any
-    fractional-seconds part. Returns `none` rather than a wrong answer on anything else — a
-    timestamp we cannot read must not silently become "already expired". -/
-def parseIso8601 (s : String) : Option Int := do
-  let cs := s.trimAscii.toString.toList
-  let y  ← digitsAt cs 0 4
-  guard (charAt cs 4 == some '-')
-  let mo ← digitsAt cs 5 2
-  guard (charAt cs 7 == some '-')
-  let d  ← digitsAt cs 8 2
-  let sep ← charAt cs 10
-  guard (sep == 'T' || sep == 't' || sep == ' ')
-  let h  ← digitsAt cs 11 2
-  guard (charAt cs 13 == some ':')
-  let mi ← digitsAt cs 14 2
-  guard (charAt cs 16 == some ':')
-  let sec ← digitsAt cs 17 2
-  guard (1 ≤ mo && mo ≤ 12 && 1 ≤ d && d ≤ 31 && h ≤ 23 && mi ≤ 59 && sec ≤ 60)
-  let rest := cs.drop 19
-  let rest := if rest.head? == some '.' then (rest.drop 1).dropWhile Char.isDigit else rest
-  let offset : Option Int ←
-    match rest.head? with
-    | none      => pure (some 0)
-    | some 'Z'  => pure (some 0)
-    | some 'z'  => pure (some 0)
-    | some c    =>
-      if c == '+' || c == '-' then
-        match digitsAt (rest.drop 1) 0 2 with
-        | none    => pure none
-        | some oh =>
-          let t := rest.drop 1
-          let t := if charAt t 2 == some ':' then t.drop 3 else t.drop 2
-          let om := (digitsAt t 0 2).getD 0
-          let mag : Int := ↑(oh * 3600 + om * 60)
-          pure (some (if c == '-' then -mag else mag))
-      else pure none
-  let off ← offset
-  return daysFromCivil y mo d * 86400 + ↑(h * 3600 + mi * 60 + sec) - off
-
-/-- Civil date `(year, month, day)` for a day count since 1970-01-01, by Howard Hinnant's
-    `civil_from_days` — the inverse of `daysFromCivil`. Only ever called with non-negative day
-    counts (reset times are in the future), so the Nat arithmetic never underflows. -/
-private def civilFromDays (z0 : Nat) : Nat × Nat × Nat :=
-  let z := z0 + 719468
-  let era := z / 146097
-  let doe := z - era * 146097
-  let yoe := (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
-  let y := yoe + era * 400
-  let doy := doe - (365 * yoe + yoe / 4 - yoe / 100)
-  let mp := (5 * doy + 2) / 153
-  let d := doy - (153 * mp + 2) / 5 + 1
-  let m := if mp < 10 then mp + 3 else mp - 9
-  (if m ≤ 2 then y + 1 else y, m, d)
-
-private def pad2 (n : Nat) : String := if n < 10 then s!"0{n}" else toString n
-
-private def pad4 (n : Nat) : String :=
-  let s := toString n
-  String.ofList (List.replicate (4 - s.length) '0') ++ s
-
-/-- Format epoch seconds as `YYYY-MM-DDTHH:MM:SSZ`. The inverse direction of `parseIso8601`: the
-    usage endpoint reports resets as timestamps, but the rate-limit *headers* report them as epoch
-    seconds, and `Limit.resetsAt` is a string every consumer re-parses with `parseIso8601`. -/
-def secsToIso8601 (epoch : Int) : String :=
-  if epoch < 0 then "1970-01-01T00:00:00Z"
-  else
-    let e := epoch.toNat
-    let (y, mo, d) := civilFromDays (e / 86400)
-    let rem := e % 86400
-    s!"{pad4 y}-{pad2 mo}-{pad2 d}T{pad2 (rem / 3600)}:{pad2 (rem % 3600 / 60)}:{pad2 (rem % 60)}Z"
+export Orchestra.Time (parseIso8601 secsToIso8601)
 
 /-- Current time in epoch seconds.
 
@@ -420,30 +332,66 @@ instance : FromJson SourceState where
     let pollAfter := (j.getObjValAs? Int "poll_after").toOption
     return { backend, label, limits, fetchedEpoch, blocks, lastUsedTick, lastError, pollAfter }
 
-def usageDir : IO System.FilePath :=
+/-- Where the JSON state and history files lived before the database: `<data>/usage`, holding a
+    `<backend>/<label>.json` and a `<backend>/<label>.history.json` per source. Read once, by
+    `Orchestra.Store.Import`, and then left alone — the import copies, it does not delete.
+
+    The label in those file names was flattened to what a filename may hold, which is lossy; the
+    state document beside it carries the real one, and that is the one the import keys on. -/
+def legacyUsageDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "usage"
 
-/-- A label as a filename. Labels come from config and are used as filenames, so anything that
-    could escape the directory is flattened rather than trusted. -/
-private def safeLabel (label : String) : String :=
-  label.map fun c => if c.isAlphanum || c == '-' || c == '_' then c else '_'
+/-- The state as a row of `usage_source`, keyed by the pair that names the source.
 
-private def statePath (backend label : String) : IO System.FilePath := do
-  return (← usageDir) / backend / s!"{safeLabel label}.json"
+    `limits` and `blocks` are the compressed JSON their own instances write: they are arrays of
+    documents with no scalar form, and storing them as text is what keeps a limit kind this
+    build has never heard of readable by the build that has. -/
+def SourceState.toRow (s : SourceState) : Store.UsageSourceRow :=
+  { backend        := s.backend
+    label          := s.label
+    fetched_epoch  := s.fetchedEpoch
+    limits         := Store.jsonColumn s.limits
+    blocks         := Store.jsonColumn s.blocks
+    last_used_tick := s.lastUsedTick
+    last_error     := s.lastError
+    poll_after     := s.pollAfter }
 
+/-- The state a row holds, or why this build cannot read it. -/
+def SourceState.ofRow? (row : Store.UsageSourceRow) : Except String SourceState := do
+  let limits ← Store.jsonOfColumn? "limits" row.limits
+  let blocks ← Store.jsonOfColumn? "blocks" row.blocks
+  return { backend      := row.backend
+           label        := row.label
+           fetchedEpoch := row.fetched_epoch
+           limits       := limits
+           blocks       := blocks
+           lastUsedTick := row.last_used_tick
+           lastError    := row.last_error
+           pollAfter    := row.poll_after }
+
+open Db.Query.DSL in
+/-- What is known about one source, or a blank state for one nothing has polled yet.
+
+    A source with no row and a source whose row this build cannot read come back the same way,
+    which is what the file store did with a missing and an unparseable file: this is a cache of
+    what the provider last said, the next poll refills it, and a daemon that refused to dispatch
+    because a cache entry was unreadable would have its priorities backwards. -/
 def loadState (backend label : String) : IO SourceState := do
-  let path ← statePath backend label
-  if !(← path.pathExists) then return { backend, label }
-  match Json.parse (← IO.FS.readFile path) with
-  | .error _ => return { backend, label }
-  | .ok j    => match FromJson.fromJson? j with
-    | .error _ => return { backend, label }
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let s ← from Store.UsageSourceRow
+    guard s.backend = backend
+    guard s.label = label
+    select s
+  match rows[0]? with
+  | none     => return { backend, label }
+  | some row => match SourceState.ofRow? row with
     | .ok s    => return s
+    | .error e =>
+      IO.eprintln s!"[usage] {backend}/{label}: state row unreadable ({e}); starting again"
+      return { backend, label }
 
-def saveState (s : SourceState) : IO Unit := do
-  let path ← statePath s.backend s.label
-  if let some dir := path.parent then IO.FS.createDirAll dir
-  IO.FS.writeFile path (Json.compress (ToJson.toJson s))
+def saveState (s : SourceState) : IO Unit :=
+  Store.run <| HasModel.save s.toRow
 
 private def modifyState (backend label : String) (f : SourceState → SourceState) : IO Unit := do
   saveState (f (← loadState backend label))
@@ -458,9 +406,9 @@ asked about.
 What is kept is one record per *window* rather than one per poll. The session and weekly limits
 are counters that fill and then reset, so the window is the unit that carries meaning: the peak
 a closed session window reached is what that session consumed, and the peak of a week is what
-that week did. Rolling polls up as they arrive is also what keeps the file small enough to read
-on every dashboard tick — a poll every five minutes is eight thousand samples a month, and the
-same month is a few hundred windows.
+that week did. Rolling polls up as they arrive is also what keeps the number of rows small enough
+to read on every dashboard tick — a poll every five minutes is eight thousand samples a month, and
+the same month is a few hundred windows.
 
 Only polls are recorded. An observed hit (`markLimited`) establishes that *a* limit was reached
 but neither which counter reached it nor where that counter stood, so folding it in would
@@ -478,11 +426,22 @@ structure Window where
       window is only ever seen through the polls that caught it. -/
   startEpoch  : Int := 0
   lastEpoch   : Int := 0
-  /-- The highest reading. Utilisation only climbs inside a window, so this is what the window
-      consumed — and it is the number that survives the reset, which the next poll reports as a
-      fresh low. -/
+  /-- The highest reading, which is what the window has been up to — and the number that
+      survives the reset, which the next poll reports as a fresh low.
+
+      Not the same as `lastPercent` whenever a reading inside the window came back down. Why one
+      does is upstream's business and not visible from here — reconciled usage, a limit raised
+      under the account, a counter that ages usage out rather than emptying at its reset — so
+      the only safe reading of the pair is "the highest we saw" and "the last we saw". A reader
+      that shows one where the other is meant reports a number the live limit disagrees with. -/
   peakPercent : Nat := 0
-  /-- The most recent reading. On the window still open, this is where it stands now. -/
+  /-- The most recent reading: on the window still open, where the source stood at the poll that
+      last touched this window.
+
+      Normally that is the same poll whose limits `refresh` stored, so this is the number the
+      source's `limits` carry for the same window. It is not a guarantee: a poll that stops
+      reporting a window leaves the record here untouched while `limits` is replaced wholesale,
+      and a history write that fails leaves this one poll behind. -/
   lastPercent : Nat := 0
   /-- How many polls this window was built from. One is a glimpse of a window rather than a
       measurement of it, and a reader is entitled to say so. -/
@@ -516,6 +475,37 @@ instance : FromJson Window where
     let lastPercent := (j.getObjValAs? Nat "last_percent").toOption.getD peakPercent
     let samples := (j.getObjValAs? Nat "samples").toOption.getD 0
     return { kind, scope, resetEpoch, startEpoch, lastEpoch, peakPercent, lastPercent, samples }
+
+/-- The window as a row of `usage_window`, under the source it was recorded for.
+
+    The source is not on the window — a window is a reading, and which account it is a reading of
+    is the store's business — so it is supplied here rather than carried. `id` is left at zero:
+    it is an `AutoKey`, which the insert leaves out for the database to assign, and it is that
+    assignment which makes `ORDER BY id` the insertion order `loadHistory` reads back. -/
+def Window.toRow (backend label : String) (w : Window) : Store.UsageWindowRow :=
+  { id           := 0
+    backend      := backend
+    label        := label
+    kind         := Store.enumColumn w.kind
+    scope        := w.scope
+    reset_epoch  := w.resetEpoch
+    start_epoch  := w.startEpoch
+    last_epoch   := w.lastEpoch
+    peak_percent := Store.natColumn w.peakPercent
+    last_percent := Store.natColumn w.lastPercent
+    samples      := Store.natColumn w.samples }
+
+/-- The window a row holds, or why this build cannot read it. -/
+def Window.ofRow? (row : Store.UsageWindowRow) : Except String Window := do
+  let kind ← Store.enumOfColumn? "kind" row.kind
+  return { kind        := kind
+           scope       := row.scope
+           resetEpoch  := row.reset_epoch
+           startEpoch  := row.start_epoch
+           lastEpoch   := row.last_epoch
+           peakPercent := row.peak_percent.toNat
+           lastPercent := row.last_percent.toNat
+           samples     := row.samples.toNat }
 
 /-- Nominal length of a window. Used only to decide whether two polls that reported no reset
     time can have been inside the same one. -/
@@ -609,47 +599,51 @@ def pruneWindows (windows : Array Window) (now : Int) : Array Window := Id.run d
     if seen < maxWindowsPerSeries then kept := kept.push w
   return kept.reverse
 
-private def historyPath (backend label : String) : IO System.FilePath := do
-  return (← usageDir) / backend / s!"{safeLabel label}.history.json"
-
+open Db.Query.DSL in
 /-- The recorded windows for one source, oldest first.
 
-    Unreadable history is empty history: it is a record of the past, nothing about the present
-    depends on it, and a monitor that refused to run because a graph's data file was corrupt
-    would have its priorities backwards. -/
+    Oldest first is `ORDER BY id`, the order they were inserted in, which `saveHistory` writes
+    them in — the windows are a sequence rather than a set, and every function that folds over
+    them relies on the open window of a series being the last one in it.
+
+    A row this build cannot read is reported and left out, as a record that did not parse always
+    was: history is a record of the past, nothing about the present depends on it, and a monitor
+    that refused to run because one row of a graph was unreadable would have its priorities
+    backwards. -/
 def loadHistory (backend label : String) : IO (Array Window) := do
-  let path ← historyPath backend label
-  if !(← path.pathExists) then return #[]
-  match Json.parse (← IO.FS.readFile path) with
-  | .error _ => return #[]
-  | .ok j    => return (j.getObjValAs? (Array Window) "windows").toOption.getD #[]
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let w ← from Store.UsageWindowRow
+    guard w.backend = backend
+    guard w.label = label
+    select w
+    order_by w.id
+  Store.keepConvertible "usage window" (fun r => s!"{r.backend}/{r.label}#{r.id}")
+    Window.ofRow? rows
 
-/-- Wrapped in an object rather than written as a bare array, so a later version can add a
-    field beside `windows` without every reader of this file having to change.
+/-- Replace a source's history with `windows`, in order.
 
-    Written through a rename, unlike the state file beside it: the dashboard re-reads this one
-    on every tick of an open page, and a reader that caught a half-written file would find it
-    unparseable — which `loadHistory` treats as no history at all, and the next poll would then
-    write that emptiness back as the truth. -/
-def saveHistory (backend label : String) (windows : Array Window) : IO Unit := do
-  let path ← historyPath backend label
-  Utils.writeFileAtomically path (Json.compress (Json.mkObj [("windows", ToJson.toJson windows)]))
+    Delete and insert rather than a row-by-row reconciliation: `recordWindows` and `pruneWindows`
+    hand back the whole sequence, an entry of which may have been folded into, dropped by the
+    retention rule, or added — and telling those apart afterwards would be inventing identities
+    for rows that have none of their own. One transaction, so no reader ever sees the gap between
+    the delete and the inserts. -/
+def saveHistory (backend label : String) (windows : Array Window) : IO Unit :=
+  Store.transaction do
+    let _ ← HasModel.delete (α := Store.UsageWindowRow)
+      (.and (.eq (.var Store.UsageWindowRowIndex.backend .text) (.text backend))
+            (.eq (.var Store.UsageWindowRowIndex.label .text) (.text label)))
+    for w in windows do
+      HasModel.insert (w.toRow backend label)
 
 /-- Fold one poll's limits into the stored history. Called on every successful poll, and by
     nothing else.
 
-    Load, fold, save, unserialised — like the state file beside it. Two polls for the same
-    source that interleave lose one of the two readings: the window survives either way, and
-    what it costs is a `samples` tick and, at worst, a peak that only the losing poll saw. A
-    lock on a path three processes reach would cost more than that. -/
+    Load, fold, save, unserialised — like the state row beside it. Two polls for the same source
+    that interleave lose one of the two readings: the window survives either way, and what it
+    costs is a `samples` tick and, at worst, a peak that only the losing poll saw. A lock on a
+    table three processes reach would cost more than that. -/
 def recordPoll (backend label : String) (limits : Array Limit) (now : Int) : IO Unit := do
   let windows ← loadHistory backend label
-  -- A file that exists and read as nothing is one this is about to replace with a single
-  -- window. That is the right thing to do — history that cannot be read is not history — but
-  -- it is not a thing to do silently, and the poll path is the only place it can be said
-  -- without a reader repeating it on every dashboard tick.
-  if windows.isEmpty && (← (← historyPath backend label).pathExists) then
-    IO.eprintln s!"[usage] {backend}/{label}: history was unreadable or empty; starting again"
   saveHistory backend label (pruneWindows (recordWindows windows limits now) now)
 
 /-! ## Availability
@@ -838,7 +832,7 @@ def chooseFrom (mode : AuthMode) (candidates : Array Candidate) (now : Int := 0)
     return .ok best.label
 
 /-- Build the candidate list for `labels` from persisted state and choose one. -/
-def select (backend : String) (labels : List String) (mode : AuthMode) (model : Option String)
+def selectSource (backend : String) (labels : List String) (mode : AuthMode) (model : Option String)
     : IO (Except String String) := do
   let now ← nowEpoch
   let mut candidates : Array Candidate := #[]
@@ -980,8 +974,8 @@ def FetchError.backoffSecs : FetchError → Int
     reading `Wed, 22 Jul 2026 …` as a number would produce a nonsense backoff — so anything that
     is not a plain count of seconds is reported as absent and the default is used instead. -/
 def retryAfterSecs (headers : Array (String × String)) : Option Int :=
-  (Utils.Http.header? headers "retry-after").bind fun v =>
-    v.trimAscii.toString.toNat?.map Int.ofNat
+  (Utils.Http.header? headers "retry-after").bind fun raw =>
+    raw.trimAscii.toString.toNat?.map Int.ofNat
 
 /-- What a non-2xx response with no usage headers means, or `none` on a 200. Only reached as a
     fallback — the usage numbers ride on the rate-limit headers of the inference call itself, and a
@@ -1271,7 +1265,7 @@ def resolveLabel (cfg : AppConfig) (backend : String) (authSources : List String
   if candidates.isEmpty then return .ok none
   for label in candidates do
     ensureFresh cfg backend label
-  match ← select backend candidates mode model with
+  match ← selectSource backend candidates mode model with
   | .ok label => return .ok (some label)
   | .error e  => return .error e
 

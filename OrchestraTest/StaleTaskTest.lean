@@ -15,18 +15,7 @@ What is tested here is the rule that closes that gap and, just as much, the two 
 refuse to touch: a run that is genuinely still going, and a run this process cannot see at all.
 -/
 
-private def withTempData (act : IO α) : IO α := do
-  let root := System.FilePath.mk "/tmp" / s!"orchestra-stale-{← IO.monoNanosNow}"
-  IO.FS.createDirAll root
-  let previous ← Dirs.dataBaseOverride.get
-  Dirs.setDataBaseOverride (some root)
-  try act
-  finally
-    -- Restored rather than cleared: clearing happens to be right only because nothing else
-    -- sets this, and a helper that quietly defeats an outer override is a bad thing to leave
-    -- lying around for whoever adds one.
-    Dirs.setDataBaseOverride previous
-    try IO.FS.removeDirAll root catch _ => pure ()
+private def withTempData (act : IO α) : IO α := Orchestra.withTempData "stale" act
 
 private def anEntry (id : String) (status : Queue.QueueStatus)
     (taskId : Option String) : Queue.QueueEntry := {

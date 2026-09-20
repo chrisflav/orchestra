@@ -73,6 +73,13 @@ structure TaskSpec where
   triageAddLabels    : List String := []
   /-- Labels to remove from the issue or PR when using the `triage` backend. -/
   triageRemoveLabels : List String := []
+  /-- The identity this step is performed under (`Orchestra.Identity`), by name.
+
+      Per step rather than per program: the steps of one workflow are different jobs, and the
+      reviewing step and the implementing step are the two most likely to want different
+      identities. A program-wide default would have to be overridable per step anyway, and one
+      way to say a thing beats two. -/
+  identity           : Option String := none
   deriving Repr
 
 /-- The tool names a step's `tools` field may ask for: the optional MCP tools and the project
@@ -212,6 +219,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       issueNumber := spec.issueNumber
       triageAddLabels := spec.triageAddLabels
       triageRemoveLabels := spec.triageRemoveLabels
+      identity := spec.identity
     }
     StateT.lift (run ioTask ())
   else
@@ -228,6 +236,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       issueNumber := spec.issueNumber
       triageAddLabels := spec.triageAddLabels
       triageRemoveLabels := spec.triageRemoveLabels
+      identity := spec.identity
     }
     let j ← StateT.lift (run ioTask ())
     modify fun (env', ctrl) =>

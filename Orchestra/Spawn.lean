@@ -92,6 +92,13 @@ structure SpawnContext where
   tools     : List String := []
   readOnly  : Bool := false
   projectId : Option Taxis.IssueId := none
+  /-- The identity the spawning task is running under, which the task it queues inherits.
+
+      Inherited and never named: `SpawnRequest` has no field for it, so an agent can pass its own
+      identity on but cannot put on another one. That is the whole of the rule — an identity is
+      assigned by configuration (`Orchestra.Identity`), and a policy that let a task choose one
+      would be a way to reach a memory and a tracker token the operator gave to somebody else. -/
+  identity  : Option String := none
 deriving Repr, Inhabited
 
 /-- A spawn the policy has approved, in the shape the queue needs it. -/
@@ -113,6 +120,8 @@ structure ResolvedSpawn where
       and `Tools.writeScopeRoot`). -/
   scopeRoot : Option Taxis.IssueId := none
   preClaim  : Bool
+  /-- The identity the queued task runs under: the spawning task's own, always. -/
+  identity  : Option String := none
   /-- Carried through so the enqueuing side can report the ceiling it enforced with the number
       in it, rather than saying "too many" and leaving the agent to guess. -/
   maxTasks  : Nat
@@ -187,6 +196,6 @@ set 'allow_pre_claim'"
   return { prompt := r.prompt, backend, model, tools, repo, budget
          , priority := p.priority, readOnly := p.readOnly.getD ctx.readOnly
          , projectId := ctx.projectId, issueId := r.issueId, preClaim := r.preClaim
-         , maxTasks := p.maxTasks }
+         , identity := ctx.identity, maxTasks := p.maxTasks }
 
 end Orchestra

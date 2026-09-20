@@ -1,5 +1,6 @@
 import Orchestra.Daemon
 import Orchestra.Dashboard
+import Orchestra.Store.Import
 import Orchestra.Project
 import Orchestra.Utils.Streams
 import Cli
@@ -164,4 +165,11 @@ def orchestradCmd : Cmd := `[Cli|
 def main (args : List String) : IO UInt32 := do
   Utils.unbufferIfPiped
   Project.ensureTaxisConfigured
+  -- The one-time carry-over of the JSON record directories. Before anything reads a record, and
+  -- wrapped: a database that cannot be imported into is a reason to say so, not a reason for the
+  -- binary to refuse to run — every command that does not touch a record still works.
+  try
+    Store.Import.run
+  catch e =>
+    IO.eprintln s!"[orchestra] legacy import failed: {e}"
   orchestradCmd.validate args

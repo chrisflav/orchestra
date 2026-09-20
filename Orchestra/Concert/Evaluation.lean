@@ -70,6 +70,7 @@ mutual
           model         := spec.model
           budget        := spec.budget
           memory        := spec.memory
+          identity      := spec.identity
           authSource    := spec.authSource
           tools         := spec.tools
           readOnly      := spec.readOnly
@@ -91,7 +92,7 @@ mutual
         let resultJson ← IO.wait promise.result!
         let result :=
           match resultJson.bind (ResultType.valueFromJson o · |>.toOption) with
-          | some v => v
+          | some out => out
           | none   => default
         evalQueued mgr appConfig debug cancelToken concertId (k result)
     | .op (.while cond body) k => do

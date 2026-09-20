@@ -1,0 +1,5 @@
+{
+  "name": "maintainer",
+  "description": "Keeps the tracker in order: triages what comes in, splits what is too big, and chases what has gone quiet.",
+  "taxis_token": "{{taxis_maintainer_token}}"
+}

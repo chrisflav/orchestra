@@ -35,3 +35,8 @@ import OrchestraTest.ClaudeAuthEnvTest
 import OrchestraTest.RepolessTaskTest
 import OrchestraTest.SpawnTaskTest
 import OrchestraTest.StaleTaskTest
+import OrchestraTest.RebootOrderingTest
+import OrchestraTest.GitHubPatTest
+import OrchestraTest.IdentityTest
+import OrchestraTest.StoreTest
+import OrchestraTest.QueryTest

@@ -73,6 +73,7 @@ instance : FromJson DaemonRequest where
         tools        := (specJson.getObjValAs? (List String) "tools" |>.toOption)
         systemPrompt := specJson.getObjValAs? String "systemPrompt"  |>.toOption
         resumeFrom   := specJson.getObjValAs? String "resumeFrom"    |>.toOption
+        identity     := specJson.getObjValAs? String "identity"      |>.toOption
       }
     | "interactive_message" =>
       let id   ← j.getObjValAs? String "id"

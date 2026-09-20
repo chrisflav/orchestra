@@ -3,6 +3,7 @@ import Std.Internal.UV.TCP
 import Std.Net
 import Orchestra.Config
 import Orchestra.GitHub
+import Orchestra.Identity
 import Orchestra.Project.Tools
 
 open Lean (Json)
@@ -34,6 +35,10 @@ structure State where
       the config named no installation of its own, so there is no installation to pick — the
       `refresh_token` tool is then not offered. -/
   installationId : Option Nat
+  /-- The personal access token for this server's `repo`, already resolved by
+      `AppConfig.patFor` at construction — a server serves one task, and a task one repository,
+      so there is nothing left to choose between here. Empty means no source covered the
+      repository and `github.pat` is unset; the tools that need one say so and decline. -/
   pat : String
   /-- Input type of the current task. When not `.unit`, the `get_task_input` tool is exposed. -/
   inputType : ResultType := .unit
@@ -80,6 +85,14 @@ structure State where
   /-- The subtree this task may write at or below, when it was queued with one. Plumbed to
       `Project.Tools.Env.scopeRoot`. -/
   scopeRoot : Option Taxis.IssueId := none
+  /-- The identity the running task is performed under, if any (`Orchestra.Identity`). Plumbed to
+      `Project.Tools.Env.identity`, which is what makes the issue tools write to taxis under the
+      identity's own token instead of the instance's.
+
+      A record rather than a name: the server serves one task, the identity was resolved when
+      that task started, and re-reading the configuration per tool call would let a run change
+      author halfway through. -/
+  identity : Option Identity.Identity := none
   /-- Labels to apply automatically to every PR created via `create_pr`.
       Missing labels are created on the target repository before the PR is opened. -/
   prLabels : List String := []
@@ -680,7 +693,7 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
   | "get_task_input" => .getTaskInput
   | "submit_task_output" =>
     match args.getObjVal? "value" with
-    | .ok v  => .submitTaskOutput v
+    | .ok j  => .submitTaskOutput j
     | .error _ => .parseError "missing required 'value' argument"
   | _ =>
     match Project.Tools.tryParseToolCall name args with
@@ -752,7 +765,8 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
       if state.pat.isEmpty then
         log "tool create_pr: error: PAT not configured (target=upstream)"
         return toolContent
-          "github.pat not set in config (required when target=upstream; pass target=\"fork\" to use the App token)"
+          s!"no GitHub PAT for {repo.upstream}: github.pat is unset and no github.pats entry \
+covers it (required when target=upstream; pass target=\"fork\" to use the App token)"
           (isError := true)
       log s!"tool create_pr [upstream]: {repo.fork}:{head} -> {repo.upstream} base={base} title={repr title}"
       try
@@ -783,12 +797,13 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     if !state.allowedTools.contains "merge_pr" then
       log "tool merge_pr: denied (not in allowed tools)"
       return toolContent "merging pull requests is not enabled for this task" (isError := true)
+    let some repo := state.repo | return noRepo "merge_pr"
     if state.pat.isEmpty then
       log "tool merge_pr: error: PAT not configured"
       return toolContent
-        "github.pat not set in config (required to merge on the upstream repository)"
+        s!"no GitHub PAT for {repo.upstream}: github.pat is unset and no github.pats entry covers \
+it (required to merge on the upstream repository)"
         (isError := true)
-    let some repo := state.repo | return noRepo "merge_pr"
     log s!"tool merge_pr: {repo.upstream}#{prNumber} {method.flag} \
       delete_branch={deleteBranch}"
     try
@@ -802,12 +817,13 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
     if !state.allowedTools.contains "label_issue" then
       log "tool label_issue: denied (not in allowed tools)"
       return toolContent "labelling issues is not enabled for this task" (isError := true)
+    let some repo := state.repo | return noRepo "label_issue"
     if state.pat.isEmpty then
       log "tool label_issue: error: PAT not configured"
       return toolContent
-        "github.pat not set in config (required to label on the upstream repository)"
+        s!"no GitHub PAT for {repo.upstream}: github.pat is unset and no github.pats entry covers \
+it (required to label on the upstream repository)"
         (isError := true)
-    let some repo := state.repo | return noRepo "label_issue"
     log s!"tool label_issue: {repo.upstream}#{issueNumber} \
       add=[{String.intercalate ", " add}] remove=[{String.intercalate ", " remove}]"
     try
@@ -969,7 +985,8 @@ created in; there is no other destination this tool will use)"
       , spawnPolicy     := state.spawnPolicy
       , spawnContext    := state.spawnContext
       , enqueueTask     := state.enqueueTask
-      , scopeRoot       := state.scopeRoot }
+      , scopeRoot       := state.scopeRoot
+      , identity        := state.identity }
     Project.Tools.evalProjectTool env call
   | .unknown name =>
     log s!"tool {name}: unknown"
@@ -1003,7 +1020,7 @@ private def awaitTcp (p : IO.Promise (Except IO.Error α)) : IO α := do
   let result ← IO.wait p.result!
   match result with
   | .error e => throw e
-  | .ok v => return v
+  | .ok a => return a
 
 /--
 Handle one TCP client connection as a JSON-RPC session.

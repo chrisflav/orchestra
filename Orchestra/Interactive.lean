@@ -4,6 +4,7 @@ import Orchestra.Sandbox
 import Orchestra.Server
 import Orchestra.Repo
 import Orchestra.GitHub
+import Orchestra.Identity
 import Orchestra.Secret
 import Orchestra.TaskRunner
 import Orchestra.Usage
@@ -420,8 +421,21 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     -- one moment it matters most.
     let repoPath ← Repo.ensureSlot fork record.upstream
       { slot, occupant := some record.id, resumeFrom := resumeSlotOf } (token := some token)
+    -- Read from the record rather than from the spec, so a wake brings the session back as the
+    -- same identity a start gave it. A record naming one that has since been deleted fails the
+    -- acquire, which for a wake leaves the session dormant with the reason on its transcript —
+    -- the right answer, since coming back as the instance would quietly re-author the rest of
+    -- the conversation on the tracker under orchestra's own actor.
+    let identity ← match record.identity with
+      | none      => pure none
+      | some name => some <$> Identity.requireIdentity name
+    let identityMemory : Option String ← match identity with
+      | none     => pure none
+      | some idn => pure (some (← Identity.ensureMemoryDir idn.name).toString)
     -- The environment this conversation happens in, opened before the MCP server because it is
-    -- what decides where that server has to listen and whether it needs a token.
+    -- what decides where that server has to listen and whether it needs a token — and after the
+    -- identity, because the identity's memory is one of the directories the session has to carry
+    -- to wherever the agent runs.
     let execBackend ← match ← Exec.resolve appConfig.execution with
       | .ok b     => pure b
       | .error e  => return ← fail s!"cannot run the agent: {e}"
@@ -431,7 +445,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let execSession ← execBackend.openSession {
       workdir := repoPath
       grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths
-                   repoPath false pluginDirs #[]
+                   repoPath false pluginDirs identityMemory.toArray
       label   := record.id
       -- The upstream, not the fork: an operator pinning an image writes the name the project is
       -- known by, and the fork is per-bot. Same key as the queue path and the merger.
@@ -448,8 +462,9 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       repo := some { upstream := record.upstream, fork }
       allowedTools := record.tools.getD allOptionalTools
       appId := appConfig.appId, privateKeyPath := appConfig.privateKeyPath
-      installationId := some installationId, pat := appConfig.pat
+      installationId := some installationId, pat := appConfig.patFor record.upstream
       agentBackend := backendName
+      identity
       authToken := mcpToken
     } (bindHost := mcpBind) (portRange := mcpPorts)
     shutdownRef.set (some shutdownMcp)
@@ -478,12 +493,23 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     -- that had spent $19 of $20 a fresh $20, once per wake, and the budget would bound nothing.
     -- Floored at a cent because zero is not a budget the CLI will take.
     let remaining := max 0.01 (record.budget - record.costUsd)
+    -- The same sections a task's system prompt is built from, minus the shared memories: a
+    -- session is held open by a person and has no `memory` field to choose them with, so the
+    -- only directory here is the identity's own — which is what makes it worth naming.
+    let promptSections : List String :=
+      [ record.systemPrompt
+      , identity.map (TaskRunner.identitySystemPrompt · identityMemory)
+      , identity.bind TaskRunner.identityInstructions
+      , TaskRunner.memorySystemPrompt identityMemory.toArray ].filterMap id
+    let systemPrompt :=
+      if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)
     let some stream ← Sandbox.launchStreaming agentDef repoPath port token
-        { mcpContext := "", model := record.model, systemPrompt := record.systemPrompt,
+        { mcpContext := "", model := record.model, systemPrompt,
           resume := resumeAgentSession, sessionId := record.agentSessionId,
           budget := remaining }
         onEvent (debug := debug)
         (extraEnv := apiKeyEnv) (pluginDirs := pluginDirs)
+        (memoryDirs := identityMemory.toArray)
         (extraPorts := extraPorts) (additionalPaths := appConfig.additionalSandboxPaths)
         (session := execSession) (mcpToken := mcpToken)
       | return ← fail s!"backend '{backendName}' cannot host an interactive session"
@@ -570,6 +596,12 @@ def Manager.start (mgr : Manager) (appConfig : AppConfig) (spec : SessionSpec)
   if (agentDef.buildStreamArgs { mcpContext := "" }).isNone then
     return .error s!"backend '{backendName}' cannot host an interactive session: its CLI has no \
 streaming input mode. Backends that can: claude."
+  -- Before a place or a clone slot is taken: an identity that is not configured is a mistake in
+  -- the request, and finding that out after reserving a slot would hold one for the length of a
+  -- clone before saying so.
+  if let some name := spec.identity then
+    try let _ ← Identity.requireIdentity name
+    catch e => return .error (toString e)
   if let some why ← mgr.claimPlace then return .error why
   let some slot ← mgr.reserveSlot spec.fork
     | do
@@ -592,6 +624,7 @@ task or another session"
       agentSessionId := ← newUuid
       resumedFrom := spec.resumeFrom
       tools := spec.tools, systemPrompt := spec.systemPrompt
+      identity := spec.identity
     }
     saveSession record
     return (record, resumed.bind (·.agentSessionId),

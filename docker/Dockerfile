@@ -33,8 +33,13 @@ RUN npm run build
 # the dependency and fails the whole build without them — the same package taxis's Dockerfile
 # installs for the same file.
 FROM debian:bookworm-slim AS build
+# libpq-dev and pkg-config are for the record store, which is PostgreSQL (see
+# Orchestra/Store/Connection.lean). libpq-dev carries the header the FFI shim in `db` compiles
+# against and the `libpq.so` symlink the executables link by absolute path; pkg-config is how
+# `libpqLinkArgs` in lakefile.lean finds where that is, rather than either of them being written
+# down here and drifting when the base image moves.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git build-essential zlib1g-dev \
+      ca-certificates curl git build-essential zlib1g-dev libpq-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 ENV ELAN_HOME=/root/.elan
 ENV PATH="${ELAN_HOME}/bin:${PATH}"
@@ -50,10 +55,13 @@ COPY ffi ./ffi
 # Orchestra/Dashboard.lean embeds docs/openapi.json with `include_str`, so the spec is a build
 # input like any source file — the API and the description a client reads ship in one binary.
 COPY docs ./docs
-# Both binaries: `orchestra` is the CLI, `orchestrad` the backend that runs the queue daemon and
-# the HTTP API. Named explicitly (rather than a bare `lake build`) so this doesn't also compile
-# the test driver.
-RUN lake build orchestra orchestrad
+# `orchestra` is the CLI, `orchestrad` the backend that runs the queue daemon and the HTTP API,
+# and `orchestra-migrate-sqlite` the one-off that carries an installation predating the PostgreSQL
+# move across. The third is here because the cutover wants to run where /data is already mounted
+# and libpq is already present, and it costs a small binary to make that possible. Named
+# explicitly (rather than a bare `lake build`) so this doesn't also compile the test driver.
+COPY MigrateSqlite.lean ./
+RUN lake build orchestra orchestrad orchestra-migrate-sqlite
 
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
@@ -73,6 +81,12 @@ FROM debian:bookworm-slim AS runtime
 # static library.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg git openssl jq procps build-essential netcat-openbsd zlib1g-dev \
+      `# libpq5 is what the binaries actually load at run time — libpq-dev in the build stage` \
+      `# supplies the header and the .so symlink, this supplies the libpq.so.5 they name. psql is` \
+      `# not needed by anything here and is present on purpose: when the daemon next stops doing` \
+      `# work, pg_stat_activity is the thing to look at, and a container with no client is a` \
+      `# container where that means installing one first.` \
+      libpq5 postgresql-client \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
          -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -93,6 +107,11 @@ COPY --from=build /src/.lake/build/bin/orchestra /usr/local/bin/orchestra
 # The backend. Both services below run this one; `orchestra` is here for `docker compose run`,
 # and finds this binary as its sibling on PATH when asked to start a daemon.
 COPY --from=build /src/.lake/build/bin/orchestrad /usr/local/bin/orchestrad
+# Run once, by hand, on an installation whose records are still in `<data>/orchestra.db`:
+#   docker compose run --rm orchestra orchestra-migrate-sqlite /data/orchestra/orchestra.db
+# See MigrateSqlite.lean. Nothing invokes it automatically — the cutover is a decision, and the
+# daemon has to be stopped for it.
+COPY --from=build /src/.lake/build/bin/orchestra-migrate-sqlite /usr/local/bin/orchestra-migrate-sqlite
 # Served by the `dashboard` service in docker-compose.yaml (`--site`). Baked in at a fixed path
 # for the same reason as the skills above: it must not depend on a bind mount.
 COPY --from=web /web/dist /opt/orchestra/dashboard-site

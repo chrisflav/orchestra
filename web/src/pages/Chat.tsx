@@ -297,6 +297,7 @@ function NewSession() {
   const [fork, setFork] = useState("");
   const [model, setModel] = useState("");
   const [budget, setBudget] = useState("");
+  const [identity, setIdentity] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -305,6 +306,7 @@ function NewSession() {
     if (busy || upstream.trim() === "" || fork.trim() === "") return;
     const chosen = model.trim();
     const spend = budget.trim();
+    const who = identity.trim();
     // Parsed here rather than by `type="number"`, which hands back an empty string for anything
     // it cannot read: "abour" would leave the box reading what was typed while the request
     // carried no budget at all, and the session would run on the default with the person
@@ -341,6 +343,9 @@ function NewSession() {
       // which is a different request from asking it to resolve a model named "".
       ...(chosen === "" ? {} : { model: chosen }),
       ...(amount === undefined ? {} : { budget: amount }),
+      // Left out when blank, for the same reason the model is: absent means the session runs as
+      // the instance, which is a different request from asking for an identity named "".
+      ...(who === "" ? {} : { identity: who }),
     })
       .then((s) => navigate(`/chat/${encodeURIComponent(s.id)}`))
       .catch((err: unknown) => setError(errorText(err)))
@@ -384,6 +389,13 @@ function NewSession() {
           onChange={(e) => setBudget(e.target.value)}
           placeholder="budget USD (optional)"
           aria-label="Budget in USD (optional)"
+        />
+        <input
+          className="chat-start-identity"
+          value={identity}
+          onChange={(e) => setIdentity(e.target.value)}
+          placeholder="identity (optional)"
+          aria-label="Identity (optional)"
         />
         <button type="submit" disabled={busy}>
           {busy ? "Starting…" : "Start"}

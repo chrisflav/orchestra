@@ -101,6 +101,14 @@ structure Role where
       Worker templates should include {{issue_description}}: it is the only way the issue body
       reaches an agent, since the tool that renders it (`get_issue`) needs `manage_issues`. -/
   promptTemplate : String
+  /-- The identity tasks dispatched for this role are performed under, by name
+      (`Orchestra.Identity`). `none` runs them as the instance itself.
+
+      On the role because a role is what an agent dispatched by orchestra *is*, and the identity
+      is the half of that which persists: every reviewer this role dispatches shares one memory
+      of what it has already reviewed, and signs its verdicts on the tracker as one actor rather
+      than as orchestra. -/
+  identity       : Option String := none
   /-- Optional auto-dispatch policy. `none` = manual-spawn only. -/
   dispatch       : Option DispatchPolicy := none
   /-- What a task dispatched for this role may itself put on the queue (`Orchestra.Spawn`).
@@ -128,6 +136,7 @@ instance : ToJson Role where
     let f := if let some s := r.systemPrompt  then f ++ [("system_prompt",  Json.str s)] else f
     let f := if let some s := r.prependPrompt then f ++ [("prepend_prompt", Json.str s)] else f
     let f := if let some b := r.budget        then f ++ [("budget",         ToJson.toJson b)] else f
+    let f := if let some i := r.identity      then f ++ [("identity",       Json.str i)] else f
     let f := if let some d := r.dispatch      then f ++ [("dispatch",       ToJson.toJson d)] else f
     let f := if let some p := r.spawnPolicy   then f ++ [("spawn_policy",   ToJson.toJson p)] else f
     Json.mkObj f
@@ -144,12 +153,13 @@ instance : FromJson Role where
     let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
     let priority      := j.getObjValAs? Nat "priority"   |>.toOption |>.getD 10
     let budget        := j.getObjValAs? Float "budget"   |>.toOption
+    let identity      := j.getObjValAs? String "identity" |>.toOption
     let dispatch      := j.getObjValAs? DispatchPolicy "dispatch" |>.toOption
     -- Strict, unlike `dispatch`: a swallowed policy leaves the role's agents without the tool
     -- and nothing on the way to say the field was the reason.
     let spawnPolicy   ← parseSpawnPolicy? j
     return { name, permissions, backend, model, systemPrompt, prependPrompt
-           , readOnly, priority, budget, promptTemplate, dispatch, spawnPolicy }
+           , readOnly, priority, budget, promptTemplate, identity, dispatch, spawnPolicy }
 
 /-! ## Filesystem layout -/
 
@@ -356,21 +366,21 @@ deriving Repr, Inhabited
 
 /-- Substitute `{{name}}` placeholders. Unknown placeholders are left in place
     so a template error is loud, not silent. -/
-def render (tmpl : String) (v : RenderVars) : String :=
+def render (tmpl : String) (vars : RenderVars) : String :=
   let subs : List (String × String) :=
-    [ ("{{project_id}}",    v.projectId)
-    , ("{{project_name}}",  v.projectName)
-    , ("{{instructions}}",  v.instructions)
-    , ("{{issue_id}}",      v.issueId.getD "")
-    , ("{{issue_title}}",   v.issueTitle.getD "")
-    , ("{{issue_description}}", v.issueDescription.getD "")
-    , ("{{issue_comments}}", v.issueComments.getD "")
-    , ("{{issue_context}}", v.issueContext.getD "")
-    , ("{{target_repo}}",   v.targetRepo.getD "")
-    , ("{{target_branch}}", v.targetBranch.getD "")
-    , ("{{pr_number}}",     v.prNumber.getD "")
-    , ("{{pr_branch}}",     v.prBranch.getD "")
-    , ("{{pr_repo}}",       v.prRepo.getD "") ]
+    [ ("{{project_id}}",    vars.projectId)
+    , ("{{project_name}}",  vars.projectName)
+    , ("{{instructions}}",  vars.instructions)
+    , ("{{issue_id}}",      vars.issueId.getD "")
+    , ("{{issue_title}}",   vars.issueTitle.getD "")
+    , ("{{issue_description}}", vars.issueDescription.getD "")
+    , ("{{issue_comments}}", vars.issueComments.getD "")
+    , ("{{issue_context}}", vars.issueContext.getD "")
+    , ("{{target_repo}}",   vars.targetRepo.getD "")
+    , ("{{target_branch}}", vars.targetBranch.getD "")
+    , ("{{pr_number}}",     vars.prNumber.getD "")
+    , ("{{pr_branch}}",     vars.prBranch.getD "")
+    , ("{{pr_repo}}",       vars.prRepo.getD "") ]
   subs.foldl (fun acc (k, val) => acc.replace k val) tmpl
 
 /-- Build render vars for a project + optional issue. Pulls the effective

@@ -44,7 +44,7 @@ Three host directories are bind-mounted, all gitignored and created on first `up
 | Host | Container | Holds |
 | --- | --- | --- |
 | `docker/config/` | `/config` | `orchestra/config.json`, `listeners/`, `roles/`, `prompts/`, `secrets.json` |
-| `docker/data/` | `/data` | Task history, queue state, cloned repos, per-project roles |
+| `docker/data/` | `/data` | `orchestra/orchestra.db` (the record database), cloned repos, task logs, per-project roles |
 | `docker/secrets/` | `/secrets` (read-only) | GitHub App private key |
 
 Plain directories rather than named volumes, so you can read and edit everything without
@@ -143,7 +143,13 @@ A few deliberate choices:
 - **A separate container, not a thread in the daemon.** The daemon drains for up to
   `stop_grace_period` on every stop, and a read-only web view should not be unavailable for half
   an hour exactly when someone is trying to see why a task is stuck. The dashboard dispatches
-  nothing; it reads the state files the daemon writes.
+  nothing; it reads the records the daemon writes, out of the same database.
+- **One `/data`, on a real filesystem.** Both services mount the same directory because the
+  records are rows of one SQLite file, `/data/orchestra/orchestra.db`, and the two containers
+  are two processes on it. WAL mode is what lets them read and write it at the same time, and it
+  needs a local filesystem: an NFS or SMB mount will corrupt it or lock up. The daemon's control
+  socket lives in `/data` too, which is how cancelling a task works across the container
+  boundary.
 - **Narrower credentials than the daemon.** This is the only container reachable from outside,
   and its environment carries no GitHub PAT and no agent tokens — only the taxis URL and token,
   which the projects and issues pages need. It mounts `/config` read-only and never renders

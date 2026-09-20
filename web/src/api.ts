@@ -329,9 +329,10 @@ export interface CancelResult {
 /**
  * One session or weekly limit window, rolled up from every poll that landed inside it.
  *
- * `peakPercent` is what the window consumed — utilisation only climbs inside a window — and
- * `percent` is where it last stood, so on a closed window the two agree and on the open one
- * they say how much of it is already gone.
+ * `peakPercent` is the highest reading inside the window and `percent` is where it last stood.
+ * The two differ whenever a reading inside the window came back down: the peak is what the
+ * window has been up to, and `percent` is where the source stood at the poll that last touched
+ * it — the same poll the limit tracks are drawn from, so on the open window it is their number.
  */
 export interface UsageWindow {
   kind: string;
@@ -401,6 +402,8 @@ export interface SessionSummary {
   lastEventSeq: number;
   title: string | null;
   error: string | null;
+  /** Who the session is held as, when it is held as anyone but the instance itself. */
+  identity: string | null;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -453,6 +456,13 @@ export interface SessionRequest {
   tools?: string[];
   systemPrompt?: string;
   resumeFrom?: string;
+  /**
+   * Hold the session under this identity: the name of a record in `<config>/identities/`. Its
+   * memory is mounted for the agent, and where the record carries a taxis token the session's
+   * tracker writes are recorded as coming from it. One that is not configured is a 400 naming
+   * the ones that are.
+   */
+  identity?: string;
 }
 
 /**

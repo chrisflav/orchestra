@@ -23,6 +23,7 @@ instance {i o : ResultType} : ToJson (IOTask i o) where
     , ("model",         ToJson.toJson t.model)
     , ("budget",        ToJson.toJson t.budget)
     , ("memory",        ToJson.toJson t.memory)
+    , ("identity",      ToJson.toJson t.identity)
     , ("auth_source",   ToJson.toJson t.authSource)
     , ("tools",         ToJson.toJson t.tools)
     , ("read_only",     .bool t.readOnly)
@@ -44,6 +45,7 @@ instance {i o : ResultType} : FromJson (IOTask i o) where
     let model        := j.getObjValAs? String "model" |>.toOption
     let budget       := j.getObjValAs? Float "budget" |>.toOption
     let memory       := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
+    let identity     := j.getObjValAs? String "identity" |>.toOption
     let authSource   := j.getObjValAs? String "auth_source" |>.toOption
     let tools        := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly     := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
@@ -51,7 +53,7 @@ instance {i o : ResultType} : FromJson (IOTask i o) where
     let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
     let spawnPolicy  ← parseSpawnPolicy? j
     return { repo, mode, prompt, agent, systemPrompt, backend, model,
-             budget, memory, authSource, tools, readOnly, series, prLabels, spawnPolicy }
+             budget, memory, identity, authSource, tools, readOnly, series, prLabels, spawnPolicy }
 
 /-- Serialize a `Concert α` to JSON.
     For `run` nodes, the task spec is computed from the current input and the continuation is

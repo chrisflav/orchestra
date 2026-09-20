@@ -42,4 +42,20 @@ def getConfig : IO Config := do
   | none => throw (.userError
       "taxis is not configured — set a \"taxis\": {\"url\": ..., \"token\": ...} section in config.json")
 
+/-- The active taxis config, writing as `asToken`'s owner when a token is given.
+
+    This is how a task run under an identity reaches the tracker as that identity: same instance,
+    same everything else, a different bearer token, so taxis attributes the write to the actor the
+    token belongs to (`Orchestra.Identity`).
+
+    It is a per-call argument rather than a second ref because it cannot be process-wide. Several
+    tasks run at once inside one daemon, each possibly under a different identity, and they share
+    this process — a ref swapped for the duration of a call would be swapped underneath every
+    other task running at the time. -/
+def getConfigAs (asToken : Option String) : IO Config := do
+  let cfg ← getConfig
+  match asToken with
+  | some token => return { cfg with token := some token }
+  | none       => return cfg
+
 end Orchestra.Taxis

@@ -1155,7 +1155,7 @@
       "get": {
         "tags": ["auth"],
         "summary": "What each authentication source has spent, window by window",
-        "description": "The history behind `/api/v1/auth`. Every poll is rolled up into the limit window it landed in, so a source reports one record per session window and one per week rather than one per poll: `peakPercent` is what that window consumed, and `open` marks the window still filling.\n\nOnly polls are recorded, and a window is only ever seen through the polls that caught it — `samples` says how many did. A source that is not polled (an API key, or a backend with `poll_usage: false`) has no history, which is an absence rather than a gap.",
+        "description": "The history behind `/api/v1/auth`. Every poll is rolled up into the limit window it landed in, so a source reports one record per session window and one per week rather than one per poll: `peakPercent` is the highest reading inside that window, `percent` is where it last stood, and `open` marks the window still filling.\n\nOnly polls are recorded, and a window is only ever seen through the polls that caught it — `samples` says how many did. A source that is not polled (an API key, or a backend with `poll_usage: false`) has no history, which is an absence rather than a gap.",
         "operationId": "getUsage",
         "parameters": [
           {
@@ -1281,6 +1281,7 @@
       "InteractiveSession": {
         "type": "object",
         "required": [
+          "identity",
           "id",
           "status",
           "createdAt",
@@ -1297,6 +1298,10 @@
           "error"
         ],
         "properties": {
+          "identity": {
+            "type": ["string", "null"],
+            "description": "The identity this session is held under: the name of a directory under `<config>/identities/`. Its memory is mounted for the agent, and where the record carries a taxis token, the session's tracker writes are recorded as coming from it rather than from orchestra."
+          },
           "id": {
             "type": "string"
           },
@@ -1366,6 +1371,7 @@
       "InteractiveSessionDetail": {
         "type": "object",
         "required": [
+          "identity",
           "id",
           "status",
           "createdAt",
@@ -1386,6 +1392,10 @@
           "resumedFrom"
         ],
         "properties": {
+          "identity": {
+            "type": ["string", "null"],
+            "description": "The identity this session is held under: the name of a directory under `<config>/identities/`. Its memory is mounted for the agent, and where the record carries a taxis token, the session's tracker writes are recorded as coming from it rather than from orchestra."
+          },
           "id": {
             "type": "string"
           },
@@ -1514,6 +1524,10 @@
           "resumeFrom": {
             "type": "string",
             "description": "Start this session by picking up the conversation another one was having. The old session is not revived; this is a new one that inherits its agent-side history. Checked as a session id: it becomes a directory name."
+          },
+          "identity": {
+            "type": "string",
+            "description": "Hold the session under this identity: the name of a directory under `<config>/identities/`. Its memory is mounted read-write for the agent, and where the record carries a taxis token, the session's tracker writes are recorded as coming from it. One that is not configured is a `400` naming the identities that are."
           }
         }
       },
@@ -1619,7 +1633,7 @@
       "QueueEntry": {
         "type": "object",
         "description": "Work waiting or running. Becomes a Task when it is claimed; `taskId` is that run.",
-        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy"],
+        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity"],
         "properties": {
           "id": { "type": "string" },
           "status": { "$ref": "#/components/schemas/QueueStatus" },
@@ -1634,7 +1648,8 @@
           "taskId": { "type": ["string", "null"], "description": "The run this entry became, once claimed." },
           "concertId": { "type": ["string", "null"] },
           "concertStepKey": { "type": ["string", "null"] },
-          "spawnedBy": { "type": ["string", "null"], "description": "The task that queued this entry with the `queue_task` tool, when one did. Without it an entry that appeared out of a running agent's turn is indistinguishable from one a person added." }
+          "spawnedBy": { "type": ["string", "null"], "description": "The task that queued this entry with the `queue_task` tool, when one did. Without it an entry that appeared out of a running agent's turn is indistinguishable from one a person added." },
+          "identity": { "type": ["string", "null"], "description": "The identity this entry is performed under: the name of a directory under `<config>/identities/`. It gives the run a memory of its own and, where the record carries a taxis token, makes the run's tracker writes come from that identity rather than from orchestra." }
         }
       },
       "Task": {
@@ -2026,8 +2041,8 @@
           "startedAt": { "type": "string", "format": "date-time", "description": "The first poll that landed in this window — not the window's own start, which is only ever seen through the polls that caught it." },
           "updatedAt": { "type": "string", "format": "date-time", "description": "The last poll that landed in it." },
           "resetsAt": { "type": ["string", "null"], "format": "date-time", "description": "When the window resets, as every poll inside it reported." },
-          "peakPercent": { "type": "integer", "minimum": 0, "description": "The highest reading. Utilisation only climbs inside a window, so this is what the window consumed." },
-          "percent": { "type": "integer", "minimum": 0, "description": "The most recent reading. Usually equal to `peakPercent` on a closed window, though a poll that read low leaves it below." },
+          "peakPercent": { "type": "integer", "minimum": 0, "description": "The highest reading inside the window: what it has been up to. A rolling counter comes back down, so this is not where the window stands now — see `percent`." },
+          "percent": { "type": "integer", "minimum": 0, "description": "The most recent reading: where the source stood at the poll that last touched this window. On the window still open that is normally the poll `/api/v1/auth` is also reporting, so it is the number shown for that limit there, and it is what a client should draw the open window at — `peakPercent` is the right value for a closed one, being what that window consumed." },
           "samples": { "type": "integer", "minimum": 0, "description": "How many polls saw this window. One is a glimpse of it rather than a measurement." },
           "open": { "type": "boolean", "description": "Whether this is the window still filling: the newest of its series, and not yet past its reset." }
         }

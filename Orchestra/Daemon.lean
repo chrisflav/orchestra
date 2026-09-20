@@ -229,6 +229,16 @@ def run (cfg : Config) : IO UInt32 := do
   if repairedRecords > 0 then
     IO.println s!"Marked {repairedRecords} stranded task record(s) unfinished."
   let appConfig ← loadAppConfig (cfg.configPath.map System.FilePath.mk)
+  -- Which PAT a repository resolves to is otherwise invisible until a call fails, and it fails as
+  -- a 404 — GitHub's answer for a private repository the token cannot see is the same as its
+  -- answer for one that does not exist. Printed once at startup so the mapping is on the record
+  -- before anything goes looking for it. Labels only; the tokens themselves are never logged.
+  let patCoverage := appConfig.patCoverage
+  unless patCoverage.isEmpty do
+    IO.println s!"GitHub PAT sources ({patCoverage.size}, most specific match wins; anything \
+uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" else "github.pat"}):"
+    for line in patCoverage do
+      IO.println s!"  {line}"
   -- Concurrency limits: the `queue` block in config.json, overridden by the flags for a single
   -- run. Resolved here rather than at the top of the handler because it needs the config, and
   -- `max 1` because zero workers would be a daemon that silently never runs anything.
@@ -428,8 +438,9 @@ def run (cfg : Config) : IO UInt32 := do
         parallelSafe    := TaskRunner.backendIsParallelSafe
         resolveAuth     := resolveEntryAuth
       }
-      let allEntries ← Queue.loadAllEntries
-      let some claim ← Queue.claimDecision ctx allEntries Repo.poolOccupant | return none
+      let pending ← Queue.pendingEntries
+      let some claim ← Queue.claimDecision ctx pending Queue.entryForTask Repo.poolOccupant
+        | return none
       let e := claim.entry
       let occupied := slotMap.getD e.slotKey #[]
       let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
@@ -541,6 +552,7 @@ its workspace; it will start from a clean checkout."
         model            := entry.model
         budget           := entry.budget
         memory           := entry.memory
+        identity         := entry.identity
         authSource       := entry.authSource
         authSources      := entry.authSources
         authMode         := entry.authMode
@@ -689,12 +701,6 @@ its workspace; it will start from a clean checkout."
   -- listeners directory holds a handful of small files, an inotify watch would be a second
   -- mechanism to get wrong, and fifteen seconds is far inside the interval of any listener.
   let listenerScanSeconds : Nat := 15
-  -- Before the first fiber polls anything. A listener used to be named by a `name` field inside
-  -- its config and is named by its file now, so one whose two spellings disagreed is about to be
-  -- known by a name with no state behind it — and would re-fire every event it has already
-  -- handled unless its state comes with it.
-  try Listener.migrateListenerStateNames
-  catch e => IO.eprintln s!"Listener state migration failed: {e}"
   let listenerFibers ← IO.mkRef ({} : Std.HashSet String)
   let spawnListener (name : String) : IO Unit := do
     let _listenerTask ← IO.asTask (prio := .dedicated) do
@@ -742,7 +748,8 @@ its workspace; it will start from a clean checkout."
             IO.println s!"  Listener '{name}': at its rate limit of {hit.describe}; \
 not polling until the window moves"
           else
-          let (events, processedIdsReplacement) ← Listener.pollSource liveCfg.source state appConfig.pat
+          let (events, processedIdsReplacement) ← Listener.pollSource liveCfg.source state
+            appConfig.patFor
             appConfig.authorizedUsers
           let dispatchesRef ← IO.mkRef state.dispatches
           -- Events this tick declined to handle because a ceiling was already full. They are
@@ -932,7 +939,7 @@ holding the rest of this tick until the window moves"
                   let upstream := (Repository.parse upstreamStr).toOption <|> prog.upstream
                   let fork     := (Repository.parse forkStr).toOption     <|> prog.fork
                   let prog := { prog with upstream, fork }
-                  let jsonVars := vars.map fun (k, v) => (k, Lean.Json.str v)
+                  let jsonVars := vars.map fun (k, value) => (k, Lean.Json.str value)
                   let concert := Workflow.WorkflowProgram.toConcert prog jsonVars
                   IO.println s!"  Listener '{name}': starting concert from {resolvedPath}"
                   let concertId ← TaskStore.generateId
@@ -1029,13 +1036,11 @@ holding the rest of this tick until the window moves"
   let _taskReaper ← IO.asTask (prio := .dedicated) do
     while !(← shutdownToken.isCancelled) do
       try
-        -- Scanned outside the lock and confirmed inside it: the scan reads every entry file on
-        -- disk, and holding the claim mutex for that would stall every worker in the pool once
-        -- a queue grew large.
-        for entry in ← Queue.loadAllEntries do
-          if entry.status == .running then
-            if ← reapIfAbandoned entry.id then
-              IO.eprintln s!"  Reaped queue entry {entry.id}: marked running, but no worker \
+        -- Scanned outside the lock and confirmed inside it: holding the claim mutex across the
+        -- scan would stall every worker in the pool for as long as it took.
+        for entry in ← Queue.runningEntries do
+          if ← reapIfAbandoned entry.id then
+            IO.eprintln s!"  Reaped queue entry {entry.id}: marked running, but no worker \
 holds it. Marked unfinished."
       catch e => IO.eprintln s!"  Task reaper error: {e}"
       for _ in List.range 30 do

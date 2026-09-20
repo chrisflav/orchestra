@@ -10,7 +10,8 @@
 #
 # A config.json mounted into the image always wins: the generated one only covers the handful of
 # settings worth exposing as environment variables. Anything richer — listeners, agent auth
-# blocks, additional_sandbox_paths — should be mounted instead. See examples/ for the full shape.
+# blocks, per-repository github.pats, additional_sandbox_paths — should be mounted instead.
+# See examples/ for the full shape.
 set -eu
 
 RUN_AS=orchestra

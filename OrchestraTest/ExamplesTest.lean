@@ -62,4 +62,48 @@ def roleExamplesParse : Test := do
         | .error e => TestM.fail s!"{path}: does not decode as Role: {e}"
         | .ok _ => TestM.assert true
 
+/-- The example identities, each loaded the way orchestra loads one.
+
+    Through `loadIdentity` per directory rather than `loadAllIdentities`, which catches and skips
+    what it cannot read: under that, a shipped example whose record had rotted was skipped in
+    silence and every assertion here still held — the test passed while checking nothing about
+    the example it was named for.
+
+    A shipped example may legitimately fail to load, and exactly one way: `maintainer` carries
+    its token as a `{{secret}}` placeholder, which is how a real one should be written, and
+    `secrets.json` does not define it on a machine that has not been set up. That refusal is the
+    behaviour we want and is asserted as such. Any other refusal is a broken example. -/
+@[test]
+def identityExamplesLoad : Test := do
+  let dir := examplesDir / "identities"
+  if !(← dir.pathExists) then
+    TestM.fail s!"{dir} not found (wrong working directory?)"
+    return
+  let mut names : Array String := #[]
+  for entry in ← System.FilePath.readDir dir do
+    if ← (entry.path / "identity.json").pathExists then names := names.push entry.fileName
+  TestM.assert (names.size ≥ 2) s!"expected the shipped identity examples, found {names.size}"
+  let previous ← Identity.identitiesDirOverride.get
+  Identity.setIdentitiesDirOverride (some dir)
+  for name in names do
+    let outcome : Except String Identity.Identity ← try
+        match ← Identity.loadIdentity name with
+        | none   =>
+          pure (Except.error "loadIdentity answered none for a directory it just listed")
+        | some i => pure (Except.ok i)
+      catch e => pure (Except.error (toString e))
+    match outcome with
+    | .ok identity =>
+      TestM.assertEqual identity.name name (msg := s!"{name}: named by its directory")
+      TestM.assert identity.agents.isSome
+        (msg := s!"{name}: an example identity should ship the AGENTS.md that shows what one is \
+for")
+    | .error why =>
+      -- The one refusal a shipped example is allowed: an undefined secret. Anything else — a
+      -- record that stopped decoding, a name that drifted from its directory — is a real break.
+      TestM.assert ((why.splitOn "unsubstituted placeholder").length > 1)
+        (msg := s!"{name}: the only reason a shipped example may fail to load is an undefined \
+secret, got: {why}")
+  Identity.setIdentitiesDirOverride previous
+
 end OrchestraTest.Examples

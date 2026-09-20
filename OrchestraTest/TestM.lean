@@ -68,6 +68,77 @@ def assertEqual [DecidableEq α] [Repr α] (a b : α)
 
 end TestM
 
+/-! ## A data directory, and a database schema, that are not the developer's
+
+Two halves since the records moved into PostgreSQL. `Dirs.dataBase` still covers what is genuinely
+a directory — task logs, the dashboard secret, the cloned repositories — and a temporary one of
+those is still the whole of the isolation for them. The records themselves are in a database that
+`withTempData` cannot create a copy of by making a directory, so each case gets a **schema** of
+its own inside one server instead, and the connection carries a `search_path` naming it.
+
+A schema rather than a database: `CREATE DATABASE` cannot run inside a transaction, takes a
+filesystem copy of a template, and needs a role allowed to create one. A schema is a catalogue
+entry, `CREATE SCHEMA` costs nothing measurable, and the isolation is the same for anything that
+names tables without qualifying them — which is everything the query DSL emits.
+-/
+
+/-- The server the tests run against.
+
+    `ORCHESTRA_TEST_DATABASE_URL`, defaulting to the same host and credentials `db`'s own suite
+    uses, so a machine set up to run that one is set up to run this one. Unlike the taxis-backed
+    tests, which skip themselves when their instance is absent, these fail: the record stores are
+    underneath most of the suite, and a green run that had quietly skipped them would be worth
+    less than a red one that says what to start. -/
+def testDatabaseUrl : IO String := do
+  return (← IO.getEnv "ORCHESTRA_TEST_DATABASE_URL").getD
+    "postgresql://testuser:secret@localhost/orchestra_test"
+
+/-- Run one statement against `url`, outside any schema override. For creating and dropping the
+    per-case schema, which by definition cannot happen through a connection already pointed at
+    it. -/
+private def execOn (url stmt : String) : IO Unit := do
+  match ← PostgreSQL.runDB url (PostgreSQL.execIgnoring stmt) with
+  | .ok _ => pure ()
+  | .error e =>
+    throw <| IO.userError s!"test database at {url}: {stmt} failed ({repr e}). \
+      Start a PostgreSQL server and create the database, or point \
+      ORCHESTRA_TEST_DATABASE_URL at one."
+
+/-- Run `act` against an empty data root under `/tmp` and an empty database schema, both named
+    after `label`, and remove both after.
+
+    The stores are not independent — a queue entry names the task record it became — so one
+    override covers the whole root rather than one per store; see `Dirs.dataBaseOverride` and
+    `Store.setUrlOverride`. -/
+def withTempData (label : String) (act : IO α) : IO α := do
+  let stamp ← IO.monoNanosNow
+  let root := System.FilePath.mk "/tmp" / s!"orchestra-{label}-{stamp}"
+  IO.FS.createDirAll root
+  -- Lowercased and stripped to what an unquoted identifier may hold: a label is a test's name,
+  -- and PostgreSQL would fold or reject some of those. Collisions are not a worry — the
+  -- nanosecond stamp is what makes the name unique, the label is only there to make a schema
+  -- left behind by a crash say which case left it.
+  let safe := label.toLower.map fun c => if c.isAlphanum then c else '_'
+  let schema := s!"t_{safe}_{stamp}"
+  let base ← testDatabaseUrl
+  execOn base s!"CREATE SCHEMA \"{schema}\""
+  let previousDir ← Dirs.dataBaseOverride.get
+  let previousUrl ← Store.getUrlOverride
+  Dirs.setDataBaseOverride (some root)
+  -- `-c search_path=...`, percent-encoded because the value carries an `=`. Every connection
+  -- `Store.run` opens from here carries it, which is what makes the isolation hold across the
+  -- connection-per-call design rather than only for the first one.
+  Store.setUrlOverride (some s!"{base}?options=-csearch_path%3D{schema}")
+  try act
+  finally
+    -- Restored rather than cleared: clearing happens to be right only because nothing else
+    -- sets these, and a helper that quietly defeats an outer override is a bad thing to leave
+    -- lying around for whoever adds one.
+    Dirs.setDataBaseOverride previousDir
+    Store.setUrlOverride previousUrl
+    try IO.FS.removeDirAll root catch _ => pure ()
+    try execOn base s!"DROP SCHEMA \"{schema}\" CASCADE" catch _ => pure ()
+
 /-! ## Real-taxis-instance opt-in for taxis-backed tests
 
 `Project.*`/`Claim.*` are backed by a real taxis HTTP API (see the "Migrate Project/Issue data

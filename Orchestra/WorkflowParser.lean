@@ -111,6 +111,7 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
   let systemPrompt  := (mappingLookup pairs "system-prompt").bind  (nodeAsString · |>.toOption)
   let prependPrompt := (mappingLookup pairs "prepend-prompt").bind (nodeAsString · |>.toOption)
   let backend       := (mappingLookup pairs "backend").bind        (nodeAsString · |>.toOption)
+  let identity      := (mappingLookup pairs "identity").bind       (nodeAsString · |>.toOption)
   -- A workflow's YAML is template-rendered before it is parsed, and an unknown `{{...}}` is left
   -- standing. Dropping what does not parse would turn `issue-number: {{pr_number}}` against a
   -- listener that exports no `pr_number` into a step that runs to completion and then cannot
@@ -168,7 +169,8 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
           let name ← nodeAsString k
           parseOutputSpec name v
   return { agent, model, budget, tools, prompt, readOnly, input, output, context, upstream, fork,
-           systemPrompt, prependPrompt, backend, issueNumber, triageAddLabels, triageRemoveLabels }
+           systemPrompt, prependPrompt, backend, issueNumber, triageAddLabels, triageRemoveLabels,
+           identity }
 
 private def parseWriteAction (node : Node) : Except String StepAction := do
   let s ← nodeAsString node

@@ -186,15 +186,15 @@ instance : FromJson SourceConfig where
         let pid  ← j.getObjValAs? Taxis.IssueId "project_id"
         let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
         let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
-        let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
-          v.getNat?.toOption.map (k, ·)
+        let caps : List (String × Nat) := pairs.filterMap fun (k, n) =>
+          n.getNat?.toOption.map (k, ·)
         return .projectDispatcher pid caps
     | "label-dispatcher" =>
         let label ← j.getObjValAs? String "label"
         let capsObj := j.getObjVal? "caps" |>.toOption |>.getD (Json.mkObj [])
         let pairs := capsObj.getObj? |>.toOption |>.map (·.toList) |>.getD []
-        let caps : List (String × Nat) := pairs.filterMap fun (k, v) =>
-          v.getNat?.toOption.map (k, ·)
+        let caps : List (String × Nat) := pairs.filterMap fun (k, n) =>
+          n.getNat?.toOption.map (k, ·)
         let limitUnclaimed :=
           j.getObjValAs? Bool "limit_unclaimed_to_open_issues" |>.toOption |>.getD false
         let excludeRoots :=
@@ -239,6 +239,13 @@ structure ActionConfig where
   budget         : Option Float  := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory         : MemoryMode    := .both
+  /-- The identity tasks queued by this listener are performed under, by name
+      (`Orchestra.Identity`). `none` runs them as the instance itself.
+
+      Not read by the two dispatcher sources, which build their entries from a role rather than
+      from this block (`buildRoleEntry`) and take the identity off the role — an identity belongs
+      with what the agent *is*, and for a dispatched role that is the role. -/
+  identity       : Option String := none
   /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
   authSource     : Option String := none
   /-- Candidate authentication sources for tasks this listener queues, tried per `authMode`.
@@ -292,6 +299,7 @@ instance : ToJson ActionConfig where
     let fields := if let some s := a.systemPrompt then fields ++ [("system_prompt", Json.str s)]      else fields
     let fields := if let some b := a.budget       then fields ++ [("budget",        ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson a.memory)]
+    let fields := if let some s := a.identity     then fields ++ [("identity",      Json.str s)]      else fields
     let fields := if let some s := a.authSource   then fields ++ [("auth_source",   Json.str s)]      else fields
     let fields := if !a.authSources.isEmpty       then fields ++ [("auth_sources",  ToJson.toJson a.authSources)] else fields
     let fields := if let some m := a.authMode     then fields ++ [("auth_mode",     ToJson.toJson m)]             else fields
@@ -328,6 +336,7 @@ instance : FromJson ActionConfig where
           | _ => none
       | _ => none
     let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
+    let identity := j.getObjValAs? String "identity" |>.toOption
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
     let authSources := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
     let authMode := j.getObjValAs? AuthMode "auth_mode" |>.toOption
@@ -341,7 +350,7 @@ instance : FromJson ActionConfig where
     -- a swallowed policy takes the tool away without saying so.
     let spawnPolicy ← parseSpawnPolicy? j
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, authSources, authMode, tools, readOnly, priority,
+             budget, memory, identity, authSource, authSources, authMode, tools, readOnly, priority,
              workflowPath, issueNumber, prLabels, spawnPolicy }
 
 -- Dispatch rate limits
@@ -422,7 +431,7 @@ or 'per_seconds'"
 
 /-- How many of `dispatches` fall in the `windowSeconds` ending at `now`, both epoch seconds.
 
-    A stamp we cannot read does not count: a state file edited by hand must not be able to hold
+    A stamp we cannot read does not count: a state edited by hand must not be able to hold
     a listener shut forever. A stamp in the *future* does — a clock that jumped is a reason to
     dispatch less, not more. -/
 def countWithin (dispatches : Array String) (now : Int) (windowSeconds : Nat) : Nat :=
@@ -438,7 +447,7 @@ def rateLimitHit? (limits : List RateLimit) (dispatches : Array String) (now : I
   limits.find? fun l => countWithin dispatches now l.windowSeconds ≥ l.max
 
 /-- Drop the stamps no configured limit can still count, so that a listener running for months
-    does not accumulate a state file of them. No limits means nothing worth remembering. -/
+    does not accumulate a row full of them. No limits means nothing worth remembering. -/
 def pruneDispatches (limits : List RateLimit) (dispatches : Array String) (now : Int) :
     Array String :=
   if limits.isEmpty then #[] else
@@ -485,12 +494,12 @@ def nextProcessedIds (previous newIds held : Array String)
 /-- Where one limit stands right now. Reported by the API and by `orchestra listener show`, so
     that "why has this listener gone quiet" has an answer that does not need the log. -/
 structure RateLimitStatus where
-  limit         : RateLimit
+  rule          : RateLimit
   /-- Dispatches inside this limit's window. -/
   used          : Nat
   /-- When the window next has room, as epoch seconds. `none` when it has room already — or, for
       the degenerate `max: 0` that `validateListenerConfig` refuses to store, when it never
-      will. Read `used < limit.max` for "may dispatch now"; this only answers "when". -/
+      will. Read `used < rule.max` for "may dispatch now"; this only answers "when". -/
   nextAllowedAt : Option Int
 deriving Repr
 
@@ -507,14 +516,14 @@ def rateLimitStatuses (limits : List RateLimit) (dispatches : Array String) (now
     let nextAllowedAt :=
       if used < l.max then none
       else (inWindow.qsort (· < ·))[used - l.max]?.map (· + (l.windowSeconds : Int))
-    { limit := l, used, nextAllowedAt }
+    { rule := l, used, nextAllowedAt }
 
 -- Listener config
 
 /-- What a listener does; *not* what it is called.
 
     A listener is named by its file: `<config>/listeners/nightly.json` is the listener `nightly`,
-    and that spelling is what keys its state file, its API routes and every line the daemon logs
+    and that spelling is what keys its state row, its API routes and every line the daemon logs
     about it. The document used to carry a `name` of its own as well, and the two could disagree
     — a file placed by hand, or an example copied without renaming it. Everything that *listed*
     listeners then reported the in-file name while everything that *loaded* one built a path from
@@ -552,7 +561,7 @@ instance : FromJson ListenerConfig where
     -- otherwise parse as no limit at all, which is the failure this field exists to prevent.
     let rateLimits ← match j.getObjVal? "rate_limits" with
       | .error _ => pure []
-      | .ok v    => (FromJson.fromJson? v : Except String (List RateLimit))
+      | .ok j    => (FromJson.fromJson? j : Except String (List RateLimit))
     return { source, action, intervalSeconds, rateLimits }
 
 -- Listener state
@@ -584,6 +593,28 @@ instance : FromJson ListenerState where
     let dispatches    := j.getObjValAs? (Array String) "dispatches" |>.toOption |>.getD #[]
     return { lastChecked, processedIds, enabled, dispatches }
 
+/-- The state as a row of `listener_state`, under the name the listener's config file gives it.
+
+    The name is supplied rather than carried: a listener is named by its file, and the document
+    has not held a name of its own since that changed. `processed_ids` and `dispatches` are the
+    compressed JSON arrays their own instances write — an empty one is `[]` and not NULL, since a
+    listener that has handled nothing and one that has just been created are the same listener. -/
+def ListenerState.toRow (name : String) (s : ListenerState) : Store.ListenerStateRow :=
+  { name          := name
+    last_checked  := s.lastChecked
+    enabled       := s.enabled
+    processed_ids := Store.jsonColumn s.processedIds
+    dispatches    := Store.jsonColumn s.dispatches }
+
+/-- The state a row holds, or why this build cannot read it. -/
+def ListenerState.ofRow? (row : Store.ListenerStateRow) : Except String ListenerState := do
+  let processedIds ← Store.jsonOfColumn? "processed_ids" row.processed_ids
+  let dispatches   ← Store.jsonOfColumn? "dispatches" row.dispatches
+  return { lastChecked  := row.last_checked
+           processedIds := processedIds
+           enabled      := row.enabled
+           dispatches   := dispatches }
+
 -- Directories
 
 /-- Optional override for the listener config directory (tests redirect this, as
@@ -598,17 +629,14 @@ def listenersConfigDir : IO System.FilePath := do
   | some p => return p
   | none   => return (← Dirs.configBase) / "listeners"
 
-/-- Optional override for the listener state directory. Paired with the one above so a test that
-    redirects configs does not leave state behind in the real data dir. -/
-initialize listenerStateDirOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
+/-- Where the JSON state files lived before the database: `<data>/listeners/state`, one
+    `<name>.json` per listener. Read once, by `Orchestra.Store.Import`, and then left alone — the
+    import copies, it does not delete.
 
-def setListenerStateDirOverride (p : Option System.FilePath) : IO Unit :=
-  listenerStateDirOverride.set p
-
-def listenerStateDir : IO System.FilePath := do
-  match ← listenerStateDirOverride.get with
-  | some p => return p
-  | none   => return (← Dirs.dataBase) / "listeners" / "state"
+    No override beside it, unlike the config directory above: state is a row of `listener_state`
+    now, and `Dirs.setDataBaseOverride` — what `withTempData` sets — moves the whole database. -/
+def legacyListenerStateDir : IO System.FilePath :=
+  return (← Dirs.dataBase) / "listeners" / "state"
 
 -- Config I/O
 
@@ -653,7 +681,7 @@ def loadAllListenerConfigs : IO (Array (String × ListenerConfig)) := do
     -- skips the state subdirectory entry (it has no .json extension anyway)
     if !file.endsWith ".json" then continue
     let name := listenerNameOfFile file
-    -- The name keys the state file and the dashboard's detail route, so a file whose stem cannot
+    -- The name keys the state row and the dashboard's detail route, so a file whose stem cannot
     -- be one — a dotfile, say — is skipped rather than returned. Nothing this API wrote can be
     -- in that state; a file placed by hand can.
     match Utils.checkConfigName "listener" name with
@@ -744,88 +772,45 @@ def deleteListenerConfig (name : String) : IO Bool := do
   let path ← listenerConfigFile name
   if !(← path.pathExists) then return false
   IO.FS.removeFile path
-  let statePath := (← listenerStateDir) / s!"{name}.json"
-  if ← statePath.pathExists then IO.FS.removeFile statePath
+  let _ ← Store.run <| HasModel.delete (α := Store.ListenerStateRow)
+    (.eq (.var Store.ListenerStateRowIndex.name .text) (.text name))
   return true
 
 -- State I/O
 
+open Db.Query.DSL in
+/-- What a listener has already seen, or a blank state for one that has never run.
+
+    The name check stays even though there is no path to build out of it any more: it is what
+    stops the HTTP and CLI surfaces from inventing listeners under names no config file could
+    have, and it is enforced here rather than at either boundary because both write through this.
+
+    A row this build cannot read is a blank state, which is what an unparseable file was. It is
+    worth knowing about, though — a listener that starts again from nothing re-queues everything
+    its source still shows — so it is said once, here, rather than swallowed. -/
 def loadListenerState (name : String) : IO ListenerState := do
   Utils.ensureConfigName "listener" name
-  let path := (← listenerStateDir) / s!"{name}.json"
-  if !(← path.pathExists) then return { lastChecked := "", processedIds := #[] }
-  let raw ← IO.FS.readFile path
-  match Json.parse raw with
-  | .error _ => return { lastChecked := "", processedIds := #[] }
-  | .ok j    =>
-    match FromJson.fromJson? j with
-    | .error _ => return { lastChecked := "", processedIds := #[] }
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let s ← from Store.ListenerStateRow
+    guard s.name = name
+    select s
+  match rows[0]? with
+  | none     => return { lastChecked := "", processedIds := #[] }
+  | some row => match ListenerState.ofRow? row with
     | .ok s    => return s
+    | .error e =>
+      IO.eprintln s!"[orchestra] listener '{name}': state row unreadable ({e}); starting again"
+      return { lastChecked := "", processedIds := #[] }
 
 def saveListenerState (name : String) (state : ListenerState) : IO Unit := do
   Utils.ensureConfigName "listener" name
-  let dir ← listenerStateDir
-  IO.FS.createDirAll dir
-  -- Atomic because the daemon reads this file every tick and the API writes it whenever someone
-  -- toggles a listener: a truncate-then-write would let a tick land on an empty file and read it
-  -- as "never checked, nothing processed", which re-queues every event the listener has seen.
-  Utils.writeFileAtomically (dir / s!"{name}.json") (Lean.Json.compress (ToJson.toJson state))
-
-/-- Carry state left under a config's old in-file `name` over to the name its file gives it.
-
-    Listeners used to be named by a `name` field inside the document, and their state — the list
-    of event ids already handled — was keyed on that. Now the file names them, so a config whose
-    two spellings disagreed would come back under a name with no state behind it and re-fire
-    every event it had already handled. This carries the state across instead, once: afterwards
-    nothing is left under the old name, so a later run finds nothing to do and says nothing.
-
-    The daemon runs it at start-up, before any listener polls. It is not the only writer of
-    listener state, which is why the destination is not assumed to be free: `PUT
-    /api/v1/listeners/{name}/enabled` writes one too, and since the CLI/backend split the API can
-    be a process of its own that never runs this. A `disable` issued under the new name before
-    the daemon came up leaves a state file with no history in it, and skipping on its account
-    would abandon the listener's history for good — so that one is filled in, keeping the
-    `enabled` just set. A destination that *has* history belongs to a listener already polling
-    under this name, and is left alone. -/
-def migrateListenerStateNames : IO Unit := do
-  let dir ← listenersConfigDir
-  if !(← dir.pathExists) then return
-  let stateDir ← listenerStateDir
-  for entry in ← System.FilePath.readDir dir do
-    let file := entry.fileName
-    if !file.endsWith ".json" then continue
-    let name := listenerNameOfFile file
-    if (Utils.checkConfigName "listener" name).toOption.isNone then continue
-    -- Read raw and unsubstituted: a legacy name is a plain string, and a config that no longer
-    -- parses still has state worth keeping under the right name.
-    let raw ← IO.FS.readFile entry.path
-    let some legacy := (Json.parse raw).toOption.bind (·.getObjValAs? String "name" |>.toOption)
-      | continue
-    if legacy == name then continue
-    if (Utils.checkConfigName "listener" legacy).toOption.isNone then continue
-    -- The legacy name may be a listener in its own right — `a.json` claiming to be `b` while
-    -- `b.json` sits beside it. That state belongs to `b`, and moving it would hand one
-    -- listener's processed events to another.
-    if ← (dir / s!"{legacy}.json").pathExists then continue
-    let source := stateDir / s!"{legacy}.json"
-    let dest   := stateDir / s!"{name}.json"
-    if !(← source.pathExists) then continue
-    if ← dest.pathExists then
-      let standing ← loadListenerState name
-      if !standing.lastChecked.isEmpty || !standing.processedIds.isEmpty then continue
-      let carried ← loadListenerState legacy
-      saveListenerState name { carried with enabled := standing.enabled }
-      IO.FS.removeFile source
-    else
-      IO.FS.rename source dest
-    IO.println s!"Listener '{name}': carried state over from its old name '{legacy}'. \
-A listener is named by its file now; the config's own 'name' field is ignored."
+  Store.run <| HasModel.save (state.toRow name)
 
 -- Template rendering
 
 /-- Replace every occurrence of `{{key}}` in `template` with the corresponding value. -/
 def renderTemplate (template : String) (vars : List (String × String)) : String :=
-  vars.foldl (fun acc (k, v) => acc.replace ("{{" ++ k ++ "}}") v) template
+  vars.foldl (fun acc (k, value) => acc.replace ("{{" ++ k ++ "}}") value) template
 
 -- Queue entry builder
 
@@ -873,6 +858,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
     series
     budget       := action.budget
     memory       := action.memory
+    identity     := action.identity
     authSource   := action.authSource
     authSources  := action.authSources
     authMode     := action.authMode
@@ -1236,7 +1222,7 @@ def latestReviewRequestsChanges (iid : Taxis.IssueId) : IO Bool := do
     lives here rather than in the pure selection. `isPrMerged` answers `false` when it cannot
     tell, so an unreachable GitHub queues a reviewer that finds nothing to do rather than
     silently dropping review of real work. -/
-def classifyReview (ghToken : String) (issues : Array Project.Issue) :
+def classifyReview (patFor : Repository → String) (issues : Array Project.Issue) :
     IO (Array (Project.Issue × ReviewDisposition)) := do
   let mut out : Array (Project.Issue × ReviewDisposition) := #[]
   for i in issues do
@@ -1244,7 +1230,9 @@ def classifyReview (ghToken : String) (issues : Array Project.Issue) :
     let mut anyUnmerged := false
     for pr in i.attachedPRs do
       unless anyUnmerged do
-        unless ← GitHub.isPrMerged ghToken pr.repo pr.number do anyUnmerged := true
+        -- Per pull request, not per call: the label dispatcher classifies across every project on
+        -- the tracker, so two PRs in one batch can sit in different accounts.
+        unless ← GitHub.isPrMerged (patFor pr.repo) pr.repo pr.number do anyUnmerged := true
     let requestsChanges ← if anyUnmerged then latestReviewRequestsChanges i.id else pure false
     out := out.push (i, dispositionOf anyUnmerged requestsChanges)
   return out
@@ -1326,6 +1314,7 @@ def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : P
     , projectId     := some project.id
     , issueId       := issue?.map (·.id)
     , spawnPolicy   := role.spawnPolicy
+    , identity      := role.identity
     , role          := some role.name }
 
 -- Source polling
@@ -1339,10 +1328,16 @@ Returns a pair of:
   re-fires when the label is re-applied).  `none` means "append new IDs as usual".
 `eventId` is `""` for shell sources (no deduplication by ID).
 Event IDs for GitHub sources are prefixed with the upstream slug
-(e.g. `"my-account/orchestra:12345"`) so a single state file
+(e.g. `"my-account/orchestra:12345"`) so a single listener state
 correctly deduplicates events across multiple repos.
+
+`patFor` is `AppConfig.patFor`: a listener's `repos` can span accounts, and a token is resolved
+per repository at the top of each loop rather than once for the source, so one listener can watch
+repositories no single PAT can see. Polling is also the heaviest PAT consumer there is — every
+tick, per repository — and GitHub's rate limits are per token, so splitting a source across two
+raises its ceiling as well as its reach.
 -/
-def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String)
+def pollSource (source : SourceConfig) (state : ListenerState) (patFor : Repository → String)
     (globalAuthorizedUsers : List String := [])
     : IO (Array (String × List (String × String)) × Option (Array String)) := do
   match source with
@@ -1352,6 +1347,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let labelParam := if labels.isEmpty then "" else "&labels=" ++ ",".intercalate labels
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       let endpoint := s!"/repos/{entry.upstream}/issues?state=open&per_page=100{labelParam}"
       let jsonOpt ← runGhApi endpoint ghToken
       match jsonOpt with
@@ -1387,6 +1383,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       -- Fetch open PRs
       let prJsonOpt ← runGhApi s!"/repos/{entry.upstream}/pulls?state=open&per_page=100" ghToken
       let prArr ← match prJsonOpt with
@@ -1449,6 +1446,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       -- Helper: extract an event from a comment JSON object, react with 🚀, return vars.
       -- `inline = true` handles inline PR review comments (different ID prefix, URL field, and
       -- reaction endpoint) vs regular issue/PR comments.
@@ -1565,15 +1563,12 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     let issues ← Project.loadIssues pid
     let roles  ← Project.loadAllRoles pid
     -- Count active per-role queue entries scoped to this project.
-    let allEntries ← Queue.loadAllEntries
     let mut active : Std.HashMap String Nat := {}
-    for e in allEntries do
-      let isActive := e.status == .pending || e.status == .running
-      if !isActive then continue
+    for e in ← Queue.activeEntries do
       if e.projectId != some pid then continue
       if let some r := e.role then
         active := active.insert r ((active.getD r 0) + 1)
-    let classified ← classifyReview ghToken (← withAttachedPRs pid issues)
+    let classified ← classifyReview patFor (← withAttachedPRs pid issues)
     -- Narrowed here, where every issue in the project is in hand: whether a child or dependency
     -- has closed cannot be told from the workable set itself. The review split then takes the
     -- reviewer's issues back out of it, so no issue is offered to two roles in one tick.
@@ -1621,7 +1616,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     -- `work` and `reviewable` from two independent tests, so an issue that is both a dispatch
     -- candidate and carries a PR appears in both; the split below is what keeps one role from
     -- taking it out from under the other.
-    let classified ← classifyReview ghToken (sets.reviewable.map (·.1))
+    let classified ← classifyReview patFor (sets.reviewable.map (·.1))
     let (issues, reviewable) := splitForDispatch issues classified
     let reworking := classified.filter (·.2 == .changesRequested) |>.size
     let roles ← Project.loadGlobalRoles
@@ -1646,8 +1641,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     -- Cap counting is scoped to the labelled set, so the caps bound concurrent work *on labelled
     -- issues* rather than colliding with per-project dispatchers running the same role names.
     let labelled : Array Taxis.IssueId := issues.map (·.id) ++ reviewable.map (·.id)
-    let allEntries ← Queue.loadAllEntries
-    let activeEntries := allEntries.filter fun e => e.status == .pending || e.status == .running
+    let activeEntries ← Queue.activeEntries
     let mut active : Std.HashMap String Nat := {}
     for e in activeEntries do
       let some eIid := e.issueId | continue
@@ -1727,7 +1721,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
             to {cap'} by limit_unclaimed_to_open_issues: it claims nothing at spawn, and this \
             root has {openHere} open issue(s) in scope"
         let rootInput : DispatcherInput :=
-          { activeByRole := unboundActiveByRole allEntries root.id
+          { activeByRole := unboundActiveByRole activeEntries root.id
           , issues := #[], reviewable := #[], caps := rootCaps, roles }
         for d in dispatcherDecisions rootInput do
           IO.println s!"[dispatcher] root {root.id.toString} \"{root.title}\": {renderDecision d}"
@@ -1742,6 +1736,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
   | .githubLabelCount repos labels max kind => do
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       let labelParam := if labels.isEmpty then "" else "&labels=" ++ ",".intercalate labels
       let endpoint := s!"/repos/{entry.upstream}/issues?state=open&per_page=100{labelParam}"
       let jsonOpt ← runGhApi endpoint ghToken
@@ -1775,6 +1770,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     -- processedIds so that a label removal followed by re-application re-triggers).
     let mut currentIds : Array String := #[]
     for entry in repos do
+      let ghToken := patFor entry.upstream
       -- Collect candidate items. One query per label (OR logic); one unlabelled query if empty.
       let mut items : Array Json := #[]
       if labels.isEmpty then
