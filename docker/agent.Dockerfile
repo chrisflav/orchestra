@@ -15,6 +15,8 @@
 #   tar      how the checkout travels, in both directions
 #   nc       the MCP transport; the agent's tools are a socket on the daemon
 #   git      how the agent commits and pushes its work
+#   kubectl  only when the agent is meant to deploy onto the cluster it is running in — see the
+#            note on it below, and the RBAC section of docs/kubernetes.md
 #
 # On top of that it carries the *package managers* a repository's `init.sh` reaches for — npm,
 # elan, uv — but none of the toolchains they install. That line is where the size is: a Lean
@@ -41,6 +43,11 @@ ARG CLAUDE_CODE_VERSION=latest
 # rather than something a Monday build did.
 ARG ELAN_VERSION=v4.2.4
 ARG UV_VERSION=0.12.7
+# The kubectl the *agent* runs, which is a different thing from the one the daemon drives this pod
+# with — that one is on the daemon and never enters the image. Kubernetes supports a client one
+# minor version either side of the server, so this does not have to track any particular cluster;
+# it is pinned for the same reason the two above are.
+ARG KUBECTL_VERSION=v1.34.9
 
 # One layer, lists dropped in the same one — a separate `rm` leaves them in the layer below, where
 # they still cost what they weigh. `bash` and `tar` come with the base; naming them keeps the
@@ -92,6 +99,26 @@ RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/
  && install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /tmp/uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/ \
  && rm -rf /tmp/uv-x86_64-unknown-linux-gnu \
  && uv --version
+
+# kubectl, for the agent that is meant to deploy something onto the cluster it is running in.
+#
+# It grants nothing by itself. What a pod may do to the API server is decided by the RBAC bound to
+# the ServiceAccount `service_account` names, and the default — the namespace's `default` account —
+# can do nothing at all; an operator who wants this has to bind a Role for it. This only means that
+# when they have, the tool to use it is present, rather than every such task beginning by
+# downloading one.
+#
+# A static Go binary with no libraries behind it, so the whole cost is the ~50MB it weighs, and it
+# goes to /usr/local/bin like the managers above — outside `$HOME`, which the pod mounts over.
+#
+# The in-cluster credential is mounted at the usual serviceaccount path and found without any
+# configuration, so nothing here needs a kubeconfig.
+RUN curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+ && curl -fsSL -o /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \
+ && echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum --check --status \
+ && install -m 0755 /tmp/kubectl /usr/local/bin/kubectl \
+ && rm -f /tmp/kubectl /tmp/kubectl.sha256 \
+ && kubectl version --client=true --output=yaml >/dev/null
 
 # Not root. Claude Code refuses `--dangerously-skip-permissions` under uid 0 — which is how
 # orchestra runs it — and the pod carries no securityContext, so the image's own USER is the only

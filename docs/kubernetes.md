@@ -70,6 +70,14 @@ repository's scripts are run with it), `tar`, `nc` and `git`. That is the fixed 
 list the daemon's own machine needs, minus `landrun`. What each repository needs on top of it is
 the subject of the next section.
 
+The image orchestra publishes also carries `kubectl`, which is not on that list because nothing the
+backend does needs one *in the pod* — the daemon drives the pod with its own. It is there for the
+other thing a cluster makes possible: an agent that deploys what it just built onto the cluster it
+is running in. It grants nothing by itself. A pod's authority is whatever RBAC is bound to the
+ServiceAccount `service_account` names, and a namespace's `default` account can do nothing at all,
+so an operator who wants this binds a Role for it — in a namespace of its own rather than the
+runners', whose Role above is deliberately confined to pods.
+
 This list is what the image orchestra publishes already satisfies, and that image is the default —
 so read the two requirements below as what a *replacement* has to meet, not as work you have to do
 before the first task runs.
