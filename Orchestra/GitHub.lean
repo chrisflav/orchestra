@@ -387,12 +387,52 @@ def orgInstallationToken (appId : Nat) (privateKeyPath : String) (org : String)
   let (jwt, instId) ← orgInstallation appId privateKeyPath org what
   createInstallationToken jwt instId
 
+/-- The fork `org` already holds for `target`, read out of a `GET /repos/{org}/{name}` response,
+    or `none` when that response does not identify one.
+
+    Separate from `forkRepo` and pure, so the rule that decides whether a repository sitting at the
+    fork's path *is* the fork can be exercised without a network — the same split
+    `installationWriteDecision` is under.
+
+    The test is the `parent`, never the path. A repository named `org/{target.name}` that is not a
+    fork of `target` is somebody else's repository that happens to share a name, and dispatching an
+    agent at it would push a branch and open a pull request somewhere nobody asked for; `none` sends
+    the caller to the fork endpoint, which is what decides the question properly. Owner and
+    repository names are compared case-insensitively because GitHub's are, and the target here comes
+    from configuration or a taxis artifact that a person typed.
+
+    Only the `parent` is consulted, not `source`: `source` is the root of a chain of forks, so a
+    fork of a fork of `target` would match it while being a repository whose pull requests do not
+    land where the task means them to. -/
+def existingForkDecision (status : Nat) (body : String) (target : Repository) :
+    Option Repository :=
+  if status < 200 || status >= 300 then none
+  else match Json.parse body with
+    | .error _ => none
+    | .ok j => do
+      let parent ← (j.getObjVal? "parent").toOption
+      let parentName ← (parent.getObjValAs? String "full_name").toOption
+      let fullName ← (j.getObjValAs? String "full_name").toOption
+      if parentName.toLower == target.toString.toLower then
+        (Repository.parse fullName).toOption
+      else
+        none
+
 /-- Fork `target` into organisation `org`, returning the fork GitHub says it created.
 
     Authenticates as `org`'s own installation — the one with permission to create repositories
-    there — so the App must be installed on `org`. Idempotent: GitHub returns the existing fork if
-    one is already present. Forking is asynchronous, so this polls until the fork is queryable
-    before returning, so a task cloning it next does not race the copy.
+    there — so the App must be installed on `org`. Forking is asynchronous, so this polls until the
+    fork is queryable before returning, so a task cloning it next does not race the copy.
+
+    **A fork that is already there is reused, without asking GitHub to create one.** The fork
+    endpoint hangs off the *source* repository, so an installation token may only call it when the
+    App is installed on the source account too — GitHub answers `403 Resource not accessible by
+    integration` otherwise, and a public source does not change that, since an installation token is
+    scoped to its installation's repositories rather than being a user who may fork anything it can
+    read. Requiring that installation defeats the point of forking: the reason to fork is to keep
+    the App off the repository the pull requests land in. So the steady state — a fork that exists
+    and that `org`'s installation can push to — is settled with a `GET` on `org`'s own side, and
+    only creating one that does not exist yet still needs the source-side installation.
 
     The fork's name is *read back* from the response rather than assumed to be `org/{target.name}`.
     It normally is, and the request asks for it explicitly, but the returned repository is what a
@@ -403,6 +443,17 @@ def orgInstallationToken (appId : Nat) (privateKeyPath : String) (org : String)
 def forkRepo (appConfig : AppConfig) (target : Repository) (org : String) : IO Repository := do
   let token ← orgInstallationToken appConfig.appId appConfig.privateKeyPath org
     s!"cannot fork {target} into '{org}'"
+  -- The fork's own side first: this is the request that works with the App installed on `org`
+  -- alone, and in the steady state it is the only one needed. A repository that is not a fork of
+  -- `target` — or no repository at all — falls through to the POST below, which is where the
+  -- source-side installation is required and where its absence is reported.
+  let (lookupStatus, lookupBody) ← curlWithStatus #[
+    "-H", s!"Authorization: Bearer {token}",
+    "-H", "Accept: application/vnd.github+json",
+    s!"https://api.github.com/repos/{org}/{target.name}" ]
+  if let some fork := existingForkDecision lookupStatus lookupBody target then
+    IO.eprintln s!"[fork] {fork} is already a fork of {target}; using it rather than creating one"
+    return fork
   let reqBody := Json.mkObj
     [("organization", Json.str org), ("name", Json.str target.name)] |>.compress
   let (status, respBody) ← curlWithStatus #[

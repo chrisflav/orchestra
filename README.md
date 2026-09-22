@@ -179,6 +179,16 @@ unset, the task is skipped rather than dispatched at a repository it cannot push
 whenever the dispatcher works on repositories the App is not directly installed on. The App must be
 installed on `default_organization` with permission to create repositories.
 
+**A fork that already exists is reused, not re-created.** orchestra first looks for a repository
+under `default_organization` whose `parent` is the target, which needs nothing but that
+organisation's own installation. Only creating a fork that is not there yet goes through GitHub's
+fork endpoint, and that endpoint hangs off the *source* repository: an installation token may call
+it only where the App is installed on the source account as well, answering `403 Resource not
+accessible by integration` otherwise. A public source does not lift that — an installation token is
+scoped to its installation's repositories rather than being a user who may fork anything it can
+read. Since installing the App on the source is the access forking exists to avoid, the way to keep
+it off is to create the fork once by hand; orchestra picks it up from then on.
+
 It is also the destination of the `create_repository` MCP tool, which is the only way an agent
 creates a repository from scratch rather than by forking — and the only owner that tool will use.
 

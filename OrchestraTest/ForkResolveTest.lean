@@ -17,6 +17,10 @@ turns that answer into a repository to push to, and on parsing the config option
 to fork into. All three are covered here — the branch table through `resolveForkWith`, which takes
 the probe and the fork step as arguments precisely so it can be driven by stubs. What is not
 covered is the code that actually talks to GitHub.
+
+`existingForkDecision` is covered here too: it is the rule that decides whether the repository
+already sitting at the fork's path is the fork, which is what lets a fork that exists be reused
+without the source-side installation the fork endpoint would demand.
 -/
 
 -- Orchestra.GitHub.installationWriteDecision
@@ -145,6 +149,67 @@ def resolve_failedForkIsSkippedNotThrown : Test := do
     (throw (.userError "boom") : IO Repository)
   let r ← GitHub.resolveForkWith (fun _ => pure (some false)) failing (some "my-org") target
   assertRepo r none "mkFork throws ⇒ skip"
+
+-- Orchestra.GitHub.existingForkDecision
+
+/-- The steady state: `org` holds a repository whose `parent` is the target, so it is the fork and
+    no fork has to be created — the case that works with the App installed on `org` alone. -/
+@[test]
+def existing_parentMatchingTargetIsTheFork : Test := do
+  let body := "{\"full_name\":\"my-org/widget\",\"fork\":true,\
+    \"parent\":{\"full_name\":\"upstream-org/widget\"}}"
+  assertRepo (GitHub.existingForkDecision 200 body target)
+    (some { owner := "my-org", name := "widget" }) "parent matches ⇒ that repository is the fork"
+
+/-- The name is read back from `full_name` rather than assumed to be `org/{target.name}`, the same
+    rule `forkRepo` follows for a fork it creates: GitHub renames on collision, and the repository
+    a task is dispatched at must be the one GitHub actually named. -/
+@[test]
+def existing_nameIsReadBackNotGuessed : Test := do
+  let body := "{\"full_name\":\"my-org/widget-1\",\
+    \"parent\":{\"full_name\":\"upstream-org/widget\"}}"
+  assertRepo (GitHub.existingForkDecision 200 body target)
+    (some { owner := "my-org", name := "widget-1" }) "the fork is whatever full_name says"
+
+/-- A repository sitting at the fork's path whose parent is something else is somebody else's
+    repository that shares a name. Using it would push a branch and open a pull request at a
+    repository nobody nominated, so it is not a fork answer. -/
+@[test]
+def existing_differentParentIsNotTheFork : Test := do
+  let body := "{\"full_name\":\"my-org/widget\",\
+    \"parent\":{\"full_name\":\"someone-else/widget\"}}"
+  assertRepo (GitHub.existingForkDecision 200 body target) none
+    "a fork of a different upstream ⇒ not our fork"
+
+/-- A repository that is not a fork at all carries no `parent`, and a name collision is exactly
+    what that looks like. -/
+@[test]
+def existing_noParentIsNotTheFork : Test := do
+  assertRepo (GitHub.existingForkDecision 200 "{\"full_name\":\"my-org/widget\"}" target) none
+    "no parent ⇒ not a fork"
+
+/-- Owner and repository names are compared case-insensitively, because GitHub's are and the
+    target is written by hand — in a config file or a taxis `repository` artifact. -/
+@[test]
+def existing_parentComparisonIsCaseInsensitive : Test := do
+  let body := "{\"full_name\":\"my-org/widget\",\
+    \"parent\":{\"full_name\":\"Upstream-Org/Widget\"}}"
+  assertRepo (GitHub.existingForkDecision 200 body target)
+    (some { owner := "my-org", name := "widget" }) "case differences still match"
+
+/-- Nothing at the path (404), and anything else that does not describe a repository, sends the
+    caller on to the fork endpoint rather than answering. -/
+@[test]
+def existing_absentOrUnreadableIsNoAnswer : Test := do
+  assertRepo (GitHub.existingForkDecision 404 "{\"message\":\"Not Found\"}" target) none
+    "404 ⇒ nothing to reuse"
+  assertRepo (GitHub.existingForkDecision 200 "<html>not json</html>" target) none
+    "unparseable 2xx ⇒ no answer"
+  assertRepo (GitHub.existingForkDecision 500 "oops" target) none
+    "5xx ⇒ no answer"
+  assertRepo (GitHub.existingForkDecision 200
+    "{\"parent\":{\"full_name\":\"upstream-org/widget\"}}" target) none
+    "no full_name ⇒ the fork cannot be identified"
 
 -- Orchestra.AppConfig default_organization parsing
 
