@@ -387,12 +387,70 @@ def orgInstallationToken (appId : Nat) (privateKeyPath : String) (org : String)
   let (jwt, instId) ← orgInstallation appId privateKeyPath org what
   createInstallationToken jwt instId
 
+/-- The fork `org` already holds for `target`, read out of a `GET /repos/{org}/{name}` response,
+    or `none` when that response does not identify one.
+
+    Separate from `forkRepo` and pure, so the rule that decides whether a repository sitting at the
+    fork's path *is* the fork can be exercised without a network — the same split
+    `installationWriteDecision` is under.
+
+    Two things have to hold, and neither is enough alone. The `parent` must be `target`: a
+    repository named `org/{target.name}` that is not a fork of `target` is somebody else's
+    repository that happens to share a name, and dispatching an agent at it would push a branch and
+    open a pull request somewhere nobody asked for. And the repository named by `full_name` must be
+    the one that was asked for — `org/{target.name}` — because a 2xx here describes the path the
+    caller requested, so a body naming anything else is GitHub answering about a different
+    repository and is not something to act on. (A repository that has since been renamed answers
+    `301`, which is not 2xx and so is already no answer; requiring the name closes the same hole
+    without depending on that, or on `curlWithStatus` never gaining `-L`.) Names are compared
+    case-insensitively because GitHub's are, and the target here comes from configuration or a taxis
+    artifact that a person typed; the repository returned is the one GitHub named, so its canonical
+    spelling is what a task is dispatched at.
+
+    `none` sends the caller to the fork endpoint, which decides the question properly.
+
+    Only the `parent` is consulted, not `source`: `source` is the root of a chain of forks, so a
+    fork of a fork of `target` would match it while being a repository whose pull requests do not
+    land where the task means them to. -/
+def existingForkDecision (status : Nat) (body : String) (org : String) (target : Repository) :
+    Option Repository :=
+  if status < 200 || status >= 300 then none
+  else match Json.parse body with
+    | .error _ => none
+    | .ok j => do
+      let parent ← (j.getObjVal? "parent").toOption
+      let parentName ← (parent.getObjValAs? String "full_name").toOption
+      let fullName ← (j.getObjValAs? String "full_name").toOption
+      let fork ← (Repository.parse fullName).toOption
+      if parentName.toLower == target.toString.toLower
+          && fullName.toLower == s!"{org}/{target.name}".toLower then
+        some fork
+      else
+        none
+
 /-- Fork `target` into organisation `org`, returning the fork GitHub says it created.
 
     Authenticates as `org`'s own installation — the one with permission to create repositories
-    there — so the App must be installed on `org`. Idempotent: GitHub returns the existing fork if
-    one is already present. Forking is asynchronous, so this polls until the fork is queryable
-    before returning, so a task cloning it next does not race the copy.
+    there — so the App must be installed on `org`. Forking is asynchronous, so this polls until the
+    fork is queryable before returning, so a task cloning it next does not race the copy.
+
+    **A fork that is already there is reused, without asking GitHub to create one.** The fork
+    endpoint hangs off the *source* repository, so an installation token may only call it when the
+    App is installed on the source account too — GitHub answers `403 Resource not accessible by
+    integration` otherwise, and a public source does not change that, since an installation token is
+    scoped to its installation's repositories rather than being a user who may fork anything it can
+    read. Requiring that installation defeats the point of forking: the reason to fork is to keep
+    the App off the repository the pull requests land in. So the steady state — a fork that exists
+    in `org` — is settled with a `GET` on `org`'s own side, and only creating one that does not
+    exist yet still needs the source-side installation. Creating one stays idempotent either way:
+    the fork endpoint answers 200 with the existing fork rather than failing, which is what makes
+    two dispatches racing each other harmless.
+
+    What a reused fork is proven to be is *readable*: a 2xx needs only `metadata`, while pushing
+    needs `contents: write`. An `org` installation without it now fails when the agent pushes
+    rather than when the task is dispatched. That is a misconfiguration of the installation the
+    README already states the requirement for, not a supported arrangement — but it is the one
+    thing this path finds out later than the fork endpoint did.
 
     The fork's name is *read back* from the response rather than assumed to be `org/{target.name}`.
     It normally is, and the request asks for it explicitly, but the returned repository is what a
@@ -403,6 +461,18 @@ def orgInstallationToken (appId : Nat) (privateKeyPath : String) (org : String)
 def forkRepo (appConfig : AppConfig) (target : Repository) (org : String) : IO Repository := do
   let token ← orgInstallationToken appConfig.appId appConfig.privateKeyPath org
     s!"cannot fork {target} into '{org}'"
+  -- The fork's own side first: this is the request that works with the App installed on `org`
+  -- alone, and in the steady state it is the only one needed. A repository that is not a fork of
+  -- `target` — or no repository at all — falls through to the POST below, which is where the
+  -- source-side installation is required and where its absence is reported.
+  let (lookupStatus, lookupBody) ← curlWithStatus #[
+    "-X", "GET",
+    "-H", s!"Authorization: Bearer {token}",
+    "-H", "Accept: application/vnd.github+json",
+    s!"https://api.github.com/repos/{org}/{target.name}" ]
+  if let some fork := existingForkDecision lookupStatus lookupBody org target then
+    IO.eprintln s!"[fork] reusing {fork}, already a fork of {target}"
+    return fork
   let reqBody := Json.mkObj
     [("organization", Json.str org), ("name", Json.str target.name)] |>.compress
   let (status, respBody) ← curlWithStatus #[
