@@ -187,7 +187,10 @@ it only where the App is installed on the source account as well, answering `403
 accessible by integration` otherwise. A public source does not lift that — an installation token is
 scoped to its installation's repositories rather than being a user who may fork anything it can
 read. Since installing the App on the source is the access forking exists to avoid, the way to keep
-it off is to create the fork once by hand; orchestra picks it up from then on.
+it off is to create the fork once by hand; orchestra picks it up from then on. It has to keep the
+target's own repository name — `{default_organization}/{name}` is the single path the lookup reads,
+so a fork renamed by hand, or renamed by GitHub on a name collision, is invisible to it and the
+dispatcher goes back to needing the source-side installation.
 
 It is also the destination of the `create_repository` MCP tool, which is the only way an agent
 creates a repository from scratch rather than by forking — and the only owner that tool will use.

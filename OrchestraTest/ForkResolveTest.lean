@@ -152,24 +152,35 @@ def resolve_failedForkIsSkippedNotThrown : Test := do
 
 -- Orchestra.GitHub.existingForkDecision
 
+/-- The lookup is a `GET` on `org`'s own side, so these bodies are what that request answers with;
+    `org` is the organisation the caller asked about. -/
+private def org : String := "my-org"
+
 /-- The steady state: `org` holds a repository whose `parent` is the target, so it is the fork and
     no fork has to be created — the case that works with the App installed on `org` alone. -/
 @[test]
 def existing_parentMatchingTargetIsTheFork : Test := do
   let body := "{\"full_name\":\"my-org/widget\",\"fork\":true,\
     \"parent\":{\"full_name\":\"upstream-org/widget\"}}"
-  assertRepo (GitHub.existingForkDecision 200 body target)
+  assertRepo (GitHub.existingForkDecision 200 body org target)
     (some { owner := "my-org", name := "widget" }) "parent matches ⇒ that repository is the fork"
 
-/-- The name is read back from `full_name` rather than assumed to be `org/{target.name}`, the same
-    rule `forkRepo` follows for a fork it creates: GitHub renames on collision, and the repository
-    a task is dispatched at must be the one GitHub actually named. -/
+/-- A body naming a repository other than the one the `GET` asked for is GitHub answering about
+    something else, and is refused however good its `parent` looks. Unlike the POST — where GitHub
+    may legitimately rename the fork it creates and the name must be read back — a 2xx here
+    describes the path that was requested, so a different name can only mean a different
+    repository, and dispatching an agent at it is the failure this whole function exists to
+    prevent. -/
 @[test]
-def existing_nameIsReadBackNotGuessed : Test := do
-  let body := "{\"full_name\":\"my-org/widget-1\",\
+def existing_answerAboutAnotherRepositoryIsRefused : Test := do
+  let renamed := "{\"full_name\":\"my-org/widget-1\",\
     \"parent\":{\"full_name\":\"upstream-org/widget\"}}"
-  assertRepo (GitHub.existingForkDecision 200 body target)
-    (some { owner := "my-org", name := "widget-1" }) "the fork is whatever full_name says"
+  assertRepo (GitHub.existingForkDecision 200 renamed org target) none
+    "a different name under org ⇒ not the repository that was asked for"
+  let elsewhere := "{\"full_name\":\"other-org/widget\",\
+    \"parent\":{\"full_name\":\"upstream-org/widget\"}}"
+  assertRepo (GitHub.existingForkDecision 200 elsewhere org target) none
+    "a fork in another organisation ⇒ refused"
 
 /-- A repository sitting at the fork's path whose parent is something else is somebody else's
     repository that shares a name. Using it would push a branch and open a pull request at a
@@ -178,37 +189,45 @@ def existing_nameIsReadBackNotGuessed : Test := do
 def existing_differentParentIsNotTheFork : Test := do
   let body := "{\"full_name\":\"my-org/widget\",\
     \"parent\":{\"full_name\":\"someone-else/widget\"}}"
-  assertRepo (GitHub.existingForkDecision 200 body target) none
+  assertRepo (GitHub.existingForkDecision 200 body org target) none
     "a fork of a different upstream ⇒ not our fork"
 
 /-- A repository that is not a fork at all carries no `parent`, and a name collision is exactly
-    what that looks like. -/
+    what that looks like. A `parent` explicitly `null` is the same answer. -/
 @[test]
 def existing_noParentIsNotTheFork : Test := do
-  assertRepo (GitHub.existingForkDecision 200 "{\"full_name\":\"my-org/widget\"}" target) none
+  assertRepo (GitHub.existingForkDecision 200 "{\"full_name\":\"my-org/widget\"}" org target) none
     "no parent ⇒ not a fork"
+  assertRepo (GitHub.existingForkDecision 200
+    "{\"full_name\":\"my-org/widget\",\"parent\":null}" org target) none
+    "parent:null ⇒ not a fork"
 
-/-- Owner and repository names are compared case-insensitively, because GitHub's are and the
-    target is written by hand — in a config file or a taxis `repository` artifact. -/
+/-- Owner and repository names are compared case-insensitively, because GitHub's are and both the
+    target and the organisation are written by hand — in a config file or a taxis `repository`
+    artifact. -/
 @[test]
-def existing_parentComparisonIsCaseInsensitive : Test := do
-  let body := "{\"full_name\":\"my-org/widget\",\
+def existing_comparisonIsCaseInsensitive : Test := do
+  let body := "{\"full_name\":\"My-Org/Widget\",\
     \"parent\":{\"full_name\":\"Upstream-Org/Widget\"}}"
-  assertRepo (GitHub.existingForkDecision 200 body target)
-    (some { owner := "my-org", name := "widget" }) "case differences still match"
+  assertRepo (GitHub.existingForkDecision 200 body org target)
+    (some { owner := "My-Org", name := "Widget" })
+    "case differences still match, and GitHub's spelling is what is returned"
 
-/-- Nothing at the path (404), and anything else that does not describe a repository, sends the
-    caller on to the fork endpoint rather than answering. -/
+/-- Nothing at the path (404), a repository that has since been renamed (301, which
+    `curlWithStatus` does not follow), and anything else that does not describe a repository all
+    send the caller on to the fork endpoint rather than answering. -/
 @[test]
 def existing_absentOrUnreadableIsNoAnswer : Test := do
-  assertRepo (GitHub.existingForkDecision 404 "{\"message\":\"Not Found\"}" target) none
+  assertRepo (GitHub.existingForkDecision 404 "{\"message\":\"Not Found\"}" org target) none
     "404 ⇒ nothing to reuse"
-  assertRepo (GitHub.existingForkDecision 200 "<html>not json</html>" target) none
+  assertRepo (GitHub.existingForkDecision 301 "{\"message\":\"Moved Permanently\"}" org target) none
+    "301 ⇒ no answer; the redirect is not followed"
+  assertRepo (GitHub.existingForkDecision 200 "<html>not json</html>" org target) none
     "unparseable 2xx ⇒ no answer"
-  assertRepo (GitHub.existingForkDecision 500 "oops" target) none
+  assertRepo (GitHub.existingForkDecision 500 "oops" org target) none
     "5xx ⇒ no answer"
   assertRepo (GitHub.existingForkDecision 200
-    "{\"parent\":{\"full_name\":\"upstream-org/widget\"}}" target) none
+    "{\"parent\":{\"full_name\":\"upstream-org/widget\"}}" org target) none
     "no full_name ⇒ the fork cannot be identified"
 
 -- Orchestra.AppConfig default_organization parsing
