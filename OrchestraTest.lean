@@ -16,6 +16,9 @@ import OrchestraTest.ProjectClaimTest
 import OrchestraTest.ProjectFieldsTest
 import OrchestraTest.ProjectMetaTest
 import OrchestraTest.ExamplesTest
+import OrchestraTest.ExecTest
+import OrchestraTest.KubernetesTest
+import OrchestraTest.KubernetesLiveTest
 import OrchestraTest.LabelDispatcherTest
 import OrchestraTest.DispatchCandidatesTest
 import OrchestraTest.ProjectToolsTest

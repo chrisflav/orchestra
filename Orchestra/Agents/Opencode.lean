@@ -65,22 +65,27 @@ def opencode : AgentDef where
     homeRwx := [".elan", ".cache"]
     extraPorts := [4096]
   }
-  setupMcp port _ _ := do
+  setupMcp mcp _ _ := do
+    let (cmd, cmdArgs) := mcp.stdioCommand
     let mcpConfig := Json.mkObj [("mcp", Json.mkObj [
       ("agent", Json.mkObj [
         ("type", .str "local"),
-        ("command", .arr #[.str "nc", .str "127.0.0.1", .str (toString port)]),
+        ("command", .arr ((#[cmd] ++ cmdArgs).map Json.str)),
         ("enabled", .bool true)
       ])
     ])]
     match ← IO.getEnv "HOME" with
-    | none => return ("", #[])
+    | none => return ("", #[], #[])
     | some home =>
       let configDir := System.FilePath.mk home / ".config" / "opencode"
       IO.FS.createDirAll configDir
       let configPath := configDir / "opencode.json"
       IO.FS.writeFile configPath mcpConfig.compress
-      return (configPath.toString, #[])
+      -- Home-scoped, not the absolute path just written: this is the daemon's `$HOME`, and the
+      -- agent reads it from its own.
+      return (configPath.toString, #[],
+        #[{ path := ".config/opencode/opencode.json", access := .rw, scope := .home
+          , from_ := .orchestra }])
   buildArgs _ctx _pluginDirs _subAgent model _systemPrompt resume _budget prompt := Id.run do
     let mut args : Array String := #[
       "run", "--format", "json",
