@@ -527,6 +527,29 @@ def execArgs (cfg : Config) (podName : String) (interactive : Bool)
         that decides what is recorded, and this end should not depend on who runs it. -/
 def extractFlags : String := "--no-overwrite-dir --no-same-owner --no-same-permissions"
 
+/-- The staged paths that sit strictly inside `hostPath`, as names relative to it (`./name`).
+
+    A task granted `memory: both` is granted two memory directories, and the project one lives
+    *inside* the global one (`<data>/memory` and `<data>/memory/<project>`, see
+    `TaskRunner.resolveMemoryDirs`). Each staged path becomes an `emptyDir` of its own, so in the
+    pod the second mount point sits inside the first — and the kubelet creates it root-owned and
+    world-writable, like every other one.
+
+    That is what makes the outer copy fail. `--no-overwrite-dir` preserves the metadata of
+    directories that already exist: `tar` records the mount point's mode before extracting and
+    `chmod`s it back afterwards, which the unprivileged user extracting does not own and may not
+    do. The flag that protects the extraction root breaks on a mount point *below* it:
+
+      tar: ./<project>: Cannot change mode to rwxrwxrwx: Operation not permitted
+
+    So the inner path is left out of the outer archive. Nothing is lost by it: the nested path is
+    staged in its own right, into the mount that is its actual home, and copying it twice was only
+    ever writing the same bytes through a second door. -/
+def nestedUnder (hostPath : String) (paths : Array String) : Array String :=
+  let root := if hostPath.endsWith "/" then hostPath.dropRight 1 else hostPath
+  paths.filterMap fun p =>
+    if p.startsWith (root ++ "/") then some ("." ++ p.drop root.length) else none
+
 /-- Copy a directory into the pod. Skipped, not failed, when the source is not there: an agent
     backend may declare a plugin directory this machine does not have, exactly as with landrun.
 
@@ -535,12 +558,15 @@ def extractFlags : String := "--no-overwrite-dir --no-same-owner --no-same-permi
     here is a mount point owned by root, under a `tar` that is not root, so the whole extraction
     fails on the first thing it does. Nothing wants that member: the mount point already exists,
     and its mode is the kubelet's business rather than the daemon's. -/
-private def stageIn (cfg : Config) (podName hostPath podPath : String) : IO Unit := do
+private def stageIn (cfg : Config) (podName hostPath podPath : String)
+    (alsoStaged : Array String := #[]) : IO Unit := do
   unless ← System.FilePath.pathExists (System.FilePath.mk hostPath) do return ()
   -- An empty directory has no entries to list, and `tar` refuses to create an empty archive.
   -- There is also nothing to carry: the mount point is already there.
   if (← (System.FilePath.mk hostPath).readDir).isEmpty then return ()
-  let excludes := String.intercalate " " (excludeArgs cfg).toList
+  -- The configured excludes, plus any staged path nested under this one: see `nestedUnder`.
+  let nested := (nestedUnder hostPath alsoStaged).flatMap fun n => #["--exclude", shellEscape n]
+  let excludes := String.intercalate " " ((excludeArgs cfg) ++ nested).toList
   -- `--exclude` before `-T`, not after: it applies only to names that come after it on the
   -- command line, so the other order silently carries everything `excludes` names.
   let script := s!"cd {shellEscape hostPath} && \
@@ -792,7 +818,7 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
 {cfg.startupTimeoutSeconds}s ({why}): {waitErr.trimAscii}")
   try
     for st in staged do
-      stageIn cfg podName st.hostPath st.podPath
+      stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
   catch e =>
     deletePod
     throw e
