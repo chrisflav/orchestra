@@ -156,6 +156,45 @@ def onlyOrchestrasOwnPathsAreStaged : Test := do
       "/var/lib/orchestra/memories/acme"]
     (msg := "staged paths")
 
+-- Orchestra.Exec.Kubernetes.nestedUnder
+
+/-- The real shape of `memory: both`: the project memory directory lives inside the global one,
+    so one staged path is an ancestor of another and the pod gets a mount point inside a mount
+    point. The fixture above deliberately has a single memory directory, which is why this needs
+    its own. -/
+private def nestedMemoryPaths : Array String :=
+  #["/var/lib/orchestra/work/acme-widgets-slot0", "/opt/orchestra/plugins",
+    "/var/lib/orchestra/memory", "/var/lib/orchestra/memory/acme-widgets"]
+
+@[test]
+def nested_innerMountIsLeftOutOfTheOuterArchive : Test := do
+  -- Without this the outer copy carries `./acme-widgets`, and restoring that directory's metadata
+  -- is a `chmod` on a root-owned mount point by a `tar` that is not root: the whole extraction
+  -- fails with "Cannot change mode to rwxrwxrwx".
+  TestM.assertEqual (nestedUnder "/var/lib/orchestra/memory" nestedMemoryPaths)
+    #["./acme-widgets"] (msg := "the nested memory directory is excluded, by its relative name")
+
+@[test]
+def nested_onlyStrictlyInsidePathsCount : Test := do
+  -- A path is not nested under itself — excluding it would empty the archive it is the subject of.
+  TestM.assertEqual (nestedUnder "/var/lib/orchestra/memory" #["/var/lib/orchestra/memory"])
+    #[] (msg := "a path is not nested under itself")
+  -- A sibling whose name merely starts with the same characters is not inside it. Comparing
+  -- without the separator would exclude `/var/lib/orchestra/memory-backup` from `.../memory`.
+  TestM.assertEqual
+    (nestedUnder "/var/lib/orchestra/memory" #["/var/lib/orchestra/memory-backup"])
+    #[] (msg := "a name-prefix sibling is not nested")
+  -- Deeper nesting keeps its whole relative path, since that is what `--exclude` matches on.
+  TestM.assertEqual
+    (nestedUnder "/var/lib/orchestra/memory" #["/var/lib/orchestra/memory/a/b"])
+    #["./a/b"] (msg := "a deeper path keeps its relative name")
+
+@[test]
+def nested_unrelatedPathsAreUntouched : Test := do
+  -- The checkout and the plugin directory are staged too, and neither is under the memory root.
+  TestM.assertEqual (nestedUnder "/opt/orchestra/plugins" nestedMemoryPaths) #[]
+    (msg := "paths elsewhere on disk are not excluded")
+
 @[test]
 def stagedPathsKeepTheirAbsolutePosition : Test := do
   -- Mounted where the daemon has them, so every log line, prompt and error message that names the
