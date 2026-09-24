@@ -5,6 +5,49 @@ open Lean (Json)
 open Orchestra
 open Orchestra.Server
 
+-- Server.start / shutdown: the listening socket's lifetime
+
+/-- Enough of a `State` to start a server with. None of the fields below are reached: the test
+    never opens a session on it, only binds and unbinds the socket. -/
+private def socketTestState : State :=
+  { repo := none, allowedTools := [], appId := 0, privateKeyPath := "/dev/null"
+  , installationId := none, pat := "" }
+
+/-- The port a server had is free the moment its shutdown returns.
+
+    This is the regression: `shutdown` stopped the accept loop but left it blocked in `accept`,
+    holding the listening socket for the life of the daemon. Off loopback that is a socket with
+    the PAT's authority behind it outliving the task it was minted for, and a port out of
+    `mcp_ports` that no later task can have — the range is sized to the queue's parallelism, so
+    enough leaks starve it. Asking for the same port again is the shortest way to say all of
+    that: it throws "no free port" if anything still holds it. -/
+@[test]
+def start_releasesItsPortOnShutdown : Test := do
+  let (port, stop) ← start socketTestState (bindHost := "127.0.0.1")
+  stop
+  try
+    let (again, stop') ← start socketTestState (bindHost := "127.0.0.1")
+      (portRange := some (port, port))
+    stop'
+    TestM.assertEqual again port (msg := "the same port is taken again after shutdown")
+  catch e =>
+    TestM.fail s!"port {port} was not released by shutdown: {e}"
+
+/-- Twice in a row, because the leak was invisible to a single start: the first server always
+    binds, and it is the *second* task that finds the range short of a port. -/
+@[test]
+def start_releasesItsPortEveryTime : Test := do
+  let (port, stop) ← start socketTestState (bindHost := "127.0.0.1")
+  stop
+  for i in [0:3] do
+    try
+      let (_, stop') ← start socketTestState (bindHost := "127.0.0.1")
+        (portRange := some (port, port))
+      stop'
+    catch e =>
+      TestM.fail s!"port {port} was not released on cycle {i}: {e}"
+  TestM.assert true
+
 -- parseToolCall: simple tools
 
 @[test]
