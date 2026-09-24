@@ -1139,9 +1139,14 @@ def start (state : State) (bindHost : String := "127.0.0.1")
   let running ← IO.mkRef true
   let _acceptTask ← IO.asTask (prio := .dedicated) do
     while ← running.get do
-      match ← IO.wait (← server.accept).result! with
-      | .error _ => break
-      | .ok client =>
+      -- `result?`, not `result!`: `cancelAccept` drops the pending promise rather than resolving
+      -- it, and `result!` panics on a dropped one — which in a dedicated task takes the process
+      -- with it rather than ending the loop. `none` *is* the cancellation, and it means the same
+      -- thing as an accept error here: stop listening.
+      match ← IO.wait (← server.accept).result? with
+      | none => break
+      | some (.error _) => break
+      | some (.ok client) =>
         if !(← running.get) then break
         let _ ← IO.asTask (prio := .dedicated) do
           log "client connected"
