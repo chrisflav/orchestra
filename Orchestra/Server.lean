@@ -1083,6 +1083,12 @@ def parseIPv4? (s : String) : Option IPv4Addr :=
 
 /-- Start the MCP server. Returns (port, shutdown action).
 
+    Running the shutdown action frees the port: by the time it returns, the accept loop has left
+    and nothing holds the listening socket. That matters twice over off loopback — the socket
+    carries the PAT's authority behind a per-task token, and the port came out of `mcp_ports`,
+    a range sized to the queue's parallelism, so one leaked listener is both a secret left
+    reachable and a port no later task can have.
+
     `bindHost` is loopback unless the execution backend says the agent runs somewhere that cannot
     reach loopback (`Exec.Backend.exposure`). Binding wider is only ever done together with
     `State.authToken`; the two are decided in one place, `Exec.mcpBinding`, so that neither can be
@@ -1144,10 +1150,18 @@ def start (state : State) (bindHost : String := "127.0.0.1")
           log "client disconnected"
   let shutdown : IO Unit := do
     running.set false
+    -- Cancel the `accept` the loop is sitting in. This is the half that actually frees the
+    -- listening socket: the pending promise resolves as an error, the loop takes its `break`,
+    -- and the reference it held goes with its frame. Nothing here closes the socket by hand
+    -- because the libuv binding offers no `close` — the handle goes when the last reference
+    -- does, so what a shutdown has to do is make sure no reference outlives it.
+    try server.cancelAccept catch _ => pure ()
     try
-      -- Wakes the accept loop so it can notice `running` is false. Loopback reaches a socket
-      -- bound to `0.0.0.0` as readily as one bound to loopback; a socket bound to one specific
-      -- interface is reached at that address instead.
+      -- And a connection to wake it, for the case `cancelAccept` has nothing to cancel because
+      -- the loop is between iterations: it then re-checks `running`, which is already false, and
+      -- leaves without blocking again. Loopback reaches a socket bound to `0.0.0.0` as readily
+      -- as one bound to loopback; a socket bound to one specific interface is reached at that
+      -- address instead.
       let dummy ← Socket.new
       let wake := if bindAddr == IPv4Addr.ofParts 0 0 0 0 then IPv4Addr.ofParts 127 0 0 1
                   else bindAddr
