@@ -660,8 +660,8 @@ def loadHistory (backend label : String) : IO (Array Window) := do
 
 /-- Replace a source's history with `windows`, in order, in one transaction.
 
-    For writing a history wholesale: seeding one, or importing it. A poll does not come through
-    here. `recordPoll` writes only the rows the poll touched, because rewriting a few hundred rows
+    For seeding a history wholesale, which is what the tests use it for. A poll does not come
+    through here. `recordPoll` writes only the rows the poll touched, because rewriting a few hundred rows
     on every poll was what made each poll take minutes in a slow process. -/
 def saveHistory (backend label : String) (windows : Array Window) : IO Unit :=
   Store.transaction do
@@ -686,10 +686,13 @@ open Db.Query.DSL in
     wholesale rewrite dropped it too, because `loadHistory` leaves it out.
 
     Load, fold, save, unserialised — like the state row beside it. Two polls for the same source
-    that interleave lose one of the two readings: the window survives either way, and what it
-    costs is a `samples` tick and, at worst, a peak that only the losing poll saw. A lock on a
-    table three processes reach would cost more than that. One transaction, so a reader never
-    sees a poll half written. -/
+    that interleave and both fold into the open window update the same row, and the last one
+    wins. That costs a `samples` tick and, at worst, a peak only the losing poll saw. Two that
+    both see a rollover both insert the new window, which leaves one stale single-sample
+    duplicate in the series. That is milder than before. With the wholesale rewrite, the second
+    poll's delete could not see the first poll's fresh inserts, so it re-added the whole history
+    on top of them. A lock on a table three processes reach would cost more than either. One
+    transaction, so a reader never sees a poll half written. -/
 def recordPoll (backend label : String) (limits : Array Limit) (now : Int) : IO Unit := do
   let rows ← Store.run <| HasModel.fetch <| query% do
     let w ← from Store.UsageWindowRow
@@ -1333,7 +1336,8 @@ def resolutionFor (cfg : AppConfig) (backend : String) (authSources : List Strin
         else if a.authSources.size == 1 then ([a.authSources[0]!.label], taskMode)
         else ([], taskMode)
 
-/-- Pick the authentication source a task should run on, refreshing usage data first.
+/-- Pick the authentication source a task should run on, refreshing stale usage data first unless
+    `refresh := false`.
 
     This is the single entry point every running mode goes through — the queue daemon deciding
     what to claim, `orchestra run`, and an interactive session — so that a limit discovered by
@@ -1347,9 +1351,14 @@ def resolutionFor (cfg : AppConfig) (backend : String) (authSources : List Strin
     first. The queue daemon's claim path passes it. It resolves under the claim mutex, and a
     refresh is a network probe plus a history write for every stale candidate. Doing that under
     the mutex stalls every claim, and every slot release too, for as long as it takes. On
-    2026-09-27 that was hours, with a pool of ~23 sources. The daemon runs its own poller, so what
-    it reads is at most one sweep old, and a limit it has not seen yet is caught by `markLimited`
-    when a run hits it. -/
+    2026-09-27 that was hours, with a pool of ~23 sources. The daemon's own poller keeps the
+    sources of its configuration about one sweep old, and a limit it has not seen yet is caught by
+    `markLimited` when a run hits it.
+
+    Some numbers go without a poll this way. These are sources the poller does not sweep: ones
+    known only to an entry's own `configPath`, a backend with polling off, or a source in 429
+    backoff. For them, the stored numbers stay where they were last left until a run hits a limit. That is
+    the same position a backend with polling disabled is always in. -/
 def resolveLabel (cfg : AppConfig) (backend : String) (authSources : List String)
     (authSource : Option String) (mode : Option AuthMode) (model : Option String)
     (refresh : Bool := true) : IO (Except String (Option String)) := do

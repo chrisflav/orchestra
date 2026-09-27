@@ -410,7 +410,9 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
       | none    => pure appConfig
       | some cp => try loadAppConfig (some (System.FilePath.mk cp)) catch _ => pure appConfig
     -- `refresh := false`: this runs under `claimMutex`, and polling stale sources here held the
-    -- mutex for hours at a time. The usage poller below keeps the stored numbers current.
+    -- mutex for hours at a time. The usage poller below keeps the stored numbers current for
+    -- `appConfig`'s sources. A source only `entryCfg` declares is never polled here; it learns
+    -- its limits from `markLimited` alone, as a backend with polling off does.
     match ← Usage.resolveLabel entryCfg backend e.authSources e.authSource e.authMode e.model
         (refresh := false) with
     | .ok label =>
@@ -670,10 +672,11 @@ its workspace; it will start from a clean checkout."
       releaseEntry entry slot
   -- Usage poller: refresh every configured OAuth source on a slow cadence.
   --
-  -- The only thing that refreshes usage while the daemon is up. Claim-time resolution reads the
-  -- stored numbers and never polls, because it runs under `claimMutex`. So this is what notices
-  -- that a *blocked* source has come back, and what keeps `orchestra usage` truthful. Errors are swallowed per
-  -- source inside `refreshAll`; an unreachable endpoint must not take the fiber down.
+  -- Claim-time resolution reads the stored numbers and never polls, because it runs under
+  -- `claimMutex`. Only concert steps, which pick their source outside that mutex, still refresh
+  -- on their own. So this is what notices that a *blocked* source has come back, and what keeps
+  -- `orchestra usage` truthful. Errors are swallowed per source inside `refreshAll`; an
+  -- unreachable endpoint must not take the fiber down.
   -- Only backends that opt into polling; a fully-disabled config spawns no poll fiber at all.
   let usageBackends := appConfig.agentAuthConfigs.toList.filterMap fun a =>
     if a.pollUsage then some a.name else none
