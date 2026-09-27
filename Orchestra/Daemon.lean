@@ -409,7 +409,12 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
     let entryCfg ← match e.configPath with
       | none    => pure appConfig
       | some cp => try loadAppConfig (some (System.FilePath.mk cp)) catch _ => pure appConfig
-    match ← Usage.resolveLabel entryCfg backend e.authSources e.authSource e.authMode e.model with
+    -- `refresh := false`: this runs under `claimMutex`, and polling stale sources here held the
+    -- mutex for hours at a time. The usage poller below keeps the stored numbers current for
+    -- `appConfig`'s sources. A source only `entryCfg` declares is never polled here; it learns
+    -- its limits from `markLimited` alone, as a backend with polling off does.
+    match ← Usage.resolveLabel entryCfg backend e.authSources e.authSource e.authMode e.model
+        (refresh := false) with
     | .ok label =>
       authWaitNoted.modify (·.erase e.id)
       -- Stamp the source as used *here*, while `claimMutex` is still held and before any other
@@ -667,10 +672,11 @@ its workspace; it will start from a clean checkout."
       releaseEntry entry slot
   -- Usage poller: refresh every configured OAuth source on a slow cadence.
   --
-  -- Claim-time resolution already refreshes what it is about to use, but only for sources it is
-  -- about to use. This is what notices that a *blocked* source has come back, and what keeps
-  -- `orchestra usage` truthful while the daemon is otherwise idle. Errors are swallowed per
-  -- source inside `refreshAll`; an unreachable endpoint must not take the fiber down.
+  -- Claim-time resolution reads the stored numbers and never polls, because it runs under
+  -- `claimMutex`. Only concert steps, which pick their source outside that mutex, still refresh
+  -- on their own. So this is what notices that a *blocked* source has come back, and what keeps
+  -- `orchestra usage` truthful. Errors are swallowed per source inside `refreshAll`; an
+  -- unreachable endpoint must not take the fiber down.
   -- Only backends that opt into polling; a fully-disabled config spawns no poll fiber at all.
   let usageBackends := appConfig.agentAuthConfigs.toList.filterMap fun a =>
     if a.pollUsage then some a.name else none
@@ -680,9 +686,8 @@ its workspace; it will start from a clean checkout."
         for backend in usageBackends do
           try Usage.refreshAll appConfig backend
           catch e => IO.eprintln s!"[usage] poll failed for {backend}: {e}"
-        -- Five minutes: fast enough that a reset is picked up promptly, slow enough that an
-        -- idle daemon makes a handful of requests an hour. Shared with `ensureFresh`'s default
-        -- TTL, which is what keeps this the only path that polls while the daemon is up.
+        -- Five minutes between sweeps: fast enough that a reset is picked up promptly, slow
+        -- enough that an idle daemon makes a handful of requests an hour.
         for _ in List.range Usage.pollIntervalSecs.toNat do
           if ← shutdownToken.isCancelled then break
           IO.sleep 1000

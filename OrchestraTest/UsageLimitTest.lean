@@ -1088,6 +1088,79 @@ def pruneWindows_capsEachSeriesSeparately : Test := do
   TestM.assertEqual kept[kept.size - 1]!.lastEpoch (t0 + (maxWindowsPerSeries : Int) + 19)
     (msg := "the most recent window is the last one")
 
+/-! ## Writing history back
+
+A poll touches one window per series, and the history is up to 240 windows per series. The
+write-back is planned from what the fold changed, so that a poll costs a row or two rather than
+the whole history. -/
+
+@[test]
+def planHistoryWrite_aPollInsideTheWindowChangesOnlyThatWindow : Test := do
+  let old := recordWindows #[] #[sessionAt 10 (some reset1), weeklyAt 3] t0
+  let folded := recordWindows old #[sessionAt 20 (some reset1), weeklyAt 3] t1
+  let plan := planHistoryWrite old folded (pruneKept folded t1)
+  TestM.assertEqual plan.drop.size 0 (msg := "nothing dropped")
+  TestM.assertEqual plan.add.size 0 (msg := "nothing new")
+  -- The weekly reading repeats, but its `lastEpoch` and `samples` still move.
+  TestM.assertEqual (plan.change.map (·.1)).toList [0, 1] (msg := "both series were touched")
+  TestM.assertEqual plan.change[0]!.2.peakPercent 20
+
+@[test]
+def planHistoryWrite_aRolloverAddsAWindowAndChangesNothingElse : Test := do
+  let old := recordWindows #[] #[sessionAt 60 (some reset1)] t0
+  let folded := recordWindows old #[sessionAt 5 (some reset2)] (t0 + 5 * 3600)
+  let plan := planHistoryWrite old folded (pruneKept folded (t0 + 5 * 3600))
+  TestM.assertEqual plan.change.size 0 (msg := "the closed window is left as it was")
+  TestM.assertEqual (plan.add.map (·.peakPercent)).toList [5] (msg := "the new window is added")
+
+@[test]
+def planHistoryWrite_theCapDropsTheOldestStoredWindow : Test := do
+  let old := (Array.range maxWindowsPerSeries).map fun (i : Nat) =>
+    ({ kind := .session, startEpoch := t0 + (↑i : Int), lastEpoch := t0 + (↑i : Int)
+       resetEpoch := some (t0 + (↑i : Int) * 20000) } : Window)
+  let now := t0 + (maxWindowsPerSeries : Int) + 1
+  let folded := recordWindows old #[sessionAt 1 (some "2027-01-01T00:00:00Z")] now
+  let plan := planHistoryWrite old folded (pruneKept folded now)
+  TestM.assertEqual plan.drop.toList [0] (msg := "the oldest stored window goes")
+  TestM.assertEqual plan.add.size 1
+  TestM.assertEqual plan.change.size 0
+
+@[test]
+def pruneWindows_isPruneKeptReadBack : Test := do
+  let windows := #[
+    ({ kind := .session, startEpoch := t0, lastEpoch := t0 } : Window),
+    ({ kind := .weeklyAll, startEpoch := t0, lastEpoch := t1 } : Window),
+    ({ kind := .session, startEpoch := t1, lastEpoch := t1 } : Window)]
+  TestM.assertEqual (pruneKept windows t1).toList [0, 1, 2]
+  TestM.assert (pruneWindows windows t1 == windows) "nothing to prune keeps everything"
+
+open Db.Query.DSL in
+@[test]
+def recordPoll_writesWhatTheWholesaleRewriteWouldHaveAndKeepsRowIds : Test := do
+  let rowIds : IO (Array Int) := do
+    let rows ← Store.run <| HasModel.fetch <| query% do
+      let w ← from Store.UsageWindowRow
+      guard w.backend = "claude"
+      guard w.label = "a"
+      select w
+      order_by w.id
+    return rows.map (·.id)
+  let (history, idsBefore, idsAfter, expected) ← Orchestra.withTempData "usage-history" do
+    recordPoll "claude" "a" #[sessionAt 10 (some reset1), weeklyAt 3] t0
+    let idsBefore ← rowIds
+    recordPoll "claude" "a" #[sessionAt 20 (some reset1), weeklyAt 4] t1
+    recordPoll "claude" "a" #[sessionAt 5 (some reset2), weeklyAt 4] (t0 + 5 * 3600)
+    let expected :=
+      let h := recordWindows #[] #[sessionAt 10 (some reset1), weeklyAt 3] t0
+      let h := recordWindows h #[sessionAt 20 (some reset1), weeklyAt 4] t1
+      recordWindows h #[sessionAt 5 (some reset2), weeklyAt 4] (t0 + 5 * 3600)
+    return (← loadHistory "claude" "a", idsBefore, ← rowIds, expected)
+  TestM.assert (history == expected)
+    s!"the stored history is the fold: got {repr history}, expected {repr expected}"
+  TestM.assertEqual idsAfter.size 3 (msg := "two series and one rollover")
+  TestM.assertEqual (idsAfter.extract 0 2).toList idsBefore.toList
+    (msg := "windows a poll only folded into keep their rows")
+
 @[test]
 def window_roundTripsThroughJson : Test := do
   let w : Window := {
