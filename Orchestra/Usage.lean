@@ -446,7 +446,7 @@ structure Window where
   /-- How many polls this window was built from. One is a glimpse of a window rather than a
       measurement of it, and a reader is entitled to say so. -/
   samples     : Nat := 0
-deriving Repr, Inhabited
+deriving Repr, Inhabited, BEq
 
 instance : ToJson Window where
   toJson w :=
@@ -585,19 +585,57 @@ def historyRetentionSecs : Int := 180 * 86400
 /-- Drop what is too old, then what is too much — newest first, per series.
 
     Capping per series rather than over the whole file is what stops a session window every five
-    hours from evicting the weekly history the second graph is drawn from. -/
-def pruneWindows (windows : Array Window) (now : Int) : Array Window := Id.run do
-  let aged := windows.filter fun w => decide (now - w.lastEpoch ≤ historyRetentionSecs)
+    hours from evicting the weekly history the second graph is drawn from.
+
+    Answered as the ascending indices of the windows kept, so that `recordPoll` can tell which
+    stored rows went. `pruneWindows` is the same answer as the windows themselves. -/
+def pruneKept (windows : Array Window) (now : Int) : Array Nat := Id.run do
+  let indices := (List.range windows.size).toArray
+  let aged := indices.filter fun i => decide (now - windows[i]!.lastEpoch ≤ historyRetentionSecs)
   -- An age filter that drops *everything* is evidence about the clock, not about the data. A
   -- container that polls once before NTP has stepped it would otherwise delete six months of
   -- history in a single atomic write, and the correction afterwards would not bring it back.
   -- The count cap below still bounds the file, so keeping it costs nothing.
-  let fresh := if aged.isEmpty then windows else aged
-  let mut kept : Array Window := #[]
-  for w in fresh.reverse do
-    let seen := (kept.filter fun k => k.kind == w.kind && k.scope == w.scope).size
-    if seen < maxWindowsPerSeries then kept := kept.push w
+  let fresh := if aged.isEmpty then indices else aged
+  let mut kept : Array Nat := #[]
+  for i in fresh.reverse do
+    let w := windows[i]!
+    let seen := (kept.filter fun k => windows[k]!.kind == w.kind && windows[k]!.scope == w.scope).size
+    if seen < maxWindowsPerSeries then kept := kept.push i
   return kept.reverse
+
+/-- Drop what is too old, then what is too much. See `pruneKept`. -/
+def pruneWindows (windows : Array Window) (now : Int) : Array Window :=
+  (pruneKept windows now).map (windows[·]!)
+
+/-- The row writes that take a source's stored history from `old` to what a poll made of it.
+
+    `folded` is `recordWindows old …`, and that function only rewrites a window in place or appends
+    one. So `folded[i]` for `i < old.size` is still the window stored as `old[i]`, and anything past
+    that is new. `kept` is `pruneKept folded …`. From those three this reads off which stored rows
+    retention dropped, which of the survivors a poll changed, and which windows are new. A poll
+    typically changes one row per series and adds none.
+
+    Indices into `old` rather than row ids, so that this stays pure. `recordPoll` maps them to
+    ids. -/
+structure HistoryWrite where
+  /-- Stored windows retention dropped, as indices into `old`. -/
+  drop   : Array Nat := #[]
+  /-- Stored windows the poll changed, as an index into `old` and what it now holds. -/
+  change : Array (Nat × Window) := #[]
+  /-- Windows the poll opened, in the order they have to be inserted in. -/
+  add    : Array Window := #[]
+deriving Repr, Inhabited
+
+def planHistoryWrite (old folded : Array Window) (kept : Array Nat) : HistoryWrite := Id.run do
+  let mut plan : HistoryWrite := {}
+  for i in [0:old.size] do
+    if !kept.contains i then plan := { plan with drop := plan.drop.push i }
+  for i in kept do
+    if i < old.size then
+      if folded[i]! != old[i]! then plan := { plan with change := plan.change.push (i, folded[i]!) }
+    else plan := { plan with add := plan.add.push folded[i]! }
+  return plan
 
 open Db.Query.DSL in
 /-- The recorded windows for one source, oldest first.
@@ -620,13 +658,11 @@ def loadHistory (backend label : String) : IO (Array Window) := do
   Store.keepConvertible "usage window" (fun r => s!"{r.backend}/{r.label}#{r.id}")
     Window.ofRow? rows
 
-/-- Replace a source's history with `windows`, in order.
+/-- Replace a source's history with `windows`, in order, in one transaction.
 
-    Delete and insert rather than a row-by-row reconciliation: `recordWindows` and `pruneWindows`
-    hand back the whole sequence, an entry of which may have been folded into, dropped by the
-    retention rule, or added — and telling those apart afterwards would be inventing identities
-    for rows that have none of their own. One transaction, so no reader ever sees the gap between
-    the delete and the inserts. -/
+    For writing a history wholesale: seeding one, or importing it. A poll does not come through
+    here. `recordPoll` writes only the rows the poll touched, because rewriting a few hundred rows
+    on every poll was what made each poll take minutes in a slow process. -/
 def saveHistory (backend label : String) (windows : Array Window) : IO Unit :=
   Store.transaction do
     let _ ← HasModel.delete (α := Store.UsageWindowRow)
@@ -635,16 +671,63 @@ def saveHistory (backend label : String) (windows : Array Window) : IO Unit :=
     for w in windows do
       HasModel.insert (w.toRow backend label)
 
+open Db.Query.DSL in
 /-- Fold one poll's limits into the stored history. Called on every successful poll, and by
     nothing else.
+
+    Only the rows the poll touched are written (see `planHistoryWrite`). The history used to be
+    replaced wholesale on every poll: a delete, then an insert for each of up to 480 windows per
+    source. Inside a daemon slowed by a leak, that took minutes a source, which is part of how the
+    queue stalled on 2026-09-27. Rows keep their ids, so `ORDER BY id` is still the order they
+    were recorded in. A new window is inserted, and takes an id after every existing one, which
+    makes it the last of its series. That is where `recordWindows` looks for the open window.
+
+    A row this build cannot read is deleted along with the rest of what retention drops. The
+    wholesale rewrite dropped it too, because `loadHistory` leaves it out.
 
     Load, fold, save, unserialised — like the state row beside it. Two polls for the same source
     that interleave lose one of the two readings: the window survives either way, and what it
     costs is a `samples` tick and, at worst, a peak that only the losing poll saw. A lock on a
-    table three processes reach would cost more than that. -/
+    table three processes reach would cost more than that. One transaction, so a reader never
+    sees a poll half written. -/
 def recordPoll (backend label : String) (limits : Array Limit) (now : Int) : IO Unit := do
-  let windows ← loadHistory backend label
-  saveHistory backend label (pruneWindows (recordWindows windows limits now) now)
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let w ← from Store.UsageWindowRow
+    guard w.backend = backend
+    guard w.label = label
+    select w
+    order_by w.id
+  let mut ids : Array Int := #[]
+  let mut old : Array Window := #[]
+  let mut unreadable : Array Int := #[]
+  for row in rows do
+    match Window.ofRow? row with
+    | .ok w    => ids := ids.push row.id; old := old.push w
+    | .error e =>
+      IO.eprintln s!"[usage] {backend}/{label}: dropping unreadable history row #{row.id}: {e}"
+      unreadable := unreadable.push row.id
+  let folded := recordWindows old limits now
+  let plan := planHistoryWrite old folded (pruneKept folded now)
+  let dropIds := unreadable ++ plan.drop.map (ids[·]!)
+  if dropIds.isEmpty && plan.change.isEmpty && plan.add.isEmpty then return
+  Store.transaction do
+    unless dropIds.isEmpty do
+      let _ ← HasModel.delete (α := Store.UsageWindowRow)
+        (.inList (.var Store.UsageWindowRowIndex.id .int) dropIds.toList)
+    for (i, w) in plan.change do
+      let _ ← HasModel.update (α := Store.UsageWindowRow)
+        { value
+            | .reset_epoch  => some (match w.resetEpoch with
+                                     | some r => .int r
+                                     | none   => .null .int)
+            | .last_epoch   => some (.int w.lastEpoch)
+            | .peak_percent => some (.int (Store.natColumn w.peakPercent))
+            | .last_percent => some (.int (Store.natColumn w.lastPercent))
+            | .samples      => some (.int (Store.natColumn w.samples))
+            | _             => none
+          condition := .eq (.var Store.UsageWindowRowIndex.id .int) (.int ids[i]!) }
+    for w in plan.add do
+      HasModel.insert (w.toRow backend label)
 
 /-! ## Availability
 
@@ -1183,10 +1266,11 @@ def refreshAll (cfg : AppConfig) (backend : String) : IO Unit := do
     running — a bare `orchestra run`, or a `usage` invocation on a machine that only ever
     dispatches by hand — where the stored numbers would otherwise be arbitrarily old.
 
-    It is deliberately not shorter. Selection runs on the queue daemon's claim path, which
-    re-resolves every pending entry once a second for as long as the queue is not empty; at the
-    minute-scale TTL this used to carry, that single path spent the whole of the endpoint's
-    budget on its own and the 429 it earned then blinded every other caller for five minutes.
+    It is deliberately not shorter. Selection used to refresh on the queue daemon's claim path,
+    which re-resolves every pending entry once a second while the queue is not empty. At the
+    minute-scale TTL this used to carry, that one path spent the endpoint's whole budget, and the
+    429 it earned then blinded every other caller for five minutes. The claim path no longer
+    refreshes at all (see `resolveLabel`'s `refresh`).
 
     A no-op when polling is disabled for the backend. -/
 def ensureFresh (cfg : AppConfig) (backend label : String)
@@ -1257,14 +1341,23 @@ def resolutionFor (cfg : AppConfig) (backend : String) (authSources : List Strin
 
     `.ok none` means "this install has no named sources"; the caller falls through to the legacy
     flat-token path. `.error` means every candidate is currently limited, and the message says
-    which limit and when it lifts. -/
+    which limit and when it lifts.
+
+    `refresh := false` decides from the stored numbers alone, without polling a stale source
+    first. The queue daemon's claim path passes it. It resolves under the claim mutex, and a
+    refresh is a network probe plus a history write for every stale candidate. Doing that under
+    the mutex stalls every claim, and every slot release too, for as long as it takes. On
+    2026-09-27 that was hours, with a pool of ~23 sources. The daemon runs its own poller, so what
+    it reads is at most one sweep old, and a limit it has not seen yet is caught by `markLimited`
+    when a run hits it. -/
 def resolveLabel (cfg : AppConfig) (backend : String) (authSources : List String)
     (authSource : Option String) (mode : Option AuthMode) (model : Option String)
-    : IO (Except String (Option String)) := do
+    (refresh : Bool := true) : IO (Except String (Option String)) := do
   let (candidates, mode) := resolutionFor cfg backend authSources authSource mode
   if candidates.isEmpty then return .ok none
-  for label in candidates do
-    ensureFresh cfg backend label
+  if refresh then
+    for label in candidates do
+      ensureFresh cfg backend label
   match ← selectSource backend candidates mode model with
   | .ok label => return .ok (some label)
   | .error e  => return .error e
