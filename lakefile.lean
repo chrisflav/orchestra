@@ -51,13 +51,14 @@ require Yaml from git "https://github.com/chrisflav/lean-yaml" @ "master"
 require Taxis from git "https://github.com/chrisflav/taxis" @ "d029b06a912a39fef52734ef90f29537561c7785"
 
 -- The record store's database layer: `Orchestra.Store` is written against it. Pinned to the
--- revision of its master that closes a PostgreSQL connection when it is done with it.
+-- revision of its master that frees a query's result when its handle is dropped -- before it,
+-- every query leaked its whole result, which took the dashboard to ~37 GiB in 32 hours.
 --
 -- `postgres = "on"` builds the libpq FFI shim, which is off by default so that a package using
 -- only the vendored SQLite needs no PostgreSQL headers. Orchestra keeps its records in
 -- PostgreSQL (see `Orchestra/Store/Connection.lean`), so it needs both the shim and, on every
 -- executable that calls into it, the libpq to resolve it against.
-require db from git "https://github.com/chrisflav/db" @ "2361cf0994610ebb7ad32770ffa042c860338d0f"
+require db from git "https://github.com/chrisflav/db" @ "cd8e6c37fd2c5a8a5778baef402475242f5e8e48"
   with NameMap.empty.insert `postgres "on"
 
 /-- Compile a single C shim under `ffi/` into a static library of the same name. -/
