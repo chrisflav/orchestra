@@ -848,6 +848,10 @@ def claimDecision (ctx : ClaimContext) (pending : Array QueueEntry)
     let predecessor ← match e.continuesFrom with
       | none     => pure none
       | some tid => predecessorOf tid
+    -- Where slots hold no trees, nothing above made a continuation of a running task wait (its
+    -- predecessor's slot being busy was the wait). Its workspace is still in use, and the backend
+    -- would refuse it; waiting is the right answer, and the predecessor will finish.
+    if !ctx.slotsHoldTrees && predecessor.any (·.status == .running) then continue
     let preferred ← match (if ctx.slotsHoldTrees then predecessor else none).bind
         (fun p => p.slot.map (p.id, ·)) with
       | none => pure none

@@ -331,7 +331,8 @@ a plain path inside the checkout"
       pure (some {
         storageClass := jsonStr? tv "storage_class"
         size := (jsonStr? tv "size").getD "20Gi"
-        retentionDays := tv.getObjValAs? Nat "retention_days" |>.toOption |>.getD 14
+        -- At least a day: zero would delete every other chain's claim at the next task start.
+        retentionDays := max 1 (tv.getObjValAs? Nat "retention_days" |>.toOption |>.getD 14)
         mountPath
         seedPaths : TaskVolumes })
     | .ok other => throw s!"kubernetes: execution.options.task_volumes must be an object, not \
@@ -467,6 +468,15 @@ def podPathOf (spec : SessionSpec) (workspaceMount : Option String) (path : Stri
 /-- The name of the volume the task's claim is mounted from. -/
 def workspaceVolumeName : String := "workspace"
 
+/-- A string as a Kubernetes label value or name part: at most `max` characters of
+    `[A-Za-z0-9._-]`, starting and ending alphanumeric. Task ids already are one; this is the guard
+    for anything that is not. Never empty, since an empty name part is not a valid key. -/
+def labelValue (s : String) (max : Nat := 63) : String :=
+  let kept := s.toList.filter (fun c => c.isAlphanum || c == '.' || c == '_' || c == '-')
+  let trimmed := (kept.drop (kept.length - max)).dropWhile (!·.isAlphanum)
+  let v := String.ofList (trimmed.reverse.dropWhile (!·.isAlphanum)).reverse
+  if v.isEmpty then "unnamed" else v
+
 /-- The pod manifest for a task. -/
 def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
     (staged : Array StagedPath) (workspaceClaim : Option String := none) : Json :=
@@ -534,7 +544,7 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
       ("namespace", .str cfg.ns),
       ("labels", Json.mkObj ([
         ("app.kubernetes.io/managed-by", .str "orchestra"),
-        ("orchestra.dev/task", .str spec.label)]
+        ("orchestra.dev/task", .str (labelValue spec.label))]
         -- A label value cannot hold a `/`, so `owner/name` is written the way Kubernetes writes
         -- its own two-part names.
         ++ (match spec.repo with
@@ -884,25 +894,23 @@ finds it. While a pod holds the claim it is annotated with that task, so a secon
 the same task is refused rather than mounted beside the first. The last-use time is an annotation
 in epoch seconds, which is what retention reads. -/
 
-/-- A string as a Kubernetes label value or name part: at most `max` characters of
-    `[A-Za-z0-9._-]`, starting and ending alphanumeric. Task ids already are one; this is the guard
-    for anything that is not. -/
-def labelValue (s : String) (max : Nat := 63) : String :=
-  let kept := s.toList.filter (fun c => c.isAlphanum || c == '.' || c == '_' || c == '-')
-  let trimmed := (kept.drop (kept.length - max)).dropWhile (!·.isAlphanum)
-  String.ofList (trimmed.reverse.dropWhile (!·.isAlphanum)).reverse
-
 /-- The label marking a workspace claim as used by `taskId`. The name part of a label key is at most
     63 characters, two of which are the `t-`. -/
 def taskLabel (taskId : String) : String := s!"orchestra.dev/t-{labelValue taskId 61}"
 
-/-- The annotation naming the task whose pod holds a workspace claim right now. -/
+/-- The annotation naming the task whose pod holds a workspace claim right now, and since when:
+    `<task>@<epoch seconds>`. The time matters for the window between taking the claim and the pod
+    existing, when the holder has no pod to show for it yet. -/
 def inUseAnnotation : String := "orchestra.dev/in-use"
 
 /-- The annotation recording when a workspace claim was last used, in epoch seconds. -/
 def lastUsedAnnotation : String := "orchestra.dev/last-used"
 
-/-- The claim a new task chain is given. -/
+/-- The value of `inUseAnnotation` for `taskId`, taken at `now`. -/
+def inUseValue (taskId : String) (now : Nat) : String := s!"{labelValue taskId}@{now}"
+
+/-- The claim a new task chain is given: labelled for the task that made it, and marked in use by it
+    from the moment it exists, so there is no instant at which another task could take it. -/
 def workspaceClaimManifest (cfg : Config) (tv : TaskVolumes) (spec : SessionSpec)
     (name taskId : String) (now : Nat) : Json :=
   Json.mkObj [
@@ -918,7 +926,8 @@ def workspaceClaimManifest (cfg : Config) (tv : TaskVolumes) (spec : SessionSpec
         ++ (match spec.repo with
             | some r => [("orchestra.dev/repo", Json.str (labelValue (r.replace "/" ".")))]
             | none   => []))),
-      ("annotations", Json.mkObj [(lastUsedAnnotation, .str (toString now))])]),
+      ("annotations", Json.mkObj [(lastUsedAnnotation, .str (toString now)),
+        (inUseAnnotation, .str (inUseValue taskId now))])]),
     ("spec", Json.mkObj ([
       ("accessModes", .arr #[.str "ReadWriteOnce"]),
       ("resources", Json.mkObj [("requests", Json.mkObj [("storage", .str tv.size)])])]
@@ -931,39 +940,84 @@ private def epochNow : IO Nat := do
   let out ← IO.Process.output { cmd := "date", args := #["+%s"] }
   return out.stdout.trimAscii.toNat?.getD 0
 
+/-- One workspace claim as the cluster reports it. -/
+structure ClaimRow where
+  name : String
+  resourceVersion : String
+  /-- `inUseAnnotation`, empty when nobody holds it. -/
+  inUse : String
+  /-- `lastUsedAnnotation`. -/
+  lastUsed : Option Nat
+  /-- Set once the claim is being deleted; such a claim is never handed out. -/
+  terminating : Bool
+
+/-- The workspace claims matching `selector`. -/
+private def listClaims (cfg : Config) (selector : String) : IO (Except String (List ClaimRow)) := do
+  let (code, out, err) ← kube cfg #["get", "pvc", "-l", selector, "-o",
+    "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.metadata.resourceVersion}{\"\\t\"}\
+{.metadata.annotations.orchestra\\.dev/in-use}{\"\\t\"}{.metadata.annotations.orchestra\\.dev/last-used}\
+{\"\\t\"}{.metadata.deletionTimestamp}{\"\\n\"}{end}"]
+  if code != 0 then return .error err.trimAscii.toString
+  return .ok <| (out.splitOn "\n").filterMap fun line =>
+    match line.splitOn "\t" with
+    | [n, rv, use, used, del] =>
+      if n.trimAscii.isEmpty then none
+      else some { name := n.trimAscii.toString, resourceVersion := rv.trimAscii.toString
+                  inUse := use.trimAscii.toString, lastUsed := used.trimAscii.toString.toNat?
+                  terminating := !del.trimAscii.isEmpty }
+    | _ => none
+
+/-- Whether the holder named in an in-use annotation is still working: its pod is up (not finished,
+    not failed), or it took the claim so recently that its pod may not exist yet. A holder whose
+    daemon died is neither, and its claim can be taken over. -/
+private def holderAlive (cfg : Config) (inUse : String) (now : Nat) : IO Bool := do
+  if inUse.isEmpty then return false
+  let (holder, since) := match inUse.splitOn "@" with
+    | [h, t] => (h, t.toNat?.getD 0)
+    | _      => (inUse, 0)
+  if now < since + cfg.startupTimeoutSeconds + 120 then return true
+  let (code, pods, _) ← kube cfg #["get", "pods", "-l",
+    s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/task={labelValue holder}",
+    "--field-selector=status.phase!=Failed,status.phase!=Succeeded", "-o", "name"]
+  -- Not knowing is not the same as knowing it is gone: an API hiccup must not hand one tree to two
+  -- agents.
+  if code != 0 then return true
+  return !pods.trimAscii.isEmpty
+
 /-- Delete workspace claims nobody has used for `retentionDays`. Best effort, and quiet about it:
-    a sweep that fails costs disk, not a task. A claim still mounted by a running pod is protected
-    by the cluster until the pod is gone, and one in use was touched when its task started anyway. -/
+    a sweep that fails costs disk, not a task. A claim whose holder is still working is skipped
+    however old its last-use stamp, and so is one already on its way out. -/
 private def sweepWorkspaceClaims (cfg : Config) (tv : TaskVolumes) : IO Unit := do
   try
-    let (code, out, _) ← kube cfg #["get", "pvc", "-l",
-      "app.kubernetes.io/managed-by=orchestra,orchestra.dev/kind=workspace", "-o",
-      "jsonpath={range .items[*]}{.metadata.name} {.metadata.annotations.orchestra\\.dev/last-used}{\"\\n\"}{end}"]
-    if code != 0 then return
+    let .ok rows ← listClaims cfg "app.kubernetes.io/managed-by=orchestra,orchestra.dev/kind=workspace"
+      | return
     let now ← epochNow
-    let cutoff := tv.retentionDays * 86400
-    for line in out.splitOn "\n" do
-      match line.trimAscii.toString.splitOn " " with
-      | [name, used] =>
-        if let some t := used.toNat? then
-          if now > t + cutoff then
-            IO.println s!"  [k8s] deleting workspace claim {name}: unused for over {tv.retentionDays} days"
-            let _ ← kube cfg #["delete", "pvc", name, "--wait=false", "--ignore-not-found"]
-      | _ => pure ()
+    let cutoff := max 1 tv.retentionDays * 86400
+    for r in rows do
+      if r.terminating then continue
+      let some t := r.lastUsed | continue
+      if now ≤ t + cutoff then continue
+      if ← holderAlive cfg r.inUse now then continue
+      IO.println s!"  [k8s] deleting workspace claim {r.name}: unused for over {tv.retentionDays} days"
+      let _ ← kube cfg #["delete", "pvc", r.name, "--wait=false", "--ignore-not-found"]
   catch _ => pure ()
 
-/-- Record that a claim is now this task's: its label, so a continuation of it finds the claim; the
-    in-use mark, so nothing else mounts it meanwhile; and the time retention measures from. -/
-private def claimWorkspace (cfg : Config) (name taskId : String) : IO Unit := do
+/-- Take a claim for `taskId`: one compare-and-swap on the in-use annotation, against the version
+    the caller read, so two tasks reading "free" at once cannot both win. Then the label a
+    continuation of this task will look it up by. -/
+private def takeClaim (cfg : Config) (row : ClaimRow) (taskId : String) : IO Bool := do
   let now ← epochNow
-  let (code, _, err) ← kube cfg #["label", "pvc", name, "--overwrite", s!"{taskLabel taskId}=1"]
-  if code != 0 then
-    throw (IO.userError s!"kubernetes: could not label workspace claim {name}: {err.trimAscii}")
-  let _ ← kube cfg #["annotate", "pvc", name, "--overwrite",
-    s!"{lastUsedAnnotation}={now}", s!"{inUseAnnotation}={labelValue taskId}"]
+  let (code, _, _) ← kube cfg #["annotate", "pvc", row.name, "--overwrite",
+    s!"--resource-version={row.resourceVersion}",
+    s!"{inUseAnnotation}={inUseValue taskId now}", s!"{lastUsedAnnotation}={now}"]
+  if code != 0 then return false
+  let (lcode, _, lerr) ← kube cfg #["label", "pvc", row.name, "--overwrite", s!"{taskLabel taskId}=1"]
+  if lcode != 0 then
+    throw (IO.userError s!"kubernetes: could not label workspace claim {row.name}: {lerr.trimAscii}")
+  return true
 
-/-- Let go of a claim when the task's pod is gone. Best effort: a claim left marked in use by a pod
-    that no longer exists is taken over by the next task that asks for it (`acquireWorkspaceClaim`). -/
+/-- Let go of a claim once the task's pod is gone. Best effort: a claim left marked by a holder that
+    is no longer working is taken over by the next task that asks for it (`holderAlive`). -/
 private def releaseWorkspace (cfg : Config) (name : String) : IO Unit := do
   try
     let now ← epochNow
@@ -971,96 +1025,102 @@ private def releaseWorkspace (cfg : Config) (name : String) : IO Unit := do
       s!"{inUseAnnotation}-"]
   catch _ => pure ()
 
+/-- Make a new claim for `taskId`, already marked in use by it. -/
+private def createClaim (cfg : Config) (tv : TaskVolumes) (spec : SessionSpec) (taskId : String)
+    : IO String := do
+  let name := s!"orchestra-ws-{← randomHex 8}"
+  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
+  IO.FS.createDirAll dir
+  let path := dir / "pvc.json"
+  IO.FS.writeFile path (workspaceClaimManifest cfg tv spec name taskId (← epochNow)).compress
+  let (code, _, err) ← kube cfg #["create", "-f", path.toString]
+  try IO.FS.removeDirAll dir catch _ => pure ()
+  if code != 0 then
+    throw (IO.userError s!"kubernetes: could not create workspace claim {name}: {err.trimAscii}")
+  return name
+
 /-- The claim this task works on, and whether it is one a predecessor left (so its tree is already
     there and must not be overwritten).
 
     A continuation is handed the claim its predecessor used, or refused: starting it on a fresh
     tree would answer a follow-up prompt with a model whose context describes edits that are not
-    there. A claim another task's pod still holds is refused too — two agents in one tree is how
-    each undoes the other's work. Anything that continues nothing gets a new claim. -/
+    there — unless the caller said a fresh one will do (`SessionSpec.continuationOptional`, for a
+    chat session whose agent never got as far as starting). A claim another task is still working
+    in is refused too: two agents in one tree is how each undoes the other's work. Anything that
+    continues nothing gets a new claim. -/
 private def acquireWorkspaceClaim (cfg : Config) (tv : TaskVolumes) (spec : SessionSpec)
     (taskId : String) : IO (String × Bool) := do
   sweepWorkspaceClaims cfg tv
-  match spec.continuesFrom with
-  | some prev =>
-    let (code, out, err) ← kube cfg #["get", "pvc", "-l",
-      s!"app.kubernetes.io/managed-by=orchestra,{taskLabel prev}", "-o",
-      "jsonpath={range .items[*]}{.metadata.name} {.metadata.annotations.orchestra\\.dev/in-use}{\"\\n\"}{end}"]
-    if code != 0 then
-      throw (IO.userError s!"kubernetes: could not look up the workspace of {prev}: {err.trimAscii}")
-    let rows := (out.splitOn "\n").filterMap fun l =>
-      match (l.trimAscii.toString.splitOn " ").filter (· ≠ "") with
-      | [n]    => some (n, none)
-      | [n, h] => some (n, some h)
-      | _      => none
+  let some prev := spec.continuesFrom | return (← createClaim cfg tv spec taskId, false)
+  -- A few rounds, for the case where another task changes the claim between our read and our
+  -- swap: that one is either taking it (and the next read says so) or letting it go.
+  for _ in [0:3] do
+    let rows ← match ← listClaims cfg s!"app.kubernetes.io/managed-by=orchestra,{taskLabel prev}" with
+      | .ok rs   => pure (rs.filter (!·.terminating))
+      | .error e => throw (IO.userError s!"kubernetes: could not look up the workspace of {prev}: {e}")
     match rows with
-    | [(name, holder)] =>
-      -- Held by a task other than this one (a waking session asks for its own claim) whose pod
-      -- is still there: someone is working in this tree right now.
-      if let some h := holder then
-        if h != labelValue taskId then
-          let (_, pods, _) ← kube cfg #["get", "pods", "-l",
-            s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/task={h}", "-o", "name"]
-          unless pods.trimAscii.isEmpty do
-            throw (IO.userError s!"kubernetes: {taskId} continues {prev}, whose workspace volume \
-{name} is in use by {h} right now. Two agents in one tree would undo each other's work; continue \
-{h} instead, or wait for it to finish.")
-      claimWorkspace cfg name taskId
-      return (name, true)
     | [] =>
+      if spec.continuationOptional then return (← createClaim cfg tv spec taskId, false)
       throw (IO.userError s!"kubernetes: {taskId} continues {prev}, but no workspace volume is \
 left for {prev} — it ran before task volumes were enabled, or went unused for more than \
 {tv.retentionDays} days and was deleted. Queue the work as a task of its own.")
+    | [row] =>
+      let now ← epochNow
+      let ownHold := row.inUse.startsWith s!"{labelValue taskId}@"
+      if !ownHold && (← holderAlive cfg row.inUse now) then
+        throw (IO.userError s!"kubernetes: {taskId} continues {prev}, whose workspace volume \
+{row.name} is in use by {(row.inUse.splitOn "@").headD row.inUse} right now. Two agents in one \
+tree would undo each other's work; continue that task instead, or wait for it to finish.")
+      if ← takeClaim cfg row taskId then return (row.name, true)
     | many =>
       throw (IO.userError s!"kubernetes: more than one workspace volume is labelled as used by \
-{prev} ({String.intercalate ", " (many.map (·.1))}); refusing to guess which one {taskId} continues")
-  | none =>
-    let name := s!"orchestra-ws-{← randomHex 8}"
-    let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
-    IO.FS.createDirAll dir
-    let path := dir / "pvc.json"
-    IO.FS.writeFile path (workspaceClaimManifest cfg tv spec name taskId (← epochNow)).compress
-    let (code, _, err) ← kube cfg #["create", "-f", path.toString]
-    try IO.FS.removeDirAll dir catch _ => pure ()
-    if code != 0 then
-      throw (IO.userError s!"kubernetes: could not create workspace claim {name}: {err.trimAscii}")
-    let _ ← kube cfg #["annotate", "pvc", name, "--overwrite", s!"{inUseAnnotation}={labelValue taskId}"]
-    return (name, false)
+{prev} ({String.intercalate ", " (many.map (·.name))}); refusing to guess which one {taskId} continues")
+  throw (IO.userError s!"kubernetes: the workspace volume of {prev} kept changing while {taskId} \
+tried to take it; another task is contending for it")
 
 /-- Copy the seed paths (`TaskVolumes.seedPaths`) the daemon holds for this repository into a fresh
-    workspace. Missing ones are skipped: the first task on a repository has nothing to seed from. -/
+    workspace. Missing ones are skipped — the first task on a repository has nothing to seed from —
+    and a failed copy is a warning, not a failed task: a seed is a head start, not a result. -/
 private def stageSeeds (cfg : Config) (tv : TaskVolumes) (podName : String)
     (seedDir : System.FilePath) (mount : String) : IO Unit := do
   for p in tv.seedPaths do
     let src := seedDir / p
-    if ← src.isDir then
-      mkdirInPod cfg podName s!"{mount}/{p}"
-      stageIn cfg podName src.toString s!"{mount}/{p}"
+    try
+      if ← src.isDir then
+        mkdirInPod cfg podName s!"{mount}/{p}"
+        stageIn cfg podName src.toString s!"{mount}/{p}"
+    catch e =>
+      IO.eprintln s!"  [k8s] warning: could not seed {p} into the new workspace: {e}"
 
 /-- Copy the seed paths back out of the pod into the daemon's seed directory, each replacing what
-    was there. Best effort — a seed is a head start, not a result — and each path is assembled
-    beside the old one and renamed into place, so a failed copy leaves the previous seed whole. -/
+    was there. Best effort, like staging them. Serialised per repository with `flock`, so two tasks
+    ending at once cannot interleave their swaps; the archive is written to a file before anything
+    is moved, so a broken stream leaves the previous seed whole rather than installing half of one. -/
 private def exportSeeds (cfg : Config) (tv : TaskVolumes) (podName : String)
     (seedDir : System.FilePath) (mount : String) : IO Unit := do
   for p in tv.seedPaths do
     let target := (seedDir / p).toString
-    let incoming := s!"{target}.orchestra-incoming-{← randomHex 4}"
-    let previous := s!"{target}.orchestra-previous-{← randomHex 4}"
+    let tag ← randomHex 4
+    let incoming := s!"{target}.orchestra-incoming-{tag}"
+    let previous := s!"{target}.orchestra-previous-{tag}"
+    let archive := s!"{target}.orchestra-{tag}.tar"
+    let kubectl := s!"{shellEscape cfg.kubectl} -n {shellEscape cfg.ns} exec {shellEscape podName} --"
     let script := s!"set -e\n\
-{shellEscape cfg.kubectl} -n {shellEscape cfg.ns} exec {shellEscape podName} -- \
-test -d {shellEscape s!"{mount}/{p}"} || exit 0\n\
+mkdir -p {shellEscape seedDir.toString} \"$(dirname {shellEscape target})\"\n\
+exec 9> {shellEscape (seedDir / ".lock").toString}\n\
+flock 9\n\
+{kubectl} test -d {shellEscape s!"{mount}/{p}"} || exit 0\n\
+trap 'rm -rf {shellEscape incoming} {shellEscape archive}' EXIT\n\
+{kubectl} tar -C {shellEscape s!"{mount}/{p}"} -cf - . > {shellEscape archive}\n\
 mkdir -p {shellEscape incoming}\n\
-{shellEscape cfg.kubectl} -n {shellEscape cfg.ns} exec {shellEscape podName} -- \
-tar -C {shellEscape s!"{mount}/{p}"} -cf - . | tar -C {shellEscape incoming} -xf -\n\
-mkdir -p \"$(dirname {shellEscape target})\"\n\
-if [ -e {shellEscape target} ]; then mv {shellEscape target} {shellEscape previous}; fi\n\
-mv {shellEscape incoming} {shellEscape target}\n\
+tar -C {shellEscape incoming} -xf {shellEscape archive}\n\
+if [ -e {shellEscape target} ]; then mv -T {shellEscape target} {shellEscape previous}; fi\n\
+mv -T {shellEscape incoming} {shellEscape target}\n\
 rm -rf {shellEscape previous}\n"
     let (code, _, err) ← shell script
     if code != 0 then
-      let _ ← shell s!"rm -rf {shellEscape incoming}; \
-if [ ! -e {shellEscape target} ] && [ -d {shellEscape previous} ]; then \
-mv {shellEscape previous} {shellEscape target}; fi"
+      let _ ← shell s!"if [ ! -e {shellEscape target} ] && [ -d {shellEscape previous} ]; then \
+mv -T {shellEscape previous} {shellEscape target}; fi"
       IO.eprintln s!"  [k8s] warning: could not keep {p} as the seed for the next task: {err.trimAscii}"
 
 /-! ## The session -/
@@ -1071,7 +1131,7 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
   let image ← match imageFor cfg spec with
     | .ok i    => pure i
     | .error e => throw (IO.userError s!"kubernetes: {e}")
-  -- A task volume only for a task: the merger, `prepare` and `orchestra interactive` have nothing
+  -- A task volume only for what asks for one (`taskId`): the merger and `prepare` have nothing
   -- to continue and nothing worth keeping, and get the throwaway pod they always had.
   let volume : Option (TaskVolumes × String × Bool) ← match cfg.taskVolumes, spec.taskId with
     | some tv, some tid =>
@@ -1094,24 +1154,35 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
   let (code, _, err) ← kube cfg #["create", "-f", manifestPath.toString]
   try IO.FS.removeDirAll dir catch _ => pure ()
   -- The claim is let go of whenever the pod is: when the task is done with it, and on every way
-  -- of failing to start one.
+  -- of failing to start one. A claim made for this task and never used is deleted rather than kept:
+  -- it holds an empty or half-copied tree, and a start that keeps failing would otherwise leave one
+  -- behind per attempt.
   let releaseClaim : IO Unit := match volume with
     | some (_, claim, _) => releaseWorkspace cfg claim
     | none => pure ()
+  let abandonClaim : IO Unit := match volume with
+    | some (_, claim, false) =>
+      discard <| (try kube cfg #["delete", "pvc", claim, "--wait=false", "--ignore-not-found"]
+                  catch _ => pure (0, "", ""))
+    | _ => releaseClaim
   if code != 0 then
-    releaseClaim
+    abandonClaim
     throw (IO.userError s!"kubernetes: could not create pod {podName}: {err.trimAscii}")
-  let deletePod : IO Unit := do
-    let _ ← try kube cfg #["delete", "pod", podName, "--now", "--wait=false",
-                           "--ignore-not-found"] catch _ => pure (0, "", "")
-    releaseClaim
+  -- On a task volume the pod is waited for before the claim is let go of: a continuation that
+  -- mounted it while a cancelled agent was still writing would be two agents in one tree.
+  let removePod : IO Unit := do
+    let _ ← try kube cfg #["delete", "pod", podName, "--now", "--ignore-not-found",
+                           if volume.isSome then "--timeout=120s" else "--wait=false"]
+            catch _ => pure (0, "", "")
+  let deletePod : IO Unit := do removePod; releaseClaim
+  let failPod : IO Unit := do removePod; abandonClaim
   -- Ready, not merely created: the next thing this does is copy a repository through
   -- `kubectl exec`, which needs a container that has actually started.
   let (waitCode, _, waitErr) ← kube cfg #["wait", "--for=condition=Ready", s!"pod/{podName}",
     s!"--timeout={cfg.startupTimeoutSeconds}s"]
   if waitCode != 0 then
     let why ← startupDiagnosis cfg podName
-    deletePod
+    failPod
     throw (IO.userError s!"kubernetes: pod {podName} did not become ready within \
 {cfg.startupTimeoutSeconds}s ({why}): {waitErr.trimAscii}")
   try
@@ -1130,7 +1201,7 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
       | none =>
         stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
   catch e =>
-    deletePod
+    failPod
     throw e
   -- Each command gets its own environment file, so a later one cannot be handed an earlier one's
   -- variables by accident.
@@ -1303,11 +1374,12 @@ and get on pods/log."
   -- Task volumes need their own verbs, and a Role written for the pods alone is the usual way to
   -- be missing them: every task would then fail at its first `kubectl create pvc`.
   if cfg.taskVolumes.isSome then
-    let (code, out, err) ← kube cfg #["auth", "can-i", "create", "persistentvolumeclaims"]
-    if code != 0 || out.trimAscii.toString != "yes" then
-      return .error s!"task_volumes is set, but this daemon may not create persistentvolumeclaims \
-in namespace '{cfg.ns}' ({(out ++ err).trimAscii}). It needs get/list/create/patch/delete on \
-persistentvolumeclaims as well as what pods need."
+    for verb in ["get", "list", "create", "patch", "delete"] do
+      let (code, out, err) ← kube cfg #["auth", "can-i", verb, "persistentvolumeclaims"]
+      if code != 0 || out.trimAscii.toString != "yes" then
+        return .error s!"task_volumes is set, but this daemon may not {verb} \
+persistentvolumeclaims in namespace '{cfg.ns}' ({(out ++ err).trimAscii}). It needs \
+get/list/create/patch/delete on persistentvolumeclaims as well as what pods need."
   return .ok ()
 
 /-- Kubernetes as an execution backend. -/

@@ -516,7 +516,7 @@ def aWorkspaceClaimIsLabelledForWhatContinuesIt : Test := do
   TestM.assertEqual (labelValue "interactive-ab12") "interactive-ab12"
   TestM.assertEqual (labelValue "-a/b c_") "abc"
   TestM.assert ((labelValue (String.ofList (List.replicate 80 'x'))).length ≤ 63) "and kept short"
-  TestM.assert ((taskLabel (String.ofList (List.replicate 80 'x'))).length ≤ 16 + 63)
+  TestM.assert ((taskLabel (String.ofList (List.replicate 80 'x'))).length ≤ 16 + 61)
     "a task label's name part fits too"
 
 @[test]

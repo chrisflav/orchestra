@@ -637,6 +637,20 @@ def removeTaskDir (path : System.FilePath) : IO Unit := do
   try if ← path.pathExists then IO.FS.removeDirAll path
   catch e => IO.eprintln s!"  Warning: could not remove {path}: {e}"
 
+/-- Remove per-task checkouts and workspaces left behind by tasks that never got to remove their
+    own — a daemon that crashed, a task that failed before its environment was opened. Anything
+    older than a day: no task holds its checkout that long, since the checkout is only what its
+    workspace is filled from at the start. Best effort. -/
+def sweepTaskDirs : IO Unit := do
+  try
+    let work ← workDir
+    let ws := (← workspaceBase) / "tasks"
+    let q (s : String) : String := "'" ++ s.replace "'" "'\\''" ++ "'"
+    let script := s!"for d in {q work.toString}/*/*-tasks {q ws.toString}; do \
+[ -d \"$d\" ] && find \"$d\" -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {"{}"} +; done; true"
+    let _ ← IO.Process.output { cmd := "/bin/sh", args := #["-c", script] }
+  catch _ => pure ()
+
 /-- Every scratch workspace that currently exists, in name order. -/
 def listWorkspaces (base : Option System.FilePath := none) : IO (Array System.FilePath) := do
   let base ← resolveWorkspaceBase base

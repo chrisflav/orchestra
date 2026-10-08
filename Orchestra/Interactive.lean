@@ -340,7 +340,7 @@ private def find (mgr : Manager) (id : String) : IO (Option LiveSession) := do
     fresh one), and the slot occupant whose working tree may be kept. -/
 private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repository)
     (slot : Nat) (agentDef : AgentDef) (debug : Bool) (onFailure : SessionStatus)
-    (prepare : IO (SessionRecord × Option String × Option String))
+    (prepare : IO (SessionRecord × Option String × Option String × Option (String × Bool)))
     : IO (Except String SessionRecord) := do
   -- `shutdownRef` is how the MCP server joins the slot's guarantee. It is empty until
   -- `Server.start` succeeds and holds that server's own shutdown afterwards, so the handler
@@ -399,7 +399,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       saveSession { r with lastEventSeq := seq }
     return .error msg
   try
-    let (record, resumeAgentSession, resumeSlotOf) ← prepare
+    let (record, resumeAgentSession, resumeSlotOf, workspaceOf) ← prepare
     recordRef.set (some record)
     let backendName := record.backend
     let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
@@ -454,10 +454,11 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let seedDir ← if keepsWorkspaces then some <$> Repo.seedPath fork else pure none
     let execSession ← execBackend.openSession {
       workdir := repoPath
-      -- Keyed by the session, so a wake finds the volume its first start made. Only a wake that
-      -- has a conversation to resume asks for it back; one whose agent never started begins anew.
+      -- Keyed by the session, so a wake finds the volume its first start made, and a session
+      -- started from another one finds that one's (see `workspaceOf`).
       taskId  := if keepsWorkspaces then some record.id else none
-      continuesFrom := if keepsWorkspaces && resumeAgentSession.isSome then some record.id else none
+      continuesFrom := if keepsWorkspaces then workspaceOf.map (·.1) else none
+      continuationOptional := workspaceOf.map (·.2) |>.getD false
       seedDir
       grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths
                    repoPath false pluginDirs identityMemory.toArray
@@ -648,8 +649,11 @@ task or another session"
       identity := spec.identity
     }
     saveSession record
+    -- On a backend that keeps workspaces, a session started from another one is handed *that*
+    -- session's volume — required only if it has a conversation to resume.
     return (record, resumed.bind (·.agentSessionId),
-            resumed.filter (·.slot == slot) |>.map (·.id))
+            resumed.filter (·.slot == slot) |>.map (·.id),
+            resumed.map fun r => (r.id, !r.agentStarted))
 
 /-- Bring a dormant session back up, resuming the conversation it was having.
 
@@ -690,7 +694,9 @@ task or another session"
     let resumeAgentSession := if record.agentStarted then record.agentSessionId else none
     -- The tree this session left behind, if the slot it left it in is the one just handed back.
     let resumeSlotOf := if slot == record.slot then some record.id else none
-    return (woken, resumeAgentSession, resumeSlotOf)
+    -- A wake always asks for its own volume back; a fresh one will do only if the agent never
+    -- started, so there is no conversation (and no tree worth keeping) to lose.
+    return (woken, resumeAgentSession, resumeSlotOf, some (record.id, !record.agentStarted))
 
 /-! ## Talking to one -/
 

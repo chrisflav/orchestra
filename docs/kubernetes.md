@@ -62,8 +62,8 @@ behind the transcript.
 it up again with: `orchestra interactive --resume <id>`. The same flag takes a queued task's id, to
 continue that task by hand in its own tree, with its build and its conversation.
 
-Cancelling a task deletes the pod, which ends whatever was running in it. Nothing is copied back
-from a cancelled task.
+Cancelling a task ends the agent in the pod, and the pod is deleted when the task closes. With
+`task_volumes` the tree stays on the claim for a continuation, as it does after any other ending.
 
 ## what you need
 
@@ -347,6 +347,13 @@ the agent's `$HOME`, and keeps it after the pod is gone:
   daemon: no agent sees another's credentials, history or scratch files.
 - **A continuation with no claim to be handed** — its predecessor ran before `task_volumes` was set,
   or its claim went unused for `retention_days` and was deleted — fails at the start and says so.
+- **A claim holds a chain, not a task.** It carries the tree as the *last* task on it left it, so
+  continuing an earlier task in the chain (or retrying a continuation) resumes that task's
+  conversation in the later tree. And while a continuation's predecessor is still running the
+  queue holds it back, since its workspace is in use.
+- **The repository's hooks are found in the daemon's checkout of the default branch**, as the
+  task's configuration is: a branch that adds or removes `.orchestra/validation.sh` takes effect
+  for continuations once it is merged.
 - **`seed_paths`** are what a fresh task starts from instead of nothing: when a task ends, those
   paths are copied back to the daemon (`<work>/<owner>/<name>-seed`), and the next fresh claim on
   the repository is filled with them. Build output is the point — a fresh task on a large Lean

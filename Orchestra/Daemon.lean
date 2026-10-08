@@ -251,6 +251,7 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   let slotsHoldTrees := !Exec.keepsWorkspaces appConfig.execution
   if !slotsHoldTrees then
     IO.println "Execution backend keeps task workspaces itself; clone slots only count tasks."
+    Repo.sweepTaskDirs
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
   -- Every task running right now and the token that stops it (one row per worker), which is

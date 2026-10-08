@@ -181,13 +181,16 @@ structure SessionSpec where
       database client. A backend that runs tasks in an image of some kind reads this to decide
       which; one that runs them on this machine has nothing to choose and ignores it. -/
   image : Option String := none
-  /-- The task (or interactive session) this environment is for, for a backend that keeps a task's
-      workspace after it ends (`Backend.persistentWorkspaces`). `none` for runs that are not tasks
-      — the merger, `orchestra prepare`, `orchestra interactive` — which get a throwaway one. -/
+  /-- The task, interactive session or `orchestra interactive` run this environment is for, for a
+      backend that keeps its workspace after it ends (`Backend.persistentWorkspaces`). `none` for
+      what keeps nothing — the merger, `orchestra prepare` — which gets a throwaway one. -/
   taskId : Option String := none
   /-- The task this one continues, whose kept workspace — tree, build and agent home — it should be
       handed instead of `workdir`'s contents. A waking interactive session names itself. -/
   continuesFrom : Option String := none
+  /-- Whether a fresh workspace will do when `continuesFrom` has none left: for a chat session that
+      is woken although its agent never started, so there is no conversation to lose. -/
+  continuationOptional : Bool := false
   /-- Where the daemon keeps build output carried from one task chain to the next, for this
       repository. Read when a fresh workspace is filled, written when a task ends. -/
   seedDir : Option System.FilePath := none

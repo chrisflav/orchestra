@@ -191,6 +191,11 @@ def onABackendThatKeepsWorkspacesAContinuationNeitherWaitsNorPrefers : Test := d
   let got ← Queue.claimDecision ctx all (predIn all) occupant
   TestM.assertEqual (got.map (·.slot)) (some 0) (msg := "any free slot, not a wait for slot 3")
   TestM.assertEqual (got.bind (·.resumeFrom)) none (msg := "and no tree is kept in it")
+  -- But a predecessor that is still running holds the workspace the continuation needs, so the
+  -- continuation waits for it rather than starting and being refused by the backend.
+  let running := #[{ pred with status := .running }, cont]
+  let got' ← Queue.claimDecision ctx running (predIn running) occupant
+  TestM.assertEqual (got'.map (·.entry.id)) none (msg := "a continuation of a running task waits")
 
 /-! ## The scratch workspace -/
 
