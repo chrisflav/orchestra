@@ -63,7 +63,9 @@ from a cancelled task.
 
 **On the daemon:** `kubectl`, configured for the cluster and namespace. The backend checks at the
 start of every task that it is there and that it may create pods, and fails the task with one line
-if not, rather than dispatching into a cluster that will refuse it.
+if not, rather than dispatching into a cluster that will refuse it. The daemon image
+(`docker/Dockerfile`) carries one at `/usr/local/bin/kubectl`; what it needs from you is the
+credential, as a kubeconfig named by `KUBECONFIG`.
 
 **In the image:** the agent CLI (`claude`, `vibe`, `opencode` or `pi`), `sh`, `bash` (the
 repository's scripts are run with it), `tar`, `nc` and `git`. That is the fixed part — the same

@@ -98,6 +98,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code
 
+# kubectl, for the `kubernetes` execution backend: the daemon creates each task's pod, stages the
+# checkout and runs every command in it through `kubectl` (docs/kubernetes.md). Without it here an
+# operator has to mount a binary in from the host, which works only for a statically linked one and
+# is one more thing to keep in step with the image. A static Go binary, so the cost is its ~50MB.
+#
+# Pinned like the agent image's (docker/agent.Dockerfile): Kubernetes supports a client one minor
+# version either side of the server, so this does not have to track any particular cluster.
+ARG KUBECTL_VERSION=v1.34.9
+RUN curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+ && curl -fsSL -o /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \
+ && echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum --check --status \
+ && install -m 0755 /tmp/kubectl /usr/local/bin/kubectl \
+ && rm -f /tmp/kubectl /tmp/kubectl.sha256 \
+ && kubectl version --client=true --output=yaml >/dev/null
+
 # Skills shipped with orchestra, seeded into /config on first start by the entrypoint. Baked in
 # at a fixed path because /config is a bind mount and starts empty.
 COPY skills /opt/orchestra/skills
