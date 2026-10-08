@@ -62,7 +62,27 @@ RUN apt-get update \
       netcat-openbsd \
       tar \
       xz-utils \
+      `# Not required by the backend, but by what agents routinely do: jq for JSON (and the Lean` \
+      `# cache shim below), ripgrep because agents search code with it, procps for ps/top when a` \
+      `# build is slow. A few MB together, and every task that wants one otherwise installs it.` \
+      jq \
+      procps \
+      ripgrep \
  && rm -rf /var/lib/apt/lists/*
+
+# gh, the GitHub CLI. Agents review and open pull requests with it (`gh pr diff`, `gh pr checkout`,
+# `gh pr create`), and the daemon image has carried it all along -- so a task that worked under the
+# local backend reached for a tool that was missing as soon as it ran in a pod. It authenticates
+# from GH_TOKEN, which is the per-task token orchestra already hands the agent.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/* \
+ && gh --version
 
 # The agent CLI. npm comes with the base image and stays — a JS repository's `init.sh` wants it,
 # and it is how this is installed in the first place.
@@ -80,17 +100,28 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 # as symlinks, and which names to create is asked of elan (installed into a throwaway ELAN_HOME
 # with no toolchain) rather than hardcoded, so a release that adds a shim is picked up by the next
 # build instead of going missing.
+#
+# They point at `lean-cache-shim` rather than at elan directly. With no Lean cache mounted the shim
+# is a bare `exec elan`; with one, it first links the toolchain and Mathlib's packages in from it,
+# so a task stops downloading 7.5 GB and every pod on a node shares one copy of the oleans. See
+# docker/lean-cache-shim.sh and "a shared Lean cache" in docs/kubernetes.md. `lean-cache-warm` is
+# the other half -- what fills that cache -- and lives here so the two cannot drift apart.
 RUN curl -fsSL "https://github.com/leanprover/elan/releases/download/${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz" \
       | tar -xz -C /tmp \
  && install -m 0755 /tmp/elan-init /usr/local/bin/elan \
  && ELAN_HOME=/tmp/elan-probe /tmp/elan-init -y --no-modify-path --default-toolchain none >/dev/null \
  && for shim in /tmp/elan-probe/bin/*; do \
       name="$(basename "$shim")"; \
-      [ "$name" = elan ] || ln -sf elan "/usr/local/bin/$name"; \
+      [ "$name" = elan ] || ln -sf lean-cache-shim "/usr/local/bin/$name"; \
     done \
  && rm -rf /tmp/elan-probe /tmp/elan-init \
  && elan --version \
  && test -L /usr/local/bin/lake
+
+# After the download, so editing either script does not re-fetch elan. The links above dangle
+# until this layer lands, which nothing in between notices.
+COPY --chmod=0755 docker/lean-cache-shim.sh /usr/local/bin/lean-cache-shim
+COPY --chmod=0755 docker/lean-cache-warm.sh /usr/local/bin/lean-cache-warm
 
 # uv, the Python package and version manager. A static binary plus its `uvx` runner; the Pythons
 # and virtualenvs it installs go under $HOME.
