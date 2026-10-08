@@ -106,8 +106,6 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 # so a task stops downloading 7.5 GB and every pod on a node shares one copy of the oleans. See
 # docker/lean-cache-shim.sh and "a shared Lean cache" in docs/kubernetes.md. `lean-cache-warm` is
 # the other half -- what fills that cache -- and lives here so the two cannot drift apart.
-COPY --chmod=0755 docker/lean-cache-shim.sh /usr/local/bin/lean-cache-shim
-COPY --chmod=0755 docker/lean-cache-warm.sh /usr/local/bin/lean-cache-warm
 RUN curl -fsSL "https://github.com/leanprover/elan/releases/download/${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz" \
       | tar -xz -C /tmp \
  && install -m 0755 /tmp/elan-init /usr/local/bin/elan \
@@ -119,6 +117,11 @@ RUN curl -fsSL "https://github.com/leanprover/elan/releases/download/${ELAN_VERS
  && rm -rf /tmp/elan-probe /tmp/elan-init \
  && elan --version \
  && test -L /usr/local/bin/lake
+
+# After the download, so editing either script does not re-fetch elan. The links above dangle
+# until this layer lands, which nothing in between notices.
+COPY --chmod=0755 docker/lean-cache-shim.sh /usr/local/bin/lean-cache-shim
+COPY --chmod=0755 docker/lean-cache-warm.sh /usr/local/bin/lean-cache-warm
 
 # uv, the Python package and version manager. A static binary plus its `uvx` runner; the Pythons
 # and virtualenvs it installs go under $HOME.

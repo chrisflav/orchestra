@@ -339,7 +339,7 @@ The agent image carries both halves of a read-only alternative:
 
 Nothing in the repository changes: its `lake exe cache get` becomes a no-op, its `lake build`
 replays Mathlib from the shared tree, and only its own modules and its non-Mathlib dependencies are
-built in the pod. Measured on a 24-thread node: `cache get` 9 s instead of a 7.5 GB download, a
+built in the pod. Measured on a 24-thread node: `cache get` about 10 s instead of a 7.5 GB download, a
 pod's `.lake` 35 MB instead of 7.5 GB, and one copy of Mathlib in memory for every pod.
 
 The mounts, with the cache as a read-only claim so that a namespace enforcing the `baseline` Pod
@@ -361,6 +361,11 @@ Security Standard (which refuses `hostPath`) can still use it:
 and links; the project's `.lake/build` still travels, so incremental builds stay incremental. The
 cache has to be world-readable, which the warmer ensures. `LEAN_CACHE_DISABLE=1` turns the shim
 into plain elan.
+
+Two things bypass it. `lake update` drops every cache link before it runs, since it rewrites
+packages in place, so whatever it fetches is the pod's own from then on. And an `elan-init`
+self-install puts its own proxies in `~/.elan/bin`, which is first on `PATH`; a repository that
+wants the cache should use the image's elan rather than installing another.
 
 ## memory, continuations and series
 
