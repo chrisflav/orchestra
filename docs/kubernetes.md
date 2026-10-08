@@ -317,6 +317,51 @@ arrangement the landrun backend gets for free from the machine it runs on. The c
 The checkout's own build output (`.lake`, `target`, `node_modules`) travels with the checkout
 instead; `excludes` keeps it off the wire without removing it from the daemon's copy.
 
+## a shared Lean cache
+
+A Mathlib project is the extreme case of the above: each fresh pod downloads and unpacks about
+7.5 GB before it can build anything, and with a dozen pods on a node the page cache holds a dozen
+copies of the same oleans. `home_claim` does not help — Mathlib lives in the checkout's
+`.lake/packages`, not in `$HOME` — and a writable volume shared by every task would let one task
+change what another builds against.
+
+The agent image carries both halves of a read-only alternative:
+
+- **`lean-cache-warm`** fills a directory with, per Mathlib revision, the toolchain, Mathlib and the
+  packages Mathlib's own manifest pins — built, with the cache archives beside them. It needs only
+  Mathlib's public repository, never the repositories the agents work on. Run it on a schedule as
+  the cache's only writer; it also warms any revision a pod has asked for, and prunes old ones.
+- **`lake`, `lean` and the other elan proxies** are a shim (`docker/lean-cache-shim.sh`). When a
+  cache is mounted at `/lean-cache`, each invocation first symlinks into the project whatever the
+  cache holds at *exactly* the revision `lake-manifest.json` pins, and points Mathlib's
+  `cache get` at the cached archives. Anything not in the cache is left to Lake as usual, and an
+  uncached Mathlib revision is written to `/lean-cache-requests` for the warmer to pick up.
+
+Nothing in the repository changes: its `lake exe cache get` becomes a no-op, its `lake build`
+replays Mathlib from the shared tree, and only its own modules and its non-Mathlib dependencies are
+built in the pod. Measured on a 24-thread node: `cache get` 9 s instead of a 7.5 GB download, a
+pod's `.lake` 35 MB instead of 7.5 GB, and one copy of Mathlib in memory for every pod.
+
+The mounts, with the cache as a read-only claim so that a namespace enforcing the `baseline` Pod
+Security Standard (which refuses `hostPath`) can still use it:
+
+```json
+"volumes": [
+  {"name": "lean-cache", "persistentVolumeClaim": {"claimName": "lean-cache", "readOnly": true}},
+  {"name": "lean-cache-requests", "persistentVolumeClaim": {"claimName": "lean-cache-requests"}}
+],
+"volume_mounts": [
+  {"name": "lean-cache", "mountPath": "/lean-cache", "readOnly": true},
+  {"name": "lean-cache-requests", "mountPath": "/lean-cache-requests"}
+],
+"excludes": [".lake/packages"]
+```
+
+`excludes` keeps the daemon's own `.lake/packages` out of the pod, so the shim finds nothing there
+and links; the project's `.lake/build` still travels, so incremental builds stay incremental. The
+cache has to be world-readable, which the warmer ensures. `LEAN_CACHE_DISABLE=1` turns the shim
+into plain elan.
+
 ## memory, continuations and series
 
 **Memory directories travel with the task.** Orchestra's memory system is a directory on the

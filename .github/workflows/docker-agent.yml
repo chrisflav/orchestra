@@ -18,10 +18,12 @@ on:
     # baked into it — the agent CLI comes from npm, and orchestra itself is not in this image.
     paths:
       - 'docker/agent.Dockerfile'
+      - 'docker/lean-cache-*.sh'
       - '.github/workflows/docker-agent.yml'
   pull_request:
     paths:
       - 'docker/agent.Dockerfile'
+      - 'docker/lean-cache-*.sh'
       - '.github/workflows/docker-agent.yml'
   # Mondays, 04:17 UTC. The agent CLI is the one thing here that moves without a commit, so the
   # schedule is what turns a claude-code release into an image. Off-the-hour because every cron
