@@ -28,6 +28,7 @@
 #   mathlib-cache/<mathlib rev>/        `cache get`'s archives for that revision (MATHLIB_CACHE_DIR)
 #   warmed/<mathlib rev>                when that revision was last warmed *or used*
 #   failed/<mathlib rev>                failed attempts; three within a week and requests are ignored
+#   orphaned/<tc>                       when a toolchain stopped being used by any kept Mathlib
 #
 # REQUESTS. A pod writes $LEAN_CACHE_REQUESTS/<mathlib rev> both when the revision is missing and
 # when it linked it, so the directory doubles as a record of use: a request for a revision already
@@ -127,6 +128,8 @@ TOML
       mkdir -p "$(dirname "$dest")"
       mv "$p" "$dest"      # one rename on one filesystem: a pod sees all of it or none
     done
+    # Dated before it appears, so an entry can never exist without a record of when it was used.
+    date +%s > "$cache/warmed/$rev"
     # Mathlib last: its presence is what the shim and this script test for.
     mv .lake/packages/mathlib "$cache/packages/mathlib/$rev@$tc"
   )
@@ -205,10 +208,17 @@ for d in "$cache/packages"/*/*/; do
   case "$key" in mathlib/*) continue ;; esac
   [ -n "${used[$key]:-}" ] || { echo "pruning $key"; rm -rf "$d"; }
 done
+# A toolchain no kept Mathlib uses may still be linked by a task on a project without Mathlib, so it
+# is only marked at first and deleted once it has stayed unused for the grace period.
+mkdir -p "$cache/orphaned"
 for d in "$ELAN_HOME/toolchains"/*/; do
   [ -d "$d" ] || continue
   t=$(basename "$d")
-  [ -n "${usedtc[$t]:-}" ] || { echo "pruning toolchain $t"; rm -rf "$d"; }
+  if [ -n "${usedtc[$t]:-}" ]; then rm -f "$cache/orphaned/$t"; continue; fi
+  if [ ! -e "$cache/orphaned/$t" ]; then touch "$cache/orphaned/$t"; continue; fi
+  if [ $((now - $(stat -c %Y "$cache/orphaned/$t"))) -ge "$grace" ]; then
+    echo "pruning toolchain $t"; rm -rf "$d" "$cache/orphaned/$t"
+  fi
 done
 
 du -sh "$cache/packages" "$ELAN_HOME" "$cache/mathlib-cache" 2>/dev/null || true
