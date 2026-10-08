@@ -402,10 +402,9 @@ def aFreshEnvironmentRunsTheInitHookEveryTime : Test := do
     TestM.assert (!Local.session.freshEnvironment) "and so does this one"
 
 @[test]
-def apersistentHomeIsWhatMakesInitCheap : Test := do
-  -- Every task starts from a new pod, so a hook that installs a toolchain pays in full each time
-  -- unless what it installs survives — and `~/.elan`, `~/.cargo` and `~/.cache` are all under
-  -- `$HOME`.
+def aScratchHomeIsTheDefault : Test := do
+  -- Every pod starts with an empty `$HOME` unless task volumes are configured: nothing the agent
+  -- wrote about itself outlives the task, and nothing is shared with any other task.
   let volumes (j : Json) : List Json :=
     match j.getObjVal? "spec" |>.toOption |>.bind (·.getObjVal? "volumes" |>.toOption) with
     | some (.arr vs) => vs.toList
@@ -417,30 +416,111 @@ def apersistentHomeIsWhatMakesInitCheap : Test := do
   | some v =>
     TestM.assert (AgentDef.containsCI v.compress "emptyDir")
       "by default it is scratch, and every task installs from nothing"
-  let cachedCfg := config [("home_claim", .str "orchestra-agent-home")]
-  let cached := podManifest cachedCfg sampleSession "orchestra-abc123"
-    (imageOf cachedCfg sampleSession) staged
-  match home cached with
-  | none   => TestM.fail "the pod has no home volume"
-  | some v =>
-    TestM.assert (AgentDef.containsCI v.compress "orchestra-agent-home")
-      "a configured claim becomes the agent's home"
-    TestM.assert (!AgentDef.containsCI v.compress "emptyDir") "and replaces the scratch volume"
+
+/-- The task-volumes configuration the tests below use. -/
+private def tvConfig : Config :=
+  config [("task_volumes", Json.mkObj [("size", .str "30Gi"), ("storage_class", .str "local-path"),
+    ("seed_paths", .arr #[.str ".lake/build"])])]
 
 @[test]
-def aConversationOnlyOutlivesThePodIfHomeDoes : Test := do
-  -- Within a task the pod is reused for every command, so the retry after a failed validation
-  -- resumes what the first attempt started. Across tasks — `continues_from`, a series — the pod is
-  -- gone, and the conversation is a file the agent CLI wrote under its `$HOME`.
+def aSharedHomeClaimIsRefused : Test := do
+  -- `home_claim` gave every agent one `$HOME`: one task's credentials, history and installed
+  -- toolchains visible to every other. It is gone, and a configuration still naming it says so
+  -- rather than silently running with a scratch home.
+  match Config.fromJson (options [("home_claim", .str "orchestra-agent-home")]) with
+  | .ok _    => TestM.fail "a config naming home_claim was accepted"
+  | .error e => TestM.assert (AgentDef.containsCI e "task_volumes") "and the error names the replacement"
+
+@[test]
+def taskVolumesAreReadAndChecked : Test := do
+  match tvConfig.taskVolumes with
+  | none => TestM.fail "task_volumes was not read"
+  | some tv =>
+    TestM.assertEqual tv.size "30Gi"
+    TestM.assertEqual tv.storageClass (some "local-path")
+    TestM.assertEqual tv.mountPath "/workspace"
+    TestM.assertEqual tv.retentionDays 14
+    TestM.assertEqual tv.seedPaths #[".lake/build"]
+  -- A seed path is a path under the checkout on both sides; anything that could name something
+  -- else is refused.
+  for bad in ["../x", "/etc", "a b"] do
+    match Config.fromJson (options [("task_volumes",
+        Json.mkObj [("seed_paths", .arr #[.str bad])])]) with
+    | .ok _    => TestM.fail s!"seed path '{bad}' was accepted"
+    | .error _ => pure ()
+  match Kubernetes.factory.make (options [("task_volumes", Json.mkObj [])]) with
+  | .ok b    => TestM.assert b.persistentWorkspaces "a backend with task volumes keeps workspaces"
+  | .error e => TestM.fail s!"task_volumes with defaults was rejected: {e}"
   match Kubernetes.factory.make (options) with
+  | .ok b    => TestM.assert (!b.persistentWorkspaces) "and one without does not"
   | .error e => TestM.fail s!"a valid config was rejected: {e}"
-  | .ok _    => pure ()
-  let scratch := config
-  let kept    := config [("home_claim", .str "orchestra-agent-home")]
-  TestM.assert (!scratch.homeClaim.isSome)
-    "with a scratch home, nothing the agent wrote about itself outlives the task"
-  TestM.assert kept.homeClaim.isSome
-    "with a claim, home outlives the pod and an earlier task's conversation is still there"
+
+@[test]
+def onATaskVolumeTheCheckoutAndHomeLiveOnTheClaim : Test := do
+  -- The claim holds the checkout and `$HOME` as two subpaths, and the checkout is mounted at one
+  -- fixed path whatever it is called on the daemon, so a continuation runs in the directory its
+  -- predecessor did — which is what the agent CLIs key a saved conversation by.
+  let mount := "/workspace"
+  let st := stagedPaths tvConfig "/home/daemon" sampleSession (some mount)
+  let m := podManifest tvConfig sampleSession "orchestra-abc123" (imageOf tvConfig sampleSession) st
+    (some "orchestra-ws-0123abcd")
+  let c := match m.getObjVal? "spec" |>.toOption |>.bind (·.getObjVal? "containers" |>.toOption) with
+    | some (.arr cs) => cs[0]?
+    | _              => none
+  let mounts := match c.bind (·.getObjVal? "volumeMounts" |>.toOption) with
+    | some (.arr ms) => ms.toList
+    | _              => []
+  let mountOf (path : String) : Option Json :=
+    mounts.find? (fun j => (j.getObjValAs? String "mountPath" |>.toOption) == some path)
+  match mountOf mount, mountOf tvConfig.homePath with
+  | some w, some h =>
+    TestM.assertEqual (w.getObjValAs? String "subPath" |>.toOption) (some "work")
+    TestM.assertEqual (h.getObjValAs? String "subPath" |>.toOption) (some "home")
+    TestM.assertEqual (w.getObjValAs? String "name" |>.toOption) (some workspaceVolumeName)
+  | _, _ => TestM.fail "the checkout and home are not both mounted from the claim"
+  TestM.assert (!mounts.any (fun j => (j.getObjValAs? String "mountPath" |>.toOption)
+      == some sampleSession.workdir.toString))
+    "nothing is mounted at the daemon's own path for the checkout"
+  TestM.assertEqual (c.bind (·.getObjValAs? String "workingDir" |>.toOption)) (some mount)
+  TestM.assert (AgentDef.containsCI m.compress "orchestra-ws-0123abcd") "the claim is the volume"
+  -- Memories and plugins are still carried as before.
+  TestM.assert (mounts.any (fun j => (j.getObjValAs? String "mountPath" |>.toOption)
+      == some "/var/lib/orchestra/memories/acme")) "the memory directory is still staged"
+
+@[test]
+def pathsUnderTheCheckoutAreTranslated : Test := do
+  let w := sampleSession.workdir.toString
+  TestM.assertEqual (podPathOf sampleSession (some "/workspace") w) "/workspace"
+  TestM.assertEqual (podPathOf sampleSession (some "/workspace") s!"{w}/.orchestra/validation.sh")
+    "/workspace/.orchestra/validation.sh"
+  -- A sibling whose name merely starts the same is not under the checkout.
+  TestM.assertEqual (podPathOf sampleSession (some "/workspace") s!"{w}-other/x") s!"{w}-other/x"
+  TestM.assertEqual (podPathOf sampleSession (some "/workspace") "/tmp/agent-mcp.json")
+    "/tmp/agent-mcp.json"
+  TestM.assertEqual (podPathOf sampleSession none s!"{w}/x") s!"{w}/x"
+
+@[test]
+def aWorkspaceClaimIsLabelledForWhatContinuesIt : Test := do
+  let tv := tvConfig.taskVolumes.getD {}
+  let pvc := workspaceClaimManifest tvConfig tv { sampleSession with repo := some "acme/widgets" }
+    "orchestra-ws-0123abcd" "34627810420982140000" 1700000000
+  let s := pvc.compress
+  TestM.assert (AgentDef.containsCI s "\"kind\":\"PersistentVolumeClaim\"") "it is a claim"
+  TestM.assert (AgentDef.containsCI s s!"\"{taskLabel "34627810420982140000"}\":\"1\"")
+    "labelled with the task that made it, so a continuation finds it"
+  TestM.assert (AgentDef.containsCI s "\"storage\":\"30Gi\"") "with the configured size"
+  TestM.assert (AgentDef.containsCI s "\"storageClassName\":\"local-path\"") "and class"
+  TestM.assert (AgentDef.containsCI s "\"orchestra.dev/last-used\":\"1700000000\"")
+    "dated, which is what retention reads"
+  -- Label values and key names have a grammar; anything a task id could be is forced into it.
+  TestM.assertEqual (labelValue "interactive-ab12") "interactive-ab12"
+  TestM.assertEqual (labelValue "-a/b c_") "abc"
+  TestM.assert ((labelValue (String.ofList (List.replicate 80 'x'))).length ≤ 63) "and kept short"
+  TestM.assert ((taskLabel (String.ofList (List.replicate 80 'x'))).length ≤ 16 + 63)
+    "a task label's name part fits too"
+
+@[test]
+def aConversationOnlyOutlivesThePodOnATaskVolume : Test := do
   -- The backends that run on this machine always can: every task shares one home.
   TestM.assert Landrun.session.carriesAgentState "a landrun session carries the agent's state"
   TestM.assert Local.session.carriesAgentState "and so does an unconfined local one"

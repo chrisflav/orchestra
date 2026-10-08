@@ -53,8 +53,14 @@ An interactive **session** — `orchestra chat`, and the dashboard's chat page �
 one `kubectl exec -i` held open for as long as the conversation, with each turn written to the
 agent's stdin as a line and its events streaming back. The pod lives as long as the session does,
 and closing that stdin is how the conversation ends. A session that goes dormant and is later
-woken gets a new pod, so waking one needs `home_claim` for the same reason a continuation does;
-without it the wake is refused rather than starting the conversation over behind the transcript.
+woken gets a new pod, so waking one needs `task_volumes` for the same reason a continuation does:
+the session's volume — tree, build and the agent's home — is kept while it is dormant and handed
+back to the new pod. Without it the wake is refused rather than starting the conversation over
+behind the transcript.
+
+`orchestra interactive` gets a volume too when `task_volumes` is set, and prints the id to pick
+it up again with: `orchestra interactive --resume <id>`. The same flag takes a queued task's id, to
+continue that task by hand in its own tree, with its build and its conversation.
 
 Cancelling a task deletes the pod, which ends whatever was running in it. Nothing is copied back
 from a cancelled task.
@@ -136,10 +142,12 @@ without this image guessing which of those it would be.
 
 Where what they install *goes* is the other half of that. `$HOME` is an `emptyDir` mounted over
 whatever the image put at that path, so a toolchain baked in here would be masked and one installed
-at runtime is gone with the pod — **unless `home_claim` points that mount at a volume**, which is
-exactly what it is for. The managers therefore live in `/usr/local` (never masked) and put their
-content under `$HOME`: `~/.elan`, `~/.cache`, `~/.local`. With a claim, the first task on a
-repository pays for the toolchain and the rest do not; without one, every task pays again.
+at runtime is gone with the pod — except on a task volume, where `$HOME` belongs to the task
+chain and lasts as long as it does. The managers therefore live in `/usr/local` (never masked) and
+put their content under `$HOME`: `~/.elan`, `~/.cache`, `~/.local`. A toolchain installed by one
+task is not shared with the next chain, by design — one agent's home is not another's — so a
+repository that needs a large toolchain on every task names an image with it, or, for Lean, uses
+the shared read-only cache below.
 
 **What it does not carry** is anything a repository needs that a package manager cannot fetch — no
 JDK, no browser, no system libraries beyond the base. A repository that needs those names its own
@@ -263,8 +271,7 @@ the answer. Three sources, settled in this order:
       "images": {
         "acme/widgets": "ghcr.io/acme/widgets-ci:latest",
         "acme/mobile":  "ghcr.io/acme/android-ci:latest"
-      },
-      "home_claim": "orchestra-agent-home"
+      }
     }
   }
 }
@@ -311,21 +318,60 @@ the checkout is exactly what gets carried into a pod that has nothing installed.
 that install a toolchain or warm a build cache are already idempotent for their own reasons — they
 check before they fetch — and that is what is expected of them here.
 
-**`home_claim` is what makes that cheap.** Point it at a `PersistentVolumeClaim` and `$HOME` — with
-`~/.elan`, `~/.cargo`, `~/.cache`, `~/.npm` and the rest under it — survives between tasks, so the
-first task on an image pays for the toolchain and the ones after it do not. That is the same
-arrangement the landrun backend gets for free from the machine it runs on. The claim needs
-`ReadWriteMany`, or `ReadWriteOnce` with every agent pod on one node, since tasks run in parallel.
-The checkout's own build output (`.lake`, `target`, `node_modules`) travels with the checkout
-instead; `excludes` keeps it off the wire without removing it from the daemon's copy.
+
+## per-task volumes
+
+`task_volumes` gives each task chain a `PersistentVolumeClaim` of its own, holding the checkout and
+the agent's `$HOME`, and keeps it after the pod is gone:
+
+```json
+"task_volumes": {
+  "size": "20Gi",
+  "storage_class": "local-path",
+  "retention_days": 14,
+  "seed_paths": [".lake/build"]
+}
+```
+
+- **A task that starts fresh** gets a new claim. The daemon makes a checkout for that task alone
+  (a `git clone --local` from its cache clone, on the up-to-date default branch), copies it onto
+  the claim, and removes it again when the task ends. No clone slot is ever prepared.
+- **A task that continues another one** — `continues_from`, a series, a retry of either — is handed
+  the claim its predecessor used, untouched, in a new pod: the tree with the edits and the branch,
+  the build, and the agent's home with its conversation. However many unrelated tasks ran in
+  between. The checkout is mounted at one fixed path (`mount_path`, `/workspace` by default)
+  whatever it is called on the daemon, because the agent CLIs key a saved conversation by its
+  working directory.
+- **Two tasks never share a claim.** One that continues a task whose claim another task's pod
+  holds right now is refused rather than mounted beside it, and `$HOME` is per chain, not per
+  daemon: no agent sees another's credentials, history or scratch files.
+- **A continuation with no claim to be handed** — its predecessor ran before `task_volumes` was set,
+  or its claim went unused for `retention_days` and was deleted — fails at the start and says so.
+- **`seed_paths`** are what a fresh task starts from instead of nothing: when a task ends, those
+  paths are copied back to the daemon (`<work>/<owner>/<name>-seed`), and the next fresh claim on
+  the repository is filled with them. Build output is the point — a fresh task on a large Lean
+  project replays the last build rather than starting from scratch.
+
+The queue knows about it too. With slots holding no trees, a continuation neither waits for its
+predecessor's slot nor prefers it; `parallel_per_repo` is only a count. `orchestra prepare` has
+nothing to warm.
+
+Interactive sessions use the same claims: a chat session's claim is keyed by the session and kept
+while it is dormant, and `orchestra interactive` gets one too, resumable with
+`orchestra interactive --resume <id>` — which also takes a queued task's id.
+
+The daemon's ServiceAccount needs `get`, `list`, `create`, `patch` and `delete` on
+`persistentvolumeclaims` in the namespace, on top of what pods need. The claims are
+`ReadWriteOnce`; on a cluster of several nodes a continuation's pod is scheduled where its volume
+is, which a `WaitForFirstConsumer` class such as k3s's `local-path` does by itself.
 
 ## a shared Lean cache
 
 A Mathlib project is the extreme case of the above: each fresh pod downloads and unpacks about
 7.5 GB before it can build anything, and with a dozen pods on a node the page cache holds a dozen
-copies of the same oleans. `home_claim` does not help — Mathlib lives in the checkout's
-`.lake/packages`, not in `$HOME` — and a writable volume shared by every task would let one task
-change what another builds against.
+copies of the same oleans. A task volume does not help — it is one chain's, and Mathlib is the same
+for all of them — and a writable volume shared by every task would let one task change what another
+builds against.
 
 The agent image carries both halves of a read-only alternative:
 
@@ -393,10 +439,10 @@ statement about what the agent learned.
 runs the next one with `continues_from` pointing at it, so both need the agent's earlier
 conversation — which lives under the agent's `$HOME`, in the pod that ran it. With a scratch home
 that pod is gone and the task is refused at the start, naming the setting that keeps it. With
-`home_claim` the home outlives the pod and both work.
-
-The checkout side of a continuation already works either way: the daemon hands a continuation its
-predecessor's clone slot, and that is the tree copied into the new pod.
+`task_volumes` the home outlives the pod and both work — and so does the tree, which is on the same
+claim (see [per-task volumes](#per-task-volumes)). Without it, the daemon hands a continuation its
+predecessor's clone slot when that slot still holds its tree, which an unrelated task can have
+reset in between.
 
 ## what a pod's lifetime covers
 
@@ -408,15 +454,16 @@ deleted when it ends, including when it fails or is cancelled.
 **The agent's conversation lives as long as its `$HOME`.** A session id is a file the agent CLI
 wrote there, and `--resume <id>` is a request to read it back. Within a task that always works: the
 retry after a failed validation runs in the same pod as the attempt before it. Across tasks it
-depends on `home_claim`:
+depends on `task_volumes`:
 
-| | scratch home (default) | `home_claim` set |
+| | scratch home (default) | `task_volumes` set |
 | --- | --- | --- |
 | retry after failed validation | resumes | resumes |
 | `continues_from` / a series | **refused** | resumes |
 | waking a dormant chat session | **refused** | resumes |
 | memory directories | copied back | copied back |
-| toolchain `init.sh` installed | reinstalled each task | kept |
+| the tree and its build, for a continuation | the slot's, if not reset | kept on the claim |
+| toolchain `init.sh` installed | reinstalled each task | kept within a chain |
 
 A task that continues another one, in an environment that cannot have its conversation, fails at
 the start and says which setting keeps it. Running anyway is the worse outcome: a follow-up prompt
@@ -517,7 +564,7 @@ the cluster was actually asked for.
 | `resources` | *(none)* | `resources` for the container, verbatim |
 | `volumes` / `volume_mounts` | `[]` | extra volumes and mounts, verbatim — a build cache, most usefully |
 | `home_path` | `/home/agent` | where the agent's `$HOME` is in the pod |
-| `home_claim` | *(none)* | PVC to mount as `$HOME`, so toolchains and caches survive between tasks |
+| `task_volumes` | *(none)* | a claim per task chain for the checkout and `$HOME`, kept for continuations; see [per-task volumes](#per-task-volumes) |
 | `mcp_bind` | `0.0.0.0` | address the daemon's MCP server binds |
 | `mcp_ports` | *(any free port)* | `[from, to]` the MCP server may listen on, for a daemon something has to route to |
 | `deadline_seconds` | `14400` | `activeDeadlineSeconds` on the pod |

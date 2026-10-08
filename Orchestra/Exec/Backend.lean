@@ -181,6 +181,16 @@ structure SessionSpec where
       database client. A backend that runs tasks in an image of some kind reads this to decide
       which; one that runs them on this machine has nothing to choose and ignores it. -/
   image : Option String := none
+  /-- The task (or interactive session) this environment is for, for a backend that keeps a task's
+      workspace after it ends (`Backend.persistentWorkspaces`). `none` for runs that are not tasks
+      — the merger, `orchestra prepare`, `orchestra interactive` — which get a throwaway one. -/
+  taskId : Option String := none
+  /-- The task this one continues, whose kept workspace — tree, build and agent home — it should be
+      handed instead of `workdir`'s contents. A waking interactive session names itself. -/
+  continuesFrom : Option String := none
+  /-- Where the daemon keeps build output carried from one task chain to the next, for this
+      repository. Read when a fresh workspace is filled, written when a task ends. -/
+  seedDir : Option System.FilePath := none
 
 /-- One way of executing agents.
 
@@ -205,6 +215,14 @@ structure Backend where
       says so in one line instead of failing every attempt with `could not execute external
       process` and burning the retry budget on it. -/
   preflight : IO (Except String Unit) := pure (.ok ())
+  /-- Whether this backend keeps each task's workspace itself, after the task, for a continuation
+      to be handed back (`SessionSpec.continuesFrom`).
+
+      When it does, the daemon's clone slots hold nothing worth keeping: the checkout prepared on
+      this machine is only what a *fresh* workspace is filled from, and is thrown away when the task
+      ends. The queue then stops pinning a continuation to its predecessor's slot, and the task
+      runner prepares a checkout per task rather than resetting a pooled one. -/
+  persistentWorkspaces : Bool := false
   /-- Open an environment for one task. -/
   openSession : SessionSpec → IO Session
 

@@ -696,46 +696,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- below and should say so rather than have one created for it.
   if ioTask.backend == some "merger" && ioTask.repo.isNone then
     throw (.userError "merger task has no repository; it merges a pull request on one")
-  -- 2. Prepare the workspace: the task slot, or the shared repo clone when running outside the
-  -- queue — and for a repository-independent task, an empty scratch directory in place of either.
-  let repoPath ← match ioTask.repo, slotOverride with
-    | some repo, some assign =>
-      IO.println s!"Preparing slot {assign.slot} for {repo.fork}..."
-      let p ← Repo.ensureSlot repo.fork repo.upstream assign (token := some token)
-      IO.println s!"  Slot at {p}"
-      pure p
-    | some repo, none =>
-      IO.println s!"Cloning/updating {repo.fork}..."
-      let p ← Repo.ensureCloned repo.fork repo.upstream interactive (token := some token)
-      IO.println s!"  Repo at {p}"
-      pure p
-    | none, some assign =>
-      IO.println s!"Preparing workspace slot {assign.slot} (no repository)..."
-      let p ← Repo.ensureWorkspace assign
-      IO.println s!"  Workspace at {p}"
-      pure p
-    | none, none =>
-      IO.println "Preparing the scratch workspace (no repository)..."
-      -- `continuesFrom` rather than nothing: outside the queue there is no slot record to look a
-      -- predecessor's workspace up by, but there is only one workspace, and the task this run
-      -- continues is exactly the occupant its files would be under. Without it every
-      -- `orchestra continue` on a repository-independent task would restore the conversation onto
-      -- a directory that had just been emptied.
-      let p ← Repo.ensureAdhocWorkspace (occupant := some taskId) (resumeFrom := continuesFrom)
-      IO.println s!"  Workspace at {p}"
-      pure p
-  -- 3. Open the environment this task runs in.
-  --
-  -- One session for the whole task, not one per agent launch, because a task is not one command:
-  -- `init.sh`, `before.sh`, the agent, `validation.sh`, the agent again if that failed, and
-  -- `after.sh` all have to happen in one place, on one copy of the workspace. For landrun that is
-  -- this machine and opening it costs nothing; for a backend that runs the agent elsewhere it is
-  -- what makes validation answer a question about the tree the agent actually worked on.
-  --
-  -- Resolved after the workspace (the session is opened on it) and before the merger, which
-  -- validates a pull request and so needs the same environment for the same reason. Checked
-  -- (`Backend.preflight`) while resolving, so a missing `landrun` or `kubectl` is one line naming
-  -- the task rather than every attempt failing as `could not execute external process`.
+  -- The execution backend, resolved before the workspace because it decides what kind of workspace
+  -- to prepare: one that keeps each task's workspace itself (`Backend.persistentWorkspaces`) needs
+  -- a fresh checkout per task to fill a new one from, not a pooled slot whose tree it would never
+  -- use. Checked (`Backend.preflight`) while resolving, so a missing `landrun` or `kubectl` is one
+  -- line naming the task rather than every attempt failing as `could not execute external process`.
   let execBackend ← match ← Exec.resolve appConfig.execution with
     | .ok b => pure b
     | .error e =>
@@ -745,6 +710,60 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       -- claim this task is holding, and a task that returned normally would keep it.
       TaskStore.saveTask { initialRecord with status := .failed }
       throw (IO.userError s!"cannot run the agent: {e}")
+  -- Such a backend gets a checkout per task, made for this task and removed after it, and no slot
+  -- is ever prepared. The merger is the one task on it that keeps nothing: it validates a pull
+  -- request on that checkout and is done, so its session gets no volume (`persistent`).
+  let taskCheckout := execBackend.persistentWorkspaces
+  let persistent := taskCheckout && ioTask.backend != some "merger"
+  -- 2. Prepare the workspace: the task slot, or the shared repo clone when running outside the
+  -- queue — and for a repository-independent task, an empty scratch directory in place of either.
+  -- On a backend that keeps workspaces, a checkout of its own for this task instead.
+  let repoPath ← match ioTask.repo with
+    | some repo =>
+      if taskCheckout then
+        Repo.ensureTaskCheckout repo.fork repo.upstream taskId (token := some token)
+      else match slotOverride with
+        | some assign => do
+          IO.println s!"Preparing slot {assign.slot} for {repo.fork}..."
+          let p ← Repo.ensureSlot repo.fork repo.upstream assign (token := some token)
+          IO.println s!"  Slot at {p}"
+          pure p
+        | none => do
+          IO.println s!"Cloning/updating {repo.fork}..."
+          let p ← Repo.ensureCloned repo.fork repo.upstream interactive (token := some token)
+          IO.println s!"  Repo at {p}"
+          pure p
+    | none =>
+      if taskCheckout then Repo.ensureTaskWorkspace taskId
+      else match slotOverride with
+        | some assign => do
+          IO.println s!"Preparing workspace slot {assign.slot} (no repository)..."
+          let p ← Repo.ensureWorkspace assign
+          IO.println s!"  Workspace at {p}"
+          pure p
+        | none => do
+          IO.println "Preparing the scratch workspace (no repository)..."
+          -- `continuesFrom` rather than nothing: outside the queue there is no slot record to look
+          -- a predecessor's workspace up by, but there is only one workspace, and the task this run
+          -- continues is exactly the occupant its files would be under. Without it every
+          -- `orchestra continue` on a repository-independent task would restore the conversation
+          -- onto a directory that had just been emptied.
+          let p ← Repo.ensureAdhocWorkspace (occupant := some taskId) (resumeFrom := continuesFrom)
+          IO.println s!"  Workspace at {p}"
+          pure p
+  -- A per-task checkout is this task's alone, and goes when the task does — however it ends.
+  let removeTaskCheckout : IO Unit := if taskCheckout then Repo.removeTaskDir repoPath else pure ()
+  -- 3. Open the environment this task runs in.
+  --
+  -- One session for the whole task, not one per agent launch, because a task is not one command:
+  -- `init.sh`, `before.sh`, the agent, `validation.sh`, the agent again if that failed, and
+  -- `after.sh` all have to happen in one place, on one copy of the workspace. For landrun that is
+  -- this machine and opening it costs nothing; for a backend that runs the agent elsewhere it is
+  -- what makes validation answer a question about the tree the agent actually worked on.
+  --
+  -- The backend was resolved before the workspace (see there); the session is opened on it here,
+  -- before the merger, which validates a pull request and so needs the same environment for the
+  -- same reason.
   -- Where the MCP server has to listen for this backend's agents, on which ports, and the secret
   -- they present. Loopback, any port and no secret unless the agent runs off this machine.
   let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
@@ -752,7 +771,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- with all other backends but skips the MCP server and the agent — and opens its own
   -- environment for the validation script, once the branch it is merging is checked out.
   if ioTask.backend == some "merger" then
-    runMerger execBackend token ioTask repoPath initialRecord identity
+    try runMerger execBackend token ioTask repoPath initialRecord identity
+    finally removeTaskCheckout
     return ((taskId, ← finalStatusOf taskId), none, none)
   -- What the session is opened with. The grants are the same ones the agent's own launch will be
   -- built from (`Sandbox.grantsFor`): a backend running the agent elsewhere reads them to know
@@ -777,8 +797,14 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- to open: what a task needs installed is a property of the repository, and the repository is
   -- where that is written down.
   let repoConfig ← RepoConfig.loadRepoConfig repoPath
-  let session ← execBackend.openSession {
+  -- Where build output carried between task chains lives for this repository, on a backend that
+  -- keeps workspaces. See `Exec.SessionSpec.seedDir`.
+  let seedDir ← if persistent then ioTask.repo.mapM (Repo.seedPath ·.fork) else pure none
+  let session ← (try execBackend.openSession {
     workdir := repoPath
+    taskId  := if persistent then some taskId else none
+    continuesFrom := if persistent then continuesFrom else none
+    seedDir
     grants  := Sandbox.grantsFor (agentDefOfBackend ioTask.backend).sandboxPaths
                  appConfig.additionalSandboxPaths repoPath ioTask.readOnly pluginDirs memoryDirs
     label   := taskId
@@ -788,6 +814,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- way as `resolveMemoryDirs` just above, and as `runMerger`.
     repo    := ioTask.repo.map (·.upstream.toString)
     image   := repoConfig.image }
+    catch e => do removeTaskCheckout; throw e)
   IO.println s!"  Running in: {session.id}"
   -- The MCP server has to come down however the task ends, not only when it ends well. It holds a
   -- listening socket with the PAT's authority behind it and — off loopback — one port out of
@@ -810,9 +837,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
         | none      => s!"this task continues {continuesFrom.getD "another task"}"
       TaskStore.saveTask { initialRecord with status := .failed }
       throw (IO.userError s!"{what}, whose conversation the agent left in an environment that no \
-longer exists ({session.id} is new for every task). Configure a persistent agent home for this \
-execution backend — execution.options.home_claim for kubernetes — or queue the work as a task of \
-its own.")
+longer exists ({session.id} is new for every task). Enable per-task workspaces for this \
+execution backend — execution.options.task_volumes for kubernetes — or queue the work as a task \
+of its own.")
     -- 4. Start MCP server (runs in this process, outside the sandbox)
     -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
     let (requestedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
@@ -1047,7 +1074,7 @@ its own.")
       IO.eprintln s!"  Warning: could not shut down the MCP server: {e}"
     -- Closed however the task ended, including by exception: for a backend that holds a pod and a
     -- copy of the workspace, this is what brings the work back and stops paying for it.
-    session.close
+    try session.close finally removeTaskCheckout
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.
 

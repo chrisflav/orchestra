@@ -368,6 +368,19 @@ private def resetSlot (slotPath : System.FilePath) (token : Option String) : IO 
     throw (.userError s!"could not determine the default branch in {slotPath}; refusing to \
       start a task on an unknown base commit")
 
+/-- Point a clone made from the cache at the fork and the upstream, with the credential helper and
+    the excludes every checkout orchestra prepares carries. Shared by the pooled slots and by the
+    per-task checkouts of a backend that keeps workspaces itself. -/
+private def configureClone (fork upstream : Repository) (path : System.FilePath) : IO Unit := do
+  runGit' #["remote", "set-url", "origin", githubUrl fork] path
+  let remotes ← runGit #["remote"] path
+  if remotes.splitOn "\n" |>.any (· == "upstream") then
+    runGit' #["remote", "set-url", "upstream", githubUrl upstream] path
+  else
+    runGit' #["remote", "add", "upstream", githubUrl upstream] path
+  configureCredentialHelper path
+  excludeOrchestraArtifacts path
+
 /-- Ensure task slot `slot` of `fork` exists and is clean, and return its path.
 
     A slot is an independent clone with its own `.git`, and therefore its own ref
@@ -412,14 +425,7 @@ def ensureSlot (fork upstream : Repository) (assign : SlotAssignment)
   -- Remote repair runs for reused slots too, not just freshly created ones. A slot whose
   -- `remote add upstream` failed after the clone succeeded, or one left by an older layout,
   -- would otherwise never grow the remote and fail every fetch from then on.
-  runGit' #["remote", "set-url", "origin", githubUrl fork] sPath
-  let remotes ← runGit #["remote"] sPath
-  if remotes.splitOn "\n" |>.any (· == "upstream") then
-    runGit' #["remote", "set-url", "upstream", githubUrl upstream] sPath
-  else
-    runGit' #["remote", "add", "upstream", githubUrl upstream] sPath
-  configureCredentialHelper sPath
-  excludeOrchestraArtifacts sPath
+  configureClone fork upstream sPath
   -- A continuation only inherits the tree if the slot still holds *its predecessor's* tree.
   -- Slots are pooled and reset between tasks, so "the slot is free" is not the same claim.
   let keepTree ← match assign.resumeFrom with
@@ -446,6 +452,36 @@ its session refers to."
   -- claiming to hold a tree it never produced.
   setSlotOccupant sPath assign.occupant
   return sPath
+
+
+/-- Where a single task's checkout is prepared, for a backend that keeps the workspace itself
+    (`Exec.Backend.persistentWorkspaces`). One directory per task rather than a pooled slot: the
+    tree is only what the task's own workspace is filled from, and is removed when the task ends. -/
+def taskCheckoutPath (fork : Repository) (taskId : String) : IO System.FilePath := do
+  return (← workDir) / fork.owner / s!"{fork.name}-tasks" / taskId
+
+/-- Where build output carried from one task chain to the next is kept for a repository, for the
+    same backends (`TaskVolumes.seedPaths` in the kubernetes backend). -/
+def seedPath (fork : Repository) : IO System.FilePath := do
+  return (← workDir) / fork.owner / s!"{fork.name}-seed"
+
+/-- A fresh checkout of `fork` for task `taskId`, on an up-to-date default branch: what `ensureSlot`
+    produces for a reset slot, without the pool. `git clone --local` from the cache clone, so it
+    costs a working tree and not a second copy of the history, and is quick to make and to throw
+    away. A leftover directory of the same name — a task that died before it was removed — is
+    replaced. -/
+def ensureTaskCheckout (fork upstream : Repository) (taskId : String)
+    (token : Option String := none) : IO System.FilePath := do
+  let mainPath ← ensureCacheClone fork upstream token
+  let path ← taskCheckoutPath fork taskId
+  if ← path.pathExists then IO.FS.removeDirAll path
+  if let some parent := path.parent then IO.FS.createDirAll parent
+  IO.println s!"  Preparing a checkout for {taskId} at {path}..."
+  runGit' #["clone", "--local", mainPath.toString, path.toString]
+  configureClone fork upstream path
+  resetSlot path token
+  return path
+
 
 /-- Base directory for the scratch workspaces repository-independent tasks run in.
 
@@ -586,6 +622,20 @@ def ensureAdhocWorkspace (occupant : Option String := none)
     : IO System.FilePath := do
   prepareWorkspace (← resolveWorkspaceBase base) adhocWorkspaceName
     { slot := 0, occupant, resumeFrom }
+
+/-- An empty scratch directory for one repository-independent task, for the same backends. -/
+def ensureTaskWorkspace (taskId : String) (base : Option System.FilePath := none)
+    : IO System.FilePath := do
+  let path := (← resolveWorkspaceBase base) / "tasks" / taskId
+  if ← path.pathExists then IO.FS.removeDirAll path
+  IO.FS.createDirAll path
+  return path
+
+/-- Remove a per-task checkout or workspace. Never throws: what is left behind is replaced the next
+    time the same id is prepared, and costs disk, not correctness. -/
+def removeTaskDir (path : System.FilePath) : IO Unit := do
+  try if ← path.pathExists then IO.FS.removeDirAll path
+  catch e => IO.eprintln s!"  Warning: could not remove {path}: {e}"
 
 /-- Every scratch workspace that currently exists, in name order. -/
 def listWorkspaces (base : Option System.FilePath := none) : IO (Array System.FilePath) := do

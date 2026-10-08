@@ -173,6 +173,25 @@ def aContinuationAsksForTheWorkspaceItsPredecessorLeft : Test := do
   TestM.assertEqual (got.map (·.slot)) (some 3) (msg := "back to the predecessor's workspace")
   TestM.assertEqual (got.bind (·.resumeFrom)) (some "0001") (msg := "and it is kept, not emptied")
 
+@[test]
+def onABackendThatKeepsWorkspacesAContinuationNeitherWaitsNorPrefers : Test := do
+  -- There the backend hands a continuation its predecessor's workspace wherever it runs, so the
+  -- slot is a count and nothing more: the predecessor's slot being busy is no reason to wait, and
+  -- it being free is no reason to prefer it.
+  let pred := { entryWithout with
+                id := "0001", taskId := some "task-1", slot := some 3, status := .done }
+  let cont := { entryWithout with id := "0002", continuesFrom := some "task-1" }
+  let all := #[pred, cont]
+  let ctx : Queue.ClaimContext :=
+    { occupiedSlots := Std.HashMap.ofList [(entryWithout.slotKey, #[3])], total := 1
+      exclusiveActive := false, parallelLimit := 4, perRepoLimit := 4
+      parallelSafe := fun _ => true, slotsHoldTrees := false }
+  let occupant : Option Repository → Nat → IO (Option String) :=
+    fun _ slot => pure (if slot == 3 then some "0001" else none)
+  let got ← Queue.claimDecision ctx all (predIn all) occupant
+  TestM.assertEqual (got.map (·.slot)) (some 0) (msg := "any free slot, not a wait for slot 3")
+  TestM.assertEqual (got.bind (·.resumeFrom)) none (msg := "and no tree is kept in it")
+
 /-! ## The scratch workspace -/
 
 /-- A workspace base of this test's own, under `/tmp`.

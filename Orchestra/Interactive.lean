@@ -419,8 +419,17 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     -- tree: the agent opens with a context full of edits it made and a checkout where none of
     -- them exist — the exact hazard the slot-pinning design exists to avoid, reintroduced at the
     -- one moment it matters most.
-    let repoPath ← Repo.ensureSlot fork record.upstream
-      { slot, occupant := some record.id, resumeFrom := resumeSlotOf } (token := some token)
+    --
+    -- A backend that keeps workspaces itself does that job instead: the session's workspace — tree,
+    -- build, and the agent's home with its conversation — is a volume keyed by the session, kept
+    -- while it is dormant and handed back when it wakes. The checkout made here is then only what a
+    -- first start fills that volume from, and goes when the session's environment closes.
+    let keepsWorkspaces := Exec.keepsWorkspaces appConfig.execution
+    let repoPath ← if keepsWorkspaces then
+        Repo.ensureTaskCheckout fork record.upstream record.id (token := some token)
+      else
+        Repo.ensureSlot fork record.upstream
+          { slot, occupant := some record.id, resumeFrom := resumeSlotOf } (token := some token)
     -- Read from the record rather than from the spec, so a wake brings the session back as the
     -- same identity a start gave it. A record naming one that has since been deleted fails the
     -- acquire, which for a wake leaves the session dormant with the reason on its transcript —
@@ -442,8 +451,14 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
     let pluginDirs ← TaskRunner.defaultPluginDirs appConfig
     let repoConfig ← RepoConfig.loadRepoConfig repoPath
+    let seedDir ← if keepsWorkspaces then some <$> Repo.seedPath fork else pure none
     let execSession ← execBackend.openSession {
       workdir := repoPath
+      -- Keyed by the session, so a wake finds the volume its first start made. Only a wake that
+      -- has a conversation to resume asks for it back; one whose agent never started begins anew.
+      taskId  := if keepsWorkspaces then some record.id else none
+      continuesFrom := if keepsWorkspaces && resumeAgentSession.isSome then some record.id else none
+      seedDir
       grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths
                    repoPath false pluginDirs identityMemory.toArray
       label   := record.id
@@ -451,13 +466,19 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       -- known by, and the fork is per-bot. Same key as the queue path and the merger.
       repo    := some record.upstream.toString
       image   := repoConfig.image }
+    -- Its checkout goes with it: closing the environment is the one thing every way out of a
+    -- session does.
+    let execSession := if keepsWorkspaces then
+        { execSession with close := do
+            try execSession.close finally Repo.removeTaskDir repoPath }
+      else execSession
     execRef.set (some execSession)
     -- Reviving a dormant conversation asks the agent to resume a session it wrote under its own
     -- home. An environment that is new every time does not have it, and a revived conversation
     -- that silently starts over is worse than one that says it cannot: the person sees their
     -- history in the transcript and the agent does not.
     if resumeAgentSession.isSome && !execSession.carriesAgentState then
-      return ← fail s!"this conversation was left in an environment that no longer exists ({execSession.id} is new every time). Configure a persistent agent home for this execution backend — execution.options.home_claim for kubernetes — to wake sessions on it."
+      return ← fail s!"this conversation was left in an environment that no longer exists ({execSession.id} is new every time). Enable per-task workspaces for this execution backend — execution.options.task_volumes for kubernetes — to wake sessions on it."
     let (port, shutdownMcp) ← Server.start {
       repo := some { upstream := record.upstream, fork }
       allowedTools := record.tools.getD allOptionalTools
