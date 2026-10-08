@@ -13,9 +13,10 @@
 #
 # RULES, so that a cache can only ever save time and never change a result:
 #
-#   - A package is linked only at exactly the rev the manifest pins, and only into a project on the
-#     same toolchain it was built with -- otherwise Lake's traces would not match and it would try
-#     to rebuild into a tree it cannot write.
+#   - A package is linked only at exactly the rev the manifest pins, and only from the entry built
+#     for the toolchain this run uses (the warmer keys every package by both) -- otherwise Lake's
+#     traces would not match and it would try to rebuild into a tree it cannot write. The toolchain
+#     is the one elan would pick: `+toolchain`, then ELAN_TOOLCHAIN, then lean-toolchain.
 #   - Nothing real is touched: a directory a task created is left alone. Only links into the cache
 #     are ever replaced or removed (a rev that no longer matches, or one the warmer pruned).
 #   - `lake update` removes every cache link first, because it rewrites packages in place and the
@@ -38,7 +39,10 @@ requests=${LEAN_CACHE_REQUESTS:-/lean-cache-requests}
 elan_dir() { printf '%s' "$1" | sed -e 's|:|---|g' -e 's|/|--|g'; }
 
 lean_cache_link() {
-  local start=$PWD sub="" arg dir root="" toolchain manifest pkgdir
+  local start=$PWD sub="" arg dir root="" toolchain="${ELAN_TOOLCHAIN:-}" manifest pkgdir
+
+  # elan's `+toolchain` override, for any proxy: `lake +leanprover/lean4:v4.33.1 build`.
+  case "${1:-}" in +?*) toolchain=${1#+}; shift ;; esac
 
   # For `lake`: where it will run (`-d`/`--dir`), and which subcommand it is.
   if [ "$name" = lake ]; then
@@ -65,7 +69,8 @@ lean_cache_link() {
   [ -n "$root" ] || return 0
   case "$root" in "$cache"|"$cache"/*|*/.lake/packages/*) return 0 ;; esac
 
-  toolchain=$(tr -d '[:space:]' < "$root/lean-toolchain")
+  # An explicit choice (`+toolchain`, ELAN_TOOLCHAIN) wins over the file, as it does for elan.
+  [ -n "$toolchain" ] || toolchain=$(tr -d '[:space:]' < "$root/lean-toolchain")
   [ -n "$toolchain" ] || return 0
 
   # elan's directory name for a toolchain: "leanprover/lean4:v4.33.1" -> "leanprover--lean4---v4.33.1".
@@ -93,7 +98,7 @@ lean_cache_link() {
   while IFS=$'\t' read -r pkg rev; do
     [ -n "$pkg" ] && [ -n "$rev" ] || continue
     target=$pkgdir/$pkg
-    src=$cache/packages/$pkg/$rev
+    src=$cache/packages/$pkg/$rev@$tcdir
     [ "$pkg" = mathlib ] && mathlib_rev=$rev
     # A link of ours that points at another rev, or at one the warmer has since pruned.
     if [ -L "$target" ]; then
@@ -102,8 +107,7 @@ lean_cache_link() {
         "$cache"/*) { [ "$link" != "$src" ] || [ ! -e "$target" ]; } && rm -f "$target" ;;
       esac
     fi
-    if [ ! -e "$target" ] && [ ! -L "$target" ] && [ -d "$src" ] \
-       && [ "$(cat "$src.toolchain" 2>/dev/null)" = "$toolchain" ]; then
+    if [ ! -e "$target" ] && [ ! -L "$target" ] && [ -d "$src" ]; then
       mkdir -p "$pkgdir" && ln -s "$src" "$target" 2>/dev/null
     fi
     if [ "$pkg" = mathlib ] && [ -L "$target" ] && [ "$(readlink "$target")" = "$src" ]; then

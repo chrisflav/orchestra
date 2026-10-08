@@ -17,28 +17,37 @@
 # and lock files for Lake to write on first use (a widget package lock, a few .hash files), which a
 # read-only mount would then refuse. One `lake build` of `import Mathlib` writes them all.
 #
-# LAYOUT (the shim reads exactly this):
+# LAYOUT (the shim reads exactly this; <tc> is elan's directory name for a toolchain, e.g.
+# leanprover--lean4---v4.33.1):
 #
-#   elan/toolchains/<elan dir>          toolchains, shared by every revision that uses them
-#   packages/<name>/<rev>/              a built package checkout
-#   packages/<name>/<rev>.toolchain     the toolchain it was built with; the shim links a package
-#                                       only into a project on the same toolchain, since Lake would
-#                                       otherwise rebuild it -- into a tree it cannot write
+#   elan/toolchains/<tc>/               toolchains
+#   packages/<name>/<rev>@<tc>/         a built package checkout. Keyed by toolchain as well as rev:
+#                                       packages such as Qq or aesop often keep a rev across a
+#                                       toolchain bump, and a build for one toolchain is not one for
+#                                       another -- Lake would rebuild it, into a tree it cannot write
 #   mathlib-cache/<mathlib rev>/        `cache get`'s archives for that revision (MATHLIB_CACHE_DIR)
 #   warmed/<mathlib rev>                when that revision was last warmed *or used*
+#   failed/<mathlib rev>                failed attempts; three within a week and requests are ignored
 #
 # REQUESTS. A pod writes $LEAN_CACHE_REQUESTS/<mathlib rev> both when the revision is missing and
 # when it linked it, so the directory doubles as a record of use: a request for a revision already
 # here just refreshes `warmed/<rev>`, and pruning keeps the most recently *used* revisions. A
-# request is removed only once it has been honoured, so a failed warm is retried next run.
+# request is removed once it has been honoured, so a failed warm is retried on the next run.
+#
+# PRUNING never removes anything a task may still be using. Pods reach the cache through symlinks
+# to these exact paths, so moving a tree aside would break them as surely as deleting it; instead a
+# revision becomes eligible only when it is outside the keep set *and* nobody has used it for
+# $LEAN_CACHE_GRACE seconds, and is then deleted outright, with whatever only it used.
 #
 # Environment:
 #   LEAN_CACHE_DIR       the cache, writable here          (default /lean-cache)
 #   LEAN_CACHE_REQUESTS  revisions pods have asked for     (default /lean-cache-requests)
 #   LEAN_CACHE_KEEP      how many unpinned revisions to keep, most recently used first (default 4);
 #                        the ones named on the command line are kept on top of these
-#   LEAN_CACHE_GRACE     seconds a pruned tree stays in trash/ before it is deleted, so a task that
-#                        linked it just before the prune can finish (default 86400)
+#   LEAN_CACHE_GRACE     seconds since last use before a revision outside the keep set may go
+#                        (default 86400, longer than any task)
+#
+# Upgrading from a cache written by an earlier layout: empty the directory and let this refill it.
 
 # No `set -e` here, deliberately: each revision's warm runs in a subshell with its own errexit, and
 # errexit is silently ignored in any function or subshell called from an `if`, `&&` or `||`. So the
@@ -50,8 +59,8 @@ requests=${LEAN_CACHE_REQUESTS:-/lean-cache-requests}
 keep=${LEAN_CACHE_KEEP:-4}
 grace=${LEAN_CACHE_GRACE:-86400}
 export ELAN_HOME=$cache/elan
-mkdir -p "$ELAN_HOME" "$cache/mathlib-cache" "$cache/packages" "$cache/tmp" "$cache/trash" "$cache/failed" \
-  "$cache/warmed" || exit 1
+mkdir -p "$ELAN_HOME" "$cache/mathlib-cache" "$cache/packages/mathlib" "$cache/tmp" \
+  "$cache/warmed" "$cache/failed" || exit 1
 
 # One writer. A second run -- an overlapping schedule, a manual `kubectl create job` -- would wipe
 # this one's scratch directory below and race it on every rename.
@@ -64,11 +73,14 @@ fi
 # A previous run that died part-way leaves its scratch directory behind; nothing else uses tmp.
 rm -rf "${cache:?}/tmp/"*
 
+now=$(date +%s)
 valid_rev() { [[ $1 =~ ^[0-9a-f]{40}$ ]]; }
+elan_dir() { printf '%s' "$1" | sed -e 's|:|---|g' -e 's|/|--|g'; }
+have_mathlib() { compgen -G "$cache/packages/mathlib/$1@*" >/dev/null; }
 
 warm() {
   local rev=$1 work rc
-  if [ -e "$cache/packages/mathlib/$rev" ]; then
+  if have_mathlib "$rev"; then
     echo "have mathlib@$rev"
     date +%s > "$cache/warmed/$rev"
     return 0
@@ -83,6 +95,7 @@ warm() {
     curl -fsSL "https://raw.githubusercontent.com/leanprover-community/mathlib4/$rev/lean-toolchain" > lean-toolchain
     toolchain=$(tr -d '[:space:]' < lean-toolchain)
     [ -n "$toolchain" ]
+    tc=$(elan_dir "$toolchain")
     cat > lakefile.toml <<TOML
 name = "warm"
 defaultTargets = ["Warm"]
@@ -109,19 +122,13 @@ TOML
     for p in .lake/packages/*; do
       name=$(basename "$p")
       [ "$name" = mathlib ] && continue
-      prev=$(git -C "$p" rev-parse HEAD)
-      dest=$cache/packages/$name/$prev
+      dest=$cache/packages/$name/$(git -C "$p" rev-parse HEAD)@$tc
       [ -e "$dest" ] && continue
       mkdir -p "$(dirname "$dest")"
-      # Sidecar first, tree second: a tree without its sidecar is never linked, so a pod sees the
-      # whole entry or none of it. One rename on one filesystem.
-      echo "$toolchain" > "$dest.toolchain"
-      mv "$p" "$dest"
+      mv "$p" "$dest"      # one rename on one filesystem: a pod sees all of it or none
     done
     # Mathlib last: its presence is what the shim and this script test for.
-    mkdir -p "$cache/packages/mathlib"
-    echo "$toolchain" > "$cache/packages/mathlib/$rev.toolchain"
-    mv .lake/packages/mathlib "$cache/packages/mathlib/$rev"
+    mv .lake/packages/mathlib "$cache/packages/mathlib/$rev@$tc"
   )
   rc=$?
   rm -rf "$work"
@@ -143,7 +150,14 @@ if [ -d "$requests" ]; then
     r=$(basename "$f")
     # Only a revision is accepted: it is fetched from Mathlib's repository by that name, so a
     # request decides *which* revision is warmed and nothing about what ends up in the cache.
-    if valid_rev "$r"; then requested+=("$r"); else rm -f "$f"; fi
+    if ! valid_rev "$r"; then rm -f "$f"; continue; fi
+    # A revision that failed three times in the last week -- one that does not exist upstream, a
+    # fork's commit -- is not retried on every run just because pods keep asking for it.
+    fails=$(cat "$cache/failed/$r" 2>/dev/null || echo 0)
+    if [ "$fails" -ge 3 ] && [ $((now - $(stat -c %Y "$cache/failed/$r"))) -lt 604800 ]; then
+      rm -f "$f"; continue
+    fi
+    requested+=("$r")
   done
 fi
 
@@ -154,70 +168,48 @@ for rev in "${pinned[@]}" "${requested[@]}"; do
     rm -f "$requests/$rev" "$cache/failed/$rev"
   else
     status=1
-    # A request is retried on the next run, but not for ever: one naming a revision that does not
-    # exist upstream would otherwise fail every run from now on.
     fails=$(( $(cat "$cache/failed/$rev" 2>/dev/null || echo 0) + 1 ))
     echo "$fails" > "$cache/failed/$rev"
-    if [ "$fails" -ge 3 ]; then
-      echo "giving up on mathlib@$rev after $fails attempts" >&2
-      rm -f "$requests/$rev" "$cache/failed/$rev"
-    fi
+    [ "$fails" -ge 3 ] && { echo "ignoring mathlib@$rev for a week after $fails failures" >&2; rm -f "$requests/$rev"; }
   fi
 done
 
-# Prune: keep the pinned revisions and the $keep most recently used others. Pruned trees go to
-# trash/ rather than straight to `rm -rf`, and are deleted only after $grace seconds, so a task that
-# linked one just before the prune does not have it vanish under its build.
-now=$(date +%s)
+# Prune. Keep: the pinned revisions, the $keep most recently used others, and anything used within
+# $grace. What is left is deleted, along with packages and toolchains only it used.
 declare -A keepset=()
 for r in "${pinned[@]}"; do keepset[$r]=1; done
 n=0
 for r in $(find "$cache/warmed" -type f -printf '%T@ %f\n' 2>/dev/null | sort -rn | cut -d" " -f2); do
   [ -n "${keepset[$r]:-}" ] && continue
-  [ $n -lt "$keep" ] || break
-  keepset[$r]=1; n=$((n + 1))
+  if [ $n -lt "$keep" ] || [ $((now - $(stat -c %Y "$cache/warmed/$r"))) -lt "$grace" ]; then
+    keepset[$r]=1; n=$((n + 1))
+  fi
 done
-trash() {
-  mv "$1" "$cache/trash/$(basename "$1").$now.$RANDOM" 2>/dev/null || rm -rf "$1"
-}
-for d in "$cache/packages/mathlib"/*/; do
-  [ -d "$d" ] || continue
-  r=$(basename "$d")
-  [ -n "${keepset[$r]:-}" ] && continue
-  echo "pruning mathlib@$r"
-  rm -f "$cache/packages/mathlib/$r.toolchain" "$cache/warmed/$r"
-  trash "$cache/packages/mathlib/$r"
-  trash "$cache/mathlib-cache/$r"
-done
-# Then any package, and any toolchain, that no kept Mathlib uses.
 declare -A used=() usedtc=()
-for r in "${!keepset[@]}"; do
-  d=$cache/packages/mathlib/$r
-  [ -f "$d/lake-manifest.json" ] || continue
-  while IFS=$'\t' read -r name prev; do used["$name/$prev"]=1; done \
-    < <(jq -r '.packages[]? | [.name, .rev] | @tsv' "$d/lake-manifest.json")
-  tc=$(cat "$d.toolchain" 2>/dev/null) && usedtc[$(printf '%s' "$tc" | sed -e 's|:|---|g' -e 's|/|--|g')]=1
+for d in "$cache/packages/mathlib"/*@*/; do
+  [ -d "$d" ] || continue
+  entry=$(basename "$d"); r=${entry%%@*}; tc=${entry#*@}
+  # A revision with no warmed/ record at all is one this run cannot date; keep it.
+  if [ -z "${keepset[$r]:-}" ] && [ -e "$cache/warmed/$r" ]; then
+    echo "pruning mathlib@$r"
+    rm -rf "$d" "$cache/mathlib-cache/$r" "$cache/warmed/$r"
+    continue
+  fi
+  usedtc[$tc]=1
+  while IFS=$'\t' read -r name prev; do used["$name/$prev@$tc"]=1; done \
+    < <(jq -r '.packages[]? | [.name, .rev] | @tsv' "$d/lake-manifest.json" 2>/dev/null)
 done
 for d in "$cache/packages"/*/*/; do
   [ -d "$d" ] || continue
   key=${d#"$cache/packages/"}; key=${key%/}
   case "$key" in mathlib/*) continue ;; esac
-  if [ -z "${used[$key]:-}" ]; then
-    echo "pruning $key"
-    rm -f "$cache/packages/$key.toolchain"
-    trash "$cache/packages/$key"
-  fi
+  [ -n "${used[$key]:-}" ] || { echo "pruning $key"; rm -rf "$d"; }
 done
 for d in "$ELAN_HOME/toolchains"/*/; do
   [ -d "$d" ] || continue
   t=$(basename "$d")
-  [ -n "${usedtc[$t]:-}" ] || { echo "pruning toolchain $t"; trash "$ELAN_HOME/toolchains/$t"; }
-done
-for d in "$cache/trash"/*; do
-  [ -e "$d" ] || continue
-  ts=$(basename "$d" | awk -F. '{print $(NF-1)}')
-  if [[ $ts =~ ^[0-9]+$ ]] && [ $((now - ts)) -ge "$grace" ]; then rm -rf "$d"; fi
+  [ -n "${usedtc[$t]:-}" ] || { echo "pruning toolchain $t"; rm -rf "$d"; }
 done
 
-du -sh "$cache/packages" "$ELAN_HOME" "$cache/mathlib-cache" "$cache/trash" 2>/dev/null || true
+du -sh "$cache/packages" "$ELAN_HOME" "$cache/mathlib-cache" 2>/dev/null || true
 exit $status
