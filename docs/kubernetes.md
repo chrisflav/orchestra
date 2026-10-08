@@ -72,7 +72,7 @@ repository's scripts are run with it), `tar`, `nc` and `git`. That is the fixed 
 list the daemon's own machine needs, minus `landrun`. What each repository needs on top of it is
 the subject of the next section.
 
-The image orchestra publishes also carries `kubectl`, which is not on that list because nothing the
+The agent image orchestra publishes (`orchestra-agent`) also carries `kubectl`, which is not on that list because nothing the
 backend does needs one *in the pod* — the daemon drives the pod with its own. It is there for the
 other thing a cluster makes possible: an agent that deploys what it just built onto the cluster it
 is running in. It grants nothing by itself. A pod's authority is whatever RBAC is bound to the

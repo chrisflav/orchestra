@@ -96,8 +96,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends gh nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code
-
 # kubectl, for the `kubernetes` execution backend: the daemon creates each task's pod, stages the
 # checkout and runs every command in it through `kubectl` (docs/kubernetes.md). Without it here an
 # operator has to mount a binary in from the host, which works only for a statically linked one and
@@ -112,6 +110,8 @@ RUN curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin
  && install -m 0755 /tmp/kubectl /usr/local/bin/kubectl \
  && rm -f /tmp/kubectl /tmp/kubectl.sha256 \
  && kubectl version --client=true --output=yaml >/dev/null
+
+RUN npm install -g @anthropic-ai/claude-code
 
 # Skills shipped with orchestra, seeded into /config on first start by the entrypoint. Baked in
 # at a fixed path because /config is a bind mount and starts empty.
