@@ -55,6 +55,7 @@ jobs:
       # Docker Hub base images through Google's mirror, as in docker.yml: anonymous pulls from
       # GitHub's runners are refused with 429 for long stretches.
       - uses: docker/setup-buildx-action@v3
+        id: buildx
         with:
           buildkitd-config-inline: |
             [registry."docker.io"]
@@ -128,7 +129,8 @@ jobs:
       - name: Check the image has what the backend needs
         run: |
           set -euo pipefail
-          docker build \
+          # On the builder set up above, so the base image comes through the same mirror.
+          docker buildx build --builder "${{ steps.buildx.outputs.name }}" \
             --build-arg "CLAUDE_CODE_VERSION=${{ steps.cli.outputs.version }}" \
             --file docker/agent.Dockerfile --tag agent-check --load .
           docker run --rm --tmpfs /home/agent:mode=0777,exec agent-check sh -eu -c '
