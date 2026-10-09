@@ -88,9 +88,12 @@ def defaultImage : String := "ghcr.io/chrisflav/orchestra-agent:latest"
     continuations — a series — keeps one volume for as long as it runs. Agents stay isolated from
     one another: no two chains share a claim, and `$HOME` is per chain rather than per daemon.
 
-    The checkout is mounted at `mountPath` whatever its path on the daemon, so a continuation runs
-    in the same directory as its predecessor — which is what the agent CLIs key their saved
-    sessions by — even though each task's daemon-side checkout is a new one. -/
+    The claim is mounted at `mountPath`; the checkout is `<mountPath>/work` and `$HOME` is
+    `<mountPath>/home`, whatever the checkout is called on the daemon. So a continuation runs in the
+    same directory as its predecessor — which is what the agent CLIs key their saved sessions by —
+    even though each task's daemon-side checkout is a new one. Both are created by the agent's own
+    user rather than being mount points, which the kubelet would make root's: git refuses a work
+    tree whose top-level directory another user owns. -/
 structure TaskVolumes where
   /-- `storageClassName` for the claims; unset means the cluster's default class. -/
   storageClass : Option String := none
@@ -98,8 +101,8 @@ structure TaskVolumes where
   size : String := "20Gi"
   /-- A claim no task has used for this many days is deleted, the next time a task starts. -/
   retentionDays : Nat := 14
-  /-- Where the checkout is in the pod. -/
-  mountPath : String := "/workspace"
+  /-- Where the claim is mounted in the pod. The checkout is `work` and `$HOME` is `home` under it. -/
+  mountPath : String := "/task"
   /-- Paths inside the checkout carried *between chains*: copied into a fresh claim from the
       daemon's seed directory for the repository, and copied back there when a task ends. Build
       output is the point — `.lake/build`, `target` — so a task that starts fresh does not rebuild
@@ -324,7 +327,7 @@ checkout"
             throw s!"kubernetes: execution.options.task_volumes.seed_paths has '{p}', which is not \
 a plain path inside the checkout"
           else pure p
-      let mountPath := (jsonStr? tv "mount_path").getD "/workspace"
+      let mountPath := (jsonStr? tv "mount_path").getD "/task"
       unless mountPath.startsWith "/" do
         throw s!"kubernetes: execution.options.task_volumes.mount_path must be absolute, not \
 '{mountPath}'"
@@ -480,46 +483,55 @@ def labelValue (s : String) (max : Nat := 63) : String :=
 /-- The pod manifest for a task. -/
 def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
     (staged : Array StagedPath) (workspaceClaim : Option String := none) : Json :=
-  -- With a task volume the checkout is not an `emptyDir` of its own but a directory on the claim,
-  -- and so is `$HOME`: one claim, two subpaths, both of which outlive the pod.
-  let onClaim (st : StagedPath) : Bool := workspaceClaim.isSome && st.isWorkspace
-  let claimMount (subPath mountPath : String) : Json :=
-    Json.mkObj [("name", .str workspaceVolumeName), ("mountPath", .str mountPath),
-      ("subPath", .str subPath)]
-  let stageMounts : Array Json := staged.mapIdx fun i st =>
-    if onClaim st then claimMount "work" st.podPath
-    else Json.mkObj [("name", .str (stageVolumeName i)), ("mountPath", .str st.podPath)]
+  -- Every directory the agent works in has to be the agent's own, mount point included: git refuses
+  -- a work tree whose top-level directory another user owns, and the kubelet creates every mount
+  -- point as root. So the checkout is never a mount point itself. It is a directory the agent
+  -- creates (see `openSession`) inside one: inside the claim's root with task volumes, where
+  -- `$HOME` lives too, and otherwise inside an `emptyDir` mounted on the directory above it.
+  let parentOf (p : String) : String :=
+    (System.FilePath.mk p).parent.map (·.toString) |>.getD "/"
+  let stageMounts : Array Json := (staged.mapIdx fun i st =>
+    if st.isWorkspace then
+      if workspaceClaim.isSome then none
+      else some (Json.mkObj [("name", .str (stageVolumeName i)),
+                             ("mountPath", .str (parentOf st.podPath))])
+    else some (Json.mkObj [("name", .str (stageVolumeName i)), ("mountPath", .str st.podPath)]))
+    |>.filterMap id
   let stageVolumes : Array Json := (staged.mapIdx fun i st =>
-    if onClaim st then none
+    if st.isWorkspace && workspaceClaim.isSome then none
     else some (Json.mkObj [("name", .str (stageVolumeName i)), ("emptyDir", Json.mkObj [])]))
     |>.filterMap id
-  let (homeVolumes, homeMount) := match workspaceClaim with
-    | some claim =>
+  -- The claim, mounted whole: the checkout and `$HOME` are directories in it, made by the agent.
+  -- Without one, `$HOME` is a scratch `emptyDir` of its own.
+  let (homeVolumes, homeMounts) := match workspaceClaim, cfg.taskVolumes with
+    | some claim, some tv =>
       (#[Json.mkObj [("name", .str workspaceVolumeName),
           ("persistentVolumeClaim", Json.mkObj [("claimName", .str claim)])]],
-       claimMount "home" cfg.homePath)
-    | none =>
+       #[Json.mkObj [("name", .str workspaceVolumeName), ("mountPath", .str tv.mountPath)]])
+    | _, _ =>
       (#[Json.mkObj [("name", .str "home"), ("emptyDir", Json.mkObj [])]],
-       Json.mkObj [("name", .str "home"), ("mountPath", .str cfg.homePath)])
+       #[Json.mkObj [("name", .str "home"), ("mountPath", .str cfg.homePath)]])
   let volumes : Array Json :=
     stageVolumes
       ++ #[Json.mkObj [("name", .str "control"), ("emptyDir", Json.mkObj [])]] ++ homeVolumes
       ++ cfg.extraVolumes
   let mounts : Array Json :=
     stageMounts
-      ++ #[Json.mkObj [("name", .str "control"), ("mountPath", .str controlPath)], homeMount]
+      ++ #[Json.mkObj [("name", .str "control"), ("mountPath", .str controlPath)]] ++ homeMounts
       ++ cfg.extraMounts
-  let workspaceMount := (staged.find? (·.isWorkspace)).map (·.podPath)
-    |>.filter (fun _ => workspaceClaim.isSome)
   -- `HOME` is set here rather than passed through: the image's idea of home is not orchestra's,
   -- and every home-relative path the agent backend declared was resolved against `homePath`.
   -- Nothing else is set on the pod. Credentials reach each command through a file (see
   -- `envFilePath`), because a pod's spec is readable by anything that can list pods.
+  --
+  -- The working directory is the control directory, not the checkout: a container runtime creates
+  -- a missing working directory itself, as root, which is exactly the ownership this avoids. Every
+  -- command `cd`s to the checkout anyway (`runnerScript`).
   let container := Json.mkObj ([
     ("name", .str "agent"),
     ("image", .str image),
     ("command", .arr #[.str "/bin/sh", .str "-c", .str idleScript]),
-    ("workingDir", .str (podPathOf spec workspaceMount spec.workdir.toString)),
+    ("workingDir", .str controlPath),
     ("env", .arr #[Json.mkObj [("name", .str "HOME"), ("value", .str cfg.homePath)]]),
     ("volumeMounts", .arr mounts)
   ] ++ (match cfg.imagePullPolicy with
@@ -1142,11 +1154,17 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
         IO.println s!"  [k8s] new workspace volume {claim}"
       pure (some (tv, claim, reused))
     | _, _ => pure none
-  let workspaceMount := volume.map (·.1.mountPath)
-  let staged := stagedPaths cfg home spec workspaceMount
+  -- On a task volume the checkout and `$HOME` are directories on the claim (see `TaskVolumes`);
+  -- `ecfg` is the configuration with `homePath` pointing there, so every home-relative path the
+  -- agent backend declared lands on the claim as well.
+  let ecfg : Config := match volume with
+    | some (tv, _, _) => { cfg with homePath := s!"{tv.mountPath}/home" }
+    | none            => cfg
+  let workspaceMount := volume.map (fun (tv, _, _) => s!"{tv.mountPath}/work")
+  let staged := stagedPaths ecfg home spec workspaceMount
   let toPod := podPathOf spec workspaceMount
   let podName := s!"orchestra-{← randomHex 6}"
-  let manifest := podManifest cfg spec podName image staged (volume.map (·.2.1))
+  let manifest := podManifest ecfg spec podName image staged (volume.map (·.2.1))
   let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
   IO.FS.createDirAll dir
   let manifestPath := dir / "pod.json"
@@ -1186,6 +1204,13 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     throw (IO.userError s!"kubernetes: pod {podName} did not become ready within \
 {cfg.startupTimeoutSeconds}s ({why}): {waitErr.trimAscii}")
   try
+    -- The directories the agent works in, made by the agent's own user (every `exec` runs as the
+    -- image's user) before anything lands in them, so that they are its own and not root's — the
+    -- checkout and, on a claim, `$HOME`. A no-op on a claim a predecessor left, where they exist.
+    if let some ws := staged.find? (·.isWorkspace) then
+      mkdirInPod cfg podName ws.podPath
+    if volume.isSome then
+      mkdirInPod cfg podName ecfg.homePath
     for st in staged do
       match volume with
       | some (tv, _, reused) =>
@@ -1281,7 +1306,7 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
       for g in grants do
         if g.from_ == .orchestra then
           stagePath cfg podName (PathGrant.resolve home g).path
-            (PathGrant.resolve cfg.homePath g).path
+            (PathGrant.resolve ecfg.homePath g).path
     runScript := fun script => do
       -- The repository's own scripts, run where the agent works. `bash` because that is what the
       -- daemon used when it ran them itself, and repositories were written against it.

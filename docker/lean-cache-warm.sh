@@ -119,6 +119,20 @@ TOML
     [ "$(git -C .lake/packages/mathlib rev-parse HEAD)" = "$rev" ]
     lake exe cache get
     lake build
+    # Every executable the cached packages declare -- Mathlib's `mk_all` and `cache`, Batteries'
+    # `runLinter`, and so on. A project's own scripts run these with `lake exe`, which builds them,
+    # native code and all, into the package's tree on first use; read-only in a pod, that fails
+    # the script. Built here instead, each on its own, so one that does not build costs only itself.
+    for p in .lake/packages/*; do
+      pkg=$(basename "$p")
+      exes=$( { sed -n 's/^lean_exe[[:space:]]\{1,\}«\{0,1\}\([A-Za-z0-9_-]*\)»\{0,1\}.*/\1/p' \
+                  "$p/lakefile.lean" 2>/dev/null || true
+                awk '/^\[\[lean_exe\]\]/ {e=1; next} /^\[/ {e=0} e && /^name *=/ {gsub(/[" ]/, "", $0); sub(/^name=/, ""); print}' \
+                  "$p/lakefile.toml" 2>/dev/null || true; } | sort -u)
+      for exe in $exes; do
+        lake build "@$pkg/$exe" || echo "warning: could not build $pkg/$exe" >&2
+      done
+    done
     chmod -R a+rX .lake/packages "$MATHLIB_CACHE_DIR" "$ELAN_HOME"
     for p in .lake/packages/*; do
       name=$(basename "$p")
@@ -160,6 +174,8 @@ if [ -d "$requests" ]; then
     if [ "$fails" -ge 3 ] && [ $((now - $(stat -c %Y "$cache/failed/$r"))) -lt 604800 ]; then
       rm -f "$f"; continue
     fi
+    # A pinned revision is warmed anyway; its request only says it is in use, which that records.
+    case " ${pinned[*]} " in *" $r "*) rm -f "$f"; date +%s > "$cache/warmed/$r" 2>/dev/null; continue ;; esac
     requested+=("$r")
   done
 fi

@@ -250,14 +250,19 @@ def thePodIsAPlaceToRunThingsRatherThanOneCommand : Test := do
       | _             => []
     TestM.assertEqual (cmd.take 2) ["/bin/sh", "-c"] (msg := "it runs a shell")
     TestM.assert (AgentDef.containsCI (cmd.getD 2 "") "sleep") "that does nothing but wait"
-    TestM.assertEqual (c.getObjValAs? String "workingDir" |>.toOption)
-      (some "/var/lib/orchestra/work/acme-widgets-slot0") (msg := "rooted in the checkout")
+    TestM.assertEqual (c.getObjValAs? String "workingDir" |>.toOption) (some controlPath)
+      (msg := "started in the control directory: the runtime would make a missing checkout root's")
+
     TestM.assertEqual (c.getObjValAs? String "image" |>.toOption)
       (some "ghcr.io/example/agent:1") (msg := "image")
 
 @[test]
 def theCheckoutIsMountedWhereTheDaemonHasIt : Test := do
-  TestM.assert (mountPaths.contains "/var/lib/orchestra/work/acme-widgets-slot0") "the checkout"
+  -- The checkout is never a mount point (the kubelet makes those root's, and git refuses a work tree
+  -- another user owns): the directory above it is, and the agent makes the checkout inside it.
+  TestM.assert (mountPaths.contains "/var/lib/orchestra/work") "the directory the checkout goes in"
+  TestM.assert (!mountPaths.contains "/var/lib/orchestra/work/acme-widgets-slot0")
+    "but not the checkout itself"
   TestM.assert (mountPaths.contains "/opt/orchestra/plugins") "the plugin directory"
   TestM.assert (mountPaths.contains "/var/lib/orchestra/memories/acme") "the memories"
   TestM.assert (mountPaths.contains "/home/agent") "a writable home"
@@ -438,7 +443,7 @@ def taskVolumesAreReadAndChecked : Test := do
   | some tv =>
     TestM.assertEqual tv.size "30Gi"
     TestM.assertEqual tv.storageClass (some "local-path")
-    TestM.assertEqual tv.mountPath "/workspace"
+    TestM.assertEqual tv.mountPath "/task"
     TestM.assertEqual tv.retentionDays 14
     TestM.assertEqual tv.seedPaths #[".lake/build"]
   -- A seed path is a path under the checkout on both sides; anything that could name something
@@ -457,12 +462,14 @@ def taskVolumesAreReadAndChecked : Test := do
 
 @[test]
 def onATaskVolumeTheCheckoutAndHomeLiveOnTheClaim : Test := do
-  -- The claim holds the checkout and `$HOME` as two subpaths, and the checkout is mounted at one
-  -- fixed path whatever it is called on the daemon, so a continuation runs in the directory its
-  -- predecessor did — which is what the agent CLIs key a saved conversation by.
-  let mount := "/workspace"
-  let st := stagedPaths tvConfig "/home/daemon" sampleSession (some mount)
-  let m := podManifest tvConfig sampleSession "orchestra-abc123" (imageOf tvConfig sampleSession) st
+  -- The claim is mounted whole, and the checkout and `$HOME` are directories in it rather than
+  -- mount points: the agent creates them, so they are its own, and git accepts the work tree. The
+  -- checkout's path is fixed whatever it is called on the daemon, so a continuation runs in the
+  -- directory its predecessor did — which is what the agent CLIs key a saved conversation by.
+  let tv := tvConfig.taskVolumes.getD {}
+  let ecfg := { tvConfig with homePath := s!"{tv.mountPath}/home" }
+  let st := stagedPaths ecfg "/home/daemon" sampleSession (some s!"{tv.mountPath}/work")
+  let m := podManifest ecfg sampleSession "orchestra-abc123" (imageOf ecfg sampleSession) st
     (some "orchestra-ws-0123abcd")
   let c := match m.getObjVal? "spec" |>.toOption |>.bind (·.getObjVal? "containers" |>.toOption) with
     | some (.arr cs) => cs[0]?
@@ -470,32 +477,32 @@ def onATaskVolumeTheCheckoutAndHomeLiveOnTheClaim : Test := do
   let mounts := match c.bind (·.getObjVal? "volumeMounts" |>.toOption) with
     | some (.arr ms) => ms.toList
     | _              => []
-  let mountOf (path : String) : Option Json :=
-    mounts.find? (fun j => (j.getObjValAs? String "mountPath" |>.toOption) == some path)
-  match mountOf mount, mountOf tvConfig.homePath with
-  | some w, some h =>
-    TestM.assertEqual (w.getObjValAs? String "subPath" |>.toOption) (some "work")
-    TestM.assertEqual (h.getObjValAs? String "subPath" |>.toOption) (some "home")
-    TestM.assertEqual (w.getObjValAs? String "name" |>.toOption) (some workspaceVolumeName)
-  | _, _ => TestM.fail "the checkout and home are not both mounted from the claim"
-  TestM.assert (!mounts.any (fun j => (j.getObjValAs? String "mountPath" |>.toOption)
-      == some sampleSession.workdir.toString))
+  let mountedAt (path : String) : Bool :=
+    mounts.any (fun j => (j.getObjValAs? String "mountPath" |>.toOption) == some path)
+  match mounts.find? (fun j => (j.getObjValAs? String "mountPath" |>.toOption) == some "/task") with
+  | some j =>
+    TestM.assertEqual (j.getObjValAs? String "name" |>.toOption) (some workspaceVolumeName)
+    TestM.assert (j.getObjVal? "subPath" |>.toOption).isNone "mounted whole, not by subPath"
+  | none => TestM.fail "the claim is not mounted at /task"
+  TestM.assert (!mountedAt "/task/work" && !mountedAt "/task/home")
+    "neither the checkout nor home is a (root-owned) mount point of its own"
+  TestM.assert (!mountedAt sampleSession.workdir.toString)
     "nothing is mounted at the daemon's own path for the checkout"
-  TestM.assertEqual (c.bind (·.getObjValAs? String "workingDir" |>.toOption)) (some mount)
+  TestM.assertEqual ((st.find? (·.isWorkspace)).map (·.podPath)) (some "/task/work")
+  TestM.assert (AgentDef.containsCI m.compress "\"value\":\"/task/home\"") "HOME is on the claim"
   TestM.assert (AgentDef.containsCI m.compress "orchestra-ws-0123abcd") "the claim is the volume"
   -- Memories and plugins are still carried as before.
-  TestM.assert (mounts.any (fun j => (j.getObjValAs? String "mountPath" |>.toOption)
-      == some "/var/lib/orchestra/memories/acme")) "the memory directory is still staged"
+  TestM.assert (mountedAt "/var/lib/orchestra/memories/acme") "the memory directory is still staged"
 
 @[test]
 def pathsUnderTheCheckoutAreTranslated : Test := do
   let w := sampleSession.workdir.toString
-  TestM.assertEqual (podPathOf sampleSession (some "/workspace") w) "/workspace"
-  TestM.assertEqual (podPathOf sampleSession (some "/workspace") s!"{w}/.orchestra/validation.sh")
-    "/workspace/.orchestra/validation.sh"
+  TestM.assertEqual (podPathOf sampleSession (some "/task/work") w) "/task/work"
+  TestM.assertEqual (podPathOf sampleSession (some "/task/work") s!"{w}/.orchestra/validation.sh")
+    "/task/work/.orchestra/validation.sh"
   -- A sibling whose name merely starts the same is not under the checkout.
-  TestM.assertEqual (podPathOf sampleSession (some "/workspace") s!"{w}-other/x") s!"{w}-other/x"
-  TestM.assertEqual (podPathOf sampleSession (some "/workspace") "/tmp/agent-mcp.json")
+  TestM.assertEqual (podPathOf sampleSession (some "/task/work") s!"{w}-other/x") s!"{w}-other/x"
+  TestM.assertEqual (podPathOf sampleSession (some "/task/work") "/tmp/agent-mcp.json")
     "/tmp/agent-mcp.json"
   TestM.assertEqual (podPathOf sampleSession none s!"{w}/x") s!"{w}/x"
 

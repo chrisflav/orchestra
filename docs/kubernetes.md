@@ -339,9 +339,12 @@ the agent's `$HOME`, and keeps it after the pod is gone:
 - **A task that continues another one** — `continues_from`, a series, a retry of either — is handed
   the claim its predecessor used, untouched, in a new pod: the tree with the edits and the branch,
   the build, and the agent's home with its conversation. However many unrelated tasks ran in
-  between. The checkout is mounted at one fixed path (`mount_path`, `/workspace` by default)
-  whatever it is called on the daemon, because the agent CLIs key a saved conversation by its
-  working directory.
+  between. The claim is mounted at `mount_path` (`/task` by default); the checkout is `/task/work`
+  and `$HOME` is `/task/home`, whatever the checkout is called on the daemon, because the agent
+  CLIs key a saved conversation by its working directory. Both are directories the agent's own
+  user creates, not mount points: the kubelet makes every mount point root's, and git refuses a
+  work tree whose top-level directory another user owns. (Without task volumes the same holds:
+  the checkout's `emptyDir` is mounted on the directory above it.)
 - **Two tasks never share a claim.** One that continues a task whose claim another task's pod
   holds right now is refused rather than mounted beside it, and `$HOME` is per chain, not per
   daemon: no agent sees another's credentials, history or scratch files.
