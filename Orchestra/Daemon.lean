@@ -402,7 +402,8 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   -- window resets, without anyone having to re-queue it. The reason is logged once per entry so
   -- a queue that looks stalled says why it is stalled.
   let authWaitNoted ← IO.mkRef ({} : Std.HashSet String)
-  let resolveEntryAuth (e : Queue.QueueEntry) : IO Queue.AuthDecision := do
+  let resolveEntryAuth (running : String → Nat) (e : Queue.QueueEntry)
+      : IO Queue.AuthDecision := do
     let backend := e.backend.getD "claude"
     -- Per-entry config, so an entry pinned to a different config file is judged against the
     -- auth sources that file declares.
@@ -413,8 +414,11 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
     -- mutex for hours at a time. The usage poller below keeps the stored numbers current for
     -- `appConfig`'s sources. A source only `entryCfg` declares is never polled here; it learns
     -- its limits from `markLimited` alone, as a backend with polling off does.
+    --
+    -- `running` is the agents already on each source. Counting them is what keeps a burst of
+    -- claims between two polls from all reading the same numbers and landing on one account.
     match ← Usage.resolveLabel entryCfg backend e.authSources e.authSource e.authMode e.model
-        (refresh := false) with
+        (refresh := false) (running := running) with
     | .ok label =>
       authWaitNoted.modify (·.erase e.id)
       -- Stamp the source as used *here*, while `claimMutex` is still held and before any other
@@ -434,6 +438,12 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
     claimMutex.lock
     try
       let slotMap ← activeSlots.get
+      let pending ← Queue.pendingEntries
+      if pending.isEmpty then return none
+      -- Read once per claim, not once per entry considered: nothing changes it until this claim
+      -- writes its entry `running`, and the next claim reads it again. After the pending check,
+      -- so an idle worker polling an empty queue every second does not pay for it.
+      let running ← Queue.runningPerAuthSource
       let ctx : Queue.ClaimContext := {
         occupiedSlots   := slotMap
         total           := ← totalActive.get
@@ -441,9 +451,8 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
         parallelLimit
         perRepoLimit    := parallelLimitPerRepo
         parallelSafe    := TaskRunner.backendIsParallelSafe
-        resolveAuth     := resolveEntryAuth
+        resolveAuth     := resolveEntryAuth running
       }
-      let pending ← Queue.pendingEntries
       let some claim ← Queue.claimDecision ctx pending Queue.entryForTask Repo.poolOccupant
         | return none
       let e := claim.entry
@@ -683,8 +692,11 @@ its workspace; it will start from a clean checkout."
   if !usageBackends.isEmpty then
     let _usageTask ← IO.asTask (prio := .dedicated) do
       while !(← shutdownToken.isCancelled) do
+        -- With the agents running on each source, so each poll also teaches how fast they
+        -- consume it (`Usage.Estimate`).
+        let running ← try some <$> Queue.runningPerAuthSource catch _ => pure none
         for backend in usageBackends do
-          try Usage.refreshAll appConfig backend
+          try Usage.refreshAll appConfig backend (running := running)
           catch e => IO.eprintln s!"[usage] poll failed for {backend}: {e}"
         -- Five minutes between sweeps: fast enough that a reset is picked up promptly, slow
         -- enough that an idle daemon makes a handful of requests an hour.
