@@ -1,6 +1,7 @@
 import Orchestra.AgentDef
 import Orchestra.StreamFormat
 import Orchestra.Exec
+import Orchestra.Kleis
 import Std.Sync
 
 /-!
@@ -179,13 +180,19 @@ def envFor (ghToken : String) (agentEnv extraEnv : Array (String × Option Strin
 def specFor (agentDef : AgentDef) (repoPath : System.FilePath) (mcp : McpEndpoint)
     (ghToken : String) (agentEnv extraEnv : Array (String × Option String))
     (pluginDirs memoryDirs : Array String) (readOnly : Bool) (extraPorts : Array Nat)
-    (additionalPaths : SandboxPaths) : RunSpec :=
+    (additionalPaths : SandboxPaths) (kleis : Option Kleis.Launch := none) : RunSpec :=
   { command := agentDef.command
     workdir := repoPath
     grants  := grantsFor agentDef.sandboxPaths additionalPaths repoPath readOnly
                  pluginDirs memoryDirs
-    ports   := portsFor agentDef.sandboxPaths additionalPaths mcp extraPorts
-    env     := envFor ghToken agentEnv extraEnv
+                 ++ (kleis.map (·.files)).getD #[]
+    ports   := portsFor agentDef.sandboxPaths additionalPaths mcp
+                 (extraPorts ++ (kleis.map (·.port)).toArray)
+    -- With kleis the sandbox holds no GitHub token at all, whatever the caller passed: the
+    -- proxy attaches the credential, and a token here would be a way around it.
+    env     := match kleis with
+      | none   => envFor ghToken agentEnv extraEnv
+      | some k => envFor "" agentEnv extraEnv ++ k.env
     -- Inherited by name, not by value: `PATH` and `HOME` mean what they mean wherever the agent
     -- ends up running, which is not necessarily here.
     envPassthrough := #["SHELL", "PATH", "HOME", "USER", "TERM"]
@@ -265,7 +272,9 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     -- Secret the agent must present to the MCP server, when the server had to listen somewhere
     -- other than loopback for this backend to reach it. Minted with the server by
     -- `Exec.mcpBinding`; `none` for every loopback run.
-    (mcpToken : Option String := none) : IO LaunchResult := do
+    (mcpToken : Option String := none)
+    -- How the agent reaches GitHub when kleis holds the credentials; see `Orchestra.Kleis`.
+    (kleis : Option Kleis.Launch := none) : IO LaunchResult := do
   -- Where the agent reaches the MCP server: loopback for a backend that runs it on this machine,
   -- and whatever a remote one says instead. Resolved before `setupMcp`, which writes it into the
   -- agent's config file.
@@ -275,6 +284,8 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   -- staged when the session opened — it did not exist then, since it holds an address that needs
   -- a server that is started after the session — so it is carried across now, before launch.
   session.provide mcpFiles
+  -- The CA bundle the proxy's certificates are verified against, carried like the MCP config.
+  if let some k := kleis then session.provide k.files
   -- Memory dirs are exposed as plugin dirs to the agent (so they appear as --plugin-dir args)
   let allPluginDirs := pluginDirs ++ memoryDirs
   -- Enforced here rather than where the prompts are built: every backend and every caller
@@ -306,7 +317,7 @@ goal; running without the goal condition."
       agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
   let spec : RunSpec :=
     { specFor agentDef repoPath mcp ghToken agentEnv extraEnv pluginDirs memoryDirs readOnly
-        extraPorts additionalPaths with
+        extraPorts additionalPaths kleis with
       args  := goalArgs ++ agentArgs
       stdio := if interactiveAgent then .inherit else .piped }
   if debug then
@@ -555,12 +566,15 @@ def launchStreaming (agentDef : AgentDef) (repoPath : System.FilePath)
     -- The environment the session's agent lives in, held for as long as the conversation is.
     (session : Exec.Session := Exec.Landrun.session)
     -- Secret the agent presents to the MCP server, when the server had to listen off loopback.
-    (mcpToken : Option String := none) : IO (Option StreamingSession) := do
+    (mcpToken : Option String := none)
+    -- How the agent reaches GitHub when kleis holds the credentials; see `Orchestra.Kleis`.
+    (kleis : Option Kleis.Launch := none) : IO (Option StreamingSession) := do
   let mcp ← session.mcpEndpoint { host := "127.0.0.1", port := serverPort, token := mcpToken }
   let (mcpContext, agentEnv, mcpFiles) ← agentDef.setupMcp mcp opts.model opts.systemPrompt
   -- Carried to wherever the agent runs, for the same reason as on the queued path: this file
   -- holds the address of the tools, and it was written here.
   session.provide mcpFiles
+  if let some k := kleis then session.provide k.files
   -- Capped for the same reason as everywhere else: it is one `execve` argument, and the limit
   -- belongs to `execve` rather than to any one caller.
   let systemPrompt ← opts.systemPrompt.mapM (capPromptArg "system prompt")
@@ -577,7 +591,7 @@ def launchStreaming (agentDef : AgentDef) (repoPath : System.FilePath)
     return none
   let spec : RunSpec :=
     { specFor agentDef repoPath mcp ghToken agentEnv extraEnv pluginDirs memoryDirs readOnly
-        extraPorts additionalPaths with
+        extraPorts additionalPaths kleis with
       args  := agentArgs
       -- The mode that keeps stdin open: a turn is a line written to it, and closing it is how the
       -- conversation ends.
