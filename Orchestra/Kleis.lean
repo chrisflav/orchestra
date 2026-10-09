@@ -209,9 +209,10 @@ def caBundle (cfg : KleisConfig) : IO System.FilePath := do
     | none => do
       IO.eprintln "  [kleis] warning: no system CA bundle found; the sandbox will trust only kleis"
       pure ""
-  -- Not twice: a daemon whose own trust store already holds kleis's CA would otherwise add it again.
-  let system := if (system.splitOn kleisCa.trimAscii.toString).length > 1 then "" else system
-  let contents := system ++ (if system.endsWith "\n" || system.isEmpty then "" else "\n") ++ kleisCa
+  -- Not twice: a daemon whose own trust store already holds kleis's CA keeps it as it is.
+  let already := (system.splitOn kleisCa.trimAscii.toString).length > 1
+  let contents := if already then system
+    else system ++ (if system.endsWith "\n" || system.isEmpty then "" else "\n") ++ kleisCa
   let dir := (← Dirs.dataBase) / "kleis"
   IO.FS.createDirAll dir
   -- Named by its contents and never replaced: a sandbox is granted the file it was started with,
@@ -273,7 +274,12 @@ structure Launch where
     than probing for a scheme first, through the environment so nothing in the sandbox's git
     configuration has to change. -/
 def launch (cfg : KleisConfig) (m : Minted) (bundle : System.FilePath) : Launch :=
-  let proxyUrl := s!"http://orchestra:{percentEncode m.token}@{proxyAuthority cfg}"
+  -- With the port always written out: the sandbox is let through to `proxyPort` and no
+  -- other, and a URL without one would have clients dial 80 whatever that says.
+  let host := match (proxyAuthority cfg).splitOn ":" with
+    | h :: _ :: _ => h
+    | _ => proxyAuthority cfg
+  let proxyUrl := s!"http://orchestra:{percentEncode m.token}@{host}:{proxyPort cfg}"
   let noProxy := ",".intercalate (["localhost", "127.0.0.1", "::1"] ++ cfg.noProxy)
   let ca := bundle.toString
   { env := #[

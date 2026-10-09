@@ -1807,7 +1807,8 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let repoPath ← match repo with
     | some r =>
       IO.println s!"Cloning/updating {r.fork}..."
-      let p ← Repo.ensureCloned r.fork r.upstream
+      -- With the token explicitly: under kleis there is no hosts.yml login to fall back on.
+      let p ← Repo.ensureCloned r.fork r.upstream (token := if token.isEmpty then none else some token)
       IO.println s!"  Repo at {p}"
       pure p
     | none =>
@@ -1872,10 +1873,12 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     image   := repoConfig.image }
   -- A token of its own, as a queued task gets, revoked however the session ends.
   let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
-    taskId := "interactive", repo, tools := allowedTools, pushPrefix := kc.pushPrefix
+    taskId := s!"interactive-{session.id}", repo, tools := allowedTools, pushPrefix := kc.pushPrefix
     org := appConfig.defaultOrganization }
   let kleisMinted ← match appConfig.kleis, kleisFacts with
-    | some kc, some facts => some <$> Kleis.mint kc facts
+    | some kc, some facts =>
+      try some <$> Kleis.mint kc facts
+      catch e => do shutdown; session.close; throw e
     | _, _ => pure none
   let revokeKleis : IO Unit := do
     if let (some kc, some m) := (appConfig.kleis, kleisMinted) then
@@ -1896,8 +1899,9 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
         (interactiveAgent := true) (session := session) (mcpToken := mcpToken)
         (kleis := kleisLaunch) (systemPrompt := kleisFacts.map Kleis.systemPrompt)
     finally
-      session.close
+      -- Revoked first: a close that throws must not leave the token live.
       revokeKleis
+      session.close
   IO.println s!"  Agent exited with code {result.exitCode}"
   shutdown
   return if result.exitCode == 0 then 0 else 1
