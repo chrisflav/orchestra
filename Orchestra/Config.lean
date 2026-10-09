@@ -977,8 +977,7 @@ structure KleisConfig where
   /-- The kleis CA certificate, PEM. Fetched from the daemon when unset. -/
   caFile : Option String := none
   /-- The grants a task's token names, in the order kleis tries them. -/
-  grants : List String :=
-    ["orchestra-fork", "orchestra-upstream", "orchestra-triage", "orchestra-public"]
+  grants : List String := ["orchestra-github"]
   /-- How long a task's token lives. Revoked when the task ends, so this only bounds a token whose
       task never got to revoke it — a daemon that died mid-task. -/
   ttl : String := "12h"

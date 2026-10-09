@@ -51,6 +51,7 @@ def facts_nameTheTask : Test := do
   TestM.assertEqual ((names facts).filter (· == "task_tool")).length 2
   TestM.assert ((names facts).contains "task_writable") "a task that is not read-only may write"
   TestM.assertEqual (termsOf facts "task_pr_labels") (some "[[\"orchestra\"]]")
+  TestM.assertEqual (termsOf facts "task_label_any") (some "[false]")
 
 @[test]
 def facts_readOnlyAndRepositoryIndependent : Test := do
@@ -59,6 +60,17 @@ def facts_readOnlyAndRepositoryIndependent : Test := do
   TestM.assert (!(names facts).contains "task_fork") "no repository, no fork"
   -- Always present, possibly empty: the grant reads it to bound the labels a pull request gets.
   TestM.assertEqual (termsOf facts "task_pr_labels") (some "[[]]")
+
+@[test]
+def facts_triageAndRepositoryCreation : Test := do
+  let facts := Orchestra.Kleis.TaskFacts.toFacts {
+    taskId := "t3", tools := ["label_issue", "create_repository"], org := some "bot-org" }
+  -- Stated either way, since the grant allows no label at all without it.
+  TestM.assertEqual (termsOf facts "task_label_any") (some "[true]")
+  TestM.assertEqual (termsOf facts "task_org") (some "[\"bot-org\"]")
+  let p := Orchestra.Kleis.systemPrompt {
+    taskId := "t3", tools := ["create_repository"], org := some "bot-org" }
+  TestM.assert (p.contains "orgs/bot-org/repos") "the agent is told where it may create repositories"
 
 @[test]
 def launch_pointsEverythingAtTheProxy : Test := do

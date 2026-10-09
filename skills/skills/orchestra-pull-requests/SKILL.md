@@ -94,6 +94,19 @@ With `merge_pr`: `gh api -X PUT repos/O/R/pulls/N/merge -f merge_method=squash`.
 refuses — conflicting, blocked by branch protection, already merged — says why in its response;
 report that rather than retrying.
 
+## Creating a repository
+
+With `create_repository`, in the organisation your system prompt names, and no other:
+
+```
+gh api orgs/ORG/repos -f name=new-repo -F private=true
+git push https://github.com/ORG/new-repo HEAD:main
+```
+
+Use letters, digits, `.`, `_` and `-` in the name; anything else is refused, since GitHub would
+quietly rename it. Once GitHub has created it, the same token may push to it. Not `gh repo create`,
+which is a GraphQL mutation.
+
 # With orchestra's tools
 
 Everything that touches a pull request or a GitHub issue goes through orchestra's MCP tools.

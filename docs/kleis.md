@@ -17,9 +17,11 @@ credential at all:
 - kleis decides each request against grants written over those facts. A task can push to its
   own fork, open a pull request from it on its upstream, comment on its own issue, and so on, as
   its tools allow. It cannot do anything else.
-- The GitHub tools — `refresh_token`, `get_pr_comments`, `create_pr`, `merge_pr`, `label_issue`
-  and `comment` — are not offered. Keeping them would be a second way to spend the PAT, past
-  the grants. `create_repository` stays: it returns a kleis token for the new repository.
+- The GitHub tools — `refresh_token`, `get_pr_comments`, `create_pr`, `merge_pr`, `label_issue`,
+  `comment` and `create_repository` — are not offered. Keeping them would be a second way to
+  spend the credentials, past the grants. A tool named in a task's `tools` becomes a fact on its
+  token instead: `create_repository` lets the token create a repository in
+  `default_organization`, and kleis then lets the same token push to it.
 
 ## Setting up kleis
 
@@ -28,14 +30,12 @@ kleis's `examples/orchestra/` is the setup this was written against. It contains
 - a `config.toml` with an `orchestra` issuer and `passthrough` for hosts kleis has no manifest
   for;
 - the GitHub manifest;
-- four grants:
-
-| grant | credential | covers |
-| --- | --- | --- |
-| `orchestra-fork` | the GitHub App | the task's fork: fetch, push, read, pull requests on it; GraphQL queries |
-| `orchestra-upstream` | the PAT | the upstream: fetch, read, pull requests from the fork, comments on the task's issue, merges |
-| `orchestra-triage` | the PAT | labels on any upstream issue, for `label_issue` |
-| `orchestra-public` | none | anonymous reads and clones of anything public |
+- one grant, `orchestra-github`, which decides what a task may do and then which credential each
+  request goes out on:
+  1. an operator-written route by owner or repository (`resources = ["acme/*"]`), first;
+  2. otherwise the task's fork, the repositories it created, and GraphQL on the GitHub App;
+  3. otherwise the task's upstream on the PAT;
+  4. otherwise nothing: public dependencies are read anonymously.
 
 Its README has the `kleis credential add` commands. Then mint orchestra's issuer credential:
 
@@ -58,7 +58,7 @@ kleis issuer token orchestra --ttl 90d
 | `issuer_token` | required | from `kleis issuer token orchestra`; put it in `secrets.json` |
 | `proxy` | `url`'s host and port | `host:port` the sandboxes reach the proxy at, if different — a service name for pods |
 | `ca_file` | fetched from kleisd | kleis's CA certificate |
-| `grants` | the four above | the grants a task's token names, in the order kleis tries them |
+| `grants` | `["orchestra-github"]` | the grants a task's token names, in the order kleis tries them |
 | `ttl` | `12h` | how long a token lives if its task never revokes it |
 | `push_prefix` | none | limit pushes to refs under this prefix |
 | `no_proxy` | none | more hosts the sandbox reaches directly, besides the loopback |
@@ -94,7 +94,7 @@ commands are mutations.
 - `label_issue` can add a label the repository does not have; GitHub creates it. The tool
   refused unknown labels, but a grant cannot ask the repository which labels exist.
 - One App installation per credential. Forks in a second organisation need a second
-  `github-app` credential in kleis and a grant naming it.
+  `github-app` credential in kleis and a `credential_route` to it.
 - The daemon's own GitHub calls — cloning into a slot, the merger, triage, listeners, approving
   an issue — still use the App token and the PAT directly. None of them run in a sandbox.
 - taxis is not behind kleis yet. Its tools stay as they are.

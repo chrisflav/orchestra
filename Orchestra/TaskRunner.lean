@@ -833,7 +833,8 @@ its own.")
     let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
       taskId, repo := ioTask.repo, issueNumber := ioTask.issueNumber
       tools := allowedTools, readOnly := ioTask.readOnly, prLabels := ioTask.prLabels
-      identity := identity.map (·.name), pushPrefix := kc.pushPrefix }
+      identity := identity.map (·.name), pushPrefix := kc.pushPrefix
+      org := appConfig.defaultOrganization }
     let kleisLaunch : Option Kleis.Launch ← match appConfig.kleis, kleisFacts with
       | some kc, some facts => do
         let minted ← Kleis.mint kc facts

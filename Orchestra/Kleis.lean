@@ -47,6 +47,9 @@ structure TaskFacts where
   identity : Option String := none
   /-- Where the task may push, when the operator limited it. -/
   pushPrefix : Option String := none
+  /-- The organisation the task may create repositories in — `default_organization`, the
+      one tasks are forked into. -/
+  org : Option String := none
 
 /-- One fact as kleis's issuer endpoint takes it. A list term becomes a set, which is what a grant
     tests membership in. -/
@@ -66,6 +69,10 @@ def TaskFacts.toFacts (t : TaskFacts) : List Json :=
   ++ t.tools.eraseDups.map (fun tool => fact "task_tool" [.str tool])
   ++ (if t.readOnly then [] else [fact "task_writable" [.bool true]])
   ++ [fact "task_pr_labels" [.arr (t.prLabels.map Json.str).toArray]]
+  -- Always stated, true or false: the grant requires it before it allows any label at all,
+  -- so a token that lacked it could not have its labels left unchecked.
+  ++ [fact "task_label_any" [.bool (t.tools.contains "label_issue")]]
+  ++ (t.org.map fun o => fact "task_org" [.str o]).toList
   ++ (t.identity.map fun i => fact "task_identity" [.str i]).toList
   ++ (t.pushPrefix.map fun p => fact "task_push_prefix" [.str p]).toList
 
@@ -223,6 +230,9 @@ def systemPrompt (t : TaskFacts) : String := Id.run do
     lines := lines.push "- This task is read-only: you may fetch, not push."
   if let some p := t.pushPrefix then
     lines := lines.push s!"- Push only refs under `{p}`."
+  if let (some o, true) := (t.org, t.tools.contains "create_repository") then
+    lines := lines.push s!"- You may create repositories in `{o}`, with `gh api orgs/{o}/repos -f name=…`; \
+the same token may then push to them."
   return "\n".intercalate lines.toList
 
 /-- What a sandbox needs to reach GitHub through the proxy. -/

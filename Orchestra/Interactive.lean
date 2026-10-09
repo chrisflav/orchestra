@@ -475,7 +475,8 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
       taskId := record.id, repo := some { upstream := record.upstream, fork }
       tools := record.tools.getD allOptionalTools
-      identity := identity.map (·.name), pushPrefix := kc.pushPrefix }
+      identity := identity.map (·.name), pushPrefix := kc.pushPrefix
+      org := appConfig.defaultOrganization }
     let (kleisLaunch, shutdownMcp) ← match appConfig.kleis, kleisFacts with
       | some kc, some facts => do
         let minted ← Kleis.mint kc facts
