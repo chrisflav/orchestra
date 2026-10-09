@@ -37,7 +37,16 @@ jobs:
       - uses: actions/checkout@v5
 
       # buildx, for the cache backend below — the classic builder has no `--cache-to`.
+      #
+      # Base images from Docker Hub are pulled through Google's public mirror. Anonymous pulls from
+      # GitHub's runners share their addresses' Docker Hub quota, and on 2026-10-09 every attempt
+      # for half an hour was refused with 429 before a single layer was fetched. The mirror serves
+      # the same digests; buildkit falls back to Docker Hub for anything it does not carry.
       - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       # Skipped for pull requests, which don't push. A PR from a fork gets a read-only
       # GITHUB_TOKEN anyway, so attempting a login there would fail rather than degrade.

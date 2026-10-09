@@ -17,7 +17,9 @@ jobs:
     # see the reasoning in OrchestraTest/TestM.lean.
     services:
       postgres:
-        image: postgres:17
+        # Docker Hub's official image, through Google's mirror: anonymous Docker Hub pulls from
+        # GitHub's runners are refused with 429 for long stretches.
+        image: mirror.gcr.io/library/postgres:17
         env:
           POSTGRES_USER: testuser
           POSTGRES_PASSWORD: secret
