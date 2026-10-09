@@ -92,13 +92,23 @@ instance : Repr Minted where
 private def base (cfg : KleisConfig) : String :=
   if cfg.url.endsWith "/" then (cfg.url.dropEnd 1).toString else cfg.url
 
+/-- The issuer credential: from {name}`KleisConfig.issuerTokenFile` when there is one, read each
+    time so a credential kleisd renewed there is picked up without a restart. -/
+def issuerCredential (cfg : KleisConfig) : IO String := do
+  match cfg.issuerTokenFile with
+  | some f =>
+    let text := (← IO.FS.readFile f).trimAscii.toString
+    if text.isEmpty then throw (.userError s!"kleis's issuer credential file {f} is empty")
+    return text
+  | none => return cfg.issuerToken
+
 /-- POST to one of kleis's own endpoints with the issuer credential. Directly, never through a
     proxy: the daemon's environment may have one set, and this request is to the proxy itself. -/
 private def postAdmin (cfg : KleisConfig) (path body : String) : IO (Nat × String) := do
   let (status, _, out) ← Utils.Http.curlFull
     #["--noproxy", "*", "-X", "POST", "-H", "Content-Type: application/json",
       "--data-raw", body, s!"{base cfg}{path}"]
-    (bearer := some cfg.issuerToken)
+    (bearer := some (← issuerCredential cfg))
   return (status, out)
 
 /-- The error kleis put in its answer, or the answer itself. -/
@@ -177,7 +187,7 @@ def caPem (cfg : KleisConfig) : IO String := do
   | some f => IO.FS.readFile f
   | none =>
     let (status, _, out) ← Utils.Http.curlFull #["--noproxy", "*", s!"{base cfg}/.kleis/v1/ca"]
-      (bearer := some cfg.issuerToken)
+      (bearer := some (← issuerCredential cfg))
     if status != 200 then
       throw (.userError s!"could not fetch kleis's CA ({status}): {errorOf out}")
     return out

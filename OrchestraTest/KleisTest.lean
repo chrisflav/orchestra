@@ -167,10 +167,21 @@ def config_readsTheKleisBlock : Test := do
       TestM.assert (!(toString (repr k)).contains "tok") "the issuer token is redacted"
 
 @[test]
+def config_theIssuerCredentialMayComeFromAFile : Test := do
+  match parse "{\"url\": \"http://kleis:8080\", \"issuer_token_file\": \"/kleis/orchestra.token\"}" with
+  | .error e => TestM.fail s!"a block naming a token file should load: {e}"
+  | .ok c => TestM.assertEqual (c.kleis.bind (·.issuerTokenFile)) (some "/kleis/orchestra.token")
+  let dir ← IO.FS.createTempDir
+  let f := dir / "orchestra.token"
+  IO.FS.writeFile f "  En0K-file-token\n"
+  let got ← Orchestra.Kleis.issuerCredential { cfg with issuerTokenFile := some f.toString }
+  TestM.assertEqual got "En0K-file-token"
+
+@[test]
 def config_aBrokenKleisBlockIsAnError : Test := do
   -- Dropped silently, the block would put the App's token back into every sandbox.
   TestM.assert (parse "{\"url\": \"http://k:8080\"}" |>.toOption |>.isNone)
-    "a block without an issuer token does not load"
+    "a block with neither an issuer token nor a file does not load"
   TestM.assert (parse "{\"url\": \"http://k\", \"issuer_token\": \"{{kleis}}\"}" |>.toOption |>.isNone)
     "nor one naming a secret that secrets.json lacks"
 

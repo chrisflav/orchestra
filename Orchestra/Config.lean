@@ -972,8 +972,13 @@ structure KleisConfig where
   /-- `host:port` at which the sandboxes reach the proxy, when that is not the host and port of
       `url` — a pod reaching a service name, say. -/
   proxy : Option String := none
-  /-- The issuer credential, from `kleis issuer token orchestra`. -/
-  issuerToken : String
+  /-- The issuer credential, from `kleis issuer token orchestra`. Empty when it is read from
+      {name}`issuerTokenFile` instead. -/
+  issuerToken : String := ""
+  /-- A file holding the issuer credential, read each time it is needed: where kleisd keeps it
+      itself (an `[[issuer]]` with a `token_file`), renewing it before it expires, so nothing has
+      to be copied into `secrets.json` or rotated by hand. -/
+  issuerTokenFile : Option String := none
   /-- The kleis CA certificate, PEM. Fetched from the daemon when unset. -/
   caFile : Option String := none
   /-- The grants a task's token names, in the order kleis tries them. -/
@@ -988,20 +993,23 @@ structure KleisConfig where
   noProxy : List String := []
 
 instance : Repr KleisConfig where
-  reprPrec c _ := s!"\{ url := {repr c.url}, proxy := {repr c.proxy}, issuerToken := <redacted>, \
+  reprPrec c _ := s!"\{ url := {repr c.url}, proxy := {repr c.proxy}, issuerToken := <redacted>, issuerTokenFile := {repr c.issuerTokenFile}, \
 caFile := {repr c.caFile}, grants := {repr c.grants}, ttl := {repr c.ttl}, \
 pushPrefix := {repr c.pushPrefix}, noProxy := {repr c.noProxy} }"
 
 instance : FromJson KleisConfig where
   fromJson? j := do
     let url ← j.getObjValAs? String "url"
-    let issuerToken ← j.getObjValAs? String "issuer_token"
+    let issuerToken := (j.getObjValAs? String "issuer_token").toOption.getD ""
+    let issuerTokenFile := (j.getObjValAs? String "issuer_token_file").toOption
+    if issuerToken.isEmpty && issuerTokenFile.isNone then
+      throw "kleis needs `issuer_token` or `issuer_token_file`"
     -- An unresolved `{{key}}` is a secret secrets.json does not define; sent as it is, every mint
     -- would fail as an unaccepted token rather than as the missing secret it is.
     if (issuerToken.splitOn "{{").length > 1 then
       throw "kleis.issuer_token names a secret that is not defined in secrets.json"
     let defaults : KleisConfig := { url, issuerToken }
-    return { url, issuerToken
+    return { url, issuerToken, issuerTokenFile
              proxy := j.getObjValAs? String "proxy" |>.toOption
              caFile := j.getObjValAs? String "ca_file" |>.toOption
              grants := j.getObjValAs? (List String) "grants" |>.toOption |>.getD defaults.grants

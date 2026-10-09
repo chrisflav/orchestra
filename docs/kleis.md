@@ -55,7 +55,8 @@ kleis issuer token orchestra --ttl 90d
 | key | default | |
 | --- | --- | --- |
 | `url` | required | where orchestra reaches kleisd, to mint and revoke tokens and fetch the CA |
-| `issuer_token` | required | from `kleis issuer token orchestra`; put it in `secrets.json` |
+| `issuer_token` | one of these two | from `kleis issuer token orchestra`; put it in `secrets.json` |
+| `issuer_token_file` | | a file kleisd keeps the issuer credential in (`token_file` in its `[[issuer]]`), read on every use; what the NixOS module sets up |
 | `proxy` | `url`'s host and port | `host:port` the sandboxes reach the proxy at, if different — a service name for pods |
 | `ca_file` | fetched from kleisd | kleis's CA certificate |
 | `grants` | `["orchestra-github"]` | the grants a task's token names, in the order kleis tries them |
