@@ -609,6 +609,19 @@ def runningEntries : IO (Array QueueEntry) := do
     order_by_desc e.id
   Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
 
+/-- How many running entries each authentication source has, as a lookup.
+
+    Exact for the daemon's own claims, including ones made a moment ago: a claim writes the entry
+    `running`, with the source it resolved, before it releases the claim mutex, so the next
+    resolution under that mutex already counts it. Not keyed by backend, because labels are what
+    a pool names and two backends sharing a label would be sharing an account. -/
+def runningPerAuthSource : IO (String → Nat) := do
+  let mut counts : Std.HashMap String Nat := {}
+  for e in ← runningEntries do
+    if let some l := e.authSource then
+      counts := counts.insert l (counts.getD l 0 + 1)
+  return fun l => counts.getD l 0
+
 open Db.Query.DSL in
 /-- The entry whose run became task `taskId`, if there is one.
 

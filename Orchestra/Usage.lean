@@ -264,6 +264,39 @@ instance : FromJson Block where
     let reason := (j.getObjValAs? String "reason").toOption.getD ""
     return { untilEpoch, model, reason }
 
+/-- Agent time accumulated against one window of one source, for learning how fast agents fill it.
+
+    `startPct` is where the counter stood when accumulation began. Accumulation begins whenever
+    this process stops being able to account for the agents that ran — the first poll it sees of a
+    window, or the first after a gap in polling — so what was consumed before then, by agents it
+    did not count, is subtracted rather than charged to the agents it did. -/
+structure WindowAcc where
+  /-- Reset epoch identifying the window; `none` before the first poll that reported one. -/
+  reset     : Option Int := none
+  startPct  : Nat := 0
+  lastPct   : Nat := 0
+  /-- Running-agent seconds inside the window since `startPct` was read. -/
+  agentSecs : Float := 0
+deriving Repr, Inhabited, ToJson, FromJson
+
+/-- What has been learned about how fast agents consume one source's limits.
+
+    The rates are in percent of the limit per *running-agent hour*: what one agent, running for an
+    hour on this source, adds to the counter. Per hour rather than per task because a task's cost
+    is only known once it ends, and the moment that matters — choosing an account for the next
+    task — is the moment the running ones are still running. Per source because accounts are not
+    alike: a larger plan fills its windows more slowly, and an account something outside orchestra
+    also uses fills them faster, and both are things the rate should say. -/
+structure Estimate where
+  sessionRate : Option Float := none
+  weeklyRate  : Option Float := none
+  session     : WindowAcc := {}
+  weekly      : WindowAcc := {}
+  /-- Agents running on the source at the last observation, and when that was. -/
+  lastRunning : Nat := 0
+  lastEpoch   : Option Int := none
+deriving Repr, Inhabited, ToJson, FromJson
+
 /-- Everything known about one `(backend, label)` authentication source. -/
 structure SourceState where
   backend       : String
@@ -290,6 +323,8 @@ structure SourceState where
       nothing about whether the *subscription* has quota left. This suppresses polling; it never
       suppresses dispatch. -/
   pollAfter     : Option Int := none
+  /-- The learned consumption rates, and the accumulators that learn them. See `Estimate`. -/
+  estimate      : Estimate := {}
 deriving Repr, Inhabited
 
 instance : ToJson SourceState where
@@ -354,13 +389,21 @@ def SourceState.toRow (s : SourceState) : Store.UsageSourceRow :=
     blocks         := Store.jsonColumn s.blocks
     last_used_tick := s.lastUsedTick
     last_error     := s.lastError
-    poll_after     := s.pollAfter }
+    poll_after     := s.pollAfter
+    estimate       := some (Store.jsonColumn s.estimate) }
 
-/-- The state a row holds, or why this build cannot read it. -/
+/-- The state a row holds, or why this build cannot read it.
+
+    An estimate this build cannot read is dropped rather than failing the row: it is relearned
+    from the polls that follow, and refusing the limits and blocks over it would forget limits. -/
 def SourceState.ofRow? (row : Store.UsageSourceRow) : Except String SourceState := do
   let limits ← Store.jsonOfColumn? "limits" row.limits
   let blocks ← Store.jsonOfColumn? "blocks" row.blocks
+  let estimate := match row.estimate with
+    | some e => (Store.jsonOfColumn? "estimate" e : Except String Estimate).toOption.getD {}
+    | none   => {}
   return { backend      := row.backend
+           estimate     := estimate
            label        := row.label
            fetchedEpoch := row.fetched_epoch
            limits       := limits
@@ -853,9 +896,177 @@ def availabilityOf (st : SourceState) (model : Option String) (now : Int) : Avai
             s!"{l.kind.toString} limit for {s} at {l.percent}%"
   return .available
 
-/-- The highest binding-relevant utilisation across the limits that could apply to `model`. Used
-    to order sources under `distribute`; a source we have never polled reports 0 so that a
-    freshly configured account is tried rather than avoided. -/
+/-! ## Consumption estimate
+
+A poll says where an account's counters stand; it does not say where they are going. Choosing by
+where they stand alone is what made `distribute` herd: every claim between two polls read the same
+numbers, so every one of them went to the same least-used account, and a dozen agents started on
+it at once filled its session window before the next poll had even noticed them. What selection
+needs is where an account's counters *will* stand once the agents already on it, and the one about
+to be added, have run — which is the polled reading plus a rate times the agent time to come.
+
+The rate is learned. Each poll the daemon makes adds the agent time spent on a source since the
+previous one to the window that poll belongs to; when the window rolls over, what the counter rose
+by over that agent time is one sample of the rate, folded into a moving average. Until a source
+has closed a window with enough agent time in it to say anything, the prior below stands in. -/
+
+/-- Prior session-window consumption, in percent per running-agent hour. The median over 82 closed
+    session windows on one deployment (Opus, Lean formalisation work, autumn 2026); the spread
+    between windows is wide, which is why it is a prior and not a constant. -/
+def defaultSessionRate : Float := 6.6
+
+/-- Prior weekly consumption, in percent per running-agent hour, from the same data. -/
+def defaultWeeklyRate : Float := 0.65
+
+/-- How full a session window may be projected to get before a source stops being preferred. The
+    gap to 100 is the margin for a rate that is an average over tasks whose consumption varies by
+    an order of magnitude. -/
+def sessionHeadroomPct : Float := 80
+
+/-- How full the weekly window may be projected to get, likewise. Narrower than the session margin
+    because a week moves slowly: the projection over one task's run is close to the truth. -/
+def weeklyHeadroomPct : Float := 98
+
+/-- How long a task just dispatched is assumed to keep running. A task does not stop consuming at
+    the reset, so a source whose window closes in five minutes is not five minutes of exposure;
+    the window it starts afterwards takes the rest. An hour is a little above the mean run. -/
+def expectedTaskSecs : Int := 3600
+
+/-- Weight of one closed window in the moving average of a rate. -/
+def rateLearningWeight : Float := 0.3
+
+/-- Least agent time a window must have seen to teach anything about a rate. Below it, rounding of
+    an integer percentage and usage from outside orchestra dominate what the agents did. -/
+def minLearningAgentSecs : LimitKind → Float
+  | .session => 1800
+  | _        => 6 * 3600
+
+/-- Longest gap between two observations across which the agent time in between is still taken as
+    known. Three of the daemon's poll intervals: anything longer is a daemon that was down, and
+    agents it was not counting may have run in it. -/
+def observeGapSecs : Int := 900
+
+private def floatOfInt (i : Int) : Float :=
+  if i ≥ 0 then i.toNat.toFloat else -((-i).toNat.toFloat)
+
+/-- The account-wide limit of `kind` in a poll, if it reported one. -/
+def unscopedLimit (limits : Array Limit) (kind : LimitKind) : Option Limit :=
+  limits.find? fun l => l.kind == kind && l.scopeModel.isNone
+
+/-- Fold one poll's reading of a window into its accumulator, and the rate it teaches if this poll
+    is the first of a new window.
+
+    `agentSecs` is the running-agent time since the previous poll, `restart` whether that previous
+    poll is too far back (or absent) for the agent time in between to be known. -/
+def WindowAcc.observe (acc : WindowAcc) (kind : LimitKind) (rate : Option Float) (prior : Float)
+    (limit : Option Limit) (agentSecs : Float) (restart : Bool) : WindowAcc × Option Float :=
+  let reset := limit.bind (·.resetsAt) |>.bind parseIso8601
+  let pct := limit.map (·.percent) |>.getD 0
+  let same : Bool := match acc.reset, reset with
+    | some a, some b => decide ((a - b).natAbs ≤ resetDriftSecs)
+    | _,      _      => false
+  if same then
+    if restart then
+      -- Agents may have run unseen since the last reading; start counting again from here, so
+      -- what they consumed is not charged to the agent time that was seen.
+      ({ acc with startPct := pct, lastPct := pct, agentSecs := 0 }, rate)
+    else
+      ({ acc with lastPct := pct, agentSecs := acc.agentSecs + agentSecs }, rate)
+  else
+    -- The window `acc` describes has closed (or there was none). Its last reading over the agent
+    -- time it saw is one sample of the rate, if it saw enough to mean anything.
+    let rate :=
+      if acc.reset.isSome && acc.agentSecs ≥ minLearningAgentSecs kind then
+        let rose := floatOfInt ((acc.lastPct : Int) - acc.startPct)
+        let sample := rose / (acc.agentSecs / 3600)
+        -- A window that rose by far more than its agents can explain was mostly used by something
+        -- else, and one that did not rise was mostly idle agents; neither is the typical agent.
+        let sample := max (prior / 10) (min (prior * 10) sample)
+        let old := rate.getD prior
+        some ((1 - rateLearningWeight) * old + rateLearningWeight * sample)
+      else rate
+    ({ reset, startPct := pct, lastPct := pct, agentSecs := 0 }, rate)
+
+/-- Fold a successful poll, made while `running` agents were on the source, into its estimate. -/
+def Estimate.observe (e : Estimate) (limits : Array Limit) (running : Nat) (now : Int) : Estimate :=
+  let dt := match e.lastEpoch with | some l => now - l | none => 0
+  let restart := e.lastEpoch.isNone || dt < 0 || dt > observeGapSecs
+  let agentSecs := if restart then 0 else (e.lastRunning + running).toFloat / 2 * floatOfInt dt
+  let (session, sessionRate) := e.session.observe .session e.sessionRate defaultSessionRate
+    (unscopedLimit limits .session) agentSecs restart
+  let (weekly, weeklyRate) := e.weekly.observe .weeklyAll e.weeklyRate defaultWeeklyRate
+    (unscopedLimit limits .weeklyAll) agentSecs restart
+  { sessionRate, weeklyRate, session, weekly, lastRunning := running, lastEpoch := some now }
+
+/-! ## Selection -/
+
+/-- How loaded a source is, as far as choosing between sources under `distribute` goes. -/
+structure Load where
+  /-- Percent of the session window used at the last poll. -/
+  sessionPct     : Nat := 0
+  /-- Seconds from now until the session window resets; `none` when no poll has said. -/
+  sessionResetIn : Option Int := none
+  /-- Percent of the tightest weekly limit that applies to the task's model. -/
+  weeklyPct      : Nat := 0
+  weeklyResetIn  : Option Int := none
+  /-- Agents running on the source right now. -/
+  running        : Nat := 0
+  /-- Seconds since the poll the percentages come from. -/
+  staleSecs      : Int := 0
+  sessionRate    : Float := defaultSessionRate
+  weeklyRate     : Float := defaultWeeklyRate
+deriving Repr, Inhabited
+
+/-- Where a window's counter is expected to stand once the running agents, and one more, have run
+    for `horizon` seconds, given a reading `stale` seconds old and the reset `resetIn` from now.
+
+    A window that has reset since the reading starts again from nothing. The horizon is capped at
+    the window's remaining life, but never below one task: work started now runs past a reset, and
+    counting it against the current window is the conservative mistake. -/
+private def projected (pct : Nat) (resetIn : Option Int) (windowLen : Int) (running : Nat)
+    (stale : Int) (rate : Float) (horizon : Int) : Float :=
+  let resetIn := resetIn.getD windowLen
+  let (base, left) :=
+    if resetIn ≤ 0 then ((0 : Float), windowLen)
+    else
+      -- The agents already running have been consuming since the reading was taken, and the
+      -- reading does not show it yet.
+      let unseen := max 0 (min stale (windowLen - resetIn))
+      (pct.toFloat + rate * running.toFloat * floatOfInt unseen / 3600, min resetIn windowLen)
+  let exposure := max (min horizon left) expectedTaskSecs
+  base + rate * (running + 1).toFloat * floatOfInt exposure / 3600
+
+/-- Projected session usage if one more agent starts now and the source keeps its current number
+    of agents until the window resets. -/
+def Load.sessionProjected (l : Load) : Float :=
+  projected l.sessionPct l.sessionResetIn (windowLengthSecs .session) l.running l.staleSecs
+    l.sessionRate (windowLengthSecs .session)
+
+/-- Projected weekly usage once one more agent's run is over. -/
+def Load.weeklyProjected (l : Load) : Float :=
+  projected l.weeklyPct l.weeklyResetIn (windowLengthSecs .weeklyAll) l.running l.staleSecs
+    l.weeklyRate expectedTaskSecs
+
+/-- Whether the source can take another agent without either window projected past its headroom. -/
+def Load.hasHeadroom (l : Load) : Bool :=
+  l.sessionProjected ≤ sessionHeadroomPct && l.weeklyProjected ≤ weeklyHeadroomPct
+
+/-- How much weekly capacity the source would lose at its reset, per hour until then: what is left
+    of the week is worth spending first where it expires soonest. -/
+def Load.weeklyUrgency (l : Load) : Float :=
+  let len := windowLengthSecs .weeklyAll
+  let resetIn := l.weeklyResetIn.getD len
+  let (pct, left) := if resetIn ≤ 0 then (0, len) else (l.weeklyPct, min resetIn len)
+  let remaining := max 0 (100 - pct.toFloat)
+  remaining / max 1 (floatOfInt left / 3600)
+
+/-- How far past its headroom the source is projected to go; what is minimised when every source
+    is past it. -/
+def Load.overshoot (l : Load) : Float :=
+  max (l.sessionProjected - sessionHeadroomPct) (l.weeklyProjected - weeklyHeadroomPct)
+
+/-- The highest binding-relevant utilisation across the limits that could apply to `model`. Shown
+    on the dashboard; selection uses `Load`, which also knows about resets and running agents. -/
 def pressureOf (st : SourceState) (model : Option String) : Nat := Id.run do
   let mut worst := 0
   for l in st.limits do
@@ -865,18 +1076,66 @@ def pressureOf (st : SourceState) (model : Option String) : Nat := Id.run do
     if applies && l.percent > worst then worst := l.percent
   return worst
 
-/-! ## Selection -/
+/-- The `Load` of a source for a task running `model`, with `running` agents on it already. -/
+def loadOf (st : SourceState) (model : Option String) (running : Nat) (now : Int) : Load := Id.run do
+  let resetIn (l : Limit) : Option Int := (l.resetsAt.bind parseIso8601).map (· - now)
+  let session := unscopedLimit st.limits .session
+  -- The tightest weekly limit that applies: the account-wide one, or one scoped to this model.
+  let mut weekly : Option Limit := none
+  for l in st.limits do
+    let applies := match l.kind, l.scopeModel with
+      | .weeklyAll,    none   => true
+      | .weeklyScoped, some s => modelMatchesScope s model
+      | _,             _      => false
+    if applies then
+      weekly := match weekly with
+        | some w => if l.percent > w.percent then some l else some w
+        | none   => some l
+  return {
+    sessionPct     := session.map (·.percent) |>.getD 0
+    sessionResetIn := session.bind resetIn
+    weeklyPct      := weekly.map (·.percent) |>.getD 0
+    weeklyResetIn  := weekly.bind resetIn
+    running
+    staleSecs      := st.fetchedEpoch.map (now - ·) |>.getD 0
+    sessionRate    := st.estimate.sessionRate.getD defaultSessionRate
+    weeklyRate     := st.estimate.weeklyRate.getD defaultWeeklyRate }
 
 /-- A source considered for selection, with the verdict that decided it. -/
 structure Candidate where
   label        : String
   availability : Availability
-  pressure     : Nat
+  load         : Load := {}
   lastUsed     : Int
   /-- Position in the configured list; the tiebreak of last resort, so selection is
       deterministic when two sources are genuinely indistinguishable. -/
   index        : Nat
 deriving Repr, Inhabited
+
+/-- Whether `a` should be chosen over `b` under `distribute`.
+
+    Sources with headroom come before sources without. Among those with it, the weekly limit
+    decides — whichever has the most of its week left to lose per hour until the reset — because
+    the week is the scarcer of the two and capacity left over at a reset is gone. The session
+    window only gets a say through headroom, which already counts the agents running there: that
+    is what stops one account taking every claim between two polls. Among sources past their
+    headroom, the one projected to go least far past it. -/
+def Candidate.preferredOver (a b : Candidate) : Bool :=
+  let tie : Unit → Bool := fun _ =>
+    if a.lastUsed != b.lastUsed then a.lastUsed < b.lastUsed else a.index < b.index
+  let close (x y : Float) : Bool := (x - y).abs < 1e-9
+  match a.load.hasHeadroom, b.load.hasHeadroom with
+  | true,  false => true
+  | false, true  => false
+  | true,  true  =>
+    let (ua, ub) := (a.load.weeklyUrgency, b.load.weeklyUrgency)
+    if !close ua ub then ua > ub
+    else
+      let (sa, sb) := (a.load.sessionProjected, b.load.sessionProjected)
+      if !close sa sb then sa < sb else tie ()
+  | false, false =>
+    let (oa, ob) := (a.load.overshoot, b.load.overshoot)
+    if !close oa ob then oa < ob else tie ()
 
 /-- Choose a source from `candidates`, or explain why none can run.
 
@@ -910,16 +1169,15 @@ def chooseFrom (mode : AuthMode) (candidates : Array Candidate) (now : Int := 0)
     return .ok (free.getD 0 default).label
   | .distribute =>
     let best := free.foldl (init := free.getD 0 default) fun best c =>
-      if c.pressure < best.pressure then c
-      else if c.pressure > best.pressure then best
-      else if c.lastUsed < best.lastUsed then c
-      else if c.lastUsed > best.lastUsed then best
-      else if c.index < best.index then c else best
+      if c.preferredOver best then c else best
     return .ok best.label
 
-/-- Build the candidate list for `labels` from persisted state and choose one. -/
+/-- Build the candidate list for `labels` from persisted state and choose one.
+
+    `running label` is how many agents are on `label` right now. Callers that cannot know pass
+    nothing, and every source then looks idle — which is how selection behaved before it counted. -/
 def selectSource (backend : String) (labels : List String) (mode : AuthMode) (model : Option String)
-    : IO (Except String String) := do
+    (running : String → Nat := fun _ => 0) : IO (Except String String) := do
   let now ← nowEpoch
   let mut candidates : Array Candidate := #[]
   for (label, i) in labels.zipIdx do
@@ -927,7 +1185,7 @@ def selectSource (backend : String) (labels : List String) (mode : AuthMode) (mo
     candidates := candidates.push {
       label
       availability := availabilityOf st model now
-      pressure := pressureOf st model
+      load := loadOf st model (running label) now
       lastUsed := st.lastUsedTick.getD 0
       index := i
     }
@@ -1191,8 +1449,13 @@ def oauthTokenOf (cfg : AppConfig) (backend label : String) : Option String := d
   | .apiKey _ _   => none
 
 /-- Poll one source and fold the result into its persisted state. `.ok false` means the source
-    has nothing to poll (not an OAuth source), which is not an error. -/
-def refresh (cfg : AppConfig) (backend label : String) : IO (Except String Bool) := do
+    has nothing to poll (not an OAuth source), which is not an error.
+
+    `running` is how many agents are on the source as the poll is made, and only the daemon's
+    poller knows it; a poll made with it teaches the source's `Estimate`. Every other caller polls
+    without, and leaves the estimate as it was. -/
+def refresh (cfg : AppConfig) (backend label : String) (running : Option Nat := none)
+    : IO (Except String Bool) := do
   match oauthTokenOf cfg backend label with
   | none => return .ok false
   | some token =>
@@ -1222,7 +1485,10 @@ def refresh (cfg : AppConfig) (backend label : String) : IO (Except String Bool)
         blockIsLive b now && (stillBlocked || b.model.isSome)
       saveState { st with
         limits, fetchedEpoch := some now, lastError := none, pollAfter := none
-        blocks }
+        blocks
+        estimate := match running with
+          | some n => st.estimate.observe limits n now
+          | none   => st.estimate }
       -- History is a nicety and monitoring is not, so a history file that cannot be written
       -- reports itself and leaves the poll — which has already been stored — successful.
       try
@@ -1247,8 +1513,11 @@ def pollingEnabled (cfg : AppConfig) (backend : String) : Bool :=
 
 /-- Poll every OAuth source configured for `backend`. Errors are recorded per source and never
     propagate: a poller that throws would take the daemon fiber down with it. A no-op when polling
-    is disabled for the backend. -/
-def refreshAll (cfg : AppConfig) (backend : String) : IO Unit := do
+    is disabled for the backend.
+
+    `running`, when given, is how many agents each source has on it; see `refresh`. -/
+def refreshAll (cfg : AppConfig) (backend : String) (running : Option (String → Nat) := none)
+    : IO Unit := do
   unless pollingEnabled cfg backend do return
   let now ← nowEpoch
   for label in configuredLabels cfg backend do
@@ -1256,7 +1525,7 @@ def refreshAll (cfg : AppConfig) (backend : String) : IO Unit := do
       let st ← loadState backend label
       let backingOff : Bool := match st.pollAfter with | some p => decide (p > now) | none => false
       unless backingOff do
-        match ← refresh cfg backend label with
+        match ← refresh cfg backend label (running.map (· label)) with
         | .error e => IO.eprintln s!"[usage] {backend}/{label}: {e}"
         | .ok _    => pure ()
     catch e => IO.eprintln s!"[usage] {backend}/{label}: {e}"
@@ -1358,16 +1627,19 @@ def resolutionFor (cfg : AppConfig) (backend : String) (authSources : List Strin
     Some numbers go without a poll this way. These are sources the poller does not sweep: ones
     known only to an entry's own `configPath`, a backend with polling off, or a source in 429
     backoff. For them, the stored numbers stay where they were last left until a run hits a limit. That is
-    the same position a backend with polling disabled is always in. -/
+    the same position a backend with polling disabled is always in.
+
+    `running label` is how many agents are on `label` right now; see `selectSource`. -/
 def resolveLabel (cfg : AppConfig) (backend : String) (authSources : List String)
     (authSource : Option String) (mode : Option AuthMode) (model : Option String)
-    (refresh : Bool := true) : IO (Except String (Option String)) := do
+    (refresh : Bool := true) (running : String → Nat := fun _ => 0)
+    : IO (Except String (Option String)) := do
   let (candidates, mode) := resolutionFor cfg backend authSources authSource mode
   if candidates.isEmpty then return .ok none
   if refresh then
     for label in candidates do
       ensureFresh cfg backend label
-  match ← selectSource backend candidates mode model with
+  match ← selectSource backend candidates mode model running with
   | .ok label => return .ok (some label)
   | .error e  => return .error e
 

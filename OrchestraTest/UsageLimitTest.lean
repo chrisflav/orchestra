@@ -613,8 +613,10 @@ def modelMatchesScope_matchesAliasAndFullId : Test := do
 /-! ## Selection -/
 
 private def candidate (label : String) (i : Nat) (avail : Availability)
-    (pressure : Nat := 0) (lastUsed : Int := 0) : Candidate :=
-  { label, availability := avail, pressure, lastUsed, index := i }
+    (session : Nat := 0) (lastUsed : Int := 0) (weekly : Nat := 0) (running : Nat := 0)
+    (sessionResetIn weeklyResetIn : Option Int := none) : Candidate :=
+  { label, availability := avail, lastUsed, index := i
+    load := { sessionPct := session, weeklyPct := weekly, running, sessionResetIn, weeklyResetIn } }
 
 @[test]
 def chooseFrom_orderedTakesTheFirstUsableSource : Test := do
@@ -628,18 +630,125 @@ def chooseFrom_orderedTakesTheFirstUsableSource : Test := do
 @[test]
 def chooseFrom_distributePrefersTheLeastConsumed : Test := do
   let cs := #[
-    candidate "heavy" 0 .available (pressure := 80),
-    candidate "light" 1 .available (pressure := 10)]
+    candidate "heavy" 0 .available (session := 80),
+    candidate "light" 1 .available (session := 10)]
   TestM.assertEqual (chooseFrom .distribute cs) (.ok "light")
-    (msg := "lowest utilisation wins regardless of order")
+    (msg := "a session window with no headroom loses regardless of order")
 
 @[test]
 def chooseFrom_distributeBreaksTiesByLeastRecentlyUsed : Test := do
   let cs := #[
-    candidate "recent" 0 .available (pressure := 50) (lastUsed := now),
-    candidate "stale"  1 .available (pressure := 50) (lastUsed := now - 600)]
+    candidate "recent" 0 .available (session := 10) (lastUsed := now),
+    candidate "stale"  1 .available (session := 10) (lastUsed := now - 600)]
   TestM.assertEqual (chooseFrom .distribute cs) (.ok "stale")
-    (msg := "equal pressure ⇒ the one used longest ago")
+    (msg := "equal load ⇒ the one used longest ago")
+
+@[test]
+def chooseFrom_distributeSpendsTheWeekThatExpiresFirst : Test := do
+  -- 30% used with the reset twelve hours out leaves 70% that is gone in twelve hours; 5% used
+  -- with six days to go has all week to be spent. The first is the one to use now.
+  let cs := #[
+    candidate "fresh"    0 .available (weekly := 5)  (weeklyResetIn := some (6 * 86400)),
+    candidate "expiring" 1 .available (weekly := 30) (weeklyResetIn := some (12 * 3600))]
+  TestM.assertEqual (chooseFrom .distribute cs) (.ok "expiring")
+
+@[test]
+def chooseFrom_distributeWeighsTheWeekOnlyWhileTheSessionHasRoom : Test := do
+  -- The same expiring week, on an account whose session window is nearly spent: another agent
+  -- there would run into the session limit mid-run, so the week waits.
+  let cs := #[
+    candidate "fresh"    0 .available (weekly := 5)  (weeklyResetIn := some (6 * 86400)),
+    candidate "expiring" 1 .available (weekly := 30) (weeklyResetIn := some (12 * 3600))
+      (session := 75) (sessionResetIn := some (3 * 3600))]
+  TestM.assertEqual (chooseFrom .distribute cs) (.ok "fresh")
+
+@[test]
+def chooseFrom_distributeCountsTheAgentsAlreadyRunning : Test := do
+  -- Two accounts the last poll reports identically. One already has agents on it that the poll
+  -- has not caught up with; it is the busier account, whatever the numbers say.
+  let cs := #[
+    candidate "busy" 0 .available (session := 10) (running := 2),
+    candidate "idle" 1 .available (session := 10) (lastUsed := now)]
+  TestM.assertEqual (chooseFrom .distribute cs) (.ok "idle")
+
+@[test]
+def headroom_aSessionAboutToResetTakesMoreAgents : Test := do
+  -- Half a window used and ten minutes left: the agents run mostly into the next window, so four
+  -- fit where, five hours from the reset, two would already be too many.
+  let soon : Load := { sessionPct := 50, sessionResetIn := some 600, running := 3 }
+  TestM.assert soon.hasHeadroom (msg := s!"projected {soon.sessionProjected}")
+  let far : Load := { sessionPct := 50, sessionResetIn := some (5 * 3600), running := 3 }
+  TestM.assert (!far.hasHeadroom) (msg := s!"projected {far.sessionProjected}")
+
+/-- Choose repeatedly between fresh accounts, starting each winner's agent and never finishing
+    one: the burst of claims between two polls, which see the same numbers every time. -/
+private def simulateBurst (sources : List (String × Nat × Int)) (n : Nat) : List String :=
+  Id.run do
+    let mut running : List (String × Nat) := sources.map (·.1, 0)
+    let mut picked : List String := []
+    for round in List.range n do
+      let cs := sources.zipIdx.toArray.map fun ((l, weekly, weeklyReset), i) =>
+        ({ label := l, availability := .available, lastUsed := round, index := i
+           load := { weeklyPct := weekly, weeklyResetIn := some weeklyReset
+                     running := (running.find? (·.1 == l)).map (·.2) |>.getD 0 } } : Candidate)
+      match chooseFrom .distribute cs 0 with
+      | .error _ => pure ()
+      | .ok winner =>
+        picked := picked ++ [winner]
+        running := running.map fun (l, k) => if l == winner then (l, k + 1) else (l, k)
+    return picked
+
+@[test]
+def distribute_aBurstFillsAccountsInWeeklyOrderWithoutPilingOnOne : Test := do
+  -- Urgency b > c > a. Each takes as many agents as its session window has projected room for —
+  -- two, at the prior rate over a fresh five-hour window — and then the next one is used.
+  TestM.assertEqual
+    (simulateBurst [("a", 0, 7 * 86400), ("b", 10, 86400), ("c", 50, 3 * 86400)] 6)
+    ["b", "b", "c", "c", "a", "a"]
+
+/-! ## Learning the consumption rate -/
+
+private def sessionReading (pct : Nat) (reset : Int) : Array Limit :=
+  #[{ kind := .session, percent := pct, resetsAt := some (secsToIso8601 reset) }]
+
+@[test]
+def estimate_learnsTheSessionRateWhenAWindowCloses : Test := do
+  let r1 := now + 5 * 3600
+  -- Two agents, polled every five minutes for two hours: four agent-hours, over which the
+  -- window rises by 40 points. That is 10 per agent-hour against a prior of 6.6.
+  let mut e : Estimate := {}
+  for k in List.range 25 do
+    e := e.observe (sessionReading (k * 40 / 24) r1) 2 (now + k * 300)
+  TestM.assert e.sessionRate.isNone (msg := "nothing is learned while the window is open")
+  e := e.observe (sessionReading 0 (r1 + 5 * 3600)) 2 (now + 25 * 300)
+  match e.sessionRate with
+  | none   => TestM.fail "the closed window taught nothing"
+  | some r =>
+    let expected := (1 - rateLearningWeight) * defaultSessionRate + rateLearningWeight * 10
+    TestM.assert ((r - expected).abs < 1e-6) (msg := s!"rate {r}, expected {expected}")
+
+@[test]
+def estimate_aGapInPollingIsNotChargedToTheAgentsSeen : Test := do
+  -- Half an hour of two agents, then the daemon is down for two hours while the window rises to
+  -- 60. The agents it could not see consumed that, so counting starts over at 60.
+  let r1 := now + 5 * 3600
+  let mut e : Estimate := {}
+  for k in List.range 7 do
+    e := e.observe (sessionReading k r1) 2 (now + k * 300)
+  e := e.observe (sessionReading 60 r1) 2 (now + 6 * 300 + 7200)
+  TestM.assertEqual e.session.startPct 60
+  TestM.assert (e.session.agentSecs == 0) (msg := s!"agent time {e.session.agentSecs}")
+
+@[test]
+def estimate_aWindowWithTooLittleAgentTimeTeachesNothing : Test := do
+  -- Usage from outside orchestra fills the window while no agent runs on it; there is no agent
+  -- time to divide by, and the prior stays.
+  let r1 := now + 5 * 3600
+  let mut e : Estimate := {}
+  for k in List.range 13 do
+    e := e.observe (sessionReading (k * 8) r1) 0 (now + k * 300)
+  e := e.observe (sessionReading 0 (r1 + 5 * 3600)) 0 (now + 13 * 300)
+  TestM.assert e.sessionRate.isNone
 
 /-- Choose repeatedly, stamping each winner the way `markUsed` does, and report the order.
 
@@ -653,7 +762,7 @@ private def simulateDispatches (mode : AuthMode) (labels : List String) (n : Nat
     let mut picked : List String := []
     for round in List.range n do
       let cs := (labels.zipIdx).toArray.map fun (l, i) =>
-        ({ label := l, availability := .available, pressure := 0
+        ({ label := l, availability := .available
            lastUsed := (lastUsed.find? (·.1 == l)).map (·.2) |>.getD 0
            index := i } : Candidate)
       match chooseFrom mode cs 0 with
@@ -679,11 +788,11 @@ def ordered_staysOnTheFirstSource : Test := do
 
 @[test]
 def chooseFrom_distributeSkipsLimitedSourcesEvenWhenIdle : Test := do
-  -- An untouched but exhausted account has pressure 0 and has never been used, so it would win
+  -- An untouched but exhausted account has no load and has never been used, so it would win
   -- every tiebreak if availability were not checked first.
   let cs := #[
-    candidate "exhausted" 0 (.blocked (some (now + 60)) "weekly_all at 100%") (pressure := 0),
-    candidate "usable"    1 .available (pressure := 90) (lastUsed := now)]
+    candidate "exhausted" 0 (.blocked (some (now + 60)) "weekly_all at 100%"),
+    candidate "usable"    1 .available (session := 90) (lastUsed := now)]
   TestM.assertEqual (chooseFrom .distribute cs) (.ok "usable")
     (msg := "availability is a gate, not a preference")
 
