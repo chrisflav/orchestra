@@ -457,12 +457,8 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
         parallelLimit
         perRepoLimit    := parallelLimitPerRepo
         parallelSafe    := TaskRunner.backendIsParallelSafe
-<<<<<<< HEAD
-        resolveAuth     := resolveEntryAuth
         slotsHoldTrees
-=======
         resolveAuth     := resolveEntryAuth running
->>>>>>> origin/master
       }
       let some claim ← Queue.claimDecision ctx pending Queue.entryForTask Repo.poolOccupant
         | return none
