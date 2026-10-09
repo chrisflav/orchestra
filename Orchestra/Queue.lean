@@ -609,6 +609,19 @@ def runningEntries : IO (Array QueueEntry) := do
     order_by_desc e.id
   Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
 
+/-- How many running entries each authentication source has, as a lookup.
+
+    Exact for the daemon's own claims, including ones made a moment ago: a claim writes the entry
+    `running`, with the source it resolved, before it releases the claim mutex, so the next
+    resolution under that mutex already counts it. Not keyed by backend, because labels are what
+    a pool names and two backends sharing a label would be sharing an account. -/
+def runningPerAuthSource : IO (String → Nat) := do
+  let mut counts : Std.HashMap String Nat := {}
+  for e in ← runningEntries do
+    if let some l := e.authSource then
+      counts := counts.insert l (counts.getD l 0 + 1)
+  return fun l => counts.getD l 0
+
 open Db.Query.DSL in
 /-- The entry whose run became task `taskId`, if there is one.
 
@@ -789,6 +802,12 @@ structure ClaimContext where
       no config and no network. Defaults to "always claimable on no particular source", which is
       what every caller that predates multiple auth sources wants. -/
   resolveAuth : QueueEntry → IO AuthDecision := fun _ => pure (.use none)
+  /-- Whether a slot still holds the tree the last task in it left. True for the backends that run
+      in the daemon's own clone slots. False for one that keeps each task's workspace itself
+      (`Exec.Backend.persistentWorkspaces`): there a continuation is handed its predecessor's
+      workspace by the backend, wherever it runs, so the slot is only a count of how many tasks a
+      repository has running and a continuation neither waits for nor prefers one. -/
+  slotsHoldTrees : Bool := true
 
 /-- The outcome of a successful claim. -/
 structure Claim where
@@ -842,7 +861,12 @@ def claimDecision (ctx : ClaimContext) (pending : Array QueueEntry)
     let predecessor ← match e.continuesFrom with
       | none     => pure none
       | some tid => predecessorOf tid
-    let preferred ← match predecessor.bind (fun p => p.slot.map (p.id, ·)) with
+    -- Where slots hold no trees, nothing above made a continuation of a running task wait (its
+    -- predecessor's slot being busy was the wait). Its workspace is still in use, and the backend
+    -- would refuse it; waiting is the right answer, and the predecessor will finish.
+    if !ctx.slotsHoldTrees && predecessor.any (·.status == .running) then continue
+    let preferred ← match (if ctx.slotsHoldTrees then predecessor else none).bind
+        (fun p => p.slot.map (p.id, ·)) with
       | none => pure none
       | some (predId, predSlot) =>
         -- Confirm the predecessor's tree is still there before asking to wait for its slot.

@@ -340,7 +340,7 @@ private def find (mgr : Manager) (id : String) : IO (Option LiveSession) := do
     fresh one), and the slot occupant whose working tree may be kept. -/
 private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repository)
     (slot : Nat) (agentDef : AgentDef) (debug : Bool) (onFailure : SessionStatus)
-    (prepare : IO (SessionRecord × Option String × Option String))
+    (prepare : IO (SessionRecord × Option String × Option String × Option (String × Bool)))
     : IO (Except String SessionRecord) := do
   -- `shutdownRef` is how the MCP server joins the slot's guarantee. It is empty until
   -- `Server.start` succeeds and holds that server's own shutdown afterwards, so the handler
@@ -399,7 +399,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       saveSession { r with lastEventSeq := seq }
     return .error msg
   try
-    let (record, resumeAgentSession, resumeSlotOf) ← prepare
+    let (record, resumeAgentSession, resumeSlotOf, workspaceOf) ← prepare
     recordRef.set (some record)
     let backendName := record.backend
     let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
@@ -419,8 +419,17 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     -- tree: the agent opens with a context full of edits it made and a checkout where none of
     -- them exist — the exact hazard the slot-pinning design exists to avoid, reintroduced at the
     -- one moment it matters most.
-    let repoPath ← Repo.ensureSlot fork record.upstream
-      { slot, occupant := some record.id, resumeFrom := resumeSlotOf } (token := some token)
+    --
+    -- A backend that keeps workspaces itself does that job instead: the session's workspace — tree,
+    -- build, and the agent's home with its conversation — is a volume keyed by the session, kept
+    -- while it is dormant and handed back when it wakes. The checkout made here is then only what a
+    -- first start fills that volume from, and goes when the session's environment closes.
+    let keepsWorkspaces := Exec.keepsWorkspaces appConfig.execution
+    let repoPath ← if keepsWorkspaces then
+        Repo.ensureTaskCheckout fork record.upstream record.id (token := some token)
+      else
+        Repo.ensureSlot fork record.upstream
+          { slot, occupant := some record.id, resumeFrom := resumeSlotOf } (token := some token)
     -- Read from the record rather than from the spec, so a wake brings the session back as the
     -- same identity a start gave it. A record naming one that has since been deleted fails the
     -- acquire, which for a wake leaves the session dormant with the reason on its transcript —
@@ -442,8 +451,15 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
     let pluginDirs ← TaskRunner.defaultPluginDirs appConfig
     let repoConfig ← RepoConfig.loadRepoConfig repoPath
+    let seedDir ← if keepsWorkspaces then some <$> Repo.seedPath fork else pure none
     let execSession ← execBackend.openSession {
       workdir := repoPath
+      -- Keyed by the session, so a wake finds the volume its first start made, and a session
+      -- started from another one finds that one's (see `workspaceOf`).
+      taskId  := if keepsWorkspaces then some record.id else none
+      continuesFrom := if keepsWorkspaces then workspaceOf.map (·.1) else none
+      continuationOptional := workspaceOf.map (·.2) |>.getD false
+      seedDir
       grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths
                    repoPath false pluginDirs identityMemory.toArray
       label   := record.id
@@ -451,13 +467,19 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       -- known by, and the fork is per-bot. Same key as the queue path and the merger.
       repo    := some record.upstream.toString
       image   := repoConfig.image }
+    -- Its checkout goes with it: closing the environment is the one thing every way out of a
+    -- session does.
+    let execSession := if keepsWorkspaces then
+        { execSession with close := do
+            try execSession.close finally Repo.removeTaskDir repoPath }
+      else execSession
     execRef.set (some execSession)
     -- Reviving a dormant conversation asks the agent to resume a session it wrote under its own
     -- home. An environment that is new every time does not have it, and a revived conversation
     -- that silently starts over is worse than one that says it cannot: the person sees their
     -- history in the transcript and the agent does not.
     if resumeAgentSession.isSome && !execSession.carriesAgentState then
-      return ← fail s!"this conversation was left in an environment that no longer exists ({execSession.id} is new every time). Configure a persistent agent home for this execution backend — execution.options.home_claim for kubernetes — to wake sessions on it."
+      return ← fail s!"this conversation was left in an environment that no longer exists ({execSession.id} is new every time). Enable per-task workspaces for this execution backend — execution.options.task_volumes for kubernetes — to wake sessions on it."
     let (port, shutdownMcp) ← Server.start {
       repo := some { upstream := record.upstream, fork }
       allowedTools := record.tools.getD allOptionalTools
@@ -489,7 +511,11 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       | _, _ => pure (none, shutdownMcp)
     -- A session goes through the same resolver as a queued run, so an account the daemon has
     -- already found to be out of quota is not handed to a person either.
-    let authLabel ← match ← Usage.resolveLabel appConfig backendName [] none none record.model with
+    -- With the queue's running agents counted, so a person is not handed the account the daemon
+    -- has just loaded up; an unreadable queue only makes every account look idle.
+    let running ← try Queue.runningPerAuthSource catch _ => pure fun _ => 0
+    let authLabel ← match ← Usage.resolveLabel appConfig backendName [] none none record.model
+        (running := running) with
       | .ok label => pure label
       | .error e  => return ← fail s!"no usable authentication source for '{backendName}': {e}"
     if let some l := authLabel then Usage.markUsed backendName l
@@ -647,8 +673,11 @@ task or another session"
       identity := spec.identity
     }
     saveSession record
+    -- On a backend that keeps workspaces, a session started from another one is handed *that*
+    -- session's volume — required only if it has a conversation to resume.
     return (record, resumed.bind (·.agentSessionId),
-            resumed.filter (·.slot == slot) |>.map (·.id))
+            resumed.filter (·.slot == slot) |>.map (·.id),
+            resumed.map fun r => (r.id, !r.agentStarted))
 
 /-- Bring a dormant session back up, resuming the conversation it was having.
 
@@ -689,7 +718,9 @@ task or another session"
     let resumeAgentSession := if record.agentStarted then record.agentSessionId else none
     -- The tree this session left behind, if the slot it left it in is the one just handed back.
     let resumeSlotOf := if slot == record.slot then some record.id else none
-    return (woken, resumeAgentSession, resumeSlotOf)
+    -- A wake always asks for its own volume back; a fresh one will do only if the agent never
+    -- started, so there is no conversation (and no tree worth keeping) to lose.
+    return (woken, resumeAgentSession, resumeSlotOf, some (record.id, !record.agentStarted))
 
 /-! ## Talking to one -/
 

@@ -73,6 +73,43 @@ def defaultImage : String := "ghcr.io/chrisflav/orchestra-agent:latest"
 
 /-! ## Configuration -/
 
+/-- Per-task volumes: the checkout and the agent's `$HOME` on a claim of their own, kept after the
+    task so that a continuation can pick up exactly where it stopped.
+
+    Without them every pod starts from a copy of a checkout on the daemon's disk and a home that
+    dies with it. A continuation then needs two things the pod no longer has: the conversation,
+    which the agent CLI wrote under `$HOME`, and the tree that conversation is about — the edits,
+    the branch, the build. The daemon's clone slots can hold the second only until an unrelated
+    task takes the slot and resets it, which with a busy queue is within a few tasks.
+
+    With them, a task that starts fresh gets a new claim, filled from the checkout the daemon
+    prepared for it; a task that continues another one is handed its predecessor's claim, untouched,
+    in a new pod. The claim is found by a label naming the last task that used it, so a chain of
+    continuations — a series — keeps one volume for as long as it runs. Agents stay isolated from
+    one another: no two chains share a claim, and `$HOME` is per chain rather than per daemon.
+
+    The claim is mounted at `mountPath`; the checkout is `<mountPath>/work` and `$HOME` is
+    `<mountPath>/home`, whatever the checkout is called on the daemon. So a continuation runs in the
+    same directory as its predecessor — which is what the agent CLIs key their saved sessions by —
+    even though each task's daemon-side checkout is a new one. Both are created by the agent's own
+    user rather than being mount points, which the kubelet would make root's: git refuses a work
+    tree whose top-level directory another user owns. -/
+structure TaskVolumes where
+  /-- `storageClassName` for the claims; unset means the cluster's default class. -/
+  storageClass : Option String := none
+  /-- The size each claim requests. -/
+  size : String := "20Gi"
+  /-- A claim no task has used for this many days is deleted, the next time a task starts. -/
+  retentionDays : Nat := 14
+  /-- Where the claim is mounted in the pod. The checkout is `work` and `$HOME` is `home` under it. -/
+  mountPath : String := "/task"
+  /-- Paths inside the checkout carried *between chains*: copied into a fresh claim from the
+      daemon's seed directory for the repository, and copied back there when a task ends. Build
+      output is the point — `.lake/build`, `target` — so a task that starts fresh does not rebuild
+      the project from nothing. Never applied to a continuation, which has its own. -/
+  seedPaths : Array String := #[]
+deriving Repr, Inhabited
+
 /-- What this backend needs from `execution.options`.
 
     `mcp_host` is the only one without a default — nothing can guess where a pod reaches this
@@ -86,7 +123,7 @@ def defaultImage : String := "ghcr.io/chrisflav/orchestra-agent:latest"
     ```
 
     A deployment past its first task usually names more — the image pinned to a version, the
-    namespace, a home claim so toolchains outlive the pod:
+    namespace, and per-task volumes so a continuation finds the tree and the conversation it left:
 
     ```json
     "execution": {
@@ -95,7 +132,7 @@ def defaultImage : String := "ghcr.io/chrisflav/orchestra-agent:latest"
         "image": "ghcr.io/chrisflav/orchestra-agent:claude-2.1.251",
         "namespace": "orchestra",
         "mcp_host": "orchestra.orchestra.svc.cluster.local",
-        "home_claim": "orchestra-agent-home"
+        "task_volumes": { "size": "20Gi", "retention_days": 14 }
       }
     }
     ```
@@ -197,17 +234,9 @@ structure Config where
       directories are writable without the image having to make them so, and so that everything it
       writes is there for the whole task and gone after it. -/
   homePath : String := "/home/agent"
-  /-- A `PersistentVolumeClaim` to mount as `$HOME` instead of an `emptyDir`.
-
-      What this buys is the cost of `init.sh`. Every task starts from a new pod, so a hook that
-      installs a toolchain or warms a build cache pays in full each time unless what it installs
-      survives — and `~/.elan`, `~/.cargo`, `~/.cache` and the rest are all under `$HOME`. With a
-      claim the first task on an image pays and the ones after it do not, which is the same
-      arrangement the landrun backend gets for free from the machine it runs on.
-
-      Needs `ReadWriteMany`, or `ReadWriteOnce` with every agent pod on one node: tasks run in
-      parallel and would mount it at the same time. -/
-  homeClaim : Option String := none
+  /-- Give each task chain a `PersistentVolumeClaim` of its own, holding its checkout and its
+      `$HOME`, and keep it after the pod is gone. See `TaskVolumes`. -/
+  taskVolumes : Option TaskVolumes := none
 deriving Inhabited
 
 /-- Where orchestra keeps its own files in the pod: the environment for each command. An
@@ -282,6 +311,38 @@ checkout"
 (letters, digits, '.', '_', '-', '/', '*', '?' and '[]' only)"
   let nat (key : String) (dflt : Nat) : Nat :=
     j.getObjValAs? Nat key |>.toOption |>.getD dflt
+  -- Present means wanted, so a value that cannot be read is refused rather than quietly turned
+  -- into "no volumes": that would be every continuation failing for a reason the log never names.
+  let taskVolumes ← match j.getObjVal? "task_volumes" with
+    | .error _ => pure none
+    | .ok (.obj _) =>
+      let tv := (j.getObjVal? "task_volumes").toOption.getD Json.null
+      let seedPaths ← (jsonArr? tv "seed_paths").filterMap (fun v =>
+          match v with | .str s => some s | _ => none)
+        |>.mapM fun p =>
+          -- Same rules as `excludes`, for the same reason: these become paths under the
+          -- checkout on both sides, and a `..` or a leading `/` would name something else.
+          if p.isEmpty || p.startsWith "/" || (p.splitOn "..").length > 1
+              || !p.all (fun c => c.isAlphanum || "._-/".any (· == c)) then
+            throw s!"kubernetes: execution.options.task_volumes.seed_paths has '{p}', which is not \
+a plain path inside the checkout"
+          else pure p
+      let mountPath := (jsonStr? tv "mount_path").getD "/task"
+      unless mountPath.startsWith "/" do
+        throw s!"kubernetes: execution.options.task_volumes.mount_path must be absolute, not \
+'{mountPath}'"
+      pure (some {
+        storageClass := jsonStr? tv "storage_class"
+        size := (jsonStr? tv "size").getD "20Gi"
+        -- At least a day: zero would delete every other chain's claim at the next task start.
+        retentionDays := max 1 (tv.getObjValAs? Nat "retention_days" |>.toOption |>.getD 14)
+        mountPath
+        seedPaths : TaskVolumes })
+    | .ok other => throw s!"kubernetes: execution.options.task_volumes must be an object, not \
+{other.compress}"
+  if j.getObjVal? "home_claim" |>.toOption |>.isSome then
+    throw "kubernetes: execution.options.home_claim is gone: it gave every agent one shared \
+$HOME. Use task_volumes, which gives each task chain its own checkout and home"
   return {
     kubectl := (jsonStr? j "kubectl").getD "kubectl"
     ns := (jsonStr? j "namespace").getD "default"
@@ -304,7 +365,7 @@ checkout"
     syncBack := j.getObjValAs? Bool "sync_back" |>.toOption |>.getD true
     excludes
     homePath := (jsonStr? j "home_path").getD "/home/agent"
-    homeClaim := jsonStr? j "home_claim"
+    taskVolumes
     repoImages := match j.getObjVal? "images" with
       | .ok (.obj kvs) => kvs.toArray.filterMap fun (k, v) =>
           match v with | .str i => some (k, i) | _ => none
@@ -382,54 +443,127 @@ deriving Repr, BEq, Inhabited
 
 /-- The paths orchestra has to carry into the pod: the checkout, and any plugin or memory directory
     the task was granted. Everything else a session names is the image's to provide. -/
-def stagedPaths (cfg : Config) (hostHome : String) (spec : SessionSpec) : Array StagedPath :=
+def stagedPaths (cfg : Config) (hostHome : String) (spec : SessionSpec)
+    (workspaceMount : Option String := none) : Array StagedPath :=
   spec.grants.filter (·.from_ == .orchestra) |>.map fun g =>
     let hostPath := (PathGrant.resolve hostHome g).path
     let podPath  := (PathGrant.resolve cfg.homePath g).path
+    let isWorkspace := podPath == spec.workdir.toString
+    -- On a task volume the checkout lives at one fixed path, whatever it is called here: see
+    -- `TaskVolumes`.
+    let podPath := if isWorkspace then workspaceMount.getD podPath else podPath
     { hostPath, podPath
       writable := g.access == .rw || g.access == .rwx
-      isWorkspace := podPath == spec.workdir.toString }
+      isWorkspace }
+
+/-- `path` as the pod sees it. The identity unless the checkout is on a task volume, where anything
+    under the daemon's checkout is under `workspaceMount` instead — the agent's working directory,
+    a hook's path, an argument naming a file in the tree. -/
+def podPathOf (spec : SessionSpec) (workspaceMount : Option String) (path : String) : String :=
+  match workspaceMount with
+  | none => path
+  | some m =>
+    let w := spec.workdir.toString
+    if path == w then m
+    else if path.startsWith (w ++ "/") then m ++ path.drop w.length
+    else path
+
+/-- The name of the volume the task's claim is mounted from. -/
+def workspaceVolumeName : String := "workspace"
+
+/-- A string as a Kubernetes label value or name part: at most `max` characters of
+    `[A-Za-z0-9._-]`, starting and ending alphanumeric. Task ids already are one; this is the guard
+    for anything that is not. Never empty, since an empty name part is not a valid key. -/
+def labelValue (s : String) (max : Nat := 63) : String :=
+  let kept := s.toList.filter (fun c => c.isAlphanum || c == '.' || c == '_' || c == '-')
+  let trimmed := (kept.drop (kept.length - max)).dropWhile (!·.isAlphanum)
+  let v := String.ofList (trimmed.reverse.dropWhile (!·.isAlphanum)).reverse
+  if v.isEmpty then "unnamed" else v
 
 /-- The pod manifest for a task. -/
 def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
-    (staged : Array StagedPath) : Json :=
-  let stageMounts : Array Json := staged.mapIdx fun i st =>
-    Json.mkObj [("name", .str (stageVolumeName i)), ("mountPath", .str st.podPath)]
-  let stageVolumes : Array Json := staged.mapIdx fun i _ =>
-    Json.mkObj [("name", .str (stageVolumeName i)), ("emptyDir", Json.mkObj [])]
-  let homeVolume := match cfg.homeClaim with
-    | some claim => Json.mkObj [("name", .str "home"),
-        ("persistentVolumeClaim", Json.mkObj [("claimName", .str claim)])]
-    | none       => Json.mkObj [("name", .str "home"), ("emptyDir", Json.mkObj [])]
+    (staged : Array StagedPath) (workspaceClaim : Option String := none) : Json :=
+  -- Every directory the agent works in has to be the agent's own, mount point included: git refuses
+  -- a work tree whose top-level directory another user owns, and the kubelet creates every mount
+  -- point as root. So the checkout is never a mount point itself. It is a directory the agent
+  -- creates (see `openSession`) inside one: inside the claim's root with task volumes, where
+  -- `$HOME` lives too, and otherwise inside an `emptyDir` mounted on the directory above it.
+  -- The directory above the checkout, unless that is `/` (mounting over the root filesystem is not
+  -- an option): there the checkout itself is the mount point, and a root-owned one.
+  let parentOf (p : String) : String :=
+    match (System.FilePath.mk p).parent.map (·.toString) with
+    | some q => if q == "/" || q.isEmpty then p else q
+    | none   => p
+  let stageMounts : Array Json := (staged.mapIdx fun i st =>
+    if st.isWorkspace then
+      if workspaceClaim.isSome then none
+      else some (Json.mkObj [("name", .str (stageVolumeName i)),
+                             ("mountPath", .str (parentOf st.podPath))])
+    else some (Json.mkObj [("name", .str (stageVolumeName i)), ("mountPath", .str st.podPath)]))
+    |>.filterMap id
+  let stageVolumes : Array Json := (staged.mapIdx fun i st =>
+    if st.isWorkspace && workspaceClaim.isSome then none
+    else some (Json.mkObj [("name", .str (stageVolumeName i)), ("emptyDir", Json.mkObj [])]))
+    |>.filterMap id
+  -- The claim, mounted whole: the checkout and `$HOME` are directories in it, made by the agent.
+  -- Without one, `$HOME` is a scratch `emptyDir` of its own.
+  let (homeVolumes, homeMounts) := match workspaceClaim, cfg.taskVolumes with
+    | some claim, some tv =>
+      (#[Json.mkObj [("name", .str workspaceVolumeName),
+          ("persistentVolumeClaim", Json.mkObj [("claimName", .str claim)])]],
+       #[Json.mkObj [("name", .str workspaceVolumeName), ("mountPath", .str tv.mountPath)]])
+    | _, _ =>
+      (#[Json.mkObj [("name", .str "home"), ("emptyDir", Json.mkObj [])]],
+       #[Json.mkObj [("name", .str "home"), ("mountPath", .str cfg.homePath)]])
   let volumes : Array Json :=
     stageVolumes
-      ++ #[Json.mkObj [("name", .str "control"), ("emptyDir", Json.mkObj [])], homeVolume]
+      ++ #[Json.mkObj [("name", .str "control"), ("emptyDir", Json.mkObj [])]] ++ homeVolumes
       ++ cfg.extraVolumes
   let mounts : Array Json :=
     stageMounts
-      ++ #[Json.mkObj [("name", .str "control"), ("mountPath", .str controlPath)],
-           Json.mkObj [("name", .str "home"), ("mountPath", .str cfg.homePath)]]
+      ++ #[Json.mkObj [("name", .str "control"), ("mountPath", .str controlPath)]] ++ homeMounts
       ++ cfg.extraMounts
   -- `HOME` is set here rather than passed through: the image's idea of home is not orchestra's,
   -- and every home-relative path the agent backend declared was resolved against `homePath`.
   -- Nothing else is set on the pod. Credentials reach each command through a file (see
   -- `envFilePath`), because a pod's spec is readable by anything that can list pods.
+  --
+  -- The working directory is the control directory, not the checkout: a container runtime creates
+  -- a missing working directory itself, as root, which is exactly the ownership this avoids. Every
+  -- command `cd`s to the checkout anyway (`runnerScript`).
   let container := Json.mkObj ([
     ("name", .str "agent"),
     ("image", .str image),
     ("command", .arr #[.str "/bin/sh", .str "-c", .str idleScript]),
-    ("workingDir", .str spec.workdir.toString),
+    ("workingDir", .str controlPath),
     ("env", .arr #[Json.mkObj [("name", .str "HOME"), ("value", .str cfg.homePath)]]),
     ("volumeMounts", .arr mounts)
   ] ++ (match cfg.imagePullPolicy with
         | some p => [("imagePullPolicy", Json.str p)] | none => [])
      ++ (match cfg.resources with | some r => [("resources", r)] | none => []))
+  -- A claim's root is whatever its storage class makes it: k3s's `local-path` hands out a
+  -- world-writable directory, a block-backed class an ext4 root that only root may write. The agent
+  -- has to create `work` and `home` in it as its own user, so a root init container opens the
+  -- root up first — sticky, like `/tmp`, so no agent could remove what another made. It needs no
+  -- uid to be named; only the claim, and only once per pod.
+  let initContainers : List (String × Json) := match workspaceClaim, cfg.taskVolumes with
+    | some _, some tv =>
+      [("initContainers", .arr #[Json.mkObj ([
+        ("name", .str "open-workspace"),
+        ("image", .str image),
+        ("command", .arr #[.str "/bin/sh", .str "-c", .str s!"chmod 1777 {shellEscape tv.mountPath}"]),
+        ("securityContext", Json.mkObj [("runAsUser", .num 0)]),
+        ("volumeMounts", .arr #[Json.mkObj [("name", .str workspaceVolumeName),
+                                            ("mountPath", .str tv.mountPath)]])
+      ] ++ (match cfg.imagePullPolicy with
+            | some p => [("imagePullPolicy", Json.str p)] | none => []))])]
+    | _, _ => []
   let podSpec := Json.mkObj ([
     ("restartPolicy", .str "Never"),
     ("activeDeadlineSeconds", .num cfg.deadlineSeconds),
     ("containers", .arr #[container]),
     ("volumes", .arr volumes)
-  ] ++ (match cfg.serviceAccount with
+  ] ++ initContainers ++ (match cfg.serviceAccount with
         | some sa => [("serviceAccountName", Json.str sa)] | none => [])
      ++ (match cfg.nodeSelector with | some n => [("nodeSelector", n)] | none => [])
      ++ (if cfg.imagePullSecrets.isEmpty then [] else
@@ -443,7 +577,7 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
       ("namespace", .str cfg.ns),
       ("labels", Json.mkObj ([
         ("app.kubernetes.io/managed-by", .str "orchestra"),
-        ("orchestra.dev/task", .str spec.label)]
+        ("orchestra.dev/task", .str (labelValue spec.label))]
         -- A label value cannot hold a `/`, so `owner/name` is written the way Kubernetes writes
         -- its own two-part names.
         ++ (match spec.repo with
@@ -785,42 +919,367 @@ private def guardedTryWait (cfg : Config) (podName : String) (settled : IO.Ref B
     settled.set true
     return some code
 
+/-! ## Task volumes
+
+A claim per task chain (`TaskVolumes`). Each task that works on a claim adds a label naming itself,
+which is how a continuation — of any task in the chain, including a retry of one that failed —
+finds it. While a pod holds the claim it is annotated with that task, so a second continuation of
+the same task is refused rather than mounted beside the first. The last-use time is an annotation
+in epoch seconds, which is what retention reads. -/
+
+/-- The label marking a workspace claim as used by `taskId`. The name part of a label key is at most
+    63 characters, two of which are the `t-`. -/
+def taskLabel (taskId : String) : String := s!"orchestra.dev/t-{labelValue taskId 61}"
+
+/-- The annotation naming the task whose pod holds a workspace claim right now, and since when:
+    `<task>@<epoch seconds>`. The time matters for the window between taking the claim and the pod
+    existing, when the holder has no pod to show for it yet. -/
+def inUseAnnotation : String := "orchestra.dev/in-use"
+
+/-- The annotation recording when a workspace claim was last used, in epoch seconds. -/
+def lastUsedAnnotation : String := "orchestra.dev/last-used"
+
+/-- The value of `inUseAnnotation` for `taskId`, taken at `now`. -/
+def inUseValue (taskId : String) (now : Nat) : String := s!"{labelValue taskId}@{now}"
+
+/-- The claim a new task chain is given: labelled for the task that made it, and marked in use by it
+    from the moment it exists, so there is no instant at which another task could take it. -/
+def workspaceClaimManifest (cfg : Config) (tv : TaskVolumes) (spec : SessionSpec)
+    (name taskId : String) (now : Nat) : Json :=
+  Json.mkObj [
+    ("apiVersion", .str "v1"),
+    ("kind", .str "PersistentVolumeClaim"),
+    ("metadata", Json.mkObj [
+      ("name", .str name),
+      ("namespace", .str cfg.ns),
+      ("labels", Json.mkObj ([
+        ("app.kubernetes.io/managed-by", .str "orchestra"),
+        ("orchestra.dev/kind", .str "workspace"),
+        (taskLabel taskId, .str "1")]
+        ++ (match spec.repo with
+            | some r => [("orchestra.dev/repo", Json.str (labelValue (r.replace "/" ".")))]
+            | none   => []))),
+      ("annotations", Json.mkObj [(lastUsedAnnotation, .str (toString now)),
+        (inUseAnnotation, .str (inUseValue taskId now))])]),
+    ("spec", Json.mkObj ([
+      ("accessModes", .arr #[.str "ReadWriteOnce"]),
+      ("resources", Json.mkObj [("requests", Json.mkObj [("storage", .str tv.size)])])]
+      ++ (match tv.storageClass with
+          | some c => [("storageClassName", Json.str c)] | none => [])))]
+
+/-- The wall clock, in epoch seconds. `date` rather than a Lean API: the standard library's clocks
+    are monotonic, and this is compared against a timestamp another daemon run wrote. -/
+private def epochNow : IO Nat := do
+  let out ← IO.Process.output { cmd := "date", args := #["+%s"] }
+  return out.stdout.trimAscii.toNat?.getD 0
+
+/-- One workspace claim as the cluster reports it. -/
+structure ClaimRow where
+  name : String
+  resourceVersion : String
+  /-- `inUseAnnotation`, empty when nobody holds it. -/
+  inUse : String
+  /-- `lastUsedAnnotation`. -/
+  lastUsed : Option Nat
+  /-- Set once the claim is being deleted; such a claim is never handed out. -/
+  terminating : Bool
+
+/-- The workspace claims matching `selector`. -/
+private def listClaims (cfg : Config) (selector : String) : IO (Except String (List ClaimRow)) := do
+  let (code, out, err) ← kube cfg #["get", "pvc", "-l", selector, "-o",
+    "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.metadata.resourceVersion}{\"\\t\"}\
+{.metadata.annotations.orchestra\\.dev/in-use}{\"\\t\"}{.metadata.annotations.orchestra\\.dev/last-used}\
+{\"\\t\"}{.metadata.deletionTimestamp}{\"\\n\"}{end}"]
+  if code != 0 then return .error err.trimAscii.toString
+  return .ok <| (out.splitOn "\n").filterMap fun line =>
+    match line.splitOn "\t" with
+    | [n, rv, use, used, del] =>
+      if n.trimAscii.isEmpty then none
+      else some { name := n.trimAscii.toString, resourceVersion := rv.trimAscii.toString
+                  inUse := use.trimAscii.toString, lastUsed := used.trimAscii.toString.toNat?
+                  terminating := !del.trimAscii.isEmpty }
+    | _ => none
+
+/-- Whether the holder named in an in-use annotation is still working: its pod is up (not finished,
+    not failed), or it took the claim so recently that its pod may not exist yet. A holder whose
+    daemon died is neither, and its claim can be taken over. -/
+private def holderAlive (cfg : Config) (inUse : String) (now : Nat) : IO Bool := do
+  if inUse.isEmpty then return false
+  let (holder, since) := match inUse.splitOn "@" with
+    | [h, t] => (h, t.toNat?.getD 0)
+    | _      => (inUse, 0)
+  if now < since + cfg.startupTimeoutSeconds + 120 then return true
+  let (code, pods, _) ← kube cfg #["get", "pods", "-l",
+    s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/task={labelValue holder}",
+    "--field-selector=status.phase!=Failed,status.phase!=Succeeded", "-o", "name"]
+  -- Not knowing is not the same as knowing it is gone: an API hiccup must not hand one tree to two
+  -- agents.
+  if code != 0 then return true
+  return !pods.trimAscii.isEmpty
+
+/-- Delete workspace claims nobody has used for `retentionDays`. Best effort, and quiet about it:
+    a sweep that fails costs disk, not a task. A claim whose holder is still working is skipped
+    however old its last-use stamp, and so is one already on its way out. -/
+private def sweepWorkspaceClaims (cfg : Config) (tv : TaskVolumes) : IO Unit := do
+  try
+    let .ok rows ← listClaims cfg "app.kubernetes.io/managed-by=orchestra,orchestra.dev/kind=workspace"
+      | return
+    let now ← epochNow
+    let cutoff := max 1 tv.retentionDays * 86400
+    for r in rows do
+      if r.terminating then continue
+      let some t := r.lastUsed | continue
+      if now ≤ t + cutoff then continue
+      if ← holderAlive cfg r.inUse now then continue
+      IO.println s!"  [k8s] deleting workspace claim {r.name}: unused for over {tv.retentionDays} days"
+      -- Marked first, by the same compare-and-swap a task takes a claim with, so a continuation that
+      -- took it a moment ago keeps it: the delete only follows if nobody changed it since the read.
+      let (mc, _, _) ← kube cfg #["annotate", "pvc", r.name, "--overwrite",
+        s!"--resource-version={r.resourceVersion}", s!"{inUseAnnotation}=retention@{now}"]
+      if mc == 0 then
+        let _ ← kube cfg #["delete", "pvc", r.name, "--wait=false", "--ignore-not-found"]
+  catch _ => pure ()
+
+/-- Take a claim for `taskId`: one compare-and-swap on the in-use annotation, against the version
+    the caller read, so two tasks reading "free" at once cannot both win. Then the label a
+    continuation of this task will look it up by. -/
+private def takeClaim (cfg : Config) (row : ClaimRow) (taskId : String) : IO Bool := do
+  let now ← epochNow
+  let (code, _, _) ← kube cfg #["annotate", "pvc", row.name, "--overwrite",
+    s!"--resource-version={row.resourceVersion}",
+    s!"{inUseAnnotation}={inUseValue taskId now}", s!"{lastUsedAnnotation}={now}"]
+  if code != 0 then return false
+  let (lcode, _, lerr) ← kube cfg #["label", "pvc", row.name, "--overwrite", s!"{taskLabel taskId}=1"]
+  if lcode != 0 then
+    throw (IO.userError s!"kubernetes: could not label workspace claim {row.name}: {lerr.trimAscii}")
+  return true
+
+/-- Let go of a claim once the task's pod is gone — if it is still this task's to let go of. Another
+    task may have taken it over in the meantime (`holderAlive` judged this one gone), and clearing
+    *its* mark would let a third mount the claim beside it; so the mark is removed only if it still
+    names `taskId`, as a compare-and-swap on the version just read. Best effort. -/
+private def releaseWorkspace (cfg : Config) (name taskId : String) : IO Unit := do
+  try
+    let (code, out, _) ← kube cfg #["get", "pvc", name, "-o",
+      "jsonpath={.metadata.resourceVersion}{\"\\t\"}{.metadata.annotations.orchestra\\.dev/in-use}"]
+    if code != 0 then return
+    match out.splitOn "\t" with
+    | [rv, inUse] =>
+      unless inUse.trimAscii.toString.startsWith s!"{labelValue taskId}@" do return
+      let now ← epochNow
+      let _ ← kube cfg #["annotate", "pvc", name, "--overwrite",
+        s!"--resource-version={rv.trimAscii}", s!"{lastUsedAnnotation}={now}", s!"{inUseAnnotation}-"]
+    | _ => pure ()
+  catch _ => pure ()
+
+/-- Make a new claim for `taskId`, already marked in use by it. -/
+private def createClaim (cfg : Config) (tv : TaskVolumes) (spec : SessionSpec) (taskId : String)
+    : IO String := do
+  let name := s!"orchestra-ws-{← randomHex 8}"
+  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
+  IO.FS.createDirAll dir
+  let path := dir / "pvc.json"
+  IO.FS.writeFile path (workspaceClaimManifest cfg tv spec name taskId (← epochNow)).compress
+  let (code, _, err) ← kube cfg #["create", "-f", path.toString]
+  try IO.FS.removeDirAll dir catch _ => pure ()
+  if code != 0 then
+    throw (IO.userError s!"kubernetes: could not create workspace claim {name}: {err.trimAscii}")
+  return name
+
+/-- The claim this task works on, and whether it is one a predecessor left (so its tree is already
+    there and must not be overwritten).
+
+    A continuation is handed the claim its predecessor used, or refused: starting it on a fresh
+    tree would answer a follow-up prompt with a model whose context describes edits that are not
+    there — unless the caller said a fresh one will do (`SessionSpec.continuationOptional`, for a
+    chat session whose agent never got as far as starting). A claim another task is still working
+    in is refused too: two agents in one tree is how each undoes the other's work. Anything that
+    continues nothing gets a new claim. -/
+private def acquireWorkspaceClaim (cfg : Config) (tv : TaskVolumes) (spec : SessionSpec)
+    (taskId : String) : IO (String × Bool) := do
+  sweepWorkspaceClaims cfg tv
+  let some prev := spec.continuesFrom | return (← createClaim cfg tv spec taskId, false)
+  -- A few rounds, for the case where another task changes the claim between our read and our
+  -- swap: that one is either taking it (and the next read says so) or letting it go.
+  for _ in [0:3] do
+    let rows ← match ← listClaims cfg s!"app.kubernetes.io/managed-by=orchestra,{taskLabel prev}" with
+      | .ok rs   => pure (rs.filter (!·.terminating))
+      | .error e => throw (IO.userError s!"kubernetes: could not look up the workspace of {prev}: {e}")
+    match rows with
+    | [] =>
+      if spec.continuationOptional then return (← createClaim cfg tv spec taskId, false)
+      throw (IO.userError s!"kubernetes: {taskId} continues {prev}, but no workspace volume is \
+left for {prev} — it ran before task volumes were enabled, or went unused for more than \
+{tv.retentionDays} days and was deleted. Queue the work as a task of its own.")
+    | [row] =>
+      let now ← epochNow
+      let ownHold := row.inUse.startsWith s!"{labelValue taskId}@"
+      if !ownHold && (← holderAlive cfg row.inUse now) then
+        throw (IO.userError s!"kubernetes: {taskId} continues {prev}, whose workspace volume \
+{row.name} is in use by {(row.inUse.splitOn "@").headD row.inUse} right now. Two agents in one \
+tree would undo each other's work; continue that task instead, or wait for it to finish.")
+      -- Its own mark is a waking session whose last pod may have outlived a daemon that died:
+      -- that pod's agent can still be running, and a second one in the same tree would undo the
+      -- first's work. So whatever of its own is left is removed before the claim is taken back.
+      if ownHold then
+        let (dc, _, derr) ← kube cfg #["delete", "pods", "-l",
+          s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/task={labelValue taskId}",
+          "--now", "--ignore-not-found", "--timeout=120s"]
+        if dc != 0 then
+          throw (IO.userError s!"kubernetes: {taskId} has a pod left over from before that could \
+not be removed ({derr.trimAscii}); refusing to start a second agent in its workspace")
+      if ← takeClaim cfg row taskId then return (row.name, true)
+    | many =>
+      throw (IO.userError s!"kubernetes: more than one workspace volume is labelled as used by \
+{prev} ({String.intercalate ", " (many.map (·.name))}); refusing to guess which one {taskId} continues")
+  throw (IO.userError s!"kubernetes: the workspace volume of {prev} kept changing while {taskId} \
+tried to take it; another task is contending for it")
+
+/-- Copy the seed paths (`TaskVolumes.seedPaths`) the daemon holds for this repository into a fresh
+    workspace. Missing ones are skipped — the first task on a repository has nothing to seed from —
+    and a failed copy is a warning, not a failed task: a seed is a head start, not a result. -/
+private def stageSeeds (cfg : Config) (tv : TaskVolumes) (podName : String)
+    (seedDir : System.FilePath) (mount : String) : IO Unit := do
+  for p in tv.seedPaths do
+    let src := seedDir / p
+    try
+      if ← src.isDir then
+        mkdirInPod cfg podName s!"{mount}/{p}"
+        stageIn cfg podName src.toString s!"{mount}/{p}"
+    catch e =>
+      IO.eprintln s!"  [k8s] warning: could not seed {p} into the new workspace: {e}"
+
+/-- Copy the seed paths back out of the pod into the daemon's seed directory, each replacing what
+    was there. Best effort, like staging them. Serialised per repository with `flock`, so two tasks
+    ending at once cannot interleave their swaps; the archive is written to a file before anything
+    is moved, so a broken stream leaves the previous seed whole rather than installing half of one. -/
+private def exportSeeds (cfg : Config) (tv : TaskVolumes) (podName : String)
+    (seedDir : System.FilePath) (mount : String) : IO Unit := do
+  for p in tv.seedPaths do
+    let target := (seedDir / p).toString
+    let tag ← randomHex 4
+    let incoming := s!"{target}.orchestra-incoming-{tag}"
+    let previous := s!"{target}.orchestra-previous-{tag}"
+    let archive := s!"{target}.orchestra-{tag}.tar"
+    let kubectl := s!"{shellEscape cfg.kubectl} -n {shellEscape cfg.ns} exec {shellEscape podName} --"
+    let script := s!"set -e\n\
+mkdir -p {shellEscape seedDir.toString} \"$(dirname {shellEscape target})\"\n\
+exec 9> {shellEscape (seedDir / ".lock").toString}\n\
+flock 9\n\
+{kubectl} test -d {shellEscape s!"{mount}/{p}"} || exit 0\n\
+trap 'rm -rf {shellEscape incoming} {shellEscape archive}' EXIT\n\
+{kubectl} tar -C {shellEscape s!"{mount}/{p}"} -cf - . > {shellEscape archive}\n\
+mkdir -p {shellEscape incoming}\n\
+tar -C {shellEscape incoming} -xf {shellEscape archive}\n\
+if [ -e {shellEscape target} ]; then mv -T {shellEscape target} {shellEscape previous}; fi\n\
+mv -T {shellEscape incoming} {shellEscape target}\n\
+rm -rf {shellEscape previous}\n"
+    let (code, _, err) ← shell script
+    if code != 0 then
+      let _ ← shell s!"if [ ! -e {shellEscape target} ] && [ -d {shellEscape previous} ]; then \
+mv -T {shellEscape previous} {shellEscape target}; fi"
+      IO.eprintln s!"  [k8s] warning: could not keep {p} as the seed for the next task: {err.trimAscii}"
+
 /-! ## The session -/
 
 /-- Open a pod for one task, and hand back the handle on it. -/
 def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
   let home ← hostHome
-  let staged := stagedPaths cfg home spec
-  let podName := s!"orchestra-{← randomHex 6}"
   let image ← match imageFor cfg spec with
     | .ok i    => pure i
     | .error e => throw (IO.userError s!"kubernetes: {e}")
-  let manifest := podManifest cfg spec podName image staged
+  -- A task volume only for what asks for one (`taskId`): the merger and `prepare` have nothing
+  -- to continue and nothing worth keeping, and get the throwaway pod they always had.
+  let volume : Option (TaskVolumes × String × Bool) ← match cfg.taskVolumes, spec.taskId with
+    | some tv, some tid =>
+      let (claim, reused) ← acquireWorkspaceClaim cfg tv spec tid
+      if reused then
+        IO.println s!"  [k8s] continuing on workspace volume {claim} ({spec.continuesFrom.getD "?"}'s)"
+      else
+        IO.println s!"  [k8s] new workspace volume {claim}"
+      pure (some (tv, claim, reused))
+    | _, _ => pure none
+  -- On a task volume the checkout and `$HOME` are directories on the claim (see `TaskVolumes`);
+  -- `ecfg` is the configuration with `homePath` pointing there, so every home-relative path the
+  -- agent backend declared lands on the claim as well.
+  let ecfg : Config := match volume with
+    | some (tv, _, _) => { cfg with homePath := s!"{tv.mountPath}/home" }
+    | none            => cfg
+  let workspaceMount := volume.map (fun (tv, _, _) => s!"{tv.mountPath}/work")
+  let staged := stagedPaths ecfg home spec workspaceMount
+  let toPod := podPathOf spec workspaceMount
+  let podName := s!"orchestra-{← randomHex 6}"
+  let manifest := podManifest ecfg spec podName image staged (volume.map (·.2.1))
   let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
   IO.FS.createDirAll dir
   let manifestPath := dir / "pod.json"
   IO.FS.writeFile manifestPath manifest.compress
   let (code, _, err) ← kube cfg #["create", "-f", manifestPath.toString]
   try IO.FS.removeDirAll dir catch _ => pure ()
+  -- The claim is let go of whenever the pod is: when the task is done with it, and on every way
+  -- of failing to start one. A claim made for this task and never used is deleted rather than kept:
+  -- it holds an empty or half-copied tree, and a start that keeps failing would otherwise leave one
+  -- behind per attempt.
+  let releaseClaim : IO Unit := match volume with
+    | some (_, claim, _) => releaseWorkspace cfg claim (spec.taskId.getD "")
+    | none => pure ()
+  let abandonClaim : IO Unit := match volume with
+    | some (_, claim, false) =>
+      discard <| (try kube cfg #["delete", "pvc", claim, "--wait=false", "--ignore-not-found"]
+                  catch _ => pure (0, "", ""))
+    | _ => releaseClaim
   if code != 0 then
+    abandonClaim
     throw (IO.userError s!"kubernetes: could not create pod {podName}: {err.trimAscii}")
+  -- On a task volume the pod is waited for before the claim is let go of: a continuation that
+  -- mounted it while a cancelled agent was still writing would be two agents in one tree.
+  -- Whether the pod is known to be gone. If the delete did not finish in time, the claim is left
+  -- marked: `holderAlive` frees it once the pod really is gone, and releasing it now would let a
+  -- continuation mount it beside an agent still writing.
+  let removePod : IO Bool := do
+    let (code, _, _) ← try kube cfg #["delete", "pod", podName, "--now", "--ignore-not-found",
+                           if volume.isSome then "--timeout=120s" else "--wait=false"]
+            catch _ => pure (1, "", "")
+    return code == 0
   let deletePod : IO Unit := do
-    let _ ← try kube cfg #["delete", "pod", podName, "--now", "--wait=false",
-                           "--ignore-not-found"] catch _ => pure (0, "", "")
+    if ← removePod then releaseClaim
+    else IO.eprintln s!"  [k8s] pod {podName} did not go away in time; its workspace claim stays \
+marked until it does"
+  let failPod : IO Unit := do
+    if ← removePod then abandonClaim
   -- Ready, not merely created: the next thing this does is copy a repository through
   -- `kubectl exec`, which needs a container that has actually started.
   let (waitCode, _, waitErr) ← kube cfg #["wait", "--for=condition=Ready", s!"pod/{podName}",
     s!"--timeout={cfg.startupTimeoutSeconds}s"]
   if waitCode != 0 then
     let why ← startupDiagnosis cfg podName
-    deletePod
+    failPod
     throw (IO.userError s!"kubernetes: pod {podName} did not become ready within \
 {cfg.startupTimeoutSeconds}s ({why}): {waitErr.trimAscii}")
   try
+    -- The directories the agent works in, made by the agent's own user (every `exec` runs as the
+    -- image's user) before anything lands in them, so that they are its own and not root's — the
+    -- checkout and, on a claim, `$HOME`. A no-op on a claim a predecessor left, where they exist.
+    if let some ws := staged.find? (·.isWorkspace) then
+      mkdirInPod cfg podName ws.podPath
+    if volume.isSome then
+      mkdirInPod cfg podName ecfg.homePath
     for st in staged do
-      stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
+      match volume with
+      | some (tv, _, reused) =>
+        if st.isWorkspace then
+          -- A continuation's tree is already on the claim, exactly as its predecessor left it;
+          -- copying the daemon's checkout over it would undo the very thing it was kept for.
+          unless reused do
+            stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
+            if let some seedDir := spec.seedDir then
+              stageSeeds cfg tv podName seedDir st.podPath
+        else
+          stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
+      | none =>
+        stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
   catch e =>
-    deletePod
+    failPod
     throw e
   -- Each command gets its own environment file, so a later one cannot be handed an earlier one's
   -- variables by accident.
@@ -837,15 +1296,15 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     -- would otherwise say it can.
     freshEnvironment := true
     -- The agent's conversation is a file under its `$HOME`. With an `emptyDir` home that is gone
-    -- when the pod is, so a task cannot continue one an earlier task started; with a claim, home
-    -- outlives the pod and it can.
-    carriesAgentState := cfg.homeClaim.isSome
+    -- when the pod is, so a task cannot continue one an earlier task started; on a task volume,
+    -- home is the chain's own and outlives the pod.
+    carriesAgentState := volume.isSome
     mcpEndpoint := fun e => pure { e with host := cfg.mcpHost }
     describe := fun run => do
       let envFile := envFilePath 0
       let rendered := String.intercalate " "
         ((#[cfg.kubectl] ++ execArgs cfg podName (run.stdio == .inherit)
-           (runnerScript envFile run.workdir.toString) run.command run.args).toList.map shellEscape)
+           (runnerScript envFile (toPod run.workdir.toString)) run.command (run.args.map toPod)).toList.map shellEscape)
       return s!"[debug] {cfg.kubectl} -n {cfg.ns} create -f - <<'EOF'\n{manifest.pretty}\nEOF\n\
 [debug] {rendered}"
     start := fun run => do
@@ -854,7 +1313,7 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
       -- the interactive one wants a TTY.
       let args := execArgs cfg podName (interactive := run.stdio == .inherit)
         (stdinOpen := run.stdio != .piped)
-        (runnerScript envFile run.workdir.toString (guard := true)) run.command run.args
+        (runnerScript envFile (toPod run.workdir.toString) (guard := true)) run.command (run.args.map toPod)
       -- Cancellation ends the agent, not the pod: `close` is the only thing that takes the pod
       -- down, because everything that has to happen after a cancelled task — `after.sh`, the
       -- checkout coming back, the status being written — is another `exec` into it.
@@ -900,13 +1359,13 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
       for g in grants do
         if g.from_ == .orchestra then
           stagePath cfg podName (PathGrant.resolve home g).path
-            (PathGrant.resolve cfg.homePath g).path
+            (PathGrant.resolve ecfg.homePath g).path
     runScript := fun script => do
       -- The repository's own scripts, run where the agent works. `bash` because that is what the
       -- daemon used when it ran them itself, and repositories were written against it.
       let envFile ← nextEnvFile #[]
       let args := execArgs cfg podName false
-        (runnerScript envFile script.workdir.toString) "bash" #[script.path]
+        (runnerScript envFile (toPod script.workdir.toString)) "bash" #[toPod script.path]
       match script.stdio with
       -- A repository's script is run, not conversed with; `.stream` is captured like `.piped`.
       | .inherit =>
@@ -916,8 +1375,13 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
       | .piped | .stream =>
         let child ← IO.Process.spawn {
           cmd := cfg.kubectl, args, stdin := .null, stdout := .piped, stderr := .piped }
+        -- Both pipes drained at once: a build writing more than a pipe buffer to stderr would
+        -- otherwise block there while stdout is read to the end, and never finish.
+        let stderrTask ← IO.asTask (prio := .dedicated) child.stderr.readToEnd
         let stdout ← child.stdout.readToEnd
-        let stderr ← child.stderr.readToEnd
+        let stderr ← match ← IO.wait stderrTask with
+          | .ok s => pure s
+          | .error e => throw e
         let exitCode ← child.wait
         return { exitCode, output := (stdout ++ stderr).trimAscii.toString }
     close := do
@@ -946,10 +1410,19 @@ directory is lost."
         for st in staged do
           if st.writable then
             if st.isWorkspace then
-              -- `sync_back` is about the checkout, and only the checkout: an operator turns it off
-              -- because the agent pushes its work and nothing local reads the tree afterwards.
-              if cfg.syncBack then
-                syncOut cfg podName st.hostPath st.podPath (merge := false)
+              match volume with
+              | some (tv, _, _) =>
+                -- The tree stays where it is, on the claim, for whatever continues this task: the
+                -- daemon's checkout was only what a fresh workspace was filled from, and nothing
+                -- reads it afterwards. What does come back is the build, as the head start for the
+                -- next task that starts fresh on this repository.
+                if let some seedDir := spec.seedDir then
+                  exportSeeds cfg tv podName seedDir st.podPath
+              | none =>
+                -- `sync_back` is about the checkout, and only the checkout: an operator turns it
+                -- off because the agent pushes its work and nothing local reads the tree afterwards.
+                if cfg.syncBack then
+                  syncOut cfg podName st.hostPath st.podPath (merge := false)
             else
               -- Memory directories come back either way. "The agent pushes its code" is not a
               -- reason to throw away what it learned, and a memory that does not outlive the pod
@@ -981,6 +1454,15 @@ Always, IfNotPresent or Never"
     return .error s!"this daemon may not create pods in namespace '{cfg.ns}' \
 ({(out ++ err).trimAscii}). It needs create/get/list/watch/delete on pods, create on pods/exec, \
 and get on pods/log."
+  -- Task volumes need their own verbs, and a Role written for the pods alone is the usual way to
+  -- be missing them: every task would then fail at its first `kubectl create pvc`.
+  if cfg.taskVolumes.isSome then
+    for verb in ["get", "list", "create", "patch", "delete"] do
+      let (code, out, err) ← kube cfg #["auth", "can-i", verb, "persistentvolumeclaims"]
+      if code != 0 || out.trimAscii.toString != "yes" then
+        return .error s!"task_volumes is set, but this daemon may not {verb} \
+persistentvolumeclaims in namespace '{cfg.ns}' ({(out ++ err).trimAscii}). It needs \
+get/list/create/patch/delete on persistentvolumeclaims as well as what pods need."
   return .ok ()
 
 /-- Kubernetes as an execution backend. -/
@@ -996,6 +1478,7 @@ def factory : BackendFactory where
       exposure := .network cfg.mcpBind cfg.mcpPorts
       mcpEndpoint := fun e => pure { e with host := cfg.mcpHost }
       preflight := preflight cfg
+      persistentWorkspaces := cfg.taskVolumes.isSome
       openSession := openSession cfg }
 
 end Orchestra.Exec.Kubernetes

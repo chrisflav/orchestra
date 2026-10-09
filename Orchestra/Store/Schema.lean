@@ -1,5 +1,6 @@
 import Db
 import Orchestra.Store.Migrations.Initial
+import Orchestra.Store.Migrations.UsageEstimate
 
 /-!
 # The shape of orchestra's database
@@ -185,6 +186,9 @@ structure UsageSourceRow where
   last_used_tick : Option Int
   last_error : Option String
   poll_after : Option Int
+  /-- The learned consumption estimate, as JSON (`Usage.Estimate`). Nullable: rows written before
+      it existed have none, and read as nothing learned yet. -/
+  estimate : Option String
   deriving Repr
 
 /-- One window of usage history. Keyed by a generated id because the rows are a sequence rather
@@ -273,6 +277,7 @@ def target : DatabaseRecipe :=
 /-- The migrations, in the order they are applied. Appended to, never edited: a deployment that
     has recorded one is a deployment the next one has to run on top of. -/
 def migrations : List Db.Migration.Migration :=
-  [Orchestra.Store.Migrations.migration_0001_initial]
+  [Orchestra.Store.Migrations.migration_0001_initial,
+   Orchestra.Store.Migrations.migration_0002_usage_estimate]
 
 end Orchestra.Store
