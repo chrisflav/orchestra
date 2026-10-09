@@ -125,12 +125,14 @@ TOML
     # the script. Built here instead, each on its own, so one that does not build costs only itself.
     for p in .lake/packages/*; do
       pkg=$(basename "$p")
-      exes=$( { sed -n 's/^lean_exe[[:space:]]\{1,\}«\{0,1\}\([A-Za-z0-9_-]*\)»\{0,1\}.*/\1/p' \
+      exes=$( { sed -n -E 's/^lean_exe[[:space:]]+(«)?([A-Za-z0-9_-]+)(»)?.*/\2/p' \
                   "$p/lakefile.lean" 2>/dev/null || true
                 awk '/^\[\[lean_exe\]\]/ {e=1; next} /^\[/ {e=0} e && /^name *=/ {gsub(/[" ]/, "", $0); sub(/^name=/, ""); print}' \
                   "$p/lakefile.toml" 2>/dev/null || true; } | sort -u)
       for exe in $exes; do
-        lake build "@$pkg/$exe" || echo "warning: could not build $pkg/$exe" >&2
+        # `:exe`, not the bare name: an executable whose root module has the same name (`mk_all`)
+        # would otherwise resolve to the module, build its olean, and report success.
+        lake build "@$pkg/$exe:exe" || echo "warning: could not build $pkg/$exe" >&2
       done
     done
     chmod -R a+rX .lake/packages "$MATHLIB_CACHE_DIR" "$ELAN_HOME"

@@ -307,8 +307,13 @@ def hostRunScript (spec : ScriptSpec) : IO ScriptResult := do
     let child ← IO.Process.spawn {
       cmd := "bash", args := #[spec.path], cwd := spec.workdir
       stdout := .piped, stderr := .piped }
+    -- Both pipes drained at once: a build writing more than a pipe buffer to stderr would
+    -- otherwise block there while stdout is read to the end, and never finish.
+    let stderrTask ← IO.asTask (prio := .dedicated) child.stderr.readToEnd
     let stdout ← child.stdout.readToEnd
-    let stderr ← child.stderr.readToEnd
+    let stderr ← match ← IO.wait stderrTask with
+      | .ok s => pure s
+      | .error e => throw e
     let exitCode ← child.wait
     return { exitCode, output := (stdout ++ stderr).trimAscii.toString }
 

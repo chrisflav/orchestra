@@ -76,6 +76,8 @@ lean_cache_link() {
   # elan's directory name for a toolchain: "leanprover/lean4:v4.33.1" -> "leanprover--lean4---v4.33.1".
   local elan_home=${ELAN_HOME:-${HOME:-}/.elan} tcdir
   tcdir=$(elan_dir "$toolchain")
+  # Remembered for the exec at the end: see there.
+  cached_toolchain=$cache/elan/toolchains/$tcdir
   if [ "$elan_home" != /.elan ] && [ -d "$cache/elan/toolchains/$tcdir" ] \
      && [ ! -e "$elan_home/toolchains/$tcdir" ]; then
     mkdir -p "$elan_home/toolchains" && ln -sfn "$cache/elan/toolchains/$tcdir" "$elan_home/toolchains/$tcdir"
@@ -131,6 +133,16 @@ lean_cache_link() {
 
 if [ -d "$cache" ] && [ -z "${LEAN_CACHE_DISABLE:-}" ] && command -v jq >/dev/null; then
   lean_cache_link "$@" || echo "lean-cache: linking failed; continuing without the cache" >&2
+fi
+
+# A cached toolchain is run from the cache itself, not through elan and the link in ~/.elan. The
+# warmer built everything with the toolchain at this very path, and Lake's traces for native code
+# record it (the compiler's include and library paths): run from anywhere else, `lake exe mk_all`
+# would see a different command and try to rebuild Mathlib's executables -- into a read-only tree.
+# elan's `+toolchain` argument has done its job by now (it chose `toolchain` above) and is dropped.
+if [ -n "${cached_toolchain:-}" ] && [ -x "$cached_toolchain/bin/$name" ]; then
+  case "${1:-}" in +?*) shift ;; esac
+  exec "$cached_toolchain/bin/$name" "$@"
 fi
 
 exec -a "$name" /usr/local/bin/elan "$@"

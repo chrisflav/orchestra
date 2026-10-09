@@ -58,8 +58,14 @@ private def runGit (args : Array String) (cwd : Option System.FilePath := none)
     stdout := .piped
     stderr := .piped
   }
+  -- stderr is drained on its own task while stdout is read here. Reading one to the end before
+  -- the other deadlocks as soon as git writes more than a pipe buffer to the second: a fetch that
+  -- reports every branch of a busy repository blocks on stderr while this waits on stdout.
+  let stderrTask ← IO.asTask (prio := .dedicated) child.stderr.readToEnd
   let stdout ← child.stdout.readToEnd
-  let stderr ← child.stderr.readToEnd
+  let stderr ← match ← IO.wait stderrTask with
+    | .ok s => pure s
+    | .error e => throw e
   let code ← child.wait
   if code != 0 then
     throw (.userError s!"git {args[0]!} failed (exit {code}):\n{stderr}")
@@ -79,8 +85,12 @@ private def runGh (args : Array String) (cwd : Option System.FilePath := none)
     stdout := .piped
     stderr := .piped
   }
+  -- As in `runGit`: both pipes drained at once, or a chatty command deadlocks.
+  let stderrTask ← IO.asTask (prio := .dedicated) child.stderr.readToEnd
   let stdout ← child.stdout.readToEnd
-  let stderr ← child.stderr.readToEnd
+  let stderr ← match ← IO.wait stderrTask with
+    | .ok s => pure s
+    | .error e => throw e
   let code ← child.wait
   if code != 0 then
     throw (.userError s!"gh {args[0]!} failed (exit {code}):\n{stderr}")
