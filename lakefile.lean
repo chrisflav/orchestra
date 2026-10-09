@@ -58,7 +58,7 @@ require Taxis from git "https://github.com/chrisflav/taxis" @ "c0074ad32550f645f
 -- only the vendored SQLite needs no PostgreSQL headers. Orchestra keeps its records in
 -- PostgreSQL (see `Orchestra/Store/Connection.lean`), so it needs both the shim and, on every
 -- executable that calls into it, the libpq to resolve it against.
-require db from git "https://github.com/chrisflav/db" @ "cd8e6c37fd2c5a8a5778baef402475242f5e8e48"
+require db from git "https://github.com/chrisflav/db" @ "f2c288850706028b79c964b70bf44b3cae15023c"
   with NameMap.empty.insert `postgres "on"
 
 /-- Compile a single C shim under `ffi/` into a static library of the same name. -/

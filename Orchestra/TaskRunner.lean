@@ -543,8 +543,11 @@ private def finalStatusOf (taskId : String) : IO TaskStore.TaskStatus := do
 def selectAuthSource {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     : IO (Option String) := do
   let backendName := ioTask.backend.getD "claude"
+  -- The queue's running entries, so a source already carrying agents is weighed as such. A
+  -- queue that cannot be read only makes every source look idle, which is no reason to refuse.
+  let running ← try Queue.runningPerAuthSource catch _ => pure fun _ => 0
   match ← Usage.resolveLabel appConfig backendName ioTask.authSources ioTask.authSource
-          ioTask.authMode ioTask.model with
+          ioTask.authMode ioTask.model (running := running) with
   | .ok label => return label
   | .error e  => throw (.userError s!"no usable authentication source for '{backendName}': {e}")
 

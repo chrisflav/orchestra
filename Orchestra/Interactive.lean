@@ -492,7 +492,11 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     shutdownRef.set (some shutdownMcp)
     -- A session goes through the same resolver as a queued run, so an account the daemon has
     -- already found to be out of quota is not handed to a person either.
-    let authLabel ← match ← Usage.resolveLabel appConfig backendName [] none none record.model with
+    -- With the queue's running agents counted, so a person is not handed the account the daemon
+    -- has just loaded up; an unreadable queue only makes every account look idle.
+    let running ← try Queue.runningPerAuthSource catch _ => pure fun _ => 0
+    let authLabel ← match ← Usage.resolveLabel appConfig backendName [] none none record.model
+        (running := running) with
       | .ok label => pure label
       | .error e  => return ← fail s!"no usable authentication source for '{backendName}': {e}"
     if let some l := authLabel then Usage.markUsed backendName l
