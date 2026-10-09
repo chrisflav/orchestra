@@ -438,8 +438,11 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
     claimMutex.lock
     try
       let slotMap ← activeSlots.get
+      let pending ← Queue.pendingEntries
+      if pending.isEmpty then return none
       -- Read once per claim, not once per entry considered: nothing changes it until this claim
-      -- writes its entry `running`, and the next claim reads it again.
+      -- writes its entry `running`, and the next claim reads it again. After the pending check,
+      -- so an idle worker polling an empty queue every second does not pay for it.
       let running ← Queue.runningPerAuthSource
       let ctx : Queue.ClaimContext := {
         occupiedSlots   := slotMap
@@ -450,7 +453,6 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
         parallelSafe    := TaskRunner.backendIsParallelSafe
         resolveAuth     := resolveEntryAuth running
       }
-      let pending ← Queue.pendingEntries
       let some claim ← Queue.claimDecision ctx pending Queue.entryForTask Repo.poolOccupant
         | return none
       let e := claim.entry

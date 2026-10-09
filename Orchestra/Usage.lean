@@ -277,7 +277,21 @@ structure WindowAcc where
   lastPct   : Nat := 0
   /-- Running-agent seconds inside the window since `startPct` was read. -/
   agentSecs : Float := 0
-deriving Repr, Inhabited, ToJson, FromJson
+deriving Repr, Inhabited, ToJson
+
+/- The decoders below are written out, field by field with defaults, rather than derived: a derived
+   one rejects a document missing any field, so the first field added after deployment would make
+   every stored estimate unreadable and quietly reset what every source has learned. -/
+
+instance : FromJson WindowAcc where
+  fromJson? j := do
+    let _ ← j.getObj?
+    let d : WindowAcc := {}
+    return {
+      reset     := (j.getObjValAs? Int "reset").toOption
+      startPct  := (j.getObjValAs? Nat "startPct").toOption.getD d.startPct
+      lastPct   := (j.getObjValAs? Nat "lastPct").toOption.getD d.lastPct
+      agentSecs := (j.getObjValAs? Float "agentSecs").toOption.getD d.agentSecs }
 
 /-- What has been learned about how fast agents consume one source's limits.
 
@@ -295,7 +309,18 @@ structure Estimate where
   /-- Agents running on the source at the last observation, and when that was. -/
   lastRunning : Nat := 0
   lastEpoch   : Option Int := none
-deriving Repr, Inhabited, ToJson, FromJson
+deriving Repr, Inhabited, ToJson
+
+instance : FromJson Estimate where
+  fromJson? j := do
+    let _ ← j.getObj?
+    return {
+      sessionRate := (j.getObjValAs? Float "sessionRate").toOption
+      weeklyRate  := (j.getObjValAs? Float "weeklyRate").toOption
+      session     := (j.getObjValAs? WindowAcc "session").toOption.getD {}
+      weekly      := (j.getObjValAs? WindowAcc "weekly").toOption.getD {}
+      lastRunning := (j.getObjValAs? Nat "lastRunning").toOption.getD 0
+      lastEpoch   := (j.getObjValAs? Int "lastEpoch").toOption }
 
 /-- Everything known about one `(backend, label)` authentication source. -/
 structure SourceState where
@@ -935,6 +960,10 @@ def expectedTaskSecs : Int := 3600
 /-- Weight of one closed window in the moving average of a rate. -/
 def rateLearningWeight : Float := 0.3
 
+/-- How far from the prior one window's sample may pull. Narrow, because usage from outside
+    orchestra lands in the same counter as the agents' and is charged to them. -/
+def rateClampFactor : Float := 3
+
 /-- Least agent time a window must have seen to teach anything about a rate. Below it, rounding of
     an integer percentage and usage from outside orchestra dominate what the agents did. -/
 def minLearningAgentSecs : LimitKind → Float
@@ -964,6 +993,9 @@ def WindowAcc.observe (acc : WindowAcc) (kind : LimitKind) (rate : Option Float)
   let pct := limit.map (·.percent) |>.getD 0
   let same : Bool := match acc.reset, reset with
     | some a, some b => decide ((a - b).natAbs ≤ resetDriftSecs)
+    -- No reset time on either side: the counter's shape has to serve, as in `continuesWindow` —
+    -- a reading that fell is the first of a new window.
+    | none,   none   => decide (pct ≥ acc.lastPct)
     | _,      _      => false
   if same then
     if restart then
@@ -976,15 +1008,24 @@ def WindowAcc.observe (acc : WindowAcc) (kind : LimitKind) (rate : Option Float)
     -- The window `acc` describes has closed (or there was none). Its last reading over the agent
     -- time it saw is one sample of the rate, if it saw enough to mean anything.
     let rate :=
-      if acc.reset.isSome && acc.agentSecs ≥ minLearningAgentSecs kind then
+      if acc.agentSecs ≥ minLearningAgentSecs kind then
         let rose := floatOfInt ((acc.lastPct : Int) - acc.startPct)
         let sample := rose / (acc.agentSecs / 3600)
         -- A window that rose by far more than its agents can explain was mostly used by something
         -- else, and one that did not rise was mostly idle agents; neither is the typical agent.
-        let sample := max (prior / 10) (min (prior * 10) sample)
+        -- Kept within a factor of `rateClampFactor` of the prior, because the rate decides how
+        -- many agents a source gets and one outlying window must not idle it.
+        let sample := max (prior / rateClampFactor) (min (prior * rateClampFactor) sample)
         let old := rate.getD prior
         some ((1 - rateLearningWeight) * old + rateLearningWeight * sample)
-      else rate
+      else
+        -- Too little agent time to learn from. A source whose learned rate keeps it short of
+        -- agents would otherwise never get the agent time to unlearn it, so the rate eases back
+        -- toward the prior instead. Only for a window that was actually observed: the first
+        -- reading a source ever gets closes nothing.
+        if acc.reset.isSome then
+          rate.map fun r => (1 - rateLearningWeight) * r + rateLearningWeight * prior
+        else rate
     ({ reset, startPct := pct, lastPct := pct, agentSecs := 0 }, rate)
 
 /-- Fold a successful poll, made while `running` agents were on the source, into its estimate. -/

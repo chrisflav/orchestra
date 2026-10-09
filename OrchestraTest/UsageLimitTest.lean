@@ -750,6 +750,47 @@ def estimate_aWindowWithTooLittleAgentTimeTeachesNothing : Test := do
   e := e.observe (sessionReading 0 (r1 + 5 * 3600)) 0 (now + 13 * 300)
   TestM.assert e.sessionRate.isNone
 
+@[test]
+def estimate_oneWindowOfOutsideUsageMovesTheRateOnlySoFar : Test := do
+  -- One agent for an hour while a person pushes the window to 50%: 50 per agent-hour, which is
+  -- what one agent would never do. The sample is held to three times the prior.
+  let r1 := now + 5 * 3600
+  let mut e : Estimate := {}
+  for k in List.range 13 do
+    e := e.observe (sessionReading (k * 50 / 12) r1) 1 (now + k * 300)
+  e := e.observe (sessionReading 0 (r1 + 5 * 3600)) 1 (now + 13 * 300)
+  let expected := (1 - rateLearningWeight) * defaultSessionRate
+    + rateLearningWeight * (defaultSessionRate * rateClampFactor)
+  match e.sessionRate with
+  | none   => TestM.fail "the window taught nothing"
+  | some r => TestM.assert ((r - expected).abs < 1e-6) (msg := s!"rate {r}, expected {expected}")
+
+@[test]
+def estimate_aRateEasesBackWhenWindowsCloseWithoutAgents : Test := do
+  -- A source whose learned rate keeps agents off it never gets the agent time to unlearn it;
+  -- idle windows pull it back toward the prior instead.
+  let r1 := now + 5 * 3600
+  let mut e : Estimate := { sessionRate := some 19.8 }
+  e := e.observe (sessionReading 10 r1) 0 now
+  e := e.observe (sessionReading 0 (r1 + 5 * 3600)) 0 (now + 300)
+  let expected := (1 - rateLearningWeight) * 19.8 + rateLearningWeight * defaultSessionRate
+  match e.sessionRate with
+  | none   => TestM.fail "the rate was forgotten"
+  | some r => TestM.assert ((r - expected).abs < 1e-6) (msg := s!"rate {r}, expected {expected}")
+
+@[test]
+def estimate_aStoredEstimateMissingFieldsStillDecodes : Test := do
+  -- What a row written by a build with fewer fields looks like to one with more.
+  match Json.parse "{\"sessionRate\":8.5,\"session\":{\"reset\":1784696400}}" with
+  | .error e => TestM.fail e
+  | .ok j =>
+    match (Lean.FromJson.fromJson? j : Except String Estimate) with
+    | .error e => TestM.fail s!"did not decode: {e}"
+    | .ok e =>
+      TestM.assert (e.sessionRate == some 8.5) (msg := "the learned rate survives")
+      TestM.assertEqual e.session.reset (some 1784696400)
+      TestM.assertEqual e.session.startPct 0
+
 /-- Choose repeatedly, stamping each winner the way `markUsed` does, and report the order.
 
     `tick` stands in for the dispatch clock. It is strictly increasing per selection because the

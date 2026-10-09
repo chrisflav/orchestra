@@ -459,11 +459,14 @@ instead of one, and say how to choose between them:
   left them. The projection adds, to the polled session and weekly usage, what
   the agents already running on the source and the one about to start are
   expected to consume before the window resets (a learned rate per
-  running-agent hour; see `Orchestra.Usage.Estimate`). A source is used only
-  while its session window keeps headroom under that projection; among those
-  that do, the one with the most weekly capacity left to lose per hour until
-  its weekly reset goes first, so a week about to expire is spent before a
-  fresh one. Between otherwise equal sources it round-robins.
+  running-agent hour; see `Orchestra.Usage.Estimate`). Sources with headroom
+  under that projection — session at most 80%, weekly at most 98% — come
+  first; among them, the one with the most weekly capacity left to lose per
+  hour until its weekly reset goes first, so a week about to expire is spent
+  before a fresh one. When no source has headroom, work still starts, on the
+  source projected to go least far past it; it waits only when every source
+  is actually limited. Ties (rare between polled sources, whose reset times
+  differ) are broken by least-recently-used.
 
 Which source ran a task is recorded on its queue entry. Under `distribute` the
 choice is made and stamped while the daemon holds its claim lock, so parallel
