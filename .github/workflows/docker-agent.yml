@@ -52,7 +52,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Docker Hub base images through Google's mirror, as in docker.yml: anonymous pulls from
+      # GitHub's runners are refused with 429 for long stretches.
       - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       # Resolved here rather than left to npm inside the build, for two reasons: the image gets a
       # tag naming the CLI version it actually contains, and two builds of the same commit produce
