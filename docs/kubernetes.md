@@ -63,14 +63,16 @@ from a cancelled task.
 
 **On the daemon:** `kubectl`, configured for the cluster and namespace. The backend checks at the
 start of every task that it is there and that it may create pods, and fails the task with one line
-if not, rather than dispatching into a cluster that will refuse it.
+if not, rather than dispatching into a cluster that will refuse it. The daemon image
+(`docker/Dockerfile`) carries one at `/usr/local/bin/kubectl`; what it needs from you is the
+credential, as a kubeconfig named by `KUBECONFIG`.
 
 **In the image:** the agent CLI (`claude`, `vibe`, `opencode` or `pi`), `sh`, `bash` (the
 repository's scripts are run with it), `tar`, `nc` and `git`. That is the fixed part — the same
 list the daemon's own machine needs, minus `landrun`. What each repository needs on top of it is
 the subject of the next section.
 
-The image orchestra publishes also carries `kubectl`, which is not on that list because nothing the
+The agent image orchestra publishes (`orchestra-agent`) also carries `kubectl`, which is not on that list because nothing the
 backend does needs one *in the pod* — the daemon drives the pod with its own. It is there for the
 other thing a cluster makes possible: an agent that deploys what it just built onto the cluster it
 is running in. It grants nothing by itself. A pod's authority is whatever RBAC is bound to the
@@ -316,6 +318,56 @@ arrangement the landrun backend gets for free from the machine it runs on. The c
 `ReadWriteMany`, or `ReadWriteOnce` with every agent pod on one node, since tasks run in parallel.
 The checkout's own build output (`.lake`, `target`, `node_modules`) travels with the checkout
 instead; `excludes` keeps it off the wire without removing it from the daemon's copy.
+
+## a shared Lean cache
+
+A Mathlib project is the extreme case of the above: each fresh pod downloads and unpacks about
+7.5 GB before it can build anything, and with a dozen pods on a node the page cache holds a dozen
+copies of the same oleans. `home_claim` does not help — Mathlib lives in the checkout's
+`.lake/packages`, not in `$HOME` — and a writable volume shared by every task would let one task
+change what another builds against.
+
+The agent image carries both halves of a read-only alternative:
+
+- **`lean-cache-warm`** fills a directory with, per Mathlib revision, the toolchain, Mathlib and the
+  packages Mathlib's own manifest pins — built, with the cache archives beside them. It needs only
+  Mathlib's public repository, never the repositories the agents work on. Run it on a schedule as
+  the cache's only writer; it also warms any revision a pod has asked for, and prunes old ones.
+- **`lake`, `lean` and the other elan proxies** are a shim (`docker/lean-cache-shim.sh`). When a
+  cache is mounted at `/lean-cache`, each invocation first symlinks into the project whatever the
+  cache holds at *exactly* the revision `lake-manifest.json` pins, and points Mathlib's
+  `cache get` at the cached archives. Anything not in the cache is left to Lake as usual, and an
+  uncached Mathlib revision is written to `/lean-cache-requests` for the warmer to pick up.
+
+Nothing in the repository changes: its `lake exe cache get` becomes a no-op, its `lake build`
+replays Mathlib from the shared tree, and only its own modules and its non-Mathlib dependencies are
+built in the pod. Measured on a 24-thread node: `cache get` about 10 s instead of a 7.5 GB download, a
+pod's `.lake` 35 MB instead of 7.5 GB, and one copy of Mathlib in memory for every pod.
+
+The mounts, with the cache as a read-only claim so that a namespace enforcing the `baseline` Pod
+Security Standard (which refuses `hostPath`) can still use it:
+
+```json
+"volumes": [
+  {"name": "lean-cache", "persistentVolumeClaim": {"claimName": "lean-cache", "readOnly": true}},
+  {"name": "lean-cache-requests", "persistentVolumeClaim": {"claimName": "lean-cache-requests"}}
+],
+"volume_mounts": [
+  {"name": "lean-cache", "mountPath": "/lean-cache", "readOnly": true},
+  {"name": "lean-cache-requests", "mountPath": "/lean-cache-requests"}
+],
+"excludes": [".lake/packages"]
+```
+
+`excludes` keeps the daemon's own `.lake/packages` out of the pod, so the shim finds nothing there
+and links; the project's `.lake/build` still travels, so incremental builds stay incremental. The
+cache has to be world-readable, which the warmer ensures. `LEAN_CACHE_DISABLE=1` turns the shim
+into plain elan.
+
+Two things bypass it. `lake update` drops every cache link before it runs, since it rewrites
+packages in place, so whatever it fetches is the pod's own from then on. And an `elan-init`
+self-install puts its own proxies in `~/.elan/bin`, which is first on `PATH`; a repository that
+wants the cache should use the image's elan rather than installing another.
 
 ## memory, continuations and series
 
