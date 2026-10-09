@@ -48,7 +48,9 @@
 #   LEAN_CACHE_GRACE     seconds since last use before a revision outside the keep set may go
 #                        (default 86400, longer than any task)
 #
-# Upgrading from a cache written by an earlier layout: empty the directory and let this refill it.
+# Upgrading from a cache written by an earlier layout or an older warmer: empty the directory and
+# let this refill it. A revision already here is not warmed again, so what a newer warmer adds (the
+# executables, say) only reaches revisions it warms itself.
 
 # No `set -e` here, deliberately: each revision's warm runs in a subshell with its own errexit, and
 # errexit is silently ignored in any function or subshell called from an `if`, `&&` or `||`. So the

@@ -488,8 +488,12 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
   -- point as root. So the checkout is never a mount point itself. It is a directory the agent
   -- creates (see `openSession`) inside one: inside the claim's root with task volumes, where
   -- `$HOME` lives too, and otherwise inside an `emptyDir` mounted on the directory above it.
+  -- The directory above the checkout, unless that is `/` (mounting over the root filesystem is not
+  -- an option): there the checkout itself is the mount point, and a root-owned one.
   let parentOf (p : String) : String :=
-    (System.FilePath.mk p).parent.map (·.toString) |>.getD "/"
+    match (System.FilePath.mk p).parent.map (·.toString) with
+    | some q => if q == "/" || q.isEmpty then p else q
+    | none   => p
   let stageMounts : Array Json := (staged.mapIdx fun i st =>
     if st.isWorkspace then
       if workspaceClaim.isSome then none
@@ -537,12 +541,29 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
   ] ++ (match cfg.imagePullPolicy with
         | some p => [("imagePullPolicy", Json.str p)] | none => [])
      ++ (match cfg.resources with | some r => [("resources", r)] | none => []))
+  -- A claim's root is whatever its storage class makes it: k3s's `local-path` hands out a
+  -- world-writable directory, a block-backed class an ext4 root that only root may write. The agent
+  -- has to create `work` and `home` in it as its own user, so a root init container opens the
+  -- root up first — sticky, like `/tmp`, so no agent could remove what another made. It needs no
+  -- uid to be named; only the claim, and only once per pod.
+  let initContainers : List (String × Json) := match workspaceClaim, cfg.taskVolumes with
+    | some _, some tv =>
+      [("initContainers", .arr #[Json.mkObj ([
+        ("name", .str "open-workspace"),
+        ("image", .str image),
+        ("command", .arr #[.str "/bin/sh", .str "-c", .str s!"chmod 1777 {shellEscape tv.mountPath}"]),
+        ("securityContext", Json.mkObj [("runAsUser", .num 0)]),
+        ("volumeMounts", .arr #[Json.mkObj [("name", .str workspaceVolumeName),
+                                            ("mountPath", .str tv.mountPath)]])
+      ] ++ (match cfg.imagePullPolicy with
+            | some p => [("imagePullPolicy", Json.str p)] | none => []))])]
+    | _, _ => []
   let podSpec := Json.mkObj ([
     ("restartPolicy", .str "Never"),
     ("activeDeadlineSeconds", .num cfg.deadlineSeconds),
     ("containers", .arr #[container]),
     ("volumes", .arr volumes)
-  ] ++ (match cfg.serviceAccount with
+  ] ++ initContainers ++ (match cfg.serviceAccount with
         | some sa => [("serviceAccountName", Json.str sa)] | none => [])
      ++ (match cfg.nodeSelector with | some n => [("nodeSelector", n)] | none => [])
      ++ (if cfg.imagePullSecrets.isEmpty then [] else
@@ -1011,7 +1032,12 @@ private def sweepWorkspaceClaims (cfg : Config) (tv : TaskVolumes) : IO Unit := 
       if now ≤ t + cutoff then continue
       if ← holderAlive cfg r.inUse now then continue
       IO.println s!"  [k8s] deleting workspace claim {r.name}: unused for over {tv.retentionDays} days"
-      let _ ← kube cfg #["delete", "pvc", r.name, "--wait=false", "--ignore-not-found"]
+      -- Marked first, by the same compare-and-swap a task takes a claim with, so a continuation that
+      -- took it a moment ago keeps it: the delete only follows if nobody changed it since the read.
+      let (mc, _, _) ← kube cfg #["annotate", "pvc", r.name, "--overwrite",
+        s!"--resource-version={r.resourceVersion}", s!"{inUseAnnotation}=retention@{now}"]
+      if mc == 0 then
+        let _ ← kube cfg #["delete", "pvc", r.name, "--wait=false", "--ignore-not-found"]
   catch _ => pure ()
 
 /-- Take a claim for `taskId`: one compare-and-swap on the in-use annotation, against the version
@@ -1028,13 +1054,22 @@ private def takeClaim (cfg : Config) (row : ClaimRow) (taskId : String) : IO Boo
     throw (IO.userError s!"kubernetes: could not label workspace claim {row.name}: {lerr.trimAscii}")
   return true
 
-/-- Let go of a claim once the task's pod is gone. Best effort: a claim left marked by a holder that
-    is no longer working is taken over by the next task that asks for it (`holderAlive`). -/
-private def releaseWorkspace (cfg : Config) (name : String) : IO Unit := do
+/-- Let go of a claim once the task's pod is gone — if it is still this task's to let go of. Another
+    task may have taken it over in the meantime (`holderAlive` judged this one gone), and clearing
+    *its* mark would let a third mount the claim beside it; so the mark is removed only if it still
+    names `taskId`, as a compare-and-swap on the version just read. Best effort. -/
+private def releaseWorkspace (cfg : Config) (name taskId : String) : IO Unit := do
   try
-    let now ← epochNow
-    let _ ← kube cfg #["annotate", "pvc", name, "--overwrite", s!"{lastUsedAnnotation}={now}",
-      s!"{inUseAnnotation}-"]
+    let (code, out, _) ← kube cfg #["get", "pvc", name, "-o",
+      "jsonpath={.metadata.resourceVersion}{\"\\t\"}{.metadata.annotations.orchestra\\.dev/in-use}"]
+    if code != 0 then return
+    match out.splitOn "\t" with
+    | [rv, inUse] =>
+      unless inUse.trimAscii.toString.startsWith s!"{labelValue taskId}@" do return
+      let now ← epochNow
+      let _ ← kube cfg #["annotate", "pvc", name, "--overwrite",
+        s!"--resource-version={rv.trimAscii}", s!"{lastUsedAnnotation}={now}", s!"{inUseAnnotation}-"]
+    | _ => pure ()
   catch _ => pure ()
 
 /-- Make a new claim for `taskId`, already marked in use by it. -/
@@ -1083,6 +1118,16 @@ left for {prev} — it ran before task volumes were enabled, or went unused for 
         throw (IO.userError s!"kubernetes: {taskId} continues {prev}, whose workspace volume \
 {row.name} is in use by {(row.inUse.splitOn "@").headD row.inUse} right now. Two agents in one \
 tree would undo each other's work; continue that task instead, or wait for it to finish.")
+      -- Its own mark is a waking session whose last pod may have outlived a daemon that died:
+      -- that pod's agent can still be running, and a second one in the same tree would undo the
+      -- first's work. So whatever of its own is left is removed before the claim is taken back.
+      if ownHold then
+        let (dc, _, derr) ← kube cfg #["delete", "pods", "-l",
+          s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/task={labelValue taskId}",
+          "--now", "--ignore-not-found", "--timeout=120s"]
+        if dc != 0 then
+          throw (IO.userError s!"kubernetes: {taskId} has a pod left over from before that could \
+not be removed ({derr.trimAscii}); refusing to start a second agent in its workspace")
       if ← takeClaim cfg row taskId then return (row.name, true)
     | many =>
       throw (IO.userError s!"kubernetes: more than one workspace volume is labelled as used by \
@@ -1176,7 +1221,7 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
   -- it holds an empty or half-copied tree, and a start that keeps failing would otherwise leave one
   -- behind per attempt.
   let releaseClaim : IO Unit := match volume with
-    | some (_, claim, _) => releaseWorkspace cfg claim
+    | some (_, claim, _) => releaseWorkspace cfg claim (spec.taskId.getD "")
     | none => pure ()
   let abandonClaim : IO Unit := match volume with
     | some (_, claim, false) =>
@@ -1188,12 +1233,20 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     throw (IO.userError s!"kubernetes: could not create pod {podName}: {err.trimAscii}")
   -- On a task volume the pod is waited for before the claim is let go of: a continuation that
   -- mounted it while a cancelled agent was still writing would be two agents in one tree.
-  let removePod : IO Unit := do
-    let _ ← try kube cfg #["delete", "pod", podName, "--now", "--ignore-not-found",
+  -- Whether the pod is known to be gone. If the delete did not finish in time, the claim is left
+  -- marked: `holderAlive` frees it once the pod really is gone, and releasing it now would let a
+  -- continuation mount it beside an agent still writing.
+  let removePod : IO Bool := do
+    let (code, _, _) ← try kube cfg #["delete", "pod", podName, "--now", "--ignore-not-found",
                            if volume.isSome then "--timeout=120s" else "--wait=false"]
-            catch _ => pure (0, "", "")
-  let deletePod : IO Unit := do removePod; releaseClaim
-  let failPod : IO Unit := do removePod; abandonClaim
+            catch _ => pure (1, "", "")
+    return code == 0
+  let deletePod : IO Unit := do
+    if ← removePod then releaseClaim
+    else IO.eprintln s!"  [k8s] pod {podName} did not go away in time; its workspace claim stays \
+marked until it does"
+  let failPod : IO Unit := do
+    if ← removePod then abandonClaim
   -- Ready, not merely created: the next thing this does is copy a repository through
   -- `kubectl exec`, which needs a container that has actually started.
   let (waitCode, _, waitErr) ← kube cfg #["wait", "--for=condition=Ready", s!"pod/{podName}",

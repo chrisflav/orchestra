@@ -491,6 +491,11 @@ def onATaskVolumeTheCheckoutAndHomeLiveOnTheClaim : Test := do
   TestM.assertEqual ((st.find? (·.isWorkspace)).map (·.podPath)) (some "/task/work")
   TestM.assert (AgentDef.containsCI m.compress "\"value\":\"/task/home\"") "HOME is on the claim"
   TestM.assert (AgentDef.containsCI m.compress "orchestra-ws-0123abcd") "the claim is the volume"
+  -- A claim's root may be root's and 0755 (block-backed classes): one root init container opens it
+  -- up so the agent can make its directories, and it is the only thing that runs as root.
+  TestM.assert (AgentDef.containsCI m.compress "\"initContainers\"") "the claim is opened by an init container"
+  TestM.assert (AgentDef.containsCI m.compress "chmod 1777 /task") "which makes its root writable, sticky"
+  TestM.assert (!AgentDef.containsCI manifest.compress "initContainers") "and only when there is a claim"
   -- Memories and plugins are still carried as before.
   TestM.assert (mountedAt "/var/lib/orchestra/memories/acme") "the memory directory is still staged"
 

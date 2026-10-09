@@ -105,10 +105,13 @@ orchestra overriding a decision the image already makes, and getting it wrong me
 passwd entry, which several toolchains will not start under. So the image's own `USER` is the only
 thing that decides, and it is the image's job to set it.
 
-Nothing has to be granted for that to work. Every directory orchestra mounts — the checkout,
-`$HOME`, the control directory — is an `emptyDir`, which the kubelet creates world-writable, so an
-unprivileged user can write all three without a `fsGroup` or an init container. `$HOME` in
-particular is empty at that point and the CLI expects to create its own state directory in it.
+Nothing has to be granted for that to work. Every directory orchestra mounts — the checkout's
+parent, `$HOME`, the control directory — is an `emptyDir`, which the kubelet creates
+world-writable, so an unprivileged user can write all three without a `fsGroup`. The checkout
+itself and, on a task volume, `$HOME` are directories that user creates, so they are its own. A
+task volume's root is whatever its storage class makes it, so one root init container
+(`open-workspace`) runs `chmod 1777` on it first; that is the only thing orchestra runs as root,
+and it names no uid. `$HOME` is empty at the start and the CLI creates its own state directory in it.
 
 The daemon does not have to run as that user, or as anyone in particular. Everything it does to
 the pod is a `kubectl exec`, which lands as the image's user whoever the daemon is.
