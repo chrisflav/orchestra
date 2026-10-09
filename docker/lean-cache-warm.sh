@@ -48,7 +48,9 @@
 #   LEAN_CACHE_GRACE     seconds since last use before a revision outside the keep set may go
 #                        (default 86400, longer than any task)
 #
-# Upgrading from a cache written by an earlier layout: empty the directory and let this refill it.
+# Upgrading from a cache written by an earlier layout or an older warmer: empty the directory and
+# let this refill it. A revision already here is not warmed again, so what a newer warmer adds (the
+# executables, say) only reaches revisions it warms itself.
 
 # No `set -e` here, deliberately: each revision's warm runs in a subshell with its own errexit, and
 # errexit is silently ignored in any function or subshell called from an `if`, `&&` or `||`. So the
@@ -119,6 +121,22 @@ TOML
     [ "$(git -C .lake/packages/mathlib rev-parse HEAD)" = "$rev" ]
     lake exe cache get
     lake build
+    # Every executable the cached packages declare -- Mathlib's `mk_all` and `cache`, Batteries'
+    # `runLinter`, and so on. A project's own scripts run these with `lake exe`, which builds them,
+    # native code and all, into the package's tree on first use; read-only in a pod, that fails
+    # the script. Built here instead, each on its own, so one that does not build costs only itself.
+    for p in .lake/packages/*; do
+      pkg=$(basename "$p")
+      exes=$( { sed -n -E 's/^lean_exe[[:space:]]+(«)?([A-Za-z0-9_-]+)(»)?.*/\2/p' \
+                  "$p/lakefile.lean" 2>/dev/null || true
+                awk '/^\[\[lean_exe\]\]/ {e=1; next} /^\[/ {e=0} e && /^name *=/ {gsub(/[" ]/, "", $0); sub(/^name=/, ""); print}' \
+                  "$p/lakefile.toml" 2>/dev/null || true; } | sort -u)
+      for exe in $exes; do
+        # `:exe`, not the bare name: an executable whose root module has the same name (`mk_all`)
+        # would otherwise resolve to the module, build its olean, and report success.
+        lake build "@$pkg/$exe:exe" || echo "warning: could not build $pkg/$exe" >&2
+      done
+    done
     chmod -R a+rX .lake/packages "$MATHLIB_CACHE_DIR" "$ELAN_HOME"
     for p in .lake/packages/*; do
       name=$(basename "$p")
@@ -160,6 +178,8 @@ if [ -d "$requests" ]; then
     if [ "$fails" -ge 3 ] && [ $((now - $(stat -c %Y "$cache/failed/$r"))) -lt 604800 ]; then
       rm -f "$f"; continue
     fi
+    # A pinned revision is warmed anyway; its request only says it is in use, which that records.
+    case " ${pinned[*]} " in *" $r "*) rm -f "$f"; date +%s > "$cache/warmed/$r" 2>/dev/null; continue ;; esac
     requested+=("$r")
   done
 fi

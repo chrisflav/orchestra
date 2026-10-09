@@ -134,7 +134,7 @@ def theSessionSaysItIsFreshAndCannotResume : Test := do
   -- follow-up prompt answered by a model that never saw what it follows.
   TestM.assert session.freshEnvironment "a pod per task is a fresh environment every task"
   TestM.assert (!session.carriesAgentState)
-    "and with no home_claim it cannot hold a conversation for the next one"
+    "and without task_volumes it cannot hold a conversation for the next one"
   session.close
   cleanup root
 

@@ -183,6 +183,12 @@ private def prepareHandler (p : Parsed) : IO UInt32 := do
     | .error e =>
       IO.eprintln s!"Cannot run the repository's init hook: {e}"
       return 1
+  -- A backend that keeps each task's workspace itself never runs a task in a slot, so there is
+  -- nothing here to warm: the cache clone above is all a task's checkout is made from, and the
+  -- build a fresh task starts from is the seed the last one left (`task_volumes.seed_paths`).
+  if execBackend.persistentWorkspaces then
+    IO.println "The execution backend keeps task workspaces itself; no slots to prepare."
+    return 0
   for slot in List.range slots do
     let slotPath ← Repo.ensureSlot fork upstream { slot }
     -- Run the repo's init hook now rather than inside the first task that lands here, so a
@@ -1755,6 +1761,7 @@ persisted one)"
 
 private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let upstreamStr := p.flag? "upstream" |>.map (·.as! String)
+  let resumeId    := p.flag? "resume"   |>.map (·.as! String)
   let forkStr     := p.flag? "fork"     |>.map (·.as! String)
   let toolsStr    := p.flag? "tools"    |>.map (·.as! String)
   let backend     := p.flag? "backend"  |>.map (·.as! String)
@@ -1802,23 +1809,36 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
     | some id => GitHub.createInstallationToken jwt id
     | none    => pure ""
   unless token.isEmpty do GitHub.setupGhAuth token
-  let repoPath ← match repo with
-    | some r =>
-      IO.println s!"Cloning/updating {r.fork}..."
-      let p ← Repo.ensureCloned r.fork r.upstream
-      IO.println s!"  Repo at {p}"
-      pure p
-    | none =>
-      IO.println "Preparing the scratch workspace (no repository)..."
-      let p ← Repo.ensureAdhocWorkspace
-      IO.println s!"  Workspace at {p}"
-      pure p
   let backendName := backend.getD "claude"
   let execBackend ← match ← Exec.resolve appConfig.execution with
     | .ok b => pure b
     | .error e =>
       IO.eprintln s!"Cannot launch the agent: {e}"
       return 1
+  -- On a backend that keeps workspaces, an interactive session gets one too, under an id of its
+  -- own: the person can leave and pick it up again later with `--resume`, and a queued task can be
+  -- picked up the same way — its tree, its build and its conversation.
+  let persistent := execBackend.persistentWorkspaces
+  if resumeId.isSome && !persistent then
+    IO.eprintln "--resume needs an execution backend that keeps workspaces (kubernetes with \
+execution.options.task_volumes); this one starts every session afresh."
+    return 1
+  let sessionId := s!"interactive-{← Orchestra.Exec.randomHex 6}"
+  let repoPath ← match repo with
+    | some r =>
+      if persistent then Repo.ensureTaskCheckout r.fork r.upstream sessionId (token := some token)
+      else do
+        IO.println s!"Cloning/updating {r.fork}..."
+        let p ← Repo.ensureCloned r.fork r.upstream
+        IO.println s!"  Repo at {p}"
+        pure p
+    | none =>
+      if persistent then Repo.ensureTaskWorkspace sessionId
+      else do
+        IO.println "Preparing the scratch workspace (no repository)..."
+        let p ← Repo.ensureAdhocWorkspace
+        IO.println s!"  Workspace at {p}"
+        pure p
   let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
   let serverState : Server.State := {
     repo
@@ -1860,13 +1880,26 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   -- The same session a queued task gets, for the same reasons: it is what carries the checkout
   -- to wherever the agent runs, and what brings it back when the person is done with it.
   let repoConfig ← RepoConfig.loadRepoConfig repoPath
-  let session ← execBackend.openSession {
+  -- The conversation to reopen, when picking up a queued task: the session id its run recorded. An
+  -- earlier interactive session recorded none; its conversation is in the restored home all the
+  -- same, and the agent's own `/resume` lists it.
+  let agentResume : Option String ← match resumeId with
+    | some rid => do pure ((← TaskStore.loadTask rid).bind (·.sessionId))
+    | none     => pure none
+  let seedDir ← if persistent then repo.mapM (Repo.seedPath ·.fork) else pure none
+  let session ← (try execBackend.openSession {
     workdir := repoPath
+    taskId  := if persistent then some sessionId else none
+    continuesFrom := resumeId
+    seedDir
     grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths repoPath
                  false appConfig.pluginDirs #[]
-    label   := "interactive"
+    label   := if persistent then sessionId else "interactive"
     repo    := repo.map (·.upstream.toString)
     image   := repoConfig.image }
+    catch e => do
+      if persistent then Repo.removeTaskDir repoPath
+      throw e)
   IO.println s!"  Running in: {session.id}"
   IO.println "  Launching agent..."
   let result ← try
@@ -1876,9 +1909,14 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
         (extraEnv := apiKeyEnv) (extraPorts := extraPorts)
         (additionalPaths := appConfig.additionalSandboxPaths)
         (interactiveAgent := true) (session := session) (mcpToken := mcpToken)
+        (resume := agentResume)
     finally
-      session.close
+      try session.close finally
+        if persistent then Repo.removeTaskDir repoPath
   IO.println s!"  Agent exited with code {result.exitCode}"
+  if persistent then
+    IO.println s!"  Workspace kept. Pick it up again with: orchestra interactive --resume {sessionId} \
+(plus the same --upstream/--fork)"
   shutdown
   return if result.exitCode == 0 then 0 else 1
 
@@ -1898,6 +1936,7 @@ private def interactiveCmd : Cmd := `[Cli|
     auth_source : String; "Authentication source label to use (overrides default_auth_source)"
     auth_sources : String; "Comma-separated candidate auth source labels, tried per --auth_mode"
     auth_mode   : String; "How to pick among --auth_sources: ordered (default) or distribute"
+    resume      : String; "Task or interactive-session id whose kept workspace to pick up (backends with per-task workspaces)"
 ]
 
 private def defaultHandler (_ : Parsed) : IO UInt32 := do

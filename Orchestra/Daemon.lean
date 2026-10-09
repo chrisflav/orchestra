@@ -246,6 +246,12 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
     cfg.parallel.getD appConfig.queue.parallel
   let parallelLimitPerRepo := max 1 <|
     cfg.parallelPerRepo.getD appConfig.queue.parallelPerRepo
+  -- On a backend that keeps each task's workspace itself, a slot is only a count: no tree in it is
+  -- worth waiting for. See `Queue.ClaimContext.slotsHoldTrees`.
+  let slotsHoldTrees := !Exec.keepsWorkspaces appConfig.execution
+  if !slotsHoldTrees then
+    IO.println "Execution backend keeps task workspaces itself; clone slots only count tasks."
+    Repo.sweepTaskDirs
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
   -- Every task running right now and the token that stops it (one row per worker), which is
@@ -451,6 +457,7 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
         parallelLimit
         perRepoLimit    := parallelLimitPerRepo
         parallelSafe    := TaskRunner.backendIsParallelSafe
+        slotsHoldTrees
         resolveAuth     := resolveEntryAuth running
       }
       let some claim ← Queue.claimDecision ctx pending Queue.entryForTask Repo.poolOccupant
@@ -464,7 +471,7 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
       -- from `runEntry` and a throwing claim never reaches it. Printing here means such a throw
       -- escapes with the entry still pending, no row registered and no slot taken, instead of
       -- leaking a clone slot and possibly wedging `exclusiveActive` for the daemon's lifetime.
-      if e.continuesFrom.isSome && claim.resumeFrom.isNone then
+      if slotsHoldTrees && e.continuesFrom.isSome && claim.resumeFrom.isNone then
         IO.eprintln s!"  Note: queue entry {e.id} continues a previous task but no longer has \
 its workspace; it will start from a clean checkout."
       -- The cancellation token goes up *before* the entry is written `running`, and under the

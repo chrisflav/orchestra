@@ -44,6 +44,18 @@ def resolve (cfg : ExecutionConfig) : IO (Except String Backend) := do
       | .ok ()   => return .ok b
       | .error e => return .error s!"execution backend '{b.name}' is not usable here: {e}"
 
+/-- Whether `cfg` selects a backend that keeps each task's workspace itself
+    (`Backend.persistentWorkspaces`). Answered from the options alone, without `preflight`: the
+    queue asks once at start-up, and a backend that turns out not to be usable fails its tasks with
+    its own message anyway. -/
+def keepsWorkspaces (cfg : ExecutionConfig) : Bool :=
+  match factoryOf? cfg.backend with
+  | none => false
+  | some f =>
+    match f.make cfg.options with
+    | .ok b    => b.persistentWorkspaces
+    | .error _ => false
+
 /-- Where the MCP server should listen for `backend`'s agents — address and, if it matters, which
     ports it may use — and the token it should demand.
 
