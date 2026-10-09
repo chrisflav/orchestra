@@ -192,7 +192,11 @@ def specFor (agentDef : AgentDef) (repoPath : System.FilePath) (mcp : McpEndpoin
     -- proxy attaches the credential, and a token here would be a way around it.
     env     := match kleis with
       | none   => envFor ghToken agentEnv extraEnv
-      | some k => envFor "" agentEnv extraEnv ++ k.env
+      -- The MCP server is reached directly, never through the proxy: on a backend where it is not
+      -- on the loopback (a pod reaching the daemon) its traffic would otherwise go through kleis,
+      -- and then stop the moment kleis stops passing that host through.
+      | some k => envFor "" agentEnv extraEnv ++ k.env.map fun (n, v) =>
+          if n == "NO_PROXY" || n == "no_proxy" then (n, s!"{v},{mcp.host}") else (n, v)
     -- Inherited by name, not by value: `PATH` and `HOME` mean what they mean wherever the agent
     -- ends up running, which is not necessarily here.
     envPassthrough := #["SHELL", "PATH", "HOME", "USER", "TERM"]

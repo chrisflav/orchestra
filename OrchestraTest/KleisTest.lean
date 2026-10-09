@@ -178,6 +178,24 @@ def config_theIssuerCredentialMayComeFromAFile : Test := do
   TestM.assertEqual got "En0K-file-token"
 
 @[test]
+def config_aMistypedOrUnknownSettingIsAnError : Test := do
+  -- Read as absent, a mistyped push_prefix would lift the restriction without a word.
+  TestM.assert (parse "{\"url\": \"http://k:8080\", \"issuer_token\": \"t\", \"push_prefix\": [\"refs/heads/o/\"]}"
+      |>.toOption |>.isNone) "a push_prefix of the wrong type does not load"
+  TestM.assert (parse "{\"url\": \"http://k:8080\", \"issuer_token\": \"t\", \"push_prefx\": \"refs/heads/o/\"}"
+      |>.toOption |>.isNone) "nor a misspelt setting"
+  TestM.assert (parse "{\"url\": \"http://k:8080/prefix\", \"issuer_token\": \"t\"}"
+      |>.toOption |>.isNone) "nor a url with a path"
+
+@[test]
+def spec_reachesTheMcpServerDirectly : Test := do
+  let mcp : Exec.McpEndpoint := { host := "orchestra.default.svc", port := 4000 }
+  let spec := Sandbox.specFor AgentDef.claude "/work" mcp "" #[] #[] #[] #[] false #[] {}
+    (kleis := some (Orchestra.Kleis.launch cfg minted "/b.pem"))
+  TestM.assert (spec.env.any fun (k, v) => k == "NO_PROXY" && v.endsWith ",orchestra.default.svc")
+    "the MCP server is not reached through the proxy"
+
+@[test]
 def config_aBrokenKleisBlockIsAnError : Test := do
   -- Dropped silently, the block would put the App's token back into every sandbox.
   TestM.assert (parse "{\"url\": \"http://k:8080\"}" |>.toOption |>.isNone)

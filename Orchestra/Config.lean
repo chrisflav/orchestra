@@ -999,9 +999,31 @@ pushPrefix := {repr c.pushPrefix}, noProxy := {repr c.noProxy} }"
 
 instance : FromJson KleisConfig where
   fromJson? j := do
+    -- Strict when present, every key: a mistyped value read as absent would fall back to its
+    -- default without a word, and for `push_prefix` the default is no restriction at all. An
+    -- unknown key is refused for the same reason — `push_prefx` is a restriction somebody
+    -- believes is in force.
+    let known := ["url", "proxy", "issuer_token", "issuer_token_file", "ca_file", "grants", "ttl",
+                  "push_prefix", "no_proxy"]
+    if let Json.obj fields := j then
+      for (k, _) in fields.toArray do
+        if !known.contains k then throw s!"kleis has no setting `{k}`"
+    let opt {α} [FromJson α] (k : String) : Except String (Option α) :=
+      match j.getObjVal? k with
+      | .error _ => .ok none
+      | .ok v => match FromJson.fromJson? v with
+        | .ok a => .ok (some a)
+        | .error e => .error s!"kleis.{k}: {e}"
     let url ← j.getObjValAs? String "url"
-    let issuerToken := (j.getObjValAs? String "issuer_token").toOption.getD ""
-    let issuerTokenFile := (j.getObjValAs? String "issuer_token_file").toOption
+    -- Only an origin: the daemon's own endpoints are matched from the start of the path, so a
+    -- path prefix here would put every mint at an address kleis does not answer.
+    let rest := match url.splitOn "://" with
+      | [_, r] => r
+      | _ => url
+    if (rest.splitOn "/").drop 1 |>.any (!·.isEmpty) then
+      throw s!"kleis.url is an origin such as http://kleis:8080, without a path: {url}"
+    let issuerToken := (← opt (α := String) "issuer_token").getD ""
+    let issuerTokenFile ← opt (α := String) "issuer_token_file"
     if issuerToken.isEmpty && issuerTokenFile.isNone then
       throw "kleis needs `issuer_token` or `issuer_token_file`"
     -- An unresolved `{{key}}` is a secret secrets.json does not define; sent as it is, every mint
@@ -1009,13 +1031,13 @@ instance : FromJson KleisConfig where
     if (issuerToken.splitOn "{{").length > 1 then
       throw "kleis.issuer_token names a secret that is not defined in secrets.json"
     let defaults : KleisConfig := { url, issuerToken }
-    return { url, issuerToken, issuerTokenFile
-             proxy := j.getObjValAs? String "proxy" |>.toOption
-             caFile := j.getObjValAs? String "ca_file" |>.toOption
-             grants := j.getObjValAs? (List String) "grants" |>.toOption |>.getD defaults.grants
-             ttl := j.getObjValAs? String "ttl" |>.toOption |>.getD defaults.ttl
-             pushPrefix := j.getObjValAs? String "push_prefix" |>.toOption
-             noProxy := j.getObjValAs? (List String) "no_proxy" |>.toOption |>.getD [] }
+    let proxy ← opt (α := String) "proxy"
+    let caFile ← opt (α := String) "ca_file"
+    let grants := (← opt (α := List String) "grants").getD defaults.grants
+    let ttl := (← opt (α := String) "ttl").getD defaults.ttl
+    let pushPrefix ← opt (α := String) "push_prefix"
+    let noProxy := (← opt (α := List String) "no_proxy").getD []
+    return { url, issuerToken, issuerTokenFile, proxy, caFile, grants, ttl, pushPrefix, noProxy }
 
 structure AppConfig where
   appId : Nat

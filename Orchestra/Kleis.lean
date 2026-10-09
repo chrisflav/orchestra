@@ -133,8 +133,11 @@ def mint (cfg : KleisConfig) (t : TaskFacts) : IO Minted := do
   | .ok j =>
     let .ok token := j.getObjValAs? String "token"
       | throw (.userError "kleis answered a token request without a token")
-    let revocationId := (j.getObjValAs? (List String) "revocation_ids" |>.toOption
-      |>.bind (·.head?)).getD ""
+    -- Without one the token could not be revoked when the task ends, so it is refused here rather
+    -- than handed to a task that would leave it live for its whole lifetime.
+    let some revocationId := j.getObjValAs? (List String) "revocation_ids" |>.toOption
+        |>.bind (·.head?)
+      | throw (.userError "kleis minted a token without a revocation id; refusing to use it")
     let expires := (j.getObjValAs? Nat "expires").toOption.getD 0
     return { token, revocationId, expires }
 
@@ -156,11 +159,12 @@ def proxyAuthority (cfg : KleisConfig) : String :=
       | _ => base cfg
     (rest.splitOn "/").headD rest
 
-/-- The port sandboxes reach the proxy on, for a backend that grants ports one by one. -/
+/-- The port sandboxes reach the proxy on, for a backend that grants ports one by one: the
+    authority's, else the default for `url`'s scheme. -/
 def proxyPort (cfg : KleisConfig) : Nat :=
   match (proxyAuthority cfg).splitOn ":" |>.getLast? |>.bind (·.toNat?) with
   | some p => p
-  | none => 80
+  | none => if cfg.proxy.isNone && cfg.url.startsWith "https:" then 443 else 80
 
 /-- Percent-encode everything but the unreserved characters, for the token's place in a URL. -/
 def percentEncode (s : String) : String :=
@@ -197,8 +201,7 @@ def caPem (cfg : KleisConfig) : IO String := do
     Both, not kleis's alone. `SSL_CERT_FILE` *replaces* a program's trust store rather than adding
     to it, and not everything goes through the proxy: a host in `NO_PROXY`, or one the proxy lets
     through untouched, presents its real certificate, which only the system roots verify. Written
-    once per content into orchestra's data directory, which is readable by every sandbox it grants
-    it to. -/
+    once per content into orchestra's data directory, under a name derived from it. -/
 def caBundle (cfg : KleisConfig) : IO System.FilePath := do
   let kleisCa ← caPem cfg
   let system ← match ← systemBundle? with
@@ -206,13 +209,19 @@ def caBundle (cfg : KleisConfig) : IO System.FilePath := do
     | none => do
       IO.eprintln "  [kleis] warning: no system CA bundle found; the sandbox will trust only kleis"
       pure ""
+  -- Not twice: a daemon whose own trust store already holds kleis's CA would otherwise add it again.
+  let system := if (system.splitOn kleisCa.trimAscii.toString).length > 1 then "" else system
   let contents := system ++ (if system.endsWith "\n" || system.isEmpty then "" else "\n") ++ kleisCa
   let dir := (← Dirs.dataBase) / "kleis"
   IO.FS.createDirAll dir
-  let path := dir / "ca-bundle.pem"
-  let current ← if ← path.pathExists then IO.FS.readFile path else pure ""
-  if current != contents then
-    let tmp := dir / s!"ca-bundle.pem.{← IO.monoNanosNow}"
+  -- Named by its contents and never replaced: a sandbox is granted the file it was started with,
+  -- and on landrun that grant is on the file itself, so replacing it under a running task would
+  -- take its trust store away mid-run. A changed bundle — kleis's CA rotated, the system's roots
+  -- updated — is a new file for the tasks that start after it.
+  let digest := String.ofList ((toString (hash contents).toNat).toList.take 20)
+  let path := dir / s!"ca-bundle-{digest}.pem"
+  if !(← path.pathExists) then
+    let tmp := dir / s!"ca-bundle-{digest}.pem.{← IO.monoNanosNow}"
     IO.FS.writeFile tmp contents
     IO.FS.rename tmp path
   return path
