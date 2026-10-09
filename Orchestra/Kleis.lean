@@ -200,6 +200,31 @@ def caBundle (cfg : KleisConfig) : IO System.FilePath := do
     IO.FS.rename tmp path
   return path
 
+/-- What the agent is told about reaching GitHub, for its system prompt.
+
+    The facts its token carries, said to the agent: the proxy decides by them, and an agent that
+    does not know which repository is its fork or which issue it may comment on would find out by
+    being refused. The pull request labels are here because nothing applies them for it any more —
+    `create_pr` used to. -/
+def systemPrompt (t : TaskFacts) : String := Id.run do
+  let mut lines := #["## GitHub",
+    "",
+    "You reach GitHub through a proxy that holds the credentials: use `git` and `gh api` " ++
+    "directly (see the orchestra-pull-requests skill). It decides each request by what this " ++
+    "task may do, and a refusal quotes the check that failed."]
+  if let some r := t.repo then
+    lines := lines.push s!"- Your fork, which you push to: `{r.fork.owner}/{r.fork.name}`"
+    lines := lines.push s!"- The upstream, which pull requests go to: `{r.upstream.owner}/{r.upstream.name}`"
+  if let some n := t.issueNumber then
+    lines := lines.push s!"- The issue or pull request this task was launched from, the only one you may comment on: #{n}"
+  if !t.prLabels.isEmpty then
+    lines := lines.push s!"- Labels to add to every pull request you open: {", ".intercalate (t.prLabels.map (s!"`{·}`"))}"
+  if t.readOnly then
+    lines := lines.push "- This task is read-only: you may fetch, not push."
+  if let some p := t.pushPrefix then
+    lines := lines.push s!"- Push only refs under `{p}`."
+  return "\n".intercalate lines.toList
+
 /-- What a sandbox needs to reach GitHub through the proxy. -/
 structure Launch where
   /-- Environment for every process in the sandbox. -/

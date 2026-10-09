@@ -4,6 +4,7 @@ import Std.Net
 import Orchestra.Config
 import Orchestra.GitHub
 import Orchestra.Identity
+import Orchestra.Kleis
 import Orchestra.Project.Tools
 
 open Lean (Json)
@@ -113,6 +114,15 @@ structure State where
       orchestra's to write to. `none` — no `default_organization` — means the tool has nowhere to
       create anything and refuses. -/
   defaultOrganization : Option String := none
+  /-- The kleis proxy this task reaches GitHub through, when one is configured.
+
+      With it the GitHub tools are not offered: the agent opens pull requests, comments and
+      merges with `gh api` itself, through the proxy, and what it may do is decided by the
+      grants in kleis against its own token rather than by which of these tools it was given.
+      The tools would otherwise be a second way to do the same things on the PAT, past the
+      grants. `create_repository` stays, since creating a repository is done with the App's
+      organisation installation and the push to it then needs a token naming it. -/
+  kleis : Option KleisConfig := none
 
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
@@ -192,8 +202,13 @@ private def getPrCommentsToolDef : Json :=
     turn to tell it something the tool list already says. -/
 private def alwaysAvailableTools (state : State) : Array Json :=
   #[healthToolDef]
-    ++ (if state.installationId.isSome then #[refreshTokenToolDef] else #[])
-    ++ (if state.repo.isSome then #[getPrCommentsToolDef] else #[])
+    ++ (if state.installationId.isSome && state.kleis.isNone then #[refreshTokenToolDef] else #[])
+    ++ (if state.repo.isSome && state.kleis.isNone then #[getPrCommentsToolDef] else #[])
+
+/-- The tools kleis replaces: with a proxy configured the agent does these with `gh api`, and
+    the grants decide what it may do. `toolsList` withholds them and `evalToolCall` refuses them. -/
+def kleisReplacedTools : List String :=
+  ["refresh_token", "get_pr_comments", "create_pr", "merge_pr", "label_issue", "comment"]
 
 /-- Optional tools that act on a repository, and are therefore never granted to a
     repository-independent task.
@@ -473,7 +488,8 @@ Call this tool exactly once when the task is complete."),
 def toolsList (state : State) : Json :=
   let optional := optionalToolDefs.filterMap fun entry =>
     if state.allowedTools.contains entry.1
-       && (state.repo.isSome || !repoScopedTools.contains entry.1) then some entry.2 else none
+       && (state.repo.isSome || !repoScopedTools.contains entry.1)
+       && (state.kleis.isNone || !kleisReplacedTools.contains entry.1) then some entry.2 else none
   -- Deduped by name: a tool may be listed under more than one permission group (an issue's
   -- comment thread is readable by workers and reviewers alike), and a task holding two of them
   -- would otherwise be offered the same tool twice.
@@ -734,6 +750,21 @@ def evalToolCall (state : State) (call : ToolCall) : IO Json := do
   -- cannot name.
   let noRepo (tool : String) : Json :=
     toolContent s!"{tool} acts on a repository, and this task runs without one" (isError := true)
+  -- With kleis these are done through the proxy, on the task's own token and under the grants
+  -- configured there. Served here they would be a second way to do the same things on the PAT,
+  -- past those grants.
+  let replacedByKleis : Option String := match call with
+    | .refreshToken => some "refresh_token"
+    | .createPr .. => some "create_pr"
+    | .mergePr .. => some "merge_pr"
+    | .labelIssue .. => some "label_issue"
+    | .getPrComments .. => some "get_pr_comments"
+    | .comment _ => some "comment"
+    | _ => none
+  if let (some _, some tool) := (state.kleis, replacedByKleis) then
+    log s!"tool {tool}: denied (GitHub is reached through kleis)"
+    return toolContent s!"{tool} is not offered here: this task reaches GitHub through a proxy, \
+with `gh api` and `git` themselves. See the orchestra-pull-requests skill." (isError := true)
   match call with
   | .health =>
     log "tool health"
@@ -856,6 +887,22 @@ created in; there is no other destination this tool will use)"
           name description isPrivate autoInit
         let visibility := if isPrivate then "private" else "public"
         let contents := if autoInit then "initialised with a README commit" else "empty"
+        -- Through kleis, the push to the new repository is too: on a token minted for it, which
+        -- names it as the fork it may push to and nothing else. The App token minted beside the
+        -- repository is not handed out; nothing in the sandbox holds a GitHub token here.
+        if let some kc := state.kleis then
+          let minted ← Kleis.mint kc {
+            taskId := s!"{state.taskId.getD "session"}:create_repository"
+            repo := some { upstream := repo, fork := repo } }
+          log s!"tool create_repository: ok: {repo} (push token minted in kleis)"
+          let proxyUrl :=
+            s!"http://orchestra:{Kleis.percentEncode minted.token}@{Kleis.proxyAuthority kc}"
+          return toolContent s!"created {repo} ({visibility}, {contents})\n\
+            https://github.com/{repo}\n\
+            Push to it through the proxy, with a token that reaches this repository and no other:\n  \
+              git -c http.proxy={proxyUrl} push https://github.com/{repo} HEAD:main\n\
+            Pass it only on that command: the proxy your environment already names is the one \
+            that carries the rest of your work."
         -- The push token is carried, not thrown, so its failure would otherwise reach the agent
         -- and nothing else; an operator asked why the agent got no token needs the reason here.
         -- Neither token is ever logged: these lines name the repository, not the credential.

@@ -830,16 +830,17 @@ its own.")
     let allowedTools ← Server.withoutRepoScopedTools ioTask.repo requestedTools
     -- With kleis the agent reaches GitHub itself, through the proxy, on a token minted for this
     -- task. Minted here, once the tools are known: they are part of what the token says.
-    let kleisLaunch : Option Kleis.Launch ← match appConfig.kleis with
-      | none => pure none
-      | some kc => do
-        let minted ← Kleis.mint kc {
-          taskId, repo := ioTask.repo, issueNumber := ioTask.issueNumber
-          tools := allowedTools, readOnly := ioTask.readOnly, prLabels := ioTask.prLabels
-          identity := identity.map (·.name), pushPrefix := kc.pushPrefix }
+    let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
+      taskId, repo := ioTask.repo, issueNumber := ioTask.issueNumber
+      tools := allowedTools, readOnly := ioTask.readOnly, prLabels := ioTask.prLabels
+      identity := identity.map (·.name), pushPrefix := kc.pushPrefix }
+    let kleisLaunch : Option Kleis.Launch ← match appConfig.kleis, kleisFacts with
+      | some kc, some facts => do
+        let minted ← Kleis.mint kc facts
         kleisRef.set (some minted)
         IO.println s!"  kleis token minted (revocation id {minted.revocationId.take 16})"
         pure (some (Kleis.launch kc minted (← Kleis.caBundle kc)))
+      | _, _ => pure none
     let inputJson := some (ResultType.valueToJson i input)
     let outputRef ← IO.mkRef (none : Option Lean.Json)
     let serverState : Server.State := {
@@ -885,6 +886,7 @@ its own.")
       prLabels  := ioTask.prLabels
       defaultOrganization := appConfig.defaultOrganization
       authToken := mcpToken
+      kleis := appConfig.kleis
     }
     let (port, shutdown) ← Server.start serverState (bindHost := mcpBind) (portRange := mcpPorts)
     shutdownRef.set (some shutdown)
@@ -902,7 +904,8 @@ its own.")
       [ baseSystemPrompt
       , identity.map (identitySystemPrompt · identityMemoryDir)
       , identity.bind identityInstructions
-      , memorySystemPrompt memoryDirs ].filterMap id
+      , memorySystemPrompt memoryDirs
+      , kleisFacts.map Kleis.systemPrompt ].filterMap id
     let systemPrompt :=
       if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)
     -- 6b. Load prepend prompt and apply to task prompt
