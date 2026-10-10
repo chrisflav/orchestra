@@ -125,6 +125,24 @@ namespace AgentDef
 def containsCI (haystack needle : String) : Bool :=
   (haystack.toLower.splitOn needle.toLower).length > 1
 
+/-- Whether `s` (lowercased) says "you've hit your … limit" the way Claude Code reports a spent
+    subscription window: `"You've hit your session limit · resets 1:20pm (UTC)"`,
+    `"You've hit your weekly limit"`, `"You've hit your Opus limit"`, `"You've hit your limit"`.
+
+    Anchored on the whole sentence shape rather than on `"hit your"`, which ordinary prose uses
+    ("you've hit your target"): the words between `"hit your"` and `"limit"` must be at most three,
+    and plain — letters, digits, `.` and `-`, so a model name with a version fits and a clause that
+    happens to mention a limit further on ("you've hit your stride; the limit lemma …") does not. -/
+def saysHitYourLimit (s : String) : Bool :=
+  ["you've hit your ", "you’ve hit your ", "you have hit your "].any fun pre =>
+    (s.splitOn pre).drop 1 |>.any fun rest =>
+      -- The leading space lets an empty qualifier ("you've hit your limit") match too.
+      match (" " ++ String.ofList (rest.toList.take 40)).splitOn " limit" with
+      | qual :: _ :: _ =>
+        let words := (qual.splitOn " ").filter (!·.isEmpty)
+        words.length ≤ 3 && qual.all fun c => c.isAlphanum || c == ' ' || c == '.' || c == '-'
+      | _ => false
+
 /-- Shared usage-limit detection patterns used by all backends.
 
     Matched against the agent's stderr *and* the text of its final result event, because the two
@@ -146,7 +164,8 @@ def stdUsageLimitError (exitCode : UInt32) (output : String) : Bool :=
     containsCI s "exceed your" ||
     containsCI s "exceeded your" ||
     containsCI s "insufficient credits" ||
-    containsCI s "credit balance")
+    containsCI s "credit balance" ||
+    saysHitYourLimit s)
 
 end AgentDef
 
