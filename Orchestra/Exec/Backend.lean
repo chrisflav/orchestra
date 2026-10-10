@@ -207,6 +207,17 @@ structure SessionSpec where
   /-- Whether a fresh workspace will do when `continuesFrom` has none left: for a chat session that
       is woken although its agent never started, so there is no conversation to lose. -/
   continuationOptional : Bool := false
+  /-- Whether the caller knows the run `continuesFrom` names is dead, rather than merely finished
+      or quiet: set for a restart resume (`Queue.resumeInterrupted`), whose predecessor the
+      starting daemon swept to `unfinished` and whose pods it removed (`Backend.reclaim`).
+
+      A backend that guards a kept workspace against a second agent may then judge the
+      predecessor by what is actually running and nothing else. The kubernetes backend otherwise
+      also counts a holder as alive for a while after it took the workspace, in case its pod is
+      still being created (`holderStillWorking`) — a grace that would refuse a resume of any task
+      killed within its first few minutes. Only ever relaxes that assumption about the
+      predecessor itself; a live pod still refuses. -/
+  predecessorDead : Bool := false
   /-- Where the daemon keeps build output carried from one task chain to the next, for this
       repository. Read when a fresh workspace is filled, written when a task ends. -/
   seedDir : Option System.FilePath := none

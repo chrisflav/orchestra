@@ -813,6 +813,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     workdir := repoPath
     taskId  := if persistent then some taskId else none
     continuesFrom := if persistent then continuesFrom else none
+    -- A restart resume is recognised by the prompt it was queued with — the same marker the
+    -- chain guard counts by — since nothing else about the entry reaches this far. Its
+    -- predecessor is known dead: the daemon swept it at startup and removed its pods.
+    predecessorDead := persistent && continuesFrom.isSome && Queue.isRestartResumePrompt ioTask.prompt
     seedDir
     cancelled := match cancelToken with
       | some t => t.isCancelled

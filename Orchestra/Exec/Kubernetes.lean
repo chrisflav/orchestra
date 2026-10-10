@@ -1068,22 +1068,55 @@ private def listClaims (cfg : Config) (selector : String) : IO (Except String (L
                   terminating := !del.trimAscii.isEmpty }
     | _ => none
 
-/-- Whether the holder named in an in-use annotation is still working: its pod is up (not finished,
-    not failed), or it took the claim so recently that its pod may not exist yet. A holder whose
-    daemon died is neither, and its claim can be taken over. -/
-private def holderAlive (cfg : Config) (inUse : String) (now : Nat) : IO Bool := do
+/-- The task named in an in-use mark (`inUseValue`), and when it took the claim. A mark that cannot
+    be read names itself, taken at the epoch — so it is judged by its pods alone. -/
+def parseInUse (inUse : String) : String × Nat :=
+  match inUse.splitOn "@" with
+  | [h, t] => (h, t.toNat?.getD 0)
+  | _      => (inUse, 0)
+
+/-- Whether the holder named in an in-use mark is still working, as a decision over what is known.
+
+    `podsAlive` is the answer from the cluster — `some true` when the holder has a pod that is up
+    (not finished, not failed), `some false` when it has none, `none` when the cluster could not
+    be asked; not knowing is not the same as knowing it is gone, so that counts as alive, since an
+    API hiccup must not hand one tree to two agents. Before that, a holder that took the claim
+    less than `grace` seconds ago is alive whatever its pods say: its pod may simply not exist yet.
+
+    `deadPredecessor` is a task the caller knows to be dead (`SessionSpec.predecessorDead`): a
+    restart resume's predecessor, swept and reclaimed at startup. When the mark names it, the grace
+    is skipped and only live pods count — the grace exists for a holder that might be about to
+    have a pod, and this one never will. Without that, a task killed within its first few minutes
+    could never be resumed. The pods still decide: a live one refuses, as always. -/
+def holderStillWorking (inUse : String) (now grace : Nat) (podsAlive : Option Bool)
+    (deadPredecessor : Option String := none) : Bool :=
+  if inUse.isEmpty then false
+  else
+    let (holder, since) := parseInUse inUse
+    let knownDead := deadPredecessor.any (labelValue · == holder)
+    if !knownDead && now < since + grace then true
+    else podsAlive.getD true
+
+/-- How long after taking a claim a holder counts as alive without a pod: long enough for its pod
+    to be created and become ready. -/
+def holderGraceSeconds (cfg : Config) : Nat := cfg.startupTimeoutSeconds + 120
+
+/-- Whether the holder named in an in-use annotation is still working (`holderStillWorking`), asking
+    the cluster for its pods only when the decision needs them. A holder whose daemon died has no
+    pod up and, once the grace is past, its claim can be taken over. -/
+private def holderAlive (cfg : Config) (inUse : String) (now : Nat)
+    (deadPredecessor : Option String := none) : IO Bool := do
   if inUse.isEmpty then return false
-  let (holder, since) := match inUse.splitOn "@" with
-    | [h, t] => (h, t.toNat?.getD 0)
-    | _      => (inUse, 0)
-  if now < since + cfg.startupTimeoutSeconds + 120 then return true
+  -- Decided without the cluster when it can be: within the grace the pods are not consulted.
+  -- (Asked with "no pods", a `true` can only have come from the grace.)
+  if holderStillWorking inUse now (holderGraceSeconds cfg) (some false) deadPredecessor then
+    return true
+  let (holder, _) := parseInUse inUse
   let (code, pods, _) ← kube cfg #["get", "pods", "-l",
     s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/task={labelValue holder}",
     "--field-selector=status.phase!=Failed,status.phase!=Succeeded", "-o", "name"]
-  -- Not knowing is not the same as knowing it is gone: an API hiccup must not hand one tree to two
-  -- agents.
-  if code != 0 then return true
-  return !pods.trimAscii.isEmpty
+  let podsAlive := if code != 0 then none else some !pods.trimAscii.isEmpty
+  return holderStillWorking inUse now (holderGraceSeconds cfg) podsAlive deadPredecessor
 
 /-- Delete workspace claims nobody has used for `retentionDays`. Best effort, and quiet about it:
     a sweep that fails costs disk, not a task. A claim whose holder is still working is skipped
@@ -1208,7 +1241,11 @@ left for {prev} — it ran before task volumes were enabled, or went unused for 
     | [row] =>
       let now ← epochNow
       let ownHold := row.inUse.startsWith s!"{labelValue taskId}@"
-      if !ownHold && (← holderAlive cfg row.inUse now) then
+      -- A restart resume's predecessor is known dead (`SessionSpec.predecessorDead`), so a mark
+      -- naming it is judged by live pods alone, without the startup grace; any other holder —
+      -- including some third task that took the claim since — keeps the grace.
+      let deadPredecessor := if spec.predecessorDead then some prev else none
+      if !ownHold && (← holderAlive cfg row.inUse now deadPredecessor) then
         throw (IO.userError s!"kubernetes: {taskId} continues {prev}, whose workspace volume \
 {row.name} is in use by {(row.inUse.splitOn "@").headD row.inUse} right now. Two agents in one \
 tree would undo each other's work; continue that task instead, or wait for it to finish.")

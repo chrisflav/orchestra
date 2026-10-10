@@ -906,4 +906,29 @@ def anInstanceHasToBeALabelValue : Test := do
   for good in ["a", "prod-a", "team_1.blue", String.ofList (List.replicate 63 'a')] do
     TestM.assert (validLabelValue good) s!"{good} is a label value"
 
+
+-- Whether a workspace claim's holder is still working
+
+@[test]
+def aHolderIsJudgedByItsPodsOnceTheGraceIsPast : Test := do
+  let mark := inUseValue "t-1" 1000
+  TestM.assert (!holderStillWorking "" 5000 720 (some true)) "nobody holds an unmarked claim"
+  TestM.assert (holderStillWorking mark 1100 720 (some false))
+    "within the grace a holder is alive though it has no pod yet"
+  TestM.assert (!holderStillWorking mark 2000 720 (some false)) "past it, no pod means gone"
+  TestM.assert (holderStillWorking mark 2000 720 (some true)) "a live pod means alive"
+  TestM.assert (holderStillWorking mark 2000 720 none) "a cluster that cannot be asked means alive"
+
+@[test]
+def aKnownDeadPredecessorGetsNoGrace : Test := do
+  let mark := inUseValue "t-1" 1000
+  TestM.assert (!holderStillWorking mark 1100 720 (some false) (deadPredecessor := some "t-1"))
+    "a restart resume takes over its killed predecessor's claim at once"
+  TestM.assert (holderStillWorking mark 1100 720 (some true) (deadPredecessor := some "t-1"))
+    "but never past a pod that is still up"
+  TestM.assert (holderStillWorking mark 1100 720 none (deadPredecessor := some "t-1"))
+    "nor when the cluster cannot say"
+  TestM.assert (holderStillWorking mark 1100 720 (some false) (deadPredecessor := some "t-2"))
+    "a mark naming some other task keeps its grace"
+
 end OrchestraTest.Kubernetes
