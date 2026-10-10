@@ -488,6 +488,44 @@ def aSharedHomeClaimIsRefused : Test := do
   | .error e => TestM.assert (AgentDef.containsCI e "task_volumes") "and the error names the replacement"
 
 @[test]
+def aFinishCommandIsReadAndABlankOneIsNone : Test := do
+  let with_ (v : Json) : Config :=
+    config [("task_volumes", Json.mkObj [("finish_command", v)])]
+  TestM.assertEqual ((with_ (.str "lake-cache-put")).taskVolumes.bind (·.finishCommand))
+    (some "lake-cache-put")
+  TestM.assertEqual ((with_ (.str "  ")).taskVolumes.bind (·.finishCommand)) none
+    (msg := "a blank command runs nothing")
+  TestM.assertEqual (tvConfig.taskVolumes.bind (·.finishCommand)) none
+    (msg := "and absent is none")
+
+@[test]
+def aFinishCommandReachesThePodsShellAsWritten : Test := do
+  -- Run by `/bin/sh` here as it is in the pod: a checkout whose path has a space and a quote in
+  -- it, and a command with quotes, a `$`, a glob and a redirection that are the command's own
+  -- business -- none of which the daemon's side may expand or split.
+  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-test-{← Exec.randomHex 6}/it's here"
+  IO.FS.createDirAll dir
+  IO.FS.writeFile (dir / "x.txt") ""
+  let command := "echo \"$(basename \"$PWD\")\" 'a  b' \"it's\" *.txt 2>/dev/null"
+  let out ← IO.Process.output {
+    cmd := "/bin/sh", args := #["-c", finishScript dir.toString command 30] }
+  try IO.FS.removeDirAll (dir.parent.getD dir) catch _ => pure ()
+  TestM.assertEqual out.stdout.trimAscii.toString "it's here a  b it's x.txt"
+    (msg := "the command ran in the checkout, as written")
+  TestM.assertEqual out.exitCode 0
+
+@[test]
+def aFinishCommandGetsAnHourAndNeverThePodsLastMinutes : Test := do
+  TestM.assertEqual (finishBudget 14400 0 (600 * 1000)) (some 3600)
+    (msg := "an hour when there is time")
+  TestM.assertEqual (finishBudget 14400 0 ((14400 - 1000) * 1000)) (some 880)
+    (msg := "what is left, less two minutes, near the deadline")
+  TestM.assertEqual (finishBudget 14400 0 ((14400 - 100) * 1000)) none
+    (msg := "and nothing at all in the last minutes")
+  TestM.assertEqual (finishBudget 14400 0 (20000 * 1000)) none
+    (msg := "or past the deadline")
+
+@[test]
 def taskVolumesAreReadAndChecked : Test := do
   match tvConfig.taskVolumes with
   | none => TestM.fail "task_volumes was not read"

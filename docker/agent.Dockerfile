@@ -48,6 +48,11 @@ ARG UV_VERSION=0.12.7
 # minor version either side of the server, so this does not have to track any particular cluster;
 # it is pinned for the same reason the two above are.
 ARG KUBECTL_VERSION=v1.34.9
+# A curl newer than Debian's for Lake's artifact cache. Lake uploads with `curl --aws-sigv4`, and
+# curl only sends the `x-amz-content-sha256` header S3 servers require (Garage refuses the
+# request without it) from 8.x; bookworm has 7.88. Static, and checked against this digest.
+ARG STATIC_CURL_VERSION=8.22.0
+ARG STATIC_CURL_SHA256=dfb02460ba2abe513087538f12a3cf79b74b64a5ea3787ce8ac0cdb11251f884
 
 # One layer, lists dropped in the same one — a separate `rm` leaves them in the layer below, where
 # they still cost what they weigh. `bash` and `tar` come with the base; naming them keeps the
@@ -60,6 +65,9 @@ RUN apt-get update \
       curl \
       git \
       netcat-openbsd \
+      `# For the Lean cache warmer's master builds, which clone a private repository with a` \
+      `# read-only deploy key.` \
+      openssh-client \
       tar \
       xz-utils \
       `# Not required by the backend, but by what agents routinely do: jq for JSON (and the Lean` \
@@ -118,10 +126,37 @@ RUN curl -fsSL "https://github.com/leanprover/elan/releases/download/${ELAN_VERS
  && elan --version \
  && test -L /usr/local/bin/lake
 
+# curl for Lake (see STATIC_CURL_VERSION), ahead of Debian's on PATH: installed as
+# /usr/local/libexec/curl-real, behind docker/lake-curl.sh as /usr/local/bin/curl (copied below),
+# which makes downloads into the node's shared Lake cache atomic and hands the static build Debian's
+# CA bundle. And git over HTTP/1.1: from some addresses GitHub answers this git (2.39) with a 401
+# to every anonymous upload-pack POST over HTTP/2 -- every clone from a pod on fuxi failed so --
+# while HTTP/1.1 works everywhere.
+RUN curl -fsSL -o /tmp/curl.tar.xz \
+      "https://github.com/stunnel/static-curl/releases/download/${STATIC_CURL_VERSION}/curl-linux-x86_64-musl-${STATIC_CURL_VERSION}.tar.xz" \
+ && echo "${STATIC_CURL_SHA256}  /tmp/curl.tar.xz" | sha256sum --check --status \
+ && tar -xJf /tmp/curl.tar.xz -C /tmp curl \
+ && install -D -m 0755 /tmp/curl /usr/local/libexec/curl-real \
+ && rm -f /tmp/curl /tmp/curl.tar.xz \
+ && /usr/local/libexec/curl-real --version | head -1 \
+ && git config --system http.version HTTP/1.1
+
 # After the download, so editing either script does not re-fetch elan. The links above dangle
 # until this layer lands, which nothing in between notices.
 COPY --chmod=0755 docker/lean-cache-shim.sh /usr/local/bin/lean-cache-shim
 COPY --chmod=0755 docker/lean-cache-warm.sh /usr/local/bin/lean-cache-warm
+COPY --chmod=0755 docker/lake-cache-put.sh /usr/local/bin/lake-cache-put
+COPY --chmod=0755 docker/lake-curl.sh /usr/local/bin/curl
+# The warmer's check of the node cache's artifacts against their names, run with a cached toolchain.
+# Into a directory that already exists: `COPY --chmod` gives a directory it creates the same mode
+# as the file, and a 0644 directory cannot be entered -- the warmer found no script to run.
+COPY --chmod=0644 docker/lake-verify.lean /usr/local/share/lake-verify.lean
+# GitHub's published SSH host keys (https://api.github.com/meta, checked against the fingerprints
+# GitHub documents under "GitHub's SSH key fingerprints"), the only ones the warmer's deploy-key
+# clones accept: see lean-cache-warm.
+COPY --chmod=0644 docker/github_known_hosts /etc/ssh/github_known_hosts
+# Through the wrapper, over HTTPS: the static curl finds the CA bundle.
+RUN curl --version | head -1 && curl -fsS -o /dev/null https://github.com
 
 # uv, the Python package and version manager. A static binary plus its `uvx` runner; the Pythons
 # and virtualenvs it installs go under $HOME.
