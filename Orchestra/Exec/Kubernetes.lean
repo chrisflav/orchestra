@@ -1094,8 +1094,8 @@ private def renewWorkspace (cfg : Config) (name taskId : String) : IO Unit := do
 def quotaExceeded (err : String) : Bool :=
   (err.splitOn "exceeded quota").length > 1
 
-/-- How long a task waits for room in the namespace before giving up, and how often it looks. -/
-def quotaWaitSeconds : Nat := 3600
+/-- How often a task waiting for room in the namespace looks again. How long it waits is
+    `SessionSpec.roomWaitSeconds`. -/
 def quotaPollSeconds : Nat := 15
 
 /-- Make a new claim for `taskId`, already marked in use by it. -/
@@ -1252,34 +1252,46 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
       discard <| (try kube cfg #["delete", "pvc", claim, "--wait=false", "--ignore-not-found"]
                   catch _ => pure (0, "", ""))
     | _ => releaseClaim
-  -- A full quota is waited out rather than failed on. It fills when something other than this
-  -- daemon's own tasks holds pods there — a previous daemon's, an operator's — and failing every
-  -- entry the queue reaches meanwhile empties the queue in seconds: on 2026-10-10 three hundred
-  -- entries were spent that way in a quarter of an hour. Waiting holds this worker, which is the
-  -- point: there is no room for what it would run next either.
-  let mut waited := 0
-  let mut announced := false
-  let mut result ← kube cfg #["create", "-f", manifestPath.toString]
-  while result.1 != 0 && quotaExceeded result.2.2 && waited < quotaWaitSeconds do
-    unless announced do
-      announced := true
-      IO.println s!"  [k8s] namespace {cfg.ns} is at its quota; waiting for room \
-(up to {quotaWaitSeconds / 60} min): {result.2.2.trimAscii}"
-    for _ in [0:quotaPollSeconds] do
-      if ← spec.cancelled then break
-      IO.sleep 1000
-    if ← spec.cancelled then break
-    waited := waited + quotaPollSeconds
-    if let some (_, claim, _) := volume then renewWorkspace cfg claim (spec.taskId.getD "")
-    result ← kube cfg #["create", "-f", manifestPath.toString]
+  -- A full quota is not the task's fault. It fills when something other than this daemon's own
+  -- tasks holds pods there — a previous daemon's, an operator's — and failing every entry the
+  -- queue reaches meanwhile empties the queue in seconds: on 2026-10-10 three hundred entries were
+  -- spent that way in a quarter of an hour. So it is waited on, briefly, and then answered with
+  -- `noRoom`, which puts the entry back to `pending`. Briefly because the task's credentials
+  -- were minted before this and are ticking, and because a stop must not wait on it: a task with
+  -- no pod yet is not one a drain should finish.
+  let gaveUp : IO Bool := do return (← spec.cancelled) || (← Exec.stopRequested)
+  let result ← try
+      let mut waited := 0
+      let mut announced := false
+      let mut result ← kube cfg #["create", "-f", manifestPath.toString]
+      while result.1 != 0 && quotaExceeded result.2.2 && waited < spec.roomWaitSeconds do
+        unless announced do
+          announced := true
+          IO.println s!"  [k8s] namespace {cfg.ns} is at its quota; waiting for room \
+(up to {spec.roomWaitSeconds}s): {result.2.2.trimAscii}"
+        for _ in [0:quotaPollSeconds] do
+          if ← gaveUp then break
+          IO.sleep 1000
+        if ← gaveUp then break
+        waited := waited + quotaPollSeconds
+        if let some (_, claim, _) := volume then renewWorkspace cfg claim (spec.taskId.getD "")
+        result ← kube cfg #["create", "-f", manifestPath.toString]
+      if announced && result.1 == 0 then
+        IO.println s!"  [k8s] room in {cfg.ns} after {waited}s; pod {podName} created"
+      pure result
+    catch e =>
+      try IO.FS.removeDirAll dir catch _ => pure ()
+      abandonClaim
+      throw e
   try IO.FS.removeDirAll dir catch _ => pure ()
   let (code, _, err) := result
   if code != 0 then
     abandonClaim
     if ← spec.cancelled then
       throw (IO.userError s!"kubernetes: cancelled while waiting for room in namespace {cfg.ns}")
+    if quotaExceeded err then
+      throw (Exec.noRoom s!"namespace {cfg.ns} is at its quota: {err.trimAscii}")
     throw (IO.userError s!"kubernetes: could not create pod {podName}: {err.trimAscii}")
-  if announced then IO.println s!"  [k8s] room in {cfg.ns} after {waited}s; pod {podName} created"
   -- On a task volume the pod is waited for before the claim is let go of: a continuation that
   -- mounted it while a cancelled agent was still writing would be two agents in one tree.
   -- Whether the pod is known to be gone. If the delete did not finish in time, the claim is left

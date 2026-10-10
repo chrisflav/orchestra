@@ -133,12 +133,18 @@ def runningAgentsAreCountedOnTheSourceThatRunsThem : Test := do
     -- Running from before the column existed: what it asked for is all there is to go by.
     Queue.saveEntry { id := "q-legacy", createdAt := "2026-10-10T00:00:01Z", prompt := "b", repo := none,
                       status := .running, authSource := some "primary" }
+    -- Pinned to one source and resolved to another (an earlier build, or a pool named in the
+    -- pin's place): the one it runs on is the one counted.
+    Queue.saveEntry { id := "q-both", createdAt := "2026-10-10T00:00:03Z", prompt := "d", repo := none,
+                      status := .running, authSource := some "primary",
+                      resolvedAuthSource := some "third" }
     -- Pending, and asking for nothing in particular: not running anywhere yet.
     Queue.saveEntry { id := "q-waiting", createdAt := "2026-10-10T00:00:02Z", prompt := "c", repo := none,
                       resolvedAuthSource := some "spare" }
     Queue.runningPerAuthSource
   TestM.assertEqual (count "spare") 1 (msg := "the pooled entry, on the account it landed on")
   TestM.assertEqual (count "primary") 1 (msg := "the legacy entry, on the account it named")
+  TestM.assertEqual (count "third") 1 (msg := "an entry with both, on the one it resolved to")
 
 @[test]
 def aFullQueueEntrySurvivesTheRoundTrip : Test := do

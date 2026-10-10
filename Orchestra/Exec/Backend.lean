@@ -17,6 +17,22 @@ and a kill that deletes it.
 
 namespace Orchestra.Exec
 
+/-- Set once this process has been asked to stop (a termination signal, `queue shutdown`). A
+    drain lets tasks that are running finish; a task still waiting for somewhere to run is not
+    running, and reads this to stop waiting. -/
+initialize stopRequestedRef : IO.Ref Bool ← IO.mkRef false
+
+def requestStop : IO Unit := stopRequestedRef.set true
+def stopRequested : IO Bool := stopRequestedRef.get
+
+/-- How a backend says it has nowhere to run a task *yet*: the cluster is full, and nothing is
+    wrong with the task. The daemon puts such an entry back to `pending` rather than failing it. -/
+def noRoomPrefix : String := "no room for the task yet"
+
+def noRoom (detail : String) : IO.Error := IO.userError s!"{noRoomPrefix}: {detail}"
+
+def isNoRoom (e : IO.Error) : Bool := (toString e).startsWith noRoomPrefix
+
 /-- A run in progress, whatever is running it.
 
     The fields are functions rather than data because a remote backend answers them with API
@@ -197,6 +213,10 @@ structure SessionSpec where
   /-- Whether the run has been called off. For a backend that may wait before the environment
       exists — for room on a cluster — so that a cancelled task stops waiting. -/
   cancelled : IO Bool := pure false
+  /-- How long a backend may wait for room before answering `noRoom`. Short: credentials minted
+      for the task are already ticking, and an entry put back to `pending` loses nothing. Zero
+      for someone waiting on the other end of a chat. -/
+  roomWaitSeconds : Nat := 600
 
 /-- One way of executing agents.
 

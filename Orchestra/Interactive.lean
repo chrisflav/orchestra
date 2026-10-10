@@ -460,6 +460,8 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       continuesFrom := if keepsWorkspaces then workspaceOf.map (·.1) else none
       continuationOptional := workspaceOf.map (·.2) |>.getD false
       seedDir
+      -- Someone is waiting on the other end: a full cluster is said at once, not after minutes.
+      roomWaitSeconds := 0
       grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths
                    repoPath false pluginDirs identityMemory.toArray
       label   := record.id

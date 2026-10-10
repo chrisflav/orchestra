@@ -543,11 +543,14 @@ kubectl -n orchestra delete pod -l app.kubernetes.io/managed-by=orchestra
 Pods are also labelled `orchestra.dev/task=<task id>`, so a running task can be found from its id
 in the dashboard — and `kubectl exec` into for a look around while it works.
 
-**A full quota.** A pod the namespace's `ResourceQuota` has no room for is waited for, not failed
-on: the task logs `namespace … is at its quota; waiting for room`, retries every 15 seconds for up
-to an hour, and stops waiting when it is cancelled. Size `queue.parallel` so that the daemon's own
-tasks fit; what fills a quota beyond that is pods nobody is running any more — orphans, above — and
-they are the thing to clear.
+**A full quota.** A pod the namespace's `ResourceQuota` has no room for is not a failed task. The
+task logs `namespace … is at its quota; waiting for room` and retries every 15 seconds for up to ten
+minutes; if there is still no room, or the task is cancelled, or the daemon is asked to stop, it
+gives up and the entry goes back to `pending` (`put back to pending: no room for the task yet` in
+the log) to be claimed again. Interactive sessions do not wait: a full cluster is reported at once.
+Size `queue.parallel` so that the daemon's own tasks fit; what fills a quota beyond that is pods
+nobody is running any more — orphans, above — and they are the thing to clear. A pod that could
+never fit (its own request above the quota's limit) is put back again and again; the log says so.
 
 **Long silences.** An agent run is a single `kubectl exec` connection, and some load balancers and
 API-server configurations drop streams that go idle. The agent's output keeps the connection busy
