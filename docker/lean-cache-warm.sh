@@ -308,7 +308,7 @@ du -sh "$cache/packages" "$ELAN_HOME" "$cache/mathlib-cache" 2>/dev/null || true
 #   LAKE_CACHE_MASTER_TIMEOUT seconds a master build may take           (default 3600)
 #   LAKE_NODE_CACHE_VERIFY_MAX files validated per run                    (default 50000)
 #   LAKE_VERIFY_SCRIPT        docker/lake-verify.lean in the image
-#                             (default /usr/local/share/lean-cache/lake-verify.lean)
+#                             (default /usr/local/share/lake-verify.lean)
 node=${LAKE_NODE_CACHE:-/lake-cache}
 if [ -d "$node" ] && [ -w "$node" ]; then
   # What this writes into the node's cache is the pods' as much as its own: group-writable, for a
@@ -440,7 +440,7 @@ if [ -d "$node" ] && [ -w "$node" ]; then
   # still be at it -- which the next pass picks up instead.
   validate_node() {
     local stamp=$cache/lake-verified max=${LAKE_NODE_CACHE_VERIFY_MAX:-50000}
-    local script=${LAKE_VERIFY_SCRIPT:-/usr/local/share/lean-cache/lake-verify.lean}
+    local script=${LAKE_VERIFY_SCRIPT:-/usr/local/share/lake-verify.lean}
     local all todo bad probe d tc l nart nbad f rel deleted=0 leans=() newer=()
     all=$(mktemp "$cache/tmp/verify.XXXXXX") && todo=$(mktemp "$cache/tmp/verify.XXXXXX") \
       && bad=$(mktemp "$cache/tmp/verify.XXXXXX") || return 1
