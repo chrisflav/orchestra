@@ -365,9 +365,12 @@ the agent's `$HOME`, and keeps it after the pod is gone:
   the repository is filled with them. Build output is the point — a fresh task on a large Lean
   project replays the last build rather than starting from scratch. For Lean, Lake's own artifact
   cache does this better (see [Lake's artifact cache](#lakes-artifact-cache)).
-- **`finish_command`** runs in the pod, in the checkout, when a task ends and before anything is
-  copied back — `lake-cache-put` to share the build. Its output's last lines go to the daemon's
-  log; it never fails the task, and `timeout` stops it after an hour.
+- **`finish_command`** runs in the pod, in the checkout, when a task ends — after the memory
+  directories and seeds are copied back, and only while the pod is running — e.g. `lake-cache-put`
+  to share the build. It reaches the pod's `sh -c` exactly as written. Its output's last lines go
+  to the daemon's log; it never fails the task, and it is stopped after an hour, or sooner when
+  less than that is left of the pod's `deadline_seconds` (counted from when the daemon created the
+  pod, less two minutes; with under three minutes left it is skipped).
 
 The queue knows about it too. With slots holding no trees, a continuation neither waits for its
 predecessor's slot nor prefers it; `parallel_per_repo` is only a count. `orchestra prepare` has
@@ -443,9 +446,11 @@ one built before, and rebuilds the rest. Two layers:
   mounted at `/lake-cache`, `LAKE_CACHE_DIR`). Writable because it has to be: Lake caches a
   package's outputs on first use by writing a `.hash` beside each of them, which fails for a
   dependency linked read-only from the Lean cache. So the warmer copies each Mathlib revision's
-  outputs, and those of the packages it pins, into this directory first ("seeding", recorded in
-  `.seeded/<rev>@<toolchain>`), and `lean-cache-shim` turns the cache on only where that has been
-  done — or where nothing is linked read-only at all.
+  outputs, and those of exactly the packages its manifest pins, into this directory first
+  ("seeding", recorded in `.seeded/<rev>@<toolchain>`), and `lean-cache-shim` turns the cache on
+  only where every package linked from the Lean cache is one a seed covered — or where nothing is
+  linked read-only at all. Everywhere else it sets `LAKE_ARTIFACT_CACHE=false`, overriding one
+  inherited from `lake env`.
 - **an S3 bucket shared by every node**, configured in Lake's system configuration (a ConfigMap
   at `/etc/lake/config.toml`, `LAKE_CONFIG`; reads unsigned, uploads signed with the key at
   `/etc/lake-key/LAKE_CACHE_KEY`). Lake files a mappings document per git revision. Before a
@@ -471,10 +476,51 @@ The pods' side, besides the image:
 "task_volumes": { "finish_command": "lake-cache-put", "seed_paths": [] }
 ```
 
+How the warmer keeps the node's directory safe for the pods (details in
+`docker/lean-cache-warm.sh`):
+
+- **Seeding never writes to the Lean cache.** It runs `lake build --no-build` — it can cache
+  outputs that are up to date, never rebuild one — in a scratch copy of the cached trees made of
+  hard links, in which every file Lake writes in place (`.hash`, `.trace`) is a copy of its own.
+- **Pruning never takes what a seed covers.** Files in `/lake-cache` unread for
+  `LAKE_NODE_CACHE_DAYS` (14) days are deleted, but before that, on every run, every file a held
+  revision's seed covers has its access time set to now; a seed some of whose files went missing
+  anyway loses its marker and is redone, and if the refresh fails every marker goes before
+  anything is pruned. Setting access times needs the warmer to own the files, which Lake makes
+  read-only: **the warmer and the pods must run as the same user** (the image's, uid 1001). The
+  warmer also writes with `umask 002`.
+- **Downloads are atomic.** Lake downloads an artifact with `curl -o` straight to its final name;
+  the image's `curl` is a wrapper (`docker/lake-curl.sh`) that, for a download into the shared
+  directory, writes to a temporary name and renames it once complete — for single downloads and
+  for Lake's parallel `--config` ones alike — so no pod sees a partial file. It also points the
+  static curl at Debian's CA bundle.
+
+**Master builds** (`LAKE_CACHE_MASTER_REPOS="owner/name ..."`, with `LAKE_CONFIG` and the key):
+the warmer fetches each repository's default branch and, when it moved, builds it with `-o` and
+uploads it under that commit. Only once the Mathlib revision it pins is seeded on the node —
+before, the build would be all of Mathlib from source; the revision is requested meanwhile. The
+checkouts live in the Lean cache (`/lean-cache/master/<owner>/<name>`), which only the warmer can
+write: the build runs code from the repository (its lakefile) with the deploy keys, the upload key
+and write access to the Lean cache, so no pod may edit it. Pods can read it, private sources
+included — as they can read any output in `/lake-cache`. A private repository is cloned over SSH
+with a read-only deploy key at `/etc/lake-deploy/<owner>_<name>` (a Secret), and only GitHub's
+host keys as pinned in the image (`/etc/ssh/github_known_hosts`) are accepted. Each build may take
+`LAKE_CACHE_MASTER_TIMEOUT` (3600) seconds.
+
+**`lake-cache-put`** uploads only what a task adds: nothing for a HEAD already on upstream's
+default branch (`lake cache put` replaces a revision's mappings, and `lake cache get` stops at the
+first revision that has any — a task's few modules must not replace the warmer's full list), and
+nothing from a checkout with uncommitted changes to its Lean sources or Lake configuration. It
+names the modules `+Module` (a bare name is resolved as a package or library first), finds their
+sources under any `srcDir`, and says so when the artifact cache is off in the checkout.
+
 Lake's hashes are not cryptographic and a mapping is taken on trust, so everything that can
 write — every agent — is trusted with every later build that reads it. CI that builds from scratch
 is the check. Two requirements of the S3 server: it must accept unsigned reads, and the image's
 curl must send `x-amz-content-sha256` (8.x does; the image ships one).
+
+With kleis or another proxy in `HTTPS_PROXY`/`HTTP_PROXY`, the bucket's host may have to be in
+`NO_PROXY`/`no_proxy`: Lake's uploads and downloads are plain `curl`, which honours both.
 
 ## memory, continuations and series
 

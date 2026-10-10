@@ -109,10 +109,12 @@ structure TaskVolumes where
       the project from nothing. Never applied to a continuation, which has its own. -/
   seedPaths : Array String := #[]
   /-- A shell command run in the pod, in the checkout, when a task ends and its pod is still
-      there — before anything is copied back. For handing the task's work to whatever outlives it
+      there — after the memory directories and seed paths have been copied back, so that however
+      long it takes it cannot cost those. For handing the task's work to whatever outlives it
       that is not the claim: the agent image's `lake-cache-put` uploads the build to a shared Lake
       cache this way. Best effort, like the seeds: its exit status and output are logged, and a
-      task never fails because of it. -/
+      task never fails because of it. It gets at most an hour, and never more than what is
+      left of the pod's `deadline_seconds`. -/
   finishCommand : Option String := none
 deriving Repr, Inhabited
 
@@ -1202,13 +1204,66 @@ private def stageSeeds (cfg : Config) (tv : TaskVolumes) (podName : String)
     catch e =>
       IO.eprintln s!"  [k8s] warning: could not seed {p} into the new workspace: {e}"
 
+/-- `s` as one single-quoted shell word, always. `shellEscape` quotes only what contains one of the
+    characters it knows to be special, which is right for display but leaves a glob (`*`, `?`, `[`),
+    a redirection, a `~` or a `#` bare -- and an operator's `finish_command` must reach the pod's
+    `sh -c` exactly as written. -/
+def singleQuote (s : String) : String :=
+  "'" ++ s.replace "'" "'\\''" ++ "'"
+
+/-- The `sh -c` script `runFinishCommand` runs in the pod: into the checkout, then the command
+    under `timeout`, so the pod ends it even if the connection to it is gone. -/
+def finishScript (mount command : String) (seconds : Nat) : String :=
+  s!"cd {singleQuote mount} && exec timeout {seconds} sh -c {singleQuote command}"
+
+/-- `kubectl` with `args`, given `seconds` to finish: `none` if it had to be killed. For an `exec`
+    whose command has its own `timeout` in the pod, this is the daemon's side of the same bound —
+    a connection that hangs after the command has ended would otherwise hold a worker forever. -/
+private def kubeWithin (cfg : Config) (args : Array String) (seconds : Nat) :
+    IO (Option (UInt32 × String × String)) := do
+  let child ← IO.Process.spawn {
+    cmd := cfg.kubectl, args := #["-n", cfg.ns] ++ args
+    stdin := .null, stdout := .piped, stderr := .piped }
+  -- Both pipes drained at once, as in `runScript`: a full one would stall the command.
+  let outTask ← IO.asTask (prio := .dedicated) child.stdout.readToEnd
+  let errTask ← IO.asTask (prio := .dedicated) child.stderr.readToEnd
+  let deadline := (← IO.monoMsNow) + seconds * 1000
+  let mut code? : Option UInt32 := none
+  while code?.isNone && (← IO.monoMsNow) < deadline do
+    code? ← child.tryWait
+    if code?.isNone then IO.sleep 1000
+  match code? with
+  | some code =>
+    let out ← IO.ofExcept (← IO.wait outTask)
+    let err ← IO.ofExcept (← IO.wait errTask)
+    return some (code, out, err)
+  | none =>
+    try child.kill catch _ => pure ()
+    discard <| child.wait
+    return none
+
+/-- How long the finish command may run: an hour at most, and never into the last minutes of the
+    pod's `activeDeadlineSeconds`, past which the cluster kills it mid-upload. The deadline counts
+    from the pod's start, which is no earlier than `createdMs` -- when the daemon's `create`
+    returned -- so measuring from there errs on the short side. `none` when there is too little
+    left to be worth starting. -/
+def finishBudget (deadlineSeconds : Nat) (createdMs nowMs : Nat) : Option Nat :=
+  let elapsed := (nowMs - createdMs) / 1000
+  let left := deadlineSeconds - elapsed
+  -- Two minutes spare: for the `exec` to connect, and for `close` to delete the pod after.
+  if left < 120 + 60 then none else some (min 3600 (left - 120))
+
 /-- Run `TaskVolumes.finishCommand` in the pod, in the checkout, and log what it said. Bounded by
-    `timeout` in the pod, so a hung upload costs the task's close an hour at most rather than the
-    daemon a worker; best effort, so nothing it does fails the task. -/
-private def runFinishCommand (cfg : Config) (podName command mount : String) : IO Unit := do
+    `timeout` in the pod and by `kubeWithin` here, to `seconds` (see `finishBudget`); best effort,
+    so nothing it does fails the task. -/
+private def runFinishCommand (cfg : Config) (podName command mount : String) (seconds : Nat) :
+    IO Unit := do
   try
-    let script := s!"cd {shellEscape mount} && exec timeout 3600 sh -c {shellEscape command}"
-    let (code, out, err) ← kube cfg #["exec", podName, "--", "sh", "-c", script]
+    let script := finishScript mount command seconds
+    let some (code, out, err) ← kubeWithin cfg #["exec", podName, "--", "sh", "-c", script]
+        (seconds + 60)
+      | IO.eprintln s!"  [k8s] warning: finish command did not return within {seconds + 60}s; \
+abandoned"
     let said := (out ++ err).trimAscii.toString
     -- The command's own summary, not kubectl's container chatter.
     let lines := (said.splitOn "\n").filter (fun l => !l.startsWith "Defaulted container")
@@ -1334,6 +1389,9 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     if quotaExceeded err then
       throw (Exec.noRoom s!"namespace {cfg.ns} is at its quota: {err.trimAscii}")
     throw (IO.userError s!"kubernetes: could not create pod {podName}: {err.trimAscii}")
+  -- When the pod came to be, near enough: its `activeDeadlineSeconds` counts from its start, which
+  -- is no earlier, so a finish command budgeted from here cannot run into it (see `finishBudget`).
+  let createdMs ← IO.monoMsNow
   -- On a task volume the pod is waited for before the claim is let go of: a continuation that
   -- mounted it while a cancelled agent was still writing would be two agents in one tree.
   -- Whether the pod is known to be gone. If the delete did not finish in time, the claim is left
@@ -1514,6 +1572,9 @@ directory is lost."
 ({why}) — trying to copy the task's work back anyway, on the chance that it is."
       | .present _ => pure ()
       unless state matches .gone do
+        -- The finish command, if there is one, and the checkout it runs in: kept for after the
+        -- loop, so that the memory directories and seeds are back before it starts.
+        let mut finish : Option (String × String) := none
         for st in staged do
           -- A file is something orchestra handed the agent, never something it hands back.
           if st.writable && !st.isFile then
@@ -1525,7 +1586,7 @@ directory is lost."
                 -- reads it afterwards. What does come back is the build, as the head start for the
                 -- next task that starts fresh on this repository.
                 if let some command := tv.finishCommand then
-                  runFinishCommand cfg podName command st.podPath
+                  finish := some (command, st.podPath)
                 if let some seedDir := spec.seedDir then
                   exportSeeds cfg tv podName seedDir st.podPath
               | none =>
@@ -1538,6 +1599,14 @@ directory is lost."
               -- reason to throw away what it learned, and a memory that does not outlive the pod
               -- is not a memory.
               syncOut cfg podName st.hostPath st.podPath (merge := true)
+        -- Last, and only in a pod that is still running: everything the task owes the daemon is
+        -- back by now, so the most a slow or hung command can cost is its own result.
+        if let some (command, mount) := finish then
+          if state matches .present "Running" | .unknown _ then
+            match finishBudget cfg.deadlineSeconds createdMs (← IO.monoMsNow) with
+            | some seconds => runFinishCommand cfg podName command mount seconds
+            | none => IO.eprintln s!"  [k8s] finish command skipped: pod {podName} is within \
+minutes of its {cfg.deadlineSeconds}s deadline_seconds"
         if state matches .present "Failed" then
           IO.eprintln s!"  [k8s] pod {podName} ended in Failed — if the task itself looked fine, \
 check whether it ran past deadline_seconds ({cfg.deadlineSeconds}s)."

@@ -126,16 +126,19 @@ RUN curl -fsSL "https://github.com/leanprover/elan/releases/download/${ELAN_VERS
  && elan --version \
  && test -L /usr/local/bin/lake
 
-# curl for Lake (see STATIC_CURL_VERSION), ahead of Debian's on PATH. And git over HTTP/1.1:
-# from some addresses GitHub answers this git (2.39) with a 401 to every anonymous upload-pack
-# POST over HTTP/2 -- every clone from a pod on fuxi failed so -- while HTTP/1.1 works everywhere.
+# curl for Lake (see STATIC_CURL_VERSION), ahead of Debian's on PATH: installed as
+# /usr/local/libexec/curl-real, behind docker/lake-curl.sh as /usr/local/bin/curl (copied below),
+# which makes downloads into the node's shared Lake cache atomic and hands the static build Debian's
+# CA bundle. And git over HTTP/1.1: from some addresses GitHub answers this git (2.39) with a 401
+# to every anonymous upload-pack POST over HTTP/2 -- every clone from a pod on fuxi failed so --
+# while HTTP/1.1 works everywhere.
 RUN curl -fsSL -o /tmp/curl.tar.xz \
       "https://github.com/stunnel/static-curl/releases/download/${STATIC_CURL_VERSION}/curl-linux-x86_64-musl-${STATIC_CURL_VERSION}.tar.xz" \
  && echo "${STATIC_CURL_SHA256}  /tmp/curl.tar.xz" | sha256sum --check --status \
  && tar -xJf /tmp/curl.tar.xz -C /tmp curl \
- && install -m 0755 /tmp/curl /usr/local/bin/curl \
+ && install -D -m 0755 /tmp/curl /usr/local/libexec/curl-real \
  && rm -f /tmp/curl /tmp/curl.tar.xz \
- && /usr/local/bin/curl --version | head -1 \
+ && /usr/local/libexec/curl-real --version | head -1 \
  && git config --system http.version HTTP/1.1
 
 # After the download, so editing either script does not re-fetch elan. The links above dangle
@@ -143,6 +146,13 @@ RUN curl -fsSL -o /tmp/curl.tar.xz \
 COPY --chmod=0755 docker/lean-cache-shim.sh /usr/local/bin/lean-cache-shim
 COPY --chmod=0755 docker/lean-cache-warm.sh /usr/local/bin/lean-cache-warm
 COPY --chmod=0755 docker/lake-cache-put.sh /usr/local/bin/lake-cache-put
+COPY --chmod=0755 docker/lake-curl.sh /usr/local/bin/curl
+# GitHub's published SSH host keys (https://api.github.com/meta, checked against the fingerprints
+# GitHub documents under "GitHub's SSH key fingerprints"), the only ones the warmer's deploy-key
+# clones accept: see lean-cache-warm.
+COPY --chmod=0644 docker/github_known_hosts /etc/ssh/github_known_hosts
+# Through the wrapper, over HTTPS: the static curl finds the CA bundle.
+RUN curl --version | head -1 && curl -fsS -o /dev/null https://github.com
 
 # uv, the Python package and version manager. A static binary plus its `uvx` runner; the Pythons
 # and virtualenvs it installs go under $HOME.
