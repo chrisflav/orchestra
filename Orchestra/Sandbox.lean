@@ -278,7 +278,14 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     -- `Exec.mcpBinding`; `none` for every loopback run.
     (mcpToken : Option String := none)
     -- How the agent reaches GitHub when kleis holds the credentials; see `Orchestra.Kleis`.
-    (kleis : Option Kleis.Launch := none) : IO LaunchResult := do
+    (kleis : Option Kleis.Launch := none)
+    -- Called with the session id the moment the agent's stream announces it (its `init` event),
+    -- rather than only through the `LaunchResult` once the run is over. A run that never gets
+    -- to the end — the daemon SIGKILLed at the close of a drain — would otherwise take the one
+    -- thing that makes it resumable down with it. Called at most once per launch, from the
+    -- stream pump; a throw is logged and swallowed, since failing to *record* the id is no
+    -- reason to stop the agent that owns it.
+    (onSessionId : String → IO Unit := fun _ => pure ()) : IO LaunchResult := do
   -- Where the agent reaches the MCP server: loopback for a backend that runs it on this machine,
   -- and whatever a remote one says instead. Resolved before `setupMcp`, which writes it into the
   -- agent's config file.
@@ -377,7 +384,13 @@ goal; running without the goal condition."
         -- then calls a tool is three — so each is handled in the order the agent emitted it.
         for event in events do
           if let .init sid _ := event then
+            let first := (← sessionIdRef.get).isNone
             sessionIdRef.set (some sid)
+            if first then
+              try onSessionId sid
+              catch e =>
+                err.putStrLn s!"  [sandbox] warning: could not record session id {sid}: {e}"
+                err.flush
           if let .result sub _ _ _ res := event then
             resultSubtypeRef.set (some sub)
             unless res.isEmpty do resultTextRef.set (some res)

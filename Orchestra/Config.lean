@@ -812,9 +812,9 @@ instance : FromJson ExecutionConfig where
     let options := j.getObjVal? "options" |>.toOption |>.getD Json.null
     return { backend, options }
 
-/-- Queue daemon concurrency, from the `queue` object in `config.json`.
+/-- Queue daemon concurrency and restart behaviour, from the `queue` object in `config.json`.
 
-    Both default to 1, which is the serial behaviour the daemon had before parallel mode
+    The two limits default to 1, which is the serial behaviour the daemon had before parallel mode
     existed. `orchestra queue start`'s `--parallel` / `--parallel-per-repo` flags override
     these for a single run. -/
 structure QueueConfig where
@@ -824,15 +824,28 @@ structure QueueConfig where
       raising this costs a working tree per slot — run `orchestra prepare --slots N` to match,
       or the first task to reach each new slot pays its repository's init hook. -/
   parallelPerRepo : Nat := 1
+  /-- Whether a task interrupted by a daemon restart is picked up again by itself.
+
+      On by default. A deploy drains for a while and then kills whatever is still running; each
+      such task leaves an `unfinished` entry and, when its agent got far enough to name its
+      conversation, a session id (`TaskRunner` writes it as soon as the agent announces it). On a
+      backend that keeps workspaces (`Exec.keepsWorkspaces`) that is everything a continuation
+      needs — the tree, `$HOME` and the conversation are on the task's own volume — so the new
+      daemon queues one (`Queue.resumeEntryFor`) instead of waiting for someone to run
+      `orchestra queue retry`, which would start over. Off leaves those entries `unfinished`,
+      which is what every daemon did before this existed. -/
+  resumeAfterRestart : Bool := true
 deriving Repr, Inhabited
 
 instance : FromJson QueueConfig where
   fromJson? j := do
-    -- Both optional: a `queue` block that sets only one of them keeps the default for the
-    -- other, and `max 1` because zero workers would be a daemon that silently does nothing.
+    -- All optional: a `queue` block that sets only one of them keeps the default for the
+    -- others, and `max 1` because zero workers would be a daemon that silently does nothing.
     let parallel := j.getObjValAs? Nat "parallel" |>.toOption |>.getD 1
     let parallelPerRepo := j.getObjValAs? Nat "parallel_per_repo" |>.toOption |>.getD 1
-    return { parallel := max 1 parallel, parallelPerRepo := max 1 parallelPerRepo }
+    let resumeAfterRestart := j.getObjValAs? Bool "resume_after_restart" |>.toOption |>.getD true
+    return { parallel := max 1 parallel, parallelPerRepo := max 1 parallelPerRepo,
+             resumeAfterRestart }
 
 /-- What bounds interactive sessions: the `interactive` block in `config.json`.
 
