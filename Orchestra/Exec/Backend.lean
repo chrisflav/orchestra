@@ -194,6 +194,9 @@ structure SessionSpec where
   /-- Where the daemon keeps build output carried from one task chain to the next, for this
       repository. Read when a fresh workspace is filled, written when a task ends. -/
   seedDir : Option System.FilePath := none
+  /-- Whether the run has been called off. For a backend that may wait before the environment
+      exists — for room on a cluster — so that a cancelled task stops waiting. -/
+  cancelled : IO Bool := pure false
 
 /-- One way of executing agents.
 

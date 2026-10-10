@@ -214,6 +214,12 @@ def run (cfg : Config) : IO UInt32 := do
   if ← Queue.daemonRunning then
     IO.eprintln "Queue daemon is already running."
     return 1
+  -- First, before anything slow. As PID 1 the daemon drops a signal it has no handler for, and
+  -- the sweeps below take a minute and more on a large queue: a `docker stop` landing in that
+  -- window was lost, so the daemon went on to claim work as if nothing had been asked and was
+  -- SIGKILLed mid-task when the grace period ran out. The handler only counts; the watcher
+  -- started further down reads a count already above zero and drains from its first tick.
+  Utils.Signals.install
   let pid ← Queue.ownPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
@@ -361,7 +367,7 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   -- Polled rather than acted on inside the handler itself: a signal handler may not touch the
   -- Lean heap, so it only bumps a counter (ffi/Signal.c) and the real work happens here. The
   -- 200ms tick is well inside any sane `docker stop` grace period and costs nothing when idle.
-  Utils.Signals.install
+  -- The handler itself went in at the top of `run`.
   let _signalTask ← IO.asTask (prio := .dedicated) do
     let mut announced := false
     repeat
@@ -496,10 +502,11 @@ its workspace; it will start from a clean checkout."
       -- thrown was moved above the push rather than guarded here.
       try
         -- Record the resolved source on the entry, so `orchestra queue list` and any later
-        -- continuation show which account actually ran it.
+        -- continuation show which account actually ran it. In its own field: `authSource` is the
+        -- request, and an entry run again must be resolved afresh, not sent back to this account.
         Queue.saveEntry { e with
           status := .running, slot := some claim.slot
-          authSource := claim.authSource.orElse fun _ => e.authSource }
+          resolvedAuthSource := claim.authSource.orElse fun _ => e.authSource }
         activeSlots.modify (fun m => m.insert e.slotKey (occupied.push claim.slot))
         totalActive.modify (· + 1)
         if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
@@ -1098,6 +1105,9 @@ holds it. Marked unfinished."
       catch e =>
         IO.eprintln s!"Queue worker error: {e}"
         IO.sleep 1000
+  -- A stop that arrived during startup is already counted; act on it here rather than leave it
+  -- to the watcher's next tick, which a worker could beat to a claim.
+  if (← Utils.Signals.count) > 0 then shutdownToken.cancel .shutdown
   -- Spawn additional workers beyond the first (which runs on the main thread below).
   let mut workerTasks : Array (_root_.Task (Except IO.Error Unit)) := #[]
   for _ in List.range (parallelLimit - 1) do
