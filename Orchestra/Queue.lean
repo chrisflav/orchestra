@@ -141,9 +141,12 @@ structure QueueEntry where
   identity      : Option String := none
   /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`.
 
-      Written back when the daemon resolves `authSources` at claim time, so the entry records
-      which source actually ran it. -/
+      What whoever queued the entry asked for, and nothing else: the daemon's own choice goes to
+      `resolvedAuthSource`. It used to be written back here, and an entry put back to `pending`
+      after a failed run then waited for the account that run had landed on, as if pinned to it. -/
   authSource    : Option String := none
+  /-- The source the daemon resolved this entry to when it claimed it: which account ran it. -/
+  resolvedAuthSource : Option String := none
   /-- Candidate authentication sources for this entry, tried according to `authMode`.
 
       Resolved when the entry is claimed rather than when it is created: an entry may sit pending
@@ -245,6 +248,7 @@ instance : ToJson QueueEntry where
     let fields := fields ++ [("memory", ToJson.toJson e.memory)]
     let fields := if let some s := e.identity      then fields ++ [("identity",        Json.str s)]      else fields
     let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
+    let fields := if let some s := e.resolvedAuthSource then fields ++ [("resolved_auth_source", Json.str s)] else fields
     let fields := if !e.authSources.isEmpty        then fields ++ [("auth_sources",    ToJson.toJson e.authSources)] else fields
     let fields := if let some m := e.authMode      then fields ++ [("auth_mode",       ToJson.toJson m)]             else fields
     let fields := if let some t := e.tools         then fields ++ [("tools",           ToJson.toJson t)] else fields
@@ -291,6 +295,7 @@ instance : FromJson QueueEntry where
     let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
     let identity      := j.getObjValAs? String "identity"    |>.toOption
     let authSource    := j.getObjValAs? String "auth_source" |>.toOption
+    let resolvedAuthSource := j.getObjValAs? String "resolved_auth_source" |>.toOption
     let authSources   := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
     let authMode      := j.getObjValAs? AuthMode "auth_mode" |>.toOption
     let tools         := j.getObjValAs? (List String) "tools" |>.toOption
@@ -320,8 +325,8 @@ instance : FromJson QueueEntry where
     let scopeRoot    := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
     return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget, memory, identity, authSource, authSources, authMode, tools, readOnly, priority,
-             concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
+             budget, memory, identity, authSource, resolvedAuthSource, authSources, authMode, tools,
+             readOnly, priority, concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
              listenerName, spawnPolicy, spawnedBy, scopeRoot }
 
@@ -382,6 +387,7 @@ def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
     memory               := Store.enumColumn e.memory
     identity             := e.identity
     auth_source          := e.authSource
+    resolved_auth_source := e.resolvedAuthSource
     auth_sources         := Store.jsonColumn e.authSources
     auth_mode            := e.authMode.map Store.enumColumn
     tools                := e.tools.map Store.jsonColumn
@@ -460,6 +466,7 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
            memory
            identity := row.identity
            authSource := row.auth_source
+           resolvedAuthSource := row.resolved_auth_source
            authSources, authMode, tools
            readOnly := row.read_only
            priority := row.priority.toNat
@@ -618,7 +625,7 @@ def runningEntries : IO (Array QueueEntry) := do
 def runningPerAuthSource : IO (String → Nat) := do
   let mut counts : Std.HashMap String Nat := {}
   for e in ← runningEntries do
-    if let some l := e.authSource then
+    if let some l := e.resolvedAuthSource.orElse (fun _ => e.authSource) then
       counts := counts.insert l (counts.getD l 0 + 1)
   return fun l => counts.getD l 0
 

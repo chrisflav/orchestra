@@ -809,6 +809,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     taskId  := if persistent then some taskId else none
     continuesFrom := if persistent then continuesFrom else none
     seedDir
+    cancelled := match cancelToken with
+      | some t => t.isCancelled
+      | none   => pure false
     grants  := Sandbox.grantsFor (agentDefOfBackend ioTask.backend).sandboxPaths
                  appConfig.additionalSandboxPaths repoPath ioTask.readOnly pluginDirs memoryDirs
     label   := taskId

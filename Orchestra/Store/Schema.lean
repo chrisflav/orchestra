@@ -1,6 +1,7 @@
 import Db
 import Orchestra.Store.Migrations.Initial
 import Orchestra.Store.Migrations.UsageEstimate
+import Orchestra.Store.Migrations.ResolvedAuthSource
 
 /-!
 # The shape of orchestra's database
@@ -120,6 +121,10 @@ structure QueueEntryRow where
   spawn_policy : Option String
   spawned_by : Option String
   scope_root : Option String
+  /-- The source the daemon chose for this entry when it claimed it. Kept apart from `auth_source`,
+      which is what whoever queued the entry asked for: with one column for both, an entry revived
+      after a failed run read the account that run happened to land on as a pin. -/
+  resolved_auth_source : Option String
   deriving Repr
 
 /-- One run of a concert workflow. See `Orchestra.Queue.ConcertRun`. -/
@@ -278,6 +283,7 @@ def target : DatabaseRecipe :=
     has recorded one is a deployment the next one has to run on top of. -/
 def migrations : List Db.Migration.Migration :=
   [Orchestra.Store.Migrations.migration_0001_initial,
-   Orchestra.Store.Migrations.migration_0002_usage_estimate]
+   Orchestra.Store.Migrations.migration_0002_usage_estimate,
+   Orchestra.Store.Migrations.migration_0003_resolved_auth_source]
 
 end Orchestra.Store

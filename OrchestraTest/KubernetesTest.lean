@@ -532,6 +532,22 @@ def aWorkspaceClaimIsLabelledForWhatContinuesIt : Test := do
     "a task label's name part fits too"
 
 @[test]
+def aFullQuotaIsWaitedOutAndAnythingElseIsNot : Test := do
+  -- What the API server answered on kuafu while another daemon's pods held the namespace.
+  TestM.assert (quotaExceeded "Error from server (Forbidden): error when creating \"pod.json\": \
+pods \"orchestra-fb2b6436a854\" is forbidden: exceeded quota: quota, requested: count/pods=1, \
+used: count/pods=16, limited: count/pods=16") "a full quota is a wait"
+  TestM.assert (!quotaExceeded "Error from server (Forbidden): pods \"x\" is forbidden: violates \
+PodSecurity \"baseline:latest\": privileged") "a refused manifest is not: it will never fit"
+  TestM.assert (!quotaExceeded "Unable to connect to the server: dial tcp: i/o timeout")
+    "nor is an unreachable server"
+  -- And what the daemon is told when the wait runs out, which it reads as "put it back".
+  TestM.assert (Orchestra.Exec.isNoRoom (Orchestra.Exec.noRoom "namespace x is at its quota"))
+    "a wait that ran out is recognised"
+  TestM.assert (!Orchestra.Exec.isNoRoom (IO.userError "kubernetes: could not create pod p: denied"))
+    "any other failure is not"
+
+@[test]
 def aConversationOnlyOutlivesThePodOnATaskVolume : Test := do
   -- The backends that run on this machine always can: every task shares one home.
   TestM.assert Landrun.session.carriesAgentState "a landrun session carries the agent's state"

@@ -172,6 +172,7 @@ Marked unfinished.")
             let actives ← activeTaskTokens.atomically (·.get)
             for a in actives do
               a.token.cancel .cancel
+          Exec.requestStop
           shutdownToken.cancel .shutdown
           pure DaemonRequest.DaemonResponse.ok
         -- The four interactive verbs. Each answers the id it acted on, or a sentence saying why
@@ -214,6 +215,12 @@ def run (cfg : Config) : IO UInt32 := do
   if ← Queue.daemonRunning then
     IO.eprintln "Queue daemon is already running."
     return 1
+  -- First, before anything slow. As PID 1 the daemon drops a signal it has no handler for, and
+  -- the sweeps below take a minute and more on a large queue: a `docker stop` landing in that
+  -- window was lost, so the daemon went on to claim work as if nothing had been asked and was
+  -- SIGKILLed mid-task when the grace period ran out. The handler only counts; the watcher
+  -- started further down reads a count already above zero and drains from its first tick.
+  Utils.Signals.install
   let pid ← Queue.ownPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
@@ -361,7 +368,7 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   -- Polled rather than acted on inside the handler itself: a signal handler may not touch the
   -- Lean heap, so it only bumps a counter (ffi/Signal.c) and the real work happens here. The
   -- 200ms tick is well inside any sane `docker stop` grace period and costs nothing when idle.
-  Utils.Signals.install
+  -- The handler itself went in at the top of `run`.
   let _signalTask ← IO.asTask (prio := .dedicated) do
     let mut announced := false
     repeat
@@ -370,6 +377,7 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
         announced := true
         IO.println "Received termination signal; finishing in-flight tasks before shutting down."
         IO.println "Send it again to cancel them instead."
+        Exec.requestStop
         shutdownToken.cancel .shutdown
       -- A second signal escalates to `queue shutdown --force`: whoever is stopping us has said
       -- once that they are willing to wait, and then changed their mind.
@@ -496,10 +504,11 @@ its workspace; it will start from a clean checkout."
       -- thrown was moved above the push rather than guarded here.
       try
         -- Record the resolved source on the entry, so `orchestra queue list` and any later
-        -- continuation show which account actually ran it.
+        -- continuation show which account actually ran it. In its own field: `authSource` is the
+        -- request, and an entry run again must be resolved afresh, not sent back to this account.
         Queue.saveEntry { e with
           status := .running, slot := some claim.slot
-          authSource := claim.authSource.orElse fun _ => e.authSource }
+          resolvedAuthSource := claim.authSource.orElse fun _ => e.authSource }
         activeSlots.modify (fun m => m.insert e.slotKey (occupied.push claim.slot))
         totalActive.modify (· + 1)
         if !TaskRunner.backendIsParallelSafe e.backend then exclusiveActive.set true
@@ -661,6 +670,13 @@ its workspace; it will start from a clean checkout."
         IO.eprintln s!"  Task cancelled (with error: {e})"
         try finish .cancelled none none catch _ => pure ()
         ConcertManager.signal concertMgr (entry.concertStepKey.getD "") none
+      else if Exec.isNoRoom e then
+        -- Nowhere to run it yet, and nothing wrong with it: back in the queue, as if never
+        -- claimed. The task record this attempt made is left `running` here and closed as
+        -- unfinished by `announce` when the entry is next claimed, or by the startup sweep.
+        -- A pre-claimed issue stays with the entry, which still means to work on it.
+        IO.println s!"  Queue entry {entry.id} put back to pending: {e}"
+        try finish .pending none none catch _ => pure ()
       else
         IO.eprintln s!"Queue entry {entry.id} failed: {e}"
         try finish .failed none none catch _ => pure ()
@@ -1098,6 +1114,11 @@ holds it. Marked unfinished."
       catch e =>
         IO.eprintln s!"Queue worker error: {e}"
         IO.sleep 1000
+  -- A stop that arrived during startup is already counted; act on it here rather than leave it
+  -- to the watcher's next tick, which a worker could beat to a claim.
+  if (← Utils.Signals.count) > 0 then
+    Exec.requestStop
+    shutdownToken.cancel .shutdown
   -- Spawn additional workers beyond the first (which runs on the main thread below).
   let mut workerTasks : Array (_root_.Task (Except IO.Error Unit)) := #[]
   for _ in List.range (parallelLimit - 1) do

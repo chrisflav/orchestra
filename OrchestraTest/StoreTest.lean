@@ -78,6 +78,7 @@ private def fullEntry : Queue.QueueEntry := {
   memory             := .project
   identity           := some "ada"
   authSource         := some "primary"
+  resolvedAuthSource := some "spare"
   authSources        := ["primary", "spare"]
   authMode           := some .distribute
   tools              := some ["create_pr", "comment"]
@@ -124,6 +125,28 @@ def aFullTaskRecordSurvivesTheRoundTrip : Test := do
     TestM.assert (r.repo.isSome) "the repository pair came back"
 
 @[test]
+def runningAgentsAreCountedOnTheSourceThatRunsThem : Test := do
+  let count ← withTempData do
+    -- Resolved at claim from the pool: counted where it landed, with nothing asked for.
+    Queue.saveEntry { id := "q-pooled", createdAt := "2026-10-10T00:00:00Z", prompt := "a", repo := none,
+                      status := .running, resolvedAuthSource := some "spare" }
+    -- Running from before the column existed: what it asked for is all there is to go by.
+    Queue.saveEntry { id := "q-legacy", createdAt := "2026-10-10T00:00:01Z", prompt := "b", repo := none,
+                      status := .running, authSource := some "primary" }
+    -- Pinned to one source and resolved to another (an earlier build, or a pool named in the
+    -- pin's place): the one it runs on is the one counted.
+    Queue.saveEntry { id := "q-both", createdAt := "2026-10-10T00:00:03Z", prompt := "d", repo := none,
+                      status := .running, authSource := some "primary",
+                      resolvedAuthSource := some "third" }
+    -- Pending, and asking for nothing in particular: not running anywhere yet.
+    Queue.saveEntry { id := "q-waiting", createdAt := "2026-10-10T00:00:02Z", prompt := "c", repo := none,
+                      resolvedAuthSource := some "spare" }
+    Queue.runningPerAuthSource
+  TestM.assertEqual (count "spare") 1 (msg := "the pooled entry, on the account it landed on")
+  TestM.assertEqual (count "primary") 1 (msg := "the legacy entry, on the account it named")
+  TestM.assertEqual (count "third") 1 (msg := "an entry with both, on the one it resolved to")
+
+@[test]
 def aFullQueueEntrySurvivesTheRoundTrip : Test := do
   let loaded ← withTempData do
     Queue.saveEntry fullEntry
@@ -134,6 +157,8 @@ def aFullQueueEntrySurvivesTheRoundTrip : Test := do
     TestM.assert (sameJson e fullEntry)
       s!"every field survives: got {(ToJson.toJson e).compress}"
     TestM.assert (e.authSources == ["primary", "spare"]) "the candidate sources came back"
+    TestM.assert (e.authSource == some "primary" && e.resolvedAuthSource == some "spare")
+      "the source asked for and the source that ran it come back apart"
     TestM.assert (e.tools == some ["create_pr", "comment"]) "the tool list came back"
     TestM.assert (e.spawnPolicy.isSome) "the spawn policy came back"
     TestM.assert (e.inputJson == some (Json.str "go")) "the task input came back"
