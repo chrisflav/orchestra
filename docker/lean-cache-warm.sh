@@ -242,4 +242,125 @@ for d in "$ELAN_HOME/toolchains"/*/; do
 done
 
 du -sh "$cache/packages" "$ELAN_HOME" "$cache/mathlib-cache" 2>/dev/null || true
+
+# ------------------------------------------------------------------ Lake's artifact cache --
+#
+# With $LAKE_NODE_CACHE mounted (the node's writable artifact cache, see lean-cache-shim), two more
+# jobs, both best effort -- a failure here costs build time, never a task:
+#
+#   SEEDING. Each Mathlib revision kept above has its outputs, and those of every package it pins,
+#   copied into the node's cache, by building `import Mathlib` over the cached packages with the
+#   artifact cache on. That is what lets a pod turn the cache on at all: Lake caches a package's
+#   outputs on first use by writing a `.hash` beside each, which fails for one linked read-only;
+#   here the package trees are writable. Recorded in .seeded/<rev>@<tc>, which the shim checks.
+#   Redone daily, and at once after pruning removed anything, so a pruned output comes back.
+#
+#   MASTER BUILDS. With $LAKE_CACHE_MASTER_REPOS (space-separated owner/name) and Lake's system
+#   configuration ($LAKE_CONFIG) and key ($LAKE_CACHE_KEY or $LAKE_CACHE_KEY_FILE): each repository's
+#   default branch is fetched, and when it has moved since the last upload, built with `-o` and its
+#   mappings uploaded under that commit -- the revision every fresh task starts from. A private
+#   repository is cloned over SSH with $LAKE_CACHE_DEPLOY_KEYS/<owner>_<name>, a read-only deploy
+#   key, when there is one. The checkouts persist in $LAKE_NODE_CACHE/.master, so each build is
+#   incremental.
+#
+# Environment:
+#   LAKE_NODE_CACHE        the node's artifact cache            (default /lake-cache)
+#   LAKE_NODE_CACHE_DAYS   prune outputs unread for this long   (default 14)
+node=${LAKE_NODE_CACHE:-/lake-cache}
+if [ -d "$node" ] && [ -w "$node" ]; then
+  mkdir -p "$node/.seeded" "$node/.master"
+  pruned=$(find "$node/artifacts" -type f -atime +"${LAKE_NODE_CACHE_DAYS:-14}" -print -delete 2>/dev/null | wc -l)
+  [ "$pruned" -gt 0 ] && echo "pruned $pruned outputs from $node unread for ${LAKE_NODE_CACHE_DAYS:-14} days"
+
+  seed() {
+    local rev=$1 tc=$2 m=$cache/packages/mathlib/$1@$2 lake=$ELAN_HOME/toolchains/$2/bin/lake work rc
+    work=$(mktemp -d "$cache/tmp/seed.XXXXXX") || return 1
+    (
+      set -e
+      cd "$work"
+      cp "$m/lean-toolchain" .
+      printf 'name = "seed"\ndefaultTargets = ["Seed"]\n[[lean_lib]]\nname = "Seed"\n[[require]]\nname = "mathlib"\ngit = "https://github.com/leanprover-community/mathlib4"\nrev = "%s"\n' "$rev" > lakefile.toml
+      echo 'import Mathlib' > Seed.lean
+      # The manifest a project requiring this Mathlib would have, so Lake takes the linked
+      # packages as they are rather than updating them.
+      jq --arg rev "$rev" '{version, packagesDir: ".lake/packages", name: "seed", lakeDir: ".lake",
+          packages: ([{url: "https://github.com/leanprover-community/mathlib4", type: "git", subDir: null,
+                       scope: "", rev: $rev, name: "mathlib", manifestFile: "lake-manifest.json",
+                       inputRev: $rev, inherited: false, configFile: "lakefile.lean"}]
+                     + [.packages[] | .inherited = true])}' "$m/lake-manifest.json" > lake-manifest.json
+      mkdir -p .lake/packages
+      ln -s "$m" .lake/packages/mathlib
+      while IFS=$'\t' read -r n r; do
+        ln -s "$cache/packages/$n/$r@$tc" ".lake/packages/$n"
+      done < <(jq -r '.packages[] | [.name, .rev] | @tsv' "$m/lake-manifest.json")
+      export LAKE_ARTIFACT_CACHE=true LAKE_CACHE_DIR=$node
+      "$lake" build
+      # The executables too: `lake exe` checks them the same way, and they were built above
+      # without the cache.
+      for p in .lake/packages/*; do
+        pkg=$(basename "$p")
+        for exe in $( { sed -n -E 's/^lean_exe[[:space:]]+(«)?([A-Za-z0-9_-]+)(»)?.*/\2/p' "$p/lakefile.lean" 2>/dev/null || true
+                        awk '/^\[\[lean_exe\]\]/ {e=1; next} /^\[/ {e=0} e && /^name *=/ {gsub(/[" ]/, "", $0); sub(/^name=/, ""); print}' \
+                          "$p/lakefile.toml" 2>/dev/null || true; } | sort -u); do
+          "$lake" build "@$pkg/$exe:exe" || echo "warning: could not cache $pkg/$exe" >&2
+        done
+      done
+    )
+    rc=$?
+    rm -rf "$work"
+    [ $rc -eq 0 ] && date +%s > "$node/.seeded/$rev@$tc"
+    return $rc
+  }
+
+  for d in "$cache/packages/mathlib"/*@*/; do
+    [ -d "$d" ] || continue
+    entry=$(basename "$d"); r=${entry%%@*}; tc=${entry#*@}
+    mark=$node/.seeded/$entry
+    if [ "$pruned" -gt 0 ] || [ ! -e "$mark" ] || [ $((now - $(cat "$mark" 2>/dev/null || echo 0))) -ge 86400 ]; then
+      echo "seeding $node with mathlib@$r"
+      seed "$r" "$tc" || { echo "seeding mathlib@$r failed" >&2; rm -f "$mark"; status=1; }
+    fi
+  done
+  # Markers of revisions no longer held: nothing to keep in step with.
+  for f in "$node/.seeded"/*; do
+    [ -e "$f" ] || continue
+    [ -d "$cache/packages/mathlib/$(basename "$f")" ] || rm -f "$f"
+  done
+
+  if [ -n "${LAKE_CACHE_MASTER_REPOS:-}" ] && [ -n "${LAKE_CONFIG:-}" ]; then
+    keyfile=${LAKE_CACHE_KEY_FILE:-/etc/lake-key/LAKE_CACHE_KEY}
+    if [ -z "${LAKE_CACHE_KEY:-}" ] && [ -r "$keyfile" ]; then LAKE_CACHE_KEY=$(cat "$keyfile"); export LAKE_CACHE_KEY; fi
+    for repo in $LAKE_CACHE_MASTER_REPOS; do
+      [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "ignoring repository '$repo'" >&2; continue; }
+      dir=$node/.master/${repo/\//_}
+      dkey=${LAKE_CACHE_DEPLOY_KEYS:-/etc/lake-deploy}/${repo/\//_}
+      if [ -r "$dkey" ]; then
+        url=git@github.com:$repo.git
+        export GIT_SSH_COMMAND="ssh -i $dkey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$node/.master/known_hosts"
+      else
+        url=https://github.com/$repo.git
+        unset GIT_SSH_COMMAND
+      fi
+      (
+        set -e
+        if [ ! -d "$dir/.git" ]; then rm -rf "$dir"; git clone -q "$url" "$dir"; fi
+        cd "$dir"
+        git fetch -q origin
+        branch=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/master)
+        git checkout -q --detach "$branch"
+        head=$(git rev-parse HEAD)
+        if [ "$(cat .lake/lake-cache-put 2>/dev/null)" = "$head" ]; then echo "have $repo@${head:0:9}"; exit 0; fi
+        echo "building $repo@${head:0:9}"
+        map=$(mktemp)
+        # Through the shim, which links the cached packages and turns the artifact cache on.
+        nice -n 10 lake build -o "$map"
+        lake cache put "$map" --repo "$repo"
+        mkdir -p .lake && echo "$head" > .lake/lake-cache-put
+        echo "uploaded $(( $(grep -c . "$map") - 1 )) modules of $repo@${head:0:9}"
+        rm -f "$map"
+      ) || { echo "master build of $repo failed" >&2; status=1; }
+    done
+  fi
+  du -sh "$node" 2>/dev/null || true
+fi
 exit $status

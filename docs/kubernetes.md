@@ -363,7 +363,11 @@ the agent's `$HOME`, and keeps it after the pod is gone:
 - **`seed_paths`** are what a fresh task starts from instead of nothing: when a task ends, those
   paths are copied back to the daemon (`<work>/<owner>/<name>-seed`), and the next fresh claim on
   the repository is filled with them. Build output is the point — a fresh task on a large Lean
-  project replays the last build rather than starting from scratch.
+  project replays the last build rather than starting from scratch. For Lean, Lake's own artifact
+  cache does this better (see [Lake's artifact cache](#lakes-artifact-cache)).
+- **`finish_command`** runs in the pod, in the checkout, when a task ends and before anything is
+  copied back — `lake-cache-put` to share the build. Its output's last lines go to the daemon's
+  log; it never fails the task, and `timeout` stops it after an hour.
 
 The queue knows about it too. With slots holding no trees, a continuation neither waits for its
 predecessor's slot nor prefers it; `parallel_per_repo` is only a count. `orchestra prepare` has
@@ -427,6 +431,50 @@ Two things bypass it. `lake update` drops every cache link before it runs, since
 packages in place, so whatever it fetches is the pod's own from then on. And an `elan-init`
 self-install puts its own proxies in `~/.elan/bin`, which is first on `PATH`; a repository that
 wants the cache should use the image's elan rather than installing another.
+
+## Lake's artifact cache
+
+The Lean cache above shares *dependencies*. The project's own build is shared by Lake's artifact
+cache (Lake 5.0, Lean 4.33 on): every module's outputs are stored by a hash of its inputs, so any
+checkout — a fresh task, another branch, the other node — reuses every module whose inputs match
+one built before, and rebuilds the rest. Two layers:
+
+- **a directory per node**, shared and writable by the pods and the warmer (claim `lake-cache`,
+  mounted at `/lake-cache`, `LAKE_CACHE_DIR`). Writable because it has to be: Lake caches a
+  package's outputs on first use by writing a `.hash` beside each of them, which fails for a
+  dependency linked read-only from the Lean cache. So the warmer copies each Mathlib revision's
+  outputs, and those of the packages it pins, into this directory first ("seeding", recorded in
+  `.seeded/<rev>@<toolchain>`), and `lean-cache-shim` turns the cache on only where that has been
+  done — or where nothing is linked read-only at all.
+- **an S3 bucket shared by every node**, configured in Lake's system configuration (a ConfigMap
+  at `/etc/lake/config.toml`, `LAKE_CONFIG`; reads unsigned, uploads signed with the key at
+  `/etc/lake-key/LAKE_CACHE_KEY`). Lake files a mappings document per git revision. Before a
+  checkout's first build at a HEAD the shim runs `lake cache get --mappings-only` for its
+  repository (the upstream if there is one); outputs then come down as the build needs them.
+  Two writers: `lake-cache-put` as a task's `finish_command`, under the task's HEAD, and the
+  warmer, which builds each new upstream master (`LAKE_CACHE_MASTER_REPOS`) — the revision every
+  fresh task starts from.
+
+The pods' side, besides the image:
+
+```json
+"volumes": [
+  { "name": "lake-cache", "persistentVolumeClaim": { "claimName": "lake-cache" } },
+  { "name": "lake-config", "configMap": { "name": "lake-config" } },
+  { "name": "lake-key", "secret": { "secretName": "lake-cache-key" } }
+],
+"volume_mounts": [
+  { "name": "lake-cache", "mountPath": "/lake-cache" },
+  { "name": "lake-config", "mountPath": "/etc/lake", "readOnly": true },
+  { "name": "lake-key", "mountPath": "/etc/lake-key", "readOnly": true }
+],
+"task_volumes": { "finish_command": "lake-cache-put", "seed_paths": [] }
+```
+
+Lake's hashes are not cryptographic and a mapping is taken on trust, so everything that can
+write — every agent — is trusted with every later build that reads it. CI that builds from scratch
+is the check. Two requirements of the S3 server: it must accept unsigned reads, and the image's
+curl must send `x-amz-content-sha256` (8.x does; the image ships one).
 
 ## memory, continuations and series
 
@@ -586,7 +634,7 @@ the cluster was actually asked for.
 | `resources` | *(none)* | `resources` for the container, verbatim |
 | `volumes` / `volume_mounts` | `[]` | extra volumes and mounts, verbatim — a build cache, most usefully |
 | `home_path` | `/home/agent` | where the agent's `$HOME` is in the pod |
-| `task_volumes` | *(none)* | a claim per task chain for the checkout and `$HOME`, kept for continuations; see [per-task volumes](#per-task-volumes) |
+| `task_volumes` | *(none)* | a claim per task chain for the checkout and `$HOME`, kept for continuations; see [per-task volumes](#per-task-volumes). Also `seed_paths` and `finish_command` |
 | `mcp_bind` | `0.0.0.0` | address the daemon's MCP server binds |
 | `mcp_ports` | *(any free port)* | `[from, to]` the MCP server may listen on, for a daemon something has to route to |
 | `deadline_seconds` | `14400` | `activeDeadlineSeconds` on the pod |

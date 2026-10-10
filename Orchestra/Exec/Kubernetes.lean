@@ -108,6 +108,12 @@ structure TaskVolumes where
       output is the point — `.lake/build`, `target` — so a task that starts fresh does not rebuild
       the project from nothing. Never applied to a continuation, which has its own. -/
   seedPaths : Array String := #[]
+  /-- A shell command run in the pod, in the checkout, when a task ends and its pod is still
+      there — before anything is copied back. For handing the task's work to whatever outlives it
+      that is not the claim: the agent image's `lake-cache-put` uploads the build to a shared Lake
+      cache this way. Best effort, like the seeds: its exit status and output are logged, and a
+      task never fails because of it. -/
+  finishCommand : Option String := none
 deriving Repr, Inhabited
 
 /-- What this backend needs from `execution.options`.
@@ -337,7 +343,8 @@ a plain path inside the checkout"
         -- At least a day: zero would delete every other chain's claim at the next task start.
         retentionDays := max 1 (tv.getObjValAs? Nat "retention_days" |>.toOption |>.getD 14)
         mountPath
-        seedPaths : TaskVolumes })
+        seedPaths
+        finishCommand := (jsonStr? tv "finish_command").filter (!·.trimAscii.isEmpty) : TaskVolumes })
     | .ok other => throw s!"kubernetes: execution.options.task_volumes must be an object, not \
 {other.compress}"
   if j.getObjVal? "home_claim" |>.toOption |>.isSome then
@@ -1195,6 +1202,21 @@ private def stageSeeds (cfg : Config) (tv : TaskVolumes) (podName : String)
     catch e =>
       IO.eprintln s!"  [k8s] warning: could not seed {p} into the new workspace: {e}"
 
+/-- Run `TaskVolumes.finishCommand` in the pod, in the checkout, and log what it said. Bounded by
+    `timeout` in the pod, so a hung upload costs the task's close an hour at most rather than the
+    daemon a worker; best effort, so nothing it does fails the task. -/
+private def runFinishCommand (cfg : Config) (podName command mount : String) : IO Unit := do
+  try
+    let script := s!"cd {shellEscape mount} && exec timeout 3600 sh -c {shellEscape command}"
+    let (code, out, err) ← kube cfg #["exec", podName, "--", "sh", "-c", script]
+    let said := (out ++ err).trimAscii.toString
+    -- The command's own summary, not kubectl's container chatter.
+    let lines := (said.splitOn "\n").filter (fun l => !l.startsWith "Defaulted container")
+    let tail := String.intercalate "\n    " (lines.drop (lines.length - 5))
+    IO.println s!"  [k8s] finish command exited {code}{if tail.isEmpty then "" else s!":\n    {tail}"}"
+  catch e =>
+    IO.eprintln s!"  [k8s] warning: finish command could not run: {e}"
+
 /-- Copy the seed paths back out of the pod into the daemon's seed directory, each replacing what
     was there. Best effort, like staging them. Serialised per repository with `flock`, so two tasks
     ending at once cannot interleave their swaps; the archive is written to a file before anything
@@ -1502,6 +1524,8 @@ directory is lost."
                 -- daemon's checkout was only what a fresh workspace was filled from, and nothing
                 -- reads it afterwards. What does come back is the build, as the head start for the
                 -- next task that starts fresh on this repository.
+                if let some command := tv.finishCommand then
+                  runFinishCommand cfg podName command st.podPath
                 if let some seedDir := spec.seedDir then
                   exportSeeds cfg tv podName seedDir st.podPath
               | none =>

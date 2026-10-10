@@ -488,6 +488,17 @@ def aSharedHomeClaimIsRefused : Test := do
   | .error e => TestM.assert (AgentDef.containsCI e "task_volumes") "and the error names the replacement"
 
 @[test]
+def aFinishCommandIsReadAndABlankOneIsNone : Test := do
+  let with_ (v : Json) : Config :=
+    config [("task_volumes", Json.mkObj [("finish_command", v)])]
+  TestM.assertEqual ((with_ (.str "lake-cache-put")).taskVolumes.bind (·.finishCommand))
+    (some "lake-cache-put")
+  TestM.assertEqual ((with_ (.str "  ")).taskVolumes.bind (·.finishCommand)) none
+    (msg := "a blank command runs nothing")
+  TestM.assertEqual (tvConfig.taskVolumes.bind (·.finishCommand)) none
+    (msg := "and absent is none")
+
+@[test]
 def taskVolumesAreReadAndChecked : Test := do
   match tvConfig.taskVolumes with
   | none => TestM.fail "task_volumes was not read"

@@ -129,6 +129,70 @@ lean_cache_link() {
   if [ -n "$mathlib_linked" ] && [ -d "$cache/mathlib-cache/$mathlib_rev" ] && [ -z "${MATHLIB_CACHE_DIR:-}" ]; then
     export MATHLIB_CACHE_DIR=$cache/mathlib-cache/$mathlib_rev
   fi
+
+  lake_artifact_cache "$root" "$pkgdir" "$tcdir" "$mathlib_rev" "$mathlib_linked" "$sub"
+}
+
+# Lake's artifact cache, on a node that has one: a directory shared and writable by every pod on
+# the node ($LAKE_NODE_CACHE, default /lake-cache), with an S3 bucket behind it shared by every
+# node (Lake's system configuration, $LAKE_CONFIG). Every module any task on the cluster has built
+# is then reused by any other whose inputs match -- on any branch, in any fresh checkout -- instead
+# of the per-task seed copied into every new workspace.
+#
+# Turned on only where it cannot break a build. Lake caches a package's outputs on first use by
+# writing a `.hash` file beside each of them, which fails for a dependency linked read-only from
+# the Lean cache. So the warmer copies the outputs of each Mathlib revision it holds into the node's
+# cache first, and records that in $LAKE_NODE_CACHE/.seeded/<mathlib rev>@<toolchain>; with nothing
+# linked from the Lean cache there is nothing read-only to trip over.
+#
+# Before the first build of a checkout at a given HEAD, the mappings for that revision (or the
+# nearest ancestor that has some) are fetched from the bucket; the outputs themselves come when the
+# build asks for them. The key for uploads ($LAKE_CACHE_KEY) is read from $LAKE_CACHE_KEY_FILE.
+lake_artifact_cache() {
+  local root=$1 pkgdir=$2 tcdir=$3 mathlib_rev=$4 mathlib_linked=$5 sub=$6
+  local node=${LAKE_NODE_CACHE:-/lake-cache}
+  [ -n "${LAKE_NODE_CACHE_DISABLE:-}" ] && return 0
+  [ -d "$node" ] && [ -w "$node" ] || return 0
+  if find "$pkgdir" -maxdepth 1 -type l -lname "$cache/*" 2>/dev/null | grep -q .; then
+    [ -n "$mathlib_linked" ] && [ -e "$node/.seeded/$mathlib_rev@$tcdir" ] || return 0
+  fi
+  export LAKE_ARTIFACT_CACHE=true LAKE_CACHE_DIR=$node
+  if [ -z "${LAKE_CONFIG:-}" ] && [ -f /etc/lake/config.toml ]; then export LAKE_CONFIG=/etc/lake/config.toml; fi
+  local keyfile=${LAKE_CACHE_KEY_FILE:-/etc/lake-key/LAKE_CACHE_KEY}
+  if [ -z "${LAKE_CACHE_KEY:-}" ] && [ -r "$keyfile" ]; then LAKE_CACHE_KEY=$(cat "$keyfile"); export LAKE_CACHE_KEY; fi
+
+  # The remote mappings: once per checkout and HEAD, for the commands that build.
+  [ "$name" = lake ] || return 0
+  case "$sub" in build|exe|env|test|lint|"") ;; *) return 0 ;; esac
+  [ -n "${LAKE_CONFIG:-}" ] && [ -z "${LAKE_CACHE_GET_RUNNING:-}" ] || return 0
+  local head repo mark
+  head=$(git -C "$root" rev-parse HEAD 2>/dev/null) || return 0
+  repo=$(lake_cache_repo "$root") || return 0
+  mark=$root/.lake/lake-cache-got/$head
+  [ -e "$mark" ] && return 0
+  mkdir -p "$(dirname "$mark")" || return 0
+  # Through this script again, so the same toolchain and environment apply; the variable keeps
+  # that inner run from coming back here.
+  if LAKE_CACHE_GET_RUNNING=1 timeout 300 "$0" cache get --mappings-only --repo "$repo" -d "$root" \
+       >"$root/.lake/lake-cache-get.log" 2>&1; then
+    echo "lake-cache: mappings for $repo@${head:0:9} fetched" >&2
+  else
+    echo "lake-cache: no mappings for $repo@${head:0:9} or an ancestor (see .lake/lake-cache-get.log)" >&2
+  fi
+  : > "$mark"
+}
+
+# `owner/name` of the repository a checkout is a clone of: the upstream if the task has one, which
+# is where a fork's master builds are filed, else origin.
+lake_cache_repo() {
+  local url
+  url=$(git -C "$1" remote get-url upstream 2>/dev/null || git -C "$1" remote get-url origin 2>/dev/null) || return 1
+  url=${url%.git}
+  case "$url" in
+    https://github.com/*) printf '%s' "${url#https://github.com/}" ;;
+    git@github.com:*) printf '%s' "${url#git@github.com:}" ;;
+    *) return 1 ;;
+  esac
 }
 
 if [ -d "$cache" ] && [ -z "${LEAN_CACHE_DISABLE:-}" ] && command -v jq >/dev/null; then
