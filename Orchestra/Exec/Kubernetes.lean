@@ -446,7 +446,8 @@ structure StagedPath where
 deriving Repr, BEq, Inhabited
 
 /-- The paths orchestra has to carry into the pod: the checkout, any plugin or memory directory
-    the task was granted, and files of orchestra's own such as kleis's CA bundle (see `markFiles`). Everything else a session names is the image's to provide. -/
+    the task was granted, and files of orchestra's own such as kleis's CA bundle (see
+    `markFiles`). Everything else a session names is the image's to provide. -/
 def stagedPaths (cfg : Config) (hostHome : String) (spec : SessionSpec)
     (workspaceMount : Option String := none) : Array StagedPath :=
   spec.grants.filter (·.from_ == .orchestra) |>.map fun g =>

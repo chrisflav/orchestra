@@ -452,6 +452,8 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let pluginDirs ← TaskRunner.defaultPluginDirs appConfig
     let repoConfig ← RepoConfig.loadRepoConfig repoPath
     let seedDir ← if keepsWorkspaces then some <$> Repo.seedPath fork else pure none
+    -- Granted at open, as for a queued task: see `Kleis.bundleGrant`.
+    let kleisBundle ← appConfig.kleis.mapM Kleis.caBundle
     let execSession ← execBackend.openSession {
       workdir := repoPath
       -- Keyed by the session, so a wake finds the volume its first start made, and a session
@@ -464,6 +466,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       roomWaitSeconds := 0
       grants  := Sandbox.grantsFor agentDef.sandboxPaths appConfig.additionalSandboxPaths
                    repoPath false pluginDirs identityMemory.toArray
+                   ++ (kleisBundle.map Kleis.bundleGrant).toArray
       label   := record.id
       -- The upstream, not the fork: an operator pinning an image writes the name the project is
       -- known by, and the fork is per-bot. Same key as the queue path and the merger.
@@ -501,16 +504,16 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       tools := record.tools.getD allOptionalTools
       identity := identity.map (·.name), pushPrefix := kc.pushPrefix
       org := appConfig.defaultOrganization }
-    let (kleisLaunch, shutdownMcp) ← match appConfig.kleis, kleisFacts with
-      | some kc, some facts => do
+    let (kleisLaunch, shutdownMcp) ← match appConfig.kleis, kleisFacts, kleisBundle with
+      | some kc, some facts, some bundle => do
         let minted ← Kleis.mint kc facts
         let shutdownBoth : IO Unit := do
           try shutdownMcp catch _ => pure ()
           try Kleis.revoke kc minted catch e =>
             IO.eprintln s!"interactive: could not revoke the session's kleis token: {e}"
         shutdownRef.set (some shutdownBoth)
-        pure (some (Kleis.launch kc minted (← Kleis.caBundle kc)), shutdownBoth)
-      | _, _ => pure (none, shutdownMcp)
+        pure (some (Kleis.launch kc minted bundle), shutdownBoth)
+      | _, _, _ => pure (none, shutdownMcp)
     -- A session goes through the same resolver as a queued run, so an account the daemon has
     -- already found to be out of quota is not handed to a person either.
     -- With the queue's running agents counted, so a person is not handed the account the daemon
