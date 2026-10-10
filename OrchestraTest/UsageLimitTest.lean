@@ -1069,6 +1069,28 @@ def usageLimitError_matchesWhatTheCliActuallySays : Test := do
       "{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit.\"}")
     (msg := "the API-key 429 body is recognised")
 
+@[test]
+def usageLimitError_matchesTheHitYourLimitWording : Test := do
+  -- Observed verbatim on fuxi on 2026-10-10, as the result text of runs that ended on the limit
+  -- without a `rate_limit_event`; none of the older phrases match it.
+  for msg in ["You've hit your session limit · resets 1:20pm (UTC)",
+              "You've hit your weekly limit · resets Oct 14, 4am (UTC)",
+              "You've hit your Opus 4.8 limit · resets 7pm (UTC)",
+              "You’ve hit your limit · resets 3am (Europe/Berlin)",
+              "Agent terminated early due to an API error: You've hit your session limit · resets \
+10:50pm (UTC) (error type rate_limit, HTTP 429)"] do
+    TestM.assert (AgentDef.stdUsageLimitError 1 msg) (msg := s!"recognised: {msg}")
+
+@[test]
+def usageLimitError_hitYourIsNotEnoughOnItsOwn : Test := do
+  -- "hit your" is ordinary prose, and a failed run's result text is the agent's own words.
+  for msg in ["You've hit your target: every test passes, but the build failed.",
+              "you've hit your stride; the limit lemma is now the only sorry left",
+              "It looks like you've hit your head against the colimit API for a while.",
+              "You've hit your quota of retries for the flaky test without reaching the limit",
+              "hit your session limit"] do
+    TestM.assert (!(AgentDef.stdUsageLimitError 1 msg)) (msg := s!"not a usage limit: {msg}")
+
 
 @[test]
 def usageLimitError_doesNotFireOnOrdinaryOutput : Test := do
