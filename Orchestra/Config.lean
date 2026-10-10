@@ -955,6 +955,90 @@ pattern"
         throw s!"github.pats entry '{label}': {e}"
     return { label, token, repos }
 
+/-- How agents reach GitHub when a kleis proxy holds the credentials instead of the sandbox.
+
+    With this set, no sandbox is given a GitHub token. Each task gets a kleis token of its own,
+    minted from the issuer credential below with facts naming the task's fork, upstream, issue and
+    tools, and every program in the sandbox is pointed at the proxy with `HTTPS_PROXY`. The agent
+    then uses the real `git` and `gh` against the real URLs, and what it may do is decided by the
+    grants configured in kleis rather than by which MCP tools it was offered — see `docs/kleis.md`.
+
+    The issuer token is a credential: it can mint tokens for any job. It is redacted from `Repr`
+    for the same reason the identity tokens are. -/
+structure KleisConfig where
+  /-- Where orchestra itself reaches kleisd, e.g. `http://127.0.0.1:8080`: for minting and
+      revoking tokens and fetching the CA. -/
+  url : String
+  /-- `host:port` at which the sandboxes reach the proxy, when that is not the host and port of
+      `url` — a pod reaching a service name, say. -/
+  proxy : Option String := none
+  /-- The issuer credential, from `kleis issuer token orchestra`. Empty when it is read from
+      {name}`issuerTokenFile` instead. -/
+  issuerToken : String := ""
+  /-- A file holding the issuer credential, read each time it is needed: where kleisd keeps it
+      itself (an `[[issuer]]` with a `token_file`), renewing it before it expires, so nothing has
+      to be copied into `secrets.json` or rotated by hand. -/
+  issuerTokenFile : Option String := none
+  /-- The kleis CA certificate, PEM. Fetched from the daemon when unset. -/
+  caFile : Option String := none
+  /-- The grants a task's token names, in the order kleis tries them. -/
+  grants : List String := ["orchestra-github"]
+  /-- How long a task's token lives. Revoked when the task ends, so this only bounds a token whose
+      task never got to revoke it — a daemon that died mid-task. -/
+  ttl : String := "12h"
+  /-- When set, a task may push only refs under this prefix (`task_push_prefix`). -/
+  pushPrefix : Option String := none
+  /-- Hosts the sandbox reaches directly rather than through the proxy, on top of the loopback
+      and the MCP server's host. -/
+  noProxy : List String := []
+
+instance : Repr KleisConfig where
+  reprPrec c _ := s!"\{ url := {repr c.url}, proxy := {repr c.proxy}, issuerToken := <redacted>, issuerTokenFile := {repr c.issuerTokenFile}, \
+caFile := {repr c.caFile}, grants := {repr c.grants}, ttl := {repr c.ttl}, \
+pushPrefix := {repr c.pushPrefix}, noProxy := {repr c.noProxy} }"
+
+instance : FromJson KleisConfig where
+  fromJson? j := do
+    -- Strict when present, every key: a mistyped value read as absent would fall back to its
+    -- default without a word, and for `push_prefix` the default is no restriction at all. An
+    -- unknown key is refused for the same reason — `push_prefx` is a restriction somebody
+    -- believes is in force.
+    let known := ["url", "proxy", "issuer_token", "issuer_token_file", "ca_file", "grants", "ttl",
+                  "push_prefix", "no_proxy"]
+    if let Json.obj fields := j then
+      for (k, _) in fields.toArray do
+        if !known.contains k then throw s!"kleis has no setting `{k}`"
+    let opt {α} [FromJson α] (k : String) : Except String (Option α) :=
+      match j.getObjVal? k with
+      | .error _ => .ok none
+      | .ok v => match FromJson.fromJson? v with
+        | .ok a => .ok (some a)
+        | .error e => .error s!"kleis.{k}: {e}"
+    let url ← j.getObjValAs? String "url"
+    -- Only an origin: the daemon's own endpoints are matched from the start of the path, so a
+    -- path prefix here would put every mint at an address kleis does not answer.
+    let rest := match url.splitOn "://" with
+      | [_, r] => r
+      | _ => url
+    if (rest.splitOn "/").drop 1 |>.any (!·.isEmpty) then
+      throw s!"kleis.url is an origin such as http://kleis:8080, without a path: {url}"
+    let issuerToken := (← opt (α := String) "issuer_token").getD ""
+    let issuerTokenFile ← opt (α := String) "issuer_token_file"
+    if issuerToken.isEmpty && issuerTokenFile.isNone then
+      throw "kleis needs `issuer_token` or `issuer_token_file`"
+    -- An unresolved `{{key}}` is a secret secrets.json does not define; sent as it is, every mint
+    -- would fail as an unaccepted token rather than as the missing secret it is.
+    if (issuerToken.splitOn "{{").length > 1 then
+      throw "kleis.issuer_token names a secret that is not defined in secrets.json"
+    let defaults : KleisConfig := { url, issuerToken }
+    let proxy ← opt (α := String) "proxy"
+    let caFile ← opt (α := String) "ca_file"
+    let grants := (← opt (α := List String) "grants").getD defaults.grants
+    let ttl := (← opt (α := String) "ttl").getD defaults.ttl
+    let pushPrefix ← opt (α := String) "push_prefix"
+    let noProxy := (← opt (α := List String) "no_proxy").getD []
+    return { url, issuerToken, issuerTokenFile, proxy, caFile, grants, ttl, pushPrefix, noProxy }
+
 structure AppConfig where
   appId : Nat
   privateKeyPath : String
@@ -1002,6 +1086,8 @@ structure AppConfig where
   execution : ExecutionConfig := {}
   /-- What bounds interactive sessions. -/
   interactive : InteractiveConfig := {}
+  /-- The kleis proxy agents reach GitHub through, instead of holding a token themselves. -/
+  kleis : Option KleisConfig := none
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -1048,10 +1134,15 @@ unique"
     let execution := j.getObjValAs? ExecutionConfig "execution" |>.toOption |>.getD {}
     let interactive := j.getObjValAs? InteractiveConfig "interactive" |>.toOption |>.getD {}
     let defaultOrganization := j.getObjValAs? String "default_organization" |>.toOption
+    -- Strict when present: a `kleis` block that failed to parse and was dropped would put the
+    -- GitHub App's token back into every sandbox, which is the thing the block exists to stop.
+    let kleis ← match j.getObjVal? "kleis" with
+      | .error _ => pure none
+      | .ok v    => some <$> (FromJson.fromJson? v : Except String KleisConfig)
     return { appId, privateKeyPath, installationId, pat, patEntries, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
              agentAuthConfigs, additionalSandboxPaths, taxis, queue, execution, interactive,
-             defaultOrganization }
+             defaultOrganization, kleis }
 
 /-- The configured PAT source covering `repo`, or `none` when only the global `github.pat` does.
 

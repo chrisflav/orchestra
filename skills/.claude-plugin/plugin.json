@@ -1,6 +1,6 @@
 {
   "name": "orchestra",
   "version": "0.1.0",
-  "description": "How to open pull requests and work taxis issues from inside an orchestra task, using orchestra's MCP tools rather than the gh CLI.",
+  "description": "How to open pull requests and work taxis issues from inside an orchestra task: with orchestra's MCP tools, or with gh api through the credential proxy.",
   "author": { "name": "orchestra" }
 }

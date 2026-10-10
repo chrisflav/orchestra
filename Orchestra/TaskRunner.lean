@@ -7,6 +7,7 @@ import Orchestra.Agents.Vibe
 import Orchestra.Exec
 import Orchestra.GitHub
 import Orchestra.Identity
+import Orchestra.Kleis
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.Sandbox
@@ -823,6 +824,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- listening socket with the PAT's authority behind it and — off loopback — one port out of
   -- `mcp_ports`, a range sized to the queue's parallelism. Leaking it on a throw leaks both for
   -- the daemon's lifetime, and enough failed tasks would leave no port for any later one.
+  -- The task's kleis token, once minted, so the `finally` below can revoke it however the task
+  -- ends. A token left live after its task would go on being able to do what the task could.
+  let kleisRef ← IO.mkRef (none : Option Kleis.Minted)
   let shutdownRef ← IO.mkRef (none : Option (IO Unit))
   let shutdownOnce : IO Unit := do
     match ← shutdownRef.modifyGet fun s => (s, none) with
@@ -854,6 +858,20 @@ of its own.")
       IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
         Use 'tools' instead (e.g. {repr requestedTools}) and optionally 'read_only: true/false'."
     let allowedTools ← Server.withoutRepoScopedTools ioTask.repo requestedTools
+    -- With kleis the agent reaches GitHub itself, through the proxy, on a token minted for this
+    -- task. Minted here, once the tools are known: they are part of what the token says.
+    let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
+      taskId, repo := ioTask.repo, issueNumber := ioTask.issueNumber
+      tools := allowedTools, readOnly := ioTask.readOnly, prLabels := ioTask.prLabels
+      identity := identity.map (·.name), pushPrefix := kc.pushPrefix
+      org := appConfig.defaultOrganization }
+    let kleisLaunch : Option Kleis.Launch ← match appConfig.kleis, kleisFacts with
+      | some kc, some facts => do
+        let minted ← Kleis.mint kc facts
+        kleisRef.set (some minted)
+        IO.println s!"  kleis token minted (revocation id {minted.revocationId.take 16})"
+        pure (some (Kleis.launch kc minted (← Kleis.caBundle kc)))
+      | _, _ => pure none
     let inputJson := some (ResultType.valueToJson i input)
     let outputRef ← IO.mkRef (none : Option Lean.Json)
     let serverState : Server.State := {
@@ -899,6 +917,7 @@ of its own.")
       prLabels  := ioTask.prLabels
       defaultOrganization := appConfig.defaultOrganization
       authToken := mcpToken
+      kleis := appConfig.kleis
     }
     let (port, shutdown) ← Server.start serverState (bindHost := mcpBind) (portRange := mcpPorts)
     shutdownRef.set (some shutdown)
@@ -916,7 +935,8 @@ of its own.")
       [ baseSystemPrompt
       , identity.map (identitySystemPrompt · identityMemoryDir)
       , identity.bind identityInstructions
-      , memorySystemPrompt memoryDirs ].filterMap id
+      , memorySystemPrompt memoryDirs
+      , kleisFacts.map Kleis.systemPrompt ].filterMap id
     let systemPrompt :=
       if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)
     -- 6b. Load prepend prompt and apply to task prompt
@@ -971,7 +991,7 @@ of its own.")
         (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
         (additionalPaths := appConfig.additionalSandboxPaths)
         (interactiveAgent := interactiveAgent) (goal := ioTask.goal) (session := session)
-        (mcpToken := mcpToken)
+        (mcpToken := mcpToken) (kleis := kleisLaunch)
       IO.println s!"  Agent exited with code {result.exitCode}"
       sessionId := result.sessionId
       lastResultSubtype := result.resultSubtype
@@ -1075,6 +1095,9 @@ of its own.")
     -- the half that brings the agent's work back.
     try shutdownOnce catch e =>
       IO.eprintln s!"  Warning: could not shut down the MCP server: {e}"
+    if let (some kc, some minted) := (appConfig.kleis, ← kleisRef.get) then
+      try Kleis.revoke kc minted catch e =>
+        IO.eprintln s!"  Warning: could not revoke the task's kleis token: {e}"
     -- Closed however the task ended, including by exception: for a backend that holds a pod and a
     -- copy of the workspace, this is what brings the work back and stops paying for it.
     try session.close finally removeTaskCheckout

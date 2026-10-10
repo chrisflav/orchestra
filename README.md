@@ -765,6 +765,10 @@ involved, so this works inside the Docker image as well. A task's agent gets:
 - `GH_TOKEN` (the installation token) and the selected authentication source's key in the
   environment — nothing else is inherited beyond `SHELL`, `PATH`, `HOME`, `USER` and `TERM`
 
+With `kleis` configured the sandbox gets no `GH_TOKEN`: it reaches GitHub through a credential
+proxy on a token minted for the task, and may connect to the proxy's port as well. See
+[docs/kleis.md](docs/kleis.md).
+
 `orchestra run --debug` prints the exact landrun invocation before executing it, which is the
 quickest way to find out why an agent cannot see a path. A path that does not exist cannot be
 granted — orchestra warns about missing `$HOME`-relative paths rather than letting the agent hang.
@@ -800,6 +804,11 @@ The agent has access to the following tools via the built-in MCP server. `health
 and `get_pr_comments` are always available; `create_pr`, `merge_pr`, `label_issue`, `comment` and
 `create_repository` must be enabled explicitly by adding them to the `tools` list in the task
 configuration.
+
+With `kleis` configured, `refresh_token`, `get_pr_comments`, `create_pr`, `merge_pr`,
+`label_issue` and `comment` are not offered: the agent does these with `gh api` through the proxy,
+and the tool names in `tools` become facts on the task's token that kleis's grants read. See
+[docs/kleis.md](docs/kleis.md).
 
 - `health` — check that the MCP server is running
 - `refresh_token` — refresh the GitHub App installation token

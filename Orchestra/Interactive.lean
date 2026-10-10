@@ -488,8 +488,27 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       agentBackend := backendName
       identity
       authToken := mcpToken
+      kleis := appConfig.kleis
     } (bindHost := mcpBind) (portRange := mcpPorts)
     shutdownRef.set (some shutdownMcp)
+    -- A session reaches GitHub through kleis the same way a queued task does, on a token minted
+    -- for it. Minted per start and per wake, and revoked with the MCP server: the one closure
+    -- every way out of a session runs, so the token cannot outlive the session that held it.
+    let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
+      taskId := record.id, repo := some { upstream := record.upstream, fork }
+      tools := record.tools.getD allOptionalTools
+      identity := identity.map (·.name), pushPrefix := kc.pushPrefix
+      org := appConfig.defaultOrganization }
+    let (kleisLaunch, shutdownMcp) ← match appConfig.kleis, kleisFacts with
+      | some kc, some facts => do
+        let minted ← Kleis.mint kc facts
+        let shutdownBoth : IO Unit := do
+          try shutdownMcp catch _ => pure ()
+          try Kleis.revoke kc minted catch e =>
+            IO.eprintln s!"interactive: could not revoke the session's kleis token: {e}"
+        shutdownRef.set (some shutdownBoth)
+        pure (some (Kleis.launch kc minted (← Kleis.caBundle kc)), shutdownBoth)
+      | _, _ => pure (none, shutdownMcp)
     -- A session goes through the same resolver as a queued run, so an account the daemon has
     -- already found to be out of quota is not handed to a person either.
     -- With the queue's running agents counted, so a person is not handed the account the daemon
@@ -526,7 +545,8 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       [ record.systemPrompt
       , identity.map (TaskRunner.identitySystemPrompt · identityMemory)
       , identity.bind TaskRunner.identityInstructions
-      , TaskRunner.memorySystemPrompt identityMemory.toArray ].filterMap id
+      , TaskRunner.memorySystemPrompt identityMemory.toArray
+      , kleisFacts.map Kleis.systemPrompt ].filterMap id
     let systemPrompt :=
       if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)
     let some stream ← Sandbox.launchStreaming agentDef repoPath port token
@@ -537,7 +557,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
         (extraEnv := apiKeyEnv) (pluginDirs := pluginDirs)
         (memoryDirs := identityMemory.toArray)
         (extraPorts := extraPorts) (additionalPaths := appConfig.additionalSandboxPaths)
-        (session := execSession) (mcpToken := mcpToken)
+        (session := execSession) (mcpToken := mcpToken) (kleis := kleisLaunch)
       | return ← fail s!"backend '{backendName}' cannot host an interactive session"
     let session : LiveSession := {
       id := record.id, fork, slot, record := recordRef, lock, stream, shutdownMcp

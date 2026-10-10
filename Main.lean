@@ -1808,7 +1808,9 @@ private def interactiveHandler (p : Parsed) : IO UInt32 := do
   let token ← match installationId with
     | some id => GitHub.createInstallationToken jwt id
     | none    => pure ""
-  unless token.isEmpty do GitHub.setupGhAuth token
+  -- Not under kleis: `setupGhAuth` writes the installation token into `~/.config/gh/hosts.yml`,
+  -- which the sandbox can read, and the point of kleis is that nothing there holds a token.
+  unless token.isEmpty || appConfig.kleis.isSome do GitHub.setupGhAuth token
   let backendName := backend.getD "claude"
   let execBackend ← match ← Exec.resolve appConfig.execution with
     | .ok b => pure b
@@ -1829,7 +1831,9 @@ execution.options.task_volumes); this one starts every session afresh."
       if persistent then Repo.ensureTaskCheckout r.fork r.upstream sessionId (token := some token)
       else do
         IO.println s!"Cloning/updating {r.fork}..."
+        -- With the token explicitly: under kleis there is no hosts.yml login to fall back on.
         let p ← Repo.ensureCloned r.fork r.upstream
+          (token := if token.isEmpty then none else some token)
         IO.println s!"  Repo at {p}"
         pure p
     | none =>
@@ -1853,6 +1857,7 @@ execution.options.task_volumes); this one starts every session afresh."
     agentBackend   := backendName
     authToken           := mcpToken
     defaultOrganization := appConfig.defaultOrganization
+    kleis               := appConfig.kleis
   }
   let (port, shutdown) ← Server.start serverState (bindHost := mcpBind)
     (portRange := mcpPorts)
@@ -1900,6 +1905,23 @@ execution.options.task_volumes); this one starts every session afresh."
     catch e => do
       if persistent then Repo.removeTaskDir repoPath
       throw e)
+  -- A token of its own, as a queued task gets, revoked however the session ends.
+  let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
+    taskId := s!"interactive-{session.id}", repo, tools := allowedTools, pushPrefix := kc.pushPrefix
+    org := appConfig.defaultOrganization }
+  let kleisMinted ← match appConfig.kleis, kleisFacts with
+    | some kc, some facts =>
+      try some <$> Kleis.mint kc facts
+      catch e => do shutdown; session.close; throw e
+    | _, _ => pure none
+  let revokeKleis : IO Unit := do
+    if let (some kc, some m) := (appConfig.kleis, kleisMinted) then
+      try Kleis.revoke kc m catch e => IO.eprintln s!"  Warning: could not revoke the kleis token: {e}"
+  let kleisLaunch ← match appConfig.kleis, kleisMinted with
+    | some kc, some m =>
+      try some <$> (Kleis.launch kc m <$> Kleis.caBundle kc)
+      catch e => do revokeKleis; shutdown; session.close; throw e
+    | _, _ => pure none
   IO.println s!"  Running in: {session.id}"
   IO.println "  Launching agent..."
   let result ← try
@@ -1910,7 +1932,10 @@ execution.options.task_volumes); this one starts every session afresh."
         (additionalPaths := appConfig.additionalSandboxPaths)
         (interactiveAgent := true) (session := session) (mcpToken := mcpToken)
         (resume := agentResume)
+        (kleis := kleisLaunch) (systemPrompt := kleisFacts.map Kleis.systemPrompt)
     finally
+      -- Revoked first: a close that throws must not leave the token live.
+      revokeKleis
       try session.close finally
         if persistent then Repo.removeTaskDir repoPath
   IO.println s!"  Agent exited with code {result.exitCode}"

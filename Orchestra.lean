@@ -11,6 +11,7 @@ import Orchestra.Config
 import Orchestra.Exec
 import Orchestra.GitHub
 import Orchestra.Identity
+import Orchestra.Kleis
 import Orchestra.Listener
 import Orchestra.Project
 import Orchestra.Queue
