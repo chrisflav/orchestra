@@ -1067,13 +1067,9 @@ private def queueCancelCmd : Cmd := `[Cli|
 private def queueRetryHandler (p : Parsed) : IO UInt32 := do
   let seriesFilter := p.flag? "series" |>.map (·.as! String)
   let all ← Queue.loadAllEntries
-  -- Collect unfinished and cancelled entries, optionally filtered by series,
-  -- reversed so we enqueue them in original (oldest-first) order
-  let retryable := (all.filter (fun e =>
-    (e.status == .unfinished || e.status == .cancelled) &&
-    match seriesFilter with
-    | none   => true
-    | some s => e.series == some s)).toList.reverse
+  -- Unfinished and cancelled entries, optionally in one series, oldest first; an unfinished one
+  -- something already carries on is left out (`Queue.retryCandidates` says why).
+  let retryable := Queue.retryCandidates all seriesFilter
   if retryable.isEmpty then
     IO.println "No unfinished or cancelled entries to retry."
     return (0 : UInt32)
@@ -1095,7 +1091,7 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
         | none     => pure none
         | some tid =>
           match ← TaskStore.loadTask tid with
-          | some r => pure (if r.sessionId.isSome then some tid else none)
+          | some _ => pure (if (← Queue.sessionFor tid).isSome then some tid else none)
           | none   => pure none
       | _           => pure entry.continuesFrom
     let newEntry : Queue.QueueEntry := {

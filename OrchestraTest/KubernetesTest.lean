@@ -905,4 +905,78 @@ def theBackendListNamesKubernetes : Test := do
   | none   => TestM.fail "kubernetes is not registered"
   | some f => TestM.assert (!f.summary.isEmpty) "and it says what it is in the unknown-name error"
 
+
+-- The instance label, and what a starting daemon removes
+
+private def podLabels (cfg : Config) : Option Json :=
+  (podManifest cfg sampleSession "orchestra-abc123" (imageOf cfg sampleSession)
+      (stagedPaths cfg "/home/daemon" sampleSession)).getObjVal? "metadata" |>.toOption
+    |>.bind (·.getObjVal? "labels" |>.toOption)
+
+@[test]
+def everyPodSaysWhichDaemonItBelongsTo : Test := do
+  TestM.assertEqual (config).inst "default" (msg := "one daemon per namespace needs nothing set")
+  let c := config [("instance", .str "prod-a")]
+  TestM.assertEqual c.inst "prod-a" (msg := "instance is read through")
+  match podLabels c with
+  | none => TestM.fail "the pod has no labels"
+  | some ls =>
+    TestM.assertEqual (ls.getObjValAs? String instanceLabel |>.toOption) (some "prod-a")
+      (msg := "the pod carries its daemon's instance")
+    TestM.assertEqual (ls.getObjValAs? String "app.kubernetes.io/managed-by" |>.toOption)
+      (some "orchestra") (msg := "and is still orchestra's")
+
+@[test]
+def aDaemonsPodsCanBeSelectedByHand : Test := do
+  TestM.assertEqual (instanceSelector (config [("instance", .str "prod-a")]))
+    "app.kubernetes.io/managed-by=orchestra,orchestra.dev/instance=prod-a"
+    (msg := "both halves: orchestra's pods, and of them only this daemon's")
+  TestM.assertEqual (instanceSelector (config))
+    "app.kubernetes.io/managed-by=orchestra,orchestra.dev/instance=default"
+
+/-- What the startup reclaim reads back from the cluster: every orchestra pod and the task it was
+    for, which the daemon's database then decides on. A pod with no task label (one of some other
+    tool's, or from before the label existed) comes back with an empty task and is never removed. -/
+@[test]
+def theReclaimReadsEachPodsTask : Test := do
+  TestM.assertEqual (parsePodTasks "orchestra-a1\tt-1\norchestra-b2\t\n\njunk\n")
+    [("orchestra-a1", "t-1"), ("orchestra-b2", "")]
+
+@[test]
+def anInstanceHasToBeALabelValue : Test := do
+  for bad in [Json.str "", .str "a/b", .str "-lead", .str "trail.", .str "has space",
+              .str (String.ofList (List.replicate 64 'a')), .num 3] do
+    match Config.fromJson (options [("instance", bad)]) with
+    | .ok c    => TestM.fail s!"instance {bad.compress} was accepted as {c.inst}"
+    | .error e => TestM.assert (AgentDef.containsCI e "instance") "the error names the key"
+  for good in ["a", "prod-a", "team_1.blue", String.ofList (List.replicate 63 'a')] do
+    TestM.assert (validLabelValue good) s!"{good} is a label value"
+
+
+-- Whether a workspace claim's holder is still working
+
+@[test]
+def aHolderIsJudgedByItsPodsOnceTheGraceIsPast : Test := do
+  let mark := inUseValue "t-1" 1000
+  TestM.assert (!holderStillWorking "" 5000 720 (some true)) "nobody holds an unmarked claim"
+  TestM.assert (holderStillWorking mark 1100 720 (some false))
+    "within the grace a holder is alive though it has no pod yet"
+  TestM.assert (!holderStillWorking mark 2000 720 (some false)) "past it, no pod means gone"
+  TestM.assert (holderStillWorking mark 2000 720 (some true)) "a live pod means alive"
+  TestM.assert (holderStillWorking mark 2000 720 none) "a cluster that cannot be asked means alive"
+
+@[test]
+def aKnownDeadPredecessorGetsNoGrace : Test := do
+  let mark := inUseValue "t-1" 1000
+  TestM.assert (!holderStillWorking mark 1100 720 (some false) (deadTasks := ["t-1"]))
+    "a restart resume takes over its killed predecessor's claim at once"
+  TestM.assert (holderStillWorking mark 1100 720 (some true) (deadTasks := ["t-1"]))
+    "but never past a pod that is still up"
+  TestM.assert (holderStillWorking mark 1100 720 none (deadTasks := ["t-1"]))
+    "nor when the cluster cannot say"
+  TestM.assert (holderStillWorking mark 1100 720 (some false) (deadTasks := ["t-2"]))
+    "a mark naming some other task keeps its grace"
+  TestM.assert (!holderStillWorking (inUseValue "t-0" 1000) 1100 720 (some false) (deadTasks := ["t-1", "t-0"]))
+    "the earlier run a workspace was found under gets no grace either, when known to be over"
+
 end OrchestraTest.Kubernetes

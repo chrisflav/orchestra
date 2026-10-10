@@ -207,6 +207,27 @@ structure SessionSpec where
   /-- Whether a fresh workspace will do when `continuesFrom` has none left: for a chat session that
       is woken although its agent never started, so there is no conversation to lose. -/
   continuationOptional : Bool := false
+  /-- Whether the caller knows the run `continuesFrom` names is over — its task record is no
+      longer `running`: it landed, or a startup sweep found it killed and its pods were removed
+      (`Backend.reclaim`). Covers every continuation of such a run alike: the daemon's own restart
+      resume (`Queue.resumeInterrupted`), a series follow-up or a continuation somebody queued.
+
+      A backend that guards a kept workspace against a second agent may then judge the
+      predecessor by what is actually running and nothing else. The kubernetes backend otherwise
+      also counts a holder as alive for a while after it took the workspace, in case its pod is
+      still being created (`holderStillWorking`) — a grace that would refuse a continuation of
+      any task killed within its first few minutes. A run that is over will not create a pod, so
+      the grace has nothing to wait for. Only ever relaxes that assumption about the predecessor
+      (and `workspaceFallback`); a live pod still refuses. -/
+  predecessorDead : Bool := false
+  /-- An earlier run of the same chain whose workspace to take when `continuesFrom` never took one,
+      and which is as over as `continuesFrom` is (set only with `predecessorDead`).
+
+      For a restart resume whose predecessor was itself a resume killed before its agent started:
+      the conversation then comes from further back (`Queue.sessionOwner`), and that killed resume
+      may not have got as far as its workspace either, so nothing is labelled with its id. The
+      workspace is then the one this run — the owner of the conversation — left. -/
+  workspaceFallback : Option String := none
   /-- Where the daemon keeps build output carried from one task chain to the next, for this
       repository. Read when a fresh workspace is filled, written when a task ends. -/
   seedDir : Option System.FilePath := none
@@ -249,6 +270,27 @@ structure Backend where
       ends. The queue then stops pinning a continuation to its predecessor's slot, and the task
       runner prepares a checkout per task rather than resetting a pooled one. -/
   persistentWorkspaces : Bool := false
+  /-- Remove what a previous daemon left running, and say nothing about the work that was in it —
+      that is the queue's business, and the startup sweep has already marked it `unfinished`.
+
+      Called once, by the queue daemon at startup, after the stale-entry sweeps and before the
+      first worker or interactive session exists. A backend whose environments die with the
+      process that started them (landrun, local: they are child processes) has nothing to do,
+      which is the default. One that runs them somewhere that outlives the daemon — pods — would
+      otherwise leave them holding capacity, and, for the kubernetes backend, holding the
+      workspace claim a continuation of the same task needs (`acquireWorkspaceClaim`).
+
+      The argument decides, for the task or session id an environment was opened for
+      (`SessionSpec.label`), whether it is a leftover: `true` only for an id this daemon's own
+      database knows and does not have running. That, and not anything the backend can see, is
+      the criterion — whatever else shares the place (another daemon, an `orchestra run` in the
+      foreground, a previous version that labelled nothing) runs ids this database either does
+      not know or still calls `running`, and is left alone.
+
+      Must not throw for an ordinary failure to reach the place: the daemon logs and carries on,
+      since leftovers that were not removed are a nuisance and a daemon that would not start is an
+      outage. -/
+  reclaim : (String → IO Bool) → IO Unit := fun _ => pure ()
   /-- Open an environment for one task. -/
   openSession : SessionSpec → IO Session
 

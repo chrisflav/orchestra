@@ -245,11 +245,42 @@ structure Config where
   /-- Give each task chain a `PersistentVolumeClaim` of its own, holding its checkout and its
       `$HOME`, and keep it after the pod is gone. See `TaskVolumes`. -/
   taskVolumes : Option TaskVolumes := none
+  /-- Which daemon's pods these are: the value of `instanceLabel` on every pod this backend
+      creates. Informational — for an operator listing one daemon's pods by hand
+      (`instanceSelector`), or a dashboard grouping them — and deliberately *not* what `reclaim`
+      decides by: a label every unconfigured daemon sets to the same `default` would let one
+      daemon's start remove another's working pods. `reclaim` asks the daemon's own database
+      instead, which knows exactly which ids are its own.
+
+      `default` unless configured. Not derived from anything on the daemon's machine — a
+      containerised daemon's paths and hostname are the same in every container, or new in every
+      one, and neither is what "the same daemon" means across a restart. Two daemons sharing a
+      namespace are best told apart here, though nothing depends on it. -/
+  inst : String := "default"
 deriving Inhabited
 
 /-- Where orchestra keeps its own files in the pod: the environment for each command. An
     `emptyDir`, so nothing survives the task. -/
 def controlPath : String := "/orchestra"
+
+/-- Whether `s` is a Kubernetes label value as one this backend selects on: 1–63 characters of
+    `[A-Za-z0-9._-]`, starting and ending alphanumeric. Kubernetes itself also allows the empty
+    value; a selector `key=` matching every unlabelled pod is not something to configure by
+    accident, so it is refused here. -/
+def validLabelValue (s : String) : Bool :=
+  !s.isEmpty && s.length ≤ 63
+    && s.all (fun c => c.isAlphanum || c == '.' || c == '_' || c == '-')
+    && s.front.isAlphanum && s.back.isAlphanum
+
+/-- The label naming the daemon a pod belongs to (`Config.inst`). -/
+def instanceLabel : String := "orchestra.dev/instance"
+
+/-- The selector for every pod this daemon's configuration created, tasks and interactive sessions
+    alike, for looking them up by hand. Both halves, because `managed-by` alone is every orchestra
+    in the namespace and `instance` alone is a label someone else may use too. Not what `reclaim`
+    removes by; see `Config.inst`. -/
+def instanceSelector (cfg : Config) : String :=
+  s!"app.kubernetes.io/managed-by=orchestra,{instanceLabel}={cfg.inst}"
 
 private def jsonArr? (j : Json) (key : String) : Array Json :=
   match j.getObjVal? key with
@@ -349,6 +380,17 @@ a plain path inside the checkout"
         finishCommand := (jsonStr? tv "finish_command").filter (!·.trimAscii.isEmpty) : TaskVolumes })
     | .ok other => throw s!"kubernetes: execution.options.task_volumes must be an object, not \
 {other.compress}"
+  -- Validated rather than passed through `labelValue`: two daemons configured with `a/b` and
+  -- `a.b` would otherwise both label their pods `a.b`, and a value that is not the one written
+  -- in the configuration is no use to an operator selecting by it.
+  let inst ← match j.getObjVal? "instance" with
+    | .error _      => pure "default"
+    | .ok (.str s)  =>
+      if validLabelValue s then pure s
+      else throw s!"kubernetes: execution.options.instance is '{s}', which is not a Kubernetes \
+label value (1–63 of letters, digits, '.', '_' and '-', starting and ending with a letter or digit)"
+    | .ok other     => throw s!"kubernetes: execution.options.instance must be a string, not \
+{other.compress}"
   if j.getObjVal? "home_claim" |>.toOption |>.isSome then
     throw "kubernetes: execution.options.home_claim is gone: it gave every agent one shared \
 $HOME. Use task_volumes, which gives each task chain its own checkout and home"
@@ -380,6 +422,7 @@ $HOME. Use task_volumes, which gives each task chain its own checkout and home"
           match v with | .str i => some (k, i) | _ => none
       | _              => #[]
     allowRepoImage := j.getObjValAs? Bool "allow_repo_image" |>.toOption |>.getD true
+    inst
   }
 
 /-- Whether `ref` is something that can be an image reference at all.
@@ -606,6 +649,7 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
       ("namespace", .str cfg.ns),
       ("labels", Json.mkObj ([
         ("app.kubernetes.io/managed-by", .str "orchestra"),
+        (instanceLabel, .str cfg.inst),
         ("orchestra.dev/task", .str (labelValue spec.label))]
         -- A label value cannot hold a `/`, so `owner/name` is written the way Kubernetes writes
         -- its own two-part names.
@@ -1029,22 +1073,57 @@ private def listClaims (cfg : Config) (selector : String) : IO (Except String (L
                   terminating := !del.trimAscii.isEmpty }
     | _ => none
 
-/-- Whether the holder named in an in-use annotation is still working: its pod is up (not finished,
-    not failed), or it took the claim so recently that its pod may not exist yet. A holder whose
-    daemon died is neither, and its claim can be taken over. -/
-private def holderAlive (cfg : Config) (inUse : String) (now : Nat) : IO Bool := do
+/-- The task named in an in-use mark (`inUseValue`), and when it took the claim. A mark that cannot
+    be read names itself, taken at the epoch — so it is judged by its pods alone. -/
+def parseInUse (inUse : String) : String × Nat :=
+  match inUse.splitOn "@" with
+  | [h, t] => (h, t.toNat?.getD 0)
+  | _      => (inUse, 0)
+
+/-- Whether the holder named in an in-use mark is still working, as a decision over what is known.
+
+    `podsAlive` is the answer from the cluster — `some true` when the holder has a pod that is up
+    (not finished, not failed), `some false` when it has none, `none` when the cluster could not
+    be asked; not knowing is not the same as knowing it is gone, so that counts as alive, since an
+    API hiccup must not hand one tree to two agents. Before that, a holder that took the claim
+    less than `grace` seconds ago is alive whatever its pods say: its pod may simply not exist yet.
+
+    `deadTasks` are tasks the caller knows to be over (`SessionSpec.predecessorDead`): a
+    continuation's predecessor whose record is no longer `running` — landed, or swept and
+    reclaimed at startup — and the run its workspace may be found under
+    (`SessionSpec.workspaceFallback`). When the mark names one of them, the grace
+    is skipped and only live pods count — the grace exists for a holder that might be about to
+    have a pod, and this one never will. Without that, a task killed within its first few minutes
+    could never be resumed. The pods still decide: a live one refuses, as always. -/
+def holderStillWorking (inUse : String) (now grace : Nat) (podsAlive : Option Bool)
+    (deadTasks : List String := []) : Bool :=
+  if inUse.isEmpty then false
+  else
+    let (holder, since) := parseInUse inUse
+    let knownDead := deadTasks.any (labelValue · == holder)
+    if !knownDead && now < since + grace then true
+    else podsAlive.getD true
+
+/-- How long after taking a claim a holder counts as alive without a pod: long enough for its pod
+    to be created and become ready. -/
+def holderGraceSeconds (cfg : Config) : Nat := cfg.startupTimeoutSeconds + 120
+
+/-- Whether the holder named in an in-use annotation is still working (`holderStillWorking`), asking
+    the cluster for its pods only when the decision needs them. A holder whose daemon died has no
+    pod up and, once the grace is past, its claim can be taken over. -/
+private def holderAlive (cfg : Config) (inUse : String) (now : Nat)
+    (deadTasks : List String := []) : IO Bool := do
   if inUse.isEmpty then return false
-  let (holder, since) := match inUse.splitOn "@" with
-    | [h, t] => (h, t.toNat?.getD 0)
-    | _      => (inUse, 0)
-  if now < since + cfg.startupTimeoutSeconds + 120 then return true
+  -- Decided without the cluster when it can be: within the grace the pods are not consulted.
+  -- (Asked with "no pods", a `true` can only have come from the grace.)
+  if holderStillWorking inUse now (holderGraceSeconds cfg) (some false) deadTasks then
+    return true
+  let (holder, _) := parseInUse inUse
   let (code, pods, _) ← kube cfg #["get", "pods", "-l",
     s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/task={labelValue holder}",
     "--field-selector=status.phase!=Failed,status.phase!=Succeeded", "-o", "name"]
-  -- Not knowing is not the same as knowing it is gone: an API hiccup must not hand one tree to two
-  -- agents.
-  if code != 0 then return true
-  return !pods.trimAscii.isEmpty
+  let podsAlive := if code != 0 then none else some !pods.trimAscii.isEmpty
+  return holderStillWorking inUse now (holderGraceSeconds cfg) podsAlive deadTasks
 
 /-- Delete workspace claims nobody has used for `retentionDays`. Best effort, and quiet about it:
     a sweep that fails costs disk, not a task. A claim whose holder is still working is skipped
@@ -1157,9 +1236,16 @@ private def acquireWorkspaceClaim (cfg : Config) (tv : TaskVolumes) (spec : Sess
   -- A few rounds, for the case where another task changes the claim between our read and our
   -- swap: that one is either taking it (and the next read says so) or letting it go.
   for _ in [0:3] do
-    let rows ← match ← listClaims cfg s!"app.kubernetes.io/managed-by=orchestra,{taskLabel prev}" with
+    let lookup (t : String) : IO (List ClaimRow) := do
+      match ← listClaims cfg s!"app.kubernetes.io/managed-by=orchestra,{taskLabel t}" with
       | .ok rs   => pure (rs.filter (!·.terminating))
-      | .error e => throw (IO.userError s!"kubernetes: could not look up the workspace of {prev}: {e}")
+      | .error e => throw (IO.userError s!"kubernetes: could not look up the workspace of {t}: {e}")
+    let rows ← lookup prev
+    -- A predecessor that never reached its workspace — a restart resume killed early — labelled
+    -- nothing; the run whose conversation this resumes did (`SessionSpec.workspaceFallback`).
+    let rows ← match rows, spec.workspaceFallback with
+      | [], some fb => lookup fb
+      | rs, _       => pure rs
     match rows with
     | [] =>
       if spec.continuationOptional then return (← createClaim cfg tv spec taskId, false)
@@ -1169,7 +1255,11 @@ left for {prev} — it ran before task volumes were enabled, or went unused for 
     | [row] =>
       let now ← epochNow
       let ownHold := row.inUse.startsWith s!"{labelValue taskId}@"
-      if !ownHold && (← holderAlive cfg row.inUse now) then
+      -- A predecessor that is over (`SessionSpec.predecessorDead`) — and the earlier run the
+      -- workspace may be found under — is judged by live pods alone, without the startup grace;
+      -- any other holder, including some third task that took the claim since, keeps the grace.
+      let deadTasks := if spec.predecessorDead then prev :: spec.workspaceFallback.toList else []
+      if !ownHold && (← holderAlive cfg row.inUse now deadTasks) then
         throw (IO.userError s!"kubernetes: {taskId} continues {prev}, whose workspace volume \
 {row.name} is in use by {(row.inUse.splitOn "@").headD row.inUse} right now. Two agents in one \
 tree would undo each other's work; continue that task instead, or wait for it to finish.")
@@ -1644,6 +1734,73 @@ persistentvolumeclaims in namespace '{cfg.ns}' ({(out ++ err).trimAscii}). It ne
 get/list/create/patch/delete on persistentvolumeclaims as well as what pods need."
   return .ok ()
 
+/-- Pods as `reclaim` lists them: `<name>\t<orchestra.dev/task>` per line, the second empty for a
+    pod without the label. Lines that are neither are dropped. -/
+def parsePodTasks (out : String) : List (String × String) :=
+  (out.splitOn "\n").filterMap fun line =>
+    match line.splitOn "\t" with
+    | [n, t] =>
+      let n := n.trimAscii.toString
+      if n.isEmpty then none else some (n, t.trimAscii.toString)
+    | _ => none
+
+/-- Remove every pod a previous daemon left behind (`Backend.reclaim`).
+
+    Every pod `app.kubernetes.io/managed-by=orchestra` in the namespace is a candidate, whatever
+    its `orchestra.dev/instance` — or none, for pods a version that did not set it created — and
+    `isLeftover` decides each one by its `orchestra.dev/task` label: removed only if this daemon's
+    own database knows that task or session and does not have it running. So the instance label
+    is not what protects another daemon's pods; their ids are not in this database. A pod without
+    a task label is never removed.
+
+    What this removes, then: queued tasks whose agents died with their `kubectl exec` streams,
+    and interactive sessions — which `Interactive.reconcile` has just put to sleep, and whose next
+    turn opens a new pod on the same claim (and would remove a leftover of its own anyway: see the
+    `ownHold` case of `acquireWorkspaceClaim`). Nothing in them is lost by removing them. With task
+    volumes the tree and the conversation are on the claim, not in the pod; without them the pod's
+    `emptyDir` held the only copy of what the agent did since the last sync, and no daemon can
+    reach it again either way.
+
+    Waited for with task volumes, as `removePod` waits: the pod's agent may outlive the stream
+    that started it, and the continuations the daemon is about to queue (`Queue.resumeEntryFor`)
+    and the sessions about to wake take over these very claims. `holderAlive` judges a pod that is
+    still terminating to be alive, so a continuation that came too soon would be refused the
+    workspace it exists to continue in. Without task volumes nothing waits on them, and the
+    delete is fire-and-forget.
+
+    The listing carries a request timeout and the delete its own `--timeout` (or a request timeout,
+    when it does not wait), so an API server that does not answer cannot hold the start for long.
+    Best effort, like the retention sweep: a cluster that cannot be reached here
+    is logged, and the pods fall back to `activeDeadlineSeconds`. -/
+def reclaim (cfg : Config) (isLeftover : String → IO Bool) : IO Unit := do
+  try
+    let (code, out, err) ← kube cfg #["--request-timeout=30s", "get", "pods", "-l",
+      "app.kubernetes.io/managed-by=orchestra", "-o",
+      "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.metadata.labels.orchestra\\.dev/task}{\"\\n\"}{end}"]
+    if code != 0 then
+      IO.eprintln s!"  [k8s] could not list orchestra's pods: {err.trimAscii}"
+      return
+    let mut leftovers : Array (String × String) := #[]
+    for (pod, task) in parsePodTasks out do
+      if task.isEmpty then continue
+      if ← isLeftover task then leftovers := leftovers.push (pod, task)
+    if leftovers.isEmpty then
+      IO.println "  [k8s] no pods left over from a previous daemon"
+      return
+    IO.println s!"  [k8s] removing {leftovers.size} pod(s) left over from a previous daemon: \
+{String.intercalate ", " (leftovers.toList.map fun (p, t) => s!"{p} ({t})")}"
+    let waitArgs := if cfg.taskVolumes.isSome then #["--timeout=120s"]
+      else #["--wait=false", "--request-timeout=30s"]
+    -- No `--request-timeout` on the waiting delete: it bounds every request kubectl makes, the
+    -- watch `--timeout` waits on included, and would end that wait at thirty seconds; `--timeout`
+    -- bounds it instead. The one that does not wait has only the delete request to bound.
+    let (dc, _, derr) ← kube cfg (#["delete", "pod"]
+      ++ leftovers.map (·.1) ++ #["--now", "--ignore-not-found"] ++ waitArgs)
+    if dc != 0 then
+      IO.eprintln s!"  [k8s] could not remove every leftover pod: {derr.trimAscii}"
+  catch e =>
+    IO.eprintln s!"  [k8s] could not remove leftover pods: {e}"
+
 /-- Kubernetes as an execution backend. -/
 def factory : BackendFactory where
   name := "kubernetes"
@@ -1658,6 +1815,7 @@ def factory : BackendFactory where
       mcpEndpoint := fun e => pure { e with host := cfg.mcpHost }
       preflight := preflight cfg
       persistentWorkspaces := cfg.taskVolumes.isSome
+      reclaim := reclaim cfg
       openSession := openSession cfg }
 
 end Orchestra.Exec.Kubernetes
