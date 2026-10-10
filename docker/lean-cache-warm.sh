@@ -356,6 +356,13 @@ if [ -d "$node" ] && [ -w "$node" ]; then
       for p in .lake/packages/*; do
         pkg=$(basename "$p")
         for exe in $(package_exes "$p"); do
+          # One the warm itself could not build (Batteries' `test`, whose sources are not in the
+          # release) has no binary to cache: --no-build fails on its missing inputs before it can
+          # say "would have to build", so it is recognised by that instead.
+          if [ ! -e "$p/.lake/build/bin/$exe" ]; then
+            echo "note: $pkg/$exe was never built; not cached" >&2
+            continue
+          fi
           rc=0
           "$lake" build --no-build "@$pkg/$exe:exe" || rc=$?
           case $rc in
