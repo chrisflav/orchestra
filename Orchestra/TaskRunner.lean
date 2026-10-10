@@ -804,6 +804,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Where build output carried between task chains lives for this repository, on a backend that
   -- keeps workspaces. See `Exec.SessionSpec.seedDir`.
   let seedDir ← if persistent then ioTask.repo.mapM (Repo.seedPath ·.fork) else pure none
+  -- kleis's CA bundle is one of the paths the session opens with, not one granted once the token is
+  -- minted: a backend that runs the agent elsewhere carries those paths there itself (see
+  -- `Kleis.bundleGrant`). It does not depend on the token, so it can be had this early.
+  let kleisBundle ← (try appConfig.kleis.mapM Kleis.caBundle
+    catch e => do removeTaskCheckout; throw e)
   let session ← (try execBackend.openSession {
     workdir := repoPath
     taskId  := if persistent then some taskId else none
@@ -814,6 +819,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | none   => pure false
     grants  := Sandbox.grantsFor (agentDefOfBackend ioTask.backend).sandboxPaths
                  appConfig.additionalSandboxPaths repoPath ioTask.readOnly pluginDirs memoryDirs
+                 ++ (kleisBundle.map Kleis.bundleGrant).toArray
     label   := taskId
     -- The upstream, not the fork: what a repository runs in is a property of the project, and an
     -- operator writing `execution.options.images` writes down the name the project is known by.
@@ -868,13 +874,13 @@ of its own.")
       tools := allowedTools, readOnly := ioTask.readOnly, prLabels := ioTask.prLabels
       identity := identity.map (·.name), pushPrefix := kc.pushPrefix
       org := appConfig.defaultOrganization }
-    let kleisLaunch : Option Kleis.Launch ← match appConfig.kleis, kleisFacts with
-      | some kc, some facts => do
+    let kleisLaunch : Option Kleis.Launch ← match appConfig.kleis, kleisFacts, kleisBundle with
+      | some kc, some facts, some bundle => do
         let minted ← Kleis.mint kc facts
         kleisRef.set (some minted)
         IO.println s!"  kleis token minted (revocation id {minted.revocationId.take 16})"
-        pure (some (Kleis.launch kc minted (← Kleis.caBundle kc)))
-      | _, _ => pure none
+        pure (some (Kleis.launch kc minted bundle))
+      | _, _, _ => pure none
     let inputJson := some (ResultType.valueToJson i input)
     let outputRef ← IO.mkRef (none : Option Lean.Json)
     let serverState : Server.State := {

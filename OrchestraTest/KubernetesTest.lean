@@ -234,6 +234,57 @@ def whatComesBackIsWhatCouldBeWritten : Test := do
     TestM.assert st.writable "memories are written by the agent"
     TestM.assert (!st.isWorkspace) "but merged back, since other tasks share them"
 
+/-- The mount paths of a manifest's one container, and how many volumes it declares. -/
+private def mountsOf (m : Json) : List String :=
+  let c := match m.getObjVal? "spec" |>.toOption |>.bind (·.getObjVal? "containers" |>.toOption) with
+    | some (.arr cs) => cs[0]?
+    | _              => none
+  match c.bind (·.getObjVal? "volumeMounts" |>.toOption) with
+  | some (.arr ms) => ms.toList.filterMap (·.getObjValAs? String "mountPath" |>.toOption)
+  | _              => []
+
+private def volumesOf (m : Json) : Nat :=
+  match m.getObjVal? "spec" |>.toOption |>.bind (·.getObjVal? "volumes" |>.toOption) with
+  | some (.arr vs) => vs.size
+  | _              => 0
+
+/-- The sample session with kleis's CA bundle granted as well, and a second file beside it. -/
+private def withFiles : Array StagedPath :=
+  staged ++ #[
+    { hostPath := "/var/lib/orchestra/kleis/ca-bundle-1.pem"
+      podPath := "/var/lib/orchestra/kleis/ca-bundle-1.pem"
+      writable := false, isWorkspace := false, isFile := true },
+    { hostPath := "/var/lib/orchestra/kleis/ca-bundle-2.pem"
+      podPath := "/var/lib/orchestra/kleis/ca-bundle-2.pem"
+      writable := false, isWorkspace := false, isFile := true }]
+
+@[test]
+def aFileIsCarriedInTheDirectoryAboveIt : Test := do
+  -- An `emptyDir` is a directory, so one mounted on the bundle's own path would put a directory
+  -- where `SSL_CERT_FILE` expects a file. It goes on the directory above instead, once however many
+  -- files are in it: a pod with two volumes on one path is refused outright.
+  let m := podManifest (config) sampleSession "orchestra-abc123" (imageOf (config) sampleSession)
+    withFiles
+  let paths := mountsOf m
+  TestM.assert (paths.contains "/var/lib/orchestra/kleis") "the bundle's directory is a mount point"
+  TestM.assert (!paths.any (·.endsWith ".pem")) "the bundle itself is not"
+  TestM.assertEqual (paths.filter (· == "/var/lib/orchestra/kleis")).length 1
+    (msg := "and two files in it share one mount")
+  TestM.assertEqual paths.length paths.eraseDups.length (msg := "no mount path appears twice")
+  TestM.assertEqual (volumesOf m) paths.length (msg := "every volume is mounted, and only once")
+
+@[test]
+def markFilesAsksTheDisk : Test := do
+  let dir := System.FilePath.mk s!"/tmp/orchestra-test-k8s-files-{← IO.monoNanosNow}"
+  IO.FS.createDirAll (dir / "sub")
+  IO.FS.writeFile (dir / "bundle.pem") "pem\n"
+  let mk (p : System.FilePath) : StagedPath :=
+    { hostPath := p.toString, podPath := p.toString, writable := false, isWorkspace := false }
+  let marked ← markFiles #[mk (dir / "bundle.pem"), mk (dir / "sub"), mk (dir / "absent")]
+  IO.FS.removeDirAll dir
+  TestM.assertEqual (marked.map (·.isFile)) #[true, false, false]
+    (msg := "a file is marked; a directory and a missing path are not")
+
 /-! ## The pod -/
 
 @[test]

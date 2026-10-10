@@ -87,6 +87,21 @@ def launch_pointsEverythingAtTheProxy : Test := do
     "the bundle is granted read-only"
 
 @[test]
+def bundleGrant_isCarriedByABackendThatRunsTheAgentElsewhere : Test := do
+  -- The session is opened with it, and a kubernetes session stages exactly the `.orchestra` paths
+  -- it was opened with into the pod — as a file, in an emptyDir on its directory.
+  let g := Orchestra.Kleis.bundleGrant "/data/kleis/ca-bundle.pem"
+  TestM.assert (g.from_ == .orchestra) "orchestra supplies it"
+  TestM.assert (g.access == .ro && g.required) "read-only, and the agent cannot do without it"
+  let spec : Orchestra.Exec.SessionSpec := {
+    workdir := "/data/work/x", label := "t", grants := #[g] }
+  let cfg : Orchestra.Exec.Kubernetes.Config := { image := "i", mcpHost := "h" }
+  let staged ← Orchestra.Exec.Kubernetes.markFiles
+    (Orchestra.Exec.Kubernetes.stagedPaths cfg "/home/d" spec)
+  TestM.assertEqual (staged.map (·.podPath)) #["/data/kleis/ca-bundle.pem"]
+    (msg := "and the kubernetes backend stages it where the CA variables point")
+
+@[test]
 def launch_aConfiguredProxyAddressWins : Test := do
   let l := Orchestra.Kleis.launch { cfg with proxy := some "kleis.orchestra.svc:3128" } minted
     "/b.pem"

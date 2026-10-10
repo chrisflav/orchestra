@@ -439,10 +439,15 @@ structure StagedPath where
   /-- Whether this is the task's checkout. It is the one path replaced wholesale on the way back
       rather than merged; see `syncOut`. -/
   isWorkspace : Bool
+  /-- Whether it is a single file rather than a directory: kleis's CA bundle, say. A file cannot
+      be a mount point of its own — an `emptyDir` is a directory — so it is carried into one
+      mounted on the directory above it, and it never comes back. -/
+  isFile : Bool := false
 deriving Repr, BEq, Inhabited
 
-/-- The paths orchestra has to carry into the pod: the checkout, and any plugin or memory directory
-    the task was granted. Everything else a session names is the image's to provide. -/
+/-- The paths orchestra has to carry into the pod: the checkout, any plugin or memory directory
+    the task was granted, and files of orchestra's own such as kleis's CA bundle (see
+    `markFiles`). Everything else a session names is the image's to provide. -/
 def stagedPaths (cfg : Config) (hostHome : String) (spec : SessionSpec)
     (workspaceMount : Option String := none) : Array StagedPath :=
   spec.grants.filter (·.from_ == .orchestra) |>.map fun g =>
@@ -455,6 +460,15 @@ def stagedPaths (cfg : Config) (hostHome : String) (spec : SessionSpec)
     { hostPath, podPath
       writable := g.access == .rw || g.access == .rwx
       isWorkspace }
+
+/-- Mark the staged paths that are files on the daemon's disk. `stagedPaths` reads only the grants,
+    and a grant does not say whether its path is a file; the disk does. A path that does not exist is
+    left as a directory, which `stageIn` already skips. -/
+def markFiles (staged : Array StagedPath) : IO (Array StagedPath) :=
+  staged.mapM fun st => do
+    let p := System.FilePath.mk st.hostPath
+    if (← p.pathExists) && !(← p.isDir) then return { st with isFile := true }
+    return st
 
 /-- `path` as the pod sees it. The identity unless the checkout is on a task volume, where anything
     under the daemon's checkout is under `workspaceMount` instead — the agent's working directory,
@@ -494,16 +508,22 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
     match (System.FilePath.mk p).parent.map (·.toString) with
     | some q => if q == "/" || q.isEmpty then p else q
     | none   => p
-  let stageMounts : Array Json := (staged.mapIdx fun i st =>
+  -- Where each staged path's `emptyDir` goes, if it gets one. A file goes into one on the directory
+  -- above it, the way the checkout does; two files in one directory share the first one's, since
+  -- a pod with two volumes on one mount path is refused.
+  let wanted : Array (Option String) := staged.map fun st =>
     if st.isWorkspace then
-      if workspaceClaim.isSome then none
-      else some (Json.mkObj [("name", .str (stageVolumeName i)),
-                             ("mountPath", .str (parentOf st.podPath))])
-    else some (Json.mkObj [("name", .str (stageVolumeName i)), ("mountPath", .str st.podPath)]))
+      if workspaceClaim.isSome then none else some (parentOf st.podPath)
+    else if st.isFile then some (parentOf st.podPath)
+    else some st.podPath
+  let mountAt : Array (Option String) := wanted.mapIdx fun i w =>
+    w.bind fun p =>
+      if (wanted.extract 0 i).any (· == some p) then none else some p
+  let stageMounts : Array Json := (mountAt.mapIdx fun i m =>
+    m.map fun p => Json.mkObj [("name", .str (stageVolumeName i)), ("mountPath", .str p)])
     |>.filterMap id
-  let stageVolumes : Array Json := (staged.mapIdx fun i st =>
-    if st.isWorkspace && workspaceClaim.isSome then none
-    else some (Json.mkObj [("name", .str (stageVolumeName i)), ("emptyDir", Json.mkObj [])]))
+  let stageVolumes : Array Json := (mountAt.mapIdx fun i m =>
+    m.map fun _ => Json.mkObj [("name", .str (stageVolumeName i)), ("emptyDir", Json.mkObj [])])
     |>.filterMap id
   -- The claim, mounted whole: the checkout and `$HOME` are directories in it, made by the agent.
   -- Without one, `$HOME` is a scratch `emptyDir` of its own.
@@ -1232,7 +1252,7 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     | some (tv, _, _) => { cfg with homePath := s!"{tv.mountPath}/home" }
     | none            => cfg
   let workspaceMount := volume.map (fun (tv, _, _) => s!"{tv.mountPath}/work")
-  let staged := stagedPaths ecfg home spec workspaceMount
+  let staged ← markFiles (stagedPaths ecfg home spec workspaceMount)
   let toPod := podPathOf spec workspaceMount
   let podName := s!"orchestra-{← randomHex 6}"
   let manifest := podManifest ecfg spec podName image staged (volume.map (·.2.1))
@@ -1326,6 +1346,10 @@ marked until it does"
     if volume.isSome then
       mkdirInPod cfg podName ecfg.homePath
     for st in staged do
+      -- A file is written into the `emptyDir` above it; `stageIn` carries a directory's entries.
+      if st.isFile then
+        putFile cfg podName st.podPath (← IO.FS.readFile st.hostPath)
+        continue
       match volume with
       | some (tv, _, reused) =>
         if st.isWorkspace then
@@ -1469,7 +1493,8 @@ directory is lost."
       | .present _ => pure ()
       unless state matches .gone do
         for st in staged do
-          if st.writable then
+          -- A file is something orchestra handed the agent, never something it hands back.
+          if st.writable && !st.isFile then
             if st.isWorkspace then
               match volume with
               | some (tv, _, _) =>

@@ -264,6 +264,13 @@ structure Launch where
   /-- The port the proxy listens on. -/
   port : Nat
 
+/-- The CA bundle as a path the session is opened with. A backend that runs the agent elsewhere
+    carries the paths it is opened with there, and one granted only later, once the token is
+    minted, has to be placed in a pod that is already running as a user who may not create the
+    directory it goes in. -/
+def bundleGrant (bundle : System.FilePath) : Exec.PathGrant :=
+  { path := bundle.toString, access := .ro, from_ := .orchestra, required := true }
+
 /-- The environment and files for a sandbox whose task holds `m`.
 
     `HTTPS_PROXY` in both spellings, because curl reads only the lowercase one for `http_proxy` and
@@ -292,7 +299,7 @@ def launch (cfg : KleisConfig) (m : Minted) (bundle : System.FilePath) : Launch 
       ("GIT_CONFIG_COUNT", "1"),
       ("GIT_CONFIG_KEY_0", "http.proxyAuthMethod"), ("GIT_CONFIG_VALUE_0", "basic"),
       ("GIT_TERMINAL_PROMPT", "0")]
-    files := #[{ path := ca, access := .ro, from_ := .orchestra, required := true }]
+    files := #[bundleGrant bundle]
     port := proxyPort cfg }
 
 end Orchestra.Kleis
