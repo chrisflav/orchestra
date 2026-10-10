@@ -1069,8 +1069,15 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
   let all ← Queue.loadAllEntries
   -- Collect unfinished and cancelled entries, optionally filtered by series,
   -- reversed so we enqueue them in original (oldest-first) order
+  -- An unfinished run something already continues is not retried a second time. The daemon
+  -- queues such continuations itself after a restart (`Queue.resumeInterrupted`) and leaves the
+  -- interrupted entry `unfinished` beside them; retrying it as well would put two agents on one
+  -- conversation, the second of them refused its workspace or redoing the first one's work.
+  let continued : Std.HashSet String :=
+    all.foldl (fun s e => match e.continuesFrom with | some t => s.insert t | none => s) {}
   let retryable := (all.filter (fun e =>
     (e.status == .unfinished || e.status == .cancelled) &&
+    !(e.status == .unfinished && e.taskId.any continued.contains) &&
     match seriesFilter with
     | none   => true
     | some s => e.series == some s)).toList.reverse

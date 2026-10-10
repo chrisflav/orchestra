@@ -237,11 +237,46 @@ structure Config where
   /-- Give each task chain a `PersistentVolumeClaim` of its own, holding its checkout and its
       `$HOME`, and keep it after the pod is gone. See `TaskVolumes`. -/
   taskVolumes : Option TaskVolumes := none
+  /-- Which daemon's pods these are: the value of `instanceLabel` on every pod this backend
+      creates, and what `reclaim` selects on when a daemon starts and removes what the last one
+      left behind.
+
+      A pod outlives the daemon that made it — its PID 1 is a sleep loop, and only
+      `activeDeadlineSeconds` ever ends it on its own — so a daemon killed mid-task leaves pods
+      that hold namespace quota for hours and, with task volumes, the workspace claim a
+      continuation of the same task is refused for (`acquireWorkspaceClaim`). At startup nothing
+      of the new daemon runs yet, so every pod carrying its instance is a leftover; the label is
+      what makes "every pod" mean *this daemon's* and not every orchestra pod in the namespace.
+
+      `default` unless configured. Not derived from anything on the daemon's machine — a
+      containerised daemon's paths and hostname are the same in every container, or new in every
+      one, and neither is what "the same daemon" means across a restart. One daemon per namespace
+      is the usual deployment, and needs nothing here; two daemons sharing a namespace must set
+      different values, or each one's start removes the other's running pods. -/
+  inst : String := "default"
 deriving Inhabited
 
 /-- Where orchestra keeps its own files in the pod: the environment for each command. An
     `emptyDir`, so nothing survives the task. -/
 def controlPath : String := "/orchestra"
+
+/-- Whether `s` is a Kubernetes label value as one this backend selects on: 1–63 characters of
+    `[A-Za-z0-9._-]`, starting and ending alphanumeric. Kubernetes itself also allows the empty
+    value; a selector `key=` matching every unlabelled pod is not something to configure by
+    accident, so it is refused here. -/
+def validLabelValue (s : String) : Bool :=
+  !s.isEmpty && s.length ≤ 63
+    && s.all (fun c => c.isAlphanum || c == '.' || c == '_' || c == '-')
+    && s.front.isAlphanum && s.back.isAlphanum
+
+/-- The label naming the daemon a pod belongs to (`Config.inst`). -/
+def instanceLabel : String := "orchestra.dev/instance"
+
+/-- The selector for every pod this daemon's configuration creates, tasks and interactive sessions
+    alike: what `reclaim` removes at startup. Both halves, because `managed-by` alone is every
+    orchestra in the namespace and `instance` alone is a label someone else may use too. -/
+def instanceSelector (cfg : Config) : String :=
+  s!"app.kubernetes.io/managed-by=orchestra,{instanceLabel}={cfg.inst}"
 
 private def jsonArr? (j : Json) (key : String) : Array Json :=
   match j.getObjVal? key with
@@ -340,6 +375,17 @@ a plain path inside the checkout"
         seedPaths : TaskVolumes })
     | .ok other => throw s!"kubernetes: execution.options.task_volumes must be an object, not \
 {other.compress}"
+  -- Validated rather than passed through `labelValue`: two daemons configured with `a/b` and
+  -- `a.b` would otherwise both run as `a.b` and remove each other's pods at every start, and
+  -- nothing in either log would say why.
+  let inst ← match j.getObjVal? "instance" with
+    | .error _      => pure "default"
+    | .ok (.str s)  =>
+      if validLabelValue s then pure s
+      else throw s!"kubernetes: execution.options.instance is '{s}', which is not a Kubernetes \
+label value (1–63 of letters, digits, '.', '_' and '-', starting and ending with a letter or digit)"
+    | .ok other     => throw s!"kubernetes: execution.options.instance must be a string, not \
+{other.compress}"
   if j.getObjVal? "home_claim" |>.toOption |>.isSome then
     throw "kubernetes: execution.options.home_claim is gone: it gave every agent one shared \
 $HOME. Use task_volumes, which gives each task chain its own checkout and home"
@@ -371,6 +417,7 @@ $HOME. Use task_volumes, which gives each task chain its own checkout and home"
           match v with | .str i => some (k, i) | _ => none
       | _              => #[]
     allowRepoImage := j.getObjValAs? Bool "allow_repo_image" |>.toOption |>.getD true
+    inst
   }
 
 /-- Whether `ref` is something that can be an image reference at all.
@@ -597,6 +644,7 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
       ("namespace", .str cfg.ns),
       ("labels", Json.mkObj ([
         ("app.kubernetes.io/managed-by", .str "orchestra"),
+        (instanceLabel, .str cfg.inst),
         ("orchestra.dev/task", .str (labelValue spec.label))]
         -- A label value cannot hold a `/`, so `owner/name` is written the way Kubernetes writes
         -- its own two-part names.
@@ -1551,6 +1599,48 @@ persistentvolumeclaims in namespace '{cfg.ns}' ({(out ++ err).trimAscii}). It ne
 get/list/create/patch/delete on persistentvolumeclaims as well as what pods need."
   return .ok ()
 
+/-- Remove every pod a previous daemon with this configuration left behind (`Backend.reclaim`).
+
+    Called at startup, before the first worker or interactive session exists, so every pod carrying
+    this daemon's instance (`instanceSelector`) belongs to a process that is gone: queued tasks
+    whose agents died with their `kubectl exec` streams, mergers, and interactive sessions — whose
+    records `Interactive.reconcile` puts to sleep a moment later, and whose next turn opens a new
+    pod on the same claim (and would remove a leftover of its own anyway: see the `ownHold` case
+    of `acquireWorkspaceClaim`). Nothing in them is lost by removing them. With task volumes the
+    tree and the conversation are on the claim, not in the pod; without them the pod's `emptyDir`
+    held the only copy of what the agent did since the last sync, and no daemon can reach it again
+    either way.
+
+    Waited for with task volumes, as `removePod` waits: the pod's agent may outlive the stream
+    that started it, and the continuations the daemon is about to queue (`Queue.resumeEntryFor`)
+    and the sessions about to wake take over these very claims. `holderAlive` judges a pod that is
+    still terminating to be alive, so a continuation that came too soon would be refused the
+    workspace it exists to continue in. Without task volumes nothing waits on them, and the
+    delete is fire-and-forget.
+
+    Best effort, like the retention sweep: a cluster that cannot be reached here is logged, and
+    the pods fall back to `activeDeadlineSeconds`. -/
+def reclaim (cfg : Config) : IO Unit := do
+  try
+    let selector := instanceSelector cfg
+    let (code, out, err) ← kube cfg #["get", "pods", "-l", selector, "-o", "name"]
+    if code != 0 then
+      IO.eprintln s!"  [k8s] could not list leftover pods ({selector}): {err.trimAscii}"
+      return
+    let pods := (out.splitOn "\n").map (·.trimAscii.toString) |>.filter (!·.isEmpty)
+    if pods.isEmpty then
+      IO.println s!"  [k8s] no pods left over from a previous daemon ({cfg.inst})"
+      return
+    IO.println s!"  [k8s] removing {pods.length} pod(s) left over from a previous daemon \
+({cfg.inst}): {String.intercalate ", " pods}"
+    let waitArgs := if cfg.taskVolumes.isSome then #["--timeout=120s"] else #["--wait=false"]
+    let (dc, _, derr) ← kube cfg (#["delete", "pods", "-l", selector, "--now",
+      "--ignore-not-found"] ++ waitArgs)
+    if dc != 0 then
+      IO.eprintln s!"  [k8s] could not remove every leftover pod: {derr.trimAscii}"
+  catch e =>
+    IO.eprintln s!"  [k8s] could not remove leftover pods: {e}"
+
 /-- Kubernetes as an execution backend. -/
 def factory : BackendFactory where
   name := "kubernetes"
@@ -1565,6 +1655,7 @@ def factory : BackendFactory where
       mcpEndpoint := fun e => pure { e with host := cfg.mcpHost }
       preflight := preflight cfg
       persistentWorkspaces := cfg.taskVolumes.isSome
+      reclaim := reclaim cfg
       openSession := openSession cfg }
 
 end Orchestra.Exec.Kubernetes

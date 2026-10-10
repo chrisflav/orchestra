@@ -224,8 +224,9 @@ def run (cfg : Config) : IO UInt32 := do
   let pid ← Queue.ownPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
-  -- Startup cleanup
-  Queue.markStaleRunningAsUnfinished
+  -- Startup cleanup. The entries swept here are kept: they are the tasks this restart
+  -- interrupted, which `Queue.resumeInterrupted` below may pick up again.
+  let swept ← Queue.markStaleRunningAsUnfinished
   Queue.cancelStaleConcertEntries
   Queue.cancelStaleRunningConcerts
   -- After the entry sweeps, not before: the sweep is what makes the entries of the last
@@ -259,6 +260,25 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   if !slotsHoldTrees then
     IO.println "Execution backend keeps task workspaces itself; clone slots only count tasks."
     Repo.sweepTaskDirs
+  -- What the last daemon left running on the execution backend — pods, for kubernetes — goes
+  -- now, after the sweeps and before anything of this daemon exists: no worker has started and
+  -- no interactive session has been opened, so everything the backend finds is a leftover. With
+  -- task volumes it is also what lets the resumes queued next take their workspace back, which
+  -- `acquireWorkspaceClaim` refuses while a holder's pod is alive. Best effort: a backend that
+  -- cannot be reached here costs capacity until the pods' own deadline, not a daemon that will
+  -- not start.
+  try Exec.reclaim appConfig.execution
+  catch e => IO.eprintln s!"Could not clean up after the previous daemon: {e}"
+  -- Tasks this restart interrupted, picked up again where they stopped (`Queue.resumeEntryFor`
+  -- says which qualify). Only where the conversation and the tree it is about outlive the run —
+  -- on a backend that keeps workspaces; elsewhere a slot may have been reset under them, and
+  -- the entries stay `unfinished` for `orchestra queue retry` as before. Queued before the
+  -- workers start so they are claimed in the usual order, with nothing special about them
+  -- beyond the prompt.
+  if appConfig.queue.resumeAfterRestart && !slotsHoldTrees && !swept.isEmpty then
+    let resumed ← Queue.resumeInterrupted swept
+    if resumed > 0 then
+      IO.println s!"Queued {resumed} continuation(s) of tasks the restart interrupted."
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
   -- Every task running right now and the token that stops it (one row per worker), which is

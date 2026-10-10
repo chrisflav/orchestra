@@ -1001,6 +1001,14 @@ of its own.")
         (additionalPaths := appConfig.additionalSandboxPaths)
         (interactiveAgent := interactiveAgent) (goal := ioTask.goal) (session := session)
         (mcpToken := mcpToken) (kleis := kleisLaunch)
+        -- Written while the run is still `running`, as soon as the agent names its conversation.
+        -- The save after the loop is the one that normally lands it, but a task whose daemon is
+        -- killed mid-run never reaches that save, and a record with no session id is one that
+        -- `orchestra queue retry` and the daemon's restart resume (`Queue.resumeEntryFor`) can
+        -- only start over from a clean checkout. Status stays `running`: only the end of the run
+        -- knows the verdict, and the startup sweep turns a stranded `running` into `unfinished`.
+        (onSessionId := fun sid =>
+          TaskStore.saveTask { initialRecord with sessionId := some sid, status := .running })
       IO.println s!"  Agent exited with code {result.exitCode}"
       sessionId := result.sessionId
       lastResultSubtype := result.resultSubtype

@@ -56,6 +56,17 @@ def keepsWorkspaces (cfg : ExecutionConfig) : Bool :=
     | .ok b    => b.persistentWorkspaces
     | .error _ => false
 
+/-- Run `cfg`'s backend's startup cleanup (`Backend.reclaim`): remove what a previous daemon left
+    running. Built from the options alone, like `keepsWorkspaces`, and without `preflight` — a
+    backend that cannot be used here has nothing to clean up that this could reach, and its
+    tasks will say why when they fail. A configuration that does not parse is skipped quietly
+    for the same reason. -/
+def reclaim (cfg : ExecutionConfig) : IO Unit := do
+  let some f := factoryOf? cfg.backend | return
+  match f.make cfg.options with
+  | .ok b    => b.reclaim
+  | .error _ => pure ()
+
 /-- Where the MCP server should listen for `backend`'s agents — address and, if it matters, which
     ports it may use — and the token it should demand.
 

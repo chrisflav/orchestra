@@ -249,6 +249,22 @@ structure Backend where
       ends. The queue then stops pinning a continuation to its predecessor's slot, and the task
       runner prepares a checkout per task rather than resetting a pooled one. -/
   persistentWorkspaces : Bool := false
+  /-- Remove whatever a previous daemon with this configuration left running, and say nothing
+      about the work that was in it — that is the queue's business, and the startup sweep has
+      already marked it `unfinished`.
+
+      Called once, by the queue daemon at startup, after the stale-entry sweeps and before the
+      first worker or interactive session exists: everything this backend could find at that
+      moment belongs to a process that is gone. A backend whose environments die with the
+      process that started them (landrun, local: they are child processes) has nothing to do,
+      which is the default. One that runs them somewhere that outlives the daemon — pods — would
+      otherwise leave them holding capacity, and, for the kubernetes backend, holding the
+      workspace claim a continuation of the same task needs (`acquireWorkspaceClaim`).
+
+      Must not throw for an ordinary failure to reach the place: the daemon logs and carries on,
+      since leftovers that were not removed are a nuisance and a daemon that would not start is an
+      outage. -/
+  reclaim : IO Unit := pure ()
   /-- Open an environment for one task. -/
   openSession : SessionSpec → IO Session
 

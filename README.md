@@ -248,6 +248,13 @@ The `queue` block sets how many tasks the daemon runs at once. Both keys default
 to `1`, which is the serial behaviour, and `orchestra queue start --parallel N` /
 `--parallel-per-repo N` override them for a single run.
 
+`resume_after_restart` (default `true`) is the third key: when the daemon starts, each task the
+previous daemon was killed in the middle of is queued again as a continuation of itself — same
+conversation, same working tree, with a prompt telling the agent what happened — as long as the
+execution backend keeps task workspaces (the kubernetes backend with `task_volumes`). Elsewhere
+such tasks stay `unfinished` for `orchestra queue retry`. See
+[docs/kubernetes.md](docs/kubernetes.md#operating-it).
+
 `parallel_per_repo` is capped separately because concurrent tasks on the same
 repository each need their own clone — a *slot* — so that two agents can create
 the same branch name without git refusing. Raising it costs one working tree per

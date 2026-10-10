@@ -867,4 +867,43 @@ def theBackendListNamesKubernetes : Test := do
   | none   => TestM.fail "kubernetes is not registered"
   | some f => TestM.assert (!f.summary.isEmpty) "and it says what it is in the unknown-name error"
 
+
+-- The instance label, and what a starting daemon removes
+
+private def podLabels (cfg : Config) : Option Json :=
+  (podManifest cfg sampleSession "orchestra-abc123" (imageOf cfg sampleSession)
+      (stagedPaths cfg "/home/daemon" sampleSession)).getObjVal? "metadata" |>.toOption
+    |>.bind (·.getObjVal? "labels" |>.toOption)
+
+@[test]
+def everyPodSaysWhichDaemonItBelongsTo : Test := do
+  TestM.assertEqual (config).inst "default" (msg := "one daemon per namespace needs nothing set")
+  let c := config [("instance", .str "prod-a")]
+  TestM.assertEqual c.inst "prod-a" (msg := "instance is read through")
+  match podLabels c with
+  | none => TestM.fail "the pod has no labels"
+  | some ls =>
+    TestM.assertEqual (ls.getObjValAs? String instanceLabel |>.toOption) (some "prod-a")
+      (msg := "the pod carries its daemon's instance")
+    TestM.assertEqual (ls.getObjValAs? String "app.kubernetes.io/managed-by" |>.toOption)
+      (some "orchestra") (msg := "and is still orchestra's")
+
+@[test]
+def startupRemovesOnlyThisDaemonsPods : Test := do
+  TestM.assertEqual (instanceSelector (config [("instance", .str "prod-a")]))
+    "app.kubernetes.io/managed-by=orchestra,orchestra.dev/instance=prod-a"
+    (msg := "both halves: orchestra's pods, and of them only this daemon's")
+  TestM.assertEqual (instanceSelector (config))
+    "app.kubernetes.io/managed-by=orchestra,orchestra.dev/instance=default"
+
+@[test]
+def anInstanceHasToBeALabelValue : Test := do
+  for bad in [Json.str "", .str "a/b", .str "-lead", .str "trail.", .str "has space",
+              .str (String.ofList (List.replicate 64 'a')), .num 3] do
+    match Config.fromJson (options [("instance", bad)]) with
+    | .ok c    => TestM.fail s!"instance {bad.compress} was accepted as {c.inst}"
+    | .error e => TestM.assert (AgentDef.containsCI e "instance") "the error names the key"
+  for good in ["a", "prod-a", "team_1.blue", String.ofList (List.replicate 63 'a')] do
+    TestM.assert (validLabelValue good) s!"{good} is a label value"
+
 end OrchestraTest.Kubernetes

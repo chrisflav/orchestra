@@ -1000,11 +1000,166 @@ def markTaskUnfinished (taskId : String) : IO Bool := do
 def shouldReap (liveEntryIds : Array String) (entry : QueueEntry) : Bool :=
   entry.status == .running && !liveEntryIds.contains entry.id
 
-/-- On daemon startup, mark any entries stuck in 'running' state as unfinished.
-    These are left over from a previous daemon that was killed mid-task. -/
-def markStaleRunningAsUnfinished : IO Unit := do
+/-- On daemon startup, mark any entries stuck in 'running' state as unfinished, and answer them
+    (as now written). These are left over from a previous daemon that was killed mid-task; the
+    answer is what `resumeEntryFor` is offered, since an entry this sweep did not touch was not
+    interrupted by *this* restart and is not the restart's to pick up. -/
+def markStaleRunningAsUnfinished : IO (Array QueueEntry) := do
+  let mut swept := #[]
   for entry in ← runningEntries do
-    saveEntry { entry with status := .unfinished }
+    let e := { entry with status := .unfinished }
+    saveEntry e
+    swept := swept.push e
+  return swept
+
+/-! ## Resuming after a restart
+
+A deploy drains the daemon and then kills it, and a task still running at that moment loses its
+agent mid-sentence. With a backend that keeps workspaces nothing else is lost: the tree, `$HOME`
+and the agent's conversation are on the task's volume, and the session id is on the task record
+from the moment the agent announced it. So the new daemon queues the continuation a person would
+have queued — same work, same settings, `continuesFrom` the dead run — with a prompt that tells
+the agent what happened. -/
+
+/-- The first line of every prompt a restart resume is queued with. It is how a resume is told
+    apart from a continuation somebody asked for (`restartResumeDepth`), so it is never reworded
+    without keeping the old spelling recognised. -/
+def restartResumeMarker : String := "[orchestra: resumed after a daemon restart]"
+
+/-- The prompt a restart resume is queued with: the next user message in the resumed
+    conversation. It says nothing about the task itself, which the conversation already holds. -/
+def restartResumePrompt : String :=
+  restartResumeMarker ++ "\n\n" ++
+  "The orchestra daemon was restarted while you were working on this task, and your previous \
+run was stopped part-way through — possibly in the middle of a command or an edit. This is the \
+same conversation, in the same working tree and home directory as before.\n\n\
+Before carrying on, check where things actually stand rather than relying on what you last \
+remember: look at the working tree (`git status`, `git log`, any half-written files), whether a \
+command you started may have been cut off, and whether a pull request or comment you meant to \
+create already exists. Then continue where you left off and finish the task."
+
+/-- Whether `prompt` is one a restart resume was queued with. -/
+def isRestartResumePrompt (prompt : String) : Bool :=
+  prompt.startsWith restartResumeMarker
+
+/-- How many restart resumes in a row a chain may get. A task that is killed by this many
+    restarts running is more likely the cause than the victim — one that hangs every drain, or
+    whose agent brings the daemon down — and resuming it at every start would keep that going
+    forever. Past this it is left `unfinished` for somebody to look at. -/
+def maxRestartResumes : Nat := 3
+
+/-- How many restart resumes end a chain whose prompts, newest run first, are `prompts`: the
+    unbroken run of them at the head. A continuation somebody queued by hand breaks the run, and
+    the count starts again behind it — that person has looked at the task. -/
+def restartResumeRun (prompts : List String) : Nat :=
+  (prompts.takeWhile isRestartResumePrompt).length
+
+/-- The prompts of the chain ending in task `taskId`, newest first, following `continuesFrom`
+    through the task records. Stops after `limit` records (only the head of the chain is ever
+    asked about) and at a record that is missing or already seen. -/
+def chainPrompts (taskId : String) (limit : Nat := maxRestartResumes + 1) : IO (List String) := do
+  let mut out : Array String := #[]
+  let mut seen : Array String := #[]
+  let mut cur := some taskId
+  for _ in [0:limit] do
+    let some tid := cur | break
+    if seen.contains tid then break
+    seen := seen.push tid
+    let some r ← TaskStore.loadTask tid | break
+    out := out.push r.prompt
+    cur := r.continuesFrom
+  return out.toList
+
+/-- The continuation to queue for `entry`, interrupted by a restart, whose run is `record` — or
+    `none` when it is not one to resume. `run` is `restartResumeRun` of the chain ending in
+    `record` (it counts `entry`'s own prompt, so an entry that is itself a resume counts).
+
+    Resumed only when everything a resume needs is there: the entry is `unfinished` and its run is
+    `record` and was left `unfinished` too; the agent got as far as naming its conversation; the
+    entry is not a concert step, whose fiber died with the daemon and which the startup sweep has
+    already cancelled; and the chain has not been resumed `maxRestartResumes` times in a row.
+
+    The new entry is the same work by the same somebody, as `orchestra queue retry` builds it, and
+    a little more of it — the issue, project, role and tool settings too, since a resume is not a
+    new decision about any of them. Deliberately not carried:
+
+    * `authSource` and `resolvedAuthSource`. Resolved afresh at claim, so a resume is not pinned
+      to the account the dead run happened to land on, which may be the one at its limit now.
+    * `prependPrompt`. It was prepended to the first message of this conversation already;
+      sending it again in the middle would read as a new instruction.
+    * `spawnPolicy` and `spawnedBy`, for the reason `spawnPolicy` gives: a continuation that carried
+      them would take a fresh allowance, or spend the spawner's.
+    * The concert fields, the slot, the task id and the output, which belong to the dead run. -/
+def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (run : Nat)
+    (id createdAt : String) : Option QueueEntry := do
+  guard (entry.status == .unfinished)
+  guard (entry.taskId == some record.id)
+  guard (record.status == .unfinished)
+  guard record.sessionId.isSome
+  guard entry.concertStepKey.isNone
+  guard (run < maxRestartResumes)
+  return {
+    id, createdAt
+    repo          := entry.repo
+    mode          := entry.mode
+    prompt        := restartResumePrompt
+    goal          := entry.goal
+    agent         := entry.agent
+    systemPrompt  := entry.systemPrompt
+    backend       := entry.backend
+    model         := entry.model
+    continuesFrom := some record.id
+    series        := entry.series
+    configPath    := entry.configPath
+    budget        := entry.budget
+    memory        := entry.memory
+    identity      := entry.identity
+    authSources   := entry.authSources
+    authMode      := entry.authMode
+    tools         := entry.tools
+    readOnly      := entry.readOnly
+    priority      := entry.priority
+    inputType     := entry.inputType
+    outputType    := entry.outputType
+    inputJson     := entry.inputJson
+    issueNumber   := entry.issueNumber
+    projectId     := entry.projectId
+    issueId       := entry.issueId
+    role          := entry.role
+    prLabels      := entry.prLabels
+    triageAddLabels    := entry.triageAddLabels
+    triageRemoveLabels := entry.triageRemoveLabels
+    listenerName  := entry.listenerName
+    scopeRoot     := entry.scopeRoot }
+
+/-- Queue a restart resume (`resumeEntryFor`) for each entry the startup sweep just turned
+    `unfinished`, and answer how many were queued. The caller decides whether to call this at
+    all: only with `queue.resume_after_restart` on and a backend that keeps workspaces, since
+    anywhere else the tree the conversation is about is not guaranteed to be there.
+
+    Per entry and best effort: one whose record cannot be read is logged and left `unfinished`,
+    as it would have been without this. -/
+def resumeInterrupted (swept : Array QueueEntry) : IO Nat := do
+  let mut queued := 0
+  for entry in swept do
+    try
+      let some tid := entry.taskId | continue
+      let some record ← TaskStore.loadTask tid | continue
+      let run := restartResumeRun (← chainPrompts tid)
+      let id ← TaskStore.generateId
+      let createdAt ← TaskStore.currentIso8601
+      match resumeEntryFor entry record run id createdAt with
+      | some e =>
+        saveEntry e
+        queued := queued + 1
+        IO.println s!"  Resuming interrupted entry {entry.id} (task {tid}) as {e.id}"
+      | none =>
+        if record.sessionId.isSome && entry.concertStepKey.isNone && run ≥ maxRestartResumes then
+          IO.println s!"  Not resuming entry {entry.id} (task {tid}): already resumed after \
+{run} restarts in a row"
+    catch e =>
+      IO.eprintln s!"  Could not resume interrupted entry {entry.id}: {e}"
+  return queued
 
 /-- Bring task records back in line with the entries that own them, and answer how many needed it.
 
