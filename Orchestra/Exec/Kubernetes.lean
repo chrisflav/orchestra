@@ -238,21 +238,16 @@ structure Config where
       `$HOME`, and keep it after the pod is gone. See `TaskVolumes`. -/
   taskVolumes : Option TaskVolumes := none
   /-- Which daemon's pods these are: the value of `instanceLabel` on every pod this backend
-      creates, and what `reclaim` selects on when a daemon starts and removes what the last one
-      left behind.
-
-      A pod outlives the daemon that made it — its PID 1 is a sleep loop, and only
-      `activeDeadlineSeconds` ever ends it on its own — so a daemon killed mid-task leaves pods
-      that hold namespace quota for hours and, with task volumes, the workspace claim a
-      continuation of the same task is refused for (`acquireWorkspaceClaim`). At startup nothing
-      of the new daemon runs yet, so every pod carrying its instance is a leftover; the label is
-      what makes "every pod" mean *this daemon's* and not every orchestra pod in the namespace.
+      creates. Informational — for an operator listing one daemon's pods by hand
+      (`instanceSelector`), or a dashboard grouping them — and deliberately *not* what `reclaim`
+      decides by: a label every unconfigured daemon sets to the same `default` would let one
+      daemon's start remove another's working pods. `reclaim` asks the daemon's own database
+      instead, which knows exactly which ids are its own.
 
       `default` unless configured. Not derived from anything on the daemon's machine — a
       containerised daemon's paths and hostname are the same in every container, or new in every
-      one, and neither is what "the same daemon" means across a restart. One daemon per namespace
-      is the usual deployment, and needs nothing here; two daemons sharing a namespace must set
-      different values, or each one's start removes the other's running pods. -/
+      one, and neither is what "the same daemon" means across a restart. Two daemons sharing a
+      namespace are best told apart here, though nothing depends on it. -/
   inst : String := "default"
 deriving Inhabited
 
@@ -272,9 +267,10 @@ def validLabelValue (s : String) : Bool :=
 /-- The label naming the daemon a pod belongs to (`Config.inst`). -/
 def instanceLabel : String := "orchestra.dev/instance"
 
-/-- The selector for every pod this daemon's configuration creates, tasks and interactive sessions
-    alike: what `reclaim` removes at startup. Both halves, because `managed-by` alone is every
-    orchestra in the namespace and `instance` alone is a label someone else may use too. -/
+/-- The selector for every pod this daemon's configuration created, tasks and interactive sessions
+    alike, for looking them up by hand. Both halves, because `managed-by` alone is every orchestra
+    in the namespace and `instance` alone is a label someone else may use too. Not what `reclaim`
+    removes by; see `Config.inst`. -/
 def instanceSelector (cfg : Config) : String :=
   s!"app.kubernetes.io/managed-by=orchestra,{instanceLabel}={cfg.inst}"
 
@@ -376,8 +372,8 @@ a plain path inside the checkout"
     | .ok other => throw s!"kubernetes: execution.options.task_volumes must be an object, not \
 {other.compress}"
   -- Validated rather than passed through `labelValue`: two daemons configured with `a/b` and
-  -- `a.b` would otherwise both run as `a.b` and remove each other's pods at every start, and
-  -- nothing in either log would say why.
+  -- `a.b` would otherwise both label their pods `a.b`, and a value that is not the one written
+  -- in the configuration is no use to an operator selecting by it.
   let inst ← match j.getObjVal? "instance" with
     | .error _      => pure "default"
     | .ok (.str s)  =>
@@ -1636,17 +1632,32 @@ persistentvolumeclaims in namespace '{cfg.ns}' ({(out ++ err).trimAscii}). It ne
 get/list/create/patch/delete on persistentvolumeclaims as well as what pods need."
   return .ok ()
 
-/-- Remove every pod a previous daemon with this configuration left behind (`Backend.reclaim`).
+/-- Pods as `reclaim` lists them: `<name>\t<orchestra.dev/task>` per line, the second empty for a
+    pod without the label. Lines that are neither are dropped. -/
+def parsePodTasks (out : String) : List (String × String) :=
+  (out.splitOn "\n").filterMap fun line =>
+    match line.splitOn "\t" with
+    | [n, t] =>
+      let n := n.trimAscii.toString
+      if n.isEmpty then none else some (n, t.trimAscii.toString)
+    | _ => none
 
-    Called at startup, before the first worker or interactive session exists, so every pod carrying
-    this daemon's instance (`instanceSelector`) belongs to a process that is gone: queued tasks
-    whose agents died with their `kubectl exec` streams, mergers, and interactive sessions — whose
-    records `Interactive.reconcile` puts to sleep a moment later, and whose next turn opens a new
-    pod on the same claim (and would remove a leftover of its own anyway: see the `ownHold` case
-    of `acquireWorkspaceClaim`). Nothing in them is lost by removing them. With task volumes the
-    tree and the conversation are on the claim, not in the pod; without them the pod's `emptyDir`
-    held the only copy of what the agent did since the last sync, and no daemon can reach it again
-    either way.
+/-- Remove every pod a previous daemon left behind (`Backend.reclaim`).
+
+    Every pod `app.kubernetes.io/managed-by=orchestra` in the namespace is a candidate, whatever
+    its `orchestra.dev/instance` — or none, for pods a version that did not set it created — and
+    `isLeftover` decides each one by its `orchestra.dev/task` label: removed only if this daemon's
+    own database knows that task or session and does not have it running. So the instance label
+    is not what protects another daemon's pods; their ids are not in this database. A pod without
+    a task label is never removed.
+
+    What this removes, then: queued tasks whose agents died with their `kubectl exec` streams,
+    and interactive sessions — which `Interactive.reconcile` has just put to sleep, and whose next
+    turn opens a new pod on the same claim (and would remove a leftover of its own anyway: see the
+    `ownHold` case of `acquireWorkspaceClaim`). Nothing in them is lost by removing them. With task
+    volumes the tree and the conversation are on the claim, not in the pod; without them the pod's
+    `emptyDir` held the only copy of what the agent did since the last sync, and no daemon can
+    reach it again either way.
 
     Waited for with task volumes, as `removePod` waits: the pod's agent may outlive the stream
     that started it, and the continuations the daemon is about to queue (`Queue.resumeEntryFor`)
@@ -1655,24 +1666,29 @@ get/list/create/patch/delete on persistentvolumeclaims as well as what pods need
     workspace it exists to continue in. Without task volumes nothing waits on them, and the
     delete is fire-and-forget.
 
-    Best effort, like the retention sweep: a cluster that cannot be reached here is logged, and
-    the pods fall back to `activeDeadlineSeconds`. -/
-def reclaim (cfg : Config) : IO Unit := do
+    Every call carries a request timeout, so an API server that does not answer cannot hold the
+    daemon's start. Best effort, like the retention sweep: a cluster that cannot be reached here
+    is logged, and the pods fall back to `activeDeadlineSeconds`. -/
+def reclaim (cfg : Config) (isLeftover : String → IO Bool) : IO Unit := do
   try
-    let selector := instanceSelector cfg
-    let (code, out, err) ← kube cfg #["get", "pods", "-l", selector, "-o", "name"]
+    let (code, out, err) ← kube cfg #["--request-timeout=30s", "get", "pods", "-l",
+      "app.kubernetes.io/managed-by=orchestra", "-o",
+      "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.metadata.labels.orchestra\\.dev/task}{\"\\n\"}{end}"]
     if code != 0 then
-      IO.eprintln s!"  [k8s] could not list leftover pods ({selector}): {err.trimAscii}"
+      IO.eprintln s!"  [k8s] could not list orchestra's pods: {err.trimAscii}"
       return
-    let pods := (out.splitOn "\n").map (·.trimAscii.toString) |>.filter (!·.isEmpty)
-    if pods.isEmpty then
-      IO.println s!"  [k8s] no pods left over from a previous daemon ({cfg.inst})"
+    let mut leftovers : Array (String × String) := #[]
+    for (pod, task) in parsePodTasks out do
+      if task.isEmpty then continue
+      if ← isLeftover task then leftovers := leftovers.push (pod, task)
+    if leftovers.isEmpty then
+      IO.println "  [k8s] no pods left over from a previous daemon"
       return
-    IO.println s!"  [k8s] removing {pods.length} pod(s) left over from a previous daemon \
-({cfg.inst}): {String.intercalate ", " pods}"
+    IO.println s!"  [k8s] removing {leftovers.size} pod(s) left over from a previous daemon: \
+{String.intercalate ", " (leftovers.toList.map fun (p, t) => s!"{p} ({t})")}"
     let waitArgs := if cfg.taskVolumes.isSome then #["--timeout=120s"] else #["--wait=false"]
-    let (dc, _, derr) ← kube cfg (#["delete", "pods", "-l", selector, "--now",
-      "--ignore-not-found"] ++ waitArgs)
+    let (dc, _, derr) ← kube cfg (#["--request-timeout=30s", "delete", "pod"]
+      ++ leftovers.map (·.1) ++ #["--now", "--ignore-not-found"] ++ waitArgs)
     if dc != 0 then
       IO.eprintln s!"  [k8s] could not remove every leftover pod: {derr.trimAscii}"
   catch e =>

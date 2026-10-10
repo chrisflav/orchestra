@@ -205,6 +205,33 @@ Marked unfinished.")
     IO.eprintln s!"Socket request error: {e}"
   try conn.close catch _ => pure ()
 
+/-- Whether an execution environment opened for some id is a leftover a starting daemon may
+    remove (`Backend.reclaim`), from what this daemon's database says about the id: the status of
+    the task record by that id, and of the interactive session by that id, either of which may be
+    missing.
+
+    Only an id the database knows and has *stopped* is one: a task record that is not `running`
+    (the startup sweep and `reconcileStaleTaskRecords` have already turned the killed ones
+    `unfinished`), or a session that is dormant or over (`Interactive.reconcile` has put every live
+    one to sleep). An id it does not know is someone else's — another daemon with another
+    database, a backend's own helper — and a record still `running` is a run some process is
+    doing, an `orchestra run` in the foreground most likely, since nothing reconciles those.
+    Either is left alone. -/
+def isLeftoverStatus (task : Option TaskStore.TaskStatus)
+    (session : Option Interactive.SessionStatus) : Bool :=
+  match task, session with
+  | some t, _    => t != .running
+  | none, some s => s == .dormant || s.isTerminal
+  | none, none   => false
+
+/-- `isLeftoverStatus`, for the id as the database has it. An id that cannot even be looked up — a
+    session id must look like one before the store will query it — is unknown, and kept. -/
+def isLeftover (id : String) : IO Bool := do
+  let task ← try (·.map (·.status)) <$> TaskStore.loadTask id catch _ => pure none
+  let session ← if task.isSome then pure none else
+    try (·.map (·.status)) <$> Interactive.loadSession id catch _ => pure none
+  return isLeftoverStatus task session
+
 /-- Run the queue daemon in the foreground until it is asked to stop, and exit the process.
 
     Does not return: a graceful shutdown ends in `IO.Process.exit 0` once the last in-flight task
@@ -224,9 +251,9 @@ def run (cfg : Config) : IO UInt32 := do
   let pid ← Queue.ownPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
-  -- Startup cleanup. The entries swept here are kept: they are the tasks this restart
-  -- interrupted, which `Queue.resumeInterrupted` below may pick up again.
-  let swept ← Queue.markStaleRunningAsUnfinished
+  -- Startup cleanup. The entries swept here are recorded (`Queue.interruptedFile`): they are the
+  -- tasks this restart interrupted, which `Queue.resumeInterrupted` below may pick up again.
+  let _ ← Queue.markStaleRunningAsUnfinished
   Queue.cancelStaleConcertEntries
   Queue.cancelStaleRunningConcerts
   -- After the entry sweeps, not before: the sweep is what makes the entries of the last
@@ -260,25 +287,6 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   if !slotsHoldTrees then
     IO.println "Execution backend keeps task workspaces itself; clone slots only count tasks."
     Repo.sweepTaskDirs
-  -- What the last daemon left running on the execution backend — pods, for kubernetes — goes
-  -- now, after the sweeps and before anything of this daemon exists: no worker has started and
-  -- no interactive session has been opened, so everything the backend finds is a leftover. With
-  -- task volumes it is also what lets the resumes queued next take their workspace back, which
-  -- `acquireWorkspaceClaim` refuses while a holder's pod is alive. Best effort: a backend that
-  -- cannot be reached here costs capacity until the pods' own deadline, not a daemon that will
-  -- not start.
-  try Exec.reclaim appConfig.execution
-  catch e => IO.eprintln s!"Could not clean up after the previous daemon: {e}"
-  -- Tasks this restart interrupted, picked up again where they stopped (`Queue.resumeEntryFor`
-  -- says which qualify). Only where the conversation and the tree it is about outlive the run —
-  -- on a backend that keeps workspaces; elsewhere a slot may have been reset under them, and
-  -- the entries stay `unfinished` for `orchestra queue retry` as before. Queued before the
-  -- workers start so they are claimed in the usual order, with nothing special about them
-  -- beyond the prompt.
-  if appConfig.queue.resumeAfterRestart && !slotsHoldTrees && !swept.isEmpty then
-    let resumed ← Queue.resumeInterrupted swept
-    if resumed > 0 then
-      IO.println s!"Queued {resumed} continuation(s) of tasks the restart interrupted."
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
   -- Every task running right now and the token that stops it (one row per worker), which is
@@ -363,6 +371,31 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   -- Sessions on disk describe agent processes that died with the last daemon. Closed before
   -- anything can read them, so a client never attaches to a conversation that will not answer.
   Interactive.reconcile
+  -- What the last daemon left running on the execution backend — pods, for kubernetes — goes
+  -- now: after the sweeps and `Interactive.reconcile`, so every run and session this database
+  -- knows of has stopped being `running`, and before the first worker or session of this daemon
+  -- exists. A leftover is decided by this database alone (`isLeftover`): an id it knows and
+  -- does not have running. With task volumes it is also what lets the resumes queued next take
+  -- their workspace back, which `acquireWorkspaceClaim` refuses while a holder's pod is alive.
+  -- Best effort: a backend that cannot be reached here costs capacity until the pods' own
+  -- deadline, not a daemon that will not start.
+  try Exec.reclaim appConfig.execution isLeftover
+  catch e => IO.eprintln s!"Could not clean up after the previous daemon: {e}"
+  -- Tasks a restart interrupted, picked up again where they stopped (`Queue.resumeEntryFor`
+  -- says which qualify). Only where the conversation and the tree it is about outlive the run —
+  -- on a backend that keeps workspaces; elsewhere a slot may have been reset under them, and
+  -- the entries stay `unfinished` for `orchestra queue retry` as before. Queued before the
+  -- workers start so they are claimed in the usual order, with nothing special about them
+  -- beyond the prompt. Read from what the sweep recorded (`Queue.interruptedFile`), so a daemon
+  -- that died between its sweep and here leaves the list to this one.
+  if appConfig.queue.resumeAfterRestart && !slotsHoldTrees then
+    let resumed ← Queue.resumeInterrupted appConfig.execution (← Usage.nowEpoch)
+    if resumed > 0 then
+      IO.println s!"Queued {resumed} continuation(s) of tasks the restart interrupted."
+  else
+    -- Nothing will be resumed under this configuration, so the list is not kept for a later
+    -- start that might: by then those runs are not the restart's to pick up.
+    Queue.clearInterrupted
   -- Socket server: receives control requests (add_task, add_concert, cancel, shutdown).
   let socketPath ← Queue.socketFile
   try Utils.UnixSocket.Server.unlink socketPath catch _ => pure ()

@@ -612,7 +612,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | none =>
         IO.eprintln s!"  Warning: task '{prevId}' not found, ignoring --continues"
         pure none
-      | some prev => pure prev.sessionId
+      -- Its own session, or — for a restart resume killed before its agent named one — the
+      -- conversation that resume was itself picking up (`Queue.sessionFor`).
+      | some _ => Queue.sessionFor prevId
   -- Diagnostic block: surface the context the agent is starting with so the
   -- daemon log shows project/issue/series/resume info without having to grep
   -- the per-task .log file. Kept compact: prompt is dumped verbatim, but the
@@ -815,7 +817,13 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     continuesFrom := if persistent then continuesFrom else none
     -- A restart resume is recognised by the prompt it was queued with — the same marker the
     -- chain guard counts by — since nothing else about the entry reaches this far. Its
-    -- predecessor is known dead: the daemon swept it at startup and removed its pods.
+    -- predecessor is known dead: the daemon swept it at startup and removed its pods. A
+    -- `queue retry` of a resume copies the marker and is treated the same, which is harmless:
+    -- its predecessor is an `unfinished` run nothing is executing.
+    --
+    -- The workspace is still looked up by the predecessor's own label, even when the session
+    -- comes from further back (`Queue.sessionFor`): a resume killed before it took the claim
+    -- never labelled it, and its own resume then fails naming the missing volume.
     predecessorDead := persistent && continuesFrom.isSome && Queue.isRestartResumePrompt ioTask.prompt
     seedDir
     cancelled := match cancelToken with

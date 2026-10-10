@@ -533,20 +533,27 @@ newline cannot end its own assignment.
 **Orphans.** The pod is deleted when the task ends, including when it fails or is cancelled. A
 daemon that dies mid-task — a deploy that outlasts the drain and ends in `SIGKILL`, a crash —
 leaves one behind: its PID 1 is a sleep loop, so nothing in it ever ends on its own. The daemon that
-starts next removes them. Every pod carries `orchestra.dev/instance=<instance>` (the `instance`
-option, `default` unless set), and at startup — after the queue's own sweeps and before any worker
-or interactive session exists, so nothing found can be its own — the daemon deletes every pod
-labelled `app.kubernetes.io/managed-by=orchestra,orchestra.dev/instance=<instance>` and logs how
-many it found (`[k8s] removing N pod(s) left over from a previous daemon`). With `task_volumes` it
-waits for them to be gone (up to two minutes), because the continuations it is about to queue need
-their claims, and a claim whose holder's pod is still terminating is refused as in use. Interactive
-sessions' pods go too: their agents died with the old daemon's streams, the sessions come back
-dormant, and the next message starts a new pod on the same claim.
+starts next removes them. At startup — after the queue's own sweeps and before any worker or
+interactive session exists — it lists every pod labelled `app.kubernetes.io/managed-by=orchestra`
+in the namespace and removes those whose `orchestra.dev/task` label names a task or interactive
+session **its own database knows and does not have running**, logging each one
+(`[k8s] removing N pod(s) left over from a previous daemon`). Pods of another daemon (another
+database), of an `orchestra run` in the foreground (its record is still `running`), and pods without
+a task label are left alone; pods from versions that set no instance label are judged the same way
+as any other. With `task_volumes` it waits for them to be gone (up to
+two minutes), because the continuations it is about to queue need their claims, and a claim whose
+holder's pod is still terminating is refused as in use. Interactive sessions' pods go too: their
+agents died with the old daemon's streams, the sessions come back dormant, and the next message
+starts a new pod on the same claim. Every `kubectl` call this makes carries a 30-second request
+timeout, so an API server that does not answer cannot hold up the start.
 
-**Two daemons sharing a namespace must set different `instance` values**, or each one's start
-deletes the other's running pods. The same applies to a foreground `orchestra run` against the
-daemon's configuration: its pod is the daemon's instance too, and a daemon starting meanwhile
-removes it.
+Pods also carry `orchestra.dev/instance=<instance>` (the `instance` option, `default` unless set).
+It is informational — for listing one daemon's pods by hand — and not what the startup cleanup
+decides by. **Two daemons must not share a database**, and must not start against the same one at
+once: the startup sweep marks every run the database calls `running` as interrupted, so a second
+daemon starting would declare the first one's tasks dead and remove their pods. (`orchestra queue
+start` refuses to start a second daemon over the same data directory; this is about two
+deployments pointed at one database.)
 
 `activeDeadlineSeconds` (`deadline_seconds`, four hours by default, counted over the whole task)
 remains the backstop when no daemon starts again, and everything this backend creates carries
@@ -554,7 +561,7 @@ remains the backstop when no daemon starts again, and everything this backend cr
 
 ```sh
 kubectl -n orchestra get pod -l app.kubernetes.io/managed-by=orchestra,orchestra.dev/instance=default
-kubectl -n orchestra delete pod -l app.kubernetes.io/managed-by=orchestra,orchestra.dev/instance=default
+kubectl -n orchestra delete pod -l orchestra.dev/task=<task id>
 ```
 
 Pods are also labelled `orchestra.dev/task=<task id>`, so a running task can be found from its id
@@ -563,15 +570,26 @@ in the dashboard — and `kubectl exec` into for a look around while it works.
 **Restarts.** A task the restart interrupted is picked up again by itself when `task_volumes` is set
 and the `queue` block's `resume_after_restart` is on (the default). The task record holds the
 agent's session id from the moment the agent announces it, not only from when the task ends, so a
-killed run is resumable; the new daemon queues a continuation of it — same repository, model,
-identity, issue and settings, `continues_from` the killed task, its authentication source chosen
-afresh — whose prompt tells the agent the daemon restarted mid-task and to check the working tree
-before carrying on. The interrupted entry stays `unfinished`, and `orchestra queue retry` skips it
-now that something continues it. A chain is resumed at most three times in a row this way; a task
-killed by that many restarts is left `unfinished` for someone to look at. Concert steps are not
-resumed (their workflow died with the daemon), and neither is a task whose agent never got as far
-as starting a conversation. Without `task_volumes` nothing is resumed automatically: the tree the
-conversation was about is not guaranteed to be there.
+killed run is resumable. The startup sweep records the entries it interrupted (in
+`<data>/queue/interrupted`, so a daemon that dies during startup leaves the list to the next one),
+and the daemon queues a continuation of each — same repository, model, identity, issue, requested
+authentication source and settings, `continues_from` the killed task — whose prompt tells the agent
+the daemon restarted mid-task and to check the working tree before carrying on. The interrupted
+entry stays `unfinished`, and `orchestra queue retry` skips it while a continuation of it is
+pending, running or done. Each skip is logged with its reason. Not resumed:
+
+- a task whose agent never started a conversation — except that a resume killed before its agent
+  started falls back to the conversation it was itself resuming;
+- one something already continues (a series follow-up, a continuation queued by hand) that is
+  pending, running or done;
+- one that started more than 24 hours ago;
+- one whose `config_path` selects a different execution configuration than the daemon's;
+- concert steps, whose workflow died with the daemon;
+- a chain already resumed three times in a row; a task killed by that many restarts is left
+  `unfinished` for someone to look at.
+
+Without `task_volumes` nothing is resumed automatically: the tree the conversation was about is not
+guaranteed to be there.
 
 **A full quota.** A pod the namespace's `ResourceQuota` has no room for is not a failed task. The
 task logs `namespace … is at its quota; waiting for room` and retries every 15 seconds for up to ten
@@ -623,7 +641,7 @@ the cluster was actually asked for.
 | `startup_timeout_seconds` | `600` | how long to wait for the pod to be ready |
 | `sync_back` | `true` | whether the *checkout* is copied back out; memory directories always are |
 | `excludes` | `[]` | `tar --exclude` patterns, applied in both directions; excluded paths stay as they are in the daemon's checkout |
-| `instance` | `default` | value of the `orchestra.dev/instance` label on every pod; a starting daemon deletes the pods carrying its own, so two daemons in one namespace must differ. 1–63 of letters, digits, `.`, `_`, `-` |
+| `instance` | `default` | value of the `orchestra.dev/instance` label on every pod, for selecting one daemon's pods by hand; informational — the startup cleanup decides by the daemon's own database, not by this. 1–63 of letters, digits, `.`, `_`, `-` |
 
 ## keeping the MCP server to one namespace
 

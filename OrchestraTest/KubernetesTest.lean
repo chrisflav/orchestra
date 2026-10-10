@@ -889,12 +889,20 @@ def everyPodSaysWhichDaemonItBelongsTo : Test := do
       (some "orchestra") (msg := "and is still orchestra's")
 
 @[test]
-def startupRemovesOnlyThisDaemonsPods : Test := do
+def aDaemonsPodsCanBeSelectedByHand : Test := do
   TestM.assertEqual (instanceSelector (config [("instance", .str "prod-a")]))
     "app.kubernetes.io/managed-by=orchestra,orchestra.dev/instance=prod-a"
     (msg := "both halves: orchestra's pods, and of them only this daemon's")
   TestM.assertEqual (instanceSelector (config))
     "app.kubernetes.io/managed-by=orchestra,orchestra.dev/instance=default"
+
+/-- What the startup reclaim reads back from the cluster: every orchestra pod and the task it was
+    for, which the daemon's database then decides on. A pod with no task label (one of some other
+    tool's, or from before the label existed) comes back with an empty task and is never removed. -/
+@[test]
+def theReclaimReadsEachPodsTask : Test := do
+  TestM.assertEqual (parsePodTasks "orchestra-a1\tt-1\norchestra-b2\t\n\njunk\n")
+    [("orchestra-a1", "t-1"), ("orchestra-b2", "")]
 
 @[test]
 def anInstanceHasToBeALabelValue : Test := do
