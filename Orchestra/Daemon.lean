@@ -389,13 +389,17 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   -- beyond the prompt. Read from what the sweep recorded (`Queue.interruptedFile`), so a daemon
   -- that died between its sweep and here leaves the list to this one.
   if appConfig.queue.resumeAfterRestart && !slotsHoldTrees then
-    let resumed ← Queue.resumeInterrupted appConfig.execution (← Usage.nowEpoch)
-    if resumed > 0 then
-      IO.println s!"Queued {resumed} continuation(s) of tasks the restart interrupted."
+    -- Never at the cost of the start: a resume that cannot be decided leaves its entry
+    -- `unfinished`, which is where it was without this.
+    try
+      let resumed ← Queue.resumeInterrupted appConfig.execution (← Usage.nowEpoch)
+      if resumed > 0 then
+        IO.println s!"Queued {resumed} continuation(s) of tasks the restart interrupted."
+    catch e => IO.eprintln s!"Could not resume the tasks the restart interrupted: {e}"
   else
     -- Nothing will be resumed under this configuration, so the list is not kept for a later
     -- start that might: by then those runs are not the restart's to pick up.
-    Queue.clearInterrupted
+    try Queue.clearInterrupted catch _ => pure ()
   -- Socket server: receives control requests (add_task, add_concert, cancel, shutdown).
   let socketPath ← Queue.socketFile
   try Utils.UnixSocket.Server.unlink socketPath catch _ => pure ()

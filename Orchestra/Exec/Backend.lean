@@ -207,17 +207,27 @@ structure SessionSpec where
   /-- Whether a fresh workspace will do when `continuesFrom` has none left: for a chat session that
       is woken although its agent never started, so there is no conversation to lose. -/
   continuationOptional : Bool := false
-  /-- Whether the caller knows the run `continuesFrom` names is dead, rather than merely finished
-      or quiet: set for a restart resume (`Queue.resumeInterrupted`), whose predecessor the
-      starting daemon swept to `unfinished` and whose pods it removed (`Backend.reclaim`).
+  /-- Whether the caller knows the run `continuesFrom` names is over — its task record is no
+      longer `running`: it landed, or a startup sweep found it killed and its pods were removed
+      (`Backend.reclaim`). Covers every continuation of such a run alike: the daemon's own restart
+      resume (`Queue.resumeInterrupted`), a series follow-up or a continuation somebody queued.
 
       A backend that guards a kept workspace against a second agent may then judge the
       predecessor by what is actually running and nothing else. The kubernetes backend otherwise
       also counts a holder as alive for a while after it took the workspace, in case its pod is
-      still being created (`holderStillWorking`) — a grace that would refuse a resume of any task
-      killed within its first few minutes. Only ever relaxes that assumption about the
-      predecessor itself; a live pod still refuses. -/
+      still being created (`holderStillWorking`) — a grace that would refuse a continuation of
+      any task killed within its first few minutes. A run that is over will not create a pod, so
+      the grace has nothing to wait for. Only ever relaxes that assumption about the predecessor
+      (and `workspaceFallback`); a live pod still refuses. -/
   predecessorDead : Bool := false
+  /-- An earlier run of the same chain whose workspace to take when `continuesFrom` never took one,
+      and which is as over as `continuesFrom` is (set only with `predecessorDead`).
+
+      For a restart resume whose predecessor was itself a resume killed before its agent started:
+      the conversation then comes from further back (`Queue.sessionOwner`), and that killed resume
+      may not have got as far as its workspace either, so nothing is labelled with its id. The
+      workspace is then the one this run — the owner of the conversation — left. -/
+  workspaceFallback : Option String := none
   /-- Where the daemon keeps build output carried from one task chain to the next, for this
       repository. Read when a fresh workspace is filled, written when a task ends. -/
   seedDir : Option System.FilePath := none

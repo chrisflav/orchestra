@@ -549,11 +549,16 @@ timeout, so an API server that does not answer cannot hold up the start.
 
 Pods also carry `orchestra.dev/instance=<instance>` (the `instance` option, `default` unless set).
 It is informational — for listing one daemon's pods by hand — and not what the startup cleanup
-decides by. **Two daemons must not share a database**, and must not start against the same one at
-once: the startup sweep marks every run the database calls `running` as interrupted, so a second
-daemon starting would declare the first one's tasks dead and remove their pods. (`orchestra queue
-start` refuses to start a second daemon over the same data directory; this is about two
-deployments pointed at one database.)
+decides by. **Two daemons must never run against the same database at once** — not two
+deployments, and not an old and a new one overlapping during a rollout. The startup sweep marks
+every run the database calls `running` as interrupted, so a daemon starting while another is still
+working would declare that one's tasks dead, remove their pods and queue resumes of them beside
+the agents still running. `orchestra queue start` refuses a second daemon over the same data
+directory, but nothing checks a second deployment pointed at the same database. Restart by
+stopping the old daemon and only then starting the new one: the production setup — one container
+under systemd — does exactly that. A Kubernetes `Deployment` running the daemon needs
+`strategy: Recreate`; the default `RollingUpdate` starts the new pod before the old one has
+stopped.
 
 `activeDeadlineSeconds` (`deadline_seconds`, four hours by default, counted over the whole task)
 remains the backstop when no daemon starts again, and everything this backend creates carries
@@ -575,11 +580,14 @@ killed run is resumable. The startup sweep records the entries it interrupted (i
 and the daemon queues a continuation of each — same repository, model, identity, issue, requested
 authentication source and settings, `continues_from` the killed task — whose prompt tells the agent
 the daemon restarted mid-task and to check the working tree before carrying on. The interrupted
-entry stays `unfinished`, and `orchestra queue retry` skips it while a continuation of it is
-pending, running or done. Each skip is logged with its reason. Not resumed:
+entry stays `unfinished`, and `orchestra queue retry` offers only the newest link of a chain: an
+entry is skipped while a continuation of it is pending, running, done or itself `unfinished`
+(only a cancelled or failed one leaves it to be retried). Each skip is logged with its reason, and
+an entry whose decision failed with an error is kept for the next start. Not resumed:
 
 - a task whose agent never started a conversation — except that a resume killed before its agent
-  started falls back to the conversation it was itself resuming;
+  started falls back to the conversation it was itself resuming (and to that run's workspace, if
+  it never reached its own);
 - one something already continues (a series follow-up, a continuation queued by hand) that is
   pending, running or done;
 - one that started more than 24 hours ago;
@@ -590,6 +598,11 @@ pending, running or done. Each skip is logged with its reason. Not resumed:
 
 Without `task_volumes` nothing is resumed automatically: the tree the conversation was about is not
 guaranteed to be there.
+
+A continuation of a run that is over — its task record no longer `running`, as after the sweep —
+takes the workspace as soon as no pod of that run is up. This applies to these resumes and equally
+to a series follow-up or hand-queued continuation that was waiting before the restart. A holder
+that is still running keeps the few minutes' grace a pod that is still being created gets.
 
 **A full quota.** A pod the namespace's `ResourceQuota` has no room for is not a failed task. The
 task logs `namespace … is at its quota; waiting for room` and retries every 15 seconds for up to ten

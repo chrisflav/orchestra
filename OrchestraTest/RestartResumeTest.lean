@@ -149,9 +149,10 @@ def aResumeKilledEarlyFallsBackToTheConversationItWasResuming : Test := do
     TaskStore.saveTask { record with id := "t-a", sessionId := some "sess-a", continuesFrom := none }
     TaskStore.saveTask { record with id := "t-b", prompt := r, sessionId := none, continuesFrom := some "t-a" }
     TaskStore.saveTask { record with id := "t-h", prompt := "go on", sessionId := none, continuesFrom := some "t-a" }
-    pure (← Queue.sessionFor "t-b", ← Queue.sessionFor "t-a", ← Queue.sessionFor "t-h")
-  TestM.assertEqual viaResume (some "sess-a") (msg := "a resume without a session resumes its predecessor's")
-  TestM.assertEqual ownSession (some "sess-a") (msg := "a run with a session resumes its own")
+    pure (← Queue.sessionOwner "t-b", ← Queue.sessionOwner "t-a", ← Queue.sessionOwner "t-h")
+  TestM.assertEqual viaResume (some ("t-a", "sess-a"))
+    (msg := "a resume without a session resumes its predecessor's, and says whose")
+  TestM.assertEqual ownSession (some ("t-a", "sess-a")) (msg := "a run with a session resumes its own")
   TestM.assertEqual handQueued none (msg := "a hand-queued run without one has nothing to resume")
 
 /-- `orchestra queue retry` leaves out an unfinished run something carries on — but only a
@@ -177,6 +178,21 @@ def retrySkipsOnlyWhatALiveContinuationCarriesOn : Test := do
   TestM.assert (ids.contains "c2") (msg := "the cancelled continuation is itself retried, as before")
   TestM.assertEqual ((Queue.retryCandidates all (some "s")).map (·.id)) ["u6"]
     (msg := "the series filter still applies")
+
+/-- Only the newest link of a chain is offered: an `unfinished` continuation hides its predecessor
+    just as a pending one does. In E → R (unfinished) → R2 (pending) nothing is retried — R2 carries
+    the work on; without R2, only R is. -/
+@[test]
+def retryOffersOnlyTheNewestLinkOfAChain : Test := do
+  let e (id : String) (status : Queue.QueueStatus) (taskId cont : Option String) : Queue.QueueEntry :=
+    { id, createdAt := "2026-10-10T08:00:00Z", status, taskId, continuesFrom := cont
+      repo := none, prompt := "p" }
+  let chain := #[e "E" .unfinished (some "tE") none, e "R" .unfinished (some "tR") (some "tE")]
+  TestM.assertEqual ((Queue.retryCandidates chain).map (·.id)) ["R"]
+    (msg := "the unfinished resume hides the entry it continues")
+  TestM.assertEqual ((Queue.retryCandidates (chain.push (e "R2" .pending none (some "tR")))).map (·.id)) []
+    (msg := "and a pending resume of that hides it in turn")
+
 
 /-- End to end over a real store: the sweep records what it swept, and the resume decides from
     that record and the database — so it works the same for a daemon that died in between. -/

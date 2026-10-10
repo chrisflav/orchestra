@@ -604,17 +604,22 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- ownership checks in attach_pr / split_issue pass.
   if let some iid := ioTask.issueId then
     Project.updateClaimTaskId globalClaimManager iid taskId
-  -- Resolve initial resume session from the continued task
-  let initialResume : Option String ← match continuesFrom with
-    | none => pure none
+  -- Resolve initial resume session from the continued task: its own session, or — for a restart
+  -- resume killed before its agent named one — the conversation that resume was itself picking up
+  -- (`Queue.sessionOwner`), together with the run that conversation belongs to. And whether the
+  -- continued run is over (its record no longer `running`), which lets the backend take its
+  -- workspace without waiting out a grace meant for a run still starting (`predecessorDead`).
+  let (initialResume, sessionOwnerId, predecessorOver) :
+      Option String × Option String × Bool ← match continuesFrom with
+    | none => pure (none, none, false)
     | some prevId =>
       match ← TaskStore.loadTask prevId with
       | none =>
         IO.eprintln s!"  Warning: task '{prevId}' not found, ignoring --continues"
-        pure none
-      -- Its own session, or — for a restart resume killed before its agent named one — the
-      -- conversation that resume was itself picking up (`Queue.sessionFor`).
-      | some _ => Queue.sessionFor prevId
+        pure (none, none, false)
+      | some prev =>
+        let owner ← Queue.sessionOwner prevId
+        pure (owner.map (·.2), owner.map (·.1), prev.status != .running)
   -- Diagnostic block: surface the context the agent is starting with so the
   -- daemon log shows project/issue/series/resume info without having to grep
   -- the per-task .log file. Kept compact: prompt is dumped verbatim, but the
@@ -815,16 +820,15 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     workdir := repoPath
     taskId  := if persistent then some taskId else none
     continuesFrom := if persistent then continuesFrom else none
-    -- A restart resume is recognised by the prompt it was queued with — the same marker the
-    -- chain guard counts by — since nothing else about the entry reaches this far. Its
-    -- predecessor is known dead: the daemon swept it at startup and removed its pods. A
-    -- `queue retry` of a resume copies the marker and is treated the same, which is harmless:
-    -- its predecessor is an `unfinished` run nothing is executing.
-    --
-    -- The workspace is still looked up by the predecessor's own label, even when the session
-    -- comes from further back (`Queue.sessionFor`): a resume killed before it took the claim
-    -- never labelled it, and its own resume then fails naming the missing volume.
-    predecessorDead := persistent && continuesFrom.isSome && Queue.isRestartResumePrompt ioTask.prompt
+    -- Over is read from the predecessor's record (`TaskStore`): a run that landed, or one the
+    -- startup sweep found killed and whose pods `Backend.reclaim` removed, will not start a pod
+    -- now. True for the daemon's restart resumes and for any other continuation of such a run —
+    -- a series follow-up queued before the restart included.
+    predecessorDead := persistent && predecessorOver
+    -- When the conversation comes from further back than the predecessor, the workspace may be
+    -- labelled only with that earlier run's id (`SessionSpec.workspaceFallback`).
+    workspaceFallback := if persistent && predecessorOver && sessionOwnerId != continuesFrom
+      then sessionOwnerId else none
     seedDir
     cancelled := match cancelToken with
       | some t => t.isCancelled

@@ -1079,17 +1079,19 @@ def parseInUse (inUse : String) : String × Nat :=
     API hiccup must not hand one tree to two agents. Before that, a holder that took the claim
     less than `grace` seconds ago is alive whatever its pods say: its pod may simply not exist yet.
 
-    `deadPredecessor` is a task the caller knows to be dead (`SessionSpec.predecessorDead`): a
-    restart resume's predecessor, swept and reclaimed at startup. When the mark names it, the grace
+    `deadTasks` are tasks the caller knows to be over (`SessionSpec.predecessorDead`): a
+    continuation's predecessor whose record is no longer `running` — landed, or swept and
+    reclaimed at startup — and the run its workspace may be found under
+    (`SessionSpec.workspaceFallback`). When the mark names one of them, the grace
     is skipped and only live pods count — the grace exists for a holder that might be about to
     have a pod, and this one never will. Without that, a task killed within its first few minutes
     could never be resumed. The pods still decide: a live one refuses, as always. -/
 def holderStillWorking (inUse : String) (now grace : Nat) (podsAlive : Option Bool)
-    (deadPredecessor : Option String := none) : Bool :=
+    (deadTasks : List String := []) : Bool :=
   if inUse.isEmpty then false
   else
     let (holder, since) := parseInUse inUse
-    let knownDead := deadPredecessor.any (labelValue · == holder)
+    let knownDead := deadTasks.any (labelValue · == holder)
     if !knownDead && now < since + grace then true
     else podsAlive.getD true
 
@@ -1101,18 +1103,18 @@ def holderGraceSeconds (cfg : Config) : Nat := cfg.startupTimeoutSeconds + 120
     the cluster for its pods only when the decision needs them. A holder whose daemon died has no
     pod up and, once the grace is past, its claim can be taken over. -/
 private def holderAlive (cfg : Config) (inUse : String) (now : Nat)
-    (deadPredecessor : Option String := none) : IO Bool := do
+    (deadTasks : List String := []) : IO Bool := do
   if inUse.isEmpty then return false
   -- Decided without the cluster when it can be: within the grace the pods are not consulted.
   -- (Asked with "no pods", a `true` can only have come from the grace.)
-  if holderStillWorking inUse now (holderGraceSeconds cfg) (some false) deadPredecessor then
+  if holderStillWorking inUse now (holderGraceSeconds cfg) (some false) deadTasks then
     return true
   let (holder, _) := parseInUse inUse
   let (code, pods, _) ← kube cfg #["get", "pods", "-l",
     s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/task={labelValue holder}",
     "--field-selector=status.phase!=Failed,status.phase!=Succeeded", "-o", "name"]
   let podsAlive := if code != 0 then none else some !pods.trimAscii.isEmpty
-  return holderStillWorking inUse now (holderGraceSeconds cfg) podsAlive deadPredecessor
+  return holderStillWorking inUse now (holderGraceSeconds cfg) podsAlive deadTasks
 
 /-- Delete workspace claims nobody has used for `retentionDays`. Best effort, and quiet about it:
     a sweep that fails costs disk, not a task. A claim whose holder is still working is skipped
@@ -1225,9 +1227,16 @@ private def acquireWorkspaceClaim (cfg : Config) (tv : TaskVolumes) (spec : Sess
   -- A few rounds, for the case where another task changes the claim between our read and our
   -- swap: that one is either taking it (and the next read says so) or letting it go.
   for _ in [0:3] do
-    let rows ← match ← listClaims cfg s!"app.kubernetes.io/managed-by=orchestra,{taskLabel prev}" with
+    let lookup (t : String) : IO (List ClaimRow) := do
+      match ← listClaims cfg s!"app.kubernetes.io/managed-by=orchestra,{taskLabel t}" with
       | .ok rs   => pure (rs.filter (!·.terminating))
-      | .error e => throw (IO.userError s!"kubernetes: could not look up the workspace of {prev}: {e}")
+      | .error e => throw (IO.userError s!"kubernetes: could not look up the workspace of {t}: {e}")
+    let rows ← lookup prev
+    -- A predecessor that never reached its workspace — a restart resume killed early — labelled
+    -- nothing; the run whose conversation this resumes did (`SessionSpec.workspaceFallback`).
+    let rows ← match rows, spec.workspaceFallback with
+      | [], some fb => lookup fb
+      | rs, _       => pure rs
     match rows with
     | [] =>
       if spec.continuationOptional then return (← createClaim cfg tv spec taskId, false)
@@ -1237,11 +1246,11 @@ left for {prev} — it ran before task volumes were enabled, or went unused for 
     | [row] =>
       let now ← epochNow
       let ownHold := row.inUse.startsWith s!"{labelValue taskId}@"
-      -- A restart resume's predecessor is known dead (`SessionSpec.predecessorDead`), so a mark
-      -- naming it is judged by live pods alone, without the startup grace; any other holder —
-      -- including some third task that took the claim since — keeps the grace.
-      let deadPredecessor := if spec.predecessorDead then some prev else none
-      if !ownHold && (← holderAlive cfg row.inUse now deadPredecessor) then
+      -- A predecessor that is over (`SessionSpec.predecessorDead`) — and the earlier run the
+      -- workspace may be found under — is judged by live pods alone, without the startup grace;
+      -- any other holder, including some third task that took the claim since, keeps the grace.
+      let deadTasks := if spec.predecessorDead then prev :: spec.workspaceFallback.toList else []
+      if !ownHold && (← holderAlive cfg row.inUse now deadTasks) then
         throw (IO.userError s!"kubernetes: {taskId} continues {prev}, whose workspace volume \
 {row.name} is in use by {(row.inUse.splitOn "@").headD row.inUse} right now. Two agents in one \
 tree would undo each other's work; continue that task instead, or wait for it to finish.")
@@ -1666,8 +1675,9 @@ def parsePodTasks (out : String) : List (String × String) :=
     workspace it exists to continue in. Without task volumes nothing waits on them, and the
     delete is fire-and-forget.
 
-    Every call carries a request timeout, so an API server that does not answer cannot hold the
-    daemon's start. Best effort, like the retention sweep: a cluster that cannot be reached here
+    The listing carries a request timeout and the delete its own `--timeout` (or a request timeout,
+    when it does not wait), so an API server that does not answer cannot hold the start for long.
+    Best effort, like the retention sweep: a cluster that cannot be reached here
     is logged, and the pods fall back to `activeDeadlineSeconds`. -/
 def reclaim (cfg : Config) (isLeftover : String → IO Bool) : IO Unit := do
   try
@@ -1686,8 +1696,12 @@ def reclaim (cfg : Config) (isLeftover : String → IO Bool) : IO Unit := do
       return
     IO.println s!"  [k8s] removing {leftovers.size} pod(s) left over from a previous daemon: \
 {String.intercalate ", " (leftovers.toList.map fun (p, t) => s!"{p} ({t})")}"
-    let waitArgs := if cfg.taskVolumes.isSome then #["--timeout=120s"] else #["--wait=false"]
-    let (dc, _, derr) ← kube cfg (#["--request-timeout=30s", "delete", "pod"]
+    let waitArgs := if cfg.taskVolumes.isSome then #["--timeout=120s"]
+      else #["--wait=false", "--request-timeout=30s"]
+    -- No `--request-timeout` on the waiting delete: it bounds every request kubectl makes, the
+    -- watch `--timeout` waits on included, and would end that wait at thirty seconds; `--timeout`
+    -- bounds it instead. The one that does not wait has only the delete request to bound.
+    let (dc, _, derr) ← kube cfg (#["delete", "pod"]
       ++ leftovers.map (·.1) ++ #["--now", "--ignore-not-found"] ++ waitArgs)
     if dc != 0 then
       IO.eprintln s!"  [k8s] could not remove every leftover pod: {derr.trimAscii}"

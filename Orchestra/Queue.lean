@@ -1029,12 +1029,16 @@ def clearInterrupted : IO Unit := do
     touch was not interrupted by a restart and is not a restart's to pick up. -/
 def markStaleRunningAsUnfinished : IO (Array QueueEntry) := do
   let stale ← runningEntries
+  -- Never at the cost of the sweep or the start: a list that could not be written means these
+  -- runs are not resumed automatically, which is what every daemon before this did anyway.
   unless stale.isEmpty do
-    let dir ← queueDir
-    IO.FS.createDirAll dir
-    let h ← IO.FS.Handle.mk (← interruptedFile) .append
-    for e in stale do h.putStrLn e.id
-    h.flush
+    try
+      IO.FS.createDirAll (← queueDir)
+      let h ← IO.FS.Handle.mk (← interruptedFile) .append
+      for e in stale do h.putStrLn e.id
+      h.flush
+    catch e =>
+      IO.eprintln s!"Could not record the interrupted entries; they will not be resumed: {e}"
   let mut swept := #[]
   for entry in stale do
     let e := { entry with status := .unfinished }
@@ -1105,16 +1109,25 @@ def chainPrompts (taskId : String) (limit : Nat := maxRestartResumes + 1) : IO (
     and so on back along the unbroken run of restart resumes. Such a run added nothing to the
     conversation, so the one before it is still the conversation to pick up; without this, a resume
     killed early would end the chain silently. A run somebody queued by hand that has no session is
-    a fresh start and gets none: nothing of it can be resumed. Bounded like `chainPrompts`. -/
-def sessionFor (taskId : String) (limit : Nat := maxRestartResumes + 1) : IO (Option String) := do
+    a fresh start and gets none: nothing of it can be resumed. Bounded like `chainPrompts`.
+
+    Answers the task the session belongs to as well as the session: when that is not `taskId`
+    itself, the dead resume between may never have reached its workspace either, and the
+    workspace is then found under the owner's label (`SessionSpec.workspaceFallback`). -/
+def sessionOwner (taskId : String) (limit : Nat := maxRestartResumes + 1)
+    : IO (Option (String × String)) := do
   let mut cur := some taskId
   for _ in [0:limit] do
     let some tid := cur | return none
     let some r ← TaskStore.loadTask tid | return none
-    if let some sid := r.sessionId then return some sid
+    if let some sid := r.sessionId then return some (tid, sid)
     unless isRestartResumePrompt r.prompt do return none
     cur := r.continuesFrom
   return none
+
+/-- The session alone (`sessionOwner`). -/
+def sessionFor (taskId : String) (limit : Nat := maxRestartResumes + 1) : IO (Option String) :=
+  return (← sessionOwner taskId limit).map (·.2)
 
 /-- Whether some entry already carries the work of task `taskId` on: one that continues it and is
     waiting, running or has landed. A cancelled or failed continuation does not count — it carried
@@ -1127,17 +1140,27 @@ def hasLiveContinuation (all : Array QueueEntry) (taskId : String) : Bool :=
       && (e.status == .pending || e.status == .running || e.status == .done)
 
 /-- What `orchestra queue retry` re-queues, oldest first: every `unfinished` or `cancelled` entry
-    (in `series`, if given), except an `unfinished` one whose run something already carries on
-    (`hasLiveContinuation`) — the daemon's restart resume, typically, which leaves the interrupted
-    entry `unfinished` beside it. Retrying that as well would put two agents on one conversation.
+    (in `series`, if given), except an `unfinished` one whose run something already carries on —
+    the daemon's restart resume, typically, which leaves the interrupted entry `unfinished` beside
+    it. Retrying that as well would put two agents on one conversation.
+
+    Wider than `hasLiveContinuation`: an `unfinished` continuation hides its predecessor too, so
+    only the newest link of a chain is offered — in E → R (unfinished) → R2 (pending) neither E nor
+    R is, and in E → R (unfinished) only R is. Offering E there would continue a conversation R
+    already moved on, in a workspace R took. Only a cancelled or failed continuation leaves its
+    predecessor to be picked up: it carried nothing on.
 
     A retry of a restart resume copies its marker prompt, and so is itself recognised as one: it
-    counts toward `maxRestartResumes` and gets `SessionSpec.predecessorDead`. Both are harmless —
-    its predecessor is an `unfinished` run nothing is executing. -/
+    counts toward `maxRestartResumes`. That is harmless. -/
 def retryCandidates (all : Array QueueEntry) (series : Option String := none) : List QueueEntry :=
+  let continued : Std.HashSet String := all.foldl (init := {}) fun s e =>
+    match e.continuesFrom with
+    | some t =>
+      if e.status == .cancelled || e.status == .failed then s else s.insert t
+    | none => s
   (all.filter fun e =>
     (e.status == .unfinished || e.status == .cancelled)
-      && !(e.status == .unfinished && e.taskId.any (hasLiveContinuation all))
+      && !(e.status == .unfinished && e.taskId.any continued.contains)
       && (series.isNone || e.series == series)).toList.reverse
 
 /-- How far back a restart resume reaches: a run started longer ago than this is left
@@ -1254,6 +1277,10 @@ def resumeInterrupted (execution : ExecutionConfig) (now : Int) : IO Nat := do
   if ids.isEmpty then return 0
   let all ← loadAllEntries
   let mut queued := 0
+  -- Ids whose decision threw — a database that was briefly locked, a record that could not be
+  -- read — are kept for the next start rather than dropped with the rest: a skip is a decision,
+  -- an error is not one.
+  let mut undecided : Array String := #[]
   for entryId in ids.toList.eraseDups do
     try
       let some entry := all.find? (·.id == entryId) | continue
@@ -1284,8 +1311,12 @@ def resumeInterrupted (execution : ExecutionConfig) (now : Int) : IO Nat := do
       | .error why =>
         IO.println s!"  Not resuming entry {entryId} (task {tid}): {why}"
     catch e =>
-      IO.eprintln s!"  Could not resume interrupted entry {entryId}: {e}"
-  clearInterrupted
+      IO.eprintln s!"  Could not resume interrupted entry {entryId}, keeping it for the next start: {e}"
+      undecided := undecided.push entryId
+  if undecided.isEmpty then clearInterrupted
+  else
+    try IO.FS.writeFile (← interruptedFile) (String.intercalate "\n" undecided.toList ++ "\n")
+    catch e => IO.eprintln s!"  Could not rewrite the list of interrupted entries: {e}"
   return queued
 
 /-- Bring task records back in line with the entries that own them, and answer how many needed it.

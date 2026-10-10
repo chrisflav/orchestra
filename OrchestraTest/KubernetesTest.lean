@@ -930,13 +930,15 @@ def aHolderIsJudgedByItsPodsOnceTheGraceIsPast : Test := do
 @[test]
 def aKnownDeadPredecessorGetsNoGrace : Test := do
   let mark := inUseValue "t-1" 1000
-  TestM.assert (!holderStillWorking mark 1100 720 (some false) (deadPredecessor := some "t-1"))
+  TestM.assert (!holderStillWorking mark 1100 720 (some false) (deadTasks := ["t-1"]))
     "a restart resume takes over its killed predecessor's claim at once"
-  TestM.assert (holderStillWorking mark 1100 720 (some true) (deadPredecessor := some "t-1"))
+  TestM.assert (holderStillWorking mark 1100 720 (some true) (deadTasks := ["t-1"]))
     "but never past a pod that is still up"
-  TestM.assert (holderStillWorking mark 1100 720 none (deadPredecessor := some "t-1"))
+  TestM.assert (holderStillWorking mark 1100 720 none (deadTasks := ["t-1"]))
     "nor when the cluster cannot say"
-  TestM.assert (holderStillWorking mark 1100 720 (some false) (deadPredecessor := some "t-2"))
+  TestM.assert (holderStillWorking mark 1100 720 (some false) (deadTasks := ["t-2"]))
     "a mark naming some other task keeps its grace"
+  TestM.assert (!holderStillWorking (inUseValue "t-0" 1000) 1100 720 (some false) (deadTasks := ["t-1", "t-0"]))
+    "the earlier run a workspace was found under gets no grace either, when known to be over"
 
 end OrchestraTest.Kubernetes
