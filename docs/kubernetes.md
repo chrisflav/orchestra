@@ -479,9 +479,11 @@ The pods' side, besides the image:
 How the warmer keeps the node's directory safe for the pods (details in
 `docker/lean-cache-warm.sh`):
 
-- **Seeding never writes to the Lean cache.** It runs `lake build --no-build` — it can cache
-  outputs that are up to date, never rebuild one — in a scratch copy of the cached trees made of
-  hard links, in which every file Lake writes in place (`.hash`, `.trace`) is a copy of its own.
+- **Seeding never writes into a file of the Lean cache.** It runs `lake build --no-build` — it can
+  cache outputs that are up to date, never rebuild one — in a scratch copy of the cached trees made
+  of hard links, in which every file Lake writes in place (`.hash`, `.trace`) is a copy of its own.
+  Only metadata changes: caching an output makes it read-only (`r--r--r--`), and the copy shares
+  its inode with the cached file.
 - **Pruning never takes what a seed covers.** Files in `/lake-cache` unread for
   `LAKE_NODE_CACHE_DAYS` (14) days are deleted, but before that, on every run, every file a held
   revision's seed covers has its access time set to now; a seed some of whose files went missing
@@ -489,6 +491,13 @@ How the warmer keeps the node's directory safe for the pods (details in
   anything is pruned. Setting access times needs the warmer to own the files, which Lake makes
   read-only: **the warmer and the pods must run as the same user** (the image's, uid 1001). The
   warmer also writes with `umask 002`.
+- **What Lake writes in place is checked.** Lake itself writes into `/lake-cache` without
+  renaming (an artifact copied across volumes, a mapping, a revision's downloaded mappings, which
+  it never downloads again). Every run, the warmer checks what was written since its last pass —
+  at most `LAKE_NODE_CACHE_VERIFY_MAX` (50000) files, oldest first, none younger than ten minutes:
+  each artifact against its name with Lake's own hash (`docker/lake-verify.lean`, run with the
+  cached toolchains' Lean), each mapping as JSON. What fails is deleted, and a seed that loses a
+  file is redone. If more than a tenth of a pass's artifacts fail, it deletes none.
 - **Downloads are atomic.** Lake downloads an artifact with `curl -o` straight to its final name;
   the image's `curl` is a wrapper (`docker/lake-curl.sh`) that, for a download into the shared
   directory, writes to a temporary name and renames it once complete — for single downloads and
@@ -497,7 +506,8 @@ How the warmer keeps the node's directory safe for the pods (details in
 
 **Master builds** (`LAKE_CACHE_MASTER_REPOS="owner/name ..."`, with `LAKE_CONFIG` and the key):
 the warmer fetches each repository's default branch and, when it moved, builds it with `-o` and
-uploads it under that commit. Only once the Mathlib revision it pins is seeded on the node —
+uploads it under that commit. A build that fails still uploads what it built; its commit is retried no
+sooner than six hours later. Only once the Mathlib revision it pins is seeded on the node —
 before, the build would be all of Mathlib from source; the revision is requested meanwhile. The
 checkouts live in the Lean cache (`/lean-cache/master/<owner>/<name>`), which only the warmer can
 write: the build runs code from the repository (its lakefile) with the deploy keys, the upload key
@@ -510,14 +520,18 @@ host keys as pinned in the image (`/etc/ssh/github_known_hosts`) are accepted. E
 **`lake-cache-put`** uploads only what a task adds: nothing for a HEAD already on upstream's
 default branch (`lake cache put` replaces a revision's mappings, and `lake cache get` stops at the
 first revision that has any — a task's few modules must not replace the warmer's full list), and
-nothing from a checkout with uncommitted changes to its Lean sources or Lake configuration. It
+nothing from a checkout with uncommitted changes to tracked Lean sources or Lake configuration
+(untracked files do not count). What is already filed under the same commit — an earlier task
+that ended there — is fetched first and merged in, rather than replaced. It
 names the modules `+Module` (a bare name is resolved as a package or library first), finds their
 sources under any `srcDir`, and says so when the artifact cache is off in the checkout.
 
 Lake's hashes are not cryptographic and a mapping is taken on trust, so everything that can
 write — every agent — is trusted with every later build that reads it. CI that builds from scratch
-is the check. Two requirements of the S3 server: it must accept unsigned reads, and the image's
-curl must send `x-amz-content-sha256` (8.x does; the image ships one).
+is the check. Three requirements of the S3 server: it must accept unsigned reads, answer `404` (not
+`403`) for a missing object — Lake's search back through a HEAD's ancestors, and `lake-cache-put`,
+take a 404 as "nothing filed here" and anything else as an error — and the image's curl must send
+`x-amz-content-sha256` (8.x does; the image ships one).
 
 With kleis or another proxy in `HTTPS_PROXY`/`HTTP_PROXY`, the bucket's host may have to be in
 `NO_PROXY`/`no_proxy`: Lake's uploads and downloads are plain `curl`, which honours both.

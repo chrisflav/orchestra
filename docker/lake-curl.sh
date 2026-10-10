@@ -96,21 +96,30 @@ if [ ${#out_idx[@]} -eq 0 ] && [ -n "$config" ] && [ -r "$config" ] && command -
     done
     "$real" "${args[@]}" 2>"$errlog"
     rc=$?
-    # The transfers that succeeded, by their index among the URLs -- which is the index of their
-    # `-o` line, Lake writing one of each per artifact, in order.
-    declare -A good=()
-    while read -r n; do [ -n "$n" ] && good[$n]=1; done < <(
-      jq -Rr 'fromjson? | select(type == "object") | select(.http_code == 200 or .http_code == 201) | .urlnum // empty' \
+    # Each transfer's status, by its index among the URLs -- which is the index of its `-o` line,
+    # Lake writing one of each per artifact, in order.
+    declare -A code=()
+    while read -r n c; do [ -n "$n" ] && code[$n]=$c; done < <(
+      jq -Rr 'fromjson? | select(type == "object") | select(.urlnum != null) | "\(.urlnum) \(.http_code // 0)"' \
         "$errlog" 2>/dev/null)
+    # Only a 200/201 is renamed into place. Any other answer's body stays out of the shared cache
+    # -- but Lake reads a failed download's body from the final path to say what the server
+    # answered (an S3 error document), so for anything but a 404 its start is passed on instead,
+    # as a line of its own after curl's: Lake reports a line that is not JSON verbatim.
+    diag=()
     for i in "${!dests[@]}"; do
       t=${dests[i]}.tmp.$$
-      if [ -n "${good[$i]:-}" ] && [ -e "$t" ]; then
-        mv -f "$t" "${dests[i]}" || rm -f "$t"
-      else
-        rm -f "$t"
-      fi
+      case "${code[$i]:-}" in
+        200|201) if [ -e "$t" ]; then mv -f "$t" "${dests[i]}" || rm -f "$t"; fi ;;
+        *)
+          if [ -s "$t" ] && [ "${code[$i]:-}" != 404 ]; then
+            diag+=("lake-curl: ${dests[i]##*/}: HTTP ${code[$i]:-?}: $(head -c 300 "$t" | tr -s '\r\n\t' '   ')")
+          fi
+          rm -f "$t" ;;
+      esac
     done
     cat "$errlog" >&2
+    [ ${#diag[@]} -eq 0 ] || printf '%s\n' "${diag[@]}" >&2
     rm -f "$tmpcfg" "$errlog"
     exit $rc
   fi

@@ -154,12 +154,13 @@ lean_cache_link() {
 # revision, or a package at the rev that Mathlib's manifest pins -- or when nothing is linked at
 # all, so that there is nothing read-only to trip over.
 #
-# Where it cannot be on, it is turned *off* explicitly: `lake env` and `lake exe` export
-# LAKE_ARTIFACT_CACHE to what they run, a `lake build` started from there would inherit a `true`,
-# and an environment setting overrides the root package's configuration for its dependencies
-# (Lake/Config/Workspace.lean `enableArtifactCache?`: the environment, then the root's config). Off
-# also means no reads from the cache: a checkout that had it on before -- its seed was since
-# dropped -- rebuilds what only the cache held. Slower, never wrong.
+# Wherever it is not turned on, it is turned *off* explicitly -- disabled, no node cache, or not
+# safe: `lake env` and `lake exe` export LAKE_ARTIFACT_CACHE to what they run, a `lake build`
+# started from there would inherit a `true`, and an environment setting overrides the root
+# package's configuration for its dependencies (Lake/Config/Workspace.lean `enableArtifactCache?`:
+# the environment, then the root's config). Off also means no reads from the cache: a checkout
+# that had it on before -- its seed was since dropped -- rebuilds what only the cache held.
+# Slower, never wrong.
 #
 # Before the first build of a checkout at a given HEAD, the mappings for that revision (or the
 # nearest ancestor that has some) are fetched from the bucket; the outputs themselves come when the
@@ -170,7 +171,7 @@ lake_artifact_cache() {
   linked=$(find "$pkgdir" -maxdepth 1 -type l -lname "$cache/*" -printf '%l\n' 2>/dev/null)
   if [ -n "${LAKE_NODE_CACHE_DISABLE:-}" ] || ! { [ -d "$node" ] && [ -w "$node" ]; } \
      || { [ -n "$linked" ] && ! lake_cache_seeded "$node" "$tcdir" "$mathlib_rev" "$mathlib_linked" "$linked"; }; then
-    [ -n "$linked" ] && export LAKE_ARTIFACT_CACHE=false
+    export LAKE_ARTIFACT_CACHE=false
     return 0
   fi
   export LAKE_ARTIFACT_CACHE=true LAKE_CACHE_DIR=$node

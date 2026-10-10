@@ -258,11 +258,25 @@ du -sh "$cache/packages" "$ELAN_HOME" "$cache/mathlib-cache" 2>/dev/null || true
 #   `lake build --no-build` -- so it can only ever *cache* outputs that are up to date, never
 #   rebuild one -- and not in the cached trees themselves but in a scratch copy of them made of
 #   hard links, in which every file Lake writes in place (`.hash`, `.trace`, locks) is a copy of
-#   its own: the trees pods have open are never written to, not even the identical `.hash` a first
-#   seed rewrites. A seed that would have had to write a trace -- a tree not up to date as built --
+#   its own: no file of the trees pods have open is written to, not even the identical `.hash` a
+#   first seed rewrites. (Their metadata is: caching an output makes it read-only, r--r--r--, and
+#   the scratch copy shares its inode with the cached tree's file -- which changes nothing a reader
+#   of it sees.) A seed that would have had to write a trace -- a tree not up to date as built --
 #   fails. What it covered is listed in $LEAN_CACHE_DIR/lake-seeded/<rev>@<tc> (the artifacts and
 #   mappings in the node's cache named by the trees' hashes), and recorded for the shim in
 #   $LAKE_NODE_CACHE/.seeded/<rev>@<tc> -- that marker last, once everything is there.
+#
+#   VALIDATION. Lake writes into the node's cache without renaming into place: an artifact it
+#   copies across volumes (`writeBinFileIfNew`), a mapping (`writeFile`), a revision's mappings
+#   it downloads (`revisions/<scope>/<rev>.jsonl`, never downloaded again once there). One whose
+#   writer died part-way stays, and every later build trusts it. So each run checks what was
+#   written since the last one (by modification time, against $LEAN_CACHE_DIR/lake-verified):
+#   every artifact's content against its name with Lake's own hash (docker/lake-verify.lean, run
+#   with the Lean of each held seed's toolchain that passes one of its seed's artifacts, so the
+#   hash is exactly Lake's; damaged only if all of them say so), every mapping and `.jsonl` as
+#   JSON; what fails is deleted. At most $LAKE_NODE_CACHE_VERIFY_MAX files per run, oldest first,
+#   the rest next time. If more than a tenth of the artifacts checked fail, nothing is deleted:
+#   that is a hash this Lean does not share with the one that wrote them, not damage.
 #
 #   PRUNING. Files in the node's cache unread for $LAKE_NODE_CACHE_DAYS days go. Not those a seed
 #   covers: on every run, *before* pruning, each held seed's files have their access time set to
@@ -276,7 +290,9 @@ du -sh "$cache/packages" "$ELAN_HOME" "$cache/mathlib-cache" 2>/dev/null || true
 #   MASTER BUILDS. With $LAKE_CACHE_MASTER_REPOS (space-separated owner/name) and Lake's system
 #   configuration ($LAKE_CONFIG) and key ($LAKE_CACHE_KEY or $LAKE_CACHE_KEY_FILE): each repository's
 #   default branch is fetched, and when it has moved since the last upload, built with `-o` and its
-#   mappings uploaded under that commit -- the revision every fresh task starts from. Only once the
+#   mappings uploaded under that commit -- the revision every fresh task starts from. A build
+#   that fails still uploads what it built, but its commit is not recorded as done, and is tried
+#   again no sooner than six hours later (or when the branch moves). Only once the
 #   Mathlib revision it pins is seeded on this node (it is requested meanwhile): before that, the
 #   build would be all of Mathlib from source. A private repository is cloned over SSH with
 #   $LAKE_CACHE_DEPLOY_KEYS/<owner>_<name>, a read-only deploy key, accepting only GitHub's host
@@ -290,6 +306,9 @@ du -sh "$cache/packages" "$ELAN_HOME" "$cache/mathlib-cache" 2>/dev/null || true
 #   LAKE_NODE_CACHE           the node's artifact cache                 (default /lake-cache)
 #   LAKE_NODE_CACHE_DAYS      prune files unread for this long          (default 14)
 #   LAKE_CACHE_MASTER_TIMEOUT seconds a master build may take           (default 3600)
+#   LAKE_NODE_CACHE_VERIFY_MAX files validated per run                    (default 50000)
+#   LAKE_VERIFY_SCRIPT        docker/lake-verify.lean in the image
+#                             (default /usr/local/share/lean-cache/lake-verify.lean)
 node=${LAKE_NODE_CACHE:-/lake-cache}
 if [ -d "$node" ] && [ -w "$node" ]; then
   # What this writes into the node's cache is the pods' as much as its own: group-writable, for a
@@ -416,6 +435,75 @@ if [ -d "$node" ] && [ -w "$node" ]; then
     return $rc
   }
 
+  # VALIDATION (see above): what was written into the node's cache since the last pass, oldest
+  # first and at most $LAKE_NODE_CACHE_VERIFY_MAX files. Not the last ten minutes' -- a writer may
+  # still be at it -- which the next pass picks up instead.
+  validate_node() {
+    local stamp=$cache/lake-verified max=${LAKE_NODE_CACHE_VERIFY_MAX:-50000}
+    local script=${LAKE_VERIFY_SCRIPT:-/usr/local/share/lean-cache/lake-verify.lean}
+    local all todo bad probe d tc l nart nbad f rel deleted=0 leans=() newer=()
+    all=$(mktemp "$cache/tmp/verify.XXXXXX") && todo=$(mktemp "$cache/tmp/verify.XXXXXX") \
+      && bad=$(mktemp "$cache/tmp/verify.XXXXXX") || return 1
+    touch -d '10 minutes ago' "$stamp.next"
+    [ -e "$stamp" ] && newer=(-newer "$stamp")
+    (cd "$node" && find artifacts outputs revisions -type f ! -name '*.tmp.*' ! -newer "$stamp.next" \
+       "${newer[@]}" -printf '%T@ %p\n' 2>/dev/null) \
+      | sort -n > "$all"
+    # The first $max, and any more with the same time as the last of those: the stamp is set to
+    # that time, and only what is newer is looked at next.
+    awk -v max="$max" 'NR <= max { b = $1; print; next } $1 == b { print; next } { exit }' "$all" > "$todo"
+    if [ "$(wc -l < "$todo")" -lt "$(wc -l < "$all")" ]; then
+      touch -d "@$(tail -n 1 "$todo" | cut -d' ' -f1)" "$stamp.next"
+    fi
+    # Artifacts, by Lake's hash: with the Lean of each held seed's toolchain that passes an
+    # artifact its own seed made (one that does not hashes differently from the Lake in use), and
+    # damaged only by the verdict of all of them -- a toolchain's Lake must not judge another's.
+    for d in "$cache/packages/mathlib"/*@*/; do
+      [ -d "$d" ] || continue
+      tc=${d%/}; tc=${tc##*@}
+      l=$ELAN_HOME/toolchains/$tc/bin/lean
+      [ -x "$l" ] && [ -r "$script" ] || continue
+      case " ${leans[*]} " in *" $l "*) continue ;; esac
+      probe=$(grep -m 1 '^artifacts/' "$seeded/$(basename "$d")" 2>/dev/null)
+      [ -n "$probe" ] && [ -e "$node/$probe" ] || continue
+      if [ -z "$(printf '%s\n' "$node/$probe" | "$l" --run "$script" 2>/dev/null)" ]; then leans+=("$l"); fi
+    done
+    nart=$(grep -c ' artifacts/' "$todo")
+    if [ ${#leans[@]} -gt 0 ] && [ "$nart" -gt 0 ]; then
+      sed -n 's|^[^ ]* \(artifacts/.*\)$|\1|p' "$todo" | sed "s|^|$node/|" > "$bad"
+      for l in "${leans[@]}"; do
+        # A Lean that fails to run passes judgement on nothing: then nothing is deleted.
+        "$l" --run "$script" < "$bad" > "$bad.next" 2>/dev/null || : > "$bad.next"
+        mv -f "$bad.next" "$bad"
+      done
+      nbad=$(grep -c . "$bad")
+      if [ "$nbad" -gt 10 ] && [ $((nbad * 10)) -gt "$nart" ]; then
+        echo "$nbad of $nart artifacts in $node do not match their names by the cached toolchains' hash; deleting none" >&2
+        : > "$bad"
+      fi
+    elif [ "$nart" -gt 0 ]; then
+      echo "no seeded toolchain to check $nart new artifacts in $node with; only empty ones go" >&2
+      sed -n 's|^[^ ]* \(artifacts/.*\)$|\1|p' "$todo" | while IFS= read -r rel; do
+        [ -s "$node/$rel" ] || printf '%s\n' "$node/$rel"
+      done > "$bad"
+    fi
+    # Mappings and revisions' mappings: JSON (Lines) that parses to the end.
+    sed -n 's#^[^ ]* \(\(outputs\|revisions\)/.*\)$#\1#p' "$todo" | while IFS= read -r rel; do
+      f=$node/$rel
+      [ -e "$f" ] || continue
+      if [ ! -s "$f" ] || ! jq empty "$f" >/dev/null 2>&1; then printf '%s\n' "$f"; fi
+    done >> "$bad"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      echo "deleting damaged ${f#"$node/"}"
+      rm -f "$f" && deleted=$((deleted + 1))
+    done < "$bad"
+    [ "$deleted" -gt 0 ] && echo "deleted $deleted damaged files from $node"
+    mv -f "$stamp.next" "$stamp"
+    rm -f "$all" "$todo" "$bad"
+  }
+  validate_node || echo "could not validate $node" >&2
+
   # Which seeds hold: a marker with a list beside it. Markers from before lists were kept, and
   # markers and lists of revisions no longer held, go.
   lists=()
@@ -476,6 +564,13 @@ if [ -d "$node" ] && [ -w "$node" ]; then
       git clean -q -ffdx -e /.lake
       head=$(git rev-parse HEAD)
       if [ "$(cat .lake/lake-cache-put 2>/dev/null)" = "$head" ]; then echo "have $repo@${head:0:9}"; exit 0; fi
+      # A commit whose build failed is built again no sooner than six hours later: a broken master
+      # would otherwise cost a full build on every run.
+      if failed=$(cat .lake/lake-cache-failed 2>/dev/null) && [[ $failed =~ ^[0-9a-f]+\ [0-9]+$ ]] \
+         && [ "${failed%% *}" = "$head" ] && [ $((now - ${failed#* })) -lt 21600 ]; then
+        echo "not building $repo@${head:0:9} again yet: its build failed less than six hours ago"
+        exit 0
+      fi
       toolchain=$(tr -d '[:space:]' < lean-toolchain)
       tc=$(elan_dir "$toolchain")
       mrev=$(jq -r '[.packages[]? | select(.name == "mathlib") | .rev][0] // empty' lake-manifest.json)
@@ -503,7 +598,10 @@ if [ -d "$node" ] && [ -w "$node" ]; then
       fi
       echo "building $repo@${head:0:9}"
       map=$(mktemp "$cache/tmp/master-map.XXXXXX")
-      timeout "${LAKE_CACHE_MASTER_TIMEOUT:-3600}" nice -n 10 lake build -o "$map"
+      # A build that fails still lists what it built (Lake writes `-o` before it reports the
+      # failure: Lake/Build/Run.lean), and that is uploaded; only the commit is not recorded as done.
+      build_rc=0
+      timeout "${LAKE_CACHE_MASTER_TIMEOUT:-3600}" nice -n 10 lake build -o "$map" || build_rc=$?
       n=$(grep -c . "$map" || true)
       if [ "${n:-0}" -gt 1 ]; then
         lake cache put "$map" --repo "$repo"
@@ -511,7 +609,14 @@ if [ -d "$node" ] && [ -w "$node" ]; then
       else
         echo "$repo@${head:0:9} has no modules to upload"
       fi
-      mkdir -p .lake && echo "$head" > .lake/lake-cache-put
+      mkdir -p .lake
+      if [ "$build_rc" -ne 0 ]; then
+        echo "$head $(date +%s)" > .lake/lake-cache-failed
+        echo "the build of $repo@${head:0:9} failed (exit $build_rc); trying it again in six hours" >&2
+        exit "$build_rc"
+      fi
+      rm -f .lake/lake-cache-failed
+      echo "$head" > .lake/lake-cache-put
     )
   }
 
@@ -545,14 +650,17 @@ if [ -d "$node" ] && [ -w "$node" ]; then
       unset GIT_SSH_COMMAND
       if [ $rc -ne 0 ]; then echo "master build of $repo failed (exit $rc)" >&2; status=1; fi
     done
+    # Checkouts of repositories no longer configured -- only here, with a list to go by: a run
+    # without one (no LAKE_CACHE_MASTER_REPOS, no LAKE_CONFIG) is not a reason to drop them all.
+    if [ "$configured" != " " ]; then
+      for d in "$cache/master"/*/*/; do
+        [ -d "$d" ] || continue
+        r=${d#"$cache/master/"}; r=${r%/}
+        case "$configured" in *" $r "*) ;; *) echo "removing the master checkout of $r"; rm -rf "$d" ;; esac
+      done
+      find "$cache/master" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null
+    fi
   fi
-  # Checkouts of repositories no longer configured.
-  for d in "$cache/master"/*/*/; do
-    [ -d "$d" ] || continue
-    r=${d#"$cache/master/"}; r=${r%/}
-    case "$configured" in *" $r "*) ;; *) echo "removing the master checkout of $r"; rm -rf "$d" ;; esac
-  done
-  find "$cache/master" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null
   du -sh "$node" 2>/dev/null || true
 fi
 exit $status

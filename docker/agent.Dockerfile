@@ -147,6 +147,8 @@ COPY --chmod=0755 docker/lean-cache-shim.sh /usr/local/bin/lean-cache-shim
 COPY --chmod=0755 docker/lean-cache-warm.sh /usr/local/bin/lean-cache-warm
 COPY --chmod=0755 docker/lake-cache-put.sh /usr/local/bin/lake-cache-put
 COPY --chmod=0755 docker/lake-curl.sh /usr/local/bin/curl
+# The warmer's check of the node cache's artifacts against their names, run with a cached toolchain.
+COPY --chmod=0644 docker/lake-verify.lean /usr/local/share/lean-cache/lake-verify.lean
 # GitHub's published SSH host keys (https://api.github.com/meta, checked against the fingerprints
 # GitHub documents under "GitHub's SSH key fingerprints"), the only ones the warmer's deploy-key
 # clones accept: see lean-cache-warm.

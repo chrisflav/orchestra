@@ -18,7 +18,8 @@
 # list would cost every later task on master most of its cache.
 #
 # Nor for a checkout with uncommitted changes to its Lean sources or its Lake configuration: what
-# was built from those does not belong under HEAD.
+# was built from those does not belong under HEAD. Untracked files do not count: a scratch file
+# the task left lying around is no part of any module the project imports.
 #
 # Goes through `lake`, i.e. lean-cache-shim, which turns the artifact cache on only where it can
 # (see there); where it is off there is nothing to upload and this says so. Never fails: a task's
@@ -45,7 +46,7 @@ case "$url" in
 esac
 head=$(git rev-parse HEAD 2>/dev/null) || exit 0
 
-if [ -n "$(git status --porcelain -- '*.lean' 'lakefile.*' lake-manifest.json lean-toolchain 2>/dev/null)" ]; then
+if [ -n "$(git status --porcelain -uno -- '*.lean' 'lakefile.*' lake-manifest.json lean-toolchain 2>/dev/null)" ]; then
   echo "lake-cache-put: uncommitted changes to Lean sources or Lake's configuration; not filing them under ${head:0:9}"
   exit 0
 fi
@@ -78,7 +79,8 @@ fi
 
 # Whether Lake's artifact cache is on here at all, as Lake itself sees it: the shim decides that in
 # lake's environment, not this script's.
-on=$(timeout 300 lake env printenv LAKE_ARTIFACT_CACHE 2>/dev/null | tail -n 1)
+mapfile -t env < <(timeout 300 lake env printenv LAKE_ARTIFACT_CACHE LAKE_CACHE_DIR 2>/dev/null | tail -n 2)
+on=${env[0]:-} cachedir=${env[1]:-}
 if [ "$on" != true ]; then
   echo "lake-cache-put: Lake's artifact cache is off in this checkout (LAKE_ARTIFACT_CACHE=${on:-unset}); nothing to upload"
   exit 0
@@ -123,6 +125,32 @@ n=$(grep -c . "$map" 2>/dev/null)
 if [ "${n:-0}" -le 1 ]; then
   echo "lake-cache-put: nothing to upload (no module of this checkout built)"
   exit 0
+fi
+# What is filed under HEAD already -- an earlier task that ended on the same commit -- is kept:
+# `put` replaces the revision's mappings, so they are merged into this upload first. Fetched with
+# Lake's own `cache get --rev`, which uses the very URL `put` writes to and also brings the
+# outputs those mappings name into the node's cache -- `put` uploads every output its map names
+# and refuses one it does not have. Its local copy of the revision's mappings is removed first:
+# `cache get` would otherwise take that rather than ask the bucket again.
+if [ -n "$cachedir" ] && [ -d "$cachedir" ]; then
+  find "$cachedir/revisions" -name "$head.jsonl" -delete 2>/dev/null
+  if timeout 600 lake cache get --rev "$head" --repo "$repo" >>"$log" 2>&1; then
+    existing=$(find "$cachedir/revisions" -name "$head.jsonl" -print -quit 2>/dev/null)
+    if [ -n "$existing" ]; then
+      before=$n
+      # Entries `[input hash, outputs]`; the first line of each file is its header.
+      jq -c -n --slurpfile mine <(tail -n +2 "$map") --slurpfile theirs <(tail -n +2 "$existing") \
+        '($mine | map({key: (.[0] | tostring), value: true}) | from_entries) as $have
+         | $theirs[] | select($have[.[0] | tostring] | not)' >> "$map"
+      n=$(grep -c . "$map" 2>/dev/null)
+      echo "lake-cache-put: kept $((n - before)) mapping entries already filed under ${head:0:9}"
+    fi
+  elif grep -q 'outputs not found' "$log"; then
+    :   # nothing filed under HEAD yet
+  else
+    echo "lake-cache-put: could not read what is filed under ${head:0:9} already; not replacing it (log: $log)"
+    exit 0
+  fi
 fi
 if lake cache put "$map" --repo "$repo" >>"$log" 2>&1; then
   echo "lake-cache-put: $((n - 1)) mapping entries of $repo filed under ${head:0:9}"
