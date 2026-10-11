@@ -30,7 +30,7 @@
 #   failed/<mathlib rev>                failed attempts; three within a week and requests are ignored
 #   orphaned/<tc>                       when a toolchain stopped being used by any kept Mathlib
 #   lake-seeded/<mathlib rev>@<tc>      what that revision's seed of Lake's artifact cache covers
-#   master/<owner>/<name>/              checkouts for the master builds
+#   master/<owner>/<name>[@branch]/     checkouts for the master builds
 #   (the last two only with a node artifact cache: see the end of this script)
 #
 # REQUESTS. A pod writes $LEAN_CACHE_REQUESTS/<mathlib rev> both when the revision is missing and
@@ -287,7 +287,8 @@ du -sh "$cache/packages" "$ELAN_HOME" "$cache/mathlib-cache" 2>/dev/null || true
 #   was written. The refresh needs the warmer to own the files (they are read-only to everyone),
 #   so warmer and pods must run as the same user -- the image's, uid 1001.
 #
-#   MASTER BUILDS. With $LAKE_CACHE_MASTER_REPOS (space-separated owner/name) and Lake's system
+#   MASTER BUILDS. With $LAKE_CACHE_MASTER_REPOS (space-separated owner/name, or owner/name@branch
+#   for a branch other than the default) and Lake's system
 #   configuration ($LAKE_CONFIG) and key ($LAKE_CACHE_KEY or $LAKE_CACHE_KEY_FILE): each repository's
 #   default branch is fetched, and when it has moved since the last upload, built with `-o` and its
 #   mappings uploaded under that commit -- the revision every fresh task starts from. A build
@@ -545,7 +546,7 @@ if [ -d "$node" ] && [ -w "$node" ]; then
   # One repository's default branch, built in its checkout at $2 from $3 and uploaded. Any step
   # failing fails it, and only a completed upload is recorded.
   master_build() {
-    local repo=$1 dir=$2 url=$3
+    local repo=$1 dir=$2 url=$3 want=${4:-}
     (
       set -e
       map=""
@@ -555,8 +556,16 @@ if [ -d "$node" ] && [ -w "$node" ]; then
       cd "$dir"
       git remote set-url origin "$url"
       git fetch -q --prune origin
-      git remote set-head origin --auto >/dev/null   # a renamed default branch
-      branch=$(git symbolic-ref --short refs/remotes/origin/HEAD)
+      if [ -n "$want" ]; then
+        # A named branch (`owner/name@branch`): the one the agents work on, which need not be the
+        # default -- weil-conjectures' tasks all branch from `slopmaster2`.
+        # The full ref name, so a tag or a local branch called `origin/...` cannot be taken for it.
+        branch=refs/remotes/origin/$want
+        git rev-parse -q --verify "$branch" >/dev/null
+      else
+        git remote set-head origin --auto >/dev/null   # a renamed default branch
+        branch=$(git symbolic-ref refs/remotes/origin/HEAD)
+      fi
       # Whatever the last build left in the tree -- a tracked file it changed, an untracked one it
       # wrote -- must neither keep the checkout from moving nor end up in this build. `.lake` stays:
       # it is what makes the build incremental.
@@ -624,11 +633,17 @@ if [ -d "$node" ] && [ -w "$node" ]; then
   if [ -n "${LAKE_CACHE_MASTER_REPOS:-}" ] && [ -n "${LAKE_CONFIG:-}" ]; then
     keyfile=${LAKE_CACHE_KEY_FILE:-/etc/lake-key/LAKE_CACHE_KEY}
     if [ -z "${LAKE_CACHE_KEY:-}" ] && [ -r "$keyfile" ]; then LAKE_CACHE_KEY=$(cat "$keyfile"); export LAKE_CACHE_KEY; fi
-    for repo in $LAKE_CACHE_MASTER_REPOS; do
-      if ! [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ /$repo/ == */./* || /$repo/ == */../* ]]; then
-        echo "ignoring repository '$repo'" >&2; continue
+    for entry in $LAKE_CACHE_MASTER_REPOS; do
+      # `owner/name`, its default branch; `owner/name@branch`, that branch -- in a checkout of its
+      # own (`owner/name@branch` under master/), so two branches of one repository never share one.
+      # No `/` in the branch name: the checkouts are matched one directory level below the owner.
+      repo=${entry%%@*} want=""
+      [[ $entry == *@* ]] && want=${entry#*@}
+      if ! [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ /$repo/ == */./* || /$repo/ == */../* ]] \
+         || [[ $entry == *@ ]] || { [ -n "$want" ] && ! [[ $want =~ ^[A-Za-z0-9_.-]+$ && $want != .* ]]; }; then
+        echo "ignoring repository '$entry'" >&2; continue
       fi
-      configured+="$repo "
+      configured+="$entry "
       dkey=${LAKE_CACHE_DEPLOY_KEYS:-/etc/lake-deploy}/${repo/\//_}
       own=""
       if [ -r "$dkey" ]; then
@@ -644,7 +659,7 @@ if [ -d "$node" ] && [ -w "$node" ]; then
         url=https://github.com/$repo.git
         unset GIT_SSH_COMMAND
       fi
-      master_build "$repo" "$cache/master/$repo" "$url"
+      master_build "$repo" "$cache/master/$entry" "$url" "$want"
       rc=$?
       [ -n "$own" ] && rm -f "$own"
       unset GIT_SSH_COMMAND

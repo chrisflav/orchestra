@@ -11,7 +11,8 @@
 #
 # Filed under HEAD, so it helps whatever later runs on that commit or a descendant: a continuation
 # that starts fresh, a review fix on the same branch, another task picking the branch up. Master's
-# own builds come from the Lean cache warmer, which uploads each new upstream master -- and so this
+# own builds come from the Lean cache warmer, which uploads each new upstream master (and any other
+# branch it is told to, listed in $LAKE_CACHE_WARMED, default /etc/lake/warmed-branches) -- and so this
 # uploads nothing for a HEAD that is on upstream's default branch already (equal to its tip or
 # behind it). `lake cache put` *replaces* the mappings filed under a revision, and Lake's `cache get`
 # stops at the first revision that has any: a task's few modules filed over the warmer's complete
@@ -63,19 +64,30 @@ if [ -z "$ref" ]; then
     git rev-parse -q --verify "refs/remotes/$remote/$b" >/dev/null && { ref=$remote/$b; break; }
   done
 fi
-if [ -n "$ref" ]; then
+[ -n "$ref" ] || echo "lake-cache-put: warning: could not tell $remote's default branch"
+# And the other branches the warmer builds for this repository: `owner/name@branch` lines in
+# $LAKE_CACHE_WARMED (Lake's ConfigMap carries the warmer's list; see lean-cache-warm, MASTER
+# BUILDS). weil-conjectures' agents all work from `slopmaster2`, which the warmer builds in full.
+refs=()
+[ -n "$ref" ] && refs+=("$ref")
+warmed=${LAKE_CACHE_WARMED:-/etc/lake/warmed-branches}
+if [ -r "$warmed" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case "$line" in "$repo@"?*) refs+=("$remote/${line#"$repo@"}") ;; esac
+  done < "$warmed"
+fi
+for r in "${refs[@]}"; do
   # A branch only moves forward, so being behind a stale tip is being behind the current one; only
   # a "no" is worth asking the remote again about.
-  if ! git merge-base --is-ancestor HEAD "$ref" 2>/dev/null; then
-    timeout 120 git fetch -q "$remote" "+refs/heads/${ref#"$remote"/}:refs/remotes/$ref" 2>/dev/null || true
+  if ! git merge-base --is-ancestor HEAD "$r" 2>/dev/null; then
+    timeout 120 git fetch -q "$remote" "+refs/heads/${r#"$remote"/}:refs/remotes/$r" 2>/dev/null || true
   fi
-  if git merge-base --is-ancestor HEAD "$ref" 2>/dev/null; then
-    echo "lake-cache-put: ${head:0:9} is on $ref, which the warmer uploads in full; nothing to add"
+  if git merge-base --is-ancestor HEAD "$r" 2>/dev/null; then
+    echo "lake-cache-put: ${head:0:9} is on $r, which the warmer uploads in full; nothing to add"
     exit 0
   fi
-else
-  echo "lake-cache-put: warning: could not tell $remote's default branch; uploading anyway"
-fi
+done
 
 # Whether Lake's artifact cache is on here at all, as Lake itself sees it: the shim decides that in
 # lake's environment, not this script's.
