@@ -12,7 +12,7 @@
 # Filed under HEAD, so it helps whatever later runs on that commit or a descendant: a continuation
 # that starts fresh, a review fix on the same branch, another task picking the branch up. Master's
 # own builds come from the Lean cache warmer, which uploads each new upstream master (and any other
-# branch it is told to, listed in $LAKE_CACHE_WARMED) -- and so this
+# branch it is told to, listed in $LAKE_CACHE_WARMED, default /etc/lake/warmed-branches) -- and so this
 # uploads nothing for a HEAD that is on upstream's default branch already (equal to its tip or
 # behind it). `lake cache put` *replaces* the mappings filed under a revision, and Lake's `cache get`
 # stops at the first revision that has any: a task's few modules filed over the warmer's complete
@@ -72,7 +72,8 @@ refs=()
 [ -n "$ref" ] && refs+=("$ref")
 warmed=${LAKE_CACHE_WARMED:-/etc/lake/warmed-branches}
 if [ -r "$warmed" ]; then
-  while read -r line; do
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
     case "$line" in "$repo@"?*) refs+=("$remote/${line#"$repo@"}") ;; esac
   done < "$warmed"
 fi

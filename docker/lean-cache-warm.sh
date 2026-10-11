@@ -559,11 +559,12 @@ if [ -d "$node" ] && [ -w "$node" ]; then
       if [ -n "$want" ]; then
         # A named branch (`owner/name@branch`): the one the agents work on, which need not be the
         # default -- weil-conjectures' tasks all branch from `slopmaster2`.
-        git rev-parse -q --verify "refs/remotes/origin/$want" >/dev/null
-        branch=origin/$want
+        # The full ref name, so a tag or a local branch called `origin/...` cannot be taken for it.
+        branch=refs/remotes/origin/$want
+        git rev-parse -q --verify "$branch" >/dev/null
       else
         git remote set-head origin --auto >/dev/null   # a renamed default branch
-        branch=$(git symbolic-ref --short refs/remotes/origin/HEAD)
+        branch=$(git symbolic-ref refs/remotes/origin/HEAD)
       fi
       # Whatever the last build left in the tree -- a tracked file it changed, an untracked one it
       # wrote -- must neither keep the checkout from moving nor end up in this build. `.lake` stays:
@@ -635,10 +636,11 @@ if [ -d "$node" ] && [ -w "$node" ]; then
     for entry in $LAKE_CACHE_MASTER_REPOS; do
       # `owner/name`, its default branch; `owner/name@branch`, that branch -- in a checkout of its
       # own (`owner/name@branch` under master/), so two branches of one repository never share one.
+      # No `/` in the branch name: the checkouts are matched one directory level below the owner.
       repo=${entry%%@*} want=""
       [[ $entry == *@* ]] && want=${entry#*@}
       if ! [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ /$repo/ == */./* || /$repo/ == */../* ]] \
-         || { [ -n "$want" ] && ! [[ $want =~ ^[A-Za-z0-9_./-]+$ && $want != *..* && $want != /* ]]; }; then
+         || [[ $entry == *@ ]] || { [ -n "$want" ] && ! [[ $want =~ ^[A-Za-z0-9_.-]+$ && $want != .* ]]; }; then
         echo "ignoring repository '$entry'" >&2; continue
       fi
       configured+="$entry "

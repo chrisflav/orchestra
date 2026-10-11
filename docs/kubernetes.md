@@ -504,12 +504,14 @@ How the warmer keeps the node's directory safe for the pods (details in
   for Lake's parallel `--config` ones alike — so no pod sees a partial file. It also points the
   static curl at Debian's CA bundle.
 
-**Master builds** (`LAKE_CACHE_MASTER_REPOS="owner/name ..."`, with `LAKE_CONFIG` and the key):
-the warmer fetches each repository's default branch and, when it moved, builds it with `-o` and
+**Master builds** (`LAKE_CACHE_MASTER_REPOS="owner/name owner/name@branch ..."`, with `LAKE_CONFIG` and
+the key): the warmer fetches each repository's default branch -- or, for `owner/name@branch`, that
+branch, which is the one to name when the agents work from a branch other than the default (no `/`
+in its name) -- and, when it moved, builds it with `-o` and
 uploads it under that commit. A build that fails still uploads what it built; its commit is retried no
 sooner than six hours later. Only once the Mathlib revision it pins is seeded on the node —
 before, the build would be all of Mathlib from source; the revision is requested meanwhile. The
-checkouts live in the Lean cache (`/lean-cache/master/<owner>/<name>`), which only the warmer can
+checkouts live in the Lean cache (`/lean-cache/master/<owner>/<name>[@<branch>]`), which only the warmer can
 write: the build runs code from the repository (its lakefile) with the deploy keys, the upload key
 and write access to the Lean cache, so no pod may edit it. Pods can read it, private sources
 included — as they can read any output in `/lake-cache`. A private repository is cloned over SSH
@@ -518,7 +520,8 @@ host keys as pinned in the image (`/etc/ssh/github_known_hosts`) are accepted. E
 `LAKE_CACHE_MASTER_TIMEOUT` (3600) seconds.
 
 **`lake-cache-put`** uploads only what a task adds: nothing for a HEAD already on upstream's
-default branch (`lake cache put` replaces a revision's mappings, and `lake cache get` stops at the
+default branch or on a branch the warmer builds (`owner/name@branch` lines in `/etc/lake/warmed-branches`,
+a key of Lake's ConfigMap kept in step with `LAKE_CACHE_MASTER_REPOS`, or `$LAKE_CACHE_WARMED`) (`lake cache put` replaces a revision's mappings, and `lake cache get` stops at the
 first revision that has any — a task's few modules must not replace the warmer's full list), and
 nothing from a checkout with uncommitted changes to tracked Lean sources or Lake configuration
 (untracked files do not count). What is already filed under the same commit — an earlier task
