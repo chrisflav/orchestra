@@ -256,7 +256,7 @@ within the last 24 hours, and its chain has not already been resumed three times
 such tasks stay `unfinished` for `orchestra queue retry`. See
 [docs/kubernetes.md](docs/kubernetes.md#operating-it).
 
-`reattach_after_restart` (default `false` for now) goes one step further on the same backend: a task
+`reattach_after_restart` (default `true`) goes one step further on the same backend: a task
 running when the daemon is restarted is not interrupted at all. A daemon stopped by a signal (or
 `orchestra queue shutdown --hand-off`) hands its running tasks over instead of draining them — their
 pods, agents and validation runs keep going — and the daemon that starts next carries each one on

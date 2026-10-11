@@ -695,8 +695,8 @@ Pods are also labelled `orchestra.dev/task=<task id>`, so a running task can be 
 in the dashboard — and `kubectl exec` into for a look around while it works.
 
 **Restarts: running tasks carry on.** With `task_volumes` set and the `queue` block's
-`reattach_after_restart` turned on (`"queue": { "reattach_after_restart": true }` — off by default
-while it is new), a daemon restart does not interrupt the tasks that are running: their pods keep
+`reattach_after_restart` on (the default; `"queue": { "reattach_after_restart": false }` turns it
+off), a daemon restart does not interrupt the tasks that are running: their pods keep
 going, and the next daemon carries each one on from exactly where it is — the same agent mid-turn,
 the same `validation.sh` mid-build — rather than resuming it in a new pod.
 
