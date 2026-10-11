@@ -1064,6 +1064,14 @@ which needs nothing but the database; whether the environment itself is still th
 the backend afterwards (`Exec.Backend.probe`). An entry that is not picked up is swept and resumed
 exactly as before. -/
 
+/-- Whether a running entry is one a stopping daemon may hand to the next one at all: exactly the
+    entries `adoptionDecision` would not refuse for what they *are*. A concert step's workflow does
+    not survive the daemon, and an entry under an execution configuration of its own may be on a
+    backend the next daemon does not run — handing either over would only have it swept up as
+    interrupted, which is worse than draining it. `sameExecution` as for `adoptionDecision`. -/
+def handOverable (entry : QueueEntry) (sameExecution : Bool) : Bool :=
+  entry.concertStepKey.isNone && sameExecution
+
 /-- Whether `entry`, `running` when this daemon started, can be carried on from where it is, and
     from what: the progress its run recorded, or why not.
 
@@ -1318,9 +1326,16 @@ def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (facts :
     id on it has been decided; one whose entry cannot be read is decided by being skipped.
 
     `execution` is the daemon's own (`ResumeFacts.sameExecution`), `now` the time in epoch
-    seconds. Every skip is logged with its reason. -/
-def resumeInterrupted (execution : ExecutionConfig) (now : Int) : IO Nat := do
-  let ids ← loadInterrupted
+    seconds. Every skip is logged with its reason.
+
+    `only` decides just those entries instead of the recorded list, and leaves the list alone: for
+    a task the daemon tried to pick up after a restart and could not (`Daemon.run`), which is
+    resumed on its own the moment that is known, without deciding anybody else's. -/
+def resumeInterrupted (execution : ExecutionConfig) (now : Int)
+    (only : Option (Array String) := none) : IO Nat := do
+  let ids ← match only with
+    | some ids => pure ids
+    | none => loadInterrupted
   if ids.isEmpty then return 0
   let all ← loadAllEntries
   let mut queued := 0
@@ -1360,7 +1375,10 @@ def resumeInterrupted (execution : ExecutionConfig) (now : Int) : IO Nat := do
     catch e =>
       IO.eprintln s!"  Could not resume interrupted entry {entryId}, keeping it for the next start: {e}"
       undecided := undecided.push entryId
-  if undecided.isEmpty then clearInterrupted
+  if only.isSome then
+    unless undecided.isEmpty do
+      IO.eprintln s!"  Left unfinished, undecided: {String.intercalate ", " undecided.toList}"
+  else if undecided.isEmpty then clearInterrupted
   else
     try IO.FS.writeFile (← interruptedFile) (String.intercalate "\n" undecided.toList ++ "\n")
     catch e => IO.eprintln s!"  Could not rewrite the list of interrupted entries: {e}"

@@ -175,6 +175,16 @@ def envFor (ghToken : String) (agentEnv extraEnv : Array (String × Option Strin
     -- Agent-specific env vars (e.g. VIBE_HOME, MISTRAL_API_KEY), then the caller's.
     ++ (agentEnv ++ extraEnv).filterMap fun (k, v) => v.map ((k, ·))
 
+/-- What an agent reaching its MCP server over a network gets on top of its environment: a bound on
+    how long one tool call may take (Claude Code's `MCP_TOOL_TIMEOUT`, in milliseconds).
+
+    Such an agent outlives the daemon (`Exec.Runner`), and its MCP relay answers every request it
+    sent whose connection ended (`McpEndpoint.relayScript`) — but a request can in principle still
+    be lost (the relay itself killed mid-line), and the client's own default would then leave the
+    agent waiting for most of a day. Ten minutes is longer than any tool orchestra serves takes. -/
+def remoteMcpEnv (mcp : McpEndpoint) : Array (String × String) :=
+  if mcp.token.isSome then #[("MCP_TOOL_TIMEOUT", "600000")] else #[]
+
 /-- Everything an agent run needs except its own command line: the same spec for all three launch
     modes, which then differ only in `command`, `args` and `stdio`. -/
 def specFor (agentDef : AgentDef) (repoPath : System.FilePath) (mcp : McpEndpoint)
@@ -190,13 +200,14 @@ def specFor (agentDef : AgentDef) (repoPath : System.FilePath) (mcp : McpEndpoin
                  (extraPorts ++ (kleis.map (·.port)).toArray)
     -- With kleis the sandbox holds no GitHub token at all, whatever the caller passed: the
     -- proxy attaches the credential, and a token here would be a way around it.
-    env     := match kleis with
+    env     := (match kleis with
       | none   => envFor ghToken agentEnv extraEnv
       -- The MCP server is reached directly, never through the proxy: on a backend where it is not
       -- on the loopback (a pod reaching the daemon) its traffic would otherwise go through kleis,
       -- and then stop the moment kleis stops passing that host through.
       | some k => envFor "" agentEnv extraEnv ++ k.env.map fun (n, v) =>
-          if n == "NO_PROXY" || n == "no_proxy" then (n, s!"{v},{mcp.host}") else (n, v)
+          if n == "NO_PROXY" || n == "no_proxy" then (n, s!"{v},{mcp.host}") else (n, v))
+      ++ remoteMcpEnv mcp
     -- Inherited by name, not by value: `PATH` and `HOME` mean what they mean wherever the agent
     -- ends up running, which is not necessarily here.
     envPassthrough := #["SHELL", "PATH", "HOME", "USER", "TERM"]

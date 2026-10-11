@@ -554,10 +554,17 @@ def selectAuthSource {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask
   | .error e  => throw (.userError s!"no usable authentication source for '{backendName}': {e}")
 
 /-- A task a previous daemon left running, which this one is carrying on (`Daemon.run`): its record,
-    and where it had got to (`RunState`). -/
+    and where it had got to (`RunState`).
+
+    `started` is set once the task has its environment and its MCP server back, which is where it
+    stops being "being picked up" and becomes a running task like any other. Anything that goes
+    wrong before then — a token that cannot be minted, an identity no longer configured, a pod that
+    went, a port that is taken — is the daemon's to answer by falling back to resuming the task
+    (`Daemon.run`), never by failing it while its agent may still be working. -/
 structure Reattach where
   record : TaskStore.TaskRecord
   state : RunState.RunState
+  started : IO.Ref Bool
 
 /-- The run id of each step of the task loop, as the execution backend keeps it (`RunSpec.runId`).
     Deterministic, which is the whole point: a daemon that picks the task up after a restart
@@ -608,6 +615,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (onStart : String → IO Unit := fun _ => pure ())
     -- A task a previous daemon left running, to be carried on rather than started (see above).
     (reattach : Option Reattach := none)
+    -- Whether this task may be handed to the next daemon at all: only the queue daemon's tasks,
+    -- and of those not what the next daemon would refuse to pick up (`Queue.handOverable`) — a
+    -- concert step, an entry under an execution configuration of its own. Off, nothing is recorded
+    -- for the task and it drains on a stop, as every task always did.
+    (handOverable : Bool := false)
     : IO ((String × TaskStore.TaskStatus) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {repoLabel ioTask.repo} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
@@ -715,19 +727,38 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- at all rather than refusing to start: its work may be entirely on the issue tracker, and
   -- failing over a token it would never use is the wrong trade.
   IO.println "  Creating GitHub App token..."
-  let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let installationId : Option Nat ← match appConfig.installationId with
-    | some id => pure (some id)
-    | none    =>
-      match ioTask.repo with
-      | some repo => some <$> GitHub.getInstallationId jwt repo.fork.owner
-      | none      =>
-        match appConfig.defaultOrganization with
-        | some org => some <$> GitHub.getInstallationId jwt org
-        | none     => pure none
-  let token ← match installationId with
-    | some id => GitHub.createInstallationToken jwt id
-    | none    => pure ""
+  -- A picked-up task tries a few times: its agent is already working in a pod, and a GitHub
+  -- hiccup at this moment would otherwise send it back to be resumed from scratch.
+  let mint : IO (Option Nat × String) := do
+    let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
+    let installationId : Option Nat ← match appConfig.installationId with
+      | some id => pure (some id)
+      | none    =>
+        match ioTask.repo with
+        | some repo => some <$> GitHub.getInstallationId jwt repo.fork.owner
+        | none      =>
+          match appConfig.defaultOrganization with
+          | some org => some <$> GitHub.getInstallationId jwt org
+          | none     => pure none
+    let token ← match installationId with
+      | some id => GitHub.createInstallationToken jwt id
+      | none    => pure ""
+    return (installationId, token)
+  let (installationId, token) ← if reattach.isNone then mint else do
+    let mut result : Option (Option Nat × String) := none
+    let mut lastErr : Option IO.Error := none
+    for attempt in [0:4] do
+      if attempt > 0 then IO.sleep (UInt32.ofNat (attempt * 5000))
+      try
+        result := some (← mint)
+        break
+      catch e =>
+        lastErr := some e
+        IO.eprintln s!"  Could not mint the task's GitHub token (attempt {attempt + 1}/4): {e}"
+    match result, lastErr with
+    | some r, _ => pure r
+    | none, some e => throw e
+    | none, none => throw (IO.userError "could not mint the task's GitHub token")
   -- Deliberately no `GitHub.setupGhAuth` here. That writes the token to
   -- `~/.config/gh/hosts.yml`, which every concurrently running task shares, so under
   -- `--parallel > 1` the last task to authenticate supplies the credentials for all of them.
@@ -760,7 +791,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       -- failure like a clone that cannot be created or a token that cannot be minted, and those
       -- all leave through the same door. The queue daemon's handler is what releases the issue
       -- claim this task is holding, and a task that returned normally would keep it.
-      TaskStore.saveTask { initialRecord with status := .failed }
+      -- Not for a picked-up task, which falls back to being resumed and must stay `running` until
+      -- the daemon has decided that (`Daemon.run`).
+      if reattach.isNone then TaskStore.saveTask { initialRecord with status := .failed }
       throw (IO.userError s!"cannot run the agent: {e}")
   -- Such a backend gets a checkout per task, made for this task and removed after it, and no slot
   -- is ever prepared. The merger is the one task on it that keeps nothing: it validates a pull
@@ -1037,6 +1070,8 @@ of its own.")
         if let some p := exactPort then Server.releasePort p
     shutdownRef.set (some shutdown)
     IO.println s!"  MCP server on port {port}"
+    -- From here a picked-up task is a running task like any other (`Reattach.started`).
+    if let some r := reattach then r.started.set true
     -- Resolved once, before the first attempt, rather than per attempt: the retries below
     -- `--resume` the same conversation, and moving that conversation to a different account
     -- part-way through would hand the agent a session the new account has never seen.
@@ -1055,7 +1090,7 @@ of its own.")
     -- that has to carry it on after a restart. Only for an environment that can be reopened
     -- (`Session.snapshot`) and only when the daemon is configured to; a record that cannot be
     -- written makes the task one that is not handed over — it drains, as every task used to.
-    let canHandOver := session.snapshot.isSome && appConfig.queue.reattachAfterRestart
+    let canHandOver := session.snapshot.isSome && appConfig.queue.reattachAfterRestart && handOverable
     let recordStep (phase : RunState.Phase) (attempt : Nat) : IO Unit := do
       let some snap := session.snapshot | return
       unless canHandOver do return
@@ -1208,7 +1243,11 @@ handed to the next daemon"
     -- verdict itself), and the verdict is what tells it the task is over. `closeOnce` is the same
     -- close the `finally` would make.
     recordStep .closing lastAttempt
-    closeOnce
+    -- A close that fails is logged and the task goes on to its verdict, as it did when the close
+    -- was only in the `finally`: the claim on the issue is released and the status written either
+    -- way.
+    try closeOnce catch e =>
+      IO.eprintln s!"  Warning: closing the task's environment failed: {e}"
     -- 8. Persist final task state
     --
     -- A usage limit is checked before the result subtype, not after: the CLI reports the limit
@@ -1300,12 +1339,13 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (slotOverride : Option Repo.SlotAssignment := none)
     (preresolvedAuth : Option String := none)
     (onStart : String → IO Unit := fun _ => pure ())
+    (handOverable : Bool := false)
     (reattach : Option Reattach := none)
     : IO (String × TaskStore.TaskStatus × Option Lean.Json) := do
   let ((taskId, status), _, outputJson) ←
     runIOTask appConfig task.ioTask idx debug default
       continuesFrom series cancelToken interactive interactiveAgent slotOverride preresolvedAuth
-      onStart reattach
+      onStart reattach handOverable
   return (taskId, status, outputJson)
 
 end Orchestra.TaskRunner

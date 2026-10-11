@@ -62,7 +62,7 @@ def theRunHelperStartsARunOnceAndReportsHowItEnded : Test := do
   let (_, rest, _) ← runner r (attachArgs "a" "out" 4)
   TestM.assertEqual rest "two\n" (msg := "and a stream can be followed from a byte offset")
   let (_, st, _) ← runner r #["status", "a"]
-  TestM.assert (parseStatus st == some (.exited 7 8)) s!"status knows how it ended ({st})"
+  TestM.assert (parseStatus st == some (.exited 7 8 5)) s!"status knows how it ended ({st})"
   let (code, again, _) ← runner r (startArgs "a" #["sh", "-c", "echo second"])
   TestM.assertEqual code 0
   TestM.assert (parseStartReply again == some (.existing 8))
@@ -87,7 +87,7 @@ def aRunOutlivesWhateverWasFollowingIt : Test := do
   discard follower.wait
   TestM.assertEqual first "line1\n" (msg := "the first follower saw the start")
   let (_, st, _) ← runner r #["status", "slow"]
-  TestM.assert (match parseStatus st with | some (.running _) => true | _ => false)
+  TestM.assert (match parseStatus st with | some (.running _ _) => true | _ => false)
     s!"the run is still going after its follower died ({st})"
   let (code, all, _) ← runner r (attachArgs "slow" "out")
   TestM.assertEqual code 3 (msg := "a new follower gets the run's exit status")
@@ -114,7 +114,7 @@ def aRunsStdinIsHeldOpenUntilItIsClosedOnPurpose : Test := do
     discard w.wait
   IO.sleep 300
   let (_, st, _) ← runner r #["status", "talk"]
-  TestM.assert (match parseStatus st with | some (.running _) => true | _ => false)
+  TestM.assert (match parseStatus st with | some (.running _ _) => true | _ => false)
     s!"a writer leaving does not end the run ({st})"
   let _ ← runner r #["close-stdin", "talk"]
   let (code, out, _) ← runner r (attachArgs "talk" "out")
@@ -128,12 +128,12 @@ def killingARunStopsItsWholeProcessGroup : Test := do
   let _ ← runner r (startArgs "stubborn" #["sh", "-c", "trap '' TERM; sleep 300 & wait; sleep 300"])
   IO.sleep 300
   let (_, st, _) ← runner r #["status", "stubborn"]
-  TestM.assert (match parseStatus st with | some (.running _) => true | _ => false) "it runs"
+  TestM.assert (match parseStatus st with | some (.running _ _) => true | _ => false) "it runs"
   let started ← IO.monoMsNow
   let _ ← runner r #["kill", "stubborn", "1"]
   let took := (← IO.monoMsNow) - started
   let (_, st, _) ← runner r #["status", "stubborn"]
-  TestM.assert (match parseStatus st with | some (.exited _ _) => true | _ => false)
+  TestM.assert (match parseStatus st with | some (.exited _ _ _) => true | _ => false)
     s!"after kill the run has an exit status on disk ({st})"
   TestM.assert (took < 10000) s!"and kill escalated rather than waiting forever ({took}ms)"
   let (code, _, _) ← runner r (attachArgs "stubborn" "out")
@@ -214,7 +214,7 @@ def theRelayDialsTheServerAgainWhenItComesBack : Test := do
   let third ← lineWithin relay.stdout 10000
   TestM.assert (third.any (AgentDef.containsCI · "\"id\":3")) "and the tools go on working"
   -- The agent closing its side ends the relay.
-  let _ := stdin
+  stdin.flush
   relay.kill
   discard relay.wait
   stop'
@@ -277,7 +277,8 @@ def aRunStateIsStoredUntilTheTaskEnds : Test := do
 @[test]
 def aPodSnapshotRoundTripsAndNamesItsRunHelper : Test := do
   let snap : Kubernetes.Snapshot := {
-    pod := "orchestra-abc", image := "img:1", claim := some ("orchestra-ws-1", true), created := 42 }
+    pod := "orchestra-abc", image := "img:1", claim := some ("orchestra-ws-1", true), created := 42
+    ns := "orchestra", mcpHost := "orchestra.svc", mcpPorts := some (47000, 47099) }
   TestM.assert (okIs (Kubernetes.Snapshot.fromJson? snap.toJson) snap) "a snapshot reads back"
   let noClaim : Kubernetes.Snapshot := { snap with claim := none }
   TestM.assert (okIs (Kubernetes.Snapshot.fromJson? noClaim.toJson) noClaim) "with or without a claim"
@@ -294,10 +295,11 @@ def theRunHelpersRepliesAreRead : Test := do
   TestM.assert (parseStartReply "started\n" == some .started) "started"
   TestM.assert (parseStartReply "existing 1234\n" == some (.existing 1234)) "existing, with bytes"
   TestM.assert (parseStartReply "orchestra-run: oops" == none) "anything else is not a reply"
-  TestM.assert (parseStatus "exited 143 10\n" == some (.exited 143 10)) "exited"
-  TestM.assert (parseStatus "running 5" == some (.running 5)) "running"
-  TestM.assert (parseStatus "starting 0" == some .starting) "starting"
-  TestM.assert (parseStatus "unknown 0" == some .unknown) "unknown"
+  TestM.assert (parseStatus "exited 143 10 3\n" == some (.exited 143 10 3)) "exited"
+  TestM.assert (parseStatus "running 5 2" == some (.running 5 2)) "running"
+  TestM.assert (parseStatus "starting 0 0" == some .starting) "starting"
+  TestM.assert (parseStatus "unknown 0 0" == some .unknown) "unknown"
+  TestM.assert (parseStatus "exited 1 10" == none) "and a protocol-1 reply is not read as this one"
   TestM.assert (parseStatus "" == none) "and silence is not a status"
   TestM.assertEqual (startArgs "agent-0" #["claude", "-p", "hi"])
     #["start", "agent-0", "--", "claude", "-p", "hi"]
@@ -378,5 +380,161 @@ def theStartupSweepLeavesPickedUpEntriesRunning : Test := do
     return (kept, swept)
   TestM.assert (kept.any (·.status == .running)) "the entry being picked up is still running"
   TestM.assertEqual (swept.map (·.id)) #["q-2"] (msg := "and only the other one was swept")
+
+/-! ## What the review found -/
+
+@[test]
+def aFollowerCutOffBeforeTheEndStillPassesTheLastLineOn : Test := do
+  -- The run has already finished — its last line, the result, is on disk — and the follower's
+  -- first connection is dropped before it says anything. Exiting on "exited" there loses the line
+  -- the whole task is decided by.
+  let r ← stageRunner
+  let dir := (System.FilePath.mk r).parent.getD "."
+  let fake := dir / "kubectl"
+  IO.FS.writeFile fake s!"#!/bin/sh
+while [ \"$1\" != \"--\" ]; do shift; done; shift
+if [ \"$3\" = attach ] && [ ! -f {dir}/dropped ]; then : > {dir}/dropped; exit 1; fi
+exec \"$@\"
+"
+  let _ ← IO.Process.output { cmd := "chmod", args := #["+x", fake.toString] }
+  let _ ← runner r (startArgs "done" #["sh", "-c", "echo progress; echo RESULT; exit 4"])
+  IO.sleep 500
+  let out ← IO.Process.output {
+    cmd := "/bin/sh", args := followArgs fake.toString "ns" "pod" r "done" "out" }
+  TestM.assert (← (dir / "dropped").pathExists) "the first connection was dropped"
+  TestM.assertEqual out.stdout "progress\nRESULT\n" (msg := "and every line still came through")
+  TestM.assertEqual out.exitCode 4
+
+@[test]
+def aRunWhoseProcessesWereKilledFromOutsideIsSettled : Test := do
+  -- `kill -9` of the wrapper and the command: nothing is left to write an exit status, and a
+  -- follower would otherwise wait for one forever.
+  let r ← stageRunner
+  let _ ← runner r (startArgs "victim" #["sh", "-c", "sleep 300"])
+  IO.sleep 300
+  let dir := ((System.FilePath.mk r).parent.getD ".") / "runs" / "victim"
+  let wrapper := (← IO.FS.readFile (dir / "wrapper")).trimAscii.toString
+  let pid := (← IO.FS.readFile (dir / "pid")).trimAscii.toString
+  let _ ← IO.Process.output { cmd := "kill", args := #["-9", wrapper, pid] }
+  IO.sleep 300
+  let (_, st, _) ← runner r #["status", "victim"]
+  TestM.assert (parseStatus st == some (.exited 255 0 0))
+    s!"status records it as ended, with 255 ({st})"
+  let started ← IO.monoMsNow
+  let (code, _, _) ← runner r (attachArgs "victim" "out")
+  TestM.assertEqual code 255 (msg := "and following it ends at once")
+  TestM.assert ((← IO.monoMsNow) - started < 5000) "rather than waiting for an exit that cannot come"
+
+@[test]
+def aStartThatIsStillGoingIsNotTakenOver : Test := do
+  let r ← stageRunner
+  let dir := ((System.FilePath.mk r).parent.getD ".") / "runs" / "busy"
+  IO.FS.createDirAll dir
+  -- A starter that is alive (this test process) and has launched nothing yet.
+  IO.FS.writeFile (dir / "starter") s!"{← IO.Process.getPID}\n"
+  let (code, _, _) ← runner r (startArgs "busy" #["true"])
+  TestM.assert (code != 0) "a second start does not take over one in progress"
+  -- One whose starter died before launching anything is done again.
+  IO.FS.writeFile (dir / "starter") "999999\n"
+  let (code, said, _) ← runner r (startArgs "busy" #["true"])
+  TestM.assertEqual code 0
+  TestM.assert (parseStartReply said == some .started) s!"a dead start is started again ({said})"
+
+/-- Listen on a free loopback port and serve exactly one connection with `serve`. -/
+private def oneShotServer (serve : Std.Internal.UV.TCP.Socket → IO Unit) : IO UInt16 := do
+  let sock ← Std.Internal.UV.TCP.Socket.new
+  sock.bind (Std.Net.SocketAddress.v4 { addr := Std.Net.IPv4Addr.ofParts 127 0 0 1, port := 0 })
+  sock.listen 1
+  let port := match ← sock.getSockName with | .v4 a => a.port | .v6 a => a.port
+  discard <| IO.asTask (prio := .dedicated) do
+    match ← IO.wait (← sock.accept).result? with
+    | some (.ok client) => serve client
+    | _ => pure ()
+  return port
+
+private def awaitP (p : IO.Promise (Except IO.Error α)) : IO α := do
+  match ← IO.wait p.result! with
+  | .error e => throw e
+  | .ok v    => return v
+
+@[test]
+def aRequestTheServerNeverAnsweredIsAnsweredByTheRelay : Test := do
+  if (← IO.Process.output { cmd := "sh", args := #["-c", "command -v bash"] }).exitCode != 0 then
+    TestM.skip "no bash here"; return
+  -- A server that reads the token and the request, then dies without answering: the daemon going
+  -- away mid-call. The agent must get an answer — an error — and the request must not be resent.
+  let received ← IO.mkRef ""
+  let port ← oneShotServer fun c => do
+    let mut got := ""
+    for _ in [0:20] do
+      match ← awaitP (← c.recv? 65536) with
+      | some bytes => got := got ++ String.fromUTF8! bytes
+      | none => break
+      if (got.splitOn "\n").length ≥ 3 then break
+    received.set got
+    try awaitP (← c.shutdown) catch _ => pure ()
+  let (cmd, args) := McpEndpoint.stdioCommand { host := "127.0.0.1", port, token := some "tok" }
+  let relay ← IO.Process.spawn { cmd, args, stdin := .piped, stdout := .piped, stderr := .null }
+  let (stdin, relay) ← relay.takeStdin
+  -- An id inside the arguments as well, which must not be mistaken for the request's.
+  let long := String.ofList (List.replicate 9000 'x')
+  stdin.putStrLn s!"\{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":\{\"arguments\":\{\"id\":99,\"body\":\"{long}\"}},\"id\":7}"
+  stdin.flush
+  let reply ← lineWithin relay.stdout 20000
+  TestM.assert (reply.any (AgentDef.containsCI · "\"id\":7,\"error\""))
+    s!"the request gets an error answer, under its own id ({reply.map (·.take 120)})"
+  TestM.assert (reply.any (AgentDef.containsCI · "interrupted")) "saying what happened"
+  let got ← received.get
+  TestM.assert (AgentDef.containsCI got long) "the long request reached the server whole"
+  let lines := (got.splitOn "\n").filter (!·.isEmpty)
+  TestM.assertEqual lines.length 2 (msg := "the token and the request, once")
+  -- Used here, so the pipe stays open until now: dropping the last reference closes it, and a
+  -- relay whose agent closed its stdin has nothing left to answer.
+  stdin.flush
+  relay.kill
+  discard relay.wait
+
+@[test]
+def aConcertStepIsNeverHandedOver : Test := do
+  TestM.assert (Queue.handOverable runningEntry true) "an ordinary entry can be"
+  TestM.assert (!Queue.handOverable { runningEntry with concertStepKey := some "k" } true)
+    "a concert step cannot: the next daemon would refuse it, and it would be lost"
+  TestM.assert (!Queue.handOverable runningEntry false)
+    "nor an entry under an execution configuration of its own"
+
+@[test]
+def aPickedUpTaskThatFailsBeforeItRunsAgainIsResumedNotFailed : Test := do
+  TestM.assert (Daemon.fallsBackToResume (reattachFailed := true) (started := true))
+    "it said it could not be picked up"
+  TestM.assert (Daemon.fallsBackToResume (reattachFailed := false) (started := false))
+    "any error before it was running again — a token, an identity, a backend — falls back too"
+  TestM.assert (!Daemon.fallsBackToResume (reattachFailed := false) (started := true))
+    "once it is running again, its errors are its own"
+  let e := Exec.reattachFailed "pod gone"
+  TestM.assert (Exec.isReattachFailed e) "and the error says which it is"
+
+@[test]
+def aDaemonConfiguredDifferentlyDoesNotPickThePodUp : Test := do
+  let cfg (extra : List (String × Json)) : Kubernetes.Config :=
+    match Kubernetes.Config.fromJson (Json.mkObj ([("mcp_host", .str "orchestra.svc"),
+        ("namespace", .str "orchestra"), ("mcp_ports", Json.arr #[Json.num 47000, Json.num 47099])]
+        ++ extra)) with
+    | .ok c => c
+    | .error _ => { mcpHost := "unparsed" }
+  let snap : Kubernetes.Snapshot := {
+    pod := "p"
+    image := "i"
+    created := 1
+    ns := "orchestra"
+    mcpHost := "orchestra.svc"
+    mcpPorts := some (47000, 47099) }
+  TestM.assert (snap.compatible (cfg [])).toOption.isSome "the same configuration picks it up"
+  TestM.assert (snap.compatible (cfg [("namespace", .str "elsewhere")])).toOption.isNone
+    "another namespace does not"
+  TestM.assert (snap.compatible (cfg [("mcp_host", .str "moved.svc")])).toOption.isNone
+    "nor another MCP host, which the agent's relay would never reach"
+  TestM.assert (snap.compatible
+      (cfg [("mcp_ports", Json.arr #[Json.num 48000, Json.num 48099])])).toOption.isNone
+    "nor another port range"
 
 end OrchestraTest.Reattach

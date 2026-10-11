@@ -170,4 +170,14 @@ def delete (taskId : String) : IO Unit := do
   let _ ← Store.run <| HasModel.delete (α := Store.TaskRunStateRow)
     (.eq (.var Store.TaskRunStateRowIndex.task_id .text) (.text taskId))
 
+
+open Db.Query.DSL in
+/-- Every task with something on record, for a starting daemon to sweep what no running entry
+    explains any more. -/
+def allTaskIds : IO (Array String) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let r ← from Store.TaskRunStateRow
+    select r
+  return rows.map (·.task_id)
+
 end Orchestra.RunState

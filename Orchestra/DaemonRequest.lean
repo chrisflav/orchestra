@@ -22,8 +22,10 @@ inductive DaemonRequest where
       before there was one: `orchestra queue cancel` sends `{"type": "cancel"}` and keeps
       working unchanged. -/
   | cancel     (id : Option String := none)
-  /-- Shut down the daemon, optionally cancelling running tasks first. -/
-  | shutdown   (force : Bool := false)
+  /-- Shut down the daemon, optionally cancelling running tasks first (`force`), or handing them
+      over to the next daemon rather than waiting for them (`handOff`, what a termination signal
+      does; see `Exec.tryHandOff`). Neither: drain, as it always did. -/
+  | shutdown   (force : Bool := false) (handOff : Bool := false)
   /-- Start an interactive session and answer with its id.
 
       Here rather than over HTTP for the same reason `cancel` is: a session is a live process
@@ -60,7 +62,8 @@ instance : FromJson DaemonRequest where
       return .cancel id
     | "shutdown" =>
       let force := j.getObjValAs? Bool "force" |>.toOption |>.getD false
-      return .shutdown force
+      let handOff := j.getObjValAs? Bool "hand_off" |>.toOption |>.getD false
+      return .shutdown force handOff
     | "interactive_start" =>
       let specJson ← j.getObjVal? "spec"
       let upstream ← specJson.getObjValAs? Repository "upstream"

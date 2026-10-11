@@ -1324,20 +1324,27 @@ side, across dropped connections, as an ordinary `Handle`. -/
 /-- Where the run helper is in every pod. -/
 def runnerPath : String := Runner.runnerPath controlPath
 
-/-- Start `argv` as run `id` in the pod, or find that it is already there (`Runner.StartReply`). -/
+/-- Start `argv` as run `id` in the pod, or find that it is already there (`Runner.StartReply`).
+
+    Tried three times: `start` is idempotent per id, so a retry after a `kubectl` that failed —
+    an API server hiccup, a connection that dropped before the reply — either starts the run or
+    finds the one the failed attempt started, and never a second. -/
 private def startRun (cfg : Config) (podName id : String) (argv : Array String) :
     IO Runner.StartReply := do
   unless Runner.validRunId id do
     throw (IO.userError s!"kubernetes: '{id}' cannot name a run")
-  let (code, out, err) ← kube cfg
-    (#["exec", podName, "--", "sh", runnerPath] ++ Runner.startArgs id argv)
-  if code != 0 then
-    throw (IO.userError s!"kubernetes: could not start {id} in pod {podName}: \
-{(err ++ out).trimAscii}")
-  match Runner.parseStartReply out with
-  | some r => return r
-  | none => throw (IO.userError s!"kubernetes: the run helper in pod {podName} said \
-'{out.trimAscii}' to starting {id}")
+  let mut lastErr := ""
+  for attempt in [0:3] do
+    if attempt > 0 then IO.sleep (UInt32.ofNat (attempt * 3000))
+    let args := #["exec", podName, "--", "sh", runnerPath] ++ Runner.startArgs id argv
+    let (code, out, err) ← (try kube cfg args catch e => pure (1, "", toString e))
+    if code == 0 then
+      match Runner.parseStartReply out with
+      | some r => return r
+      | none => lastErr := s!"the run helper said '{out.trimAscii}'"
+    else
+      lastErr := (err ++ out).trimAscii.toString
+  throw (IO.userError s!"kubernetes: could not start {id} in pod {podName}: {lastErr}")
 
 /-- One of the helper's control verbs (`kill`, `term`) for run `id`. Best effort: a run that cannot
     be reached to be stopped is stopped by the pod going, which `close` sees to. -/
@@ -1350,8 +1357,33 @@ private def runControl (cfg : Config) (podName : String) (args : Array String) :
     discard child.wait
   catch _ => pure ()
 
+/-- What the pod says about run `id`, or `none` if it could not be asked. -/
+private def runStatus (cfg : Config) (podName id : String) : IO (Option Runner.RunStatus) := do
+  try
+    let (code, out, _) ← kube cfg (#["--request-timeout=30s", "exec", podName, "--", "sh",
+      runnerPath] ++ Runner.statusArgs id)
+    return if code == 0 then Runner.parseStatus out else none
+  catch _ => return none
+
+/-- A follower's exit status, made trustworthy. Anything but 255 is the run's own (the follower
+    only exits with a status the pod reported). 255 is ambiguous — the command's, or the follower
+    giving up (`Runner.followScript`) — so the pod is asked: a run that is over answers with its
+    own status. A run that cannot be confirmed over is *lost*: it is killed, as far as the pod can
+    still be reached, and the step fails with an error rather than reading as finished — so nothing
+    goes on to validate or close beside an agent that may still be writing. -/
+private def confirmExit (cfg : Config) (podName id : String) (code : UInt32) : IO UInt32 := do
+  if code != 255 then return code
+  for attempt in [0:3] do
+    if attempt > 0 then IO.sleep 5000
+    match ← runStatus cfg podName id with
+    | some (.exited c _ _) => return c
+    | _ => pure ()
+  runControl cfg podName #["kill", id, "5"]
+  throw (IO.userError s!"kubernetes: lost track of {id} in pod {podName}: the pod could not be \
+followed or asked how the run ended (see the follower's message above)")
+
 /-- Follow one of run `id`'s streams with `Runner.followScript`. Its stdout is the stream; its exit
-    status is the run's. -/
+    status is the run's, or 255 when it gave up (`confirmExit`). -/
 private def spawnFollower (cfg : Config) (podName id stream : String) (offset : Nat := 0) :
     IO (IO.Process.Child { stdin := .null, stdout := .piped, stderr := .inherit }) :=
   IO.Process.spawn {
@@ -1378,7 +1410,7 @@ private def detachedHandle (cfg : Config) (podName id : String) (replayBytes : N
     wait := do
       let code ← out.wait
       discard err.wait
-      return code
+      confirmExit cfg podName id code
     tryWait := out.tryWait
     terminate := runControl cfg podName #["term", id]
     kill := runControl cfg podName #["kill", id, "5"]
@@ -1408,6 +1440,7 @@ private def collectRun (cfg : Config) (podName id : String) (seconds : Option Na
       return none
   let code ← out.wait
   discard err.wait
+  let code ← confirmExit cfg podName id code
   let o ← IO.ofExcept (← IO.wait outTask)
   let e ← IO.ofExcept (← IO.wait errTask)
   return some (code, o, e)
@@ -1492,14 +1525,24 @@ structure Snapshot where
   claim : Option (String × Bool) := none
   /-- When it was created, in epoch seconds: what `finishBudget` measures the deadline from. -/
   created : Nat
+  /-- The namespace it is in, and where its agent reaches the MCP server — host and the configured
+      port range. A daemon whose configuration says otherwise cannot carry the task on: it would
+      look for the pod in the wrong place, or bring the task's server back somewhere its agent's
+      relay is not dialling (`compatible`). -/
+  ns : String := "default"
+  mcpHost : String := ""
+  mcpPorts : Option (UInt16 × UInt16) := none
 deriving Repr, BEq, Inhabited
 
 def Snapshot.toJson (s : Snapshot) : Json :=
   Json.mkObj ([("pod", .str s.pod), ("image", .str s.image), ("created", Lean.toJson s.created),
-               ("runner", .str runnerPath)]
-    ++ match s.claim with
+               ("runner", .str runnerPath), ("namespace", .str s.ns), ("mcp_host", .str s.mcpHost)]
+    ++ (match s.claim with
        | some (c, reused) => [("claim", .str c), ("reused", .bool reused)]
        | none => [])
+    ++ (match s.mcpPorts with
+       | some (lo, hi) => [("mcp_ports", Json.arr #[Lean.toJson lo.toNat, Lean.toJson hi.toNat])]
+       | none => []))
 
 /-- Read a snapshot back. Strict: a snapshot that does not say where the pod is, or names a
     different run helper than this daemon stages (`Runner.protocol`), is one this daemon cannot
@@ -1511,10 +1554,27 @@ def Snapshot.fromJson? (j : Json) : Except String Snapshot := do
   let runner ← j.getObjValAs? String "runner"
   unless runner == runnerPath do
     throw s!"the pod was set up with run helper {runner}, and this daemon speaks {runnerPath}"
+  let ns ← j.getObjValAs? String "namespace"
+  let mcpHost ← j.getObjValAs? String "mcp_host"
+  let mcpPorts := match j.getObjValAs? (Array Nat) "mcp_ports" with
+    | .ok #[lo, hi] => some (UInt16.ofNat lo, UInt16.ofNat hi)
+    | _ => none
   let claim := match j.getObjValAs? String "claim" with
     | .ok c => some (c, (j.getObjValAs? Bool "reused").toOption.getD true)
     | .error _ => none
-  return { pod, image, claim, created }
+  return { pod, image, claim, created, ns, mcpHost, mcpPorts }
+
+/-- Whether this daemon's configuration can carry on a task whose pod a snapshot describes: same
+    namespace, same MCP host, same MCP port range — what changing any of them across a deploy
+    would break is said in the error. -/
+def Snapshot.compatible (s : Snapshot) (cfg : Config) : Except String Unit := do
+  unless s.ns == cfg.ns do
+    throw s!"its pod is in namespace {s.ns}, and this daemon runs in {cfg.ns}"
+  unless s.mcpHost == cfg.mcpHost do
+    throw s!"its agent reaches the MCP server at {s.mcpHost}, and this daemon is configured with \
+mcp_host {cfg.mcpHost}"
+  unless s.mcpPorts == cfg.mcpPorts do
+    throw "the mcp_ports range changed since it started"
 
 /-- Everything a session's operations need about the pod they run in, whether this daemon created
     it or picked it up from the one before. -/
@@ -1576,7 +1636,8 @@ marked until it does"
     return path
   let snapshot : Snapshot := {
     pod := podName, image := ctx.image, created := ctx.createdEpoch
-    claim := volume.map fun (_, c, reused) => (c, reused) }
+    claim := volume.map fun (_, c, reused) => (c, reused)
+    ns := cfg.ns, mcpHost := cfg.mcpHost, mcpPorts := cfg.mcpPorts }
   return {
     id := s!"pod {cfg.ns}/{podName} ({ctx.image})"
     -- Every task starts from a new pod, so the repository's `init.sh` cannot rely on what a
@@ -1689,7 +1750,7 @@ from the start ({n} bytes read before)"
           stdin := .null, stdout := .inherit, stderr := .inherit }
         let out ← follow "out"
         let err ← follow "err"
-        let exitCode ← out.wait
+        let exitCode ← confirmExit cfg podName runId (← out.wait)
         discard err.wait
         return { exitCode }
       -- A repository's script is run, not conversed with; `.stream` is captured like `.piped`.
@@ -1891,16 +1952,27 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     manifest := some manifest }
 
 /-- Whether the pod and the run helper a snapshot names are there to be picked up: the pod
-    `Running`, and the helper of this daemon's protocol staged in it. Anything that cannot be
-    asked is a `false`. -/
-def probe (cfg : Config) (snapshot : Json) : IO Bool := do
+    `Running`, the helper of this daemon's protocol staged in it, and this daemon configured to reach
+    it the same way (`Snapshot.compatible`). The cluster not answering is `unknown`, never `gone`:
+    the pod may well be there, and treating it as gone would sweep up a task that is still running. -/
+def probe (cfg : Config) (snapshot : Json) : IO ProbeResult := do
+  let snap ← match Snapshot.fromJson? snapshot with
+    | .ok s => pure s
+    | .error e => return .gone s!"its pod snapshot cannot be used: {e}"
+  if let .error e := snap.compatible cfg then return .gone e
+  match ← podState cfg snap.pod with
+  | .gone => return .gone s!"pod {snap.pod} is gone"
+  | .present "Running" => pure ()
+  | .present phase => return .gone s!"pod {snap.pod} is {phase}"
+  | .unknown why => return .unknown why
   try
-    let .ok snap := Snapshot.fromJson? snapshot | return false
-    let .present "Running" ← podState cfg snap.pod | return false
-    let (code, _, _) ← kube cfg #["--request-timeout=30s", "exec", snap.pod, "--", "test", "-f",
+    let (code, _, err) ← kube cfg #["--request-timeout=30s", "exec", snap.pod, "--", "test", "-f",
       runnerPath]
-    return code == 0
-  catch _ => return false
+    -- `test` answering no is the pod saying it has no helper; anything else is not knowing.
+    if code == 0 then return .alive
+    if code == 1 && err.trimAscii.isEmpty then return .gone s!"pod {snap.pod} has no run helper"
+    return .unknown err.trimAscii.toString
+  catch e => return .unknown (toString e)
 
 /-- Open again the pod a previous daemon opened for this task (`Backend.reattach`).
 
@@ -1926,7 +1998,16 @@ daemon's configuration has no task_volumes")
     | none            => cfg
   let workspaceMount := volume.map (fun (tv, _, _) => s!"{tv.mountPath}/work")
   let staged ← markFiles (stagedPaths ecfg home spec workspaceMount)
-  match ← podState cfg snap.pod with
+  if let .error e := snap.compatible cfg then
+    throw (IO.userError s!"kubernetes: cannot carry the task on: {e}")
+  -- Asked a few times: the startup check may have found the cluster not answering, and the pod is
+  -- not to be given up on for a hiccup.
+  let mut state ← podState cfg snap.pod
+  for _ in [0:4] do
+    if state matches .unknown _ then
+      IO.sleep 5000
+      state ← podState cfg snap.pod
+  match state with
   | .present "Running" => pure ()
   | .present phase =>
     throw (IO.userError s!"kubernetes: pod {snap.pod} is {phase}, not Running")

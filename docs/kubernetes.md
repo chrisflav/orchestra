@@ -695,46 +695,72 @@ Pods are also labelled `orchestra.dev/task=<task id>`, so a running task can be 
 in the dashboard — and `kubectl exec` into for a look around while it works.
 
 **Restarts: running tasks carry on.** With `task_volumes` set and the `queue` block's
-`reattach_after_restart` on (the default), a daemon restart does not interrupt the tasks that are
-running: their pods keep going, and the next daemon carries each one on from exactly where it is —
-the same agent mid-turn, the same `validation.sh` mid-build — rather than resuming it in a new pod.
+`reattach_after_restart` turned on (`"queue": { "reattach_after_restart": true }` — off by default
+while it is new), a daemon restart does not interrupt the tasks that are running: their pods keep
+going, and the next daemon carries each one on from exactly where it is — the same agent mid-turn,
+the same `validation.sh` mid-build — rather than resuming it in a new pod.
 
-- **Stopping hands over instead of draining.** On `SIGTERM` or `orchestra queue shutdown` the
-  daemon stops claiming, as before; then, as soon as every task still running is one the next daemon
-  can carry on, it exits — without waiting for them and without touching their pods, claims or
-  tokens (`Handing N running task(s) over to the next daemon`). Tool calls already running are let
-  finish first (up to a minute), and new ones are answered with "orchestra is restarting, try again
-  in a minute". A task that cannot be handed over yet — one still creating or staging its pod, one
-  being cancelled, one whose pod is being deleted, any task on a backend whose runs die with the
-  daemon — holds the hand-off until it can be or is done, and until then the stop is the drain it
-  always was. A second signal, or `--force`, still cancels everything.
+- **A signal hands over instead of draining.** On `SIGTERM`/`SIGINT` (what `docker stop` and a
+  systemd restart send) or `orchestra queue shutdown --hand-off`, the daemon stops claiming, as
+  before; then, as soon as every task still running is one the next daemon can carry on, it exits —
+  without waiting for them and without touching their pods, claims or tokens (`Handing N running
+  task(s) over to the next daemon`). From that moment no new task is claimed and the control socket
+  is closed; tool calls already running are let finish (up to a minute), and new ones are answered
+  with "orchestra is restarting, try again in a minute". A task that cannot be handed over yet —
+  one still creating or staging its pod, one being cancelled, one whose pod is being deleted, a
+  concert step, any task on a backend whose runs die with the daemon — holds the hand-off until it
+  can be or is done, and until then the stop is the drain it always was. A plain `orchestra queue
+  shutdown` always drains. A second signal, or `--force`, still cancels everything.
 - **Starting picks them up.** Before the startup sweep marks running entries interrupted, the daemon
   looks at each one: its task record still `running`, where it had got to on record (the
-  `task_run_state` table: the step, the attempt, the pod and its claim, the MCP port and token), the
-  same execution configuration, and the pod `Running` with its run helper in it. Each such entry is
-  picked up (`Picking up entry … where it was: attempt 2`); it keeps its slot, its claim and its
-  pod, `reclaim` leaves the pod alone (its record is still `running`), and its worker re-opens the
-  session on that pod and resumes the task loop at the recorded attempt. Every step of the loop has
-  a fixed run id (`agent-1`, `validate-1`, `after`), and starting one that exists only attaches to
-  it — so the agent that was running is followed again, re-read from its first byte (which rebuilds
-  the session id, the result and any usage limit; the part already printed is kept out of the log),
-  and a validation that finished while no daemon was there is simply read back. Cancelling, the
-  budget, `deadline_seconds`, the finish command and the close all work for it as for any other task.
+  `task_run_state` table: the step, the attempt, the pod and its claim, the namespace, MCP host,
+  port range, port and token), the same execution configuration, and the pod `Running` with its
+  run helper in it (all pods are asked at once). Each such entry is picked up (`Picking up entry …
+  where it was: attempt 2`); it keeps its slot, its claim and its pod, `reclaim` leaves the pod
+  alone (its record is still `running`), and its worker re-opens the session on that pod and
+  resumes the task loop at the recorded attempt. Every step of the loop has a fixed run id
+  (`agent-1`, `validate-1`, `after`), and starting one that exists only attaches to it — so the
+  agent that was running is followed again, re-read from its first byte (which rebuilds the session
+  id, the result and any usage limit; the part already printed is kept out of the log), and a
+  validation that finished while no daemon was there is simply read back. Cancelling, the budget,
+  `deadline_seconds`, the finish command and the close all work for it as for any other task. A
+  cluster that does not answer at startup is not taken to mean the pod is gone: the entry is picked
+  up anyway and its pod looked for again.
 - **The agent keeps its tools.** The agent's MCP client is a small `bash` relay that dials the
   daemon again when the connection drops, holding back whatever the agent asks meanwhile; the next
   daemon serves the task on the same port with the same token (its port is set aside at startup, so
-  no new task can take it). This needs `mcp_host` to reach the new daemon the way it reached the old
-  one, which it does when the daemon is restarted in place. A tool call the old daemon had started
-  and not answered when it exited is the one thing that can be lost; the hand-off waits for those.
+  no new task can take it). A request that went out on a connection that then ended without an
+  answer is answered by the relay itself with an error ("the connection was interrupted … call the
+  tool again") rather than sent twice, and the agent runs with `MCP_TOOL_TIMEOUT` of ten minutes as
+  a last resort. This needs `mcp_host` to reach the new daemon the way it reached the old one; a
+  daemon whose namespace, `mcp_host` or `mcp_ports` changed across the restart does not pick the
+  tasks up.
 - **What falls back.** An entry that cannot be picked up — its pod gone, nothing on record (it was
   still being set up, or ran on a version before this), a different execution configuration, a
-  concert step, the pod or the MCP port lost between the check and the worker — is swept and resumed
-  exactly as described next. Interactive sessions do not take part: they still go dormant across a
-  restart and wake on a new pod.
+  concert step, a changed namespace or MCP address — is swept and resumed exactly as described next,
+  and what it had on record is forgotten (its kleis token revoked first). So is one that fails
+  anywhere before it is running again (its pod or checkout gone, its MCP port taken, a GitHub token
+  that cannot be minted after a few tries): its pod is removed, its port and token let go of, and it
+  is resumed from its conversation in a new pod. Interactive sessions do not take part: they still
+  go dormant across a restart and wake on a new pod.
+- **A run that went missing is not a run that finished.** The daemon's connection following a
+  run's output reconnects for up to fifteen minutes of an unreachable cluster; if it gives up, or
+  the run's processes were killed from outside (the run helper then records exit 255), the daemon
+  asks the pod how the run ended, and a run it cannot confirm as over is killed and fails its step —
+  it never reads as an agent that finished, with validation started beside it.
 
 The MCP token and, with kleis, the task's kleis token are in `task_run_state` for as long as the task
 runs — the agent holds them, so the next daemon has to accept them — and the row is deleted when the
 task ends.
+
+**Rolling back** past this version: the older daemon refuses to start on a database that records a
+migration it does not know (`0004_task_run_state`). Turn `reattach_after_restart` off and stop the
+daemon with a plain `orchestra queue shutdown` (so nothing is handed over), then delete the record of
+the migration — the table itself can stay, nothing older reads it:
+
+```sql
+DELETE FROM db_migrations WHERE name = '0004_task_run_state';
+```
 
 **Restarts: tasks that were interrupted.** A task the restart interrupted — one that could not be
 carried on as above, or any task when a daemon was killed rather than stopped — is picked up again by
@@ -782,8 +808,9 @@ never fit (its own request above the quota's limit) is put back again and again;
 **Long silences.** Some load balancers and API-server configurations drop `kubectl exec` streams
 that go idle. For a queued task that costs nothing: the agent and the scripts run detached in the
 pod, and what drops is only the daemon's connection following their output, which reconnects and
-carries on from the byte it had reached (it gives up only after five minutes of not reaching the
-pod at all, or at once if the pod is gone). An interactive session's agent is still a plain
+carries on from the byte it had reached (it gives up only after fifteen minutes of not reaching the
+pod at all, or at once if the pod is gone — and then the step fails rather than reading as finished;
+see restarts, above). An interactive session's agent is still a plain
 `kubectl exec`; if that connection drops, the agent process in the pod outlives it, and the next
 launch kills whatever the last one left behind before starting, so two agents never share a
 checkout.

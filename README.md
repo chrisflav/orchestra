@@ -256,13 +256,14 @@ within the last 24 hours, and its chain has not already been resumed three times
 such tasks stay `unfinished` for `orchestra queue retry`. See
 [docs/kubernetes.md](docs/kubernetes.md#operating-it).
 
-`reattach_after_restart` (default `true`) goes one step further on the same backend: a task running
-when the daemon is restarted is not interrupted at all. A stopping daemon hands its running tasks
-over instead of draining them — their pods, agents and validation runs keep going — and the daemon
-that starts next carries each one on from where it is, same pod, same agent, same MCP endpoint. A
-task that cannot be handed over (on another backend, or still setting up its pod) is drained as
-before, and one the new daemon cannot pick up falls back to `resume_after_restart`. See
-[docs/kubernetes.md](docs/kubernetes.md#operating-it).
+`reattach_after_restart` (default `false` for now) goes one step further on the same backend: a task
+running when the daemon is restarted is not interrupted at all. A daemon stopped by a signal (or
+`orchestra queue shutdown --hand-off`) hands its running tasks over instead of draining them — their
+pods, agents and validation runs keep going — and the daemon that starts next carries each one on
+from where it is, same pod, same agent, same MCP endpoint. A plain `queue shutdown` still drains. A
+task that cannot be handed over (on another backend, a concert step, or still setting up its pod) is
+drained as before, and one the new daemon cannot pick up falls back to `resume_after_restart`. See
+[docs/kubernetes.md](docs/kubernetes.md#operating-it), which also says how to roll back past it.
 
 `parallel_per_repo` is capped separately because concurrent tasks on the same
 repository each need their own clone — a *slot* — so that two agents can create

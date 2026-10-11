@@ -1148,18 +1148,20 @@ private def handleClient (state : State) (client : Socket) : IO Unit := do
           | some req =>
             -- A tool call is counted from before it runs until its answer is sent, so a hand-off
             -- waiting for `toolCallsInFlight` to reach zero waits for the answer too; and one
-            -- that arrives once the hand-off has begun is not run at all (`handOffReply`).
-            if let .toolsCall id _ := req then
-              if ← handOffRef.get then
-                let response := jsonrpcResult id (toolContent handOffReply (isError := true))
-                let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
-                continue
+            -- that arrives once the hand-off has begun is not run at all (`handOffReply`). Counted
+            -- *before* the hand-off flag is read: read first, a call could pass the check, the
+            -- hand-off could then see zero in flight and exit, and the call would be cut off.
             let counted := req matches .toolsCall ..
             if counted then inFlightRef.modify (· + 1)
             try
-              match ← evalRequest state req with
-              | none => pure ()
-              | some response =>
+              let refused ← if counted then handOffRef.get else pure false
+              let response? ← if refused then
+                  match req with
+                  | .toolsCall id _ =>
+                    pure (some (jsonrpcResult id (toolContent handOffReply (isError := true))))
+                  | _ => pure none
+                else evalRequest state req
+              if let some response := response? then
                 let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
             finally
               if counted then inFlightRef.modify (· - 1)

@@ -67,18 +67,24 @@ namespace Orchestra.Exec.Runner
 /-- The version of the protocol below. Part of the file name the script is staged under, so a
     daemon never runs a different version's script in a pod a previous daemon set up — and never
     overwrites a script a running wrapper is still reading. -/
-def protocol : Nat := 1
+def protocol : Nat := 2
 
 /-- Where the run helper lives in a pod, given the control directory. -/
 def runnerPath (controlDir : String) : String := s!"{controlDir}/run-{protocol}"
 
-/-- The run helper. POSIX `sh`, tested under dash and busybox (`OrchestraTest.RunnerTest` runs it).
+/-- The run helper. POSIX `sh`, tested under dash and busybox (`OrchestraTest.ReattachTest` runs it).
 
     Files per run, under `runs/<id>/` beside the script: `out`, `err`, `pid` (the command's process
-    id — and, with `setsid`, its process group), `exit` (its exit status, written by the wrapper
-    when the command ends: `mv`d into place, so a reader sees it whole or not at all), and with
-    `--stdin` the FIFO `in` and the holder's pid in `holder`. -/
-def runnerScript : String := "# orchestra's in-pod run helper (protocol 1). Staged by the daemon; run as `sh <this file> ...`.
+    id — and, with `setsid`, its process group), `wrapper` (the wrapper's), `starter` (the `start`
+    that created the directory, so a second `start` takes over only one that died before it
+    launched anything), `exit` (its exit status, written by the wrapper when the command ends:
+    `mv`d into place, so a reader sees it whole or not at all), and with `--stdin` the FIFO `in`
+    and the holder's pid in `holder`.
+
+    A run whose wrapper and command are both gone with no `exit` on disk — `kill -9`, the OOM
+    killer — is settled by whoever looks next (`status`, `attach`): `exit` is written as 255, so
+    nothing waits for a run that can no longer end. -/
+def runnerScript : String := "# orchestra's in-pod run helper (protocol 2). Staged by the daemon; run as `sh <this file> ...`.
 # See Orchestra/Exec/Runner.lean for what each subcommand promises.
 set -u
 self=$0
@@ -94,6 +100,16 @@ dir_of() {
 }
 size_of() { if [ -f \"$1\" ]; then wc -c <\"$1\" | tr -d ' '; else echo 0; fi; }
 put() { printf '%s\\n' \"$2\" >\"$1.tmp\" && mv \"$1.tmp\" \"$1\"; }
+alive() { [ -n \"$1\" ] && kill -0 \"$1\" 2>/dev/null; }
+# A run whose wrapper and command are both gone without an exit status on disk was killed from
+# outside (kill -9, the OOM killer): record that, so nobody waits for it forever.
+settle() {
+  [ -f \"$d/exit\" ] && return 0
+  [ -f \"$d/pid\" ] || return 0
+  if ! alive \"$(cat \"$d/wrapper\" 2>/dev/null)\" && ! alive \"$(cat \"$d/pid\" 2>/dev/null)\"; then
+    [ -f \"$d/exit\" ] || put \"$d/exit\" 255
+  fi
+}
 
 # start <id> [--stdin] -- <cmd...>: start the command detached, once per id.
 cmd_start() {
@@ -114,10 +130,13 @@ cmd_start() {
     i=0
     while [ ! -f \"$d/pid\" ] && [ ! -f \"$d/exit\" ] && [ $i -lt 50 ]; do nap 0.2; i=$((i + 1)); done
     if [ -f \"$d/pid\" ] || [ -f \"$d/exit\" ]; then echo \"existing $(size_of \"$d/out\")\"; exit 0; fi
-    # A start that died before it launched anything: nothing runs from it, so it is done again.
+    # A start that is still going (its starter alive) is not taken over; one that died before it
+    # launched anything left nothing running, so it is done again.
+    if alive \"$(cat \"$d/starter\" 2>/dev/null)\"; then die \"start: this run is being started by another request\"; fi
     rm -rf \"$d\"
     mkdir \"$d\" || die \"start: cannot create $d\"
   fi
+  put \"$d/starter\" \"$$\"
   if [ -n \"$stdin\" ]; then
     mkfifo \"$d/in\" || die \"start: cannot create $d/in\"
     detach sh \"$self\" _hold \"$d\" </dev/null >/dev/null 2>&1 &
@@ -143,6 +162,7 @@ cmd_hold() {
 # The wrapper: runs the command in a process group of its own and records how it ended.
 cmd_wrap() {
   d=$1; shift
+  put \"$d/wrapper\" \"$$\"
   if [ -p \"$d/in\" ]; then in=$d/in; else in=/dev/null; fi
   if command -v setsid >/dev/null 2>&1; then
     setsid \"$@\" <\"$in\" >\"$d/out\" 2>\"$d/err\" &
@@ -164,31 +184,39 @@ stop_holder() {
   fi
 }
 
-# status <id>: exited <code> <out bytes> | running <out bytes> | starting 0 | unknown 0
+# status <id>: exited <code> <out bytes> <err bytes> | running <out> <err> | starting 0 0 |
+# unknown 0 0
 cmd_status() {
   dir_of \"$1\"
-  if [ -f \"$d/exit\" ]; then echo \"exited $(cat \"$d/exit\") $(size_of \"$d/out\")\"
-  elif [ -f \"$d/pid\" ]; then echo \"running $(size_of \"$d/out\")\"
-  elif [ -d \"$d\" ]; then echo \"starting 0\"
-  else echo \"unknown 0\"; fi
+  settle
+  if [ -f \"$d/exit\" ]; then echo \"exited $(cat \"$d/exit\") $(size_of \"$d/out\") $(size_of \"$d/err\")\"
+  elif [ -f \"$d/pid\" ]; then echo \"running $(size_of \"$d/out\") $(size_of \"$d/err\")\"
+  elif [ -d \"$d\" ]; then echo \"starting 0 0\"
+  else echo \"unknown 0 0\"; fi
 }
 
 # attach <id> out|err [offset]: the stream from offset on, until the command has exited and all
-# of it is out; then exit with the command's own status.
+# of it is out; then exit with the command's own status. Polls quickly while output flows and
+# backs off to a second while it does not.
 cmd_attach() {
   dir_of \"$1\"
   case ${2:-} in out|err) f=$d/$2 ;; *) die \"attach: stream must be out or err\" ;; esac
   off=${3:-0}
   [ -d \"$d\" ] || die \"attach: no run $1\"
+  idle=0
   while :; do
+    settle
     fin=; [ -f \"$d/exit\" ] && fin=1
     size=$(size_of \"$f\")
     if [ \"$size\" -gt \"$off\" ]; then
       tail -c +$((off + 1)) \"$f\" | head -c $((size - off)) || exit 141
       off=$size
+      idle=0
+    else
+      idle=$((idle + 1))
     fi
     if [ -n \"$fin\" ]; then exit \"$(cat \"$d/exit\")\"; fi
-    nap 0.2
+    if [ $idle -lt 10 ]; then nap 0.2; else nap 1; fi
   done
 }
 
@@ -284,12 +312,13 @@ def parseStartReply (out : String) : Option StartReply :=
   | ["existing", n] => n.toNat?.map .existing
   | _ => none
 
-/-- What `status` says about a run. -/
+/-- What `status` says about a run. The byte counts are of `out`, then `err`, so far: what a
+    follower compares its offset with before it believes it has passed the whole stream on. -/
 inductive RunStatus where
-  /-- Over, with this exit status; this much is on stdout. -/
-  | exited (code : UInt32) (outBytes : Nat)
-  /-- Still going; this much is on stdout so far. -/
-  | running (outBytes : Nat)
+  /-- Over, with this exit status. -/
+  | exited (code : UInt32) (outBytes errBytes : Nat)
+  /-- Still going. -/
+  | running (outBytes errBytes : Nat)
   /-- Being started right now. -/
   | starting
   /-- Never started in this pod. -/
@@ -299,11 +328,14 @@ deriving Repr, BEq, Inhabited
 /-- Read `status`'s one line. -/
 def parseStatus (out : String) : Option RunStatus :=
   match (out.trimAscii.toString.splitOn " ").filter (!·.isEmpty) with
-  | ["exited", c, n] => do pure (.exited (UInt32.ofNat (← c.toNat?)) (← n.toNat?))
-  | ["running", n]   => n.toNat?.map .running
-  | ["starting", _]  => some .starting
-  | ["unknown", _]   => some .unknown
+  | ["exited", c, n, e] => do pure (.exited (UInt32.ofNat (← c.toNat?)) (← n.toNat?) (← e.toNat?))
+  | ["running", n, e]   => do pure (.running (← n.toNat?) (← e.toNat?))
+  | ["starting", _, _]  => some .starting
+  | ["unknown", _, _]   => some .unknown
   | _ => none
+
+/-- The argument vector, after `sh <runner>`, that asks how run `id` is. -/
+def statusArgs (id : String) : Array String := #["status", id]
 
 /-- The daemon-side half: follow one stream of a run, across dropped connections, and exit with
     the run's own exit status.
@@ -312,9 +344,17 @@ def parseStatus (out : String) : Option RunStatus :=
     with its stdout being what the daemon reads. Each round is one `kubectl exec … attach` from the
     offset reached so far — counted by passing everything through `tee` into a FIFO `wc -c` reads,
     since POSIX `sh` has no other way to count a stream it forwards — and when that exec ends it
-    asks the pod how the run is: over (exit with its status), still running (the connection
-    dropped: attach again from where it stopped), or not answerable (try again for five minutes,
-    then give up with 255 and say why on stderr). A pod that is gone is given up on at once.
+    asks the pod how the run is:
+    * over, and everything it wrote to this stream passed on (the byte counts `status` gives):
+      exit with its status. Over with bytes still unforwarded — the attach was cut off before the
+      end — is another round, since the last line is the one with the result in it;
+    * still running: the connection dropped, attach again from where it stopped;
+    * not answerable: try again every ten seconds for fifteen minutes, then give up.
+
+    Giving up — that, a pod that is gone, or a run the pod has never heard of — exits 255 with the
+    reason on stderr. 255 is also a status a command can exit with, so the daemon never takes it at
+    its word: it asks the pod itself, and treats a run it cannot confirm as over as *lost*, which
+    fails the step rather than reading as a finished one (`Kubernetes.confirmExit`).
 
     Its own reader going away ends it too (141), so a follower is never left behind looping on a
     run nobody reads. -/
@@ -334,17 +374,23 @@ while :; do
   rm -f \"$tmp/c\"
   [ \"$piped\" -eq 0 ] || exit 141
   st=$(\"$k\" -n \"$ns\" exec \"$pod\" -- sh \"$runner\" status \"$id\" 2>>\"$tmp/e\") || st=
-  case $st in
-    \"exited \"*) set -- $st; exit \"$2\" ;;
-    \"running \"*|\"starting \"*) fails=0; sleep 1 ;;
-    \"unknown \"*) echo \"orchestra: run $id is not in pod $pod\" >&2; exit 255 ;;
+  set -- $st
+  case ${1:-} in
+    exited)
+      # Over -- but only done once everything it wrote has been passed on: the attach that just
+      # ended may have been cut off before the end, and the last line is the one with the result.
+      if [ \"$stream\" = out ]; then want=${3:-0}; else want=${4:-0}; fi
+      if [ \"$off\" -ge \"$want\" ]; then exit \"$2\"; fi
+      fails=0 ;;
+    running|starting) fails=0; sleep 1 ;;
+    unknown) echo \"orchestra: run $id is not in pod $pod\" >&2; exit 255 ;;
     *)
       if grep -qi 'not found' \"$tmp/e\"; then echo \"orchestra: pod $pod is gone\" >&2; exit 255; fi
       fails=$((fails + 1))
-      if [ \"$fails\" -ge 60 ]; then
+      if [ \"$fails\" -ge 90 ]; then
         echo \"orchestra: lost run $id in pod $pod: $(tail -n 3 \"$tmp/e\")\" >&2; exit 255
       fi
-      sleep 5 ;;
+      sleep 10 ;;
   esac
   : >\"$tmp/e\"
 done

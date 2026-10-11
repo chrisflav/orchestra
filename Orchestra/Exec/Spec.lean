@@ -189,6 +189,14 @@ def shellEscape (s : String) : String :=
 
 namespace McpEndpoint
 
+/-- The `"error"` member the relay answers a request with when the connection it was sent on ended
+    before its answer came back (`relayScript`). Plain text, no apostrophe and no backslash: it is
+    spliced into a single-quoted shell word and then into TOML and JSON. -/
+def relayLostReply : String :=
+  "\"error\":{\"code\":-32001,\"message\":\"The connection to orchestra was interrupted before \
+this call was answered (orchestra is probably restarting). The call was not retried: if it is \
+still needed, make it again.\"}"
+
 /-- The script `stdioCommand` runs under `bash` for an endpoint with a token: a relay between the
     agent's MCP client and the server that survives the server going away and coming back.
 
@@ -205,29 +213,46 @@ namespace McpEndpoint
     * The agent's requests go into a FIFO held open read-write by the relay itself, by one `cat`
       that lives as long as the agent's stdin does. Nothing the agent writes while the server is
       away is lost: it waits in the FIFO for the next connection.
-    * Each connection is `bash`'s own `/dev/tcp`, so the relay rather than `nc` decides when it is
-      over: the token goes first, then one `cat` copies the FIFO to the socket and another the
-      socket to the agent. The first of the two to end (`wait -n`, so `bash` 4.3 or later) ends
-      the connection — the server closing it is an immediate EOF on the second — and the other is
-      stopped before it can take another request off the FIFO.
+    * Each connection is `bash`'s own `/dev/tcp`: the token goes first, then one loop copies whole
+      lines from the FIFO to the socket and another whole lines from the socket to the agent
+      (`read -r`, so a long request is never split across two connections). The first of the two
+      to end (`wait -n`, so `bash` 4.3 or later) ends the connection — the server closing it is an
+      immediate EOF — and the other is stopped before it can take another request off the FIFO.
+    * **Every request is answered exactly once.** The id of each request sent is noted (one file
+      per id; the id is the last `"id":` in the line, which is where the MCP client puts it), and
+      crossed off when the server's answer to it passes back (the server writes `"id"` first,
+      directly followed by `"jsonrpc"`: its keys are sorted). When a connection ends, every id not
+      crossed off is answered by the relay itself with an error (`relayLostReply`), and nothing is
+      sent again — a tool call that may have half happened (a comment posted, a pull request
+      opened) is not the relay's to repeat. So a request the old server read and never answered,
+      or one that went out on a connection about to close, gets an error the agent can act on
+      instead of a wait that never ends. Notifications carry no id and need no answer.
     * Reconnecting backs off from one second to fifteen, and gives up after an hour without a
       connection that lasted, which is longer than any restart and shorter than a pod's deadline.
     * The agent closing its stdin — it is done — ends the relay.
 
     The server is stateless per connection (every request is answered on its own, `initialize` or
     not), so a request on a new connection is served exactly as it would have been on the old one.
-    A request the old server had read and not answered when it died is the one thing lost; the
-    daemon stops accepting tool calls and waits for the ones in flight before it hands over
-    (`Server.beginHandOff`), so that is a request that raced the exit itself. -/
+    As a last backstop for anything that still slips through, a remote agent runs with
+    `MCP_TOOL_TIMEOUT` set (`Sandbox.remoteMcpEnv`), so no tool call waits forever. -/
 def relayScript (e : McpEndpoint) (token : String) : String :=
   s!"t={shellEscape token}; h={shellEscape e.host}; p={e.port}; " ++
-  "d=$(mktemp -d) || exit 1; mkfifo \"$d/q\" || exit 1; exec 5<>\"$d/q\"; rm -rf \"$d\"; " ++
-  "exec 4<&0; ( cat <&4 >&5; kill -TERM $$ 2>/dev/null ) & " ++
-  "trap 'kill $(jobs -p) 2>/dev/null; exit 0' HUP INT TERM; w=1; down=0; " ++
+  "d=$(mktemp -d) || exit 1; mkdir \"$d/p\" && mkfifo \"$d/q\" || exit 1; exec 5<>\"$d/q\"; " ++
+  "exec 4<&0; rq='.*\"id\":([0-9]+|\"[^\"]*\")[,}]'; rs='\"id\":([0-9]+|\"[^\"]*\"),\"jsonrpc\"'; " ++
+  "( cat <&4 >&5; kill -TERM $$ 2>/dev/null ) & " ++
+  "trap 'kill $(jobs -p) 2>/dev/null; rm -rf \"$d\"' EXIT; trap 'exit 0' HUP INT TERM; " ++
+  "w=1; down=0; " ++
   "while :; do s=$SECONDS; " ++
   "if { exec 3<>\"/dev/tcp/$h/$p\"; } 2>/dev/null; then echo \"$t\" >&3; " ++
-  "cat <&3 & r=$!; cat <&5 >&3 & f=$!; wait -n; kill $r $f 2>/dev/null; " ++
-  "wait $r $f 2>/dev/null; exec 3>&-; fi; " ++
+  "( while IFS= read -r l; do echo \"$l\"; if [[ $l =~ $rs ]]; then " ++
+  "rm -f \"$d/p/${BASH_REMATCH[1]//[^A-Za-z0-9]/_}\"; fi; done <&3 ) & r=$!; " ++
+  "( while IFS= read -r l; do if [[ $l =~ $rq ]]; then " ++
+  "echo \"${BASH_REMATCH[1]}\" > \"$d/p/${BASH_REMATCH[1]//[^A-Za-z0-9]/_}\"; fi; " ++
+  "echo \"$l\" >&3 || exit 1; done <&5 ) & f=$!; " ++
+  "wait -n; kill $r $f 2>/dev/null; wait $r $f 2>/dev/null; exec 3>&-; fi; " ++
+  "for x in \"$d\"/p/*; do [ -f \"$x\" ] || continue; " ++
+  "echo '{\"jsonrpc\":\"2.0\",\"id\":'\"$(cat \"$x\")\"'," ++ relayLostReply ++ "}'; " ++
+  "rm -f \"$x\"; done; " ++
   "if [ $((SECONDS - s)) -ge 5 ]; then w=1; down=0; else down=$((down + w)); " ++
   "[ $down -ge 3600 ] && exit 1; w=$((w * 2)); [ $w -gt 15 ] && w=15; fi; " ++
   "sleep $w & wait $!; done"

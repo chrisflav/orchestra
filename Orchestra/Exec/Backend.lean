@@ -27,6 +27,13 @@ initialize stopRequestedRef : IO.Ref Bool ← IO.mkRef false
 def requestStop : IO Unit := stopRequestedRef.set true
 def stopRequested : IO Bool := stopRequestedRef.get
 
+/-- Set when the stop that was asked for is one that may hand tasks over: a termination signal, or
+    `orchestra queue shutdown --hand-off`. A plain `queue shutdown` drains, as it always did. -/
+initialize handOffRequestedRef : IO.Ref Bool ← IO.mkRef false
+
+def requestHandOff : IO Unit := handOffRequestedRef.set true
+def handOffRequested : IO Bool := handOffRequestedRef.get
+
 /-- How a backend says it has nowhere to run a task *yet*: the cluster is full, and nothing is
     wrong with the task. The daemon puts such an entry back to `pending` rather than failing it. -/
 def noRoomPrefix : String := "no room for the task yet"
@@ -353,6 +360,16 @@ structure SessionSpec where
       for someone waiting on the other end of a chat. -/
   roomWaitSeconds : Nat := 600
 
+/-- What `Backend.probe` found of an environment a previous daemon left. -/
+inductive ProbeResult where
+  /-- There, and ready to be reopened. -/
+  | alive
+  /-- Positively not there to be picked up, and why. -/
+  | gone (why : String)
+  /-- Could not be asked, and why. Not the same as `gone`. -/
+  | unknown (why : String)
+deriving Repr, BEq, Inhabited
+
 /-- One way of executing agents.
 
     Everything a backend needs to know about the task is in the specs it is handed; everything
@@ -416,10 +433,11 @@ structure Backend where
       every backend that runs the agent on this machine. Throws when the environment is gone. -/
   reattach : Option (Lean.Json → SessionSpec → IO Session) := none
   /-- Whether the environment a snapshot names is still there to be reopened, asked of every
-      running task at startup before anything is decided about it (`Daemon.run`). Cheap, and a
-      `false` for anything that cannot be answered — a task that is not picked up again is resumed
-      the way it was before there was any of this. -/
-  probe : Lean.Json → IO Bool := fun _ => pure false
+      running task at startup before anything is decided about it (`Daemon.run`). `unknown` when
+      the place cannot be asked: the task is then picked up anyway, and its reopening tries again
+      (and falls back if it still cannot) — treating "could not ask" as "gone" would sweep up a
+      task whose agent is still working. -/
+  probe : Lean.Json → IO ProbeResult := fun _ => pure (.gone "this backend cannot reopen anything")
 
 namespace Handle
 

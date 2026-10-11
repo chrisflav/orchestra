@@ -839,11 +839,12 @@ structure QueueConfig where
       rather than drained, and picked up again — same pod, same agent, same validation run — by
       the daemon that starts next.
 
-      On by default, and only ever applies to tasks on a backend whose runs outlive the daemon (the
-      kubernetes backend with `task_volumes`, `Exec.Backend.reattach`); every other task drains on
-      a stop and is resumed by `resumeAfterRestart` as before. Off makes a stop drain everything and
-      a start pick nothing up, which is what every daemon before this did. -/
-  reattachAfterRestart : Bool := true
+      Off by default while it is new, and only ever applies to tasks on a backend whose runs outlive
+      the daemon (the kubernetes backend with `task_volumes`, `Exec.Backend.reattach`) that a
+      signal or `queue shutdown --hand-off` stops; every other task drains on a stop and is resumed
+      by `resumeAfterRestart` as before. Off, a stop drains everything and a start picks nothing
+      up, which is what every daemon before this did. -/
+  reattachAfterRestart : Bool := false
 deriving Repr, Inhabited
 
 instance : FromJson QueueConfig where
@@ -854,7 +855,7 @@ instance : FromJson QueueConfig where
     let parallelPerRepo := j.getObjValAs? Nat "parallel_per_repo" |>.toOption |>.getD 1
     let resumeAfterRestart := j.getObjValAs? Bool "resume_after_restart" |>.toOption |>.getD true
     let reattachAfterRestart :=
-      j.getObjValAs? Bool "reattach_after_restart" |>.toOption |>.getD true
+      j.getObjValAs? Bool "reattach_after_restart" |>.toOption |>.getD false
     return { parallel := max 1 parallel, parallelPerRepo := max 1 parallelPerRepo,
              resumeAfterRestart, reattachAfterRestart }
 
