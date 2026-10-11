@@ -913,8 +913,7 @@ private def queueCancelHandler (_ : Parsed) : IO UInt32 := do
     IO.eprintln "Queue daemon is not running."
     return 1
   let req := Lean.Json.mkObj [("type", "cancel")]
-  let resp ← daemonRequest req
-  let mode := (resp.getObjValAs? String "id").toOption.getD ""
+  let _ ← daemonRequest req
   IO.println "Cancel request sent. The current task will be stopped."
   return 0
 
