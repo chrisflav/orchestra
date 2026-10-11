@@ -154,6 +154,11 @@ structure RunSpec where
   /-- What to call this run in a log line. Not passed to the command; used by backends that have
       to name the thing they create (a container, a pod) and by `--debug` output. -/
   label : String := "orchestra-agent"
+  /-- What to call this run where the backend keeps it, for a backend whose runs outlive the
+      daemon (`Exec.Runner`): an id that is the same every time the same step of the same task is
+      reached — `agent-0`, `agent-1` — so that a daemon coming back to the task finds the run the
+      last one started instead of starting a second. `none` lets the backend pick a fresh one. -/
+  runId : Option String := none
 deriving Inhabited
 
 namespace PathGrant
@@ -184,13 +189,59 @@ def shellEscape (s : String) : String :=
 
 namespace McpEndpoint
 
+/-- The script `stdioCommand` runs under `bash` for an endpoint with a token: a relay between the
+    agent's MCP client and the server that survives the server going away and coming back.
+
+    It used to be `{ echo <token>; cat; } | nc <host> <port>`, which ends — and with it every tool
+    the agent has — the moment the connection does. The connection ends whenever the daemon
+    restarts, and a daemon that now hands its running tasks over to the next one
+    (`docs/kubernetes.md`, restarts) has to give the agent its tools back afterwards, or the
+    reconnect is a conversation with no hands. The next daemon brings the task's server back on
+    the same port with the same token (`TaskRunner`); this is the half that dials it again.
+
+    How, in one line of `bash` (one line, and no backslash anywhere: it is written into TOML as well
+    as JSON, see `vibe`'s config):
+
+    * The agent's requests go into a FIFO held open read-write by the relay itself, by one `cat`
+      that lives as long as the agent's stdin does. Nothing the agent writes while the server is
+      away is lost: it waits in the FIFO for the next connection.
+    * Each connection is `bash`'s own `/dev/tcp`, so the relay rather than `nc` decides when it is
+      over: the token goes first, then one `cat` copies the FIFO to the socket and another the
+      socket to the agent. The first of the two to end (`wait -n`, so `bash` 4.3 or later) ends
+      the connection — the server closing it is an immediate EOF on the second — and the other is
+      stopped before it can take another request off the FIFO.
+    * Reconnecting backs off from one second to fifteen, and gives up after an hour without a
+      connection that lasted, which is longer than any restart and shorter than a pod's deadline.
+    * The agent closing its stdin — it is done — ends the relay.
+
+    The server is stateless per connection (every request is answered on its own, `initialize` or
+    not), so a request on a new connection is served exactly as it would have been on the old one.
+    A request the old server had read and not answered when it died is the one thing lost; the
+    daemon stops accepting tool calls and waits for the ones in flight before it hands over
+    (`Server.beginHandOff`), so that is a request that raced the exit itself. -/
+def relayScript (e : McpEndpoint) (token : String) : String :=
+  s!"t={shellEscape token}; h={shellEscape e.host}; p={e.port}; " ++
+  "d=$(mktemp -d) || exit 1; mkfifo \"$d/q\" || exit 1; exec 5<>\"$d/q\"; rm -rf \"$d\"; " ++
+  "exec 4<&0; ( cat <&4 >&5; kill -TERM $$ 2>/dev/null ) & " ++
+  "trap 'kill $(jobs -p) 2>/dev/null; exit 0' HUP INT TERM; w=1; down=0; " ++
+  "while :; do s=$SECONDS; " ++
+  "if { exec 3<>\"/dev/tcp/$h/$p\"; } 2>/dev/null; then echo \"$t\" >&3; " ++
+  "cat <&3 & r=$!; cat <&5 >&3 & f=$!; wait -n; kill $r $f 2>/dev/null; " ++
+  "wait $r $f 2>/dev/null; exec 3>&-; fi; " ++
+  "if [ $((SECONDS - s)) -ge 5 ]; then w=1; down=0; else down=$((down + w)); " ++
+  "[ $down -ge 3600 ] && exit 1; w=$((w * 2)); [ $w -gt 15 ] && w=15; fi; " ++
+  "sleep $w & wait $!; done"
+
 /-- The command an agent's MCP client runs to reach this endpoint over a stdio transport, as
     `(command, args)`.
 
     Every agent backend asks for this rather than writing `nc <host> <port>` itself, because the
     answer stops being `nc` as soon as the endpoint carries a token: the token has to be the first
-    line on the connection, and `nc` has no way to put it there. A shell sends it and then gets
-    out of the way, leaving the same bidirectional pipe the agent expects.
+    line on the connection, and `nc` has no way to put it there. With a token it is `relayScript`
+    under `bash`, which sends the token first on every connection and keeps the agent's side of
+    the pipe open across the server restarting. Only an endpoint off this machine carries a token
+    (`Exec.mcpBinding`), and only an agent off this machine outlives the daemon, so the loopback
+    case stays plain `nc`.
 
     The token is emitted through `echo` rather than `printf` on purpose: it is written into TOML
     as well as JSON (`vibe`'s config), and a `\n` escape means one thing in one and another in the
@@ -203,9 +254,7 @@ namespace McpEndpoint
 def stdioCommand (e : McpEndpoint) : String × Array String :=
   match e.token with
   | none   => ("nc", #[e.host, toString e.port])
-  | some t => ("sh", #["-c",
-      "{ echo " ++ shellEscape t ++ "; cat; } | nc "
-        ++ shellEscape e.host ++ " " ++ toString e.port])
+  | some t => ("bash", #["-c", relayScript e t])
 
 /-- `host` if it is something that can be a host at all, otherwise why not.
 

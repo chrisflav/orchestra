@@ -232,6 +232,60 @@ def isLeftover (id : String) : IO Bool := do
     try (·.map (·.status)) <$> Interactive.loadSession id catch _ => pure none
   return isLeftoverStatus task session
 
+/-- The running entries the previous daemon handed over (`Exec.tryHandOff`) that this one can carry
+    on from where they are, each with what it needs to (`TaskRunner.Reattach`).
+
+    Asked before the startup sweep, which marks every other running entry interrupted: an entry
+    is picked up when its run's record is still `running`, it recorded where it was
+    (`Queue.adoptionDecision`), and the backend finds its environment still there
+    (`Exec.Backend.probe`). Each decision is logged, and one that cannot be made — a database
+    hiccup, a cluster that does not answer — leaves the entry to the sweep: it is then resumed in a
+    new pod, which is what happened to every interrupted task before this existed.
+
+    Whatever an entry that is not picked up had recorded is forgotten here, so a later start cannot
+    mistake it for something to carry on. -/
+def findAdoptions (appConfig : AppConfig) : IO (Array (Queue.QueueEntry × TaskRunner.Reattach)) := do
+  let running ← Queue.runningEntries
+  if running.isEmpty then return #[]
+  let some factory := Exec.factoryOf? appConfig.execution.backend | return #[]
+  let .ok backend := factory.make appConfig.execution.options | return #[]
+  let mut out := #[]
+  for entry in running do
+    let some tid := entry.taskId
+      | IO.println s!"  Not picking up entry {entry.id}: it never started a run"
+    try
+      let record ← TaskStore.loadTask tid
+      let state ← RunState.load tid
+      let sameExecution ← match entry.configPath with
+        | none    => pure true
+        | some cp =>
+          try
+            let c ← loadAppConfig (some (System.FilePath.mk cp))
+            pure (c.execution.backend == appConfig.execution.backend
+              && c.execution.options == appConfig.execution.options)
+          catch _ => pure false
+      let decided : Except String RunState.RunState := match backend.reattach with
+        | none => .error s!"the '{backend.name}' backend cannot hand tasks over"
+        | some _ => Queue.adoptionDecision entry (record.map (fun (r : TaskStore.TaskRecord) => r.status)) state backend.name
+            sameExecution
+      match decided, record with
+      | .ok st, some rec =>
+        if ← backend.probe st.session then
+          IO.println s!"  Picking up entry {entry.id} (task {tid}) where it was: \
+{st.phase.toString}{if st.phase == .init then "" else s!" {st.attempt + 1}"}"
+          out := out.push (entry, { record := rec, state := st })
+        else
+          IO.println s!"  Not picking up entry {entry.id} (task {tid}): its environment is gone"
+          RunState.delete tid
+      | .ok _, none => pure ()
+      | .error why, _ =>
+        IO.println s!"  Not picking up entry {entry.id} (task {tid}): {why}"
+        if state.isSome then RunState.delete tid
+    catch e =>
+      IO.eprintln s!"  Could not decide whether to pick up entry {entry.id}; leaving it to the \
+restart resume: {e}"
+  return out
+
 /-- Run the queue daemon in the foreground until it is asked to stop, and exit the process.
 
     Does not return: a graceful shutdown ends in `IO.Process.exit 0` once the last in-flight task
@@ -251,9 +305,28 @@ def run (cfg : Config) : IO UInt32 := do
   let pid ← Queue.ownPid
   Queue.writePid pid
   IO.println s!"Queue daemon started (PID {pid})"
+  -- Read before the sweep, which now depends on it: what a task can be carried on in is the
+  -- execution backend's business.
+  let appConfig ← loadAppConfig (cfg.configPath.map System.FilePath.mk)
+  -- Tasks the previous daemon handed over when it stopped (`Exec.tryHandOff`), still running in
+  -- their pods: decided before the sweep, which would otherwise mark them interrupted, and carried
+  -- on below once the daemon is up (`findAdoptions`). Their MCP ports are set aside at once, so
+  -- that no task this daemon starts can be handed one an agent's relay is about to dial.
+  let adoptions ← if appConfig.queue.reattachAfterRestart then
+      try findAdoptions appConfig
+      catch e => do
+        IO.eprintln s!"Could not look for tasks to pick up; they will be resumed instead: {e}"
+        pure #[]
+    else pure #[]
+  Server.reservePorts (adoptions.map fun (_, r) => UInt16.ofNat r.state.mcpPort)
+  -- The per-task checkouts they were opened on are what their configuration is read from; the
+  -- sweep of old ones below goes by age, and a task that has run for a day is still this one's.
+  for (_, r) in adoptions do
+    try discard <| IO.Process.output { cmd := "touch", args := #[r.state.repoPath] }
+    catch _ => pure ()
   -- Startup cleanup. The entries swept here are recorded (`Queue.interruptedFile`): they are the
   -- tasks this restart interrupted, which `Queue.resumeInterrupted` below may pick up again.
-  let _ ← Queue.markStaleRunningAsUnfinished
+  let _ ← Queue.markStaleRunningAsUnfinished (keep := adoptions.map (·.1.id))
   Queue.cancelStaleConcertEntries
   Queue.cancelStaleRunningConcerts
   -- After the entry sweeps, not before: the sweep is what makes the entries of the last
@@ -263,7 +336,6 @@ def run (cfg : Config) : IO UInt32 := do
   let repairedRecords ← Queue.reconcileStaleTaskRecords
   if repairedRecords > 0 then
     IO.println s!"Marked {repairedRecords} stranded task record(s) unfinished."
-  let appConfig ← loadAppConfig (cfg.configPath.map System.FilePath.mk)
   -- Which PAT a repository resolves to is otherwise invisible until a call fails, and it fails as
   -- a 404 — GitHub's answer for a private repository the token cannot see is the same as its
   -- answer for one that does not exist. Printed once at startup so the mapping is on the record
@@ -302,6 +374,24 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   -- Set while a task on a backend that is not parallel-safe holds the daemon exclusively.
   -- Also protected by claimMutex.
   let exclusiveActive ← IO.mkRef false
+  -- The tasks being picked up are this daemon's running tasks from the start: each gets its row in
+  -- `activeTaskTokens` and its slot counted *now*, before the socket server, the reaper or any
+  -- worker exists — the reaper reads an entry that is `running` with no row as abandoned, and a
+  -- worker reads `totalActive` as the room it has. Their workers start further down, once
+  -- `runEntry` exists. No lock: nothing else is running yet.
+  let mut adopted : Array (Queue.QueueEntry × TaskRunner.Reattach × Nat × Nat ×
+      Std.CancellationToken) := #[]
+  for (entry, r) in adoptions do
+    let tokenId ← nextTokenId.modifyGet (fun n => (n, n + 1))
+    let token ← Std.CancellationToken.new
+    activeTaskTokens.atomically (·.modify (·.push { tokenId, entryId := entry.id, token }))
+    let occupied := (← activeSlots.get).getD entry.slotKey #[]
+    let slot := entry.slot.getD ((List.range (occupied.size + 1)).find? (!occupied.contains ·)
+      |>.getD occupied.size)
+    activeSlots.modify (fun m => m.insert entry.slotKey (occupied.push slot))
+    totalActive.modify (· + 1)
+    if !TaskRunner.backendIsParallelSafe entry.backend then exclusiveActive.set true
+    adopted := adopted.push (entry, r, slot, tokenId, token)
   -- Repair one entry that is `running` on disk with no worker behind it, and say whether it
   -- needed repairing. Defined up here beside the two things it consults, because both the
   -- reaper fiber and a `cancel` that finds nothing to cancel ask exactly this question — the
@@ -432,7 +522,8 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
       let n ← Utils.Signals.count
       if n > 0 && !announced then
         announced := true
-        IO.println "Received termination signal; finishing in-flight tasks before shutting down."
+        IO.println "Received termination signal; handing in-flight tasks over to the next daemon \
+where they can be, finishing the rest before shutting down."
         IO.println "Send it again to cancel them instead."
         Exec.requestStop
         shutdownToken.cancel .shutdown
@@ -592,7 +683,9 @@ its workspace; it will start from a clean checkout."
   -- branch) inside the try below. The slot is released by `runEntry`, which wraps this.
   let runEntryBody (entry : Queue.QueueEntry) (slot : Nat)
       (taskToken : Std.CancellationToken)
-      (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
+      (resumeFrom : Option String) (authSource : Option String)
+      -- A task the previous daemon handed over, carried on rather than started.
+      (reattach : Option TaskRunner.Reattach) : IO Unit := do
     -- Terminal writes go through here rather than saving the claim-time snapshot: a socket
     -- `cancel`, a listener, or a cascade from another worker can rewrite this entry's file
     -- while the task runs, and writing the stale snapshot back would silently revert it.
@@ -687,7 +780,7 @@ its workspace; it will start from a clean checkout."
         (cancelToken := some taskToken) (interactive := false)
         (slotOverride := some { slot, occupant := some entry.id, resumeFrom })
         (preresolvedAuth := authSource)
-        (onStart := announce)
+        (onStart := announce) (reattach := reattach)
       -- The sandbox always cancels taskToken with `.custom "done"` on normal exit, so
       -- `isCancelled` is true for both normal completion and watcher-triggered cancellation.
       -- Check the reason to distinguish the two cases.
@@ -734,6 +827,25 @@ its workspace; it will start from a clean checkout."
         -- A pre-claimed issue stays with the entry, which still means to work on it.
         IO.println s!"  Queue entry {entry.id} put back to pending: {e}"
         try finish .pending none none catch _ => pure ()
+      else if Exec.isReattachFailed e then
+        -- A task handed over by the previous daemon that could not be carried on after all — its
+        -- pod went between the startup check and now, its checkout is gone, its MCP port is
+        -- taken. It is what it would have been without the hand-off: interrupted by the restart,
+        -- and resumed in a new pod from its conversation (`Queue.resumeInterrupted`). Its pod, if
+        -- one is left, goes first, so the continuation can take its workspace.
+        IO.eprintln s!"  Queue entry {entry.id}: {e}; resuming it in a new pod instead"
+        try
+          finish .unfinished none none
+          if let some tid := reattach.map (·.record.id) then
+            let _ ← Queue.markTaskUnfinished tid
+            try RunState.delete tid catch _ => pure ()
+            Exec.reclaim appConfig.execution (fun id => pure (id == tid))
+          if appConfig.queue.resumeAfterRestart && !slotsHoldTrees then
+            Queue.recordInterrupted #[entry.id]
+            let n ← Queue.resumeInterrupted appConfig.execution (← Usage.nowEpoch)
+            if n == 0 then
+              IO.println s!"  Queue entry {entry.id} stays unfinished (see above for why)"
+        catch e2 => IO.eprintln s!"  Could not resume queue entry {entry.id} either: {e2}"
       else
         IO.eprintln s!"Queue entry {entry.id} failed: {e}"
         try finish .failed none none catch _ => pure ()
@@ -754,8 +866,9 @@ its workspace; it will start from a clean checkout."
   -- is over rather than merely nearly over.
   let runEntry (entry : Queue.QueueEntry) (slot : Nat) (tokenId : Nat)
       (taskToken : Std.CancellationToken)
-      (resumeFrom : Option String) (authSource : Option String) : IO Unit := do
-    try runEntryBody entry slot taskToken resumeFrom authSource
+      (resumeFrom : Option String) (authSource : Option String)
+      (reattach : Option TaskRunner.Reattach) : IO Unit := do
+    try runEntryBody entry slot taskToken resumeFrom authSource reattach
     finally
       activeTaskTokens.atomically (·.modify (·.filter (·.tokenId != tokenId)))
       releaseEntry entry slot
@@ -1167,7 +1280,7 @@ holds it. Marked unfinished."
         match ← claimNextEntry with
         | none => IO.sleep 1000
         | some (claim, tokenId, taskToken) =>
-          runEntry claim.entry claim.slot tokenId taskToken claim.resumeFrom claim.authSource
+          runEntry claim.entry claim.slot tokenId taskToken claim.resumeFrom claim.authSource none
       catch e =>
         IO.eprintln s!"Queue worker error: {e}"
         IO.sleep 1000
@@ -1176,6 +1289,66 @@ holds it. Marked unfinished."
   if (← Utils.Signals.count) > 0 then
     Exec.requestStop
     shutdownToken.cancel .shutdown
+  -- The tasks picked up from the previous daemon, each on a worker of its own (their rows and
+  -- slots were taken at the top). Not counted among `parallelLimit`'s workers, which only claim:
+  -- they count against the limit through `totalActive`, exactly as a claimed task does.
+  let mut adoptedTasks : Array (_root_.Task (Except IO.Error Unit)) := #[]
+  for (entry, r, slot, tokenId, token) in adopted do
+    adoptedTasks := adoptedTasks.push (← IO.asTask (prio := .dedicated) do
+      try
+        runEntry entry slot tokenId token none
+          (entry.resolvedAuthSource.orElse fun _ => entry.authSource) (some r)
+      catch e => IO.eprintln s!"Queue worker error (picked-up entry {entry.id}): {e}")
+  if !adopted.isEmpty then
+    IO.println s!"Carrying on {adopted.size} task(s) the previous daemon handed over."
+  -- Hand-off: once the daemon has been asked to stop (a signal, `queue shutdown`), every task
+  -- still running that can be carried on by the next daemon is left running rather than waited
+  -- for, and the daemon exits as soon as that is every task (`Exec.tryHandOff`). While any task
+  -- cannot be — one on a backend whose runs die with the daemon, one still opening its pod or
+  -- tearing it down, one that was cancelled and is finishing — the stop is the drain it always
+  -- was, and the hand-off is tried again every second until it is decided or nothing is left. A
+  -- cancellation (the second signal, `queue shutdown --force`) marks every task cancelled, which
+  -- keeps the hand-off from being decided at all.
+  --
+  -- Leaving is deliberately abrupt: `IO.Process.exit` takes the workers with it in the middle of
+  -- whatever they are doing, and nothing in a task's `finally` runs — no pod is deleted, no claim
+  -- released, no token revoked. That is the point. Every task is at a step the next daemon redoes
+  -- (`TaskRunner`), and one that tries to move past that point after the decision stops where it
+  -- is (`Exec.leaveReattachable`). What does get done first: tool calls already running finish,
+  -- and new ones are answered with "try again in a minute" (`Server.beginHandOff`); interactive
+  -- sessions are closed as on any stop; the socket and the pid file go.
+  if appConfig.queue.reattachAfterRestart then
+    discard <| IO.asTask (prio := .dedicated) do
+      while !(← shutdownToken.isCancelled) do IO.sleep 500
+      let mut noted := false
+      repeat
+        let actives ← activeTaskTokens.atomically (·.get)
+        if actives.isEmpty then break
+        let cancelled ← actives.anyM fun a => return (← a.token.getCancellationReason) == some .cancel
+        let taskIds ← actives.filterMapM fun a => do
+          return (← try Queue.loadEntry a.entryId catch _ => pure none).bind (·.taskId)
+        if !cancelled && taskIds.size == actives.size && (← Exec.tryHandOff taskIds) then
+          IO.println s!"Handing {actives.size} running task(s) over to the next daemon; their \
+pods keep running and it carries them on from where they are."
+          Server.beginHandOff
+          -- Bounded: a tool call that hangs must not hold the restart. One cut off here is the
+          -- one thing the agent can lose (`McpEndpoint.relayScript`).
+          for _ in [0:600] do
+            if (← Server.toolCallsInFlight) == 0 then break
+            IO.sleep 100
+          try interactive.closeAll catch e => IO.eprintln s!"  Closing sessions failed: {e}"
+          match ← socketServerRef.get with
+          | some s => try s.close catch _ => pure ()
+          | none   => pure ()
+          try Utils.UnixSocket.Server.unlink socketPath catch _ => pure ()
+          try Queue.deletePid catch _ => pure ()
+          IO.println "Queue daemon handed over."
+          Utils.Signals.exitNow 0
+        unless noted do
+          noted := true
+          IO.println "Not every running task can be handed over yet; draining until they can be, \
+or until they are done."
+        IO.sleep 1000
   -- Spawn additional workers beyond the first (which runs on the main thread below).
   let mut workerTasks : Array (_root_.Task (Except IO.Error Unit)) := #[]
   for _ in List.range (parallelLimit - 1) do
@@ -1188,6 +1361,9 @@ holds it. Marked unfinished."
     -- PID file are torn down; otherwise `IO.Process.exit 0` below kills them mid-task
     -- and their entries are left stuck in `running`.
     for t in workerTasks do
+      let _ ← IO.wait t
+    -- And the tasks picked up from the previous daemon, for the same reason.
+    for t in adoptedTasks do
       let _ ← IO.wait t
   finally
     -- Before the socket goes: a session outlives the worker loop, and a daemon that exited

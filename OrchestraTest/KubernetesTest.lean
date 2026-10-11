@@ -763,18 +763,22 @@ def anExposedServerAlwaysGetsAToken : Test := do
 @[test]
 def theClientSendsItsTokenBeforeAnythingElse : Test := do
   -- `nc` has no way to put a line on the connection before the agent's own traffic, so a token
-  -- turns the transport into a shell that sends it and then gets out of the way.
+  -- turns the transport into a `bash` relay that sends it first on every connection — and keeps
+  -- the agent's side open while the server is away (`McpEndpoint.relayScript`).
   let (cmd, args) := McpEndpoint.stdioCommand { host := "10.0.0.1", port := 4000 }
   TestM.assertEqual cmd "nc" (msg := "an unauthenticated endpoint is still plain nc")
   TestM.assertEqual args #["10.0.0.1", "4000"] (msg := "with the host and port")
   let (cmd', args') := McpEndpoint.stdioCommand
     { host := "orchestra.svc", port := 4000, token := some "abc123" }
-  TestM.assertEqual cmd' "sh" (msg := "an authenticated one goes through a shell")
+  TestM.assertEqual cmd' "bash" (msg := "an authenticated one goes through bash")
   let script := args'[1]!
-  TestM.assert (AgentDef.containsCI script "echo abc123") "which sends the token first"
-  TestM.assert (AgentDef.containsCI script "nc orchestra.svc 4000") "and then the connection"
-  TestM.assert (!AgentDef.containsCI script "\\n")
-    "with no backslash escape, which TOML and JSON would read differently"
+  TestM.assert (AgentDef.containsCI script "t=abc123") "which carries the token"
+  TestM.assert (AgentDef.containsCI script "h=orchestra.svc; p=4000") "and the address"
+  TestM.assert (AgentDef.containsCI script "echo \"$t\" >&3")
+    "and sends the token first on each connection"
+  TestM.assert (!AgentDef.containsCI script "\\")
+    "with no backslash anywhere, which TOML and JSON would read differently"
+  TestM.assert (!AgentDef.containsCI script "\n") "and on one line, which a TOML string needs"
 
 private def testServerState (token : Option String) : Server.State :=
   { repo := some { upstream := { owner := "acme", name := "widgets" }

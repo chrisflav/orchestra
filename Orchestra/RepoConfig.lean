@@ -79,11 +79,12 @@ does not.
 Run `.orchestra/<name>` (or `.agent/<name>`) as a bash script with the repository as the working
 directory. Does nothing if the script does not exist. Throws if the script exits non-zero.
 -/
-def runHook (session : Exec.Session) (repoPath : System.FilePath) (name : String) : IO Unit := do
+def runHook (session : Exec.Session) (repoPath : System.FilePath) (name : String)
+    (runId : Option String := none) : IO Unit := do
   let hookPath := (← orchestraDir repoPath) / name
   if !(← hookPath.pathExists) then return
   let result ← session.runScript {
-    path := hookPath.toString, workdir := repoPath, stdio := .inherit }
+    path := hookPath.toString, workdir := repoPath, stdio := .inherit, runId }
   if result.exitCode != 0 then
     throw (.userError s!"hook {name} failed with exit code {result.exitCode}")
 
@@ -98,12 +99,13 @@ that has nothing installed — so a session that starts fresh every task (`fresh
 hook every task, marker or no marker. A repository's `init.sh` should be idempotent, and the ones
 that install a toolchain or warm a cache already are: they check before they fetch.
 -/
-def runInitIfNeeded (session : Exec.Session) (repoPath : System.FilePath) : IO Unit := do
+def runInitIfNeeded (session : Exec.Session) (repoPath : System.FilePath)
+    (runId : Option String := none) : IO Unit := do
   let dir ← orchestraDir repoPath
   if !(← dir.pathExists) then return
   let markerPath := dir / ".initialized"
   if (← markerPath.pathExists) && !session.freshEnvironment then return
-  runHook session repoPath "init.sh"
+  runHook session repoPath "init.sh" runId
   IO.FS.writeFile markerPath ""
 
 /-- Returns `true` if `validation.sh` exists in the repo's `.orchestra/` or `.agent/` directory. -/
@@ -116,11 +118,12 @@ Returns `(true, "")` if the script passes (exit 0) or does not exist.
 Returns `(false, output)` if the script exits non-zero, where `output` is the
 combined stdout and stderr of the script. Does not throw.
 -/
-def runValidation (session : Exec.Session) (repoPath : System.FilePath) : IO (Bool × String) := do
+def runValidation (session : Exec.Session) (repoPath : System.FilePath)
+    (runId : Option String := none) : IO (Bool × String) := do
   if !(← hasValidationScript repoPath) then return (true, "")
   let hookPath := (← orchestraDir repoPath) / "validation.sh"
   let result ← session.runScript {
-    path := hookPath.toString, workdir := repoPath, stdio := .piped }
+    path := hookPath.toString, workdir := repoPath, stdio := .piped, runId }
   return (result.exitCode == 0, result.output)
 
 end Orchestra.RepoConfig

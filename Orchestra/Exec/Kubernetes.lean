@@ -1,12 +1,14 @@
 import Orchestra.Exec.Backend
+import Orchestra.Exec.Runner
 
 /-!
 # The Kubernetes backend: one pod per task
 
 Each task gets a pod, and everything the task does happens inside it: the repository's `init.sh`
 and `before.sh`, the agent, `validation.sh`, the retry the agent gets when that fails, and
-`after.sh`. The pod is a long-lived container that does nothing on its own; each of those is a
-`kubectl exec` into it.
+`after.sh`. The pod is a long-lived container that does nothing on its own; each of those is
+started in it through the run helper orchestra stages into the pod (`Exec.Runner`) — detached, so
+that it outlives the daemon — and followed from here with `kubectl exec`.
 
 That the pod belongs to the *task* rather than to one agent launch is what makes the rest work:
 
@@ -16,28 +18,32 @@ That the pod belongs to the *task* rather than to one agent launch is what makes
 * **A retry resumes.** `--resume <session>` names a file the agent CLI wrote where it ran, so a
   second attempt has to run in the same place as the first.
 * **The checkout is carried once**, not once per attempt.
+* **A restart is survived.** The pod, and everything running in it, does not depend on the daemon
+  that created it: a daemon that stops hands its tasks over, and the next one reopens the same pod
+  (`reopenSession`) and follows the same runs (`Exec.tryHandOff`, `TaskRunner`).
 
 An interactive session is the same mechanism with a terminal: `kubectl exec -it`, the daemon's own
 streams handed straight through.
 
 ```
-  open ─► create pod ─► wait Ready ─► stage the checkout in
+  open ─► create pod ─► wait Ready ─► stage the run helper and the checkout in
                                               │
-       init.sh / before.sh ── kubectl exec ────┤
-       the agent ─────────── kubectl exec ────┤    (stdout and stderr arrive separately)
-       validation.sh ─────── kubectl exec ────┤
-       after.sh ──────────── kubectl exec ────┘
+       init.sh / before.sh ── run start ──────┤
+       the agent ─────────── run start ──────┤    (followed with `run attach`,
+       validation.sh ─────── run start ──────┤     stdout and stderr apart)
+       after.sh ──────────── run start ──────┘
                                               │
-  close ─► copy the checkout back ─► delete the pod
+  close ─► copy back, finish command ─► delete the pod
 ```
 
 Cancelling a task deletes the pod, which ends whatever was running in it.
 
 ## what the image has to have
 
-`sh`, `bash` (the repository's scripts are run with it), `tar`, `nc` for the MCP transport, `git`,
-the agent CLI, and whatever the repositories being worked on need to build. The same list the
-daemon's own machine needs, minus `landrun`.
+`sh`, `bash` (the repository's scripts are run with it, and the agent's MCP relay needs 4.3 or
+later, `McpEndpoint.relayScript`), `tar`, `git`, the agent CLI, what the run helper uses
+(`setsid`, `mkfifo`, `tail`, `head`, `wc` — `Exec.Runner`), and whatever the repositories being
+worked on need to build. The same list the daemon's own machine needs, minus `landrun`.
 
 And a `USER` that is not root: Claude Code refuses `--dangerously-skip-permissions` under uid 0,
 which is how orchestra runs it, so a root image fails every task before the agent starts. Nothing
@@ -662,8 +668,9 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
 def excludeArgs (cfg : Config) : Array String :=
   cfg.excludes.flatMap fun p => #["--exclude", p]
 
-/-- Where the environment for the `n`th command in a session is written inside the pod. -/
-def envFilePath (n : Nat) : String := s!"{controlPath}/env-{n}"
+/-- Where the environment for the command called `name` in a session is written inside the pod:
+    the run id, for a detached run (`Exec.Runner`), so each run has a file of its own. -/
+def envFilePath (name : String) : String := s!"{controlPath}/env-{name}"
 
 /-- A command's environment as a file to be sourced.
 
@@ -1306,31 +1313,104 @@ def singleQuote (s : String) : String :=
 def finishScript (mount command : String) (seconds : Nat) : String :=
   s!"cd {singleQuote mount} && exec timeout {seconds} sh -c {singleQuote command}"
 
-/-- `kubectl` with `args`, given `seconds` to finish: `none` if it had to be killed. For an `exec`
-    whose command has its own `timeout` in the pod, this is the daemon's side of the same bound —
-    a connection that hangs after the command has ended would otherwise hold a worker forever. -/
-private def kubeWithin (cfg : Config) (args : Array String) (seconds : Nat) :
+/-! ## Detached runs
+
+Everything a queued task runs in its pod — the agent, the repository's scripts, the finish command —
+is started through the run helper (`Exec.Runner`) rather than being the far end of a `kubectl exec`,
+so that it outlives the daemon. The two halves are here: `startRun` asks the helper to start a
+command (or finds it already started), and `detachedHandle` follows its output from the daemon's
+side, across dropped connections, as an ordinary `Handle`. -/
+
+/-- Where the run helper is in every pod. -/
+def runnerPath : String := Runner.runnerPath controlPath
+
+/-- Start `argv` as run `id` in the pod, or find that it is already there (`Runner.StartReply`). -/
+private def startRun (cfg : Config) (podName id : String) (argv : Array String) :
+    IO Runner.StartReply := do
+  unless Runner.validRunId id do
+    throw (IO.userError s!"kubernetes: '{id}' cannot name a run")
+  let (code, out, err) ← kube cfg
+    (#["exec", podName, "--", "sh", runnerPath] ++ Runner.startArgs id argv)
+  if code != 0 then
+    throw (IO.userError s!"kubernetes: could not start {id} in pod {podName}: \
+{(err ++ out).trimAscii}")
+  match Runner.parseStartReply out with
+  | some r => return r
+  | none => throw (IO.userError s!"kubernetes: the run helper in pod {podName} said \
+'{out.trimAscii}' to starting {id}")
+
+/-- One of the helper's control verbs (`kill`, `term`) for run `id`. Best effort: a run that cannot
+    be reached to be stopped is stopped by the pod going, which `close` sees to. -/
+private def runControl (cfg : Config) (podName : String) (args : Array String) : IO Unit := do
+  try
+    let child ← IO.Process.spawn {
+      cmd := cfg.kubectl
+      args := #["-n", cfg.ns, "exec", podName, "--", "sh", runnerPath] ++ args
+      stdin := .null, stdout := .null, stderr := .null }
+    discard child.wait
+  catch _ => pure ()
+
+/-- Follow one of run `id`'s streams with `Runner.followScript`. Its stdout is the stream; its exit
+    status is the run's. -/
+private def spawnFollower (cfg : Config) (podName id stream : String) (offset : Nat := 0) :
+    IO (IO.Process.Child { stdin := .null, stdout := .piped, stderr := .inherit }) :=
+  IO.Process.spawn {
+    cmd := "/bin/sh"
+    args := Runner.followArgs cfg.kubectl cfg.ns podName runnerPath id stream offset
+    stdin := .null, stdout := .piped, stderr := .inherit }
+
+/-- A handle over run `id`, followed from its beginning.
+
+    From the beginning even for a run that was already going (`replayBytes` says how much of it
+    was read once before): see `Exec.Runner` for why a daemon picking a run up re-reads it rather
+    than continuing from where its predecessor stopped.
+
+    `kill` and `terminate` go to the run's process group in the pod; the followers are not touched,
+    and end on their own once the run's exit status is on disk and its output drained — so a
+    cancelled agent's last words still reach the log. -/
+private def detachedHandle (cfg : Config) (podName id : String) (replayBytes : Nat) :
+    IO Handle := do
+  let out ← spawnFollower cfg podName id "out"
+  let err ← spawnFollower cfg podName id "err"
+  return {
+    stdout := some out.stdout
+    stderr := some err.stdout
+    wait := do
+      let code ← out.wait
+      discard err.wait
+      return code
+    tryWait := out.tryWait
+    terminate := runControl cfg podName #["term", id]
+    kill := runControl cfg podName #["kill", id, "5"]
+    id := s!"pod {cfg.ns}/{podName} run {id}"
+    replayBytes }
+
+/-- Both streams of a detached run read to the end, and its exit status — or `none` if it had not
+    finished within `seconds`, when the followers are let go of (the run itself is left to its own
+    `timeout`, and to the pod being deleted). Both streams at once, for the reason `runScript`
+    gives. -/
+private def collectRun (cfg : Config) (podName id : String) (seconds : Option Nat := none) :
     IO (Option (UInt32 × String × String)) := do
-  let child ← IO.Process.spawn {
-    cmd := cfg.kubectl, args := #["-n", cfg.ns] ++ args
-    stdin := .null, stdout := .piped, stderr := .piped }
-  -- Both pipes drained at once, as in `runScript`: a full one would stall the command.
-  let outTask ← IO.asTask (prio := .dedicated) child.stdout.readToEnd
-  let errTask ← IO.asTask (prio := .dedicated) child.stderr.readToEnd
-  let deadline := (← IO.monoMsNow) + seconds * 1000
-  let mut code? : Option UInt32 := none
-  while code?.isNone && (← IO.monoMsNow) < deadline do
-    code? ← child.tryWait
-    if code?.isNone then IO.sleep 1000
-  match code? with
-  | some code =>
-    let out ← IO.ofExcept (← IO.wait outTask)
-    let err ← IO.ofExcept (← IO.wait errTask)
-    return some (code, out, err)
-  | none =>
-    try child.kill catch _ => pure ()
-    discard <| child.wait
-    return none
+  let out ← spawnFollower cfg podName id "out"
+  let err ← spawnFollower cfg podName id "err"
+  let outTask ← IO.asTask (prio := .dedicated) out.stdout.readToEnd
+  let errTask ← IO.asTask (prio := .dedicated) err.stdout.readToEnd
+  if let some s := seconds then
+    let deadline := (← IO.monoMsNow) + s * 1000
+    let mut code? : Option UInt32 := none
+    while code?.isNone && (← IO.monoMsNow) < deadline do
+      code? ← out.tryWait
+      if code?.isNone then IO.sleep 1000
+    if code?.isNone then
+      try out.kill catch _ => pure ()
+      try err.kill catch _ => pure ()
+      discard out.wait; discard err.wait
+      return none
+  let code ← out.wait
+  discard err.wait
+  let o ← IO.ofExcept (← IO.wait outTask)
+  let e ← IO.ofExcept (← IO.wait errTask)
+  return some (code, o, e)
 
 /-- How long the finish command may run: an hour at most, and never into the last minutes of the
     pod's `activeDeadlineSeconds`, past which the cluster kills it mid-upload. The deadline counts
@@ -1344,14 +1424,18 @@ def finishBudget (deadlineSeconds : Nat) (createdMs nowMs : Nat) : Option Nat :=
   if left < 120 + 60 then none else some (min 3600 (left - 120))
 
 /-- Run `TaskVolumes.finishCommand` in the pod, in the checkout, and log what it said. Bounded by
-    `timeout` in the pod and by `kubeWithin` here, to `seconds` (see `finishBudget`); best effort,
-    so nothing it does fails the task. -/
+    `timeout` in the pod and by the daemon giving up following it, to `seconds` (see
+    `finishBudget`); best effort, so nothing it does fails the task.
+
+    A detached run like any other, under the one id `finish`: a daemon that is handed the task while
+    the command is uploading (`Exec.tryHandOff`) follows that upload to its end rather than starting
+    a second one beside it. -/
 private def runFinishCommand (cfg : Config) (podName command mount : String) (seconds : Nat) :
     IO Unit := do
   try
     let script := finishScript mount command seconds
-    let some (code, out, err) ← kubeWithin cfg #["exec", podName, "--", "sh", "-c", script]
-        (seconds + 60)
+    discard <| startRun cfg podName "finish" #["sh", "-c", script]
+    let some (code, out, err) ← collectRun cfg podName "finish" (some (seconds + 60))
       | IO.eprintln s!"  [k8s] warning: finish command did not return within {seconds + 60}s; \
 abandoned"
     let said := (out ++ err).trimAscii.toString
@@ -1395,157 +1479,106 @@ mv -T {shellEscape previous} {shellEscape target}; fi"
 
 /-! ## The session -/
 
-/-- Open a pod for one task, and hand back the handle on it. -/
-def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
-  let home ← hostHome
-  let image ← match imageFor cfg spec with
-    | .ok i    => pure i
-    | .error e => throw (IO.userError s!"kubernetes: {e}")
-  -- A task volume only for what asks for one (`taskId`): the merger and `prepare` have nothing
-  -- to continue and nothing worth keeping, and get the throwaway pod they always had.
-  let volume : Option (TaskVolumes × String × Bool) ← match cfg.taskVolumes, spec.taskId with
-    | some tv, some tid =>
-      let (claim, reused) ← acquireWorkspaceClaim cfg tv spec tid
-      if reused then
-        IO.println s!"  [k8s] continuing on workspace volume {claim} ({spec.continuesFrom.getD "?"}'s)"
-      else
-        IO.println s!"  [k8s] new workspace volume {claim}"
-      pure (some (tv, claim, reused))
-    | _, _ => pure none
-  -- On a task volume the checkout and `$HOME` are directories on the claim (see `TaskVolumes`);
-  -- `ecfg` is the configuration with `homePath` pointing there, so every home-relative path the
-  -- agent backend declared lands on the claim as well.
-  let ecfg : Config := match volume with
-    | some (tv, _, _) => { cfg with homePath := s!"{tv.mountPath}/home" }
-    | none            => cfg
-  let workspaceMount := volume.map (fun (tv, _, _) => s!"{tv.mountPath}/work")
-  let staged ← markFiles (stagedPaths ecfg home spec workspaceMount)
-  let toPod := podPathOf spec workspaceMount
-  let podName := s!"orchestra-{← randomHex 6}"
-  let manifest := podManifest ecfg spec podName image staged (volume.map (·.2.1))
-  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
-  IO.FS.createDirAll dir
-  let manifestPath := dir / "pod.json"
-  IO.FS.writeFile manifestPath manifest.compress
-  -- The claim is let go of whenever the pod is: when the task is done with it, and on every way
-  -- of failing to start one. A claim made for this task and never used is deleted rather than kept:
-  -- it holds an empty or half-copied tree, and a start that keeps failing would otherwise leave one
-  -- behind per attempt.
-  let releaseClaim : IO Unit := match volume with
-    | some (_, claim, _) => releaseWorkspace cfg claim (spec.taskId.getD "")
-    | none => pure ()
-  let abandonClaim : IO Unit := match volume with
-    | some (_, claim, false) =>
-      discard <| (try kube cfg #["delete", "pvc", claim, "--wait=false", "--ignore-not-found"]
-                  catch _ => pure (0, "", ""))
-    | _ => releaseClaim
-  -- A full quota is not the task's fault. It fills when something other than this daemon's own
-  -- tasks holds pods there — a previous daemon's, an operator's — and failing every entry the
-  -- queue reaches meanwhile empties the queue in seconds: on 2026-10-10 three hundred entries were
-  -- spent that way in a quarter of an hour. So it is waited on, briefly, and then answered with
-  -- `noRoom`, which puts the entry back to `pending`. Briefly because the task's credentials
-  -- were minted before this and are ticking, and because a stop must not wait on it: a task with
-  -- no pod yet is not one a drain should finish.
-  let gaveUp : IO Bool := do return (← spec.cancelled) || (← Exec.stopRequested)
-  let result ← try
-      let mut waited := 0
-      let mut announced := false
-      let mut result ← kube cfg #["create", "-f", manifestPath.toString]
-      while result.1 != 0 && quotaExceeded result.2.2 && waited < spec.roomWaitSeconds do
-        unless announced do
-          announced := true
-          IO.println s!"  [k8s] namespace {cfg.ns} is at its quota; waiting for room \
-(up to {spec.roomWaitSeconds}s): {result.2.2.trimAscii}"
-        for _ in [0:quotaPollSeconds] do
-          if ← gaveUp then break
-          IO.sleep 1000
-        if ← gaveUp then break
-        waited := waited + quotaPollSeconds
-        if let some (_, claim, _) := volume then renewWorkspace cfg claim (spec.taskId.getD "")
-        result ← kube cfg #["create", "-f", manifestPath.toString]
-      if announced && result.1 == 0 then
-        IO.println s!"  [k8s] room in {cfg.ns} after {waited}s; pod {podName} created"
-      pure result
-    catch e =>
-      try IO.FS.removeDirAll dir catch _ => pure ()
-      abandonClaim
-      throw e
-  try IO.FS.removeDirAll dir catch _ => pure ()
-  let (code, _, err) := result
-  if code != 0 then
-    abandonClaim
-    if ← spec.cancelled then
-      throw (IO.userError s!"kubernetes: cancelled while waiting for room in namespace {cfg.ns}")
-    if quotaExceeded err then
-      throw (Exec.noRoom s!"namespace {cfg.ns} is at its quota: {err.trimAscii}")
-    throw (IO.userError s!"kubernetes: could not create pod {podName}: {err.trimAscii}")
-  -- When the pod came to be, near enough: its `activeDeadlineSeconds` counts from its start, which
-  -- is no earlier, so a finish command budgeted from here cannot run into it (see `finishBudget`).
-  let createdMs ← IO.monoMsNow
-  -- On a task volume the pod is waited for before the claim is let go of: a continuation that
-  -- mounted it while a cancelled agent was still writing would be two agents in one tree.
-  -- Whether the pod is known to be gone. If the delete did not finish in time, the claim is left
-  -- marked: `holderAlive` frees it once the pod really is gone, and releasing it now would let a
-  -- continuation mount it beside an agent still writing.
-  let removePod : IO Bool := do
-    let (code, _, _) ← try kube cfg #["delete", "pod", podName, "--now", "--ignore-not-found",
-                           if volume.isSome then "--timeout=120s" else "--wait=false"]
-            catch _ => pure (1, "", "")
-    return code == 0
+/-- What `Session.snapshot` holds for this backend: enough for another daemon to find the pod
+    again and close it the way this one would have (`reopenSession`). The claim is named rather
+    than looked up again — the in-use mark on it names the task, and nothing about the pod could
+    say which claim it mounts more cheaply than this. -/
+structure Snapshot where
+  /-- The pod's name. -/
+  pod : String
+  /-- The image it runs, for log lines. -/
+  image : String
+  /-- The task volume it mounts, and whether that was a predecessor's (`acquireWorkspaceClaim`). -/
+  claim : Option (String × Bool) := none
+  /-- When it was created, in epoch seconds: what `finishBudget` measures the deadline from. -/
+  created : Nat
+deriving Repr, BEq, Inhabited
+
+def Snapshot.toJson (s : Snapshot) : Json :=
+  Json.mkObj ([("pod", .str s.pod), ("image", .str s.image), ("created", Lean.toJson s.created),
+               ("runner", .str runnerPath)]
+    ++ match s.claim with
+       | some (c, reused) => [("claim", .str c), ("reused", .bool reused)]
+       | none => [])
+
+/-- Read a snapshot back. Strict: a snapshot that does not say where the pod is, or names a
+    different run helper than this daemon stages (`Runner.protocol`), is one this daemon cannot
+    pick up. -/
+def Snapshot.fromJson? (j : Json) : Except String Snapshot := do
+  let pod ← j.getObjValAs? String "pod"
+  let image := (j.getObjValAs? String "image").toOption.getD "?"
+  let created ← j.getObjValAs? Nat "created"
+  let runner ← j.getObjValAs? String "runner"
+  unless runner == runnerPath do
+    throw s!"the pod was set up with run helper {runner}, and this daemon speaks {runnerPath}"
+  let claim := match j.getObjValAs? String "claim" with
+    | .ok c => some (c, (j.getObjValAs? Bool "reused").toOption.getD true)
+    | .error _ => none
+  return { pod, image, claim, created }
+
+/-- Everything a session's operations need about the pod they run in, whether this daemon created
+    it or picked it up from the one before. -/
+private structure PodContext where
+  podName : String
+  image : String
+  /-- The configuration with `homePath` pointing at the claim, on a task volume. -/
+  ecfg : Config
+  volume : Option (TaskVolumes × String × Bool)
+  staged : Array StagedPath
+  workspaceMount : Option String
+  /-- When the pod came to be, on this process's monotonic clock (see `finishBudget`). -/
+  createdMs : Nat
+  createdEpoch : Nat
+  /-- The manifest, for `--debug`; `none` for a pod this daemon did not create. -/
+  manifest : Option Json
+
+/-- Let go of the task's claim, once its pod is gone — if it is still the task's to let go of. -/
+private def releaseClaimOf (cfg : Config) (spec : SessionSpec)
+    (volume : Option (TaskVolumes × String × Bool)) : IO Unit :=
+  match volume with
+  | some (_, claim, _) => releaseWorkspace cfg claim (spec.taskId.getD "")
+  | none => pure ()
+
+/-- Delete the pod, and say whether it is known to be gone. On a task volume it is waited for
+    before the claim is let go of: a continuation that mounted it while a cancelled agent was still
+    writing would be two agents in one tree. If the delete did not finish in time, the claim is
+    left marked: `holderAlive` frees it once the pod really is gone. -/
+private def removePodOf (cfg : Config) (podName : String)
+    (volume : Option (TaskVolumes × String × Bool)) : IO Bool := do
+  let (code, _, _) ← try kube cfg #["delete", "pod", podName, "--now", "--ignore-not-found",
+                         if volume.isSome then "--timeout=120s" else "--wait=false"]
+          catch _ => pure (1, "", "")
+  return code == 0
+
+/-- The session over a pod that exists and is set up: the run helper staged, the checkout in.
+    Shared by `openSession`, which has just made it so, and `reopenSession`, which finds it so. -/
+private def sessionOf (cfg : Config) (spec : SessionSpec) (home : String) (ctx : PodContext) :
+    IO Session := do
+  let podName := ctx.podName
+  let ecfg := ctx.ecfg
+  let volume := ctx.volume
+  let staged := ctx.staged
+  let toPod := podPathOf spec ctx.workspaceMount
   let deletePod : IO Unit := do
-    if ← removePod then releaseClaim
+    -- The last moment the task could still be picked up by another daemon: see
+    -- `SessionSpec.beforeRelease`.
+    spec.beforeRelease
+    if ← removePodOf cfg podName volume then releaseClaimOf cfg spec volume
     else IO.eprintln s!"  [k8s] pod {podName} did not go away in time; its workspace claim stays \
 marked until it does"
-  let failPod : IO Unit := do
-    if ← removePod then abandonClaim
-  -- Ready, not merely created: the next thing this does is copy a repository through
-  -- `kubectl exec`, which needs a container that has actually started.
-  let (waitCode, _, waitErr) ← kube cfg #["wait", "--for=condition=Ready", s!"pod/{podName}",
-    s!"--timeout={cfg.startupTimeoutSeconds}s"]
-  if waitCode != 0 then
-    let why ← startupDiagnosis cfg podName
-    failPod
-    throw (IO.userError s!"kubernetes: pod {podName} did not become ready within \
-{cfg.startupTimeoutSeconds}s ({why}): {waitErr.trimAscii}")
-  try
-    -- The directories the agent works in, made by the agent's own user (every `exec` runs as the
-    -- image's user) before anything lands in them, so that they are its own and not root's — the
-    -- checkout and, on a claim, `$HOME`. A no-op on a claim a predecessor left, where they exist.
-    if let some ws := staged.find? (·.isWorkspace) then
-      mkdirInPod cfg podName ws.podPath
-    if volume.isSome then
-      mkdirInPod cfg podName ecfg.homePath
-    for st in staged do
-      -- A file is written into the `emptyDir` above it; `stageIn` carries a directory's entries.
-      if st.isFile then
-        putFile cfg podName st.podPath (← IO.FS.readFile st.hostPath)
-        continue
-      match volume with
-      | some (tv, _, reused) =>
-        if st.isWorkspace then
-          -- A continuation's tree is already on the claim, exactly as its predecessor left it;
-          -- copying the daemon's checkout over it would undo the very thing it was kept for.
-          unless reused do
-            stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
-            if let some seedDir := spec.seedDir then
-              stageSeeds cfg tv podName seedDir st.podPath
-        else
-          stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
-      | none =>
-        stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
-  catch e =>
-    failPod
-    throw e
+  -- The run id for a command nobody named: unique, and never one a task step would pick.
+  let freshId (prefix_ : String) : IO String := return s!"{prefix_}-{← randomHex 4}"
   -- Each command gets its own environment file, so a later one cannot be handed an earlier one's
-  -- variables by accident.
-  let commandCount ← IO.mkRef 0
-  let nextEnvFile (env : Array (String × String)) : IO String := do
-    let n ← commandCount.modifyGet fun n => (n, n + 1)
-    let path := envFilePath n
+  -- variables by accident. Named after the run for a detached one.
+  let putEnvFile (name : String) (env : Array (String × String)) : IO String := do
+    let path := envFilePath name
     putFile cfg podName path (envFileContents env)
     return path
+  let snapshot : Snapshot := {
+    pod := podName, image := ctx.image, created := ctx.createdEpoch
+    claim := volume.map fun (_, c, reused) => (c, reused) }
   return {
-    id := s!"pod {cfg.ns}/{podName} ({image})"
+    id := s!"pod {cfg.ns}/{podName} ({ctx.image})"
     -- Every task starts from a new pod, so the repository's `init.sh` cannot rely on what a
     -- previous one installed — and the marker it leaves in the checkout, which is carried in here,
     -- would otherwise say it can.
@@ -1554,43 +1587,55 @@ marked until it does"
     -- when the pod is, so a task cannot continue one an earlier task started; on a task volume,
     -- home is the chain's own and outlives the pod.
     carriesAgentState := volume.isSome
+    -- Only a task on a task volume is worth coming back to: its tree and conversation are on the
+    -- claim, and so is everything the next daemon's `close` has to finish with. A pod without one
+    -- has nothing a new daemon could copy back to the slot it came from (see `docs/kubernetes.md`).
+    snapshot := if volume.isSome && spec.taskId.isSome then some snapshot.toJson else none
     mcpEndpoint := fun e => pure { e with host := cfg.mcpHost }
     describe := fun run => do
-      let envFile := envFilePath 0
+      let envFile := envFilePath (run.runId.getD "agent")
       let rendered := String.intercalate " "
         ((#[cfg.kubectl] ++ execArgs cfg podName (run.stdio == .inherit)
            (runnerScript envFile (toPod run.workdir.toString)) run.command (run.args.map toPod)).toList.map shellEscape)
-      return s!"[debug] {cfg.kubectl} -n {cfg.ns} create -f - <<'EOF'\n{manifest.pretty}\nEOF\n\
-[debug] {rendered}"
+      let created := match ctx.manifest with
+        | some m => s!"[debug] {cfg.kubectl} -n {cfg.ns} create -f - <<'EOF'\n{m.pretty}\nEOF\n"
+        | none => s!"[debug] (pod {podName} was created by an earlier daemon)\n"
+      return s!"{created}[debug] {rendered}\n[debug] (queued runs go through {runnerPath} start)"
     start := fun run => do
-      let envFile ← nextEnvFile run.env
-      -- `-i` for a stream as well as for a terminal: both need our end of stdin open, and only
-      -- the interactive one wants a TTY.
-      let args := execArgs cfg podName (interactive := run.stdio == .inherit)
-        (stdinOpen := run.stdio != .piped)
-        (runnerScript envFile (toPod run.workdir.toString) (guard := true)) run.command (run.args.map toPod)
       -- Cancellation ends the agent, not the pod: `close` is the only thing that takes the pod
       -- down, because everything that has to happen after a cancelled task — `after.sh`, the
       -- checkout coming back, the status being written — is another `exec` into it.
       let settled ← IO.mkRef false
       match run.stdio with
+      | .piped =>
+        -- A queued agent: started detached through the run helper (`Exec.Runner`), so that it
+        -- outlives this daemon, and followed from here. The id is the task's own for this step
+        -- (`agent-<attempt>`), so a daemon that comes back to the task finds this agent rather
+        -- than starting a second one in the same tree.
+        let runId ← match run.runId with
+          | some r => pure r
+          | none => freshId "agent"
+        let envFile ← putEnvFile runId run.env
+        let argv := #["/bin/sh", "-c", runnerScript envFile (toPod run.workdir.toString) (guard := true),
+          "orchestra", run.command] ++ run.args.map toPod
+        let reply ← startRun cfg podName runId argv
+        let replay ← match reply with
+          | .existing n => do
+            IO.println s!"  [k8s] {runId} was already running in pod {podName}; following it \
+from the start ({n} bytes read before)"
+            pure n
+          | .started => pure 0
+        detachedHandle cfg podName runId replay
       | .inherit =>
         -- An interactive session: `kubectl exec -i -t` puts a terminal on the connection, and the
         -- daemon's own streams go straight through, so the agent's TUI behaves as it does locally.
+        let envFile ← putEnvFile s!"c{← randomHex 4}" run.env
+        let args := execArgs cfg podName (interactive := true) (stdinOpen := true)
+          (runnerScript envFile (toPod run.workdir.toString) (guard := true)) run.command (run.args.map toPod)
         let child ← IO.Process.spawn {
           cmd := cfg.kubectl, args
           stdin := .inherit, stdout := .inherit, stderr := .inherit }
         return { Handle.ofInheritChild child with
-                 id := s!"pod {cfg.ns}/{podName}"
-                 tryWait := guardedTryWait cfg podName settled child.tryWait
-                 kill := killAgent cfg podName child.pid }
-      | .piped =>
-        -- Without a terminal, `kubectl exec` keeps the two streams apart, which is what orchestra
-        -- needs: the agent's events are on one and everything else is on the other.
-        let child ← IO.Process.spawn {
-          cmd := cfg.kubectl, args
-          stdin := .null, stdout := .piped, stderr := .piped }
-        return { Handle.ofPipedChild child with
                  id := s!"pod {cfg.ns}/{podName}"
                  tryWait := guardedTryWait cfg podName settled child.tryWait
                  kill := killAgent cfg podName child.pid }
@@ -1599,6 +1644,13 @@ marked until it does"
         -- without `-t` is what carries a pipe rather than a terminal, so closing our end reaches
         -- the agent's stdin as the EOF that tells it there are no more turns — and stdout and
         -- stderr still arrive apart, which a TTY would merge.
+        --
+        -- Still a plain exec rather than a detached run: an interactive session that loses its
+        -- daemon is put to sleep and woken on a new pod (`Interactive.reconcile`), and nothing
+        -- would come back to a detached one. The run helper's `--stdin` is what that would use.
+        let envFile ← putEnvFile s!"c{← randomHex 4}" run.env
+        let args := execArgs cfg podName (interactive := false) (stdinOpen := true)
+          (runnerScript envFile (toPod run.workdir.toString) (guard := true)) run.command (run.args.map toPod)
         let child ← IO.Process.spawn {
           cmd := cfg.kubectl, args
           stdin := .piped, stdout := .piped, stderr := .piped }
@@ -1617,27 +1669,33 @@ marked until it does"
             (PathGrant.resolve ecfg.homePath g).path
     runScript := fun script => do
       -- The repository's own scripts, run where the agent works. `bash` because that is what the
-      -- daemon used when it ran them itself, and repositories were written against it.
-      let envFile ← nextEnvFile #[]
-      let args := execArgs cfg podName false
-        (runnerScript envFile (toPod script.workdir.toString)) "bash" #[toPod script.path]
+      -- daemon used when it ran them itself, and repositories were written against it. Detached,
+      -- like the agent: a `validation.sh` half way through a build when the daemon restarts is
+      -- picked up by the next one (`validate-<attempt>`), not started over.
+      let runId ← match script.runId with
+        | some r => pure r
+        | none => freshId "script"
+      let envFile ← putEnvFile runId #[]
+      let argv := #["/bin/sh", "-c", runnerScript envFile (toPod script.workdir.toString),
+        "orchestra", "bash", toPod script.path]
+      discard <| startRun cfg podName runId argv
       match script.stdio with
-      -- A repository's script is run, not conversed with; `.stream` is captured like `.piped`.
+      -- A hook's output belongs in the daemon log as it happens: the followers write straight
+      -- into it.
       | .inherit =>
-        let child ← IO.Process.spawn {
-          cmd := cfg.kubectl, args, stdin := .null, stdout := .inherit, stderr := .inherit }
-        return { exitCode := ← child.wait }
+        let follow (stream : String) := IO.Process.spawn {
+          cmd := "/bin/sh"
+          args := Runner.followArgs cfg.kubectl cfg.ns podName runnerPath runId stream
+          stdin := .null, stdout := .inherit, stderr := .inherit }
+        let out ← follow "out"
+        let err ← follow "err"
+        let exitCode ← out.wait
+        discard err.wait
+        return { exitCode }
+      -- A repository's script is run, not conversed with; `.stream` is captured like `.piped`.
       | .piped | .stream =>
-        let child ← IO.Process.spawn {
-          cmd := cfg.kubectl, args, stdin := .null, stdout := .piped, stderr := .piped }
-        -- Both pipes drained at once: a build writing more than a pipe buffer to stderr would
-        -- otherwise block there while stdout is read to the end, and never finish.
-        let stderrTask ← IO.asTask (prio := .dedicated) child.stderr.readToEnd
-        let stdout ← child.stdout.readToEnd
-        let stderr ← match ← IO.wait stderrTask with
-          | .ok s => pure s
-          | .error e => throw e
-        let exitCode ← child.wait
+        let some (exitCode, stdout, stderr) ← collectRun cfg podName runId
+          | throw (IO.userError s!"kubernetes: lost {runId} in pod {podName}")
         return { exitCode, output := (stdout ++ stderr).trimAscii.toString }
     close := do
       -- A pod that is already gone is the interesting case: it means something outside this daemon
@@ -1693,7 +1751,7 @@ directory is lost."
         -- back by now, so the most a slow or hung command can cost is its own result.
         if let some (command, mount) := finish then
           if state matches .present "Running" | .unknown _ then
-            match finishBudget cfg.deadlineSeconds createdMs (← IO.monoMsNow) with
+            match finishBudget cfg.deadlineSeconds ctx.createdMs (← IO.monoMsNow) with
             | some seconds => runFinishCommand cfg podName command mount seconds
             | none => IO.eprintln s!"  [k8s] finish command skipped: pod {podName} is within \
 minutes of its {cfg.deadlineSeconds}s deadline_seconds"
@@ -1701,6 +1759,191 @@ minutes of its {cfg.deadlineSeconds}s deadline_seconds"
           IO.eprintln s!"  [k8s] pod {podName} ended in Failed — if the task itself looked fine, \
 check whether it ran past deadline_seconds ({cfg.deadlineSeconds}s)."
       deletePod }
+
+/-- Open a pod for one task, and hand back the handle on it. -/
+def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
+  let home ← hostHome
+  let image ← match imageFor cfg spec with
+    | .ok i    => pure i
+    | .error e => throw (IO.userError s!"kubernetes: {e}")
+  -- A task volume only for what asks for one (`taskId`): the merger and `prepare` have nothing
+  -- to continue and nothing worth keeping, and get the throwaway pod they always had.
+  let volume : Option (TaskVolumes × String × Bool) ← match cfg.taskVolumes, spec.taskId with
+    | some tv, some tid =>
+      let (claim, reused) ← acquireWorkspaceClaim cfg tv spec tid
+      if reused then
+        IO.println s!"  [k8s] continuing on workspace volume {claim} ({spec.continuesFrom.getD "?"}'s)"
+      else
+        IO.println s!"  [k8s] new workspace volume {claim}"
+      pure (some (tv, claim, reused))
+    | _, _ => pure none
+  -- On a task volume the checkout and `$HOME` are directories on the claim (see `TaskVolumes`);
+  -- `ecfg` is the configuration with `homePath` pointing there, so every home-relative path the
+  -- agent backend declared lands on the claim as well.
+  let ecfg : Config := match volume with
+    | some (tv, _, _) => { cfg with homePath := s!"{tv.mountPath}/home" }
+    | none            => cfg
+  let workspaceMount := volume.map (fun (tv, _, _) => s!"{tv.mountPath}/work")
+  let staged ← markFiles (stagedPaths ecfg home spec workspaceMount)
+  let podName := s!"orchestra-{← randomHex 6}"
+  let manifest := podManifest ecfg spec podName image staged (volume.map (·.2.1))
+  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
+  IO.FS.createDirAll dir
+  let manifestPath := dir / "pod.json"
+  IO.FS.writeFile manifestPath manifest.compress
+  -- The claim is let go of whenever the pod is: when the task is done with it, and on every way
+  -- of failing to start one. A claim made for this task and never used is deleted rather than kept:
+  -- it holds an empty or half-copied tree, and a start that keeps failing would otherwise leave one
+  -- behind per attempt.
+  let abandonClaim : IO Unit := match volume with
+    | some (_, claim, false) =>
+      discard <| (try kube cfg #["delete", "pvc", claim, "--wait=false", "--ignore-not-found"]
+                  catch _ => pure (0, "", ""))
+    | _ => releaseClaimOf cfg spec volume
+  -- A full quota is not the task's fault. It fills when something other than this daemon's own
+  -- tasks holds pods there — a previous daemon's, an operator's — and failing every entry the
+  -- queue reaches meanwhile empties the queue in seconds: on 2026-10-10 three hundred entries were
+  -- spent that way in a quarter of an hour. So it is waited on, briefly, and then answered with
+  -- `noRoom`, which puts the entry back to `pending`. Briefly because the task's credentials
+  -- were minted before this and are ticking, and because a stop must not wait on it: a task with
+  -- no pod yet is not one a drain should finish.
+  let gaveUp : IO Bool := do return (← spec.cancelled) || (← Exec.stopRequested)
+  let result ← try
+      let mut waited := 0
+      let mut announced := false
+      let mut result ← kube cfg #["create", "-f", manifestPath.toString]
+      while result.1 != 0 && quotaExceeded result.2.2 && waited < spec.roomWaitSeconds do
+        unless announced do
+          announced := true
+          IO.println s!"  [k8s] namespace {cfg.ns} is at its quota; waiting for room \
+(up to {spec.roomWaitSeconds}s): {result.2.2.trimAscii}"
+        for _ in [0:quotaPollSeconds] do
+          if ← gaveUp then break
+          IO.sleep 1000
+        if ← gaveUp then break
+        waited := waited + quotaPollSeconds
+        if let some (_, claim, _) := volume then renewWorkspace cfg claim (spec.taskId.getD "")
+        result ← kube cfg #["create", "-f", manifestPath.toString]
+      if announced && result.1 == 0 then
+        IO.println s!"  [k8s] room in {cfg.ns} after {waited}s; pod {podName} created"
+      pure result
+    catch e =>
+      try IO.FS.removeDirAll dir catch _ => pure ()
+      abandonClaim
+      throw e
+  try IO.FS.removeDirAll dir catch _ => pure ()
+  let (code, _, err) := result
+  if code != 0 then
+    abandonClaim
+    if ← spec.cancelled then
+      throw (IO.userError s!"kubernetes: cancelled while waiting for room in namespace {cfg.ns}")
+    if quotaExceeded err then
+      throw (Exec.noRoom s!"namespace {cfg.ns} is at its quota: {err.trimAscii}")
+    throw (IO.userError s!"kubernetes: could not create pod {podName}: {err.trimAscii}")
+  -- When the pod came to be, near enough: its `activeDeadlineSeconds` counts from its start, which
+  -- is no earlier, so a finish command budgeted from here cannot run into it (see `finishBudget`).
+  let createdMs ← IO.monoMsNow
+  let createdEpoch ← epochNow
+  let failPod : IO Unit := do
+    if ← removePodOf cfg podName volume then abandonClaim
+  -- Ready, not merely created: the next thing this does is copy a repository through
+  -- `kubectl exec`, which needs a container that has actually started.
+  let (waitCode, _, waitErr) ← kube cfg #["wait", "--for=condition=Ready", s!"pod/{podName}",
+    s!"--timeout={cfg.startupTimeoutSeconds}s"]
+  if waitCode != 0 then
+    let why ← startupDiagnosis cfg podName
+    failPod
+    throw (IO.userError s!"kubernetes: pod {podName} did not become ready within \
+{cfg.startupTimeoutSeconds}s ({why}): {waitErr.trimAscii}")
+  try
+    -- The run helper first: everything a queued task runs here goes through it (`Exec.Runner`).
+    putFile cfg podName runnerPath Runner.runnerScript
+    -- The directories the agent works in, made by the agent's own user (every `exec` runs as the
+    -- image's user) before anything lands in them, so that they are its own and not root's — the
+    -- checkout and, on a claim, `$HOME`. A no-op on a claim a predecessor left, where they exist.
+    if let some ws := staged.find? (·.isWorkspace) then
+      mkdirInPod cfg podName ws.podPath
+    if volume.isSome then
+      mkdirInPod cfg podName ecfg.homePath
+    for st in staged do
+      -- A file is written into the `emptyDir` above it; `stageIn` carries a directory's entries.
+      if st.isFile then
+        putFile cfg podName st.podPath (← IO.FS.readFile st.hostPath)
+        continue
+      match volume with
+      | some (tv, _, reused) =>
+        if st.isWorkspace then
+          -- A continuation's tree is already on the claim, exactly as its predecessor left it;
+          -- copying the daemon's checkout over it would undo the very thing it was kept for.
+          unless reused do
+            stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
+            if let some seedDir := spec.seedDir then
+              stageSeeds cfg tv podName seedDir st.podPath
+        else
+          stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
+      | none =>
+        stageIn cfg podName st.hostPath st.podPath (staged.map (·.hostPath))
+  catch e =>
+    failPod
+    throw e
+  sessionOf cfg spec home {
+    podName, image, ecfg, volume, staged, workspaceMount, createdMs, createdEpoch
+    manifest := some manifest }
+
+/-- Whether the pod and the run helper a snapshot names are there to be picked up: the pod
+    `Running`, and the helper of this daemon's protocol staged in it. Anything that cannot be
+    asked is a `false`. -/
+def probe (cfg : Config) (snapshot : Json) : IO Bool := do
+  try
+    let .ok snap := Snapshot.fromJson? snapshot | return false
+    let .present "Running" ← podState cfg snap.pod | return false
+    let (code, _, _) ← kube cfg #["--request-timeout=30s", "exec", snap.pod, "--", "test", "-f",
+      runnerPath]
+    return code == 0
+  catch _ => return false
+
+/-- Open again the pod a previous daemon opened for this task (`Backend.reattach`).
+
+    `spec` is what the task was opened with, rebuilt by the task runner the same way; from it and
+    the snapshot this recovers everything `openSession` worked out — the staged paths and where they
+    are in the pod, the claim, the configuration with `$HOME` on it — without creating or copying
+    anything. The session it hands back closes the pod exactly as the original would have: the
+    memories and seeds come back, the finish command runs (or is followed, if the last daemon had
+    started it), the pod goes and the claim is let go of. -/
+def reopenSession (cfg : Config) (snapshot : Json) (spec : SessionSpec) : IO Session := do
+  let home ← hostHome
+  let snap ← match Snapshot.fromJson? snapshot with
+    | .ok s => pure s
+    | .error e => throw (IO.userError s!"kubernetes: cannot read the task's pod snapshot: {e}")
+  let volume : Option (TaskVolumes × String × Bool) ← match cfg.taskVolumes, snap.claim with
+    | some tv, some (claim, reused) => pure (some (tv, claim, reused))
+    | none, some (claim, _) =>
+      throw (IO.userError s!"kubernetes: the task's pod mounts workspace volume {claim}, and this \
+daemon's configuration has no task_volumes")
+    | _, none => pure none
+  let ecfg : Config := match volume with
+    | some (tv, _, _) => { cfg with homePath := s!"{tv.mountPath}/home" }
+    | none            => cfg
+  let workspaceMount := volume.map (fun (tv, _, _) => s!"{tv.mountPath}/work")
+  let staged ← markFiles (stagedPaths ecfg home spec workspaceMount)
+  match ← podState cfg snap.pod with
+  | .present "Running" => pure ()
+  | .present phase =>
+    throw (IO.userError s!"kubernetes: pod {snap.pod} is {phase}, not Running")
+  | .gone => throw (IO.userError s!"kubernetes: pod {snap.pod} is gone")
+  | .unknown why => throw (IO.userError s!"kubernetes: could not ask for pod {snap.pod}: {why}")
+  let (code, _, err) ← kube cfg #["exec", snap.pod, "--", "test", "-f", runnerPath]
+  if code != 0 then
+    throw (IO.userError s!"kubernetes: pod {snap.pod} has no run helper at {runnerPath} \
+({err.trimAscii})")
+  -- The pod's age, carried over to this process's monotonic clock, for `finishBudget`.
+  let nowMs ← IO.monoMsNow
+  let ageMs := ((← epochNow) - snap.created) * 1000
+  IO.println s!"  [k8s] picked up pod {cfg.ns}/{snap.pod} again{match snap.claim with
+    | some (c, _) => s!" (workspace volume {c})" | none => ""}"
+  sessionOf cfg spec home {
+    podName := snap.pod, image := snap.image, ecfg, volume, staged, workspaceMount
+    createdMs := nowMs - ageMs, createdEpoch := snap.created, manifest := none }
 
 /-- Check that `kubectl` is here and that it may do what this backend does.
 
@@ -1816,6 +2059,8 @@ def factory : BackendFactory where
       preflight := preflight cfg
       persistentWorkspaces := cfg.taskVolumes.isSome
       reclaim := reclaim cfg
-      openSession := openSession cfg }
+      openSession := openSession cfg
+      reattach := some (reopenSession cfg)
+      probe := probe cfg }
 
 end Orchestra.Exec.Kubernetes
