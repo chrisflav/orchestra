@@ -34,15 +34,22 @@ see [the execution model](execution.md) for how the pieces divide.
 ## what a task looks like
 
 ```
-  open ─► create pod ─► wait Ready ─► stage the checkout in
+  open ─► create pod ─► wait Ready ─► stage the run helper and the checkout in
                                               │
-       init.sh / before.sh ── kubectl exec ────┤
-       the agent ─────────── kubectl exec ────┤   (stdout and stderr arrive separately)
-       validation.sh ─────── kubectl exec ────┤
-       after.sh ──────────── kubectl exec ────┘
+       init.sh / before.sh ── run start ──────┤
+       the agent ─────────── run start ──────┤   detached in the pod; followed with
+       validation.sh ─────── run start ──────┤   `run attach` (stdout and stderr apart)
+       after.sh ──────────── run start ──────┘
                                               │
-  close ─► copy the checkout back ─► delete the pod
+  close ─► copy back ─► finish command ─► delete the pod
 ```
+
+Every command a queued task runs in its pod is started through a small `sh` script orchestra
+stages into the pod's control directory when the pod comes up (`/orchestra/run-1`), rather than
+being the far end of a `kubectl exec`: it runs detached, in a process group of its own, with its
+output going to files in the control directory, and the daemon follows those files with a second
+`kubectl exec`. A dropped connection is picked up from the byte it stopped at, and — the point of
+it — the daemon going away does not end the command. See [restarts](#operating-it).
 
 `orchestra interactive` is the same mechanism with a terminal: `kubectl exec -i -t`, with the
 daemon's own streams handed straight through, so the agent's TUI behaves as it does locally. A
@@ -74,7 +81,10 @@ if not, rather than dispatching into a cluster that will refuse it. The daemon i
 credential, as a kubeconfig named by `KUBECONFIG`.
 
 **In the image:** the agent CLI (`claude`, `vibe`, `opencode` or `pi`), `sh`, `bash` (the
-repository's scripts are run with it), `tar`, `nc` and `git`. That is the fixed part — the same
+repository's scripts are run with it, and the agent's MCP relay needs version 4.3 or later with `/dev/tcp`, which
+every distribution builds in), `tar`, `nc`, `git`, and `setsid`, `mkfifo`, `tail`, `head` and `wc` for the run
+helper (coreutils, util-linux and busybox all have them; without `setsid` a cancellation reaches the
+command but not its children). That is the fixed part — the same
 list the daemon's own machine needs, minus `landrun`. What each repository needs on top of it is
 the subject of the next section.
 
@@ -644,7 +654,8 @@ newline cannot end its own assignment.
 **Orphans.** The pod is deleted when the task ends, including when it fails or is cancelled. A
 daemon that dies mid-task — a deploy that outlasts the drain and ends in `SIGKILL`, a crash —
 leaves one behind: its PID 1 is a sleep loop, so nothing in it ever ends on its own. The daemon that
-starts next removes them. At startup — after the queue's own sweeps and before any worker or
+starts next removes them — except the pods of tasks a stopping daemon handed over, which it picks
+up instead (see restarts, below). At startup — after the queue's own sweeps and before any worker or
 interactive session exists — it lists every pod labelled `app.kubernetes.io/managed-by=orchestra`
 in the namespace and removes those whose `orchestra.dev/task` label names a task or interactive
 session **its own database knows and does not have running**, logging each one
@@ -683,7 +694,77 @@ kubectl -n orchestra delete pod -l orchestra.dev/task=<task id>
 Pods are also labelled `orchestra.dev/task=<task id>`, so a running task can be found from its id
 in the dashboard — and `kubectl exec` into for a look around while it works.
 
-**Restarts.** A task the restart interrupted is picked up again by itself when `task_volumes` is set
+**Restarts: running tasks carry on.** With `task_volumes` set and the `queue` block's
+`reattach_after_restart` on (the default; `"queue": { "reattach_after_restart": false }` turns it
+off), a daemon restart does not interrupt the tasks that are running: their pods keep
+going, and the next daemon carries each one on from exactly where it is — the same agent mid-turn,
+the same `validation.sh` mid-build — rather than resuming it in a new pod.
+
+- **A signal hands over instead of draining.** On `SIGTERM`/`SIGINT` (what `docker stop` and a
+  systemd restart send) or `orchestra queue shutdown --hand-off`, the daemon stops claiming, as
+  before; then, as soon as every task still running is one the next daemon can carry on, it exits —
+  without waiting for them and without touching their pods, claims or tokens (`Handing N running
+  task(s) over to the next daemon`). From that moment no new task is claimed and the control socket
+  is closed; tool calls already running are let finish (up to a minute), and new ones are answered
+  with "orchestra is restarting, try again in a minute". A task that cannot be handed over yet —
+  one still creating or staging its pod, one being cancelled, one whose pod is being deleted, a
+  concert step, any task on a backend whose runs die with the daemon — holds the hand-off until it
+  can be or is done, and until then the stop is the drain it always was. A plain `orchestra queue
+  shutdown` always drains. A second signal, or `--force`, still cancels everything.
+- **Starting picks them up.** Before the startup sweep marks running entries interrupted, the daemon
+  looks at each one: its task record still `running`, where it had got to on record (the
+  `task_run_state` table: the step, the attempt, the pod and its claim, the namespace, MCP host,
+  port range, port and token), the same execution configuration, and the pod `Running` with its
+  run helper in it (all pods are asked at once). Each such entry is picked up (`Picking up entry …
+  where it was: attempt 2`); it keeps its slot, its claim and its pod, `reclaim` leaves the pod
+  alone (its record is still `running`), and its worker re-opens the session on that pod and
+  resumes the task loop at the recorded attempt. Every step of the loop has a fixed run id
+  (`agent-1`, `validate-1`, `after`), and starting one that exists only attaches to it — so the
+  agent that was running is followed again, re-read from its first byte (which rebuilds the session
+  id, the result and any usage limit; the part already printed is kept out of the log), and a
+  validation that finished while no daemon was there is simply read back. Cancelling, the budget,
+  `deadline_seconds`, the finish command and the close all work for it as for any other task. A
+  cluster that does not answer at startup is not taken to mean the pod is gone: the entry is picked
+  up anyway and its pod looked for again.
+- **The agent keeps its tools.** The agent's MCP client is a small `bash` relay that dials the
+  daemon again when the connection drops, holding back whatever the agent asks meanwhile; the next
+  daemon serves the task on the same port with the same token (its port is set aside at startup, so
+  no new task can take it). A request that went out on a connection that then ended without an
+  answer is answered by the relay itself with an error ("the connection was interrupted … call the
+  tool again") rather than sent twice, and the agent runs with `MCP_TOOL_TIMEOUT` of ten minutes as
+  a last resort. This needs `mcp_host` to reach the new daemon the way it reached the old one; a
+  daemon whose namespace, `mcp_host` or `mcp_ports` changed across the restart does not pick the
+  tasks up.
+- **What falls back.** An entry that cannot be picked up — its pod gone, nothing on record (it was
+  still being set up, or ran on a version before this), a different execution configuration, a
+  concert step, a changed namespace or MCP address — is swept and resumed exactly as described next,
+  and what it had on record is forgotten (its kleis token revoked first). So is one that fails
+  anywhere before it is running again (its pod or checkout gone, its MCP port taken, a GitHub token
+  that cannot be minted after a few tries): its pod is removed, its port and token let go of, and it
+  is resumed from its conversation in a new pod. Interactive sessions do not take part: they still
+  go dormant across a restart and wake on a new pod.
+- **A run that went missing is not a run that finished.** The daemon's connection following a
+  run's output reconnects for up to fifteen minutes of an unreachable cluster; if it gives up, or
+  the run's processes were killed from outside (the run helper then records exit 255), the daemon
+  asks the pod how the run ended, and a run it cannot confirm as over is killed and fails its step —
+  it never reads as an agent that finished, with validation started beside it.
+
+The MCP token and, with kleis, the task's kleis token are in `task_run_state` for as long as the task
+runs — the agent holds them, so the next daemon has to accept them — and the row is deleted when the
+task ends.
+
+**Rolling back** past this version: the older daemon refuses to start on a database that records a
+migration it does not know (`0004_task_run_state`). Turn `reattach_after_restart` off and stop the
+daemon with a plain `orchestra queue shutdown` (so nothing is handed over), then delete the record of
+the migration — the table itself can stay, nothing older reads it:
+
+```sql
+DELETE FROM db_migrations WHERE name = '0004_task_run_state';
+```
+
+**Restarts: tasks that were interrupted.** A task the restart interrupted — one that could not be
+carried on as above, or any task when a daemon was killed rather than stopped — is picked up again by
+itself when `task_volumes` is set
 and the `queue` block's `resume_after_restart` is on (the default). The task record holds the
 agent's session id from the moment the agent announces it, not only from when the task ends, so a
 killed run is resumable. The startup sweep records the entries it interrupted (in
@@ -724,12 +805,15 @@ Size `queue.parallel` so that the daemon's own tasks fit; what fills a quota bey
 nobody is running any more — orphans, above — and they are the thing to clear. A pod that could
 never fit (its own request above the quota's limit) is put back again and again; the log says so.
 
-**Long silences.** An agent run is a single `kubectl exec` connection, and some load balancers and
-API-server configurations drop streams that go idle. The agent's output keeps the connection busy
-most of the time, but a long pause between tool calls is the thing to watch if runs die mid-task
-with no error from the agent itself. If the connection does drop, the agent process in the pod
-outlives it — the next attempt kills whatever the last one left behind before starting, so two
-agents never share a checkout.
+**Long silences.** Some load balancers and API-server configurations drop `kubectl exec` streams
+that go idle. For a queued task that costs nothing: the agent and the scripts run detached in the
+pod, and what drops is only the daemon's connection following their output, which reconnects and
+carries on from the byte it had reached (it gives up only after fifteen minutes of not reaching the
+pod at all, or at once if the pod is gone — and then the step fails rather than reading as finished;
+see restarts, above). An interactive session's agent is still a plain
+`kubectl exec`; if that connection drops, the agent process in the pod outlives it, and the next
+launch kills whatever the last one left behind before starting, so two agents never share a
+checkout.
 
 **Every task failing the same way at the first launch** is almost always the image running as
 root — see "what you need". Two symptoms, depending on how far it gets:

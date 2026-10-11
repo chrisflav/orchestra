@@ -175,6 +175,16 @@ def envFor (ghToken : String) (agentEnv extraEnv : Array (String × Option Strin
     -- Agent-specific env vars (e.g. VIBE_HOME, MISTRAL_API_KEY), then the caller's.
     ++ (agentEnv ++ extraEnv).filterMap fun (k, v) => v.map ((k, ·))
 
+/-- What an agent reaching its MCP server over a network gets on top of its environment: a bound on
+    how long one tool call may take (Claude Code's `MCP_TOOL_TIMEOUT`, in milliseconds).
+
+    Such an agent outlives the daemon (`Exec.Runner`), and its MCP relay answers every request it
+    sent whose connection ended (`McpEndpoint.relayScript`) — but a request can in principle still
+    be lost (the relay itself killed mid-line), and the client's own default would then leave the
+    agent waiting for most of a day. Ten minutes is longer than any tool orchestra serves takes. -/
+def remoteMcpEnv (mcp : McpEndpoint) : Array (String × String) :=
+  if mcp.token.isSome then #[("MCP_TOOL_TIMEOUT", "600000")] else #[]
+
 /-- Everything an agent run needs except its own command line: the same spec for all three launch
     modes, which then differ only in `command`, `args` and `stdio`. -/
 def specFor (agentDef : AgentDef) (repoPath : System.FilePath) (mcp : McpEndpoint)
@@ -190,13 +200,14 @@ def specFor (agentDef : AgentDef) (repoPath : System.FilePath) (mcp : McpEndpoin
                  (extraPorts ++ (kleis.map (·.port)).toArray)
     -- With kleis the sandbox holds no GitHub token at all, whatever the caller passed: the
     -- proxy attaches the credential, and a token here would be a way around it.
-    env     := match kleis with
+    env     := (match kleis with
       | none   => envFor ghToken agentEnv extraEnv
       -- The MCP server is reached directly, never through the proxy: on a backend where it is not
       -- on the loopback (a pod reaching the daemon) its traffic would otherwise go through kleis,
       -- and then stop the moment kleis stops passing that host through.
       | some k => envFor "" agentEnv extraEnv ++ k.env.map fun (n, v) =>
-          if n == "NO_PROXY" || n == "no_proxy" then (n, s!"{v},{mcp.host}") else (n, v)
+          if n == "NO_PROXY" || n == "no_proxy" then (n, s!"{v},{mcp.host}") else (n, v))
+      ++ remoteMcpEnv mcp
     -- Inherited by name, not by value: `PATH` and `HOME` mean what they mean wherever the agent
     -- ends up running, which is not necessarily here.
     envPassthrough := #["SHELL", "PATH", "HOME", "USER", "TERM"]
@@ -285,7 +296,11 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     -- thing that makes it resumable down with it. Called at most once per launch, from the
     -- stream pump; a throw is logged and swallowed, since failing to *record* the id is no
     -- reason to stop the agent that owns it.
-    (onSessionId : String → IO Unit := fun _ => pure ()) : IO LaunchResult := do
+    (onSessionId : String → IO Unit := fun _ => pure ())
+    -- What the execution backend should call this run if its runs outlive the daemon
+    -- (`RunSpec.runId`): the task runner's `agent-<attempt>`, so that a daemon picking the task up
+    -- after a restart follows the agent that is already running instead of starting another.
+    (runId : Option String := none) : IO LaunchResult := do
   -- Where the agent reaches the MCP server: loopback for a backend that runs it on this machine,
   -- and whatever a remote one says instead. Resolved before `setupMcp`, which writes it into the
   -- agent's config file.
@@ -330,7 +345,8 @@ goal; running without the goal condition."
     { specFor agentDef repoPath mcp ghToken agentEnv extraEnv pluginDirs memoryDirs readOnly
         extraPorts additionalPaths kleis with
       args  := goalArgs ++ agentArgs
-      stdio := if interactiveAgent then .inherit else .piped }
+      stdio := if interactiveAgent then .inherit else .piped
+      runId }
   if debug then
     IO.eprintln (← session.describe spec)
   let handle ← session.start spec
@@ -360,6 +376,14 @@ goal; running without the goal condition."
   let resultSubtypeRef ← IO.mkRef (none : Option StreamFormat.ResultSubtype)
   let resultTextRef   ← IO.mkRef (none : Option String)
   let rateLimitResetRef ← IO.mkRef (none : Option String)
+  -- A run this daemon picked up from the one before it is read from its beginning, which is how
+  -- the session id, the result and a usage limit are known again (`Exec.Runner`); the part the
+  -- other daemon already printed is kept off the console. The log files are written whole, so
+  -- they hold the entire run across the restart.
+  let consumedRef ← IO.mkRef (0 : Nat)
+  if handle.replayBytes > 0 then
+    IO.println s!"  [sandbox] re-reading {handle.replayBytes} bytes of output from before the \
+restart; showing what follows"
   let outTask ← match handle.stdout with
     | none => pure none
     | some stdout => some <$> IO.asTask (prio := .dedicated) do
@@ -368,6 +392,8 @@ goal; running without the goal condition."
       repeat do
         let line ← stdout.getLine
         if line.isEmpty then return
+        let replayed := (← consumedRef.get) < handle.replayBytes
+        consumedRef.modify (· + line.utf8ByteSize)
         -- Write every raw line to the debug log
         if let some h := debugHandle then
           h.putStrLn line
@@ -399,7 +425,7 @@ goal; running without the goal condition."
           -- `none` for them achieved before there was anywhere to record them.
           if let .rateLimit reset := event then
             if reset.isSome then rateLimitResetRef.set reset
-          else
+          else unless replayed do
             out.putStrLn (StreamFormat.format event)
             out.flush
           -- Write the parsed event as a JSON line to the structured log
