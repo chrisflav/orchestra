@@ -537,4 +537,101 @@ def aDaemonConfiguredDifferentlyDoesNotPickThePodUp : Test := do
       (cfg [("mcp_ports", Json.arr #[Json.num 48000, Json.num 48099])])).toOption.isNone
     "nor another port range"
 
+/-! ## The second review -/
+
+/-- The shells a pod image may run the helper under, beyond `/bin/sh` here: the task images are
+    Debian (dash) or busybox-based. Each one that is on `PATH` is used; none is required. -/
+private def otherShells : IO (Array (Array String)) := do
+  let mut out := #[]
+  for (probe, sh) in [("dash", #["dash"]), ("busybox", #["busybox", "sh"])] do
+    if (← IO.Process.output { cmd := "sh", args := #["-c", s!"command -v {probe}"] }).exitCode == 0 then
+      out := out.push sh
+  return out
+
+@[test]
+def theRunHelperBehavesTheSameUnderDashAndBusybox : Test := do
+  let shells ← otherShells
+  if shells.isEmpty then
+    TestM.skip "neither dash nor busybox on PATH"; return
+  for sh in shells do
+    let r ← stageRunner
+    let run (args : Array String) : IO (UInt32 × String) := do
+      let o ← IO.Process.output { cmd := sh[0]!, args := sh.extract 1 sh.size ++ #[r] ++ args }
+      return (o.exitCode, o.stdout)
+    let name := " ".intercalate sh.toList
+    let (_, said) ← run (startArgs "a" #["sh", "-c", "echo one; sleep 0.5; echo two; exit 3"])
+    TestM.assert (parseStartReply said == some .started) s!"{name}: start ({said})"
+    let (code, out) ← run (attachArgs "a" "out")
+    TestM.assertEqual code 3 (msg := s!"{name}: the exit status")
+    TestM.assertEqual out "one\ntwo\n" (msg := s!"{name}: the stream")
+    let (_, again) ← run (startArgs "a" #["true"])
+    TestM.assert (parseStartReply again == some (.existing 8)) s!"{name}: start is idempotent"
+    let _ ← run (startArgs "talk" (stdin := true) #["sh", "-c", "read l; echo \"got $l\""])
+    let w ← IO.Process.spawn { cmd := sh[0]!, args := sh.extract 1 sh.size ++ #[r, "write", "talk"]
+                               stdin := .piped, stdout := .null }
+    let (wi, w) ← w.takeStdin
+    wi.putStrLn "hi"; wi.flush
+    let _ := wi
+    discard w.wait
+    let (_, said) ← run (attachArgs "talk" "out")
+    TestM.assertEqual said "got hi\n" (msg := s!"{name}: stdin through the FIFO")
+    let _ ← run (startArgs "k" #["sh", "-c", "trap '' TERM; sleep 300 & wait; sleep 300"])
+    IO.sleep 300
+    let _ ← run #["kill", "k", "1"]
+    let (_, st) ← run #["status", "k"]
+    TestM.assert (match parseStatus st with | some (.exited _ _ _) => true | _ => false)
+      s!"{name}: kill ends the run ({st})"
+    let _ ← run (startArgs "v" #["sh", "-c", "sleep 300"])
+    IO.sleep 300
+    let dir := ((System.FilePath.mk r).parent.getD ".") / "runs" / "v"
+    let _ ← IO.Process.output { cmd := "kill", args := #["-9",
+      (← IO.FS.readFile (dir / "wrapper")).trimAscii.toString,
+      (← IO.FS.readFile (dir / "pid")).trimAscii.toString] }
+    IO.sleep 300
+    let (_, st) ← run #["status", "v"]
+    TestM.assert (parseStatus st == some (.exited 255 0 0)) s!"{name}: a killed run is settled ({st})"
+
+@[test]
+def theRelayKeepsInitializeAndWholeLinesAcrossAReconnect : Test := do
+  if (← IO.Process.output { cmd := "sh", args := #["-c", "command -v bash"] }).exitCode != 0 then
+    TestM.skip "no bash here"; return
+  -- The first server reads the token and `initialize` and dies without answering. An error for
+  -- `initialize` would make the agent's MCP client give the server up for good; it is sent again
+  -- to the next server instead, which answers it.
+  let port ← oneShotServer fun c => do
+    let mut got := ""
+    for _ in [0:20] do
+      match ← awaitP (← c.recv? 65536) with
+      | some bytes => got := got ++ String.fromUTF8! bytes
+      | none => break
+      if (got.splitOn "\n").length ≥ 3 then break
+    try awaitP (← c.shutdown) catch _ => pure ()
+  let token := "tok"
+  let (cmd, args) := McpEndpoint.stdioCommand { host := "127.0.0.1", port, token := some token }
+  let relay ← IO.Process.spawn { cmd, args, stdin := .piped, stdout := .piped, stderr := .null }
+  let (stdin, relay) ← relay.takeStdin
+  stdin.putStrLn "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{},\"id\":0}"
+  stdin.flush
+  IO.sleep 1000
+  let (_, stop) ← Server.start (testServerState (some token)) (exactPort := some port)
+  let first ← lineWithin relay.stdout 30000
+  TestM.assert (first.any fun l => AgentDef.containsCI l "\"id\":0"
+      && !AgentDef.containsCI l "\"error\"")
+    s!"initialize is answered by the next server, not with an error ({first.map (·.take 100)})"
+  -- Half a request, then a pause longer than the writer's read timeout, then the rest: one
+  -- request, whole.
+  stdin.putStr "{\"jsonrpc\":\"2.0\",\"method\":\"tools/l"
+  stdin.flush
+  IO.sleep 2500
+  stdin.putStrLn "ist\",\"id\":1}"
+  stdin.flush
+  let second ← lineWithin relay.stdout 10000
+  TestM.assert (second.any fun l => AgentDef.containsCI l "\"id\":1"
+      && AgentDef.containsCI l "\"tools\"")
+    s!"a request written in two halves arrives as one ({second.map (·.take 100)})"
+  stdin.flush
+  relay.kill
+  discard relay.wait
+  stop
+
 end OrchestraTest.Reattach

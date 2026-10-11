@@ -91,15 +91,25 @@ self=$0
 runs=$(dirname \"$self\")/runs
 die() { echo \"orchestra-run: $*\" >&2; exit 125; }
 nap() { sleep \"$1\" 2>/dev/null || sleep 1; }
+# Detached: a simple command in the background, which the shell forks and execs with its own
+# redirections. They belong on that command and never on a call of this function: dash keeps
+# a redirected function call's original descriptors on fds 10 and up while it runs, and in a
+# background job those copies -- the caller's stdout, the pipe `kubectl exec` reads -- would
+# stay open for as long as the job lives, so `start` would never be seen to finish.
 detach() {
-  if command -v setsid >/dev/null 2>&1; then setsid \"$@\"; else nohup \"$@\"; fi
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh \"$self\" \"$@\" </dev/null >/dev/null 2>&1 &
+  else
+    nohup sh \"$self\" \"$@\" </dev/null >/dev/null 2>&1 &
+  fi
 }
 dir_of() {
   case $1 in ''|*/*|.*) die \"bad run id '$1'\" ;; esac
   d=$runs/$1
 }
 size_of() { if [ -f \"$1\" ]; then wc -c <\"$1\" | tr -d ' '; else echo 0; fi; }
-put() { printf '%s\\n' \"$2\" >\"$1.tmp\" && mv \"$1.tmp\" \"$1\"; }
+# Atomically, under a name of its own per process: `settle` may write `exit` from two places at once.
+put() { printf '%s\\n' \"$2\" >\"$1.tmp.$$\" && mv \"$1.tmp.$$\" \"$1\"; }
 alive() { [ -n \"$1\" ] && kill -0 \"$1\" 2>/dev/null; }
 # A run whose wrapper and command are both gone without an exit status on disk was killed from
 # outside (kill -9, the OOM killer): record that, so nobody waits for it forever.
@@ -139,12 +149,12 @@ cmd_start() {
   put \"$d/starter\" \"$$\"
   if [ -n \"$stdin\" ]; then
     mkfifo \"$d/in\" || die \"start: cannot create $d/in\"
-    detach sh \"$self\" _hold \"$d\" </dev/null >/dev/null 2>&1 &
+    detach _hold \"$d\"
     i=0
     while [ ! -f \"$d/holder\" ] && [ $i -lt 100 ]; do nap 0.1; i=$((i + 1)); done
     [ -f \"$d/holder\" ] || die \"start: the stdin holder did not come up\"
   fi
-  detach sh \"$self\" _wrap \"$d\" \"$@\" </dev/null >/dev/null 2>&1 &
+  detach _wrap \"$d\" \"$@\"
   i=0
   while [ ! -f \"$d/pid\" ] && [ ! -f \"$d/exit\" ] && [ $i -lt 100 ]; do nap 0.1; i=$((i + 1)); done
   [ -f \"$d/pid\" ] || [ -f \"$d/exit\" ] || die \"start: the command did not come up\"

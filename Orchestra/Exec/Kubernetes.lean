@@ -2000,12 +2000,12 @@ daemon's configuration has no task_volumes")
   let staged ← markFiles (stagedPaths ecfg home spec workspaceMount)
   if let .error e := snap.compatible cfg then
     throw (IO.userError s!"kubernetes: cannot carry the task on: {e}")
-  -- Asked a few times: the startup check may have found the cluster not answering, and the pod is
-  -- not to be given up on for a hiccup.
+  -- Asked again for four minutes: the startup check may have found the cluster not answering, and
+  -- the pod is not to be given up on for an API server that is slow to come back.
   let mut state ← podState cfg snap.pod
-  for _ in [0:4] do
+  for _ in [0:24] do
     if state matches .unknown _ then
-      IO.sleep 5000
+      IO.sleep 10000
       state ← podState cfg snap.pod
   match state with
   | .present "Running" => pure ()
@@ -2125,6 +2125,29 @@ def reclaim (cfg : Config) (isLeftover : String → IO Bool) : IO Unit := do
   catch e =>
     IO.eprintln s!"  [k8s] could not remove leftover pods: {e}"
 
+
+/-- Remove every pod opened for task `taskId`, and say whether they are confirmed gone
+    (`Backend.removeTask`). Unlike `reclaim`, which is best effort, this answers: `false` whenever
+    the cluster could not be asked, the delete did not finish, or a pod is still listed after it. -/
+def removeTask (cfg : Config) (taskId : String) : IO Bool := do
+  let selector := s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/task={labelValue taskId}"
+  for attempt in [0:3] do
+    if attempt > 0 then IO.sleep 10000
+    try
+      let (dc, _, derr) ← kube cfg #["delete", "pods", "-l", selector, "--now",
+        "--ignore-not-found", "--timeout=120s"]
+      if dc != 0 then
+        IO.eprintln s!"  [k8s] could not delete the pods of {taskId}: {derr.trimAscii}"
+        continue
+      let (lc, out, lerr) ← kube cfg #["--request-timeout=30s", "get", "pods", "-l", selector,
+        "-o", "name"]
+      if lc != 0 then
+        IO.eprintln s!"  [k8s] could not confirm the pods of {taskId} are gone: {lerr.trimAscii}"
+        continue
+      if out.trimAscii.isEmpty then return true
+    catch e => IO.eprintln s!"  [k8s] could not remove the pods of {taskId}: {e}"
+  return false
+
 /-- Kubernetes as an execution backend. -/
 def factory : BackendFactory where
   name := "kubernetes"
@@ -2140,6 +2163,7 @@ def factory : BackendFactory where
       preflight := preflight cfg
       persistentWorkspaces := cfg.taskVolumes.isSome
       reclaim := reclaim cfg
+      removeTask := removeTask cfg
       openSession := openSession cfg
       reattach := some (reopenSession cfg)
       probe := probe cfg }

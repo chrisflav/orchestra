@@ -67,6 +67,14 @@ def reclaim (cfg : ExecutionConfig) (isLeftover : String → IO Bool) : IO Unit 
   | .ok b    => b.reclaim isLeftover
   | .error _ => pure ()
 
+/-- `cfg`'s backend's `Backend.removeTask`. `false` when the backend cannot even be built: nothing
+    is then confirmed. -/
+def removeTask (cfg : ExecutionConfig) (taskId : String) : IO Bool := do
+  let some f := factoryOf? cfg.backend | return false
+  match f.make cfg.options with
+  | .ok b    => b.removeTask taskId
+  | .error _ => return false
+
 /-- Where the MCP server should listen for `backend`'s agents — address and, if it matters, which
     ports it may use — and the token it should demand.
 

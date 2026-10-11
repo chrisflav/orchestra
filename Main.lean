@@ -894,12 +894,16 @@ private def queueShutdownHandler (p : Parsed) : IO UInt32 := do
   let handOff := p.hasFlag "hand-off"
   let req := Lean.Json.mkObj [("type", "shutdown"), ("force", Lean.Json.bool force),
     ("hand_off", Lean.Json.bool handOff)]
-  let _ ← daemonRequest req
+  let resp ← daemonRequest req
+  let mode := (resp.getObjValAs? String "id").toOption.getD ""
   if force then
     IO.println "Shutdown request sent. Daemon will stop after cancelling the current task."
-  else if handOff then
+  else if handOff && mode == "hand-off" then
     IO.println "Shutdown request sent. Daemon will hand its running tasks over once every one of them \
 can be, and drain the rest."
+  else if handOff then
+    IO.println "Shutdown request sent. This daemon does not hand tasks over \
+(queue.reattach_after_restart is off), so it will stop after the current tasks finish."
   else
     IO.println "Shutdown request sent. Daemon will stop after the current task finishes."
   return 0
@@ -909,7 +913,8 @@ private def queueCancelHandler (_ : Parsed) : IO UInt32 := do
     IO.eprintln "Queue daemon is not running."
     return 1
   let req := Lean.Json.mkObj [("type", "cancel")]
-  let _ ← daemonRequest req
+  let resp ← daemonRequest req
+  let mode := (resp.getObjValAs? String "id").toOption.getD ""
   IO.println "Cancel request sent. The current task will be stopped."
   return 0
 

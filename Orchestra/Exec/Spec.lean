@@ -215,9 +215,11 @@ still needed, make it again.\"}"
       away is lost: it waits in the FIFO for the next connection.
     * Each connection is `bash`'s own `/dev/tcp`: the token goes first, then one loop copies whole
       lines from the FIFO to the socket and another whole lines from the socket to the agent
-      (`read -r`, so a long request is never split across two connections). The first of the two
-      to end (`wait -n`, so `bash` 4.3 or later) ends the connection — the server closing it is an
-      immediate EOF — and the other is stopped before it can take another request off the FIFO.
+      (`read -r`, so a long request is never split across two connections). When the server's
+      side ends (`wait -n`, so `bash` 4.3 or later) the writer is *asked* to stop rather than
+      killed: it reads with a one-second timeout, keeps a partial line across timeouts, and stops
+      only between lines — so a request half way into the FIFO is neither cut in two nor sent as
+      garbage on the next connection.
     * **Every request is answered exactly once.** The id of each request sent is noted (one file
       per id; the id is the last `"id":` in the line, which is where the MCP client puts it), and
       crossed off when the server's answer to it passes back (the server writes `"id"` first,
@@ -227,6 +229,9 @@ still needed, make it again.\"}"
       opened) is not the relay's to repeat. So a request the old server read and never answered,
       or one that went out on a connection about to close, gets an error the agent can act on
       instead of a wait that never ends. Notifications carry no id and need no answer.
+    * The one exception is `initialize`, which has no effect to repeat and whose error would make
+      the MCP client give the server up for the rest of the session: while unanswered it is kept,
+      and sent again first on the next connection.
     * Reconnecting backs off from one second to fifteen, and gives up after an hour without a
       connection that lasted, which is longer than any restart and shorter than a pod's deadline.
     * The agent closing its stdin — it is done — ends the relay.
@@ -242,15 +247,23 @@ def relayScript (e : McpEndpoint) (token : String) : String :=
   "( cat <&4 >&5; kill -TERM $$ 2>/dev/null ) & " ++
   "trap 'kill $(jobs -p) 2>/dev/null; rm -rf \"$d\"' EXIT; trap 'exit 0' HUP INT TERM; " ++
   "w=1; down=0; " ++
-  "while :; do s=$SECONDS; " ++
+  "while :; do s=$SECONDS; rm -f \"$d/stop\"; " ++
   "if { exec 3<>\"/dev/tcp/$h/$p\"; } 2>/dev/null; then echo \"$t\" >&3; " ++
+  "[ -f \"$d/init\" ] && cat \"$d/init\" >&3; " ++
   "( while IFS= read -r l; do echo \"$l\"; if [[ $l =~ $rs ]]; then " ++
-  "rm -f \"$d/p/${BASH_REMATCH[1]//[^A-Za-z0-9]/_}\"; fi; done <&3 ) & r=$!; " ++
-  "( while IFS= read -r l; do if [[ $l =~ $rq ]]; then " ++
-  "echo \"${BASH_REMATCH[1]}\" > \"$d/p/${BASH_REMATCH[1]//[^A-Za-z0-9]/_}\"; fi; " ++
-  "echo \"$l\" >&3 || exit 1; done <&5 ) & f=$!; " ++
-  "wait -n; kill $r $f 2>/dev/null; wait $r $f 2>/dev/null; exec 3>&-; fi; " ++
+  "k=${BASH_REMATCH[1]//[^A-Za-z0-9]/_}; rm -f \"$d/p/$k\"; " ++
+  "[ \"$k\" = \"$(cat \"$d/initid\" 2>/dev/null)\" ] && rm -f \"$d/init\" \"$d/initid\"; " ++
+  "fi; done <&3 ) & r=$!; " ++
+  "( b=; while :; do if IFS= read -r -t 1 l; then l=$b$l; b=; if [[ $l =~ $rq ]]; then " ++
+  "k=${BASH_REMATCH[1]//[^A-Za-z0-9]/_}; echo \"${BASH_REMATCH[1]}\" > \"$d/p/$k\"; " ++
+  "if [[ $l == *'\"method\":\"initialize\"'* ]]; then echo \"$l\" > \"$d/init\"; " ++
+  "echo \"$k\" > \"$d/initid\"; fi; fi; echo \"$l\" >&3 || exit 1; " ++
+  "elif [ $? -gt 128 ]; then b=$b$l; [ -z \"$b\" ] && [ -f \"$d/stop\" ] && exit 0; " ++
+  "else exit 0; fi; done <&5 ) & f=$!; " ++
+  "wait -n; touch \"$d/stop\"; wait $f 2>/dev/null; kill $r 2>/dev/null; wait $r 2>/dev/null; " ++
+  "exec 3>&-; fi; " ++
   "for x in \"$d\"/p/*; do [ -f \"$x\" ] || continue; " ++
+  "[ \"${x##*/}\" = \"$(cat \"$d/initid\" 2>/dev/null)\" ] && continue; " ++
   "echo '{\"jsonrpc\":\"2.0\",\"id\":'\"$(cat \"$x\")\"'," ++ relayLostReply ++ "}'; " ++
   "rm -f \"$x\"; done; " ++
   "if [ $((SECONDS - s)) -ge 5 ]; then w=1; down=0; else down=$((down + w)); " ++

@@ -422,6 +422,11 @@ structure Backend where
       since leftovers that were not removed are a nuisance and a daemon that would not start is an
       outage. -/
   reclaim : (String → IO Bool) → IO Unit := fun _ => pure ()
+  /-- Remove whatever was opened for task `taskId`, and say whether it is confirmed gone. For the
+      daemon giving up on a task it was picking up again: a continuation of it may only take its
+      workspace once nothing of the old run can still be writing there. `true` for a backend whose
+      environments die with the process that opened them. -/
+  removeTask : String → IO Bool := fun _ => pure true
   /-- Open an environment for one task. -/
   openSession : SessionSpec → IO Session
   /-- Open, again, an environment a previous daemon opened and left running: from its

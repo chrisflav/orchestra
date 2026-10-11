@@ -176,7 +176,11 @@ Marked unfinished.")
           if handOff && !force then Exec.requestHandOff
           Exec.requestStop
           shutdownToken.cancel .shutdown
-          pure DaemonRequest.DaemonResponse.ok
+          -- Which kind of stop this became, for the client to say: a hand-off asked of a daemon that
+          -- does not hand over (`reattach_after_restart` off) is a drain.
+          pure (DaemonRequest.DaemonResponse.withId
+            (if force then "cancel" else if handOff && appConfig.queue.reattachAfterRestart
+             then "hand-off" else "drain"))
         -- The four interactive verbs. Each answers the id it acted on, or a sentence saying why
         -- it could not — the HTTP route in front of them turns that sentence into a status, in
         -- exactly the way `POST /api/v1/queue/{id}/cancel` already does.
@@ -343,16 +347,21 @@ def fallsBackToResume (reattachFailed started : Bool) : Bool :=
 /-- Let go of everything a picked-up task held that will not be used now: its pod (and with it
     whatever is still running there — a continuation is about to take its workspace), its record of
     where it was and the kleis token on it, the MCP port kept for it. Its task record is marked
-    unfinished first, which is also what lets `reclaim` judge the pod a leftover. Best effort, and
-    idempotent: much of it is already done when the task got as far as reopening its pod, whose
-    close does the same. -/
-def abandonAdoption (appConfig : AppConfig) (r : TaskRunner.Reattach) : IO Unit := do
+    unfinished first. Idempotent: much of it is already done when the task got as far as reopening
+    its pod, whose close does the same.
+
+    Answers whether the pod is *confirmed* gone (`Exec.removeTask`). Only then may a continuation be
+    queued: one queued beside a pod that could not be removed — the API server unreachable for a
+    minute — would be a second agent on the same branch. -/
+def abandonAdoption (appConfig : AppConfig) (r : TaskRunner.Reattach) : IO Bool := do
   let tid := r.record.id
   try discard <| Queue.markTaskUnfinished tid catch _ => pure ()
   forgetRunState appConfig tid (some r.state)
   Server.releasePort (UInt16.ofNat r.state.mcpPort)
-  try Exec.reclaim appConfig.execution (fun id => pure (id == tid))
-  catch e => IO.eprintln s!"  Could not remove the pod of task {tid}: {e}"
+  try Exec.removeTask appConfig.execution tid
+  catch e =>
+    IO.eprintln s!"  Could not remove the pod of task {tid}: {e}"
+    return false
 
 /-- Run the queue daemon in the foreground until it is asked to stop, and exit the process.
 
@@ -594,8 +603,11 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
       let n ← Utils.Signals.count
       if n > 0 && !announced then
         announced := true
-        IO.println "Received termination signal; handing in-flight tasks over to the next daemon \
-where they can be, finishing the rest before shutting down."
+        if appConfig.queue.reattachAfterRestart then
+          IO.println "Received termination signal; handing in-flight tasks over to the next \
+daemon where they can be, finishing the rest before shutting down."
+        else
+          IO.println "Received termination signal; finishing in-flight tasks before shutting down."
         IO.println "Send it again to cancel them instead."
         Exec.requestHandOff
         Exec.requestStop
@@ -901,10 +913,11 @@ its workspace; it will start from a clean checkout."
       let abandoned ← match reattach with
         | some r => pure (fallsBackToResume (Exec.isReattachFailed e) (← r.started.get))
         | none => pure false
+      let mut podGone := true
       if abandoned then
         if let some r := reattach then
           IO.eprintln s!"  Queue entry {entry.id} could not be picked up: {e}"
-          abandonAdoption appConfig r
+          podGone ← abandonAdoption appConfig r
       if explicitlyCancelled then
         IO.eprintln s!"  Task cancelled (with error: {e})"
         try finish .cancelled none none catch _ => pure ()
@@ -920,17 +933,24 @@ its workspace; it will start from a clean checkout."
         -- What it would have been without the hand-off: interrupted by the restart, and resumed in
         -- a new pod from its conversation (`Queue.resumeInterrupted`) — this entry alone, under a
         -- lock, so two of these at once cannot both decide from the same snapshot of the queue
-        -- and queue the same continuation twice.
+        -- and queue the same continuation twice. Only once its old pod is confirmed gone; until
+        -- then it is left on the interrupted list for a later start, whose `reclaim` removes the
+        -- pod before anything is resumed.
         try
           finish .unfinished none none
           if appConfig.queue.resumeAfterRestart && !slotsHoldTrees then
-            resumeMutex.lock
-            try
-              let n ← Queue.resumeInterrupted appConfig.execution (← Usage.nowEpoch)
-                (only := some #[entry.id])
-              if n == 0 then
-                IO.println s!"  Queue entry {entry.id} stays unfinished (see above for why)"
-            finally resumeMutex.unlock
+            if !podGone then
+              IO.eprintln s!"  Queue entry {entry.id}: its old pod could not be confirmed gone, so \
+it is not resumed now; the next start removes the pod and resumes it"
+              Queue.recordInterrupted #[entry.id]
+            else
+              resumeMutex.lock
+              try
+                let n ← Queue.resumeInterrupted appConfig.execution (← Usage.nowEpoch)
+                  (only := some #[entry.id])
+                if n == 0 then
+                  IO.println s!"  Queue entry {entry.id} stays unfinished (see above for why)"
+              finally resumeMutex.unlock
         catch e2 => IO.eprintln s!"  Could not resume queue entry {entry.id} either: {e2}"
       else
         IO.eprintln s!"Queue entry {entry.id} failed: {e}"
@@ -1404,14 +1424,21 @@ holds it. Marked unfinished."
   -- they are doing, and nothing in a task's `finally` runs — no pod is deleted, no claim released,
   -- no token revoked. That is the point. Every task is at a step the next daemon redoes
   -- (`TaskRunner`), and one that tries to move past that point after the decision stops where it
-  -- is (`Exec.leaveReattachable`). In order, once decided: no further claim can start (the claim
-  -- lock is taken and kept), the control socket stops answering, tool calls already running
+  -- is (`Exec.leaveReattachable`). In order, once decided: no claim has started since the stop (the
+  -- claim-lock barrier below), the control socket stops answering, tool calls already running
   -- finish and new ones are answered with "try again in a minute" (`Server.beginHandOff`),
   -- interactive sessions are closed as on any stop, and the pid file goes.
   if appConfig.queue.reattachAfterRestart then
     discard <| IO.asTask (prio := .dedicated) do
       while !(← shutdownToken.isCancelled) do IO.sleep 500
       unless ← Exec.handOffRequested do return
+      -- A barrier, not a hold: once a claim that was already under way has finished, no further
+      -- one can start (`claimNextEntry` checks the stop under this lock), so the tasks counted below
+      -- are all the tasks there will be. Never kept: closing interactive sessions on the way out
+      -- releases their slots through this same lock (`releaseInteractiveSlot`), and it is not
+      -- reentrant — holding it here deadlocked the hand-off whenever a session was open.
+      claimMutex.lock
+      claimMutex.unlock
       let mut noted := false
       repeat
         let actives ← activeTaskTokens.atomically (·.get)
@@ -1422,8 +1449,6 @@ holds it. Marked unfinished."
         if !cancelled && taskIds.size == actives.size && (← Exec.tryHandOff taskIds) then
           IO.println s!"Handing {actives.size} running task(s) over to the next daemon; their \
 pods keep running and it carries them on from where they are."
-          -- Kept for good: a claim half way through would start a task nobody hands over.
-          claimMutex.lock
           match ← socketServerRef.get with
           | some s => try s.close catch _ => pure ()
           | none   => pure ()
