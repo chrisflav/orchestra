@@ -773,9 +773,9 @@ involved, so this works inside the Docker image as well. A task's agent gets:
 - `GH_TOKEN` (the installation token) and the selected authentication source's key in the
   environment — nothing else is inherited beyond `SHELL`, `PATH`, `HOME`, `USER` and `TERM`
 
-With `kleis` configured the sandbox gets no `GH_TOKEN`: it reaches GitHub through a credential
-proxy on a token minted for the task, and may connect to the proxy's port as well. See
-[docs/kleis.md](docs/kleis.md).
+With `kleis` configured the sandbox gets no `GH_TOKEN`: it reaches GitHub — and whatever else the
+task's kleis spec names — through a credential proxy on a token made for the task, and may connect
+to the proxy's port as well. See [docs/kleis.md](docs/kleis.md).
 
 `orchestra run --debug` prints the exact landrun invocation before executing it, which is the
 quickest way to find out why an agent cannot see a path. A path that does not exist cannot be

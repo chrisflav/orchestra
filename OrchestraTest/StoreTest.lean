@@ -51,6 +51,10 @@ private def fullTask : TaskStore.TaskRecord := {
   issueId       := some ⟨34⟩
   role          := some "maintainer"
   identity      := some "ada"
+  kleisToken    := some "{{ada_token}}"
+  kleisSpec     := some "secretary"
+  kleisRoleSpec := some "worker"
+  kleisNarrow   := ["mail: only read", "caldav: only read"]
 }
 
 /-- A queue entry with the same treatment: every option set, every list non-empty, both JSON
@@ -77,6 +81,10 @@ private def fullEntry : Queue.QueueEntry := {
   budget             := some 0.1
   memory             := .project
   identity           := some "ada"
+  kleisToken         := some "{{ada_token}}"
+  kleisSpec          := some "secretary"
+  kleisRoleSpec      := some "worker"
+  kleisNarrow        := ["mail: only read"]
   authSource         := some "primary"
   resolvedAuthSource := some "spare"
   authSources        := ["primary", "spare"]
@@ -281,7 +289,8 @@ def anUnreadableRowIsSkippedNotFatal : Test := do
       continues_from := none, series := none, backend := none, model := none
       agent := none, system_prompt := none, prepend_prompt := none
       budget := none, priority := 10, project_id := none, issue_id := none
-      role := none, identity := none } : Orchestra.Store.TaskRow)
+      role := none, identity := none, kleis_token := none, kleis_spec := none
+      kleis_role_spec := none, kleis_narrow := none } : Orchestra.Store.TaskRow)
     pure (← TaskStore.loadAllTasks, ← TaskStore.loadTask "t-alien")
   TestM.assertEqual (all.map (·.id)).toList ["t-good"] (msg := "the readable row still comes back")
   TestM.assert direct.isNone "and the unreadable one reads as absent rather than throwing"

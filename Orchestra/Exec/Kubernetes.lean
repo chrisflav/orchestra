@@ -827,6 +827,51 @@ private def stagePath (cfg : Config) (podName hostPath podPath : String) : IO Un
     mkdirInPod cfg podName ((System.FilePath.mk podPath).parent.map (·.toString) |>.getD "/")
     putFile cfg podName podPath (← IO.FS.readFile host)
 
+/-- The script `putHomeFile` runs in the pod: `Exec.writeUnderHome`, in `sh`. Takes the home, the
+    relative path and the mode as `$1`–`$3` and the content on stdin; walks the path one directory
+    at a time, refusing a link or a non-directory and creating what is missing, and then writes
+    beside the destination and renames over it, so a link left at the destination is replaced
+    rather than written through. A pod's home can carry what an earlier task in the chain left. -/
+def putHomeFileScript : String := "\n".intercalate [
+  "set -eu",
+  "home=$1; rel=$2; mode=$3",
+  "cur=$home; rest=$rel",
+  "while :; do",
+  "  case $rest in",
+  "    */*) seg=${rest%%/*}; rest=${rest#*/}; cur=$cur/$seg",
+  "         if [ -L \"$cur\" ]; then echo \"$cur is a symbolic link\" >&2; exit 3; fi",
+  "         if [ ! -e \"$cur\" ]; then mkdir \"$cur\"",
+  "         elif [ ! -d \"$cur\" ]; then echo \"$cur is not a directory\" >&2; exit 3; fi ;;",
+  "    *) break ;;",
+  "  esac",
+  "done",
+  "dest=$cur/$rest",
+  "if [ -L \"$dest\" ]; then rm -f \"$dest\"; fi",
+  "if [ -d \"$dest\" ]; then echo \"$dest is a directory\" >&2; exit 3; fi",
+  "tmp=$(mktemp \"$cur/.orchestra-setup.XXXXXX\")",
+  "cat > \"$tmp\"",
+  "chmod \"$mode\" \"$tmp\"",
+  "mv -f \"$tmp\" \"$dest\""]
+
+/-- Write a file under the pod's home (`Session.putHomeFile`). The path is checked here as well as
+    by the caller, since it is about to be handed to a shell in the pod. -/
+private def putHomeFileInPod (cfg : Config) (podName home rel mode content : String) : IO Unit := do
+  if let some e := homePathError? rel then
+    throw (IO.userError s!"kubernetes: refusing to write {e}")
+  if (fileModeOf? mode).isNone then
+    throw (IO.userError s!"kubernetes: refusing to write {rel}: '{mode}' is not a file mode")
+  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
+  IO.FS.createDirAll dir
+  let _ ← IO.Process.output { cmd := "chmod", args := #["700", dir.toString] }
+  IO.FS.writeFile (dir / "content") content
+  let script := s!"{shellEscape cfg.kubectl} -n {shellEscape cfg.ns} exec -i \
+{shellEscape podName} -- /bin/sh -c {shellEscape putHomeFileScript} orchestra \
+{shellEscape home} {shellEscape rel} {shellEscape mode} < {shellEscape (dir / "content").toString}"
+  let (code, _, err) ← shell script
+  try IO.FS.removeDirAll dir catch _ => pure ()
+  if code != 0 then
+    throw (IO.userError s!"kubernetes: could not write ~/{rel} in the pod: {err.trimAscii}")
+
 /-- Copy one directory back out of the pod, replacing what is on disk.
 
     The checkout is swapped rather than extracted over: `tar` never deletes, so extracting on top
@@ -1615,6 +1660,9 @@ marked until it does"
         if g.from_ == .orchestra then
           stagePath cfg podName (PathGrant.resolve home g).path
             (PathGrant.resolve ecfg.homePath g).path
+    -- Into the pod's own home, which is the run's alone (on a task volume, the chain's).
+    putHomeFile := fun rel mode content =>
+      putHomeFileInPod cfg podName ecfg.homePath rel mode content
     runScript := fun script => do
       -- The repository's own scripts, run where the agent works. `bash` because that is what the
       -- daemon used when it ran them itself, and repositories were written against it.

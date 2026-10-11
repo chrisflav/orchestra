@@ -71,6 +71,10 @@ mutual
           budget        := spec.budget
           memory        := spec.memory
           identity      := spec.identity
+          kleisToken    := spec.kleisToken
+          kleisSpec     := spec.kleisSpec
+          kleisRoleSpec := spec.kleisRoleSpec
+          kleisNarrow   := spec.kleisNarrow
           authSource    := spec.authSource
           tools         := spec.tools
           readOnly      := spec.readOnly

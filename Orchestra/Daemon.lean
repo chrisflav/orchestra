@@ -640,6 +640,10 @@ its workspace; it will start from a clean checkout."
         budget           := entry.budget
         memory           := entry.memory
         identity         := entry.identity
+        kleisToken       := entry.kleisToken
+        kleisSpec        := entry.kleisSpec
+        kleisRoleSpec    := entry.kleisRoleSpec
+        kleisNarrow      := entry.kleisNarrow
         authSource       := entry.authSource
         authSources      := entry.authSources
         authMode         := entry.authMode

@@ -109,6 +109,72 @@ structure ScriptResult where
   /-- Combined stdout and stderr, captured only under `.piped`; empty otherwise. -/
   output : String := ""
 
+/-! ## Files written into a run's home
+
+What kleis's `/setup` hands a sandbox (`Kleis.Setup`): configuration files a client expects in its
+home — `~/.zuliprc`, `~/.config/khal/config` — holding placeholders rather than secrets. Each is a
+path *relative to the run's home*, and that path is the one thing about it orchestra checks: it
+comes from a server, and a `../` or an absolute path in it would be a write wherever the daemon
+can write. -/
+
+/-- Why `rel` cannot be written under a run's home, or `none` when it can: it is relative, has no
+    `..`, `.` or empty segment, and no character a shell or a path could read twice. -/
+def homePathError? (rel : String) : Option String :=
+  if rel.isEmpty then some "the path is empty"
+  else if rel.startsWith "/" then some s!"'{rel}' is absolute; only paths under the home are written"
+  else if rel.any (fun c => c == '\x00' || c == '\n' || c == '\\') then
+    some s!"'{rel}' holds a character no setup file's name may"
+  else
+    let segs := rel.splitOn "/"
+    if segs.any (· == "..") then some s!"'{rel}' has a '..' segment"
+    else if segs.any (fun s => s.isEmpty || s == ".") then
+      some s!"'{rel}' has an empty or '.' segment"
+    else none
+
+/-- `mode` (`"0600"`, `"644"`) as permission bits, or `none` when it is not three or four octal
+    digits without setuid, setgid or sticky bits. -/
+def fileModeOf? (mode : String) : Option UInt32 :=
+  let digits := if mode.length == 4 && mode.startsWith "0" then (mode.drop 1).toString else mode
+  if digits.length != 3 || !digits.all (fun c => '0' ≤ c && c ≤ '7') then none
+  else some (digits.foldl (fun acc c => acc * 8 + (c.toNat - '0'.toNat).toUInt32) 0)
+
+/-- Write `content` to `rel` under `home` on this machine, refusing to follow a symbolic link at
+    any point below `home`: every directory on the way is created if missing and refused if it is
+    a link or not a directory, and the file itself is written beside its destination and renamed
+    over it — a rename replaces a link rather than writing through it.
+
+    `home` itself is trusted; everything below it may have been put there by an agent. -/
+def writeUnderHome (home : System.FilePath) (rel : String) (mode : UInt32) (content : String)
+    : IO Unit := do
+  if let some e := homePathError? rel then throw (IO.userError s!"refusing to write {e}")
+  let segs := rel.splitOn "/"
+  let mut dir := home
+  for seg in segs.dropLast do
+    dir := dir / seg
+    match ← (dir.symlinkMetadata.toBaseIO) with
+    | .error _ => IO.FS.createDir dir
+    | .ok md =>
+      if md.type == .symlink then
+        throw (IO.userError s!"refusing to write under {dir}: it is a symbolic link")
+      else if md.type != .dir then
+        throw (IO.userError s!"refusing to write under {dir}: it is not a directory")
+  let dest := dir / (segs.getLast?.getD rel)
+  if let .ok md ← dest.symlinkMetadata.toBaseIO then
+    if md.type == .dir then
+      throw (IO.userError s!"refusing to write {dest}: a directory is there")
+  let tmp := dir / s!".{segs.getLast?.getD "file"}.orchestra-{← IO.monoNanosNow}"
+  IO.FS.writeFile tmp content
+  IO.Prim.setAccessRights tmp mode
+  IO.FS.rename tmp dest
+
+/-- `writeUnderHome` against this machine's `$HOME`, for the backends that run the agent here. -/
+def hostPutHomeFile (rel mode content : String) : IO Unit := do
+  let some bits := fileModeOf? mode
+    | throw (IO.userError s!"refusing to write {rel}: '{mode}' is not a file mode")
+  let home := (← IO.getEnv "HOME").getD ""
+  if home.isEmpty then throw (IO.userError s!"cannot write {rel}: HOME is not set")
+  writeUnderHome home rel bits content
+
 /-- An execution environment, held for as long as one task.
 
     A task is not one command. It is `init.sh`, then `before.sh`, then the agent, then
@@ -147,6 +213,14 @@ structure Session where
       A no-op for the backends that run the agent on this machine, where the file is already
       where the agent will look. -/
   provide : Array PathGrant → IO Unit := fun _ => pure ()
+  /-- Write a file at a path relative to the run's home — `putHomeFile rel mode content` — without
+      following a symbolic link below it (`writeUnderHome`). For what kleis's `/setup` hands a
+      sandbox: configuration a client expects at a fixed place in its home.
+
+      The default writes into this machine's `$HOME`, which is the run's home for every backend
+      that runs the agent here — and so is shared by every task, and by the daemon. A backend that
+      gives each run a home of its own writes it there instead. -/
+  putHomeFile : String → String → String → IO Unit := hostPutHomeFile
   /-- Finish: bring back anything that has to come back, and release whatever was held. Called once
       per task, including when the task failed. -/
   close : IO Unit

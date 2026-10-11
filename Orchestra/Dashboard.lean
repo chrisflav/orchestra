@@ -485,7 +485,14 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     -- Who the entry runs as (`Orchestra.Identity`). The same provenance question as `spawnedBy`,
     -- asked of the tracker: an operator reading a comment signed by an identity needs to be able
     -- to find the run that wrote it.
-    ("identity",       optStr e.identity)
+    ("identity",       optStr e.identity),
+    -- What the entry's kleis token is to be derived from, where the entry itself says so, and
+    -- how it is narrowed (`Orchestra.Kleis`). The token is a `{{secret}}` reference: the name of
+    -- a secret, never its value.
+    ("kleisSpec",      optStr e.kleisSpec),
+    ("kleisToken",     optStr e.kleisToken),
+    ("kleisRoleSpec",  optStr e.kleisRoleSpec),
+    ("kleisNarrow",    ToJson.toJson e.kleisNarrow)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=

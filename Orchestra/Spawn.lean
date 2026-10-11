@@ -80,6 +80,10 @@ structure SpawnRequest where
   budget   : Option Float := none
   issueId  : Option Taxis.IssueId := none
   preClaim : Bool := false
+  /-- Narrowings the queued task's kleis token carries on top of this task's own, which it
+      inherits whatever it asks. A task may narrow what it hands on; it may not widen it, and it
+      may not name another source (`SpawnContext.kleisSpec`). -/
+  kleisNarrow : List String := []
 deriving Repr, Inhabited
 
 /-- What the spawning task itself has, which is what every omitted field inherits. -/
@@ -99,6 +103,15 @@ structure SpawnContext where
       assigned by configuration (`Orchestra.Identity`), and a policy that let a task choose one
       would be a way to reach a memory and a tracker token the operator gave to somebody else. -/
   identity  : Option String := none
+  /-- The source the spawning task's kleis token was derived from, as the queued task carries it
+      (`Kleis.Choice.inherited`): the spec's name, or the `{{secret}}` reference of a token —
+      never the spawning task's token, which is revoked when that task ends and may be gone
+      before the queued one is dispatched. Inherited and never named, like `identity`. -/
+  kleisSpec   : Option String := none
+  kleisToken  : Option String := none
+  /-- Every narrowing the spawning task's token carries. The queued task's token carries them
+      too, and whatever the agent adds (`SpawnRequest.kleisNarrow`). -/
+  kleisNarrow : List String := []
 deriving Repr, Inhabited
 
 /-- A spawn the policy has approved, in the shape the queue needs it. -/
@@ -122,6 +135,11 @@ structure ResolvedSpawn where
   preClaim  : Bool
   /-- The identity the queued task runs under: the spawning task's own, always. -/
   identity  : Option String := none
+  /-- The queued task's kleis source and narrowings: the spawning task's source, and its
+      narrowings followed by the agent's own. -/
+  kleisSpec   : Option String := none
+  kleisToken  : Option String := none
+  kleisNarrow : List String := []
   /-- Carried through so the enqueuing side can report the ceiling it enforced with the number
       in it, rather than saying "too many" and leaving the agent to guess. -/
   maxTasks  : Nat
@@ -196,6 +214,9 @@ set 'allow_pre_claim'"
   return { prompt := r.prompt, backend, model, tools, repo, budget
          , priority := p.priority, readOnly := p.readOnly.getD ctx.readOnly
          , projectId := ctx.projectId, issueId := r.issueId, preClaim := r.preClaim
-         , identity := ctx.identity, maxTasks := p.maxTasks }
+         , identity := ctx.identity
+         , kleisSpec := ctx.kleisSpec, kleisToken := ctx.kleisToken
+         , kleisNarrow := (ctx.kleisNarrow ++ r.kleisNarrow).eraseDups
+         , maxTasks := p.maxTasks }
 
 end Orchestra

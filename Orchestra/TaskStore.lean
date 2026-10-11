@@ -89,6 +89,13 @@ structure TaskRecord where
       thing that says, of a run that has since been pruned from the queue, who wrote the comments
       it left on the tracker. -/
   identity      : Option String    := none
+  /-- The run's kleis source and narrowings as its task carried them (`IOTask.kleisToken` and
+      the rest), inherited by continuations for the reason `identity` is: the same work picked up
+      again runs under the same access. The token is the `{{secret}}` reference, never a token. -/
+  kleisToken    : Option String    := none
+  kleisSpec     : Option String    := none
+  kleisRoleSpec : Option String    := none
+  kleisNarrow   : List String      := []
 deriving Repr
 
 instance : ToJson TaskRecord where
@@ -116,6 +123,10 @@ instance : ToJson TaskRecord where
     let fields := if let some i := r.issueId     then fields ++ [("issue_id",         ToJson.toJson i)]    else fields
     let fields := if let some s := r.role        then fields ++ [("role",             Json.str s)]         else fields
     let fields := if let some s := r.identity    then fields ++ [("identity",         Json.str s)]         else fields
+    let fields := if let some s := r.kleisToken  then fields ++ [("kleis_token",      Json.str s)]         else fields
+    let fields := if let some s := r.kleisSpec   then fields ++ [("kleis_spec",       Json.str s)]         else fields
+    let fields := if let some s := r.kleisRoleSpec then fields ++ [("kleis_role_spec", Json.str s)]       else fields
+    let fields := if !r.kleisNarrow.isEmpty      then fields ++ [("kleis_narrow",     ToJson.toJson r.kleisNarrow)] else fields
     Json.mkObj fields
 
 instance : FromJson TaskRecord where
@@ -141,9 +152,13 @@ instance : FromJson TaskRecord where
     let issueId       := j.getObjValAs? Taxis.IssueId   "issue_id"   |>.toOption
     let role          := j.getObjValAs? String    "role"       |>.toOption
     let identity      := j.getObjValAs? String    "identity"   |>.toOption
+    let kleisToken    := j.getObjValAs? String    "kleis_token"     |>.toOption
+    let kleisSpec     := j.getObjValAs? String    "kleis_spec"      |>.toOption
+    let kleisRoleSpec := j.getObjValAs? String    "kleis_role_spec" |>.toOption
+    let kleisNarrow   := j.getObjValAs? (List String) "kleis_narrow" |>.toOption |>.getD []
     return { id, createdAt, repo, mode, prompt, goal, status, sessionId,
              continuesFrom, series, backend, model, agent, systemPrompt, prependPrompt, budget, priority,
-             projectId, issueId, role, identity }
+             projectId, issueId, role, identity, kleisToken, kleisSpec, kleisRoleSpec, kleisNarrow }
 
 -- Directories
 
@@ -212,7 +227,11 @@ def TaskRecord.toRow (r : TaskRecord) : Store.TaskRow :=
     project_id     := Store.issueIdColumn r.projectId
     issue_id       := Store.issueIdColumn r.issueId
     role           := r.role
-    identity       := r.identity }
+    identity       := r.identity
+    kleis_token    := r.kleisToken
+    kleis_spec     := r.kleisSpec
+    kleis_role_spec := r.kleisRoleSpec
+    kleis_narrow   := if r.kleisNarrow.isEmpty then none else some (Store.jsonColumn r.kleisNarrow) }
 
 /-- The record a row holds, or why this build cannot read it.
 
@@ -225,6 +244,8 @@ def TaskRecord.ofRow? (row : Store.TaskRow) : Except String TaskRecord := do
   let status    ← Store.enumOfColumn? "status" row.status
   let projectId ← Store.issueIdOfColumn? "project_id" row.project_id
   let issueId   ← Store.issueIdOfColumn? "issue_id" row.issue_id
+  let kleisNarrow ← (row.kleis_narrow.mapM fun s =>
+    Store.jsonOfColumn? (α := List String) "kleis_narrow" s).map (·.getD [])
   return { id            := row.id
            createdAt     := row.created_at
            repo          := repo
@@ -245,7 +266,11 @@ def TaskRecord.ofRow? (row : Store.TaskRow) : Except String TaskRecord := do
            projectId     := projectId
            issueId       := issueId
            role          := row.role
-           identity      := row.identity }
+           identity      := row.identity
+           kleisToken    := row.kleis_token
+           kleisSpec     := row.kleis_spec
+           kleisRoleSpec := row.kleis_role_spec
+           kleisNarrow }
 
 -- Storage
 

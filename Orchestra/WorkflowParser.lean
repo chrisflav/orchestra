@@ -112,6 +112,31 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
   let prependPrompt := (mappingLookup pairs "prepend-prompt").bind (nodeAsString · |>.toOption)
   let backend       := (mappingLookup pairs "backend").bind        (nodeAsString · |>.toOption)
   let identity      := (mappingLookup pairs "identity").bind       (nodeAsString · |>.toOption)
+  -- Strict, unlike the fields above: each decides what the step's kleis token reaches, and a
+  -- dropped one would run the step under whatever the next level names.
+  let kleisSpec ← match mappingLookup pairs "kleis-spec" with
+    | none => pure none
+    | some n =>
+      let s := strTrim (← nodeAsString n)
+      match kleisSpecNameError? s with
+      | some e => .error s!"kleis-spec: {e}"
+      | none   => pure (some s)
+  let kleisToken ← match mappingLookup pairs "kleis-token" with
+    | none => pure none
+    | some n =>
+      match nodeAsString n with
+      | .error _ => .error "kleis-token must be a quoted reference to a secret, such as \
+                           \"{{my_token}}\"; unquoted, YAML reads the braces as a mapping"
+      | .ok raw =>
+        let s := strTrim raw
+        match kleisTokenRefError? s with
+        | some e => .error e
+        | none   => pure (some s)
+  let kleisNarrow ← match mappingLookup pairs "kleis-narrow" with
+    | none      => pure []
+    | some node => do
+        let items ← nodeAsSeq node
+        items.toList.mapM fun item => return strTrim (← nodeAsString item)
   -- A workflow's YAML is template-rendered before it is parsed, and an unknown `{{...}}` is left
   -- standing. Dropping what does not parse would turn `issue-number: {{pr_number}}` against a
   -- listener that exports no `pr_number` into a step that runs to completion and then cannot
@@ -170,7 +195,7 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
           parseOutputSpec name v
   return { agent, model, budget, tools, prompt, readOnly, input, output, context, upstream, fork,
            systemPrompt, prependPrompt, backend, issueNumber, triageAddLabels, triageRemoveLabels,
-           identity }
+           identity, kleisToken, kleisSpec, kleisNarrow }
 
 private def parseWriteAction (node : Node) : Except String StepAction := do
   let s ← nodeAsString node

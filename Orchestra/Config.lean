@@ -482,6 +482,72 @@ the tools a queued task may be granted are {String.intercalate ", " knownTools}"
       .error "spawn_policy 'max_budget' must be greater than 0; a task budgeted at nothing \
 cannot run"
 
+/-! ## A task's kleis source (`Orchestra.Kleis`, `docs/kleis.md`) -/
+
+/-- Why `name` cannot be a kleis spec name, or `none` when it can. A spec is a file in kleis's
+    `config/specs/`, so its name is held to what such a file name can be: letters, digits, `-`,
+    `_` and `.`, not starting with a dot. Checked here rather than left to kleis so that a typo in
+    a task file is reported when the file is read, not after its task has been dispatched. -/
+def kleisSpecNameError? (name : String) : Option String :=
+  if name.isEmpty then some "a spec name is empty"
+  else if name.startsWith "." then some s!"'{name}' is not a spec name (it starts with a dot)"
+  else if name.all (fun c => c.isAlphanum || c == '-' || c == '_' || c == '.') then none
+  else some s!"'{name}' is not a spec name (letters, digits, '-', '_' and '.' only)"
+
+/-- The secret a `{{key}}` reference names, or `none` when `ref` is not exactly one reference. -/
+def secretRefKey? (ref : String) : Option String :=
+  if ref.startsWith "{{" && ref.endsWith "}}" && ref.length > 4 then
+    let key := ((ref.drop 2).dropEnd 2).toString
+    if key.all (fun c => c.isAlphanum || c == '-' || c == '_' || c == '.') then some key else none
+  else none
+
+/-- Why `ref` cannot be a task's `kleis_token`, or `none` when it can.
+
+    A task names its token as a `{{secret}}` reference, never as the token itself: a task is kept
+    in the queue and the task store, which are listed over the API and shown on the dashboard, and
+    a bearer token written there is held by everyone who can read them. The reference is resolved
+    from `secrets.json` at launch (`Kleis.resolveTokenRef`), as an identity's `taxis_token` is
+    when its record is read. -/
+def kleisTokenRefError? (ref : String) : Option String :=
+  match secretRefKey? ref with
+  | some _ => none
+  | none => some ("kleis_token must be a reference to a secret in secrets.json, such as " ++
+      "\"{{my_token}}\", never the token itself")
+
+/-- Read an optional list of narrowings (`kleis_narrow`) out of `j`, strictly: present and not a
+    list of strings is an error, since a narrowing silently dropped is access somebody believes
+    was taken away. -/
+def parseKleisNarrow? (j : Json) (what : String := "kleis_narrow") : Except String (List String) :=
+  match j.getObjVal? "kleis_narrow" with
+  | .error _ => .ok []
+  | .ok .null => .ok []
+  | .ok v => match (FromJson.fromJson? v : Except String (List String)) with
+    | .ok ns =>
+      if ns.any (·.trimAscii.isEmpty) then .error s!"{what}: a narrowing is empty"
+      else .ok ns
+    | .error _ => .error s!"{what} must be a list of strings, such as [\"mail: only read\"]"
+
+/-- Read an optional `kleis_spec` out of `j`, strictly: a misspelt or mistyped spec read as
+    absent would run the task under whatever the next level names instead. -/
+def parseKleisSpec? (j : Json) (what : String := "kleis_spec") : Except String (Option String) :=
+  match j.getObjVal? "kleis_spec" with
+  | .error _ => .ok none
+  | .ok .null => .ok none
+  | .ok (.str s) => match kleisSpecNameError? s with
+    | some e => .error s!"{what}: {e}"
+    | none => .ok (some s)
+  | .ok _ => .error s!"{what} must be a string naming a kleis spec"
+
+/-- Read an optional task-level `kleis_token` reference out of `j`, strictly. -/
+def parseKleisTokenRef? (j : Json) : Except String (Option String) :=
+  match j.getObjVal? "kleis_token" with
+  | .error _ => .ok none
+  | .ok .null => .ok none
+  | .ok (.str s) => match kleisTokenRefError? s with
+    | some e => .error e
+    | none => .ok (some s)
+  | .ok _ => .error "kleis_token must be a string: a reference to a secret, such as \"{{my_token}}\""
+
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
   /-- The repositories this task works on, or `none` for a **repository-independent** task.
@@ -535,6 +601,21 @@ structure IOTask (i o : ResultType) where
       may sit pending for hours, and the record it names is configuration that can change in the
       meantime — the run should get the identity as it stands when it starts. -/
   identity : Option String := none
+  /-- The token this task's kleis token is derived from, as a `{{secret}}` reference — the first
+      source `Kleis.choose` consults. Held as the reference, never resolved, for the reason
+      `kleisTokenRefError?` gives; resolved from `secrets.json` at launch. -/
+  kleisToken : Option String := none
+  /-- The kleis spec this task's token is derived from, when the task names one itself. -/
+  kleisSpec : Option String := none
+  /-- The spec of the role this task was dispatched for, or else of the listener action that
+      queued it: consulted after the task's own source and its identity's (`Kleis.choose`), so
+      a task run under an identity keeps that identity's access whatever role it fills. Written
+      when the entry is built, since neither the role nor the action is at hand at launch. -/
+  kleisRoleSpec : Option String := none
+  /-- Narrowings of this task's kleis token (`mail: only read`), accumulated from every level
+      that set one — the task's own, its role's, its listener action's, the task that queued it
+      — and, at launch, its identity's. Each is applied, so the result is their intersection. -/
+  kleisNarrow : List String := []
   /-- Label of the authentication source to use for this task.
       Must match a label in the agent's `auth_sources` config. -/
   authSource : Option String := none
@@ -741,8 +822,16 @@ instance : FromJson Task where
     -- queue anything, and nothing on the way says the field was why.
     let spawnPolicy ← parseSpawnPolicy? j
     let scopeRoot := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
+    -- Strict, like the spawn policy: each of these decides what the task's token reaches.
+    let kleisToken ← parseKleisTokenRef? j
+    let kleisSpec ← parseKleisSpec? j
+    let kleisRoleSpec ← match j.getObjVal? "kleis_role_spec" with
+      | .ok v => parseKleisSpec? (Json.mkObj [("kleis_spec", v)]) "kleis_role_spec"
+      | .error _ => pure none
+    let kleisNarrow ← parseKleisNarrow? j
     return { i, o, ioTask := { repo, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
-                                budget, memory, identity, authSource, authSources, authMode, tools, readOnly,
+                                budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec,
+                                kleisNarrow, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,
                                 triageAddLabels, triageRemoveLabels, spawnPolicy, scopeRoot } }
@@ -994,8 +1083,14 @@ structure KleisConfig where
   issuerTokenFile : Option String := none
   /-- The kleis CA certificate, PEM. Fetched from the daemon when unset. -/
   caFile : Option String := none
-  /-- The grants a task's token names, in the order kleis tries them. -/
+  /-- The grants a task's token names, in the order kleis tries them, on the legacy path: a task
+      with no source (`Kleis.choose`) has its token minted through `/tokens` naming these. Kept
+      while deployments move to `default_spec`, then removed (`docs/kleis.md`). -/
   grants : List String := ["orchestra-github"]
+  /-- The spec a task with no other source runs under (`Kleis.choose`), e.g. `"worker"`. With it
+      set every task's token is derived from a spec or a token (`/.kleis/v1/derive`) and none is
+      minted from `grants`; without it a task with no source of its own keeps the legacy mint. -/
+  defaultSpec : Option String := none
   /-- How long a task's token lives. Revoked when the task ends, so this only bounds a token whose
       task never got to revoke it — a daemon that died mid-task. -/
   ttl : String := "12h"
@@ -1007,8 +1102,8 @@ structure KleisConfig where
 
 instance : Repr KleisConfig where
   reprPrec c _ := s!"\{ url := {repr c.url}, proxy := {repr c.proxy}, issuerToken := <redacted>, issuerTokenFile := {repr c.issuerTokenFile}, \
-caFile := {repr c.caFile}, grants := {repr c.grants}, ttl := {repr c.ttl}, \
-pushPrefix := {repr c.pushPrefix}, noProxy := {repr c.noProxy} }"
+caFile := {repr c.caFile}, grants := {repr c.grants}, defaultSpec := {repr c.defaultSpec}, \
+ttl := {repr c.ttl}, pushPrefix := {repr c.pushPrefix}, noProxy := {repr c.noProxy} }"
 
 instance : FromJson KleisConfig where
   fromJson? j := do
@@ -1017,7 +1112,7 @@ instance : FromJson KleisConfig where
     -- unknown key is refused for the same reason — `push_prefx` is a restriction somebody
     -- believes is in force.
     let known := ["url", "proxy", "issuer_token", "issuer_token_file", "ca_file", "grants", "ttl",
-                  "push_prefix", "no_proxy"]
+                  "push_prefix", "no_proxy", "default_spec"]
     if let Json.obj fields := j then
       for (k, _) in fields.toArray do
         if !known.contains k then throw s!"kleis has no setting `{k}`"
@@ -1050,7 +1145,11 @@ instance : FromJson KleisConfig where
     let ttl := (← opt (α := String) "ttl").getD defaults.ttl
     let pushPrefix ← opt (α := String) "push_prefix"
     let noProxy := (← opt (α := List String) "no_proxy").getD []
-    return { url, issuerToken, issuerTokenFile, proxy, caFile, grants, ttl, pushPrefix, noProxy }
+    let defaultSpec ← opt (α := String) "default_spec"
+    if let some s := defaultSpec then
+      if let some e := kleisSpecNameError? s then throw s!"kleis.default_spec: {e}"
+    return { url, issuerToken, issuerTokenFile, proxy, caFile, grants, defaultSpec, ttl, pushPrefix,
+             noProxy }
 
 structure AppConfig where
   appId : Nat

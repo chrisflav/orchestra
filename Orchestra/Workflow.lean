@@ -80,6 +80,12 @@ structure TaskSpec where
       identities. A program-wide default would have to be overridable per step anyway, and one
       way to say a thing beats two. -/
   identity           : Option String := none
+  /-- The step's kleis source and narrowings (`kleis-token`, `kleis-spec`, `kleis-narrow`), as a
+      task file's `kleis_token`, `kleis_spec` and `kleis_narrow` (`Orchestra.Kleis`). The token is
+      a `{{secret}}` reference, quoted in the YAML. -/
+  kleisToken         : Option String := none
+  kleisSpec          : Option String := none
+  kleisNarrow        : List String := []
   deriving Repr
 
 /-- The tool names a step's `tools` field may ask for: the optional MCP tools and the project
@@ -220,6 +226,8 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       triageAddLabels := spec.triageAddLabels
       triageRemoveLabels := spec.triageRemoveLabels
       identity := spec.identity
+      kleisToken := spec.kleisToken, kleisSpec := spec.kleisSpec
+      kleisNarrow := spec.kleisNarrow
     }
     StateT.lift (run ioTask ())
   else
@@ -237,6 +245,8 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       triageAddLabels := spec.triageAddLabels
       triageRemoveLabels := spec.triageRemoveLabels
       identity := spec.identity
+      kleisToken := spec.kleisToken, kleisSpec := spec.kleisSpec
+      kleisNarrow := spec.kleisNarrow
     }
     let j ← StateT.lift (run ioTask ())
     modify fun (env', ctrl) =>

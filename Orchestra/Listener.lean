@@ -246,6 +246,12 @@ structure ActionConfig where
       from this block (`buildRoleEntry`) and take the identity off the role — an identity belongs
       with what the agent *is*, and for a dispatched role that is the role. -/
   identity       : Option String := none
+  /-- The kleis spec tasks queued by this listener run under when neither the task nor its
+      identity names a source (`Kleis.choose`). Not read by the two dispatcher sources, which take
+      it off the role, as they do the identity. -/
+  kleisSpec      : Option String := none
+  /-- Narrowings every task this listener queues carries. -/
+  kleisNarrow    : List String := []
   /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`. -/
   authSource     : Option String := none
   /-- Candidate authentication sources for tasks this listener queues, tried per `authMode`.
@@ -300,6 +306,8 @@ instance : ToJson ActionConfig where
     let fields := if let some b := a.budget       then fields ++ [("budget",        ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson a.memory)]
     let fields := if let some s := a.identity     then fields ++ [("identity",      Json.str s)]      else fields
+    let fields := if let some s := a.kleisSpec    then fields ++ [("kleis_spec",    Json.str s)]      else fields
+    let fields := if !a.kleisNarrow.isEmpty       then fields ++ [("kleis_narrow",  ToJson.toJson a.kleisNarrow)] else fields
     let fields := if let some s := a.authSource   then fields ++ [("auth_source",   Json.str s)]      else fields
     let fields := if !a.authSources.isEmpty       then fields ++ [("auth_sources",  ToJson.toJson a.authSources)] else fields
     let fields := if let some m := a.authMode     then fields ++ [("auth_mode",     ToJson.toJson m)]             else fields
@@ -349,8 +357,11 @@ instance : FromJson ActionConfig where
     -- Absent is fine; present and unreadable is not, for the reason `parseSpawnPolicy?` gives:
     -- a swallowed policy takes the tool away without saying so.
     let spawnPolicy ← parseSpawnPolicy? j
+    -- Strict, for the same reason: a swallowed spec or narrowing changes what the tasks reach.
+    let kleisSpec ← parseKleisSpec? j
+    let kleisNarrow ← parseKleisNarrow? j
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, identity, authSource, authSources, authMode, tools, readOnly, priority,
+             budget, memory, identity, kleisSpec, kleisNarrow, authSource, authSources, authMode, tools, readOnly, priority,
              workflowPath, issueNumber, prLabels, spawnPolicy }
 
 -- Dispatch rate limits
@@ -859,6 +870,8 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
     budget       := action.budget
     memory       := action.memory
     identity     := action.identity
+    kleisRoleSpec := action.kleisSpec
+    kleisNarrow  := action.kleisNarrow
     authSource   := action.authSource
     authSources  := action.authSources
     authMode     := action.authMode
@@ -1315,6 +1328,9 @@ def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : P
     , issueId       := issue?.map (·.id)
     , spawnPolicy   := role.spawnPolicy
     , identity      := role.identity
+    -- The role's spec, consulted after the identity's (`Kleis.choose`); its narrowings always.
+    , kleisRoleSpec := role.kleisSpec
+    , kleisNarrow   := role.kleisNarrow
     , role          := some role.name }
 
 -- Source polling

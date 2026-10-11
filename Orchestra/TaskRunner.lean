@@ -186,6 +186,11 @@ by task {e.taskId}"
       -- The spawning task's identity, which `SpawnPolicy.resolve` took from the context rather
       -- than from anything the agent asked for.
       , identity := resolved.identity
+      -- Likewise its kleis source, as a name or a reference, and its narrowings (B.3 of the
+      -- design: the child derives a token of its own when it is dispatched).
+      , kleisSpec := resolved.kleisSpec
+      , kleisToken := resolved.kleisToken
+      , kleisNarrow := resolved.kleisNarrow
       , spawnedBy := some spawnerTaskId
       -- The queueing task's scope, not one derived from the bound issue (`Tools.writeScopeRoot`).
       , scopeRoot := resolved.scopeRoot }
@@ -596,6 +601,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     issueId   := ioTask.issueId
     role      := ioTask.role
     identity  := ioTask.identity
+    kleisToken    := ioTask.kleisToken
+    kleisSpec     := ioTask.kleisSpec
+    kleisRoleSpec := ioTask.kleisRoleSpec
+    kleisNarrow   := ioTask.kleisNarrow
   }
   TaskStore.saveTask initialRecord
   onStart taskId
@@ -811,11 +820,61 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Where build output carried between task chains lives for this repository, on a backend that
   -- keeps workspaces. See `Exec.SessionSpec.seedDir`.
   let seedDir ← if persistent then ioTask.repo.mapM (Repo.seedPath ·.fork) else pure none
-  -- kleis's CA bundle is one of the paths the session opens with, not one granted once the token is
-  -- minted: a backend that runs the agent elsewhere carries those paths there itself (see
-  -- `Kleis.bundleGrant`). It does not depend on the token, so it can be had this early.
-  let kleisBundle ← (try appConfig.kleis.mapM Kleis.caBundle
+  -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat.
+  -- Here rather than beside the MCP server that serves them, because they are part of what the
+  -- task's kleis token says, and that token is derived before the session is opened (below).
+  let (requestedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
+  -- Only when the fallback actually granted something. `mode` is optional now, so every task
+  -- that writes neither field lands on `fork` — and warning about a deprecated field the task
+  -- never wrote, to say it was read as "grant nothing", is noise on every repository-independent
+  -- run. `pr` is the case that carries meaning and is worth migrating.
+  if usingModeFallback && !requestedTools.isEmpty then
+    IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
+      Use 'tools' instead (e.g. {repr requestedTools}) and optionally 'read_only: true/false'."
+  let allowedTools ← Server.withoutRepoScopedTools ioTask.repo requestedTools
+  -- What the task's kleis token says about it: the task facts orchestra states, whichever path
+  -- the token takes. kleis decides which grants read them; orchestra only says what it knows.
+  let facts : Kleis.TaskFacts := {
+    taskId, repo := ioTask.repo, issueNumber := ioTask.issueNumber
+    tools := allowedTools, readOnly := ioTask.readOnly, prLabels := ioTask.prLabels
+    identity := identity.map (·.name), pushPrefix := appConfig.kleis.bind (·.pushPrefix)
+    org := appConfig.defaultOrganization }
+  let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun _ => facts
+  -- Every level's narrowing, applied together: the task's own (which already carries its role's,
+  -- its listener action's and the task that queued it), and its identity's.
+  let kleisNarrow :=
+    (ioTask.kleisNarrow ++ (identity.map (·.kleisNarrow)).getD []).eraseDups
+  let kleisLevels : Kleis.SourceLevels := {
+    taskToken := ioTask.kleisToken, taskSpec := ioTask.kleisSpec
+    identitySpec := identity.bind (·.kleisSpec)
+    identityToken := (identity.bind (·.kleisToken)).isSome
+    roleSpec := ioTask.kleisRoleSpec }
+  -- The task's kleis token, once it has one, so every way out below can revoke it however the
+  -- task ends. A token left live after its task would go on being able to do what the task could.
+  let kleisRef ← IO.mkRef (none : Option Kleis.Minted)
+  let revokeKleis : IO Unit := do
+    if let (some kc, some minted) := (appConfig.kleis, ← kleisRef.modifyGet fun m => (m, none)) then
+      try Kleis.revoke kc minted catch e =>
+        IO.eprintln s!"  Warning: could not revoke the task's kleis token: {e}"
+  -- With a source, the token is derived before the session is opened, and its setup fetched: the
+  -- CA bundle the setup names is one of the paths the session opens with, which a backend running
+  -- the agent elsewhere carries there itself (`Kleis.bundleGrant`). Without one — the legacy path —
+  -- the bundle is kleis's own CA, and the token is minted once the session is up, as it always was.
+  let kleisPrepared : Option Kleis.Prepared ← (try
+      let p? ← Kleis.prepareFor appConfig.kleis kleisLevels (identity.bind (·.kleisToken)) facts
+        kleisNarrow
+      if let some p := p? then
+        kleisRef.set (some p.minted)
+        IO.println s!"  kleis token derived from {p.choice.describe} \
+(revocation id {p.minted.revocationId.take 16})"
+      pure p?
     catch e => do removeTaskCheckout; throw e)
+  let kleisBundle ← (try
+      match appConfig.kleis, kleisPrepared with
+      | some kc, some p => some <$> Kleis.setupBundle kc p.setup
+      | some kc, none   => some <$> Kleis.caBundle kc
+      | none, _         => pure none
+    catch e => do revokeKleis; removeTaskCheckout; throw e)
   let session ← (try execBackend.openSession {
     workdir := repoPath
     taskId  := if persistent then some taskId else none
@@ -843,15 +902,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- way as `resolveMemoryDirs` just above, and as `runMerger`.
     repo    := ioTask.repo.map (·.upstream.toString)
     image   := repoConfig.image }
-    catch e => do removeTaskCheckout; throw e)
+    catch e => do revokeKleis; removeTaskCheckout; throw e)
   IO.println s!"  Running in: {session.id}"
   -- The MCP server has to come down however the task ends, not only when it ends well. It holds a
   -- listening socket with the PAT's authority behind it and — off loopback — one port out of
   -- `mcp_ports`, a range sized to the queue's parallelism. Leaking it on a throw leaks both for
   -- the daemon's lifetime, and enough failed tasks would leave no port for any later one.
-  -- The task's kleis token, once minted, so the `finally` below can revoke it however the task
-  -- ends. A token left live after its task would go on being able to do what the task could.
-  let kleisRef ← IO.mkRef (none : Option Kleis.Minted)
   let shutdownRef ← IO.mkRef (none : Option (IO Unit))
   let shutdownOnce : IO Unit := do
     match ← shutdownRef.modifyGet fun s => (s, none) with
@@ -873,30 +929,21 @@ longer exists ({session.id} is new for every task). Enable per-task workspaces f
 execution backend — execution.options.task_volumes for kubernetes — or queue the work as a task \
 of its own.")
     -- 4. Start MCP server (runs in this process, outside the sandbox)
-    -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat
-    let (requestedTools, usingModeFallback) := resolveTools ioTask.mode ioTask.tools
-    -- Only when the fallback actually granted something. `mode` is optional now, so every task
-    -- that writes neither field lands on `fork` — and warning about a deprecated field the task
-    -- never wrote, to say it was read as "grant nothing", is noise on every repository-independent
-    -- run. `pr` is the case that carries meaning and is worth migrating.
-    if usingModeFallback && !requestedTools.isEmpty then
-      IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
-        Use 'tools' instead (e.g. {repr requestedTools}) and optionally 'read_only: true/false'."
-    let allowedTools ← Server.withoutRepoScopedTools ioTask.repo requestedTools
-    -- With kleis the agent reaches GitHub itself, through the proxy, on a token minted for this
-    -- task. Minted here, once the tools are known: they are part of what the token says.
-    let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
-      taskId, repo := ioTask.repo, issueNumber := ioTask.issueNumber
-      tools := allowedTools, readOnly := ioTask.readOnly, prLabels := ioTask.prLabels
-      identity := identity.map (·.name), pushPrefix := kc.pushPrefix
-      org := appConfig.defaultOrganization }
-    let kleisLaunch : Option Kleis.Launch ← match appConfig.kleis, kleisFacts, kleisBundle with
-      | some kc, some facts, some bundle => do
+    -- With kleis the agent reaches the world itself, through the proxy. A derived token's setup
+    -- files go into the session's home now that there is one; the legacy token is minted here.
+    let kleisLaunch : Option Kleis.Launch ← match appConfig.kleis, kleisPrepared, kleisBundle with
+      | some kc, some p, some bundle => do
+        let fileGrants ← Kleis.installFiles session p.setup.files
+        pure (some (Kleis.launchDerived kc p bundle fileGrants))
+      | some kc, none, some bundle => do
         let minted ← Kleis.mint kc facts
         kleisRef.set (some minted)
         IO.println s!"  kleis token minted (revocation id {minted.revocationId.take 16})"
         pure (some (Kleis.launch kc minted bundle))
       | _, _, _ => pure none
+    -- What a task this one queues carries as its own source: the same, by name or reference.
+    let (inheritedSpec, inheritedToken) :=
+      (kleisPrepared.map (·.choice.inherited)).getD (none, none)
     let inputJson := some (ResultType.valueToJson i input)
     let outputRef ← IO.mkRef (none : Option Lean.Json)
     let serverState : Server.State := {
@@ -936,7 +983,9 @@ of its own.")
                       , tools   := allowedTools
                       , readOnly := ioTask.readOnly
                       , projectId := ioTask.projectId
-                      , identity := ioTask.identity }
+                      , identity := ioTask.identity
+                      , kleisSpec := inheritedSpec, kleisToken := inheritedToken
+                      , kleisNarrow }
       enqueueTask  := some (enqueueTaskImpl appConfig)
       scopeRoot    := ioTask.scopeRoot
       prLabels  := ioTask.prLabels
@@ -961,7 +1010,11 @@ of its own.")
       , identity.map (identitySystemPrompt · identityMemoryDir)
       , identity.bind identityInstructions
       , memorySystemPrompt memoryDirs
-      , kleisFacts.map Kleis.systemPrompt ].filterMap id
+      -- A derived token's card says what it reaches, in kleis's words; the legacy token gets
+      -- orchestra's own GitHub section, as before.
+      , match kleisPrepared with
+        | some p => some (Kleis.cardPrompt p.card)
+        | none   => kleisFacts.map Kleis.systemPrompt ].filterMap id
     let systemPrompt :=
       if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)
     -- 6b. Load prepend prompt and apply to task prompt
@@ -1128,9 +1181,7 @@ of its own.")
     -- the half that brings the agent's work back.
     try shutdownOnce catch e =>
       IO.eprintln s!"  Warning: could not shut down the MCP server: {e}"
-    if let (some kc, some minted) := (appConfig.kleis, ← kleisRef.get) then
-      try Kleis.revoke kc minted catch e =>
-        IO.eprintln s!"  Warning: could not revoke the task's kleis token: {e}"
+    revokeKleis
     -- Closed however the task ended, including by exception: for a backend that holds a pod and a
     -- copy of the workspace, this is what brings the work back and stops paying for it.
     try session.close finally removeTaskCheckout
