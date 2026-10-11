@@ -60,10 +60,14 @@ LEAN_EXPORT lean_obj_res lean_orchestra_signal_count(lean_obj_arg world) {
    For the daemon handing its running tasks over to the next one (`Daemon.run`): it leaves from a
    thread of its own while the workers are blocked in the middle of tasks, and the whole point is
    that nothing more happens -- no handler, no destructor, no runtime teardown waiting on a thread
-   that is waiting on a pod. Standard streams are flushed first, so the last log lines are not
-   lost; the caller flushes Lean's own. */
+   that is waiting on a pod. stdout and stderr are flushed first, so the last log lines are not
+   lost; the caller flushes Lean's own. Only those two: `fflush(NULL)` takes the lock of every
+   open stream, and a worker blocked reading a child's pipe (a `kubectl exec` following a run)
+   holds that one's until the child next writes -- which kept a handed-over daemon alive, and its
+   MCP ports bound, until the agent in the pod printed something. */
 LEAN_EXPORT lean_obj_res lean_orchestra_exit_now(uint8_t code, lean_obj_arg world) {
-    fflush(NULL);
+    fflush(stdout);
+    fflush(stderr);
     _exit(code);
     return lean_io_result_mk_ok(lean_box(0));
 }
