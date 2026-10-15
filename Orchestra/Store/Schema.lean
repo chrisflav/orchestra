@@ -3,6 +3,7 @@ import Orchestra.Store.Migrations.Initial
 import Orchestra.Store.Migrations.UsageEstimate
 import Orchestra.Store.Migrations.ResolvedAuthSource
 import Orchestra.Store.Migrations.TaskRunState
+import Orchestra.Store.Migrations.KleisSource
 
 /-!
 # The shape of orchestra's database
@@ -60,6 +61,13 @@ structure TaskRow where
   issue_id : Option String
   role : Option String
   identity : Option String
+  /-- The task's kleis source and narrowings (`IOTask.kleisToken` and the rest), so that a
+      continuation built from this record runs under the same access. The token column holds the
+      `{{secret}}` reference, never a token. `kleis_narrow` is a JSON array, NULL for none. -/
+  kleis_token : Option String
+  kleis_spec : Option String
+  kleis_role_spec : Option String
+  kleis_narrow : Option String
   deriving Repr
 
 /-- Where a named series has got to: the id of its most recent task, which is what a `--series`
@@ -126,6 +134,11 @@ structure QueueEntryRow where
       which is what whoever queued the entry asked for: with one column for both, an entry revived
       after a failed run read the account that run happened to land on as a pin. -/
   resolved_auth_source : Option String
+  /-- The entry's kleis source and narrowings, as on `task`. -/
+  kleis_token : Option String
+  kleis_spec : Option String
+  kleis_role_spec : Option String
+  kleis_narrow : Option String
   deriving Repr
 
 /-- Where a running task has got to, for a daemon that picks the task up after a restart instead of
@@ -303,6 +316,7 @@ def migrations : List Db.Migration.Migration :=
   [Orchestra.Store.Migrations.migration_0001_initial,
    Orchestra.Store.Migrations.migration_0002_usage_estimate,
    Orchestra.Store.Migrations.migration_0003_resolved_auth_source,
-   Orchestra.Store.Migrations.migration_0004_task_run_state]
+   Orchestra.Store.Migrations.migration_0004_task_run_state,
+   Orchestra.Store.Migrations.migration_0005_kleis_source]
 
 end Orchestra.Store

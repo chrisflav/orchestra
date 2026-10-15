@@ -141,6 +141,13 @@ structure QueueEntry where
       similar reason: an entry can wait hours for a slot, and the record is configuration that
       may have been rewritten in between. -/
   identity      : Option String := none
+  /-- The task's kleis source and narrowings, as `IOTask` carries them (`Orchestra.Kleis`). The
+      token is the `{{secret}}` reference, never the token: an entry is a row anybody who can list
+      the queue can read. -/
+  kleisToken    : Option String := none
+  kleisSpec     : Option String := none
+  kleisRoleSpec : Option String := none
+  kleisNarrow   : List String   := []
   /-- Label of the authentication source to use. Must match a label in the backend's `auth_sources`.
 
       What whoever queued the entry asked for, and nothing else: the daemon's own choice goes to
@@ -249,6 +256,10 @@ instance : ToJson QueueEntry where
     let fields := if let some b := e.budget        then fields ++ [("budget",          ToJson.toJson b)] else fields
     let fields := fields ++ [("memory", ToJson.toJson e.memory)]
     let fields := if let some s := e.identity      then fields ++ [("identity",        Json.str s)]      else fields
+    let fields := if let some s := e.kleisToken    then fields ++ [("kleis_token",     Json.str s)]      else fields
+    let fields := if let some s := e.kleisSpec     then fields ++ [("kleis_spec",      Json.str s)]      else fields
+    let fields := if let some s := e.kleisRoleSpec then fields ++ [("kleis_role_spec", Json.str s)]      else fields
+    let fields := if !e.kleisNarrow.isEmpty        then fields ++ [("kleis_narrow",    ToJson.toJson e.kleisNarrow)] else fields
     let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
     let fields := if let some s := e.resolvedAuthSource then fields ++ [("resolved_auth_source", Json.str s)] else fields
     let fields := if !e.authSources.isEmpty        then fields ++ [("auth_sources",    ToJson.toJson e.authSources)] else fields
@@ -296,6 +307,12 @@ instance : FromJson QueueEntry where
     let budget        := j.getObjValAs? Float      "budget"  |>.toOption
     let memory        := j.getObjValAs? MemoryMode "memory"  |>.toOption |>.getD .both
     let identity      := j.getObjValAs? String "identity"    |>.toOption
+    -- Read as written: orchestra wrote them, and they were checked when the task they came from
+    -- was read (see the leniency note at `spawnPolicy` below).
+    let kleisToken    := j.getObjValAs? String "kleis_token"     |>.toOption
+    let kleisSpec     := j.getObjValAs? String "kleis_spec"      |>.toOption
+    let kleisRoleSpec := j.getObjValAs? String "kleis_role_spec" |>.toOption
+    let kleisNarrow   := j.getObjValAs? (List String) "kleis_narrow" |>.toOption |>.getD []
     let authSource    := j.getObjValAs? String "auth_source" |>.toOption
     let resolvedAuthSource := j.getObjValAs? String "resolved_auth_source" |>.toOption
     let authSources   := j.getObjValAs? (List String) "auth_sources" |>.toOption |>.getD []
@@ -327,7 +344,8 @@ instance : FromJson QueueEntry where
     let scopeRoot    := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
     return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget, memory, identity, authSource, resolvedAuthSource, authSources, authMode, tools,
+             budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec, kleisNarrow,
+             authSource, resolvedAuthSource, authSources, authMode, tools,
              readOnly, priority, concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
              listenerName, spawnPolicy, spawnedBy, scopeRoot }
@@ -388,6 +406,10 @@ def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
     budget               := Store.optFloatColumn e.budget
     memory               := Store.enumColumn e.memory
     identity             := e.identity
+    kleis_token          := e.kleisToken
+    kleis_spec           := e.kleisSpec
+    kleis_role_spec      := e.kleisRoleSpec
+    kleis_narrow         := if e.kleisNarrow.isEmpty then none else some (Store.jsonColumn e.kleisNarrow)
     auth_source          := e.authSource
     resolved_auth_source := e.resolvedAuthSource
     auth_sources         := Store.jsonColumn e.authSources
@@ -449,6 +471,10 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
                               row.triage_remove_labels).toOption.getD []
   let spawnPolicy        := row.spawn_policy.bind fun s =>
                               (Store.jsonOfColumn? (α := SpawnPolicy) "spawn_policy" s).toOption
+  -- Strict, unlike the lists above: a narrowing that fell back to none would run the task with
+  -- access somebody took away from it.
+  let kleisNarrow        ← (row.kleis_narrow.mapM fun s =>
+                              Store.jsonOfColumn? (α := List String) "kleis_narrow" s).map (·.getD [])
   return { id := row.id
            createdAt := row.created_at
            status, repo, mode
@@ -467,6 +493,10 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
            budget := row.budget
            memory
            identity := row.identity
+           kleisToken := row.kleis_token
+           kleisSpec := row.kleis_spec
+           kleisRoleSpec := row.kleis_role_spec
+           kleisNarrow
            authSource := row.auth_source
            resolvedAuthSource := row.resolved_auth_source
            authSources, authMode, tools
@@ -1294,6 +1324,10 @@ def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (facts :
     budget        := entry.budget
     memory        := entry.memory
     identity      := entry.identity
+    kleisToken    := entry.kleisToken
+    kleisSpec     := entry.kleisSpec
+    kleisRoleSpec := entry.kleisRoleSpec
+    kleisNarrow   := entry.kleisNarrow
     authSource    := entry.authSource
     authSources   := entry.authSources
     authMode      := entry.authMode

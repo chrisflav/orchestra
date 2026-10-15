@@ -64,6 +64,11 @@ service exists to answer — one every task-configuration surface could already 
 `tools` is written on the task. The token is what an identity carries for now, and the tracker is
 what enforces what that token may do.
 
+What an identity *does* name is where its access comes from: a `kleis_spec` (or a `kleis_token`)
+that tasks run as it derive their kleis tokens from, ahead of the role's and the default
+(`Kleis.choose`, `docs/kleis.md`). The access itself is written in kleis, as a spec; the identity
+only says which.
+
 ## An identity is assigned, never chosen
 
 Nothing an agent says selects an identity: it is written on the task, the role or the listener
@@ -88,6 +93,16 @@ structure Identity where
       orchestra's own token, which is a usable identity — one with a dedicated memory and no
       separate presence on the tracker. -/
   taxisToken : Option String := none
+  /-- The kleis spec tasks run as this identity derive their tokens from (`Kleis.choose`), when
+      the task names no source of its own. Above the role's: a secretary dispatched for a role
+      keeps the secretary's access. At most one of this and `kleisToken`. -/
+  kleisSpec : Option String := none
+  /-- A kleis token tasks run as this identity derive theirs from, instead of a spec: what the
+      identity was handed by whoever owns the accounts it reaches. Resolved from `secrets.json`
+      when the record is read, like `taxisToken`, and redacted the same way. -/
+  kleisToken : Option String := none
+  /-- Narrowings every task run as this identity carries, on top of the task's own. -/
+  kleisNarrow : List String := []
   /-- The identity's `AGENTS.md`, whole, when it has one.
 
       Not a field of the JSON record: it is read from the file beside it by `loadIdentity`, the
@@ -112,12 +127,21 @@ instance : Repr Identity where
     let described := if i.description.isSome then "described" else "no description"
     let token     := if i.taxisToken.isSome then "token <redacted>" else "no token"
     let agents    := if i.agents.isSome then "AGENTS.md" else "no AGENTS.md"
-    f!"identity {i.name} ({described}, {token}, {agents})"
+    let kleis     := match i.kleisSpec, i.kleisToken with
+      | some s, _    => s!"kleis spec {s}"
+      | none, some _ => "kleis token <redacted>"
+      | none, none   => "no kleis source"
+    f!"identity {i.name} ({described}, {token}, {kleis}, {agents})"
 
 instance : ToJson Identity where
   toJson i :=
     let fields : List (String × Json) := [("name", Json.str i.name)]
     let fields := if let some d := i.description then fields ++ [("description", Json.str d)]
+                  else fields
+    -- The spec is configuration and worth listing; the token, like `taxis_token`, is not.
+    let fields := if let some s := i.kleisSpec then fields ++ [("kleis_spec", Json.str s)]
+                  else fields
+    let fields := if !i.kleisNarrow.isEmpty then fields ++ [("kleis_narrow", Lean.toJson i.kleisNarrow)]
                   else fields
     -- `agents` is left out too, but for a duller reason than the token: it is a file, and a
     -- listing that inlined every identity's instructions would be a listing nobody could read.
@@ -158,7 +182,28 @@ orchestra, or fill it in"
             throw s!"identity '{name}' still holds an unsubstituted placeholder in \
 'taxis_token'; define it in secrets.json"
           else pure (some t)
-    return { name, description, taxisToken }
+    -- Held to the same rules, for the same reason: a token that is present but unusable fails
+    -- the task at derive time, and one silently read as absent would run it under the role's or
+    -- the default spec instead — the wrong access, with nothing to say so.
+    let kleisSpec ← parseKleisSpec? j s!"identity '{name}': kleis_spec"
+    let kleisToken ← match j.getObjVal? "kleis_token" with
+      | .error _ => pure none
+      | .ok v    =>
+        match (FromJson.fromJson? v : Except String String) with
+        | .error _ => throw s!"identity '{name}': 'kleis_token' must be a string"
+        | .ok t =>
+          if t.trimAscii.toString.isEmpty then
+            throw s!"identity '{name}' has an empty 'kleis_token'; remove the field or fill it in"
+          else if (t.splitOn "{{").length > 1 then
+            throw s!"identity '{name}' still holds an unsubstituted placeholder in \
+'kleis_token'; define it in secrets.json"
+          else pure (some t.trimAscii.toString)
+    -- One source per level: which of the two would win is a question with no right answer.
+    if kleisSpec.isSome && kleisToken.isSome then
+      throw s!"identity '{name}' names both a 'kleis_spec' and a 'kleis_token'; an identity has \
+one source"
+    let kleisNarrow ← parseKleisNarrow? j s!"identity '{name}': kleis_narrow"
+    return { name, description, taxisToken, kleisSpec, kleisToken, kleisNarrow }
 
 /-! ## Filesystem layout -/
 

@@ -24,6 +24,10 @@ instance {i o : ResultType} : ToJson (IOTask i o) where
     , ("budget",        ToJson.toJson t.budget)
     , ("memory",        ToJson.toJson t.memory)
     , ("identity",      ToJson.toJson t.identity)
+    , ("kleis_token",   ToJson.toJson t.kleisToken)
+    , ("kleis_spec",    ToJson.toJson t.kleisSpec)
+    , ("kleis_role_spec", ToJson.toJson t.kleisRoleSpec)
+    , ("kleis_narrow",  ToJson.toJson t.kleisNarrow)
     , ("auth_source",   ToJson.toJson t.authSource)
     , ("tools",         ToJson.toJson t.tools)
     , ("read_only",     .bool t.readOnly)
@@ -52,8 +56,15 @@ instance {i o : ResultType} : FromJson (IOTask i o) where
     let series       := j.getObjValAs? String "series" |>.toOption
     let prLabels     := j.getObjValAs? (List String) "pr_labels" |>.toOption |>.getD []
     let spawnPolicy  ← parseSpawnPolicy? j
+    let kleisToken   ← parseKleisTokenRef? j
+    let kleisSpec    ← parseKleisSpec? j
+    let kleisRoleSpec ← match j.getObjVal? "kleis_role_spec" with
+      | .ok v => parseKleisSpec? (Json.mkObj [("kleis_spec", v)]) "kleis_role_spec"
+      | .error _ => pure none
+    let kleisNarrow  ← parseKleisNarrow? j
     return { repo, mode, prompt, agent, systemPrompt, backend, model,
-             budget, memory, identity, authSource, tools, readOnly, series, prLabels, spawnPolicy }
+             budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec, kleisNarrow,
+             authSource, tools, readOnly, series, prLabels, spawnPolicy }
 
 /-- Serialize a `Concert α` to JSON.
     For `run` nodes, the task spec is computed from the current input and the continuation is

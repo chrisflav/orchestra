@@ -6,6 +6,8 @@ import OrchestraTest.ServerParseTest
 import OrchestraTest.MergePrTest
 import OrchestraTest.CreateRepositoryTest
 import OrchestraTest.KleisTest
+import OrchestraTest.KleisSpecTest
+import OrchestraTest.KleisLiveTest
 import OrchestraTest.LabelIssueTest
 import OrchestraTest.StreamFormatTest
 import OrchestraTest.StreamArgsTest

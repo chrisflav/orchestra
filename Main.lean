@@ -481,6 +481,11 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         -- nothing on either path to say so. `requireIdentity` cannot catch it — the name never
         -- reaches the run to be checked.
         identity         := task.ioTask.identity
+        -- For the same reason: the token the task file asked for is part of the task.
+        kleisToken       := task.ioTask.kleisToken
+        kleisSpec        := task.ioTask.kleisSpec
+        kleisRoleSpec    := task.ioTask.kleisRoleSpec
+        kleisNarrow      := task.ioTask.kleisNarrow
       }
       let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
       let _ ← daemonRequest req
@@ -1122,6 +1127,11 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
       -- A retry is the same work by the same somebody: without this the second half of a run is
       -- authored by orchestra and reads a different memory than the first half did.
       identity     := entry.identity
+      -- And under the same access: a retry that lost its source would run under the default.
+      kleisToken    := entry.kleisToken
+      kleisSpec     := entry.kleisSpec
+      kleisRoleSpec := entry.kleisRoleSpec
+      kleisNarrow   := entry.kleisNarrow
     }
     Queue.saveEntry newEntry
     IO.println newEntry.id
@@ -1916,19 +1926,36 @@ execution.options.task_volumes); this one starts every session afresh."
   let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
     taskId := s!"interactive-{session.id}", repo, tools := allowedTools, pushPrefix := kc.pushPrefix
     org := appConfig.defaultOrganization }
-  let kleisMinted ← match appConfig.kleis, kleisFacts with
+  -- Derived from `default_spec` when there is one — a session started here names no identity, so
+  -- that is the only source it can have — and otherwise minted, as before.
+  let kleisPrepared ← match appConfig.kleis, kleisFacts with
     | some kc, some facts =>
-      try some <$> Kleis.mint kc facts
+      try Kleis.prepareFor (some kc) {} none facts []
       catch e => do shutdown; session.close; throw e
     | _, _ => pure none
+  let kleisMinted ← match appConfig.kleis, kleisFacts, kleisPrepared with
+    | _, _, some p => pure (some p.minted)
+    | some kc, some facts, none =>
+      try some <$> Kleis.mint kc facts
+      catch e => do shutdown; session.close; throw e
+    | _, _, _ => pure none
   let revokeKleis : IO Unit := do
     if let (some kc, some m) := (appConfig.kleis, kleisMinted) then
       try Kleis.revoke kc m catch e => IO.eprintln s!"  Warning: could not revoke the kleis token: {e}"
-  let kleisLaunch ← match appConfig.kleis, kleisMinted with
-    | some kc, some m =>
+  let kleisLaunch ← match appConfig.kleis, kleisMinted, kleisPrepared with
+    | some kc, _, some p =>
+      try
+        let bundle ← Kleis.setupBundle kc p.setup
+        let fileGrants ← Kleis.installFiles session p.setup.files
+        pure (some (Kleis.launchDerived kc p bundle fileGrants))
+      catch e => do revokeKleis; shutdown; session.close; throw e
+    | some kc, some m, none =>
       try some <$> (Kleis.launch kc m <$> Kleis.caBundle kc)
       catch e => do revokeKleis; shutdown; session.close; throw e
-    | _, _ => pure none
+    | _, _, _ => pure none
+  let kleisPrompt : Option String := match kleisPrepared with
+    | some p => some (Kleis.cardPrompt p.card)
+    | none   => kleisFacts.map Kleis.systemPrompt
   IO.println s!"  Running in: {session.id}"
   IO.println "  Launching agent..."
   let result ← try
@@ -1939,7 +1966,7 @@ execution.options.task_volumes); this one starts every session afresh."
         (additionalPaths := appConfig.additionalSandboxPaths)
         (interactiveAgent := true) (session := session) (mcpToken := mcpToken)
         (resume := agentResume)
-        (kleis := kleisLaunch) (systemPrompt := kleisFacts.map Kleis.systemPrompt)
+        (kleis := kleisLaunch) (systemPrompt := kleisPrompt)
     finally
       -- Revoked first: a close that throws must not leave the token live.
       revokeKleis

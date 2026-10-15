@@ -80,6 +80,16 @@ structure TaskSpec where
       identities. A program-wide default would have to be overridable per step anyway, and one
       way to say a thing beats two. -/
   identity           : Option String := none
+  /-- The step's kleis source and narrowings (`kleis-token`, `kleis-spec`, `kleis-narrow`), as a
+      task file's `kleis_token`, `kleis_spec` and `kleis_narrow` (`Orchestra.Kleis`). The token is
+      a `{{secret}}` reference, quoted in the YAML. -/
+  kleisToken         : Option String := none
+  kleisSpec          : Option String := none
+  kleisNarrow        : List String := []
+  /-- The spec of the listener action that started the workflow, consulted after the step's own
+      source and its identity's (`IOTask.kleisRoleSpec`). Not read from the YAML: set by
+      `WorkflowProgram.withListenerKleis`. -/
+  kleisRoleSpec      : Option String := none
   deriving Repr
 
 /-- The tool names a step's `tools` field may ask for: the optional MCP tools and the project
@@ -132,6 +142,20 @@ structure WorkflowProgram where
   variables   : List (String × ResultType) := []
   steps       : List Step
   deriving Repr
+
+/-- Every task step of `prog` with a listener action's `kleis_spec` as its role-level spec and
+    the action's `kleis_narrow` added to its own: what a listener says of "every task it queues"
+    holds of the tasks its workflow runs, as it does of the one task a listener without a workflow
+    queues (`Listener.buildQueueEntry`). A narrowing left off a workflow's steps would be access
+    the listener's author believes was taken away. -/
+def WorkflowProgram.withListenerKleis (prog : WorkflowProgram) (spec : Option String)
+    (narrow : List String) : WorkflowProgram :=
+  { prog with steps := prog.steps.map fun s =>
+      match s.action with
+      | .task t => { s with action := .task { t with
+          kleisRoleSpec := t.kleisRoleSpec <|> spec
+          kleisNarrow := (t.kleisNarrow ++ narrow).eraseDups } }
+      | _ => s }
 
 namespace Workflow
 
@@ -220,6 +244,9 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       triageAddLabels := spec.triageAddLabels
       triageRemoveLabels := spec.triageRemoveLabels
       identity := spec.identity
+      kleisToken := spec.kleisToken, kleisSpec := spec.kleisSpec
+      kleisRoleSpec := spec.kleisRoleSpec
+      kleisNarrow := spec.kleisNarrow
     }
     StateT.lift (run ioTask ())
   else
@@ -237,6 +264,9 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       triageAddLabels := spec.triageAddLabels
       triageRemoveLabels := spec.triageRemoveLabels
       identity := spec.identity
+      kleisToken := spec.kleisToken, kleisSpec := spec.kleisSpec
+      kleisRoleSpec := spec.kleisRoleSpec
+      kleisNarrow := spec.kleisNarrow
     }
     let j ← StateT.lift (run ioTask ())
     modify fun (env', ctrl) =>

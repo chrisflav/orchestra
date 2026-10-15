@@ -422,7 +422,11 @@ def queueTaskToolDef : Json :=
             [ ("type", "boolean")
             , ("description",
                 "Claim the bound issue for the queued task, taking it out of every " ++
-                "dispatcher's candidate set until that task ends. Requires issue_id.") ]) ]
+                "dispatcher's candidate set until that task ends. Requires issue_id.") ])
+        , ("kleis_narrow", strArrayProp
+            ("Only under kleis: narrowings of the queued task's access, one per service, in " ++
+             "the form \"mail: only read, flag\". It always has at most the access this task " ++
+             "has; this takes more away. Default: none beyond this task's own.")) ]
         ["prompt"]) ]
 
 /-- Tool definition for `project_info`, exposed separately because it is
@@ -661,7 +665,10 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | .error _  => pure false
         | .ok .null => pure false
         | .ok _     => args.getObjValAs? Bool "pre_claim"
-      return .queueTask { prompt, backend, model, tools, repo, budget, issueId, preClaim }
+      -- Strict too: a narrowing dropped here hands the queued task more than the agent meant to.
+      let kleisNarrow ← parseKleisNarrow? args
+      return .queueTask { prompt, backend, model, tools, repo, budget, issueId, preClaim,
+                          kleisNarrow }
   | "project_info" => some (.ok .projectInfo)
   | _ => none
 

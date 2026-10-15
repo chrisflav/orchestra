@@ -2,10 +2,24 @@ import Lean.Data.Json
 import Orchestra.Config
 import Orchestra.Dirs
 import Orchestra.Exec.Spec
+import Orchestra.Exec.Backend
 import Orchestra.Utils.Http
 
 /-!
-# Reaching GitHub through kleis
+# Reaching the world through kleis
+
+Each task resolves a **source** (`choose`): a kleis spec named by the task, its identity, its role
+or listener action or `kleis.default_spec`, or a token handed to the task or its identity. From it
+orchestra *derives* a task token (`/.kleis/v1/derive`), asks kleis what a sandbox needs to use it
+(`/.kleis/v1/setup`: environment, files in the home, the CA, and a **card** saying in prose what the
+token allows), starts the sandbox with all of that, puts the card in the system prompt, and revokes
+the token when the task ends. Orchestra does not know which services the token reaches; kleis does.
+
+A task with no source, under a `kleis` block without `default_spec`, keeps the older path described
+below: a token minted through `/tokens` naming `kleis.grants`, with orchestra's own GitHub prompt.
+Both paths are in this module; `docs/kleis.md` describes them.
+
+## The legacy path: GitHub through kleis
 
 With `kleis` configured, no sandbox holds a GitHub credential. kleis — a credential proxy — holds
 the GitHub App's key and the PAT, and each task is given a token of its own that says, as facts,
@@ -82,8 +96,10 @@ structure Minted where
   token : String
   /-- The identifier it is revoked by. -/
   revocationId : String
-  /-- When it expires, in seconds since the epoch. -/
+  /-- When it expires, in seconds since the epoch; `0` when kleis said it some other way. -/
   expires : Nat
+  /-- The token's card, when kleis sent one with it (`derive` does, `/tokens` does not). -/
+  card : Option String := none
 
 instance : Repr Minted where
   reprPrec m _ := s!"\{ token := <redacted>, revocationId := {repr m.revocationId} }"
@@ -105,10 +121,12 @@ def issuerCredential (cfg : KleisConfig) : IO String := do
 /-- POST to one of kleis's own endpoints with the issuer credential. Directly, never through a
     proxy: the daemon's environment may have one set, and this request is to the proxy itself. -/
 private def postAdmin (cfg : KleisConfig) (path body : String) : IO (Nat × String) := do
+  -- The body on stdin with the credential, never in argv: a derive from a token carries that
+  -- token, and `/proc/<pid>/cmdline` is readable by everyone on the host (`Http.dataConfig`).
   let (status, _, out) ← Utils.Http.curlFull
     #["--noproxy", "*", "-X", "POST", "-H", "Content-Type: application/json",
-      "--data-raw", body, s!"{base cfg}{path}"]
-    (bearer := some (← issuerCredential cfg))
+      s!"{base cfg}{path}"]
+    (bearer := some (← issuerCredential cfg)) (data := some body)
   return (status, out)
 
 /-- The error kleis put in its answer, or the answer itself. -/
@@ -202,8 +220,7 @@ def caPem (cfg : KleisConfig) : IO String := do
     to it, and not everything goes through the proxy: a host in `NO_PROXY`, or one the proxy lets
     through untouched, presents its real certificate, which only the system roots verify. Written
     once per content into orchestra's data directory, under a name derived from it. -/
-def caBundle (cfg : KleisConfig) : IO System.FilePath := do
-  let kleisCa ← caPem cfg
+def bundleOf (kleisCa : String) : IO System.FilePath := do
   let system ← match ← systemBundle? with
     | some p => IO.FS.readFile p
     | none => do
@@ -226,6 +243,11 @@ def caBundle (cfg : KleisConfig) : IO System.FilePath := do
     IO.FS.writeFile tmp contents
     IO.FS.rename tmp path
   return path
+
+/-- `bundleOf` kleis's CA as `ca_file` or the daemon gives it: the bundle for the legacy path, and
+    for a session opened before a token exists. -/
+def caBundle (cfg : KleisConfig) : IO System.FilePath := do
+  bundleOf (← caPem cfg)
 
 /-- What the agent is told about reaching GitHub, for its system prompt.
 
@@ -263,6 +285,12 @@ structure Launch where
   files : Array Exec.PathGrant
   /-- The port the proxy listens on. -/
   port : Nat
+  /-- The names in `env` that came from kleis's `/setup` rather than from orchestra. Where the
+      sandbox's own environment (the agent's API key, its base URL, its configuration directory)
+      already sets one, the agent's wins (`Sandbox.specFor`): a setup is about reaching services
+      through the proxy, and one that re-pointed the agent's own model endpoint would hand that
+      endpoint the agent's credential. -/
+  setupEnvNames : List String := []
 
 /-- The CA bundle as a path the session is opened with. A backend that runs the agent elsewhere
     carries the paths it is opened with there, and one granted only later, once the token is
@@ -281,25 +309,386 @@ def bundleGrant (bundle : System.FilePath) : Exec.PathGrant :=
     than probing for a scheme first, through the environment so nothing in the sandbox's git
     configuration has to change. -/
 def launch (cfg : KleisConfig) (m : Minted) (bundle : System.FilePath) : Launch :=
-  -- With the port always written out: the sandbox is let through to `proxyPort` and no
-  -- other, and a URL without one would have clients dial 80 whatever that says.
-  let host := match (proxyAuthority cfg).splitOn ":" with
-    | h :: _ :: _ => h
-    | _ => proxyAuthority cfg
-  let proxyUrl := s!"http://orchestra:{percentEncode m.token}@{host}:{proxyPort cfg}"
-  let noProxy := ",".intercalate (["localhost", "127.0.0.1", "::1"] ++ cfg.noProxy)
-  let ca := bundle.toString
-  { env := #[
-      ("HTTPS_PROXY", proxyUrl), ("https_proxy", proxyUrl),
-      ("HTTP_PROXY", proxyUrl), ("http_proxy", proxyUrl),
-      ("NO_PROXY", noProxy), ("no_proxy", noProxy),
-      ("SSL_CERT_FILE", ca), ("GIT_SSL_CAINFO", ca), ("CURL_CA_BUNDLE", ca),
-      ("REQUESTS_CA_BUNDLE", ca), ("NODE_EXTRA_CA_CERTS", ca),
+  { env := proxyEnv cfg m.token bundle ++ #[
       ("GH_TOKEN", "kleis"),
       ("GIT_CONFIG_COUNT", "1"),
       ("GIT_CONFIG_KEY_0", "http.proxyAuthMethod"), ("GIT_CONFIG_VALUE_0", "basic"),
       ("GIT_TERMINAL_PROMPT", "0")]
     files := #[bundleGrant bundle]
     port := proxyPort cfg }
+where
+  /-- What every sandbox behind the proxy gets, on either path: the proxy with `token` in it, the
+      hosts it does not go through, and the CA bundle under every name the common tools read. -/
+  proxyEnv (cfg : KleisConfig) (token : String) (bundle : System.FilePath)
+      (extraNoProxy : List String := []) : Array (String × String) :=
+    -- With the port always written out: the sandbox is let through to `proxyPort` and no
+    -- other, and a URL without one would have clients dial 80 whatever that says.
+    let host := match (proxyAuthority cfg).splitOn ":" with
+      | h :: _ :: _ => h
+      | _ => proxyAuthority cfg
+    let proxyUrl := s!"http://orchestra:{percentEncode token}@{host}:{proxyPort cfg}"
+    let noProxy := ",".intercalate
+      ((["localhost", "127.0.0.1", "::1"] ++ cfg.noProxy ++ extraNoProxy).eraseDups)
+    let ca := bundle.toString
+    #[("HTTPS_PROXY", proxyUrl), ("https_proxy", proxyUrl),
+      ("HTTP_PROXY", proxyUrl), ("http_proxy", proxyUrl),
+      ("NO_PROXY", noProxy), ("no_proxy", noProxy),
+      ("SSL_CERT_FILE", ca), ("GIT_SSL_CAINFO", ca), ("CURL_CA_BUNDLE", ca),
+      ("REQUESTS_CA_BUNDLE", ca), ("NODE_EXTRA_CA_CERTS", ca)]
+
+/-! ## Sources (B.2.2 of kleis's `docs/design/specs.md`) -/
+
+/-- Every place a task's source can be written, in the order `choose` consults them. -/
+structure SourceLevels where
+  /-- The task's own `kleis_token`: a `{{secret}}` reference, unresolved. -/
+  taskToken : Option String := none
+  /-- The task's own `kleis_spec`. -/
+  taskSpec : Option String := none
+  /-- Its identity's `kleis_spec`. -/
+  identitySpec : Option String := none
+  /-- Whether its identity carries a `kleis_token` (already resolved, so only whether). -/
+  identityToken : Bool := false
+  /-- Its role's `kleis_spec`, else its listener action's (`IOTask.kleisRoleSpec`). -/
+  roleSpec : Option String := none
+  /-- `kleis.default_spec`. -/
+  defaultSpec : Option String := none
+deriving Repr, Inhabited
+
+/-- Which source a task's token is to be derived from. -/
+inductive Choice where
+  /-- The task's own token, by its `{{secret}}` reference. -/
+  | taskToken (ref : String)
+  /-- A spec, and the level that named it (`task`, `identity`, `role`, `default_spec`). -/
+  | spec (name : String) (level : String)
+  /-- The identity's token. -/
+  | identityToken
+  /-- No source: no kleis, or the legacy mint when `kleis` is configured without a default. -/
+  | none
+deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- The first source that is set, in the order B.2.2 fixes: the task's token, the task's spec,
+    the identity's spec or token, the role's then the listener action's spec, `default_spec`.
+
+    The identity comes before the role so that a task run as an identity keeps that identity's
+    access whatever role it fills; a role that wants less narrows instead of replacing. -/
+def choose (l : SourceLevels) : Choice :=
+  match l.taskToken, l.taskSpec, l.identitySpec, l.identityToken, l.roleSpec, l.defaultSpec with
+  | some ref, _, _, _, _, _ => .taskToken ref
+  | none, some s, _, _, _, _ => .spec s "task"
+  | none, none, some s, _, _, _ => .spec s "identity"
+  | none, none, none, true, _, _ => .identityToken
+  | none, none, none, false, some s, _ => .spec s "role"
+  | none, none, none, false, none, some s => .spec s "default_spec"
+  | none, none, none, false, none, none => .none
+
+/-- What a task queued by this one carries as its own source (B.3): the spec's name, or the
+    reference of a token the task named — never a resolved token. A source that came off the
+    identity's token is not carried: the queued task inherits the identity, which names it again.
+    Returned as `(kleisSpec, kleisToken)`. -/
+def Choice.inherited : Choice → Option String × Option String
+  | .taskToken ref => (Option.none, some ref)
+  | .spec s _      => (some s, Option.none)
+  | .identityToken => (Option.none, Option.none)
+  | .none          => (Option.none, Option.none)
+
+/-- For a log line. Never the token. -/
+def Choice.describe : Choice → String
+  | .taskToken ref => s!"the token the task names ({ref})"
+  | .spec s level  => s!"spec '{s}' (from {level})"
+  | .identityToken => "the identity's token"
+  | .none          => "no source"
+
+/-- What a task token is derived from, resolved. -/
+inductive Source where
+  | spec (name : String)
+  | token (token : String)
+
+instance : Repr Source where
+  reprPrec
+    | .spec s, _  => s!"spec {repr s}"
+    | .token _, _ => "token <redacted>"
+
+/-- The token a `{{key}}` reference names in `secrets`. -/
+def resolveTokenRef (secrets : List (String × String)) (ref : String) : Except String String :=
+  match secretRefKey? ref with
+  | none => .error (kleisTokenRefError? ref |>.getD s!"'{ref}' is not a secret reference")
+  | some key =>
+    match secrets.find? (·.1 == key) with
+    | none => .error s!"kleis_token names the secret '{key}', which secrets.json does not define"
+    | some (_, v) =>
+      if v.trimAscii.isEmpty then .error s!"the secret '{key}' named by kleis_token is empty"
+      else .ok v.trimAscii.toString
+
+/-- `c` resolved to what derive is called with: a task's token reference looked up in
+    `secrets.json` now, at launch, so the queue never held it; the identity's token as its record
+    was read. `none` for no source. -/
+def resolve (c : Choice) (identityToken : Option String) : IO (Option Source) := do
+  match c with
+  | .none => return none
+  | .spec s _ => return some (.spec s)
+  | .taskToken ref => return some (.token (← IO.ofExcept (resolveTokenRef (← loadSecrets) ref)))
+  | .identityToken =>
+    match identityToken with
+    | some t => return some (.token t)
+    | none => throw (.userError "the identity's kleis_token is gone")
+
+/-! ## `derive` (A.7) -/
+
+/-- The body of a `/.kleis/v1/derive` request. From a spec: the spec, the task's facts, its bearer;
+    from a token: the token and the bearer, no facts. Either way the TTL and the narrowings —
+    omitted when there are none. -/
+def deriveBody (cfg : KleisConfig) (src : Source) (facts : TaskFacts) (narrow : List String)
+    : Json :=
+  let narrowField : List (String × Json) :=
+    if narrow.isEmpty then [] else [("narrow", .arr (narrow.map Json.str).toArray)]
+  match src with
+  | .spec s => Json.mkObj ([
+      ("spec", .str s),
+      ("ttl", .str cfg.ttl),
+      ("bearer", .str s!"orchestra:{facts.taskId}"),
+      ("facts", .arr facts.toFacts.toArray)] ++ narrowField)
+  -- `bearer` here is kept in kleis's issued record only (A.7.3), so the audit log can be read
+  -- against orchestra's task; it adds no fact to the token.
+  | .token t => Json.mkObj ([("token", .str t), ("ttl", .str cfg.ttl),
+      ("bearer", .str s!"orchestra:{facts.taskId}")] ++ narrowField)
+
+/-- The token in a derive answer. `revocation_id` is one id (A.7.2); a list is taken too, as long
+    as it holds exactly one, since revoking a list could revoke the source a token came from. -/
+def parseDerived (body : String) : Except String Minted := do
+  let j ← Json.parse body |>.mapError (s!"kleis answered derive with malformed JSON: {·}")
+  let .ok token := j.getObjValAs? String "token"
+    | .error "kleis answered derive without a token"
+  let revocationId ← match j.getObjValAs? String "revocation_id" with
+    | .ok r => pure r
+    | .error _ => match j.getObjValAs? (List String) "revocation_ids" with
+      | .ok [r] => pure r
+      | _ => .error "kleis derived a token without a single revocation id; refusing to use it"
+  if revocationId.isEmpty then
+    .error "kleis derived a token with an empty revocation id; refusing to use it"
+  let expires := (j.getObjValAs? Nat "expires").toOption.getD 0
+  let card := (j.getObjValAs? String "card").toOption.filter (!·.trimAscii.isEmpty)
+  return { token, revocationId, expires, card }
+
+/-- Derive a task token (`POST /.kleis/v1/derive`, with the issuer credential). -/
+def derive (cfg : KleisConfig) (src : Source) (facts : TaskFacts) (narrow : List String)
+    : IO Minted := do
+  let (status, out) ← postAdmin cfg "/.kleis/v1/derive" (deriveBody cfg src facts narrow).compress
+  if status != 200 then
+    let what := match src with
+      | .spec s => s!"from spec '{s}'"
+      | .token _ => "from the token it was given"
+    throw (.userError s!"kleis refused to derive a token {what} for task {facts.taskId} \
+({status}): {errorOf out}")
+  IO.ofExcept (parseDerived out)
+
+/-! ## `setup` and the card (A.8, A.9) -/
+
+/-- One file a sandbox is to have in its home. -/
+structure SetupFile where
+  /-- Relative to the home; checked by `Exec.homePathError?`. -/
+  path : String
+  /-- Octal, as `"0600"`. -/
+  mode : String := "0600"
+  content : String
+deriving Repr, Inhabited
+
+/-- What kleis says a sandbox needs to use a token with ordinary tools. -/
+structure Setup where
+  /-- kleis's CA, which the sandbox's bundle adds to the system's roots. -/
+  caPem : Option String := none
+  /-- Environment for every process in the sandbox. Holds no secrets: placeholders kleis
+      replaces (`GH_TOKEN=kleis`). -/
+  env : Array (String × String) := #[]
+  files : Array SetupFile := #[]
+  /-- Hosts the sandbox reaches directly, on top of orchestra's own. -/
+  noProxy : List String := []
+  /-- The token's card. -/
+  card : Option String := none
+deriving Repr, Inhabited
+
+/-- The variables orchestra sets itself and a setup may not (A.8, B.2.3): the proxy, the CA and
+    the hosts the proxy is bypassed for. A setup that set one would decide where the sandbox's
+    traffic goes, or what it trusts, and that is the consumer's to say.
+
+    Every name kleis's own `Service.reservedEnv` holds is here (`ALL_PROXY`, `SSL_CERT_DIR`,
+    `HOME`, `PATH`), and the switches that turn certificate checking off, which would let a
+    sandbox be pointed past the proxy's CA. The dynamic loader's variables (`LD_*`) are refused by
+    prefix in `reservedSetupEnv?`. -/
+def reservedSetupEnv : List String :=
+  ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy",
+   "ALL_PROXY", "all_proxy",
+   "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH", "CURL_CA_BUNDLE",
+   "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+   "GIT_SSL_NO_VERIFY", "NODE_TLS_REJECT_UNAUTHORIZED",
+   "HOME", "PATH"]
+
+/-- Whether a setup may not set `n`: one of `reservedSetupEnv`, or the dynamic loader's. -/
+def reservedSetupEnv? (n : String) : Bool :=
+  reservedSetupEnv.contains n || n.startsWith "LD_"
+
+/-- Whether `n` can be an environment variable's name. -/
+def envNameValid (n : String) : Bool :=
+  !n.isEmpty && !(n.front.isDigit) && n.all (fun c => c.isAlphanum || c == '_')
+
+/-- A `/setup` answer, checked. Anything this would have to refuse fails the whole setup rather
+    than being dropped: a sandbox missing half of what kleis said it needs fails later, and less
+    legibly, than one that never started. -/
+def parseSetup (j : Json) : Except String Setup := do
+  let caPem := (j.getObjVal? "proxy" >>= (·.getObjValAs? String "ca_pem")).toOption
+    |>.filter (!·.trimAscii.isEmpty)
+  let env ← match j.getObjVal? "env" with
+    | .error _ | .ok .null => pure #[]
+    | .ok (.obj kvs) => kvs.toArray.mapM fun (k, v) => do
+      let .str s := v | .error s!"setup.env.{k} is not a string"
+      if !envNameValid k then .error s!"setup.env names '{k}', which is not a variable name"
+      if reservedSetupEnv? k then
+        .error s!"setup.env sets {k}, which is orchestra's to set (the proxy, the CA, \
+NO_PROXY, HOME, PATH and the loader are the consumer's); refusing the setup"
+      pure (k, s)
+    | .ok _ => .error "setup.env is not an object"
+  let files ← match j.getObjVal? "files" with
+    | .error _ | .ok .null => pure #[]
+    | .ok (.arr fs) => fs.mapM fun f => do
+      let path ← f.getObjValAs? String "path" |>.mapError (fun _ => "a setup file has no path")
+      if let some e := Exec.homePathError? path then .error s!"setup.files: {e}; refusing the setup"
+      let mode := (f.getObjValAs? String "mode").toOption.getD "0600"
+      if (Exec.fileModeOf? mode).isNone then
+        .error s!"setup.files: {path} has mode '{mode}', which is not a file mode"
+      let content ← f.getObjValAs? String "content"
+        |>.mapError (fun _ => s!"setup.files: {path} has no content")
+      pure { path, mode, content }
+    | .ok _ => .error "setup.files is not a list"
+  let noProxy ← match j.getObjVal? "no_proxy" with
+    | .error _ | .ok .null => pure []
+    | .ok v => (Lean.FromJson.fromJson? v : Except String (List String))
+      |>.mapError (fun _ => "setup.no_proxy is not a list of hosts")
+  if noProxy.any (fun h => h.isEmpty || h.any (fun c => c == ',' || c.isWhitespace)) then
+    .error "setup.no_proxy holds something that is not a host"
+  let card := (j.getObjValAs? String "card").toOption.filter (!·.trimAscii.isEmpty)
+  return { caPem, env, files, noProxy, card }
+
+/-- GET one of kleis's own endpoints as the bearer of `token`. Directly, never through a proxy,
+    as `postAdmin` does. -/
+private def getAsBearer (cfg : KleisConfig) (path token : String) : IO (Nat × String) := do
+  let (status, _, out) ← Utils.Http.curlFull #["--noproxy", "*", s!"{base cfg}{path}"]
+    (bearer := some token)
+  return (status, out)
+
+/-- What a sandbox needs for `token` (`GET /.kleis/v1/setup`). -/
+def fetchSetup (cfg : KleisConfig) (token : String) : IO Setup := do
+  let (status, out) ← getAsBearer cfg "/.kleis/v1/setup" token
+  if status != 200 then
+    throw (.userError s!"kleis refused the setup for a task token ({status}): {errorOf out}")
+  match Json.parse out with
+  | .error e => throw (.userError s!"kleis answered setup with malformed JSON: {e}")
+  | .ok j => match parseSetup j with
+    | .ok s => return s
+    | .error e => throw (.userError s!"kleis's setup for a task token: {e}")
+
+/-- The card for `token` (`GET /.kleis/v1/card`), as JSON `{"card": …}` or as text. For when
+    neither derive nor setup carried one. -/
+def fetchCard (cfg : KleisConfig) (token : String) : IO String := do
+  let (status, out) ← getAsBearer cfg "/.kleis/v1/card" token
+  if status != 200 then
+    throw (.userError s!"kleis refused the card for a task token ({status}): {errorOf out}")
+  match Json.parse out >>= (·.getObjValAs? String "card") with
+  | .ok c => return c
+  | .error _ => return out
+
+/-- A task's token, derived, with what kleis said its sandbox needs. -/
+structure Prepared where
+  minted : Minted
+  setup : Setup
+  /-- What the agent is told its token allows: setup's card, else derive's, else `/card`'s. -/
+  card : String
+  /-- Where it came from, for logs and for what a queued task inherits. -/
+  choice : Choice
+
+/-- Derive a token from `src` and fetch its setup. The token is revoked before this throws, so
+    a caller holding nothing has nothing to clean up. -/
+def prepare (cfg : KleisConfig) (choice : Choice) (src : Source) (facts : TaskFacts)
+    (narrow : List String) : IO Prepared := do
+  let minted ← derive cfg src facts narrow
+  try
+    let setup ← fetchSetup cfg minted.token
+    let card ← match setup.card <|> minted.card with
+      | some c => pure c
+      | none => fetchCard cfg minted.token
+    return { minted, setup, card, choice }
+  catch e =>
+    try revoke cfg minted catch _ => pure ()
+    throw e
+
+/-- Everything a launch site needs to know to get a task its token, given the levels of its
+    source. `none` when there is no source: no kleis at all, or the legacy mint. Throws when a
+    level names a source and no kleis is configured — running such a task without one would hand
+    it whatever the sandbox holds without kleis — and when a narrowing would be lost to the legacy
+    mint, which cannot narrow. -/
+def prepareFor (kleis : Option KleisConfig) (levels : SourceLevels)
+    (identityToken : Option String) (facts : TaskFacts) (narrow : List String)
+    : IO (Option Prepared) := do
+  let choice := choose { levels with defaultSpec := kleis.bind (·.defaultSpec) }
+  match kleis, choice with
+  | none, .none =>
+    unless narrow.isEmpty do
+      throw (.userError "this task carries kleis_narrow, but no kleis is configured")
+    return none
+  | none, c =>
+    throw (.userError s!"this task names a kleis source ({c.describe}), but no kleis is configured")
+  | some _, .none =>
+    unless narrow.isEmpty do
+      throw (.userError "this task carries kleis_narrow but has no kleis source to derive from, \
+and the legacy mint (kleis.grants) cannot narrow; set kleis.default_spec or a kleis_spec")
+    return none
+  | some cfg, c =>
+    let some src ← resolve c identityToken | return none
+    some <$> prepare cfg c src facts narrow
+
+/-- The bundle a derived token's sandbox trusts: the system's roots and the CA its setup named,
+    else the one `ca_file` or the daemon gives. -/
+def setupBundle (cfg : KleisConfig) (s : Setup) : IO System.FilePath :=
+  match s.caPem with
+  | some pem => bundleOf pem
+  | none => caBundle cfg
+
+/-- Write the setup's files into the session's home, and the grants that let the agent read them
+    there (`Exec.Session.putHomeFile`). Home-relative and supplied by the environment, as far as a
+    backend that carries paths is concerned: they are already where the agent will look. -/
+def installFiles (session : Exec.Session) (files : Array SetupFile) : IO (Array Exec.PathGrant) :=
+  files.mapM fun f => do
+    session.putHomeFile f.path f.mode f.content
+    return { path := f.path, access := grantAccess f.mode, scope := .home }
+where
+  /-- Read, and execute when the mode lets anybody execute it: a client such as
+      `.local/bin/kleis-mail` comes as `0755`, and a read-only grant would let the sandbox see it
+      and refuse to run it. -/
+  grantAccess (mode : String) : Exec.Access :=
+    match Exec.fileModeOf? mode with
+    | some bits => if bits &&& 0o111 != 0 then .rox else .ro
+    | none => .ro
+
+/-- `setup.env` without what orchestra sets for every derived sandbox itself, so that one name is
+    not exported twice with two values: the setup's value is kept. -/
+private def withSetupEnv (own setup : Array (String × String)) : Array (String × String) :=
+  own.filter (fun (k, _) => !setup.any (·.1 == k)) ++ setup
+
+/-- The environment and files for a sandbox whose token was derived. Unlike `launch`, nothing
+    about any one service: no `GH_TOKEN`, no git configuration — those come in `setup.env` from
+    the extensions that need them. -/
+def launchDerived (cfg : KleisConfig) (p : Prepared) (bundle : System.FilePath)
+    (fileGrants : Array Exec.PathGrant) : Launch :=
+  { env := launch.proxyEnv cfg p.minted.token bundle p.setup.noProxy
+      ++ withSetupEnv #[("GIT_TERMINAL_PROMPT", "0")] p.setup.env
+    files := #[bundleGrant bundle] ++ fileGrants
+    port := proxyPort cfg
+    setupEnvNames := (p.setup.env.map (·.1)).toList }
+
+/-- The card as a system-prompt section. -/
+def cardPrompt (card : String) : String :=
+  "## What you can reach\n\n" ++
+  "Everything you do over the network goes through a proxy, kleis, which holds the credentials " ++
+  "and decides each request; use ordinary command-line tools against the real addresses. A " ++
+  "refusal is HTTP 403 and says which rule refused it. This is what your token allows:\n\n" ++
+  card.trimAscii.toString
 
 end Orchestra.Kleis

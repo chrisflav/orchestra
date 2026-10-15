@@ -109,6 +109,13 @@ structure Role where
       of what it has already reviewed, and signs its verdicts on the tracker as one actor rather
       than as orchestra. -/
   identity       : Option String := none
+  /-- The kleis spec a task dispatched for this role runs under when neither the task nor its
+      identity names a source (`Kleis.choose`). Below the identity on purpose: a secretary
+      dispatched for a role keeps the secretary's access. A role that wants *less* than its
+      identity gives says so with `kleisNarrow`. -/
+  kleisSpec      : Option String := none
+  /-- Narrowings every task dispatched for this role carries (`mail: only read`). -/
+  kleisNarrow    : List String := []
   /-- Optional auto-dispatch policy. `none` = manual-spawn only. -/
   dispatch       : Option DispatchPolicy := none
   /-- What a task dispatched for this role may itself put on the queue (`Orchestra.Spawn`).
@@ -137,6 +144,8 @@ instance : ToJson Role where
     let f := if let some s := r.prependPrompt then f ++ [("prepend_prompt", Json.str s)] else f
     let f := if let some b := r.budget        then f ++ [("budget",         ToJson.toJson b)] else f
     let f := if let some i := r.identity      then f ++ [("identity",       Json.str i)] else f
+    let f := if let some s := r.kleisSpec     then f ++ [("kleis_spec",     Json.str s)] else f
+    let f := if !r.kleisNarrow.isEmpty        then f ++ [("kleis_narrow",   ToJson.toJson r.kleisNarrow)] else f
     let f := if let some d := r.dispatch      then f ++ [("dispatch",       ToJson.toJson d)] else f
     let f := if let some p := r.spawnPolicy   then f ++ [("spawn_policy",   ToJson.toJson p)] else f
     Json.mkObj f
@@ -158,8 +167,12 @@ instance : FromJson Role where
     -- Strict, unlike `dispatch`: a swallowed policy leaves the role's agents without the tool
     -- and nothing on the way to say the field was the reason.
     let spawnPolicy   ← parseSpawnPolicy? j
+    -- Strict for the same reason: each decides what the role's tasks may reach.
+    let kleisSpec     ← parseKleisSpec? j
+    let kleisNarrow   ← parseKleisNarrow? j
     return { name, permissions, backend, model, systemPrompt, prependPrompt
-           , readOnly, priority, budget, promptTemplate, identity, dispatch, spawnPolicy }
+           , readOnly, priority, budget, promptTemplate, identity, kleisSpec, kleisNarrow
+           , dispatch, spawnPolicy }
 
 /-! ## Filesystem layout -/
 

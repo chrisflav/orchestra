@@ -452,8 +452,30 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let pluginDirs ← TaskRunner.defaultPluginDirs appConfig
     let repoConfig ← RepoConfig.loadRepoConfig repoPath
     let seedDir ← if keepsWorkspaces then some <$> Repo.seedPath fork else pure none
+    -- A session's kleis token says what a queued task's does about it, and comes from the same
+    -- sources, less the ones a session has no field for: its identity's, then `default_spec`.
+    -- Derived before the environment is opened, as for a queued task, because its setup names the
+    -- CA bundle the session opens with; and revoked by whatever brings the session down.
+    let kleisFacts : Kleis.TaskFacts := {
+      taskId := record.id, repo := some { upstream := record.upstream, fork }
+      tools := record.tools.getD allOptionalTools
+      identity := identity.map (·.name), pushPrefix := appConfig.kleis.bind (·.pushPrefix)
+      org := appConfig.defaultOrganization }
+    let kleisPrepared ← Kleis.prepareFor appConfig.kleis
+      { identitySpec := identity.bind (·.kleisSpec)
+        identityToken := (identity.bind (·.kleisToken)).isSome }
+      (identity.bind (·.kleisToken)) kleisFacts ((identity.map (·.kleisNarrow)).getD [])
+    let revokePrepared : IO Unit := match appConfig.kleis, kleisPrepared with
+      | some kc, some p => do
+        try Kleis.revoke kc p.minted catch e =>
+          IO.eprintln s!"interactive: could not revoke the session's kleis token: {e}"
+      | _, _ => pure ()
+    shutdownRef.set (some revokePrepared)
     -- Granted at open, as for a queued task: see `Kleis.bundleGrant`.
-    let kleisBundle ← appConfig.kleis.mapM Kleis.caBundle
+    let kleisBundle ← match appConfig.kleis, kleisPrepared with
+      | some kc, some p => some <$> Kleis.setupBundle kc p.setup
+      | some kc, none   => some <$> Kleis.caBundle kc
+      | none, _         => pure none
     let execSession ← execBackend.openSession {
       workdir := repoPath
       -- Keyed by the session, so a wake finds the volume its first start made, and a session
@@ -495,18 +517,20 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       authToken := mcpToken
       kleis := appConfig.kleis
     } (bindHost := mcpBind) (portRange := mcpPorts)
+    -- The derived token, if there is one, is revoked with the MCP server: the one closure every
+    -- way out of a session runs, so the token cannot outlive the session that held it.
+    let shutdownMcp : IO Unit := do
+      try shutdownMcp catch _ => pure ()
+      revokePrepared
     shutdownRef.set (some shutdownMcp)
-    -- A session reaches GitHub through kleis the same way a queued task does, on a token minted
-    -- for it. Minted per start and per wake, and revoked with the MCP server: the one closure
-    -- every way out of a session runs, so the token cannot outlive the session that held it.
-    let kleisFacts : Option Kleis.TaskFacts := appConfig.kleis.map fun kc => {
-      taskId := record.id, repo := some { upstream := record.upstream, fork }
-      tools := record.tools.getD allOptionalTools
-      identity := identity.map (·.name), pushPrefix := kc.pushPrefix
-      org := appConfig.defaultOrganization }
-    let (kleisLaunch, shutdownMcp) ← match appConfig.kleis, kleisFacts, kleisBundle with
-      | some kc, some facts, some bundle => do
-        let minted ← Kleis.mint kc facts
+    -- A session reaches GitHub through kleis the same way a queued task does, on a token of its
+    -- own: derived above when it has a source, and otherwise minted here, per start and per wake.
+    let (kleisLaunch, shutdownMcp) ← match appConfig.kleis, kleisPrepared, kleisBundle with
+      | some kc, some p, some bundle => do
+        let fileGrants ← Kleis.installFiles execSession p.setup.files
+        pure (some (Kleis.launchDerived kc p bundle fileGrants), shutdownMcp)
+      | some kc, none, some bundle => do
+        let minted ← Kleis.mint kc kleisFacts
         let shutdownBoth : IO Unit := do
           try shutdownMcp catch _ => pure ()
           try Kleis.revoke kc minted catch e =>
@@ -551,7 +575,10 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       , identity.map (TaskRunner.identitySystemPrompt · identityMemory)
       , identity.bind TaskRunner.identityInstructions
       , TaskRunner.memorySystemPrompt identityMemory.toArray
-      , kleisFacts.map Kleis.systemPrompt ].filterMap id
+      , match appConfig.kleis, kleisPrepared with
+        | _, some p    => some (Kleis.cardPrompt p.card)
+        | some _, none => some (Kleis.systemPrompt kleisFacts)
+        | none, none   => none ].filterMap id
     let systemPrompt :=
       if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)
     let some stream ← Sandbox.launchStreaming agentDef repoPath port token

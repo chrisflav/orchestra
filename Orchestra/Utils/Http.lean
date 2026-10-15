@@ -91,11 +91,23 @@ def header? (headers : Array (String × String)) (name : String) : Option String
     `-H` is visible to every other user on the machine for as long as the request runs — and
     orchestra's tokens are a GitHub App installation and the dashboard secret. `-K -` makes curl
     read the same setting from stdin, which is a pipe nobody else can open. Inside a quoted
-    config value only `\` and `"` mean anything, so those are the only two to escape. -/
+    config value `\` and `"` are escaped, and a line break, which would end the value, is written
+    as the escape curl reads back as one (`configEscape`). -/
+def configEscape (s : String) : String :=
+  s.foldl (init := "") fun acc c =>
+    if c == '\\' || c == '"' then acc.push '\\' |>.push c
+    else if c == '\n' then acc ++ "\\n"
+    else if c == '\r' then acc ++ "\\r"
+    else if c == '\t' then acc ++ "\\t"
+    else acc.push c
+
 def bearerConfig (token : String) : String :=
-  let esc := token.foldl (init := "") fun acc c =>
-    if c == '\\' || c == '"' then acc.push '\\' |>.push c else acc.push c
-  s!"header = \"Authorization: Bearer {esc}\"\n"
+  s!"header = \"Authorization: Bearer {configEscape token}\"\n"
+
+/-- The request body as a curl config line, for a body that carries a secret: `--data-raw` on the
+    command line is as world-readable as a `-H` would be (`bearerConfig`). -/
+def dataConfig (body : String) : String :=
+  s!"data-raw = \"{configEscape body}\"\n"
 
 /-- Failure text for a curl invocation that exited non-zero. Arguments are deliberately never
     included: they carry bearer tokens. -/
@@ -120,17 +132,20 @@ private def curlFailure (code : UInt32) (stdout stderr : String) : String :=
     a request with `retry-after` is telling us something we would otherwise have to guess. -/
 def curlFull (args : Array String) (connectTimeout : Nat := 10) (maxTime : Nat := 30)
     (bearer : Option String := none)
+    -- A request body that must not be an argument either (`dataConfig`); sent as `--data-raw`.
+    (data : Option String := none)
     : IO (Nat × Array (String × String) × String) := do
+  let config := (bearer.map bearerConfig).getD "" ++ (data.map dataConfig).getD ""
   let full := #["-sS", "--connect-timeout", toString connectTimeout,
                 "--max-time", toString maxTime, "-D", "-",
                 "-w", statusMarker ++ "%{http_code}"]
-              ++ (if bearer.isSome then #["-K", "-"] else #[]) ++ args
+              ++ (if config.isEmpty then #[] else #["-K", "-"]) ++ args
   let spawned ← IO.Process.spawn {
     cmd := "curl", args := full, stdin := .piped, stdout := .piped, stderr := .piped
   }
   let (stdinHandle, child) ← spawned.takeStdin
-  if let some token := bearer then
-    stdinHandle.putStr (bearerConfig token)
+  if !config.isEmpty then
+    stdinHandle.putStr config
     stdinHandle.flush
   -- The handle drops here, which is the EOF curl waits for before it starts the request.
   let stdout ← child.stdout.readToEnd
