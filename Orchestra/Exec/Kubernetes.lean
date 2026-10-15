@@ -854,21 +854,29 @@ def putHomeFileScript : String := "\n".intercalate [
   "mv -f \"$tmp\" \"$dest\""]
 
 /-- Write a file under the pod's home (`Session.putHomeFile`). The path is checked here as well as
-    by the caller, since it is about to be handed to a shell in the pod. -/
+    by the caller, since it is about to be handed to a shell in the pod.
+
+    `kubectl` is run directly, with the content on its stdin, rather than through a shell on this
+    machine: the path comes from kleis, and `shellEscape` quotes only the characters it lists — a
+    `>` in a path left unquoted would be a redirection on the daemon's host. In the pod the path
+    is `$2` of a fixed script, so it is never parsed as shell there either. -/
 private def putHomeFileInPod (cfg : Config) (podName home rel mode content : String) : IO Unit := do
   if let some e := homePathError? rel then
     throw (IO.userError s!"kubernetes: refusing to write {e}")
   if (fileModeOf? mode).isNone then
     throw (IO.userError s!"kubernetes: refusing to write {rel}: '{mode}' is not a file mode")
-  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-{← randomHex 8}"
-  IO.FS.createDirAll dir
-  let _ ← IO.Process.output { cmd := "chmod", args := #["700", dir.toString] }
-  IO.FS.writeFile (dir / "content") content
-  let script := s!"{shellEscape cfg.kubectl} -n {shellEscape cfg.ns} exec -i \
-{shellEscape podName} -- /bin/sh -c {shellEscape putHomeFileScript} orchestra \
-{shellEscape home} {shellEscape rel} {shellEscape mode} < {shellEscape (dir / "content").toString}"
-  let (code, _, err) ← shell script
-  try IO.FS.removeDirAll dir catch _ => pure ()
+  let child ← IO.Process.spawn {
+    cmd := cfg.kubectl
+    args := #["-n", cfg.ns, "exec", "-i", podName, "--", "/bin/sh", "-c", putHomeFileScript,
+              "orchestra", home, rel, mode]
+    stdin := .piped, stdout := .piped, stderr := .piped }
+  let (stdin, child) ← child.takeStdin
+  stdin.putStr content
+  stdin.flush
+  -- The handle is dropped here: the EOF `cat` in the pod waits for.
+  let _ ← child.stdout.readToEnd
+  let err ← child.stderr.readToEnd
+  let code ← child.wait
   if code != 0 then
     throw (IO.userError s!"kubernetes: could not write ~/{rel} in the pod: {err.trimAscii}")
 

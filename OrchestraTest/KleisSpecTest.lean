@@ -368,6 +368,65 @@ def writeUnderHome_followsNoLink : Test := do
     IO.FS.removeDirAll outside
 
 @[test]
+def homePath_allowsOnlyWhatNoShellReads : Test := do
+  for ok in [".zuliprc", ".config/zulip/weil.zulip.merten.dev.zuliprc", ".local/bin/kleis-mail",
+             ".config/vdirsyncer/dav.example.invalid.conf", "a/b@c+d=e,f:g%h"] do
+    TestM.assertEqual (Exec.homePathError? ok) none (msg := s!"{ok} is a home path")
+  -- `>` would be a redirection on the daemon's host if it reached a shell unquoted, and with a
+  -- `/` after it the segments look harmless: `a>` `tmp` `x`.
+  for bad in ["a>/tmp/x", "a<b", "*", "x?", "#c", "a b", "$(id)", "`id`", "a;b", "a|b", "~/x",
+              "a\nb", "a\\b", "ä"] do
+    TestM.assert (Exec.homePathError? bad).isSome s!"{bad.quote} is refused"
+
+@[test]
+def setup_refusesHomePathAndTheLoader : Test := do
+  for v in ["HOME", "PATH", "ALL_PROXY", "all_proxy", "SSL_CERT_DIR", "LD_PRELOAD",
+            "LD_LIBRARY_PATH", "NODE_TLS_REJECT_UNAUTHORIZED", "GIT_SSL_NO_VERIFY"] do
+    TestM.assert (setupOf ("{\"env\":{\"" ++ v ++ "\":\"x\"}}") |>.toOption |>.isNone)
+      s!"setup may not set {v}"
+
+@[test]
+def installFiles_grantsExecuteToAnExecutable : Test := do
+  TestM.assert (Kleis.installFiles.grantAccess "0755" matches .rox) "0755 is run, so rox"
+  TestM.assert (Kleis.installFiles.grantAccess "0600" matches .ro) "0600 is only read"
+  TestM.assert (Kleis.installFiles.grantAccess "0700" matches .rox) "0700 too is run"
+
+@[test]
+def deriveBody_fromATokenNamesTheBearer : Test := do
+  let body := Kleis.deriveBody cfg (.token "En0K-src") { taskId := "t-9" } []
+  TestM.assertEqual (body.getObjValAs? String "bearer" |>.toOption) (some "orchestra:t-9")
+    (msg := "for kleis's issued record and audit log")
+
+@[test]
+def launchDerived_setupEnvIsNotDoubled : Test := do
+  let p : Kleis.Prepared := {
+    minted := { token := "T", revocationId := "r", expires := 0 }
+    setup := { env := #[("GIT_TERMINAL_PROMPT", "0"), ("GH_TOKEN", "kleis")] }
+    card := "c", choice := .spec "worker" "default_spec" }
+  let l := Kleis.launchDerived cfg p "/b.pem" #[]
+  TestM.assertEqual (l.env.filter (·.1 == "GIT_TERMINAL_PROMPT")).size 1
+    (msg := "one GIT_TERMINAL_PROMPT")
+  TestM.assertEqual l.setupEnvNames ["GIT_TERMINAL_PROMPT", "GH_TOKEN"]
+
+@[test]
+def workflow_listenerKleisReachesEveryTaskStep : Test := do
+  let step (n : String) (narrow : List String) : Step :=
+    { name := n, action := .task { prompt := "p", kleisNarrow := narrow } }
+  let prog : WorkflowProgram := { name := "w", steps := [step "a" [], step "b" ["mail: only read"]] }
+  let prog := prog.withListenerKleis (some "worker") ["caldav: only read"]
+  for s in prog.steps do
+    match s.action with
+    | .task t =>
+      TestM.assertEqual t.kleisRoleSpec (some "worker") (msg := s!"{s.name}: the action's spec")
+      TestM.assert (t.kleisNarrow.contains "caldav: only read") s!"{s.name}: the action's narrowing"
+    | _ => TestM.fail "a task step stayed a task step"
+  match prog.steps with
+  | [_, b] => match b.action with
+    | .task t => TestM.assert (t.kleisNarrow.contains "mail: only read") "the step's own kept"
+    | _ => TestM.fail "b is a task"
+  | _ => TestM.fail "two steps"
+
+@[test]
 def fileMode_isOctalWithoutSpecialBits : Test := do
   TestM.assertEqual (Exec.fileModeOf? "0600") (some 0o600)
   TestM.assertEqual (Exec.fileModeOf? "644") (some 0o644)

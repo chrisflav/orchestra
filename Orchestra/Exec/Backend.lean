@@ -117,13 +117,21 @@ path *relative to the run's home*, and that path is the one thing about it orche
 comes from a server, and a `../` or an absolute path in it would be a write wherever the daemon
 can write. -/
 
+/-- The characters a setup file's path may hold: ASCII letters and digits, `/` between segments,
+    and `.`, `_`, `-`, `@`, `+`, `=`, `,`, `:`, `%`. Allowed rather than refused, because the path
+    reaches a shell on the Kubernetes backend, and a shell reads far more characters than a list
+    of the dangerous ones would remember (`>` is a redirection, `*` a glob, `#` a comment). -/
+def homePathCharOk (c : Char) : Bool :=
+  (c.isAlphanum && c.toNat < 128) || c == '/' || c == '.' || c == '_' || c == '-' || c == '@'
+    || c == '+' || c == '=' || c == ',' || c == ':' || c == '%'
+
 /-- Why `rel` cannot be written under a run's home, or `none` when it can: it is relative, has no
-    `..`, `.` or empty segment, and no character a shell or a path could read twice. -/
+    `..`, `.` or empty segment, and only characters `homePathCharOk` allows. -/
 def homePathError? (rel : String) : Option String :=
   if rel.isEmpty then some "the path is empty"
   else if rel.startsWith "/" then some s!"'{rel}' is absolute; only paths under the home are written"
-  else if rel.any (fun c => c == '\x00' || c == '\n' || c == '\\') then
-    some s!"'{rel}' holds a character no setup file's name may"
+  else if !rel.all homePathCharOk then
+    some s!"'{rel.quote}' holds a character no setup file's name may"
   else
     let segs := rel.splitOn "/"
     if segs.any (· == "..") then some s!"'{rel}' has a '..' segment"

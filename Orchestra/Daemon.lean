@@ -1040,6 +1040,9 @@ holding the rest of this tick until the window moves"
                   let upstream := (Repository.parse upstreamStr).toOption <|> prog.upstream
                   let fork     := (Repository.parse forkStr).toOption     <|> prog.fork
                   let prog := { prog with upstream, fork }
+                  -- The action's kleis spec and narrowings hold of every task the workflow runs.
+                  let prog := prog.withListenerKleis liveCfg.action.kleisSpec
+                    liveCfg.action.kleisNarrow
                   let jsonVars := vars.map fun (k, value) => (k, Lean.Json.str value)
                   let concert := Workflow.WorkflowProgram.toConcert prog jsonVars
                   IO.println s!"  Listener '{name}': starting concert from {resolvedPath}"

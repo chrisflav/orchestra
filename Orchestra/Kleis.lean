@@ -121,10 +121,12 @@ def issuerCredential (cfg : KleisConfig) : IO String := do
 /-- POST to one of kleis's own endpoints with the issuer credential. Directly, never through a
     proxy: the daemon's environment may have one set, and this request is to the proxy itself. -/
 private def postAdmin (cfg : KleisConfig) (path body : String) : IO (Nat × String) := do
+  -- The body on stdin with the credential, never in argv: a derive from a token carries that
+  -- token, and `/proc/<pid>/cmdline` is readable by everyone on the host (`Http.dataConfig`).
   let (status, _, out) ← Utils.Http.curlFull
     #["--noproxy", "*", "-X", "POST", "-H", "Content-Type: application/json",
-      "--data-raw", body, s!"{base cfg}{path}"]
-    (bearer := some (← issuerCredential cfg))
+      s!"{base cfg}{path}"]
+    (bearer := some (← issuerCredential cfg)) (data := some body)
   return (status, out)
 
 /-- The error kleis put in its answer, or the answer itself. -/
@@ -283,6 +285,12 @@ structure Launch where
   files : Array Exec.PathGrant
   /-- The port the proxy listens on. -/
   port : Nat
+  /-- The names in `env` that came from kleis's `/setup` rather than from orchestra. Where the
+      sandbox's own environment (the agent's API key, its base URL, its configuration directory)
+      already sets one, the agent's wins (`Sandbox.specFor`): a setup is about reaching services
+      through the proxy, and one that re-pointed the agent's own model endpoint would hand that
+      endpoint the agent's credential. -/
+  setupEnvNames : List String := []
 
 /-- The CA bundle as a path the session is opened with. A backend that runs the agent elsewhere
     carries the paths it is opened with there, and one granted only later, once the token is
@@ -427,8 +435,8 @@ def resolve (c : Choice) (identityToken : Option String) : IO (Option Source) :=
 /-! ## `derive` (A.7) -/
 
 /-- The body of a `/.kleis/v1/derive` request. From a spec: the spec, the task's facts, its bearer;
-    from a token: the token alone. Either way the TTL and the narrowings — omitted when there are
-    none. -/
+    from a token: the token and the bearer, no facts. Either way the TTL and the narrowings —
+    omitted when there are none. -/
 def deriveBody (cfg : KleisConfig) (src : Source) (facts : TaskFacts) (narrow : List String)
     : Json :=
   let narrowField : List (String × Json) :=
@@ -439,7 +447,10 @@ def deriveBody (cfg : KleisConfig) (src : Source) (facts : TaskFacts) (narrow : 
       ("ttl", .str cfg.ttl),
       ("bearer", .str s!"orchestra:{facts.taskId}"),
       ("facts", .arr facts.toFacts.toArray)] ++ narrowField)
-  | .token t => Json.mkObj ([("token", .str t), ("ttl", .str cfg.ttl)] ++ narrowField)
+  -- `bearer` here is kept in kleis's issued record only (A.7.3), so the audit log can be read
+  -- against orchestra's task; it adds no fact to the token.
+  | .token t => Json.mkObj ([("token", .str t), ("ttl", .str cfg.ttl),
+      ("bearer", .str s!"orchestra:{facts.taskId}")] ++ narrowField)
 
 /-- The token in a derive answer. `revocation_id` is one id (A.7.2); a list is taken too, as long
     as it holds exactly one, since revoking a list could revoke the source a token came from. -/
@@ -497,11 +508,23 @@ deriving Repr, Inhabited
 
 /-- The variables orchestra sets itself and a setup may not (A.8, B.2.3): the proxy, the CA and
     the hosts the proxy is bypassed for. A setup that set one would decide where the sandbox's
-    traffic goes, or what it trusts, and that is the consumer's to say. -/
+    traffic goes, or what it trusts, and that is the consumer's to say.
+
+    Every name kleis's own `Service.reservedEnv` holds is here (`ALL_PROXY`, `SSL_CERT_DIR`,
+    `HOME`, `PATH`), and the switches that turn certificate checking off, which would let a
+    sandbox be pointed past the proxy's CA. The dynamic loader's variables (`LD_*`) are refused by
+    prefix in `reservedSetupEnv?`. -/
 def reservedSetupEnv : List String :=
   ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy",
-   "SSL_CERT_FILE", "GIT_SSL_CAINFO", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
-   "NODE_EXTRA_CA_CERTS"]
+   "ALL_PROXY", "all_proxy",
+   "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH", "CURL_CA_BUNDLE",
+   "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+   "GIT_SSL_NO_VERIFY", "NODE_TLS_REJECT_UNAUTHORIZED",
+   "HOME", "PATH"]
+
+/-- Whether a setup may not set `n`: one of `reservedSetupEnv`, or the dynamic loader's. -/
+def reservedSetupEnv? (n : String) : Bool :=
+  reservedSetupEnv.contains n || n.startsWith "LD_"
 
 /-- Whether `n` can be an environment variable's name. -/
 def envNameValid (n : String) : Bool :=
@@ -518,9 +541,9 @@ def parseSetup (j : Json) : Except String Setup := do
     | .ok (.obj kvs) => kvs.toArray.mapM fun (k, v) => do
       let .str s := v | .error s!"setup.env.{k} is not a string"
       if !envNameValid k then .error s!"setup.env names '{k}', which is not a variable name"
-      if reservedSetupEnv.contains k then
-        .error s!"setup.env sets {k}, which is orchestra's to set (the proxy, the CA and \
-NO_PROXY are the consumer's); refusing the setup"
+      if reservedSetupEnv? k then
+        .error s!"setup.env sets {k}, which is orchestra's to set (the proxy, the CA, \
+NO_PROXY, HOME, PATH and the loader are the consumer's); refusing the setup"
       pure (k, s)
     | .ok _ => .error "setup.env is not an object"
   let files ← match j.getObjVal? "files" with
@@ -634,7 +657,20 @@ def setupBundle (cfg : KleisConfig) (s : Setup) : IO System.FilePath :=
 def installFiles (session : Exec.Session) (files : Array SetupFile) : IO (Array Exec.PathGrant) :=
   files.mapM fun f => do
     session.putHomeFile f.path f.mode f.content
-    return { path := f.path, access := .ro, scope := .home }
+    return { path := f.path, access := grantAccess f.mode, scope := .home }
+where
+  /-- Read, and execute when the mode lets anybody execute it: a client such as
+      `.local/bin/kleis-mail` comes as `0755`, and a read-only grant would let the sandbox see it
+      and refuse to run it. -/
+  grantAccess (mode : String) : Exec.Access :=
+    match Exec.fileModeOf? mode with
+    | some bits => if bits &&& 0o111 != 0 then .rox else .ro
+    | none => .ro
+
+/-- `setup.env` without what orchestra sets for every derived sandbox itself, so that one name is
+    not exported twice with two values: the setup's value is kept. -/
+private def withSetupEnv (own setup : Array (String × String)) : Array (String × String) :=
+  own.filter (fun (k, _) => !setup.any (·.1 == k)) ++ setup
 
 /-- The environment and files for a sandbox whose token was derived. Unlike `launch`, nothing
     about any one service: no `GH_TOKEN`, no git configuration — those come in `setup.env` from
@@ -642,9 +678,10 @@ def installFiles (session : Exec.Session) (files : Array SetupFile) : IO (Array 
 def launchDerived (cfg : KleisConfig) (p : Prepared) (bundle : System.FilePath)
     (fileGrants : Array Exec.PathGrant) : Launch :=
   { env := launch.proxyEnv cfg p.minted.token bundle p.setup.noProxy
-      ++ #[("GIT_TERMINAL_PROMPT", "0")] ++ p.setup.env
+      ++ withSetupEnv #[("GIT_TERMINAL_PROMPT", "0")] p.setup.env
     files := #[bundleGrant bundle] ++ fileGrants
-    port := proxyPort cfg }
+    port := proxyPort cfg
+    setupEnvNames := (p.setup.env.map (·.1)).toList }
 
 /-- The card as a system-prompt section. -/
 def cardPrompt (card : String) : String :=
