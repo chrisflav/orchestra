@@ -154,6 +154,11 @@ structure RunSpec where
   /-- What to call this run in a log line. Not passed to the command; used by backends that have
       to name the thing they create (a container, a pod) and by `--debug` output. -/
   label : String := "orchestra-agent"
+  /-- What to call this run where the backend keeps it, for a backend whose runs outlive the
+      daemon (`Exec.Runner`): an id that is the same every time the same step of the same task is
+      reached — `agent-0`, `agent-1` — so that a daemon coming back to the task finds the run the
+      last one started instead of starting a second. `none` lets the backend pick a fresh one. -/
+  runId : Option String := none
 deriving Inhabited
 
 namespace PathGrant
@@ -184,13 +189,97 @@ def shellEscape (s : String) : String :=
 
 namespace McpEndpoint
 
+/-- The `"error"` member the relay answers a request with when the connection it was sent on ended
+    before its answer came back (`relayScript`). Plain text, no apostrophe and no backslash: it is
+    spliced into a single-quoted shell word and then into TOML and JSON. -/
+def relayLostReply : String :=
+  "\"error\":{\"code\":-32001,\"message\":\"The connection to orchestra was interrupted before \
+this call was answered (orchestra is probably restarting). The call was not retried: if it is \
+still needed, make it again.\"}"
+
+/-- The script `stdioCommand` runs under `bash` for an endpoint with a token: a relay between the
+    agent's MCP client and the server that survives the server going away and coming back.
+
+    It used to be `{ echo <token>; cat; } | nc <host> <port>`, which ends — and with it every tool
+    the agent has — the moment the connection does. The connection ends whenever the daemon
+    restarts, and a daemon that now hands its running tasks over to the next one
+    (`docs/kubernetes.md`, restarts) has to give the agent its tools back afterwards, or the
+    reconnect is a conversation with no hands. The next daemon brings the task's server back on
+    the same port with the same token (`TaskRunner`); this is the half that dials it again.
+
+    How, in one line of `bash` (one line, and no backslash anywhere: it is written into TOML as well
+    as JSON, see `vibe`'s config):
+
+    * The agent's requests go into a FIFO held open read-write by the relay itself, by one `cat`
+      that lives as long as the agent's stdin does. Nothing the agent writes while the server is
+      away is lost: it waits in the FIFO for the next connection.
+    * Each connection is `bash`'s own `/dev/tcp`: the token goes first, then one loop copies whole
+      lines from the FIFO to the socket and another whole lines from the socket to the agent
+      (`read -r`, so a long request is never split across two connections). When the server's
+      side ends (`wait -n`, so `bash` 4.3 or later) the writer is *asked* to stop rather than
+      killed: it reads with a one-second timeout, keeps a partial line across timeouts, and stops
+      only between lines — so a request half way into the FIFO is neither cut in two nor sent as
+      garbage on the next connection.
+    * **Every request is answered exactly once.** The id of each request sent is noted (one file
+      per id; the id is the last `"id":` in the line, which is where the MCP client puts it), and
+      crossed off when the server's answer to it passes back (the server writes `"id"` first,
+      directly followed by `"jsonrpc"`: its keys are sorted). When a connection ends, every id not
+      crossed off is answered by the relay itself with an error (`relayLostReply`), and nothing is
+      sent again — a tool call that may have half happened (a comment posted, a pull request
+      opened) is not the relay's to repeat. So a request the old server read and never answered,
+      or one that went out on a connection about to close, gets an error the agent can act on
+      instead of a wait that never ends. Notifications carry no id and need no answer.
+    * The one exception is `initialize`, which has no effect to repeat and whose error would make
+      the MCP client give the server up for the rest of the session: while unanswered it is kept,
+      and sent again first on the next connection.
+    * Reconnecting backs off from one second to fifteen, and gives up after an hour without a
+      connection that lasted, which is longer than any restart and shorter than a pod's deadline.
+    * The agent closing its stdin — it is done — ends the relay.
+
+    The server is stateless per connection (every request is answered on its own, `initialize` or
+    not), so a request on a new connection is served exactly as it would have been on the old one.
+    As a last backstop for anything that still slips through, a remote agent runs with
+    `MCP_TOOL_TIMEOUT` set (`Sandbox.remoteMcpEnv`), so no tool call waits forever. -/
+def relayScript (e : McpEndpoint) (token : String) : String :=
+  s!"t={shellEscape token}; h={shellEscape e.host}; p={e.port}; " ++
+  "d=$(mktemp -d) || exit 1; mkdir \"$d/p\" && mkfifo \"$d/q\" || exit 1; exec 5<>\"$d/q\"; " ++
+  "exec 4<&0; rq='.*\"id\":([0-9]+|\"[^\"]*\")[,}]'; rs='\"id\":([0-9]+|\"[^\"]*\"),\"jsonrpc\"'; " ++
+  "( cat <&4 >&5; kill -TERM $$ 2>/dev/null ) & " ++
+  "trap 'kill $(jobs -p) 2>/dev/null; rm -rf \"$d\"' EXIT; trap 'exit 0' HUP INT TERM; " ++
+  "w=1; down=0; " ++
+  "while :; do s=$SECONDS; rm -f \"$d/stop\"; " ++
+  "if { exec 3<>\"/dev/tcp/$h/$p\"; } 2>/dev/null; then echo \"$t\" >&3; " ++
+  "[ -f \"$d/init\" ] && cat \"$d/init\" >&3; " ++
+  "( while IFS= read -r l; do echo \"$l\"; if [[ $l =~ $rs ]]; then " ++
+  "k=${BASH_REMATCH[1]//[^A-Za-z0-9]/_}; rm -f \"$d/p/$k\"; " ++
+  "[ \"$k\" = \"$(cat \"$d/initid\" 2>/dev/null)\" ] && rm -f \"$d/init\" \"$d/initid\"; " ++
+  "fi; done <&3 ) & r=$!; " ++
+  "( b=; while :; do if IFS= read -r -t 1 l; then l=$b$l; b=; if [[ $l =~ $rq ]]; then " ++
+  "k=${BASH_REMATCH[1]//[^A-Za-z0-9]/_}; echo \"${BASH_REMATCH[1]}\" > \"$d/p/$k\"; " ++
+  "if [[ $l == *'\"method\":\"initialize\"'* ]]; then echo \"$l\" > \"$d/init\"; " ++
+  "echo \"$k\" > \"$d/initid\"; fi; fi; echo \"$l\" >&3 || exit 1; " ++
+  "elif [ $? -gt 128 ]; then b=$b$l; [ -z \"$b\" ] && [ -f \"$d/stop\" ] && exit 0; " ++
+  "else exit 0; fi; done <&5 ) & f=$!; " ++
+  "wait -n; touch \"$d/stop\"; wait $f 2>/dev/null; kill $r 2>/dev/null; wait $r 2>/dev/null; " ++
+  "exec 3>&-; fi; " ++
+  "for x in \"$d\"/p/*; do [ -f \"$x\" ] || continue; " ++
+  "[ \"${x##*/}\" = \"$(cat \"$d/initid\" 2>/dev/null)\" ] && continue; " ++
+  "echo '{\"jsonrpc\":\"2.0\",\"id\":'\"$(cat \"$x\")\"'," ++ relayLostReply ++ "}'; " ++
+  "rm -f \"$x\"; done; " ++
+  "if [ $((SECONDS - s)) -ge 5 ]; then w=1; down=0; else down=$((down + w)); " ++
+  "[ $down -ge 3600 ] && exit 1; w=$((w * 2)); [ $w -gt 15 ] && w=15; fi; " ++
+  "sleep $w & wait $!; done"
+
 /-- The command an agent's MCP client runs to reach this endpoint over a stdio transport, as
     `(command, args)`.
 
     Every agent backend asks for this rather than writing `nc <host> <port>` itself, because the
     answer stops being `nc` as soon as the endpoint carries a token: the token has to be the first
-    line on the connection, and `nc` has no way to put it there. A shell sends it and then gets
-    out of the way, leaving the same bidirectional pipe the agent expects.
+    line on the connection, and `nc` has no way to put it there. With a token it is `relayScript`
+    under `bash`, which sends the token first on every connection and keeps the agent's side of
+    the pipe open across the server restarting. Only an endpoint off this machine carries a token
+    (`Exec.mcpBinding`), and only an agent off this machine outlives the daemon, so the loopback
+    case stays plain `nc`.
 
     The token is emitted through `echo` rather than `printf` on purpose: it is written into TOML
     as well as JSON (`vibe`'s config), and a `\n` escape means one thing in one and another in the
@@ -203,9 +292,7 @@ namespace McpEndpoint
 def stdioCommand (e : McpEndpoint) : String × Array String :=
   match e.token with
   | none   => ("nc", #[e.host, toString e.port])
-  | some t => ("sh", #["-c",
-      "{ echo " ++ shellEscape t ++ "; cat; } | nc "
-        ++ shellEscape e.host ++ " " ++ toString e.port])
+  | some t => ("bash", #["-c", relayScript e t])
 
 /-- `host` if it is something that can be a host at all, otherwise why not.
 

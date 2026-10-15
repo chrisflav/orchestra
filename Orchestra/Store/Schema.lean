@@ -2,6 +2,7 @@ import Db
 import Orchestra.Store.Migrations.Initial
 import Orchestra.Store.Migrations.UsageEstimate
 import Orchestra.Store.Migrations.ResolvedAuthSource
+import Orchestra.Store.Migrations.TaskRunState
 import Orchestra.Store.Migrations.KleisSource
 
 /-!
@@ -138,6 +139,23 @@ structure QueueEntryRow where
   kleis_spec : Option String
   kleis_role_spec : Option String
   kleis_narrow : Option String
+  deriving Repr
+
+/-- Where a running task has got to, for a daemon that picks the task up after a restart instead of
+    losing what it was doing. One row per task id, written as the task moves from step to step and
+    removed when it ends. See `Orchestra.RunState`.
+
+    A table of its own rather than columns on `task`: the task record is saved whole, from a
+    snapshot taken when the run started (`TaskRunner`), and a column there would be reset by every
+    one of those saves. `phase` and `attempt` are columns because they are what a person looking
+    at a stuck task asks; the rest is `state`, as JSON. -/
+@[model (dbName := "task_run_state") (primaryKey := ["task_id"]) orchestra]
+structure TaskRunStateRow where
+  task_id : String
+  updated_at : String
+  phase : String
+  attempt : Int
+  state : String
   deriving Repr
 
 /-- One run of a concert workflow. See `Orchestra.Queue.ConcertRun`. -/
@@ -298,6 +316,7 @@ def migrations : List Db.Migration.Migration :=
   [Orchestra.Store.Migrations.migration_0001_initial,
    Orchestra.Store.Migrations.migration_0002_usage_estimate,
    Orchestra.Store.Migrations.migration_0003_resolved_auth_source,
-   Orchestra.Store.Migrations.migration_0004_kleis_source]
+   Orchestra.Store.Migrations.migration_0004_task_run_state,
+   Orchestra.Store.Migrations.migration_0005_kleis_source]
 
 end Orchestra.Store

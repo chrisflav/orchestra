@@ -27,4 +27,15 @@ def install : IO Unit := installHandlers
     exit" and a second as "stop now", mirroring `queue shutdown` and `queue shutdown --force`. -/
 def count : IO UInt32 := signalCount
 
+@[extern "lean_orchestra_exit_now"]
+private opaque exitNowImpl (code : UInt8) : IO Unit
+
+/-- End the process now, without exit handlers or runtime teardown, after flushing stdout and
+    stderr. For a daemon leaving in the middle of its workers' tasks on purpose (the hand-off in
+    `Daemon.run`), where an orderly exit could wait on any of them. -/
+def exitNow (code : UInt8) : IO Unit := do
+  try (← IO.getStdout).flush catch _ => pure ()
+  try (← IO.getStderr).flush catch _ => pure ()
+  exitNowImpl code
+
 end Orchestra.Utils.Signals

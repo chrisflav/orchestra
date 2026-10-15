@@ -896,10 +896,19 @@ private def queueShutdownHandler (p : Parsed) : IO UInt32 := do
   if !(← Queue.daemonRunning) then
     IO.eprintln "Queue daemon is not running."
     return 1
-  let req := Lean.Json.mkObj [("type", "shutdown"), ("force", Lean.Json.bool force)]
-  let _ ← daemonRequest req
+  let handOff := p.hasFlag "hand-off"
+  let req := Lean.Json.mkObj [("type", "shutdown"), ("force", Lean.Json.bool force),
+    ("hand_off", Lean.Json.bool handOff)]
+  let resp ← daemonRequest req
+  let mode := (resp.getObjValAs? String "id").toOption.getD ""
   if force then
     IO.println "Shutdown request sent. Daemon will stop after cancelling the current task."
+  else if handOff && mode == "hand-off" then
+    IO.println "Shutdown request sent. Daemon will hand its running tasks over once every one of them \
+can be, and drain the rest."
+  else if handOff then
+    IO.println "Shutdown request sent. This daemon does not hand tasks over \
+(queue.reattach_after_restart is off), so it will stop after the current tasks finish."
   else
     IO.println "Shutdown request sent. Daemon will stop after the current task finishes."
   return 0
@@ -1062,6 +1071,8 @@ private def queueShutdownCmd : Cmd := `[Cli|
 
   FLAGS:
     f, force; "Cancel the current task immediately and shut down"
+    "hand-off"; "Hand running tasks over to the next daemon instead of waiting for them \
+(queue.reattach_after_restart; what SIGTERM does)"
 ]
 
 private def queueCancelCmd : Cmd := `[Cli|

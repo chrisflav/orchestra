@@ -16,6 +16,7 @@ import Orchestra.Queue
 import Orchestra.Server
 import Orchestra.StreamFormat
 import Orchestra.TaskStore
+import Orchestra.RunState
 import Orchestra.Usage
 import Std.Sync
 
@@ -557,8 +558,45 @@ def selectAuthSource {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask
   | .ok label => return label
   | .error e  => throw (.userError s!"no usable authentication source for '{backendName}': {e}")
 
+/-- A task a previous daemon left running, which this one is carrying on (`Daemon.run`): its record,
+    and where it had got to (`RunState`).
+
+    `started` is set once the task has its environment and its MCP server back, which is where it
+    stops being "being picked up" and becomes a running task like any other. Anything that goes
+    wrong before then — a token that cannot be minted, an identity no longer configured, a pod that
+    went, a port that is taken — is the daemon's to answer by falling back to resuming the task
+    (`Daemon.run`), never by failing it while its agent may still be working. -/
+structure Reattach where
+  record : TaskStore.TaskRecord
+  state : RunState.RunState
+  started : IO.Ref Bool
+
+/-- The run id of each step of the task loop, as the execution backend keeps it (`RunSpec.runId`).
+    Deterministic, which is the whole point: a daemon that picks the task up after a restart
+    reaches the same step under the same id and finds the run the last one started — still going,
+    or finished with its status and output on disk — rather than starting it a second time. -/
+def stepRunId (step : String) (attempt : Option Nat := none) : String :=
+  match attempt with
+  | some k => s!"{step}-{k}"
+  | none => step
+
+/-- The attempt a picked-up task's loop resumes at: the one it had recorded, clamped into the range
+    the repository's configuration allows now — a `max_retries` lowered across the restart ends the
+    loop at its new last attempt rather than skipping it. -/
+def resumeAttempt (recorded maxAttempts : Nat) : Nat :=
+  min recorded (maxAttempts - 1)
+
 /-- Run a single IOTask: clone repo, start MCP server, run validation loop.
-    Returns the task ID, the status the run ended in, and the typed output. -/
+    Returns the task ID, the status the run ended in, and the typed output.
+
+    With `reattach`, the task is one a previous daemon started and left running in an environment
+    that outlives it (`Exec.Backend.reattach`): no record is made, no workspace prepared and no
+    environment opened. The environment is opened *again*, the task's MCP server is brought back
+    on the port and with the token its agent already holds, and the loop resumes at the attempt
+    the task had recorded — replaying each step, whose runs it finds already going or already over
+    (`stepRunId`). Anything that stops that from happening before the loop starts is thrown as
+    `Exec.reattachFailed`, which the daemon answers the way it answers any task a restart
+    interrupted. -/
 def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     (idx : Nat) (debug : Bool) (input : i.Type)
     (continuesFrom : Option String := none)
@@ -580,6 +618,13 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- caller that has to point at the run *while* it is happening — the queue daemon writes it
     -- onto the entry from here so the dashboard can find the log a running agent is filling.
     (onStart : String → IO Unit := fun _ => pure ())
+    -- A task a previous daemon left running, to be carried on rather than started (see above).
+    (reattach : Option Reattach := none)
+    -- Whether this task may be handed to the next daemon at all: only the queue daemon's tasks,
+    -- and of those not what the next daemon would refuse to pick up (`Queue.handOverable`) — a
+    -- concert step, an entry under an execution configuration of its own. Off, nothing is recorded
+    -- for the task and it drains on a stop, as every task always did.
+    (handOverable : Bool := false)
     : IO ((String × TaskStore.TaskStatus) × Option o.Type × Option Lean.Json) := do
   IO.println s!"=== Task {idx}: {repoLabel ioTask.repo} ({repr ioTask.mode}) ==="
   -- Record this run in the task store
@@ -588,25 +633,33 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- requiring the pre-claim retag in `updateClaimTaskId`. The fix is to
   -- pre-assign the task ID on the queue entry and pass it in instead of
   -- generating a new one, making `entry.taskId : Option String` redundant.
-  let taskId ← TaskStore.generateId
-  let createdAt ← TaskStore.currentIso8601
-  let initialRecord : TaskStore.TaskRecord := {
-    id := taskId, createdAt
-    repo := ioTask.repo, mode := ioTask.mode
-    prompt := ioTask.prompt, goal := ioTask.goal, continuesFrom, series
-    backend := ioTask.backend, model := ioTask.model, agent := ioTask.agent
-    systemPrompt := ioTask.systemPrompt, budget := ioTask.budget
-    priority := ioTask.priority
-    projectId := ioTask.projectId
-    issueId   := ioTask.issueId
-    role      := ioTask.role
-    identity  := ioTask.identity
-    kleisToken    := ioTask.kleisToken
-    kleisSpec     := ioTask.kleisSpec
-    kleisRoleSpec := ioTask.kleisRoleSpec
-    kleisNarrow   := ioTask.kleisNarrow
-  }
-  TaskStore.saveTask initialRecord
+  -- A picked-up task is the run it was: same id, same record, already `running` — and the session
+  -- id its agent announced, which the retries below resume.
+  let (taskId, initialRecord) ← match reattach with
+    | some r => pure (r.record.id, { r.record with status := .running })
+    | none => do
+      let taskId ← TaskStore.generateId
+      let createdAt ← TaskStore.currentIso8601
+      let initialRecord : TaskStore.TaskRecord := {
+        id := taskId, createdAt
+        repo := ioTask.repo, mode := ioTask.mode
+        prompt := ioTask.prompt, goal := ioTask.goal, continuesFrom, series
+        backend := ioTask.backend, model := ioTask.model, agent := ioTask.agent
+        systemPrompt := ioTask.systemPrompt, budget := ioTask.budget
+        priority := ioTask.priority
+        projectId := ioTask.projectId
+        issueId   := ioTask.issueId
+        role      := ioTask.role
+        identity  := ioTask.identity
+        kleisToken    := ioTask.kleisToken
+        kleisSpec     := ioTask.kleisSpec
+        kleisRoleSpec := ioTask.kleisRoleSpec
+        kleisNarrow   := ioTask.kleisNarrow
+      }
+      TaskStore.saveTask initialRecord
+      pure (taskId, initialRecord)
+  if reattach.isSome then
+    IO.println s!"  Picking up task {taskId} where the previous daemon left it"
   onStart taskId
   -- If this task was pre-claimed (daemon wrote the claim with the queue-entry
   -- ID before we ran), retag the claim with the real generated taskId so that
@@ -683,19 +736,38 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- at all rather than refusing to start: its work may be entirely on the issue tracker, and
   -- failing over a token it would never use is the wrong trade.
   IO.println "  Creating GitHub App token..."
-  let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-  let installationId : Option Nat ← match appConfig.installationId with
-    | some id => pure (some id)
-    | none    =>
-      match ioTask.repo with
-      | some repo => some <$> GitHub.getInstallationId jwt repo.fork.owner
-      | none      =>
-        match appConfig.defaultOrganization with
-        | some org => some <$> GitHub.getInstallationId jwt org
-        | none     => pure none
-  let token ← match installationId with
-    | some id => GitHub.createInstallationToken jwt id
-    | none    => pure ""
+  -- A picked-up task tries a few times: its agent is already working in a pod, and a GitHub
+  -- hiccup at this moment would otherwise send it back to be resumed from scratch.
+  let mint : IO (Option Nat × String) := do
+    let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
+    let installationId : Option Nat ← match appConfig.installationId with
+      | some id => pure (some id)
+      | none    =>
+        match ioTask.repo with
+        | some repo => some <$> GitHub.getInstallationId jwt repo.fork.owner
+        | none      =>
+          match appConfig.defaultOrganization with
+          | some org => some <$> GitHub.getInstallationId jwt org
+          | none     => pure none
+    let token ← match installationId with
+      | some id => GitHub.createInstallationToken jwt id
+      | none    => pure ""
+    return (installationId, token)
+  let (installationId, token) ← if reattach.isNone then mint else do
+    let mut result : Option (Option Nat × String) := none
+    let mut lastErr : Option IO.Error := none
+    for attempt in [0:4] do
+      if attempt > 0 then IO.sleep (UInt32.ofNat (attempt * 5000))
+      try
+        result := some (← mint)
+        break
+      catch e =>
+        lastErr := some e
+        IO.eprintln s!"  Could not mint the task's GitHub token (attempt {attempt + 1}/4): {e}"
+    match result, lastErr with
+    | some r, _ => pure r
+    | none, some e => throw e
+    | none, none => throw (IO.userError "could not mint the task's GitHub token")
   -- Deliberately no `GitHub.setupGhAuth` here. That writes the token to
   -- `~/.config/gh/hosts.yml`, which every concurrently running task shares, so under
   -- `--parallel > 1` the last task to authenticate supplies the credentials for all of them.
@@ -728,7 +800,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       -- failure like a clone that cannot be created or a token that cannot be minted, and those
       -- all leave through the same door. The queue daemon's handler is what releases the issue
       -- claim this task is holding, and a task that returned normally would keep it.
-      TaskStore.saveTask { initialRecord with status := .failed }
+      -- Not for a picked-up task, which falls back to being resumed and must stay `running` until
+      -- the daemon has decided that (`Daemon.run`).
+      if reattach.isNone then TaskStore.saveTask { initialRecord with status := .failed }
       throw (IO.userError s!"cannot run the agent: {e}")
   -- Such a backend gets a checkout per task, made for this task and removed after it, and no slot
   -- is ever prepared. The merger is the one task on it that keeps nothing: it validates a pull
@@ -738,7 +812,16 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- 2. Prepare the workspace: the task slot, or the shared repo clone when running outside the
   -- queue — and for a repository-independent task, an empty scratch directory in place of either.
   -- On a backend that keeps workspaces, a checkout of its own for this task instead.
-  let repoPath ← match ioTask.repo with
+  let repoPath ← if let some r := reattach then do
+      -- The checkout the task was opened on is still on this machine (a task keeps its per-task
+      -- checkout until it ends, and the startup sweep leaves a day's worth alone); it is what the
+      -- repository's configuration and scripts are read from. Gone is a task that cannot be
+      -- carried on here.
+      let p := System.FilePath.mk r.state.repoPath
+      unless ← p.pathExists do
+        throw (Exec.reattachFailed s!"its checkout {p} is gone")
+      pure p
+    else match ioTask.repo with
     | some repo =>
       if taskCheckout then
         Repo.ensureTaskCheckout repo.fork repo.upstream taskId (token := some token)
@@ -786,7 +869,13 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- same reason.
   -- Where the MCP server has to listen for this backend's agents, on which ports, and the secret
   -- they present. Loopback, any port and no secret unless the agent runs off this machine.
-  let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
+  -- A picked-up task keeps the token its agent already holds: the agent's relay presents it on
+  -- every reconnection (`McpEndpoint.relayScript`), and a fresh one would be refused.
+  let (mcpBind, mcpPorts, mcpToken) ← do
+    let (bind, ports, minted) ← Exec.mcpBinding execBackend
+    pure (bind, ports, match reattach with
+      | some r => r.state.mcpToken
+      | none => minted)
   -- Merger: checkout the PR branch, run validation, then merge. Shares auth + workspace setup
   -- with all other backends but skips the MCP server and the agent — and opens its own
   -- environment for the validation script, once the branch it is merging is checked out.
@@ -861,8 +950,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- the agent elsewhere carries there itself (`Kleis.bundleGrant`). Without one — the legacy path —
   -- the bundle is kleis's own CA, and the token is minted once the session is up, as it always was.
   let kleisPrepared : Option Kleis.Prepared ← (try
-      let p? ← Kleis.prepareFor appConfig.kleis kleisLevels (identity.bind (·.kleisToken)) facts
-        kleisNarrow
+      -- A task picked up from a previous daemon keeps the token its agent is already running
+      -- with (`RunState`): a new one would not reach a process started before it.
+      let p? ← if (reattach.bind (·.state.kleis)).isSome then pure none
+        else (Kleis.prepareFor appConfig.kleis kleisLevels (identity.bind (·.kleisToken)) facts
+          kleisNarrow)
       if let some p := p? then
         kleisRef.set (some p.minted)
         IO.println s!"  kleis token derived from {p.choice.describe} \
@@ -875,7 +967,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | some kc, none   => some <$> Kleis.caBundle kc
       | none, _         => pure none
     catch e => do revokeKleis; removeTaskCheckout; throw e)
-  let session ← (try execBackend.openSession {
+  let sessionSpec : Exec.SessionSpec := {
     workdir := repoPath
     taskId  := if persistent then some taskId else none
     continuesFrom := if persistent then continuesFrom else none
@@ -901,8 +993,22 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- The fork is per-bot and appears nowhere a person would think to configure. Keyed the same
     -- way as `resolveMemoryDirs` just above, and as `runMerger`.
     repo    := ioTask.repo.map (·.upstream.toString)
-    image   := repoConfig.image }
-    catch e => do revokeKleis; removeTaskCheckout; throw e)
+    image   := repoConfig.image
+    -- Past this point the pod is gone and the task cannot be handed to another daemon: see
+    -- `Exec.enterReattachable` below.
+    beforeRelease := Exec.leaveReattachable taskId }
+  -- A picked-up task's environment is opened *again*, from what the last daemon recorded, with the
+  -- same spec it was opened with — which is why the spec is built the same way either way.
+  let openIt : IO Exec.Session := do
+    match reattach with
+    | none => execBackend.openSession sessionSpec
+    | some r =>
+      let some reopen := execBackend.reattach
+        | throw (Exec.reattachFailed s!"the '{execBackend.name}' backend cannot reopen an \
+environment")
+      try reopen r.state.session sessionSpec
+      catch e => throw (Exec.reattachFailed s!"{e}")
+  let session ← (try openIt catch e => do revokeKleis; removeTaskCheckout; throw e)
   IO.println s!"  Running in: {session.id}"
   -- The MCP server has to come down however the task ends, not only when it ends well. It holds a
   -- listening socket with the PAT's authority behind it and — off loopback — one port out of
@@ -913,6 +1019,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     match ← shutdownRef.modifyGet fun s => (s, none) with
     | some stop => stop
     | none      => pure ()
+  -- The environment, closed once: at the end of a task that got there (7b, below), or by the
+  -- `finally` for one that did not.
+  let closedRef ← IO.mkRef false
+  let closeOnce : IO Unit := do
+    unless ← closedRef.modifyGet fun c => (c, true) do session.close
   try
     -- A task that continues another one is asking the agent to pick up a conversation it had
     -- before, and that conversation is a file the agent CLI wrote where it was running. An
@@ -936,9 +1047,16 @@ of its own.")
         let fileGrants ← Kleis.installFiles session p.setup.files
         pure (some (Kleis.launchDerived kc p bundle fileGrants))
       | some kc, none, some bundle => do
-        let minted ← Kleis.mint kc facts
+        -- A picked-up task goes on with the token its agent's proxy settings already carry
+        -- (derived or minted by the daemon before); it is revoked when the task ends.
+        let minted ← match reattach.bind (·.state.kleis) with
+          | some k => pure { token := k.token, revocationId := k.revocationId
+                             expires := k.expires : Kleis.Minted }
+          | none => do
+            let m ← Kleis.mint kc facts
+            IO.println s!"  kleis token minted (revocation id {m.revocationId.take 16})"
+            pure m
         kleisRef.set (some minted)
-        IO.println s!"  kleis token minted (revocation id {minted.revocationId.take 16})"
         pure (some (Kleis.launch kc minted bundle))
       | _, _, _ => pure none
     -- What a task this one queues carries as its own source: the same, by name or reference.
@@ -993,13 +1111,67 @@ of its own.")
       authToken := mcpToken
       kleis := appConfig.kleis
     }
-    let (port, shutdown) ← Server.start serverState (bindHost := mcpBind) (portRange := mcpPorts)
+    -- A picked-up task's server comes back on the port its agent's relay is dialling, which was set
+    -- aside for it at startup (`Server.reservePorts`) so no new task could take it meanwhile.
+    let exactPort := reattach.map fun r => UInt16.ofNat r.state.mcpPort
+    let (port, shutdown) ← try
+        Server.start serverState (bindHost := mcpBind) (portRange := mcpPorts) (exactPort := exactPort)
+      catch e =>
+        if reattach.isSome then throw (Exec.reattachFailed s!"{e}") else throw e
+      finally
+        if let some p := exactPort then Server.releasePort p
     shutdownRef.set (some shutdown)
     IO.println s!"  MCP server on port {port}"
+    -- From here a picked-up task is a running task like any other (`Reattach.started`).
+    if let some r := reattach then r.started.set true
+    -- Resolved once, before the first attempt, rather than per attempt: the retries below
+    -- `--resume` the same conversation, and moving that conversation to a different account
+    -- part-way through would hand the agent a session the new account has never seen.
+    -- Marked at the point the choice is made, not here: a caller that resolved for us (the queue
+    -- daemon, under its claim lock) already recorded it, and re-stamping would make two accounts
+    -- look equally recently used when only one of them ran. A picked-up task keeps the account it
+    -- was running on, for the same reason.
+    let authLabel ← match reattach.bind (·.state.authLabel), preresolvedAuth with
+      | some l, _ => pure (some l)
+      | none, some l => pure (some l)
+      | none, none => do
+        let label ← selectAuthSource appConfig ioTask
+        if let some l := label then Usage.markUsed (ioTask.backend.getD "claude") l
+        pure label
+    -- Where the task is, on record before each step starts (`Orchestra.RunState`), for a daemon
+    -- that has to carry it on after a restart. Only for an environment that can be reopened
+    -- (`Session.snapshot`) and only when the daemon is configured to; a record that cannot be
+    -- written makes the task one that is not handed over — it drains, as every task used to.
+    let canHandOver := session.snapshot.isSome && appConfig.queue.reattachAfterRestart && handOverable
+    let recordStep (phase : RunState.Phase) (attempt : Nat) : IO Unit := do
+      let some snap := session.snapshot | return
+      unless canHandOver do return
+      try
+        RunState.save taskId {
+          phase, attempt, backend := execBackend.name, session := snap
+          repoPath := repoPath.toString, mcpPort := port.toNat, mcpToken
+          kleis := (← kleisRef.get).map fun m =>
+            { token := m.token, revocationId := m.revocationId, expires := m.expires }
+          authLabel }
+        Exec.enterReattachable taskId
+      catch e =>
+        IO.eprintln s!"  Warning: could not record where task {taskId} is ({e}); it will not be \
+handed to the next daemon"
+        Exec.leaveReattachable taskId
+    let maxAttempts := repoConfig.validation.maxRetries + 1
+    -- The attempt the loop starts at: the first, or the one a picked-up task had reached.
+    let firstAttempt := match reattach with
+      | some r => match r.state.phase with
+        | .init => 0
+        | _ => resumeAttempt r.state.attempt maxAttempts
+      | none => 0
     -- 5. Run the init hook, in the session — that is where the agent will work, and where
     -- `init.sh` installs the toolchain `validation.sh` later needs. The repository's config was read
-    -- before the session was opened, since it says which environment to open.
-    RepoConfig.runInitIfNeeded session repoPath
+    -- before the session was opened, since it says which environment to open. A picked-up task
+    -- that had got past it does not run it again.
+    if reattach.all (·.state.phase == .init) then
+      recordStep .init 0
+      RepoConfig.runInitIfNeeded session repoPath (runId := some (stepRunId "init"))
     -- 6. Validation loop: before.sh → agent → validation.sh, retry on failure
     let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
     -- Ordered: what the operator wrote, then who the agent is, then the directories it may write
@@ -1023,26 +1195,27 @@ of its own.")
       match prependPrompt with
       | none    => ioTask.prompt
       | some pp => pp ++ "\n\n" ++ ioTask.prompt
-    let mut sessionId : Option String := none
+    -- A picked-up task's conversation is the one its record names: a retry that has not started
+    -- yet resumes it.
+    let mut sessionId : Option String := initialRecord.sessionId.filter fun _ => reattach.isSome
     let mut usageLimitHit := false
     let mut wasCancelled := false
     let mut lastValidationOutput : String := ""
     let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
-    -- Resolved once, before the first attempt, rather than per attempt: the retries below
-    -- `--resume` the same conversation, and moving that conversation to a different account
-    -- part-way through would hand the agent a session the new account has never seen.
-    -- Marked at the point the choice is made, not here: a caller that resolved for us (the queue
-    -- daemon, under its claim lock) already recorded it, and re-stamping would make two accounts
-    -- look equally recently used when only one of them ran.
-    let authLabel ← match preresolvedAuth with
-      | some l => pure (some l)
-      | none   => do
-        let label ← selectAuthSource appConfig ioTask
-        if let some l := label then Usage.markUsed (ioTask.backend.getD "claude") l
-        pure label
-    let maxAttempts := repoConfig.validation.maxRetries + 1
+    -- A task picked up at a retry needs the validation output that retry's prompt quotes. It is in
+    -- the pod, in the run of the attempt before (`validate-<k>`), which this replays.
+    if firstAttempt > 0 && (← RepoConfig.hasValidationScript repoPath) then
+      let (_, out) ← RepoConfig.runValidation session repoPath
+        (runId := some (stepRunId "validate" (some (firstAttempt - 1))))
+      lastValidationOutput := out
+    let mut lastAttempt := firstAttempt
     for attempt in List.range maxAttempts do
-      RepoConfig.runHook session repoPath "before.sh"
+      -- Attempts a picked-up task had already finished are not replayed: what they decided is
+      -- that there was a next attempt, and the output that one needs is read above.
+      if attempt < firstAttempt then continue
+      lastAttempt := attempt
+      recordStep .attempt attempt
+      RepoConfig.runHook session repoPath "before.sh" (runId := some (stepRunId "before" (some attempt)))
       let prompt :=
         if attempt == 0 then baseTaskPrompt
         else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
@@ -1070,6 +1243,7 @@ of its own.")
         (additionalPaths := appConfig.additionalSandboxPaths)
         (interactiveAgent := interactiveAgent) (goal := ioTask.goal) (session := session)
         (mcpToken := mcpToken) (kleis := kleisLaunch)
+        (runId := some (stepRunId "agent" (some attempt)))
         -- Written while the run is still `running`, as soon as the agent names its conversation.
         -- The save after the loop is the one that normally lands it, but a task whose daemon is
         -- killed mid-run never reaches that save, and a record with no session id is one that
@@ -1079,7 +1253,7 @@ of its own.")
         (onSessionId := fun sid =>
           TaskStore.saveTask { initialRecord with sessionId := some sid, status := .running })
       IO.println s!"  Agent exited with code {result.exitCode}"
-      sessionId := result.sessionId
+      sessionId := result.sessionId.orElse fun _ => sessionId
       lastResultSubtype := result.resultSubtype
       if interactiveAgent then
         break
@@ -1102,6 +1276,7 @@ of its own.")
         break
       IO.println "  Running validation script..."
       let (valid, validationOutput) ← RepoConfig.runValidation session repoPath
+        (runId := some (stepRunId "validate" (some attempt)))
       lastValidationOutput := validationOutput
       if !validationOutput.isEmpty then
         IO.println s!"  Validation output:\n{validationOutput}"
@@ -1113,11 +1288,22 @@ of its own.")
       else
         IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
     -- 7. Run after hook and shut down MCP server
-    RepoConfig.runHook session repoPath "after.sh"
+    recordStep .after lastAttempt
+    RepoConfig.runHook session repoPath "after.sh" (runId := some (stepRunId "after"))
     -- Here as well as in the `finally`, so the agent's tool endpoint is gone before the task's
     -- bookkeeping runs rather than merely by the time the task is over. `shutdownOnce` is what
     -- makes saying it twice safe.
     shutdownOnce
+    -- 7b. Close the environment before the verdict is written, not after: until the pod is gone
+    -- the task can still be handed to the next daemon (which closes it again, and writes the
+    -- verdict itself), and the verdict is what tells it the task is over. `closeOnce` is the same
+    -- close the `finally` would make.
+    recordStep .closing lastAttempt
+    -- A close that fails is logged and the task goes on to its verdict, as it did when the close
+    -- was only in the `finally`: the claim on the issue is released and the status written either
+    -- way.
+    try closeOnce catch e =>
+      IO.eprintln s!"  Warning: closing the task's environment failed: {e}"
     -- 8. Persist final task state
     --
     -- A usage limit is checked before the result subtype, not after: the CLI reports the limit
@@ -1181,10 +1367,19 @@ of its own.")
     -- the half that brings the agent's work back.
     try shutdownOnce catch e =>
       IO.eprintln s!"  Warning: could not shut down the MCP server: {e}"
-    revokeKleis
     -- Closed however the task ended, including by exception: for a backend that holds a pod and a
-    -- copy of the workspace, this is what brings the work back and stops paying for it.
-    try session.close finally removeTaskCheckout
+    -- copy of the workspace, this is what brings the work back and stops paying for it. Before the
+    -- kleis token is revoked, not after: until the pod is gone the task may yet be handed to the
+    -- next daemon (`SessionSpec.beforeRelease`), whose agent goes on using that token.
+    try closeOnce finally
+      -- However the close went, the task is past the point another daemon could pick it up, and
+      -- nothing is left on record for one to try.
+      Exec.leaveReattachable taskId
+      try RunState.delete taskId catch _ => pure ()
+      if let (some kc, some minted) := (appConfig.kleis, ← kleisRef.get) then
+        try Kleis.revoke kc minted catch e =>
+          IO.eprintln s!"  Warning: could not revoke the task's kleis token: {e}"
+      removeTaskCheckout
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.
 
@@ -1200,11 +1395,13 @@ def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (slotOverride : Option Repo.SlotAssignment := none)
     (preresolvedAuth : Option String := none)
     (onStart : String → IO Unit := fun _ => pure ())
+    (handOverable : Bool := false)
+    (reattach : Option Reattach := none)
     : IO (String × TaskStore.TaskStatus × Option Lean.Json) := do
   let ((taskId, status), _, outputJson) ←
     runIOTask appConfig task.ioTask idx debug default
       continuesFrom series cancelToken interactive interactiveAgent slotOverride preresolvedAuth
-      onStart
+      onStart reattach handOverable
   return (taskId, status, outputJson)
 
 end Orchestra.TaskRunner

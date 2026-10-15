@@ -1,3 +1,5 @@
+import Std.Sync
+import Std.Data.HashSet
 import Orchestra.Exec.Spec
 import Lean.Data.Json
 
@@ -25,6 +27,13 @@ initialize stopRequestedRef : IO.Ref Bool ← IO.mkRef false
 def requestStop : IO Unit := stopRequestedRef.set true
 def stopRequested : IO Bool := stopRequestedRef.get
 
+/-- Set when the stop that was asked for is one that may hand tasks over: a termination signal, or
+    `orchestra queue shutdown --hand-off`. A plain `queue shutdown` drains, as it always did. -/
+initialize handOffRequestedRef : IO.Ref Bool ← IO.mkRef false
+
+def requestHandOff : IO Unit := handOffRequestedRef.set true
+def handOffRequested : IO Bool := handOffRequestedRef.get
+
 /-- How a backend says it has nowhere to run a task *yet*: the cluster is full, and nothing is
     wrong with the task. The daemon puts such an entry back to `pending` rather than failing it. -/
 def noRoomPrefix : String := "no room for the task yet"
@@ -32,6 +41,91 @@ def noRoomPrefix : String := "no room for the task yet"
 def noRoom (detail : String) : IO.Error := IO.userError s!"{noRoomPrefix}: {detail}"
 
 def isNoRoom (e : IO.Error) : Bool := (toString e).startsWith noRoomPrefix
+
+/-! ## Handing running tasks over to the next daemon
+
+A daemon asked to stop used to *drain*: stop claiming, wait for every running task to finish, then
+exit — for up to half an hour, after which it was killed anyway and the tasks with it. On a backend
+whose runs outlive the daemon (the kubernetes backend's detached runs, `Exec.Runner`) there is
+nothing to wait for: the agent, its build and its validation are processes in a pod that do not
+care whether the daemon is there, and the next daemon picks each task up where it is
+(`TaskRunner`, `Daemon.run`). So a stop *hands off* instead, as soon as every task still running is
+one that can be picked up again — and drains, as it always did, while any is not.
+
+"Can be picked up again" is a property of a task at a moment, not of a backend: a task opening its
+pod, or one whose environment is being torn down, is in the middle of something no other daemon
+could finish for it. Each task says so itself: `enterReattachable` once its state is on record and
+everything it does from there is re-doable (`TaskRunner`), `leaveReattachable` before the stretch
+where it is not. The daemon's decision and a task's leaving are serialised, and a task that tries to
+leave after the decision was taken simply stops there — the process is about to exit, and the next
+daemon will redo whatever it was going to do. That is what makes "every running task can be picked
+up" stay true from the moment it is decided until the exit. -/
+
+/-- The tasks, by task id, that are in a stretch the next daemon could pick up, and whether a
+    hand-off has been decided. Pure, so the rules can be tested without deciding a hand-off in the
+    test process; the daemon holds one behind a lock (`reattachableRef`). -/
+structure HandOffState where
+  reattachable : Std.HashSet String := {}
+  decided : Bool := false
+deriving Inhabited
+
+namespace HandOffState
+
+/-- `taskId` can be carried on by the next daemon from here. -/
+def enter (s : HandOffState) (taskId : String) : HandOffState :=
+  { s with reattachable := s.reattachable.insert taskId }
+
+/-- `taskId` is leaving that stretch: the new state, and whether it must stop where it is instead
+    because a hand-off was already decided (in which case nothing changes). -/
+def leave (s : HandOffState) (taskId : String) : HandOffState × Bool :=
+  if s.decided then (s, true) else ({ s with reattachable := s.reattachable.erase taskId }, false)
+
+/-- Decide a hand-off when every task in `running` can be carried on: the new state, and whether
+    it is decided. Never taken back once taken; never taken for an empty `running`, since a daemon
+    with nothing running simply exits. -/
+def decide (s : HandOffState) (running : Array String) : HandOffState × Bool :=
+  if s.decided then (s, true)
+  else if running.isEmpty || !running.all s.reattachable.contains then (s, false)
+  else ({ s with decided := true }, true)
+
+end HandOffState
+
+/-- The daemon's `HandOffState`. One lock for the decision and every task's leaving: see
+    `leaveReattachable`. -/
+initialize reattachableRef : Std.Mutex HandOffState ← Std.Mutex.new {}
+
+/-- `taskId` is now somewhere a daemon taking over could carry it on from. -/
+def enterReattachable (taskId : String) : IO Unit :=
+  reattachableRef.atomically (modify (·.enter taskId))
+
+/-- `taskId` is about to do something the next daemon could not pick up. Returns at once unless a
+    hand-off has already been decided, in which case it never returns: the process exits in a
+    moment, leaving the task where it was decided to be, which is where the next daemon looks. -/
+def leaveReattachable (taskId : String) : IO Unit := do
+  let frozen ← reattachableRef.atomically do
+    let (s, frozen) := (← get).leave taskId
+    set s
+    return frozen
+  if frozen then
+    repeat IO.sleep 1000
+
+/-- Decide a hand-off if every task in `running` can be picked up by the next daemon, and say
+    whether it was (`HandOffState.decide`). -/
+def tryHandOff (running : Array String) : IO Bool :=
+  reattachableRef.atomically do
+    let (s, decided) := (← get).decide running
+    set s
+    return decided
+
+/-- How a re-adopted task says it could not be picked up after all — its pod is gone, its server's
+    port is taken — so that the daemon falls back to what it does for any task a restart
+    interrupted (a continuation that resumes the conversation in a new pod) rather than failing it.
+    A prefix, the way `noRoom` is one. -/
+def reattachFailedPrefix : String := "could not pick the task up again"
+
+def reattachFailed (detail : String) : IO.Error := IO.userError s!"{reattachFailedPrefix}: {detail}"
+
+def isReattachFailed (e : IO.Error) : Bool := (toString e).startsWith reattachFailedPrefix
 
 /-- A run in progress, whatever is running it.
 
@@ -68,6 +162,12 @@ structure Handle where
   /-- What this run is called where the backend runs it — a pid, a container id, a pod name. For
       logs and for a human trying to find it by hand. -/
   id : String
+  /-- How many bytes at the start of `stdout` were already read once, by a daemon that has since
+      gone away: the run was started before this handle existed and is being followed again from
+      its beginning (`Exec.Runner`). Whoever reads the stream parses all of it — that is how the
+      state the old daemon held is rebuilt — and keeps this much off the console, where it was
+      printed the first time. Zero for every run this daemon started. -/
+  replayBytes : Nat := 0
 
 /-- Where the MCP server has to listen for this backend's agents to reach it.
 
@@ -102,6 +202,11 @@ structure ScriptSpec where
   /-- `.inherit` for the hooks, whose output belongs in the daemon log as it happens; `.piped` for
       `validation.sh`, whose output is fed back to the agent in the retry prompt. -/
   stdio : Stdio := .inherit
+  /-- What the backend calls this run, when it keeps runs past the daemon (`RunSpec.runId`): the
+      same id every time the same step of the same task is reached — `before-0`, `validate-1`,
+      `after` — so that a daemon coming back to the task attaches to the script the last one
+      started rather than running it twice. `none` picks a fresh one. -/
+  runId : Option String := none
 
 /-- What a script did. -/
 structure ScriptResult where
@@ -254,6 +359,14 @@ structure Session where
       Not a detail to leave to the agent CLI: the failure is a follow-up prompt ("now also handle
       the timeout case") answered by a model that has never seen what came before. -/
   carriesAgentState : Bool := true
+  /-- What another daemon needs to open this same environment again (`Backend.reattach`), or
+      `none` when it cannot be: an environment that dies with this process, or one that holds
+      nothing worth coming back to.
+
+      Only the backend reads it. The task runner stores it with the task's progress
+      (`Orchestra.RunState`) so that a daemon that comes back after a restart can find the pod, the
+      claim and the run helper the task was using, without opening — and paying for — a new one. -/
+  snapshot : Option Lean.Json := none
 
 /-- What an execution environment has to be opened with.
 
@@ -316,10 +429,28 @@ structure SessionSpec where
   /-- Whether the run has been called off. For a backend that may wait before the environment
       exists — for room on a cluster — so that a cancelled task stops waiting. -/
   cancelled : IO Bool := pure false
+  /-- Called by `Session.close` immediately before the environment is let go of for good — the
+      pod deleted — and after everything that comes back out of it is back.
+
+      For the task runner, whose task can be handed over to the next daemon while its environment
+      exists and not after: this is where it says so (`Exec.leaveReattachable`). A daemon that exits
+      before this point leaves a pod the next one can finish closing; one that exits after it would
+      leave a task with nowhere to be picked up from and its verdict not yet written. -/
+  beforeRelease : IO Unit := pure ()
   /-- How long a backend may wait for room before answering `noRoom`. Short: credentials minted
       for the task are already ticking, and an entry put back to `pending` loses nothing. Zero
       for someone waiting on the other end of a chat. -/
   roomWaitSeconds : Nat := 600
+
+/-- What `Backend.probe` found of an environment a previous daemon left. -/
+inductive ProbeResult where
+  /-- There, and ready to be reopened. -/
+  | alive
+  /-- Positively not there to be picked up, and why. -/
+  | gone (why : String)
+  /-- Could not be asked, and why. Not the same as `gone`. -/
+  | unknown (why : String)
+deriving Repr, BEq, Inhabited
 
 /-- One way of executing agents.
 
@@ -373,8 +504,27 @@ structure Backend where
       since leftovers that were not removed are a nuisance and a daemon that would not start is an
       outage. -/
   reclaim : (String → IO Bool) → IO Unit := fun _ => pure ()
+  /-- Remove whatever was opened for task `taskId`, and say whether it is confirmed gone. For the
+      daemon giving up on a task it was picking up again: a continuation of it may only take its
+      workspace once nothing of the old run can still be writing there. `true` for a backend whose
+      environments die with the process that opened them. -/
+  removeTask : String → IO Bool := fun _ => pure true
   /-- Open an environment for one task. -/
   openSession : SessionSpec → IO Session
+  /-- Open, again, an environment a previous daemon opened and left running: from its
+      `Session.snapshot`, and the same `SessionSpec` the task was opened with. Nothing is created
+      or copied — the environment is the one the task has been working in all along — and the
+      session handed back closes it the way the original would have.
+
+      `none` for a backend whose environments die with the process that opened them, which is
+      every backend that runs the agent on this machine. Throws when the environment is gone. -/
+  reattach : Option (Lean.Json → SessionSpec → IO Session) := none
+  /-- Whether the environment a snapshot names is still there to be reopened, asked of every
+      running task at startup before anything is decided about it (`Daemon.run`). `unknown` when
+      the place cannot be asked: the task is then picked up anyway, and its reopening tries again
+      (and falls back if it still cannot) — treating "could not ask" as "gone" would sweep up a
+      task whose agent is still working. -/
+  probe : Lean.Json → IO ProbeResult := fun _ => pure (.gone "this backend cannot reopen anything")
 
 namespace Handle
 

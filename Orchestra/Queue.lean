@@ -2,6 +2,7 @@ import Lean.Data.Json
 import Orchestra.Config
 import Orchestra.Store
 import Orchestra.TaskStore
+import Orchestra.RunState
 import Orchestra.Utils.Time
 
 /-!
@@ -1053,20 +1054,27 @@ def loadInterrupted : IO (Array String) := do
 def clearInterrupted : IO Unit := do
   try IO.FS.removeFile (← interruptedFile) catch _ => pure ()
 
+/-- Add `ids` to `interruptedFile`, for `resumeInterrupted`. Throws when it cannot be written. -/
+def recordInterrupted (ids : Array String) : IO Unit := do
+  if ids.isEmpty then return
+  IO.FS.createDirAll (← queueDir)
+  let h ← IO.FS.Handle.mk (← interruptedFile) .append
+  for id in ids do h.putStrLn id
+  h.flush
+
 /-- On daemon startup, mark any entries stuck in 'running' state as unfinished, and answer them
     (as now written). These are left over from a previous daemon that was killed mid-task. Their
     ids are added to `interruptedFile` first, for `resumeInterrupted`: an entry this sweep did not
-    touch was not interrupted by a restart and is not a restart's to pick up. -/
-def markStaleRunningAsUnfinished : IO (Array QueueEntry) := do
-  let stale ← runningEntries
+    touch was not interrupted by a restart and is not a restart's to pick up.
+
+    `keep` are the entries this daemon is picking up where the last one left them
+    (`adoptionDecision`): still running, and not interrupted at all. -/
+def markStaleRunningAsUnfinished (keep : Array String := #[]) : IO (Array QueueEntry) := do
+  let stale := (← runningEntries).filter (!keep.contains ·.id)
   -- Never at the cost of the sweep or the start: a list that could not be written means these
   -- runs are not resumed automatically, which is what every daemon before this did anyway.
   unless stale.isEmpty do
-    try
-      IO.FS.createDirAll (← queueDir)
-      let h ← IO.FS.Handle.mk (← interruptedFile) .append
-      for e in stale do h.putStrLn e.id
-      h.flush
+    try recordInterrupted (stale.map (·.id))
     catch e =>
       IO.eprintln s!"Could not record the interrupted entries; they will not be resumed: {e}"
   let mut swept := #[]
@@ -1075,6 +1083,53 @@ def markStaleRunningAsUnfinished : IO (Array QueueEntry) := do
     saveEntry e
     swept := swept.push e
   return swept
+
+/-! ## Picking running tasks up again
+
+A daemon that hands its running tasks over when it stops (`Exec.tryHandOff`) leaves them `running`,
+in environments that are still going, with where each had got to on record (`RunState`). The next
+daemon carries each one on (`TaskRunner.runIOTask`'s `reattach`) instead of sweeping it up as
+interrupted — as long as everything it needs to do that is there. This decides the part of that
+which needs nothing but the database; whether the environment itself is still there is asked of
+the backend afterwards (`Exec.Backend.probe`). An entry that is not picked up is swept and resumed
+exactly as before. -/
+
+/-- Whether a running entry is one a stopping daemon may hand to the next one at all: exactly the
+    entries `adoptionDecision` would not refuse for what they *are*. A concert step's workflow does
+    not survive the daemon, and an entry under an execution configuration of its own may be on a
+    backend the next daemon does not run — handing either over would only have it swept up as
+    interrupted, which is worse than draining it. `sameExecution` as for `adoptionDecision`. -/
+def handOverable (entry : QueueEntry) (sameExecution : Bool) : Bool :=
+  entry.concertStepKey.isNone && sameExecution
+
+/-- Whether `entry`, `running` when this daemon started, can be carried on from where it is, and
+    from what: the progress its run recorded, or why not.
+
+    `record` is the status of the entry's task record, `state` what `RunState.load` said for it,
+    `backend` this daemon's execution backend, and `sameExecution` whether the entry's own
+    `config_path` (if any) selects the same execution configuration as the daemon's. -/
+def adoptionDecision (entry : QueueEntry) (record : Option TaskStore.TaskStatus)
+    (state : Option (Except String RunState.RunState)) (backend : String) (sameExecution : Bool) :
+    Except String RunState.RunState := do
+  if entry.status != .running then throw "it is not running"
+  -- Its workflow's fiber died with the daemon, and `cancelStaleConcertEntries` is about to cancel
+  -- it; nothing would be waiting for its result.
+  if entry.concertStepKey.isSome then throw "it is a concert step, whose workflow did not survive"
+  if entry.taskId.isNone then throw "it never started a run"
+  match record with
+  | none => throw "its run has no record"
+  | some s => if s != .running then throw "its run is no longer running"
+  let some st := state
+    | throw "it left no record of where it was (its environment cannot be handed over, or it was \
+still being set up)"
+  let st ← match st with
+    | .ok s => pure s
+    | .error e => throw s!"its record of where it was cannot be read: {e}"
+  unless sameExecution do
+    throw "it runs under an execution configuration of its own, not this daemon's"
+  unless st.backend == backend do
+    throw s!"it ran on the '{st.backend}' backend, and this daemon runs '{backend}'"
+  return st
 
 /-! ## Resuming after a restart
 
@@ -1305,9 +1360,16 @@ def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (facts :
     id on it has been decided; one whose entry cannot be read is decided by being skipped.
 
     `execution` is the daemon's own (`ResumeFacts.sameExecution`), `now` the time in epoch
-    seconds. Every skip is logged with its reason. -/
-def resumeInterrupted (execution : ExecutionConfig) (now : Int) : IO Nat := do
-  let ids ← loadInterrupted
+    seconds. Every skip is logged with its reason.
+
+    `only` decides just those entries instead of the recorded list, and leaves the list alone: for
+    a task the daemon tried to pick up after a restart and could not (`Daemon.run`), which is
+    resumed on its own the moment that is known, without deciding anybody else's. -/
+def resumeInterrupted (execution : ExecutionConfig) (now : Int)
+    (only : Option (Array String) := none) : IO Nat := do
+  let ids ← match only with
+    | some ids => pure ids
+    | none => loadInterrupted
   if ids.isEmpty then return 0
   let all ← loadAllEntries
   let mut queued := 0
@@ -1347,7 +1409,10 @@ def resumeInterrupted (execution : ExecutionConfig) (now : Int) : IO Nat := do
     catch e =>
       IO.eprintln s!"  Could not resume interrupted entry {entryId}, keeping it for the next start: {e}"
       undecided := undecided.push entryId
-  if undecided.isEmpty then clearInterrupted
+  if only.isSome then
+    unless undecided.isEmpty do
+      IO.eprintln s!"  Left unfinished, undecided: {String.intercalate ", " undecided.toList}"
+  else if undecided.isEmpty then clearInterrupted
   else
     try IO.FS.writeFile (← interruptedFile) (String.intercalate "\n" undecided.toList ++ "\n")
     catch e => IO.eprintln s!"  Could not rewrite the list of interrupted entries: {e}"

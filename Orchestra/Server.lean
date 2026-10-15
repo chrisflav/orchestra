@@ -124,6 +124,54 @@ structure State where
       created a repository push to it. -/
   kleis : Option KleisConfig := none
 
+
+/-! ## Across a daemon restart
+
+A task whose agent outlives the daemon (`Exec.Runner`) keeps talking to the same address after a
+restart: its MCP client is a relay that dials the server again when the connection drops
+(`McpEndpoint.relayScript`), with the token it was given at launch. So the next daemon serves the
+task on the **same port with the same token** (`start`'s `exactPort`, `TaskRunner`), and two things
+here keep that working:
+
+* the ports of tasks about to be picked up are set aside before any new task can be handed one
+  (`reservePorts`), since a range (`mcp_ports`) is shared by every task the daemon runs;
+* a daemon handing its tasks over stops running tool calls, answers each new one at once with an
+  error that says to try again shortly, and waits for the ones already running to finish
+  (`beginHandOff`, `toolCallsInFlight`) — a call the old server had started and never answered
+  would otherwise leave the agent waiting on a reply that cannot come. -/
+
+/-- Ports a task this daemon is picking up again is going to ask for by number, kept out of the
+    range search until it has. -/
+initialize reservedPortsRef : IO.Ref (Std.HashSet UInt16) ← IO.mkRef {}
+
+/-- Keep `ports` for the tasks that will ask for them by number. -/
+def reservePorts (ports : Array UInt16) : IO Unit :=
+  reservedPortsRef.modify fun s => ports.foldl (·.insert ·) s
+
+/-- Give a reserved port back to the range: its task has its server, or will never ask. -/
+def releasePort (port : UInt16) : IO Unit :=
+  reservedPortsRef.modify (·.erase port)
+
+/-- Set once the daemon has decided to hand its tasks over. -/
+initialize handOffRef : IO.Ref Bool ← IO.mkRef false
+
+/-- Tool calls being run right now, across every task's server. -/
+initialize inFlightRef : IO.Ref Nat ← IO.mkRef 0
+
+/-- Stop running tool calls: every one that arrives from now on is answered with an error saying
+    the daemon is restarting (`handOffReply`), and nothing is started that the exit could cut off
+    half way. -/
+def beginHandOff : IO Unit := handOffRef.set true
+
+/-- How many tool calls are still being run, for a hand-off waiting until there are none. -/
+def toolCallsInFlight : IO Nat := inFlightRef.get
+
+/-- What a tool call that arrives during a hand-off is told. An error result rather than a
+    JSON-RPC error, so the agent reads it as the tool's answer and can act on it. -/
+def handOffReply : String :=
+  "orchestra is restarting, so this tool call was not run. Your tools come back by themselves \
+in a minute or two: try the call again then. Nothing else about your task is affected."
+
 private def log (msg : String) : IO Unit := do
   let err ← IO.getStderr
   err.putStrLn s!"[mcp] {msg}"
@@ -1098,10 +1146,25 @@ private def handleClient (state : State) (client : Socket) : IO Unit := do
           match parseRequest msg with
           | none => pure ()
           | some req =>
-            match ← evalRequest state req with
-            | none => pure ()
-            | some response =>
-              let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
+            -- A tool call is counted from before it runs until its answer is sent, so a hand-off
+            -- waiting for `toolCallsInFlight` to reach zero waits for the answer too; and one
+            -- that arrives once the hand-off has begun is not run at all (`handOffReply`). Counted
+            -- *before* the hand-off flag is read: read first, a call could pass the check, the
+            -- hand-off could then see zero in flight and exit, and the call would be cut off.
+            let counted := req matches .toolsCall ..
+            if counted then inFlightRef.modify (· + 1)
+            try
+              let refused ← if counted then handOffRef.get else pure false
+              let response? ← if refused then
+                  match req with
+                  | .toolsCall id _ =>
+                    pure (some (jsonrpcResult id (toolContent handOffReply (isError := true))))
+                  | _ => pure none
+                else evalRequest state req
+              if let some response := response? then
+                let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
+            finally
+              if counted then inFlightRef.modify (· - 1)
 
 /-- Parse a dotted-quad address. `none` for anything else, including a hostname: this binds a
     socket, and a name would have to be resolved to do that. -/
@@ -1125,9 +1188,14 @@ def parseIPv4? (s : String) : Option IPv4Addr :=
     `bindHost` is loopback unless the execution backend says the agent runs somewhere that cannot
     reach loopback (`Exec.Backend.exposure`). Binding wider is only ever done together with
     `State.authToken`; the two are decided in one place, `Exec.mcpBinding`, so that neither can be
-    set without the other. -/
+    set without the other.
+
+    `exactPort` is for a task this daemon picked up from the one before (`TaskRunner`): its agent's
+    relay dials the port it was given at launch, so that port and no other — and failing to get it
+    is an error, since a server anywhere else is one the agent never finds. -/
 def start (state : State) (bindHost : String := "127.0.0.1")
-    (portRange : Option (UInt16 × UInt16) := none) : IO (UInt16 × IO Unit) := do
+    (portRange : Option (UInt16 × UInt16) := none)
+    (exactPort : Option UInt16 := none) : IO (UInt16 × IO Unit) := do
   let bindAddr := match parseIPv4? bindHost with
     | some a => a
     | none   =>
@@ -1149,16 +1217,24 @@ def start (state : State) (bindHost : String := "127.0.0.1")
       sock.listen 8
       return some sock
     catch _ => return none
-  let server ← match portRange with
-    | none =>
+  let server ← match exactPort, portRange with
+    | some p, _ =>
+      match ← listenOn p with
+      | some sock => pure sock
+      | none => throw (IO.userError s!"could not listen on port {p} again for this task's MCP \
+server; its agent's tools are configured for that port and no other")
+    | none, none =>
       match ← listenOn 0 with
       | some sock => pure sock
       | none      => throw (IO.userError "could not listen for this task's MCP server")
-    | some (lo, hi) => do
+    | none, some (lo, hi) => do
+      let reserved ← reservedPortsRef.get
       let mut found : Option Socket := none
       for i in List.range (hi.toNat + 1 - lo.toNat) do
-        if found.isNone then
-          found ← listenOn (UInt16.ofNat (lo.toNat + i))
+        let candidate := UInt16.ofNat (lo.toNat + i)
+        -- Promised to a task being picked up again, which will ask for it by number.
+        if found.isNone && !reserved.contains candidate then
+          found ← listenOn candidate
       match found with
       | some sock => pure sock
       | none =>
@@ -1170,6 +1246,11 @@ def start (state : State) (bindHost : String := "127.0.0.1")
   let port := match localAddr with
     | .v4 a => a.port | .v6 a => a.port
   let running ← IO.mkRef true
+  -- The connections being served, so that a shutdown ends them as well as the listener: a client
+  -- still connected to a server that is gone is served by nothing, and one told so (EOF) can dial
+  -- again — which is what an agent's relay does (`McpEndpoint.relayScript`).
+  let clients ← IO.mkRef (#[] : Array (Nat × Socket))
+  let nextClient ← IO.mkRef (0 : Nat)
   let _acceptTask ← IO.asTask (prio := .dedicated) do
     while ← running.get do
       -- `result?`, not `result!`: `cancelAccept` drops the pending promise rather than resolving
@@ -1181,13 +1262,20 @@ def start (state : State) (bindHost : String := "127.0.0.1")
       | some (.error _) => break
       | some (.ok client) =>
         if !(← running.get) then break
+        let n ← nextClient.modifyGet fun n => (n, n + 1)
+        clients.modify (·.push (n, client))
         let _ ← IO.asTask (prio := .dedicated) do
           log "client connected"
           try handleClient state client
           catch _ => pure ()
+          clients.modify (·.filter (·.1 != n))
           log "client disconnected"
   let shutdown : IO Unit := do
     running.set false
+    for (_, c) in ← clients.modifyGet fun cs => (cs, #[]) do
+      -- In the background: a client that is not reading must not hold the shutdown up.
+      discard <| IO.asTask (prio := .dedicated) do
+        try awaitTcp (← c.shutdown) catch _ => pure ()
     -- Cancel the `accept` the loop is sitting in. This is the half that actually frees the
     -- listening socket: the pending promise resolves as an error, the loop takes its `break`,
     -- and the reference it held goes with its frame. Nothing here closes the socket by hand

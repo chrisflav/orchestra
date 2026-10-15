@@ -1,7 +1,7 @@
 import Db
 
 /-!
-# `0004_kleis_source`
+# `0005_kleis_source`
 
 Adds a task's kleis source and narrowings (`docs/kleis.md`) to `task` and `queue_entry`: the
 `{{secret}}` reference of a token the task names (`kleis_token` — the reference, never a token),
@@ -13,8 +13,8 @@ own, and no narrowing.
 
 namespace Orchestra.Store.Migrations
 
-def migration_0004_kleis_source : Db.Migration.Migration where
-  name := "0004_kleis_source"
+def migration_0005_kleis_source : Db.Migration.Migration where
+  name := "0005_kleis_source"
   steps := [
     .addColumn "task" "kleis_token" { type := .text, nullable := true },
     .addColumn "task" "kleis_spec" { type := .text, nullable := true },

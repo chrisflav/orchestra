@@ -253,7 +253,7 @@ def theTokenTransportEscapesWhatItInterpolates : Test := do
   -- Belt and braces: even reaching `stdioCommand` directly, the host lands as one word.
   let (cmd, args) := McpEndpoint.stdioCommand
     { host := "orchestra.internal", port := 4711, token := some "deadbeef" }
-  TestM.assertEqual cmd "sh" (msg := "a shell, because `nc` cannot send the token first")
+  TestM.assertEqual cmd "bash" (msg := "a shell, because `nc` cannot send the token first")
   let script := (args.getD 1 "")
   TestM.assert (AgentDef.containsCI script "deadbeef") "the token is in the script"
   TestM.assert (AgentDef.containsCI script "orchestra.internal") "and so is the host"

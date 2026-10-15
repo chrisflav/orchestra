@@ -36,6 +36,7 @@ import Orchestra.TaskRunner
 import Orchestra.Store
 import Orchestra.Store.Import
 import Orchestra.TaskStore
+import Orchestra.RunState
 import Orchestra.Usage
 import Orchestra.Workflow
 import Orchestra.WorkflowParser

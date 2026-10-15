@@ -924,6 +924,16 @@ structure QueueConfig where
       `orchestra queue retry`, which would start over. Off leaves those entries `unfinished`,
       which is what every daemon did before this existed. -/
   resumeAfterRestart : Bool := true
+  /-- Whether running tasks survive a daemon restart: handed over when the daemon is asked to stop
+      rather than drained, and picked up again — same pod, same agent, same validation run — by
+      the daemon that starts next.
+
+      On by default. It only ever applies to tasks on a backend whose runs outlive
+      the daemon (the kubernetes backend with `task_volumes`, `Exec.Backend.reattach`) that a
+      signal or `queue shutdown --hand-off` stops; every other task drains on a stop and is resumed
+      by `resumeAfterRestart` as before. Off, a stop drains everything and a start picks nothing
+      up, which is what every daemon before this did. -/
+  reattachAfterRestart : Bool := true
 deriving Repr, Inhabited
 
 instance : FromJson QueueConfig where
@@ -933,8 +943,10 @@ instance : FromJson QueueConfig where
     let parallel := j.getObjValAs? Nat "parallel" |>.toOption |>.getD 1
     let parallelPerRepo := j.getObjValAs? Nat "parallel_per_repo" |>.toOption |>.getD 1
     let resumeAfterRestart := j.getObjValAs? Bool "resume_after_restart" |>.toOption |>.getD true
+    let reattachAfterRestart :=
+      j.getObjValAs? Bool "reattach_after_restart" |>.toOption |>.getD true
     return { parallel := max 1 parallel, parallelPerRepo := max 1 parallelPerRepo,
-             resumeAfterRestart }
+             resumeAfterRestart, reattachAfterRestart }
 
 /-- What bounds interactive sessions: the `interactive` block in `config.json`.
 
