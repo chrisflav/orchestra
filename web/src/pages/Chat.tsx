@@ -31,6 +31,22 @@ function turnState(session: SessionDetail): {
   canInterrupt: boolean;
   note: string;
 } {
+  // A resident takes every turn through its inbox: one written while it is busy, asleep or paused is
+  // queued and handed over when it can take it, so the box stays open whatever it is doing.
+  if (session.resident) {
+    switch (session.status) {
+      case "running":
+        return { canType: true, canInterrupt: true, note: "Working; what you write now is queued." };
+      case "paused":
+        return {
+          canType: true,
+          canInterrupt: false,
+          note: `Paused (${session.pausedReason ?? "no reason recorded"}); what you write is queued.`,
+        };
+      default:
+        return { canType: true, canInterrupt: false, note: "" };
+    }
+  }
   switch (session.status) {
     case "idle":
       return { canType: true, canInterrupt: false, note: "" };
@@ -251,7 +267,7 @@ export function Chat() {
                   end={<Status status={s.status} />}
                   meta={[
                     s.id,
-                    s.fork,
+                    s.resident ? `resident ${s.resident}` : s.fork ?? "no repository",
                     `${s.turnCount} turn${s.turnCount === 1 ? "" : "s"}`,
                     <Time key="t" iso={s.lastActivityAt} />,
                   ]}
@@ -454,7 +470,9 @@ export function ChatDetail() {
           <Facts
             items={[
               { key: "Status", value: <Status status={session.status} /> },
-              { key: "Repository", value: session.fork },
+              session.resident
+                ? { key: "Resident", value: session.resident }
+                : { key: "Repository", value: session.fork ?? "none" },
               { key: "Backend", value: session.backend },
               // The model as it was asked for, not as the agent resolved it: a session started
               // without one runs on the backend's default, and saying "—" is the honest way to

@@ -383,6 +383,10 @@ export type SessionStatus =
   | "running"
   /** Nothing running, conversation intact: posting a turn starts an agent again and resumes it. */
   | "dormant"
+  /** A resident asleep with its environment kept: the next turn starts a process in it. */
+  | "warm"
+  /** A resident that is not woken until `pausedReason` is gone; its inbox keeps filling. */
+  | "paused"
   | "ended"
   | "failed";
 
@@ -392,8 +396,9 @@ export interface SessionSummary {
   createdAt: string;
   lastActivityAt: string;
   endedAt: string | null;
-  upstream: string;
-  fork: string;
+  /** Both null for a session without a repository, such as a resident's. */
+  upstream: string | null;
+  fork: string | null;
   backend: string;
   model: string | null;
   turnCount: number;
@@ -404,6 +409,10 @@ export interface SessionSummary {
   error: string | null;
   /** Who the session is held as, when it is held as anyone but the instance itself. */
   identity: string | null;
+  /** The resident this session is, when it is one: its turns go through the resident's inbox. */
+  resident: string | null;
+  /** Why a paused resident is paused: `budget:<day>`, `failed` or `operator`. */
+  pausedReason: string | null;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -663,10 +672,20 @@ export async function startSession(request: SessionRequest): Promise<SessionDeta
   return (await (await sessionCall(path, "POST", request)).json()) as SessionDetail;
 }
 
+/** What posting a turn answers: the seq it landed at, or, for a resident that could not take it
+ *  yet, the inbox item it waits as and why. */
+export interface TurnPosted {
+  id: string;
+  seq?: number;
+  queued?: boolean;
+  inboxItem?: number;
+  why?: string;
+}
+
 /** Post a turn. Answers the seq it was written at, so a reader knows where it landed. */
-export async function sendTurn(id: string, text: string): Promise<{ id: string; seq: number }> {
+export async function sendTurn(id: string, text: string): Promise<TurnPosted> {
   const path = `/api/${API_VERSION}/interactive/${encodeURIComponent(id)}/messages`;
-  return (await (await sessionCall(path, "POST", { text })).json()) as { id: string; seq: number };
+  return (await (await sessionCall(path, "POST", { text })).json()) as TurnPosted;
 }
 
 /** Abandon the turn in flight. The session, the clone and the conversation all survive. */

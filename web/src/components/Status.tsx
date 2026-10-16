@@ -29,6 +29,10 @@ const SECTION: Record<string, Section> = {
   // Waiting, like `idle` — the difference is whether an agent is up for it, which is the
   // daemon's business rather than the conversation's.
   dormant: "pending",
+  // A resident asleep with its environment kept is waiting like a dormant session; a paused one is
+  // held back from working, which is the same section a blocked task is in.
+  warm: "pending",
+  paused: "failed",
   ended: "done",
 };
 

@@ -225,3 +225,79 @@ way to run an agent, with a repository, credentials and tools, to a surface gate
 shared secret that already grants every read and every write. No separate credential and no
 additional gate: the same secret, the same cookie, the same content-type rule as every other
 write.
+
+## residents
+
+A **resident** is an identity with one session that never ends — the design is
+[`design/resident-sessions.md`](design/resident-sessions.md); what is built so far is its phase 1.
+An identity becomes one with a `resident` block in its `identity.json`:
+
+```json
+{
+  "name": "secretary",
+  "kleis_spec": "secretary",
+  "resident": {
+    "budget_per_day": 20,
+    "process_idle_seconds": 1800,
+    "pod_idle_seconds": 21600,
+    "batch_window_seconds": 3,
+    "model": "claude-opus-5-5"
+  }
+}
+```
+
+Every field is optional and falls back to the `residents` block of `config.json`: `enabled`
+(`true`), `budget_per_day` (`100`, USD), `process_idle_seconds` (`1800`), `pod_idle_seconds`
+(`21600`), `batch_window_seconds` (`3`), `timezone` (`"UTC"`, for the budget day), `max_awake`
+(`4`, residents with a process at once, counted apart from `interactive.max_sessions`),
+`max_turns_per_hour` (`60`) and `volume_size` (the backend's own size when absent). The block
+may carry `tools`, `agent` (the backend) and `feeds`; it may not carry `upstream` or `fork`. Feeds
+are read and ignored for now — the Zulip feed is the next phase — so a resident is reached
+through its inbox: the chat, and listeners with `deliver_to`.
+
+**One session, by name, never ended.** At start-up the daemon creates each resident's session
+asleep (id `resident-<name>`, no process), with no repository: a scratch workspace kept across
+wakes (`<data>/workspaces/sessions/<id>` on landrun, its task volume on Kubernetes), no clone
+slot, no repository-scoped tools, and the repository-less form of the kleis task facts. Its
+kleis token is derived from the identity's source at every cold wake. What ends or fails another
+session puts a resident to sleep instead — a dead process, a turn that could not be written, a
+failed wake — and the next delivery wakes it, with a backoff; three failures in a row pause it
+(`paused: failed`) until an operator resumes it. `DELETE /api/v1/interactive/{id}` is refused for
+it. Only `orchestra resident reset` ends its conversation, by starting a new one in the same
+session: the memory directory and the inbox carry over.
+
+**The inbox.** Everything a resident is handed goes through `resident_inbox`: a person's message
+(source `human`), a listener event (`listener:<name>`). Items are unique per
+`(resident, source, event_id)`, so a source that replays delivers once. The daemon's delivery
+loop, once a second, waits `batch_window_seconds` from the oldest ready item (not at all when a
+person is waiting), wakes the resident if needed, renders every ready item into **one turn** and
+marks them `sent_in` it; the turn's `result` marks them `confirmed`. A turn that never got a
+result leaves its items ready, and the next turn carries them again headed "these may have
+reached you already; your previous turn was interrupted". A message posted to a resident's
+session (`POST /interactive/{id}/messages` or `/residents/{name}/messages`) is queued rather than
+refused while it is busy: the answer is the turn's `seq` once it is sent, or `queued` with the
+inbox item and why.
+
+**The day's budget** is enforced by the process: every agent process a resident starts gets
+`--max-budget-usd` = what is left of today's `budget_per_day` (spend is recorded per turn in
+`resident_spend`). A process whose budget day has rolled over is restarted before its next turn,
+to pick up the new allowance. A spent day pauses the resident (`paused: budget:<day>`); its inbox
+keeps filling and the next day it is woken with everything that arrived.
+
+**Asleep: warm, then cold.** After `process_idle_seconds` idle the agent process is stopped and
+everything else kept — the environment (on Kubernetes, the pod), the MCP server, the credentials:
+`warm`, and the next turn is a process start (`--resume`). After `pod_idle_seconds` the
+environment goes too: `cold` (`dormant` on the record), and the next turn is a full wake. A warm
+resident whose kleis token expires within two hours is woken cold instead, for a new one. On
+Kubernetes a resident's pod has no `deadline_seconds`, and its task volume — keyed by its session
+— is labelled `orchestra.dev/resident` and exempt from `retention_days`. A volume lost anyway (or
+a backend that keeps none) starts a fresh conversation in the same session, said in the
+transcript and at the head of the next turn. A daemon stop puts residents to sleep cold.
+
+**`deliver_to`.** A listener action may name `"deliver_to": "<resident>"` instead of queueing a
+task: each event's rendered `prompt_template` becomes an inbox item from `listener:<name>`, keyed
+by the event's id, and is marked untrusted unless the action says `"trusted": true`.
+
+**Control.** `orchestra resident list|show|inbox|pause|resume|reset <name>` and
+`orchestra resident send <name> <text…>` go through the API (`/api/v1/residents…`), as
+`orchestra chat` does; `orchestra chat --resident <name>` attaches to its session.
