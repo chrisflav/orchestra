@@ -1257,7 +1257,19 @@ holding the rest of this tick until the window moves"
                     {scope} ({label}) → {entry.id}"
               continue
             | _ => pure ()
-            if let some wfPath := liveCfg.action.workflowPath then
+            if let some resident := liveCfg.action.deliverTo then
+              -- Into a resident's inbox instead of the queue (`docs/design/resident-sessions.md`
+              -- §5.5). Deduplicated by the event's id, so an event a dying tick already delivered
+              -- is not delivered twice; the delivery loop hands it over.
+              let (source, itemEvent, trusted, payload) :=
+                Listener.inboxItemFor liveCfg.action vars name eventId (← TaskStore.generateId)
+              match ← Resident.insert resident source itemEvent trusted payload with
+              | some item =>
+                noteDispatch
+                IO.println s!"  Listener '{name}': delivered event {itemEvent} to resident \
+{resident} (inbox item {item})"
+              | none => pure ()
+            else if let some wfPath := liveCfg.action.workflowPath then
               -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
               let resolvedPath := Listener.renderTemplate wfPath vars
               try

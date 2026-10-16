@@ -16,6 +16,7 @@
       "name": "interactive",
       "description": "Chat sessions the daemon holds open. A session is a conversation with an agent, bound to a repository and running in the same sandbox with the same credentials and MCP tools a task would get. Unlike a task it stays up between turns: the clone slot, the MCP server and the agent process are acquired once and kept, so a turn costs a line on a pipe rather than a process start.\n\nThe four routes that do something rather than read something forward to the daemon over its control socket, which is not on the network. Each answers `409` when the daemon is not reachable or refuses — a statement about the daemon rather than about this server. The reads come off disk instead, so they answer whether the daemon is busy, restarting or gone."
     },
+    { "name": "residents", "description": "Identities with one session that never ends (`docs/design/resident-sessions.md`). A resident is addressed by name; what reaches it goes through its inbox, which hands it over as one turn when it can take one, waking it first. Its transcript is its session's, under `interactive`." },
     { "name": "session", "description": "Acquiring and releasing a credential." },
     { "name": "queue", "description": "Work waiting, running, and the concerts it belongs to." },
     { "name": "tasks", "description": "Runs that happened, and their logs." },
@@ -321,8 +322,7 @@
                 "schema": {
                   "type": "object",
                   "required": [
-                    "id",
-                    "seq"
+                    "id"
                   ],
                   "properties": {
                     "id": {
@@ -330,8 +330,11 @@
                     },
                     "seq": {
                       "type": "integer",
-                      "description": "Where the turn landed in the transcript."
-                    }
+                      "description": "Where the turn landed in the transcript. Absent when the session is a resident's and the message was queued in its inbox."
+                    },
+                    "queued": { "type": "boolean", "description": "A resident's session that could not take the turn yet: it is in the inbox." },
+                    "inboxItem": { "type": "integer" },
+                    "why": { "type": "string" }
                   }
                 }
               }
@@ -416,6 +419,156 @@
           "415": {
             "$ref": "#/components/responses/UnsupportedMediaType"
           }
+        }
+      }
+    },
+    "/api/v1/residents": {
+      "get": {
+        "tags": ["residents"],
+        "summary": "List residents",
+        "description": "Every resident session (`docs/design/resident-sessions.md`): an identity with a `resident` block has one session, by name, that never ends. `state` is what it is doing — `running`, `idle`, `warm` (process stopped, environment kept), `cold` (nothing held), `waking` or `paused` (`pausedReason` says why: `budget:<day>`, `failed`, `operator`). `inboxReady` counts what is waiting to be handed over; `spentToday` is against `budgetPerDay` on `budgetDay`.",
+        "operationId": "listResidents",
+        "parameters": [
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/offset" }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of residents.",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/residents/{name}": {
+      "get": {
+        "tags": ["residents"],
+        "summary": "One resident",
+        "description": "The resident's state, as in the list, and the twenty most recent items of its inbox. Its transcript is its session's: `GET /api/v1/interactive/{sessionId}/events`.",
+        "operationId": "getResident",
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "description": "The resident's name, which is its identity's.", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "The resident.",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/residents/{name}/inbox": {
+      "get": {
+        "tags": ["residents"],
+        "summary": "A resident's inbox",
+        "description": "The most recent inbox items, newest first. An item is `waiting` until it is written into a turn, `sent` once it is (with the turn and the transcript `sentSeq`), and `confirmed` once that turn produced a result. A sent item whose turn was interrupted is handed over again.",
+        "operationId": "getResidentInbox",
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "description": "The resident's name.", "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/limit" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The inbox.",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/residents/{name}/messages": {
+      "post": {
+        "tags": ["residents"],
+        "summary": "Say something to a resident",
+        "description": "Through its inbox: handed over at once, with whatever else is ready, if the resident can take a turn — waking it first if it is asleep — and queued otherwise. Once sent, `seq` is where the turn landed in the session's transcript; while queued, `inboxItem` is the item and `why` says what it waits for. `POST /api/v1/interactive/{id}/messages` on a resident's session does the same.",
+        "operationId": "sendResidentMessage",
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "description": "The resident's name.", "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "required": ["text"], "properties": { "text": { "type": "string" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Sent, or queued.",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "name": { "type": "string" }, "sessionId": { "type": "string" },
+              "queued": { "type": "boolean" }, "seq": { "type": "integer" },
+              "inboxItem": { "type": "integer" }, "why": { "type": "string" } } } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      }
+    },
+    "/api/v1/residents/{name}/pause": {
+      "post": {
+        "tags": ["residents"],
+        "summary": "Pause a resident",
+        "description": "Until an operator resumes it. A turn in flight is abandoned and its items handed over again on resume; the inbox keeps filling.",
+        "operationId": "pauseResident",
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "description": "The resident's name.", "schema": { "type": "string" } }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false } } } },
+        "responses": {
+          "200": { "description": "Paused.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      }
+    },
+    "/api/v1/residents/{name}/resume": {
+      "post": {
+        "tags": ["residents"],
+        "summary": "Resume a paused resident",
+        "description": "Lifts a pause, whatever its reason — the day's budget, three failures in a row, an operator — and forgets the failures. The next delivery wakes it.",
+        "operationId": "resumeResident",
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "description": "The resident's name.", "schema": { "type": "string" } }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false } } } },
+        "responses": {
+          "200": { "description": "Resumed.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      }
+    },
+    "/api/v1/residents/{name}/reset": {
+      "post": {
+        "tags": ["residents"],
+        "summary": "Start a resident's conversation over",
+        "description": "The only way a resident's conversation ends: its process is stopped and the next turn starts a new conversation in the same session. The identity's memory directory carries over, and so does whatever is waiting in the inbox.",
+        "operationId": "resetResident",
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "description": "The resident's name.", "schema": { "type": "string" } }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false } } } },
+        "responses": {
+          "200": { "description": "Reset.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
         }
       }
     },

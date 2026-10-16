@@ -288,6 +288,14 @@ structure ActionConfig where
       from this block (`buildRoleEntry`), so a dispatched role takes its policy from its own
       `spawn_policy` field. -/
   spawnPolicy    : Option SpawnPolicy := none
+  /-- Hand each event to this resident's inbox instead of queueing a task
+      (`docs/design/resident-sessions.md` §5.5): the rendered `prompt_template` becomes an inbox
+      item from `listener:<name>`, keyed by the event's id so a replayed event is delivered once.
+      Every task field is then unused. -/
+  deliverTo      : Option String := none
+  /-- Whether what `deliver_to` hands the resident is from a trusted source — one it may take
+      instructions from. Off by default: a listener relays what other people wrote. -/
+  trusted        : Bool := false
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -318,6 +326,8 @@ instance : ToJson ActionConfig where
     let fields := if let some n := a.issueNumber  then fields ++ [("issue_number",   Json.str n)]          else fields
     let fields := if !a.prLabels.isEmpty          then fields ++ [("pr_labels",      ToJson.toJson a.prLabels)] else fields
     let fields := if let some p := a.spawnPolicy  then fields ++ [("spawn_policy",   ToJson.toJson p)]         else fields
+    let fields := if let some r := a.deliverTo    then fields ++ [("deliver_to",     Json.str r)]               else fields
+    let fields := if a.trusted                    then fields ++ [("trusted",        Json.bool true)]           else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -360,9 +370,20 @@ instance : FromJson ActionConfig where
     -- Strict, for the same reason: a swallowed spec or narrowing changes what the tasks reach.
     let kleisSpec ← parseKleisSpec? j
     let kleisNarrow ← parseKleisNarrow? j
+    let deliverTo ← match j.getObjVal? "deliver_to" with
+      | .error _ => pure none
+      | .ok v => match (FromJson.fromJson? v : Except String String) with
+        | .ok r => do
+          if let .error e := Utils.checkConfigName "deliver_to resident" r then throw e
+          pure (some r)
+        | .error _ => throw "'deliver_to' must name a resident"
+    if deliverTo.isSome && workflowPath.isSome then
+      throw "an action delivers to a resident (deliver_to) or starts a workflow (workflow_path), not both"
+    let trusted := j.getObjValAs? Bool "trusted" |>.toOption |>.getD false
+    let kleisNarrow ← parseKleisNarrow? j
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
              budget, memory, identity, kleisSpec, kleisNarrow, authSource, authSources, authMode, tools, readOnly, priority,
-             workflowPath, issueNumber, prLabels, spawnPolicy }
+             workflowPath, issueNumber, prLabels, spawnPolicy, deliverTo, trusted }
 
 -- Dispatch rate limits
 
@@ -883,6 +904,19 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
     spawnPolicy  := action.spawnPolicy
     listenerName
   }
+
+/-- What one event becomes in a resident's inbox when the action names `deliver_to`: the source
+    (`listener:<name>`), the event id it is deduplicated by, whether it is trusted, and the payload
+    the turn renders — the action's `prompt_template` rendered with the event's variables, and the
+    variables themselves. An event with no id of its own gets `fallbackId`. -/
+def inboxItemFor (action : ActionConfig) (vars : List (String × String)) (listenerName : String)
+    (eventId fallbackId : String) : String × String × Bool × Json :=
+  let text := renderTemplate action.promptTemplate vars
+  let payload := Json.mkObj [
+    ("text", .str text), ("listener", .str listenerName),
+    ("vars", Json.mkObj (vars.map fun (k, v) => (k, Json.str v)))]
+  (s!"listener:{listenerName}", if eventId.isEmpty then fallbackId else eventId, action.trusted,
+   payload)
 
 -- GitHub helpers
 
