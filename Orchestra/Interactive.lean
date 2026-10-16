@@ -238,13 +238,14 @@ private def onAgentEvent (mgr : Manager) (s : LiveSession) (event : Event) : IO 
     let total := costBase + processTotal
     let _ ← append s (.turnEnded r.turnCount (subtypeName sub) (some (total - r.costUsd))
                                  (durationMs.map (· / 1000)))
-    update s fun r => { r with
-      status  := if r.status.isTerminal || r.status == .paused then r.status else .idle
-      costUsd := total }
     if let some (name, _) := s.resident then
       -- The turn's cost goes against the budget day it ended on, and the items it carried are
       -- handed over — unless it ended on the day's cap, in which case they may well not have been
       -- read to the end and are carried again tomorrow (`docs/design/resident-sessions.md` §8).
+      --
+      -- All of it *before* the record reads `idle`: `idle` is what lets the delivery loop hand
+      -- over the next turn, and one that looked at the inbox between the two would find this
+      -- turn's items still unconfirmed and carry them again as if the turn had been interrupted.
       let day ← Resident.today mgr.cfg.residents.timezone
       try Resident.addSpend name day (total - r.costUsd)
       catch e => IO.eprintln s!"resident {name}: could not record a turn's spend: {e}"
@@ -252,14 +253,23 @@ private def onAgentEvent (mgr : Manager) (s : LiveSession) (event : Event) : IO 
         let _ ← append s (.notice "warning"
           s!"the day's budget is spent; the resident is paused until the next budget day ({day} \
 is over) and its inbox keeps filling meanwhile")
-        update s fun r => { r with status := .paused, pausedReason := some s!"budget:{day}" }
+        update s fun r => { r with
+          costUsd := total
+          status := if r.status.isTerminal then r.status else .paused
+          pausedReason := some s!"budget:{day}" }
       else
         try discard <| Resident.confirm name r.turnCount
         catch e => IO.eprintln s!"resident {name}: could not confirm turn {r.turnCount}: {e}"
         mgr.residentState.atomically <| modify fun m => match m.get? name with
           | some rt => m.insert name { rt with failures := 0, retryAfter := 0 }
           | none    => m
+        update s fun r => { r with
+          status  := if r.status.isTerminal || r.status == .paused then r.status else .idle
+          costUsd := total }
       return
+    update s fun r => { r with
+      status  := if r.status.isTerminal || r.status == .paused then r.status else .idle
+      costUsd := total }
     -- A budget the session has spent is the session over, not a turn that went badly: the CLI
     -- will refuse every turn after it, and a session that answers nothing while still reading
     -- `idle` is worse than one that says it is finished.
@@ -1289,11 +1299,20 @@ private def Manager.relaunch (mgr : Manager) (s : LiveSession) (budget : Float) 
 private def Manager.handTurn (mgr : Manager) (name : String) (s : LiveSession)
     (items : Array Resident.InboxItem) : IO Delivery := do
   let some stream ← s.stream.get | return .waiting "the resident has no process"
-  let notes ← s.notes.get
-  let text := Resident.renderTurn items notes
-  let turn ← match ← claimTurn s text with
+  let turn ← match ← claimTurn s (Resident.renderTurn items) with
     | .error e => return .waiting e
     | .ok t    => pure t
+  -- Read again now that this turn is claimed: what was ready a moment ago may have been
+  -- confirmed since by the turn that was still finishing, and carrying it again would hand it
+  -- over twice under a note saying the last turn was interrupted when it was not.
+  let items ← Resident.ready name
+  if items.isEmpty then
+    update s fun r => { r with
+      status := if r.status == .running then .idle else r.status
+      turnCount := r.turnCount - 1 }
+    return .nothing
+  let notes ← s.notes.get
+  let text := Resident.renderTurn items notes
   s.notes.set []
   let ids := items.toList.map (·.id)
   let seq ← append s (.user text)

@@ -1793,12 +1793,17 @@ persisted one)"
 A resident is an identity with one session that never ends (`docs/design/resident-sessions.md`).
 Everything here goes through the API, as `orchestra chat` does. -/
 
+/-- Dollars to the cent. -/
+private def usd (x : Float) : String :=
+  let cents := (x * 100.0).round.toUInt64.toNat
+  s!"${cents / 100}.{if cents % 100 < 10 then "0" else ""}{cents % 100}"
+
 private def residentLine (r : Lean.Json) : String :=
   let paused := match (r.getObjValAs? String "pausedReason").toOption with
     | some why => s!" ({why})"
     | none => ""
   let budget := match (r.getObjValAs? Float "budgetPerDay").toOption with
-    | some b => s!"${(r.getObjValAs? Float "spentToday").toOption.getD 0.0} of ${b}"
+    | some b => s!"{usd ((r.getObjValAs? Float "spentToday").toOption.getD 0.0)} of {usd b}"
     | none   => "not configured"
   s!"{padRight (Client.str r "name") 20} {padRight (Client.str r "state" ++ paused) 22} \
 {padRight (toString (Client.nat r "inboxReady")) 6} {budget}"
