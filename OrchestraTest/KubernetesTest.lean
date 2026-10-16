@@ -983,4 +983,32 @@ def aKnownDeadPredecessorGetsNoGrace : Test := do
   TestM.assert (!holderStillWorking (inUseValue "t-0" 1000) 1100 720 (some false) (deadTasks := ["t-1", "t-0"]))
     "the earlier run a workspace was found under gets no grace either, when known to be over"
 
+/-! ## A resident's environment
+
+A resident's pod is kept for hours while it is warm and its volume for as long as it is a resident
+(`docs/design/resident-sessions.md` §9), so neither the pod deadline nor retention may touch them. -/
+
+@[test]
+def aResidentsClaimIsLabelledSizedAndExemptFromRetention : Test := do
+  let tv := tvConfig.taskVolumes.getD {}
+  let spec := { sampleSession with resident := some "secretary", volumeSize := some "5Gi" }
+  let s := (workspaceClaimManifest tvConfig tv spec "orchestra-ws-0" "resident-secretary" 1).compress
+  TestM.assert (AgentDef.containsCI s s!"\"{residentLabel}\":\"secretary\"")
+    "labelled as the resident's"
+  TestM.assert (AgentDef.containsCI s "\"storage\":\"5Gi\"") "with the residents' volume size"
+  TestM.assert (AgentDef.containsCI retentionSelector s!"!{residentLabel}")
+    "and the retention sweep selects every workspace claim but a resident's"
+  let plain := (workspaceClaimManifest tvConfig tv sampleSession "orchestra-ws-1" "t-1" 1).compress
+  TestM.assert (!AgentDef.containsCI plain residentLabel) "a task's claim is not a resident's"
+  TestM.assert (AgentDef.containsCI plain "\"storage\":\"30Gi\"") "and keeps the configured size"
+
+@[test]
+def aResidentsPodHasNoDeadline : Test := do
+  let spec := { sampleSession with resident := some "secretary" }
+  let m := podManifest (config) spec "orchestra-abc123" (imageOf (config) spec) staged
+  TestM.assert (!AgentDef.containsCI m.compress "activeDeadlineSeconds")
+    "warm sleep keeps it on purpose; going cold deletes it"
+  TestM.assert (AgentDef.containsCI manifest.compress "activeDeadlineSeconds")
+    "a task's pod still has one"
+
 end OrchestraTest.Kubernetes

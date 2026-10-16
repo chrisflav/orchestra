@@ -45,3 +45,4 @@ import OrchestraTest.IdentityTest
 import OrchestraTest.StoreTest
 import OrchestraTest.QueryTest
 import OrchestraTest.RestartResumeTest
+import OrchestraTest.ResidentTest

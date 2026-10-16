@@ -20,7 +20,7 @@ inductive Command where
   | inbox (name : String)
   /-- Say something to it, through its inbox. -/
   | send (name : String) (text : String)
-deriving Repr, BEq
+deriving Repr, BEq, DecidableEq
 
 /-- The verbs, in the order the usage line names them. -/
 def verbs : List String := ["list", "show", "pause", "resume", "reset", "inbox", "send"]

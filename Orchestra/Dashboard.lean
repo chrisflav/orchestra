@@ -2335,6 +2335,7 @@ checks the two against each other, so a route added without a spec entry fails t
 /-- The OpenAPI description of this API, embedded from `docs/openapi.json`. -/
 def openApiSpec : String := include_str "../docs/openapi.json"
 
+
 /-- Where the spec is served, and the prefix everything it describes lives under. -/
 def apiVersion : String := "v1"
 
