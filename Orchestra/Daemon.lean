@@ -89,6 +89,10 @@ def handleSocketRequest
     (reapIfAbandoned  : String → IO Bool)
     (interactive      : Interactive.Manager)
     : IO Unit := do
+  let residentReply : Except String Interactive.HumanOutcome → IO DaemonRequest.DaemonResponse
+    | .ok (.sent seq)        => pure (.withId (toString seq))
+    | .ok (.queued item why) => pure (.queued item why)
+    | .error e               => pure (.error e)
   try
     let line ← conn.recvLine
     let response : DaemonRequest.DaemonResponse ← match Lean.Json.parse line with
@@ -189,8 +193,23 @@ Marked unfinished.")
           | .ok record => pure (.withId record.id)
           | .error e   => pure (.error e)
         | .interactiveMessage id text =>
-          match ← interactive.send appConfig id text debug with
-          | .ok seq  => pure (.withId (toString seq))
+          -- A resident's turns go through its inbox: a person writing while it is busy is
+          -- queued rather than refused (`docs/design/resident-sessions.md` §4.2).
+          match ← (try (·.bind (·.resident)) <$> Interactive.loadSession id catch _ => pure none) with
+          | some name => residentReply (← interactive.residentMessage appConfig name text debug)
+          | none =>
+            match ← interactive.send appConfig id text debug with
+            | .ok seq  => pure (.withId (toString seq))
+            | .error e => pure (.error e)
+        | .residentMessage name text =>
+          residentReply (← interactive.residentMessage appConfig name text debug)
+        | .residentControl name action =>
+          let result ← match action with
+            | "pause"  => interactive.pauseResident name
+            | "resume" => interactive.resumeResident name
+            | _        => interactive.resetResident name
+          match result with
+          | .ok ()   => pure (.withId name)
           | .error e => pure (.error e)
         | .interactiveInterrupt id =>
           match ← interactive.interrupt id with
@@ -227,7 +246,7 @@ def isLeftoverStatus (task : Option TaskStore.TaskStatus)
     (session : Option Interactive.SessionStatus) : Bool :=
   match task, session with
   | some t, _    => t != .running
-  | none, some s => s == .dormant || s.isTerminal
+  | none, some s => s == .dormant || s == .paused || s.isTerminal
   | none, none   => false
 
 /-- `isLeftoverStatus`, for the id as the database has it. An id that cannot even be looked up — a
@@ -537,11 +556,16 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
     finally claimMutex.unlock
   let interactive ← Interactive.Manager.new
     { maxSessions        := appConfig.interactive.maxSessions
-      idleTimeoutSeconds := appConfig.interactive.idleTimeoutSeconds }
+      idleTimeoutSeconds := appConfig.interactive.idleTimeoutSeconds
+      residents          := appConfig.residents }
     reserveInteractiveSlot releaseInteractiveSlot
   -- Sessions on disk describe agent processes that died with the last daemon. Closed before
   -- anything can read them, so a client never attaches to a conversation that will not answer.
   Interactive.reconcile
+  -- Each resident's session, created asleep if it has none (`docs/design/resident-sessions.md`
+  -- §3.1), before anything can address one by name. Never at the cost of the start.
+  try interactive.refreshResidents
+  catch e => IO.eprintln s!"Could not prepare the residents: {e}"
   -- What the last daemon left running on the execution backend — pods, for kubernetes — goes
   -- now: after the sweeps and `Interactive.reconcile`, so every run and session this database
   -- knows of has stopped being `running`, and before the first worker or session of this daemon
@@ -1380,6 +1404,20 @@ holds it. Marked unfinished."
       for _ in List.range 30 do
         if ← shutdownToken.isCancelled then break
         IO.sleep 1000
+  -- The residents' delivery loop: once a second, hand each resident what its inbox holds when it
+  -- can take it (`Interactive.Manager.deliver`), and now and again re-read which identities are
+  -- residents. Its own fiber, for the reaper's reason: a delivery may wake a resident, which takes
+  -- as long as starting a session does.
+  let _residentLoop ← IO.asTask (prio := .dedicated) do
+    let mut ticks := 0
+    while !(← shutdownToken.isCancelled) do
+      if ticks % 30 == 29 then
+        try interactive.refreshResidents
+        catch e => IO.eprintln s!"  Resident refresh error: {e}"
+      try interactive.tickResidents appConfig cfg.debug
+      catch e => IO.eprintln s!"  Resident delivery error: {e}"
+      ticks := ticks + 1
+      IO.sleep 1000
   -- Queue worker loop: claim and run one entry at a time.
   -- Spawning parallelLimit copies of this loop enables parallel execution.
   let workerLoop : IO Unit := do

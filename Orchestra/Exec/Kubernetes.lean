@@ -636,9 +636,12 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
       ] ++ (match cfg.imagePullPolicy with
             | some p => [("imagePullPolicy", Json.str p)] | none => []))])]
     | _, _ => []
+  -- A resident's pod has no deadline: warm sleep keeps it for hours on purpose, and it is
+  -- deleted when the resident goes cold rather than when a clock runs out.
+  let deadline : List (String × Json) :=
+    if spec.resident.isSome then [] else [("activeDeadlineSeconds", .num cfg.deadlineSeconds)]
   let podSpec := Json.mkObj ([
-    ("restartPolicy", .str "Never"),
-    ("activeDeadlineSeconds", .num cfg.deadlineSeconds),
+    ("restartPolicy", .str "Never")] ++ deadline ++ [
     ("containers", .arr #[container]),
     ("volumes", .arr volumes)
   ] ++ initContainers ++ (match cfg.serviceAccount with
@@ -1075,6 +1078,14 @@ def lastUsedAnnotation : String := "orchestra.dev/last-used"
 /-- The value of `inUseAnnotation` for `taskId`, taken at `now`. -/
 def inUseValue (taskId : String) (now : Nat) : String := s!"{labelValue taskId}@{now}"
 
+/-- The label marking a workspace claim as a resident's: kept whatever its age, because a resident's
+    conversation is meant to outlive any retention window (`docs/design/resident-sessions.md` §9). -/
+def residentLabel : String := "orchestra.dev/resident"
+
+/-- The selector `sweepWorkspaceClaims` deletes from: every workspace claim but a resident's. -/
+def retentionSelector : String :=
+  s!"app.kubernetes.io/managed-by=orchestra,orchestra.dev/kind=workspace,!{residentLabel}"
+
 /-- The claim a new task chain is given: labelled for the task that made it, and marked in use by it
     from the moment it exists, so there is no instant at which another task could take it. -/
 def workspaceClaimManifest (cfg : Config) (tv : TaskVolumes) (spec : SessionSpec)
@@ -1091,12 +1102,15 @@ def workspaceClaimManifest (cfg : Config) (tv : TaskVolumes) (spec : SessionSpec
         (taskLabel taskId, .str "1")]
         ++ (match spec.repo with
             | some r => [("orchestra.dev/repo", Json.str (labelValue (r.replace "/" ".")))]
+            | none   => [])
+        ++ (match spec.resident with
+            | some n => [(residentLabel, Json.str (labelValue n))]
             | none   => []))),
       ("annotations", Json.mkObj [(lastUsedAnnotation, .str (toString now)),
         (inUseAnnotation, .str (inUseValue taskId now))])]),
     ("spec", Json.mkObj ([
       ("accessModes", .arr #[.str "ReadWriteOnce"]),
-      ("resources", Json.mkObj [("requests", Json.mkObj [("storage", .str tv.size)])])]
+      ("resources", Json.mkObj [("requests", Json.mkObj [("storage", .str (spec.volumeSize.getD tv.size))])])]
       ++ (match tv.storageClass with
           | some c => [("storageClassName", Json.str c)] | none => [])))]
 
@@ -1190,8 +1204,7 @@ private def holderAlive (cfg : Config) (inUse : String) (now : Nat)
     however old its last-use stamp, and so is one already on its way out. -/
 private def sweepWorkspaceClaims (cfg : Config) (tv : TaskVolumes) : IO Unit := do
   try
-    let .ok rows ← listClaims cfg "app.kubernetes.io/managed-by=orchestra,orchestra.dev/kind=workspace"
-      | return
+    let .ok rows ← listClaims cfg retentionSelector | return
     let now ← epochNow
     let cutoff := max 1 tv.retentionDays * 86400
     for r in rows do
@@ -1701,6 +1714,7 @@ marked until it does"
     -- when the pod is, so a task cannot continue one an earlier task started; on a task volume,
     -- home is the chain's own and outlives the pod.
     carriesAgentState := volume.isSome
+    workspaceReused := match volume with | some (_, _, reused) => reused | none => false
     -- Only a task on a task volume is worth coming back to: its tree and conversation are on the
     -- claim, and so is everything the next daemon's `close` has to finish with. A pod without one
     -- has nothing a new daemon could copy back to the slot it came from (see `docs/kubernetes.md`).

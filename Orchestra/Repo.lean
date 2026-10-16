@@ -641,6 +641,16 @@ def ensureTaskWorkspace (taskId : String) (base : Option System.FilePath := none
   IO.FS.createDirAll path
   return path
 
+/-- The scratch workspace of a session without a repository — a resident — on a backend that runs
+    the agent on this machine: `<workspaces>/sessions/<id>`. Created if missing and never emptied,
+    unlike every other workspace here: a resident's session does not end, and what it left in its
+    workspace yesterday is part of the conversation it is still having. -/
+def ensureSessionWorkspace (id : String) (base : Option System.FilePath := none)
+    : IO System.FilePath := do
+  let path := (← resolveWorkspaceBase base) / "sessions" / id
+  IO.FS.createDirAll path
+  return path
+
 /-- Remove a per-task checkout or workspace. Never throws: what is left behind is replaced the next
     time the same id is prepared, and costs disk, not correctness. -/
 def removeTaskDir (path : System.FilePath) : IO Unit := do

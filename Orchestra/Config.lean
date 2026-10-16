@@ -970,6 +970,60 @@ instance : FromJson InteractiveConfig where
       j.getObjValAs? Nat "idle_timeout_seconds" |>.toOption |>.getD 1800
     return { maxSessions, idleTimeoutSeconds }
 
+/-- What bounds resident sessions (`docs/design/resident-sessions.md`): the `residents` block in
+    `config.json`. The defaults every identity's `resident` block falls back to, and the limits
+    that hold across all of them.
+
+    Separate from `interactive` on purpose: a resident is not a conversation somebody opened and
+    may abandon, it is one the configuration keeps, and the number of them awake at once is a
+    question about how many agent processes the daemon may hold for them — counted apart from
+    `interactive.max_sessions`, so a person opening a chat is never refused because the secretary
+    is up. -/
+structure ResidentsConfig where
+  /-- Off: no resident is created, woken or delivered to. Their records stay as they are. -/
+  enabled : Bool := true
+  /-- A day's spend, in USD, for a resident whose block names none. -/
+  budgetPerDay : Float := 100.0
+  /-- How long an idle resident keeps its agent process before it is stopped (warm sleep). -/
+  processIdleSeconds : Nat := 1800
+  /-- How long an asleep resident keeps its environment — its pod — before that goes too (cold). -/
+  podIdleSeconds : Nat := 21600
+  /-- How long the delivery loop waits after the oldest ready item before it hands the batch over. -/
+  batchWindowSeconds : Nat := 3
+  /-- The time zone the budget day rolls over in, as `TZ` takes it. -/
+  timezone : String := "UTC"
+  /-- Residents that may have an agent process at once. -/
+  maxAwake : Nat := 4
+  /-- The size of a resident's task volume, where the execution backend keeps one. `none` is the
+      backend's own `task_volumes.size`. -/
+  volumeSize : Option String := none
+  /-- Turns a resident may be handed in any hour: a bound on a loop with another bot. -/
+  maxTurnsPerHour : Nat := 60
+deriving Repr, Inhabited
+
+instance : FromJson ResidentsConfig where
+  fromJson? j := do
+    let d : ResidentsConfig := {}
+    let nat (k : String) (dflt : Nat) : Nat := j.getObjValAs? Nat k |>.toOption |>.getD dflt
+    -- Strict about the one field that bounds spending: a budget that did not parse and fell back
+    -- to the default would be a hundred dollars a day nobody chose.
+    let budgetPerDay ← match j.getObjVal? "budget_per_day" with
+      | .error _ => pure d.budgetPerDay
+      | .ok v => match v.getNum? with
+        | .ok n => pure n.toFloat
+        | .error _ => throw "residents.budget_per_day must be a number of USD"
+    if budgetPerDay < 0.0 then throw "residents.budget_per_day must not be negative"
+    return {
+      enabled := j.getObjValAs? Bool "enabled" |>.toOption |>.getD d.enabled
+      budgetPerDay
+      processIdleSeconds := nat "process_idle_seconds" d.processIdleSeconds
+      podIdleSeconds     := nat "pod_idle_seconds" d.podIdleSeconds
+      batchWindowSeconds := nat "batch_window_seconds" d.batchWindowSeconds
+      timezone := j.getObjValAs? String "timezone" |>.toOption |>.getD d.timezone
+      maxAwake := max 1 (nat "max_awake" d.maxAwake)
+      volumeSize := j.getObjValAs? String "volume_size" |>.toOption
+      maxTurnsPerHour := max 1 (nat "max_turns_per_hour" d.maxTurnsPerHour) }
+
 /-- A GitHub personal access token and the repositories it is the right token for.
 
     Keyed by repository rather than named per task the way `AuthSource` is, because which PAT is
@@ -1210,6 +1264,8 @@ structure AppConfig where
   execution : ExecutionConfig := {}
   /-- What bounds interactive sessions. -/
   interactive : InteractiveConfig := {}
+  /-- Defaults and limits for resident sessions. -/
+  residents : ResidentsConfig := {}
   /-- The kleis proxy agents reach GitHub through, instead of holding a token themselves. -/
   kleis : Option KleisConfig := none
 deriving Repr
@@ -1257,6 +1313,10 @@ unique"
     let queue := j.getObjValAs? QueueConfig "queue" |>.toOption |>.getD {}
     let execution := j.getObjValAs? ExecutionConfig "execution" |>.toOption |>.getD {}
     let interactive := j.getObjValAs? InteractiveConfig "interactive" |>.toOption |>.getD {}
+    -- Strict when present, like `kleis`: the block carries the daily budget.
+    let residents ← match j.getObjVal? "residents" with
+      | .error _ => pure {}
+      | .ok v    => (FromJson.fromJson? v : Except String ResidentsConfig)
     let defaultOrganization := j.getObjValAs? String "default_organization" |>.toOption
     -- Strict when present: a `kleis` block that failed to parse and was dropped would put the
     -- GitHub App's token back into every sandbox, which is the thing the block exists to stop.
@@ -1266,7 +1326,7 @@ unique"
     return { appId, privateKeyPath, installationId, pat, patEntries, pluginDirs,
              claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
              agentAuthConfigs, additionalSandboxPaths, taxis, queue, execution, interactive,
-             defaultOrganization, kleis }
+             residents, defaultOrganization, kleis }
 
 /-- The configured PAT source covering `repo`, or `none` when only the global `github.pat` does.
 

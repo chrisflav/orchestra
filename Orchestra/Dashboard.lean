@@ -1178,8 +1178,8 @@ private def interactiveSummaryJson (r : Interactive.SessionRecord) : Json :=
     ("createdAt",      normIso r.createdAt),
     ("lastActivityAt", normIso r.lastActivityAt),
     ("endedAt",        optNormIso r.endedAt),
-    ("upstream",       Json.str r.upstream.toString),
-    ("fork",           Json.str r.fork.toString),
+    ("upstream",       optStr (r.upstream.map toString)),
+    ("fork",           optStr (r.fork.map toString)),
     ("backend",        Json.str r.backend),
     ("model",          optStr r.model),
     ("turnCount",      ToJson.toJson r.turnCount),
@@ -1189,7 +1189,10 @@ private def interactiveSummaryJson (r : Interactive.SessionRecord) : Json :=
     ("error",          optStr r.error),
     -- Who the session is being held as (`Orchestra.Identity`), so a list of conversations says
     -- which of them are speaking on the tracker as somebody other than orchestra.
-    ("identity",       optStr r.identity)
+    ("identity",       optStr r.identity),
+    -- The resident this session is, when it is one, and why it is paused, when it is.
+    ("resident",       optStr r.resident),
+    ("pausedReason",   optStr r.pausedReason)
   ]
 
 private def interactiveApi (p : Page) : IO Json := do
@@ -1204,8 +1207,8 @@ private def interactiveDetailApi (id : String) : IO (Option Json) := do
     ("createdAt",      normIso r.createdAt),
     ("lastActivityAt", normIso r.lastActivityAt),
     ("endedAt",        optNormIso r.endedAt),
-    ("upstream",       Json.str r.upstream.toString),
-    ("fork",           Json.str r.fork.toString),
+    ("upstream",       optStr (r.upstream.map toString)),
+    ("fork",           optStr (r.fork.map toString)),
     ("backend",        Json.str r.backend),
     ("model",          optStr r.model),
     ("budget",         ToJson.toJson r.budget),
@@ -1217,7 +1220,10 @@ private def interactiveDetailApi (id : String) : IO (Option Json) := do
     ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
     ("title",          optStr r.title),
     ("error",          optStr r.error),
-    ("identity",       optStr r.identity)
+    ("identity",       optStr r.identity),
+    -- The resident this session is, when it is one, and why it is paused, when it is.
+    ("resident",       optStr r.resident),
+    ("pausedReason",   optStr r.pausedReason)
   ]
 
 /-- A page of the transcript, from a cursor.

@@ -79,6 +79,92 @@ can hand its own identity onwards but cannot put on another one.
 
 namespace Orchestra.Identity
 
+/-- An identity's `resident` block: what makes it a resident, with one session that never ends
+    (`docs/design/resident-sessions.md`). Every field is optional; what is absent falls back to the
+    `residents` block of `config.json` (`ResidentSpec.settings`).
+
+    `feeds` is read and kept, not acted on: the feeds themselves — Zulip first — are a later phase,
+    and a block written for them should not stop the resident from working without them. -/
+structure ResidentSpec where
+  budgetPerDay : Option Float := none
+  processIdleSeconds : Option Nat := none
+  podIdleSeconds : Option Nat := none
+  batchWindowSeconds : Option Nat := none
+  model : Option String := none
+  /-- Optional tools its MCP server grants; `none` is every one a repository-less session can use. -/
+  tools : Option (List String) := none
+  /-- The agent backend, as a session's `backend`. -/
+  agent : Option String := none
+  /-- The feeds, as written. Not acted on yet. -/
+  feeds : Array Json := #[]
+deriving Inhabited
+
+/-- A resident's settings with every default filled in. -/
+structure ResidentSettings where
+  budgetPerDay : Float
+  processIdleSeconds : Nat
+  podIdleSeconds : Nat
+  batchWindowSeconds : Nat
+  model : Option String
+  tools : Option (List String)
+  agent : String
+deriving Inhabited, Repr
+
+/-- The block's own values, and the configuration's where it has none. -/
+def ResidentSpec.settings (r : ResidentSpec) (cfg : ResidentsConfig) : ResidentSettings :=
+  { budgetPerDay       := r.budgetPerDay.getD cfg.budgetPerDay
+    processIdleSeconds := r.processIdleSeconds.getD cfg.processIdleSeconds
+    -- Never shorter than the process stage: the pod outliving its process is what warm means.
+    podIdleSeconds     := max (r.podIdleSeconds.getD cfg.podIdleSeconds)
+                            (r.processIdleSeconds.getD cfg.processIdleSeconds)
+    batchWindowSeconds := r.batchWindowSeconds.getD cfg.batchWindowSeconds
+    model := r.model, tools := r.tools, agent := r.agent.getD "claude" }
+
+/-- Read a `resident` block. Strict: a block that half-parsed would be a resident running on
+    defaults nobody wrote — a hundred dollars a day instead of the five the operator asked for. -/
+def parseResidentSpec (who : String) (j : Json) : Except String ResidentSpec := do
+  let .obj kvs := j | throw s!"{who}: 'resident' must be an object"
+  for key in ["upstream", "fork"] do
+    if (j.getObjVal? key).isOk then
+      throw s!"{who}: a resident has no repository, so its block may not set '{key}'"
+  let known := ["budget_per_day", "process_idle_seconds", "pod_idle_seconds",
+    "batch_window_seconds", "model", "tools", "agent", "feeds"]
+  for (k, _) in kvs.toArray do
+    unless known.contains k do
+      throw s!"{who}: unknown field '{k}' in 'resident' (known: {", ".intercalate known})"
+  let optNat (k : String) : Except String (Option Nat) := match j.getObjVal? k with
+    | .error _ => pure none
+    | .ok v => match (FromJson.fromJson? v : Except String Nat) with
+      | .ok n => pure (some n)
+      | .error _ => throw s!"{who}: resident.{k} must be a whole number of seconds"
+  let optStr (k : String) : Except String (Option String) := match j.getObjVal? k with
+    | .error _ => pure none
+    | .ok v => match (FromJson.fromJson? v : Except String String) with
+      | .ok s => pure (if s.trimAscii.isEmpty then none else some s)
+      | .error _ => throw s!"{who}: resident.{k} must be a string"
+  let budgetPerDay ← match j.getObjVal? "budget_per_day" with
+    | .error _ => pure none
+    | .ok v => match v.getNum? with
+      | .ok n =>
+        let f := n.toFloat
+        if f < 0.0 then throw s!"{who}: resident.budget_per_day must not be negative"
+        pure (some f)
+      | .error _ => throw s!"{who}: resident.budget_per_day must be a number of USD"
+  let tools ← match j.getObjVal? "tools" with
+    | .error _ => pure none
+    | .ok v => match (FromJson.fromJson? v : Except String (List String)) with
+      | .ok ts => pure (some ts)
+      | .error _ => throw s!"{who}: resident.tools must be a list of tool names"
+  let feeds ← match j.getObjVal? "feeds" with
+    | .error _ => pure #[]
+    | .ok (.arr fs) => pure fs
+    | .ok _ => throw s!"{who}: resident.feeds must be a list"
+  return { budgetPerDay, tools, feeds
+           processIdleSeconds := ← optNat "process_idle_seconds"
+           podIdleSeconds     := ← optNat "pod_idle_seconds"
+           batchWindowSeconds := ← optNat "batch_window_seconds"
+           model := ← optStr "model", agent := ← optStr "agent" }
+
 /-- One identity, as configuration writes it and as a task carries it. -/
 structure Identity where
   /-- The name a task, role or listener action refers to it by, and the file it is stored in. -/
@@ -116,6 +202,8 @@ structure Identity where
       its own `AGENTS.md` and orchestra has no business overwriting it, or leaving a file in a
       working tree that the agent would then have to remember not to commit. -/
   agents : Option String := none
+  /-- The identity's `resident` block, when it is a resident (`ResidentSpec`). -/
+  resident : Option ResidentSpec := none
 deriving Inhabited
 
 /-- Hand-written so the token cannot be printed. `deriving Repr` would put it in whatever a
@@ -203,7 +291,10 @@ orchestra, or fill it in"
       throw s!"identity '{name}' names both a 'kleis_spec' and a 'kleis_token'; an identity has \
 one source"
     let kleisNarrow ← parseKleisNarrow? j s!"identity '{name}': kleis_narrow"
-    return { name, description, taxisToken, kleisSpec, kleisToken, kleisNarrow }
+    let resident ← match j.getObjVal? "resident" with
+      | .error _ => pure none
+      | .ok v    => some <$> parseResidentSpec s!"identity '{name}'" v
+    return { name, description, taxisToken, kleisSpec, kleisToken, kleisNarrow, resident }
 
 /-! ## Filesystem layout -/
 

@@ -359,6 +359,12 @@ structure Session where
       Not a detail to leave to the agent CLI: the failure is a follow-up prompt ("now also handle
       the timeout case") answered by a model that has never seen what came before. -/
   carriesAgentState : Bool := true
+  /-- Whether the workspace this environment opened on is one a predecessor left — the tree and
+      agent home `continuesFrom` asked for — rather than a fresh one. `true` for a backend that
+      keeps no workspaces of its own: there the agent's home is this machine's, and nothing of it
+      is lost between runs. A resident reads it to tell a woken conversation from one whose volume
+      was lost (`docs/design/resident-sessions.md` §9). -/
+  workspaceReused : Bool := true
   /-- What another daemon needs to open this same environment again (`Backend.reattach`), or
       `none` when it cannot be: an environment that dies with this process, or one that holds
       nothing worth coming back to.
@@ -441,6 +447,13 @@ structure SessionSpec where
       for the task are already ticking, and an entry put back to `pending` loses nothing. Zero
       for someone waiting on the other end of a chat. -/
   roomWaitSeconds : Nat := 600
+  /-- The resident this environment is for, by name, when it is one. A backend that keeps
+      workspaces keeps a resident's whatever its age — exempt from retention — and does not bound
+      how long the environment may live, since a resident's warm sleep keeps it for hours
+      (`docs/design/resident-sessions.md` §9). -/
+  resident : Option String := none
+  /-- The size of a new workspace volume, where the backend makes one; `none` is its own default. -/
+  volumeSize : Option String := none
 
 /-- What `Backend.probe` found of an environment a previous daemon left. -/
 inductive ProbeResult where

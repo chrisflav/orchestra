@@ -305,7 +305,7 @@ def aTaskWithNoIdentityQueuesTasksWithNone : Test := do
 def aSessionRecordRoundTripsTheIdentity : Test := do
   let record : Interactive.SessionRecord :=
     { id := "s1", createdAt := "2026-01-01T00:00:00Z", lastActivityAt := "2026-01-01T00:00:00Z"
-    , upstream := { owner := "o", name := "r" }, fork := { owner := "o", name := "r" }
+    , upstream := some { owner := "o", name := "r" }, fork := some { owner := "o", name := "r" }
     , identity := some "maintainer" }
   match (FromJson.fromJson? (ToJson.toJson record) : Except String Interactive.SessionRecord) with
   | .error e => TestM.fail s!"session record did not decode: {e}"

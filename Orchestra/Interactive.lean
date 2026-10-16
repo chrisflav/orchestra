@@ -8,7 +8,9 @@ import Orchestra.Identity
 import Orchestra.Secret
 import Orchestra.TaskRunner
 import Orchestra.Usage
+import Orchestra.Resident.Inbox
 import Std.Sync
+import Std.Data.HashMap
 
 open Lean (Json)
 
@@ -57,12 +59,16 @@ structure Config where
   maxSessions : Nat := 2
   /-- How long a session may sit without a turn before it is closed. -/
   idleTimeoutSeconds : Nat := 1800
+  /-- Defaults and limits for resident sessions (`docs/design/resident-sessions.md`). -/
+  residents : ResidentsConfig := {}
 
 /-- A session the daemon is holding right now. Its on-disk record is the durable half; this is
     the half that cannot be written down. -/
 structure LiveSession where
   id : String
-  fork : Repository
+  /-- The fork whose clone slot this session holds; `none` for a session without a repository,
+      which holds none. -/
+  fork : Option Repository
   slot : Nat
   /-- The record as it currently stands. Written through to disk under `lock`. -/
   record : IO.Ref SessionRecord
@@ -71,7 +77,9 @@ structure LiveSession where
       Both the pump thread and whichever thread posted a turn append, and a seq handed to two
       events is a transcript a cursor cannot read. -/
   lock : Std.BaseMutex
-  stream : Sandbox.StreamingSession
+  /-- The agent process. `none` while the session is `warm`: a resident's process stopped with
+      its environment kept, to be started again in it (`launch`). -/
+  stream : IO.Ref (Option Sandbox.StreamingSession)
   /-- The environment the agent lives in, held for as long as the conversation is.
 
       One session, not one per turn, for the same reason the process is one: a conversation is a
@@ -79,12 +87,41 @@ structure LiveSession where
       carried there once. Released by `teardown`, which is also what brings it back. -/
   exec : Exec.Session
   /-- What the session had spent before this process started. See `onAgentEvent`. -/
-  costBase : Float
+  costBase : IO.Ref Float
   /-- Shuts down this session's MCP server. -/
   shutdownMcp : IO Unit
   /-- The authentication source this session is spending against, if one was resolved. -/
-  authLabel : Option String
+  authLabel : IO.Ref (Option String)
   backend : String
+  /-- Start an agent process in this environment: the conversation to resume, if any, and the
+      most it may spend. What `acquire` launches the first process with, and what waking a warm
+      resident launches the next one with — the environment, the MCP server and the credentials
+      are the ones already held. -/
+  launch : Option String → Float → IO (Except String Sandbox.StreamingSession)
+  /-- The resident this session is, with its settings, when it is one. -/
+  resident : Option (String × Identity.ResidentSettings) := none
+  /-- The budget day the running process's allowance (`--max-budget-usd`) was computed for. A
+      process whose day is over is stopped between turns, so the next one gets the new day's. -/
+  budgetDay : IO.Ref String
+  /-- Said at the head of the next turn: a conversation that was lost, for one. -/
+  notes : IO.Ref (List String)
+  /-- When the credentials this environment holds expire, in epoch seconds, if known: the kleis
+      token. A warm resident whose credentials are close to it is woken cold, which derives new
+      ones — the seam token cycling (§7 of the design) will replace. -/
+  credentialsExpire : Option Nat := none
+
+/-- The delivery loop's memory of one resident: what a restart may forget.
+
+    `lock` serialises deliveries to it — the tick and a person's message can both want to hand it
+    a turn, and two at once would wake it twice. `failures` counts wakes (and processes) that
+    failed in a row, for the backoff and for pausing it after `Resident.maxFailures`. -/
+structure ResidentRuntime where
+  lock : Std.BaseMutex
+  failures : Nat := 0
+  /-- Epoch seconds before which the tick does not try again. -/
+  retryAfter : Int := 0
+  /-- When each recent turn was handed over, epoch seconds: for `max_turns_per_hour`. -/
+  turnStamps : Array Int := #[]
 
 /-- The daemon's table of live sessions, plus the two things it needs from the queue's own
     bookkeeping.
@@ -105,6 +142,14 @@ structure Manager where
   /-- Take a clone slot for `fork`, or answer `none` when the repository is at its limit. -/
   private reserveSlot : Repository → IO (Option Nat)
   private releaseSlot : Repository → Nat → IO Unit
+  /-- What the delivery loop knows about each resident that is not on its record. -/
+  private residentState : Std.Mutex (Std.HashMap String ResidentRuntime)
+  /-- Residents being woken from cold right now, counted against `max_awake` with the ones that
+      have a process, under `sessions`' mutex. -/
+  private residentWaking : IO.Ref Nat
+  /-- The residents configuration names, with their settings. Refreshed by the daemon
+      (`Manager.setConfigured`). -/
+  private configured : IO.Ref (Array (String × Identity.ResidentSettings))
 
 /-- A UUID the agent CLI will accept for `--session-id`. Version 4, from `/dev/urandom`. -/
 private def newUuid : IO String := do
@@ -158,14 +203,14 @@ time, in the order the agent emitted them. -/
     Three of them mean something to the session beyond being written down: `init` names the
     conversation the CLI is actually in, which is what a later `--resume` needs; `result` ends
     the turn; and a rate-limit event carries when the limit lifts. The rest are transcript. -/
-private def onAgentEvent (s : LiveSession) (event : Event) : IO Unit := do
+private def onAgentEvent (mgr : Manager) (s : LiveSession) (event : Event) : IO Unit := do
   if Wire.isNoise event then return
   -- Recorded against the source this session is spending, exactly as a queued run does. Without
   -- it the resolver keeps offering an account whose window is spent, and the next tasks
   -- dispatched to it each clone a slot, mint a token, start a sandbox and die on the limit —
   -- the waste `markLimited` exists to prevent.
   if let .rateLimit reset := event then
-    if let some label := s.authLabel then
+    if let some label ← s.authLabel.get then
       Usage.markLimited s.backend label none "the agent reported a usage limit"
         (resetHint := reset)
   if let .init sid _ := event then
@@ -187,14 +232,34 @@ private def onAgentEvent (s : LiveSession) (event : Event) : IO Unit := do
     -- a session that has only ever had one. A woken session has had more than one, and the
     -- CLI's total counts only its own: without the base, the first turn after a wake would
     -- overwrite the accumulated spend with a few cents and report a negative cost for itself.
+    let costBase ← s.costBase.get
     let processTotal := (cost.bind (·.getNum?.toOption) |>.map (·.toFloat)).getD
-      (r.costUsd - s.costBase)
-    let total := s.costBase + processTotal
+      (r.costUsd - costBase)
+    let total := costBase + processTotal
     let _ ← append s (.turnEnded r.turnCount (subtypeName sub) (some (total - r.costUsd))
                                  (durationMs.map (· / 1000)))
     update s fun r => { r with
-      status  := if r.status.isTerminal then r.status else .idle
+      status  := if r.status.isTerminal || r.status == .paused then r.status else .idle
       costUsd := total }
+    if let some (name, _) := s.resident then
+      -- The turn's cost goes against the budget day it ended on, and the items it carried are
+      -- handed over — unless it ended on the day's cap, in which case they may well not have been
+      -- read to the end and are carried again tomorrow (`docs/design/resident-sessions.md` §8).
+      let day ← Resident.today mgr.cfg.residents.timezone
+      try Resident.addSpend name day (total - r.costUsd)
+      catch e => IO.eprintln s!"resident {name}: could not record a turn's spend: {e}"
+      if sub == .errorMaxBudgetUsd then
+        let _ ← append s (.notice "warning"
+          s!"the day's budget is spent; the resident is paused until the next budget day ({day} \
+is over) and its inbox keeps filling meanwhile")
+        update s fun r => { r with status := .paused, pausedReason := some s!"budget:{day}" }
+      else
+        try discard <| Resident.confirm name r.turnCount
+        catch e => IO.eprintln s!"resident {name}: could not confirm turn {r.turnCount}: {e}"
+        mgr.residentState.atomically <| modify fun m => match m.get? name with
+          | some rt => m.insert name { rt with failures := 0, retryAfter := 0 }
+          | none    => m
+      return
     -- A budget the session has spent is the session over, not a turn that went badly: the CLI
     -- will refuse every turn after it, and a session that answers nothing while still reading
     -- `idle` is worse than one that says it is finished.
@@ -226,6 +291,9 @@ private def gone (id : String) : IO String := do
     -- flight to abandon, and starting an agent in order to stop it is not what was asked for.
     else if r.status == .dormant then
       return "this session is asleep; say something to wake it"
+    else if r.status == .paused then
+      return s!"this resident is paused ({(r.pausedReason.getD "no reason recorded")}); \
+`orchestra resident resume` brings it back"
     -- A wake takes as long as a start does, and for that minute the record reads `starting`
     -- while nothing holds the session. Saying "no such session" there denies a conversation
     -- that is in the middle of coming back.
@@ -277,7 +345,8 @@ def Manager.new (cfg : Config)
     (reserveSlot : Repository → IO (Option Nat))
     (releaseSlot : Repository → Nat → IO Unit) : IO Manager := do
   return { sessions := ← Std.Mutex.new #[], starting := ← IO.mkRef 0, cfg, reserveSlot,
-           releaseSlot }
+           releaseSlot, residentState := ← Std.Mutex.new {}, residentWaking := ← IO.mkRef 0
+           configured := ← IO.mkRef #[] }
 
 /-- Close a live session: stop the agent, shut down its MCP server, release its slot, and stamp
     the record terminal.
@@ -301,22 +370,36 @@ private def teardown (mgr : Manager) (s : LiveSession) (status : SessionStatus)
     else
       return false
   unless claimed do return
-  try s.stream.shutdown catch _ => pure ()
+  if let some st ← s.stream.modifyGet (fun st => (st, none)) then
+    try st.shutdown catch _ => pure ()
   -- After the agent, before the slot: closing the environment is what copies a remote workspace
   -- back onto the slot this is about to release, and it has nothing to copy while the agent is
   -- still writing.
   try s.exec.close catch _ => pure ()
   try s.shutdownMcp catch _ => pure ()
-  try mgr.releaseSlot s.fork s.slot catch _ => pure ()
+  if let some fork := s.fork then
+    try mgr.releaseSlot fork s.slot catch _ => pure ()
   let now ← TaskStore.currentIso8601
   try
     update s fun r =>
       if r.status.isTerminal then r
+      -- A paused resident stays paused, for the reason it was paused for: putting it down is
+      -- not what lifts that.
+      else if r.status == .paused then { r with error := why }
       -- Dormant is not an ending, so it does not get stamped with one. The record keeps its
       -- `endedAt` empty because the conversation has not ended; only the process has.
-      else if status == .dormant then { r with status := .dormant, error := why }
+      else if status == .dormant || status == .paused then { r with status, error := why }
       else { r with status, endedAt := some now, error := why }
   catch _ => pure ()
+
+/-- Stop a resident's agent process and keep everything else: its environment, its MCP server,
+    its credentials. The session is then `warm`, and the next delivery starts a process on the
+    same environment (`Manager.relaunch`) — seconds, where a cold wake on Kubernetes is a pod. -/
+private def stopProcess (s : LiveSession) : IO Unit := do
+  if let some st ← s.stream.modifyGet (fun st => (st, none)) then
+    try st.shutdown catch _ => pure ()
+  update s fun r =>
+    if r.status.isTerminal || r.status == .paused then r else { r with status := .warm }
 
 private def find (mgr : Manager) (id : String) : IO (Option LiveSession) := do
   let ss ← mgr.sessions.atomically get
@@ -338,9 +421,11 @@ private def find (mgr : Manager) (id : String) : IO (Option LiveSession) := do
 
     `prepare` answers the record it saved, the agent-side session to resume (`none` to start a
     fresh one), and the slot occupant whose working tree may be kept. -/
-private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repository)
+private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Option Repository)
     (slot : Nat) (agentDef : AgentDef) (debug : Bool) (onFailure : SessionStatus)
     (prepare : IO (SessionRecord × Option String × Option String × Option (String × Bool)))
+    (resident : Option (String × Identity.ResidentSettings) := none)
+    (budget? : Option Float := none)
     : IO (Except String SessionRecord) := do
   -- `shutdownRef` is how the MCP server joins the slot's guarantee. It is empty until
   -- `Server.start` succeeds and holds that server's own shutdown afterwards, so the handler
@@ -358,12 +443,18 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
   -- Releasing a clone slot twice is not a harmless repeat: the second release takes it from
   -- whichever session or task has since been given it. See `teardown`.
   let failed ← IO.mkRef false
+  -- A resident is counted against `max_awake` while it wakes, every other session against the
+  -- session cap (`claimPlace`); whichever was taken is given back once it is in the table or
+  -- has failed.
   let dropStarting : IO Unit :=
-    mgr.sessions.atomically <| mgr.starting.modify fun n => if n > 0 then n - 1 else 0
+    mgr.sessions.atomically do
+      if resident.isSome then mgr.residentWaking.modify fun n => if n > 0 then n - 1 else 0
+      else mgr.starting.modify fun n => if n > 0 then n - 1 else 0
   let release : IO Unit := do
     if let some ex ← execRef.get then try ex.close catch _ => pure ()
     if let some shut ← shutdownRef.get then try shut catch _ => pure ()
-    try mgr.releaseSlot fork slot catch _ => pure ()
+    if let some f := fork then
+      try mgr.releaseSlot f slot catch _ => pure ()
   let fail (raw : String) : IO (Except String SessionRecord) := do
     if ← failed.get then return .error (redactPaths raw)
     failed.set true
@@ -389,7 +480,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       -- acquire never got a working tree into the slot it reserved, and a record naming a slot
       -- the session has never occupied loses the pin to the tree it actually left behind.
       let r :=
-        if current.status.isTerminal then current
+        if current.status.isTerminal || current.status == .paused then current
         else if onFailure == .dormant then { current with status := .dormant, error := some msg }
         else { current with status := .failed, endedAt := some now, error := some msg }
       -- The seq continues from wherever the transcript got to. The pump may have written the
@@ -402,17 +493,34 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let (record, resumeAgentSession, resumeSlotOf, workspaceOf) ← prepare
     recordRef.set (some record)
     let backendName := record.backend
+    -- Both halves of the pair or neither; a session without one is repository-less throughout.
+    let repoPair : Option RepoPair := match record.upstream, fork with
+      | some upstream, some f => some { upstream, fork := f }
+      | _, _                  => none
     let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
-    let installationId ← match appConfig.installationId with
-      | some i => pure i
-      | none   => GitHub.getInstallationId jwt fork.owner
+    -- A session without a repository is installed where a repository-less task is: the configured
+    -- installation, else the default organisation's, else none — and then it runs with no GitHub
+    -- token at all rather than refusing to start (`TaskRunner`, the same choice).
+    let installationId : Option Nat ← match appConfig.installationId, repoPair with
+      | some i, _    => pure (some i)
+      | none, some p => some <$> GitHub.getInstallationId jwt p.fork.owner
+      | none, none   =>
+        match appConfig.defaultOrganization with
+        | some org => GitHub.getInstallationId? jwt org
+        | none     => pure none
     -- Deliberately no `GitHub.setupGhAuth`: that writes the token into
     -- `~/.config/gh/hosts.yml`, which every concurrently running task in this daemon shares.
     -- `TaskRunner` avoids it for the same reason, and it is not needed — the token reaches the
     -- clone through `ensureSlot` and the agent through `GH_TOKEN` in the sandbox. A session
     -- doing it would silently re-point every other `gh` call in the process at its own
     -- installation, and leave the token on disk afterwards.
-    let token ← GitHub.createInstallationToken jwt installationId
+    let mintToken : IO String := match installationId with
+      | some i => do GitHub.createInstallationToken (← GitHub.createJWT appConfig.appId
+                       appConfig.privateKeyPath) i
+      | none   => pure ""
+    let token ← match installationId with
+      | some i => GitHub.createInstallationToken jwt i
+      | none   => pure ""
     -- `resumeFrom` on the assignment is what keeps a working tree instead of resetting it, and
     -- it is checked against the slot's recorded occupant, so asking for it is safe even when the
     -- tree has since been taken. Without it a resumed conversation was restored onto a wiped
@@ -424,12 +532,20 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     -- build, and the agent's home with its conversation — is a volume keyed by the session, kept
     -- while it is dormant and handed back when it wakes. The checkout made here is then only what a
     -- first start fills that volume from, and goes when the session's environment closes.
+    --
+    -- A session without a repository has a scratch workspace instead: on such a backend an empty
+    -- one to fill a new volume from, and otherwise one of its own that is kept across wakes.
     let keepsWorkspaces := Exec.keepsWorkspaces appConfig.execution
-    let repoPath ← if keepsWorkspaces then
-        Repo.ensureTaskCheckout fork record.upstream record.id (token := some token)
-      else
-        Repo.ensureSlot fork record.upstream
-          { slot, occupant := some record.id, resumeFrom := resumeSlotOf } (token := some token)
+    let repoPath ← match repoPair with
+      | some p =>
+        if keepsWorkspaces then
+          Repo.ensureTaskCheckout p.fork p.upstream record.id (token := some token)
+        else
+          Repo.ensureSlot p.fork p.upstream
+            { slot, occupant := some record.id, resumeFrom := resumeSlotOf } (token := some token)
+      | none =>
+        if keepsWorkspaces then Repo.ensureTaskWorkspace record.id
+        else Repo.ensureSessionWorkspace record.id
     -- Read from the record rather than from the spec, so a wake brings the session back as the
     -- same identity a start gave it. A record naming one that has since been deleted fails the
     -- acquire, which for a wake leaves the session dormant with the reason on its transcript —
@@ -451,14 +567,20 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
     let pluginDirs ← TaskRunner.defaultPluginDirs appConfig
     let repoConfig ← RepoConfig.loadRepoConfig repoPath
-    let seedDir ← if keepsWorkspaces then some <$> Repo.seedPath fork else pure none
+    let seedDir ← match keepsWorkspaces, fork with
+      | true, some f => some <$> Repo.seedPath f
+      | _, _         => pure none
+    -- The tools a session without a repository can use: the repository-scoped ones need one.
+    let allowedTools ← Server.withoutRepoScopedTools repoPair (record.tools.getD allOptionalTools)
+      (warn := false)
     -- A session's kleis token says what a queued task's does about it, and comes from the same
     -- sources, less the ones a session has no field for: its identity's, then `default_spec`.
     -- Derived before the environment is opened, as for a queued task, because its setup names the
-    -- CA bundle the session opens with; and revoked by whatever brings the session down.
+    -- CA bundle the session opens with; and revoked by whatever brings the session down. A
+    -- session without a repository states the repository-less form of the facts, as a task does.
     let kleisFacts : Kleis.TaskFacts := {
-      taskId := record.id, repo := some { upstream := record.upstream, fork }
-      tools := record.tools.getD allOptionalTools
+      taskId := record.id, repo := repoPair
+      tools := allowedTools
       identity := identity.map (·.name), pushPrefix := appConfig.kleis.bind (·.pushPrefix)
       org := appConfig.defaultOrganization }
     let kleisPrepared ← Kleis.prepareFor appConfig.kleis
@@ -476,13 +598,18 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       | some kc, some p => some <$> Kleis.setupBundle kc p.setup
       | some kc, none   => some <$> Kleis.caBundle kc
       | none, _         => pure none
+    -- A resident's environment is keyed by its session, which never changes, and always asks for
+    -- its own volume back — a fresh one will do, since losing it is survivable for a resident
+    -- (its conversation starts over, said so in the first turn) where it is not for a chat.
+    let isResident := resident.isSome
     let execSession ← execBackend.openSession {
       workdir := repoPath
       -- Keyed by the session, so a wake finds the volume its first start made, and a session
       -- started from another one finds that one's (see `workspaceOf`).
       taskId  := if keepsWorkspaces then some record.id else none
-      continuesFrom := if keepsWorkspaces then workspaceOf.map (·.1) else none
-      continuationOptional := workspaceOf.map (·.2) |>.getD false
+      continuesFrom := if keepsWorkspaces then
+          (if isResident then some record.id else workspaceOf.map (·.1)) else none
+      continuationOptional := isResident || (workspaceOf.map (·.2) |>.getD false)
       seedDir
       -- Someone is waiting on the other end: a full cluster is said at once, not after minutes.
       roomWaitSeconds := 0
@@ -492,8 +619,10 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
       label   := record.id
       -- The upstream, not the fork: an operator pinning an image writes the name the project is
       -- known by, and the fork is per-bot. Same key as the queue path and the merger.
-      repo    := some record.upstream.toString
-      image   := repoConfig.image }
+      repo    := record.upstream.map (·.toString)
+      image   := repoConfig.image
+      resident := resident.map (·.1)
+      volumeSize := if isResident then mgr.cfg.residents.volumeSize else none }
     -- Its checkout goes with it: closing the environment is the one thing every way out of a
     -- session does.
     let execSession := if keepsWorkspaces then
@@ -501,6 +630,24 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
             try execSession.close finally Repo.removeTaskDir repoPath }
       else execSession
     execRef.set (some execSession)
+    -- A resident whose conversation did not survive — its volume was lost, or this backend keeps
+    -- none — starts a new one in the same session rather than failing every wake: it says so in
+    -- the transcript and at the head of its next turn, and its memory directory, which lives
+    -- apart from the conversation, is intact (`docs/design/resident-sessions.md` §9).
+    let lostConversation := isResident && resumeAgentSession.isSome &&
+      (!execSession.carriesAgentState || !execSession.workspaceReused)
+    let (record, resumeAgentSession) ← if lostConversation then do
+        let fresh := { record with agentSessionId := some (← newUuid), agentStarted := false }
+        let now ← TaskStore.currentIso8601
+        let seq := fresh.lastEventSeq + 1
+        appendEvent fresh.id seq now (.notice "warning"
+          "the previous conversation was lost with the environment that held it; starting a new \
+one in this session (the resident's memory directory is intact)")
+        let fresh := { fresh with lastEventSeq := seq }
+        saveSession fresh
+        recordRef.set (some fresh)
+        pure (fresh, (none : Option String))
+      else pure (record, resumeAgentSession)
     -- Reviving a dormant conversation asks the agent to resume a session it wrote under its own
     -- home. An environment that is new every time does not have it, and a revived conversation
     -- that silently starts over is worse than one that says it cannot: the person sees their
@@ -508,10 +655,10 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     if resumeAgentSession.isSome && !execSession.carriesAgentState then
       return ← fail s!"this conversation was left in an environment that no longer exists ({execSession.id} is new every time). Enable per-task workspaces for this execution backend — execution.options.task_volumes for kubernetes — to wake sessions on it."
     let (port, shutdownMcp) ← Server.start {
-      repo := some { upstream := record.upstream, fork }
-      allowedTools := record.tools.getD allOptionalTools
+      repo := repoPair
+      allowedTools
       appId := appConfig.appId, privateKeyPath := appConfig.privateKeyPath
-      installationId := some installationId, pat := appConfig.patFor record.upstream
+      installationId, pat := (record.upstream.map appConfig.patFor).getD appConfig.pat
       agentBackend := backendName
       identity
       authToken := mcpToken
@@ -525,10 +672,10 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     shutdownRef.set (some shutdownMcp)
     -- A session reaches GitHub through kleis the same way a queued task does, on a token of its
     -- own: derived above when it has a source, and otherwise minted here, per start and per wake.
-    let (kleisLaunch, shutdownMcp) ← match appConfig.kleis, kleisPrepared, kleisBundle with
+    let (kleisLaunch, shutdownMcp, kleisExpires) ← match appConfig.kleis, kleisPrepared, kleisBundle with
       | some kc, some p, some bundle => do
         let fileGrants ← Kleis.installFiles execSession p.setup.files
-        pure (some (Kleis.launchDerived kc p bundle fileGrants), shutdownMcp)
+        pure (some (Kleis.launchDerived kc p bundle fileGrants), shutdownMcp, p.minted.expires)
       | some kc, none, some bundle => do
         let minted ← Kleis.mint kc kleisFacts
         let shutdownBoth : IO Unit := do
@@ -536,19 +683,8 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
           try Kleis.revoke kc minted catch e =>
             IO.eprintln s!"interactive: could not revoke the session's kleis token: {e}"
         shutdownRef.set (some shutdownBoth)
-        pure (some (Kleis.launch kc minted bundle), shutdownBoth)
-      | _, _, _ => pure (none, shutdownMcp)
-    -- A session goes through the same resolver as a queued run, so an account the daemon has
-    -- already found to be out of quota is not handed to a person either.
-    -- With the queue's running agents counted, so a person is not handed the account the daemon
-    -- has just loaded up; an unreadable queue only makes every account look idle.
-    let running ← try Queue.runningPerAuthSource catch _ => pure fun _ => 0
-    let authLabel ← match ← Usage.resolveLabel appConfig backendName [] none none record.model
-        (running := running) with
-      | .ok label => pure label
-      | .error e  => return ← fail s!"no usable authentication source for '{backendName}': {e}"
-    if let some l := authLabel then Usage.markUsed backendName l
-    let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName authLabel
+        pure (some (Kleis.launch kc minted bundle), shutdownBoth, minted.expires)
+      | _, _, _ => pure (none, shutdownMcp, 0)
     let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
       |>.map (·.extraPorts) |>.getD #[]
     let recordRef ← IO.mkRef record
@@ -561,12 +697,7 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
     -- it cannot happen.
     let liveRef ← IO.mkRef (none : Option LiveSession)
     let onEvent (e : Event) : IO Unit := do
-      if let some s ← liveRef.get then onAgentEvent s e
-    -- What is *left* of the budget, not all of it. `--max-budget-usd` bounds the process, and a
-    -- woken session is a second process: handing it the whole figure again would give a session
-    -- that had spent $19 of $20 a fresh $20, once per wake, and the budget would bound nothing.
-    -- Floored at a cent because zero is not a budget the CLI will take.
-    let remaining := max 0.01 (record.budget - record.costUsd)
+      if let some s ← liveRef.get then onAgentEvent mgr s e
     -- The same sections a task's system prompt is built from, minus the shared memories: a
     -- session is held open by a person and has no `memory` field to choose them with, so the
     -- only directory here is the identity's own — which is what makes it worth naming.
@@ -581,25 +712,61 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Repo
         | none, none   => none ].filterMap id
     let systemPrompt :=
       if promptSections.isEmpty then none else some (String.intercalate "\n\n" promptSections)
-    let some stream ← Sandbox.launchStreaming agentDef repoPath port token
-        { mcpContext := "", model := record.model, systemPrompt,
-          resume := resumeAgentSession, sessionId := record.agentSessionId,
-          budget := remaining }
-        onEvent (debug := debug)
-        (extraEnv := apiKeyEnv) (pluginDirs := pluginDirs)
-        (memoryDirs := identityMemory.toArray)
-        (extraPorts := extraPorts) (additionalPaths := appConfig.additionalSandboxPaths)
-        (session := execSession) (mcpToken := mcpToken) (kleis := kleisLaunch)
-      | return ← fail s!"backend '{backendName}' cannot host an interactive session"
+    let authRef ← IO.mkRef (none : Option String)
+    -- The installation token the agent holds lives an hour. The first process is given the one
+    -- minted above; a later one in the same environment — a warm resident woken hours on — gets a
+    -- fresh one rather than a token that has long expired.
+    let firstLaunch ← IO.mkRef true
+    -- One agent process in this environment. Each goes through the resolver again, as a queued
+    -- run does, so an account found out of quota since the last process is not handed the next.
+    let launch (resume : Option String) (budget : Float) :
+        IO (Except String Sandbox.StreamingSession) := do
+      let ghToken ← if ← firstLaunch.modifyGet (fun b => (b, false)) then pure token
+        else try mintToken catch _ => pure token
+      -- With the queue's running agents counted, so a person is not handed the account the daemon
+      -- has just loaded up; an unreadable queue only makes every account look idle.
+      let running ← try Queue.runningPerAuthSource catch _ => pure fun _ => 0
+      let authLabel ← match ← Usage.resolveLabel appConfig backendName [] none none record.model
+          (running := running) with
+        | .ok label => pure label
+        | .error e  => return .error s!"no usable authentication source for '{backendName}': {e}"
+      if let some l := authLabel then Usage.markUsed backendName l
+      authRef.set authLabel
+      let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName authLabel
+      let some stream ← Sandbox.launchStreaming agentDef repoPath port ghToken
+          { mcpContext := "", model := record.model, systemPrompt,
+            resume, sessionId := (← recordRef.get).agentSessionId,
+            budget := max 0.01 budget }
+          onEvent (debug := debug)
+          (extraEnv := apiKeyEnv) (pluginDirs := pluginDirs)
+          (memoryDirs := identityMemory.toArray)
+          (extraPorts := extraPorts) (additionalPaths := appConfig.additionalSandboxPaths)
+          (session := execSession) (mcpToken := mcpToken) (kleis := kleisLaunch)
+        | return .error s!"backend '{backendName}' cannot host an interactive session"
+      return .ok stream
+    -- What is *left* of the budget, not all of it. `--max-budget-usd` bounds the process, and a
+    -- woken session is a second process: handing it the whole figure again would give a session
+    -- that had spent $19 of $20 a fresh $20, once per wake, and the budget would bound nothing.
+    -- A resident's is what is left of today's (`budget?`).
+    let remaining := budget?.getD (record.budget - record.costUsd)
+    let stream ← match ← launch resumeAgentSession remaining with
+      | .ok st    => pure st
+      | .error e  => return ← fail e
+    let day ← Resident.today mgr.cfg.residents.timezone
     let session : LiveSession := {
-      id := record.id, fork, slot, record := recordRef, lock, stream, shutdownMcp
-      exec := execSession
-      authLabel, backend := backendName, costBase := record.costUsd
+      id := record.id, fork, slot, record := recordRef, lock, stream := ← IO.mkRef (some stream)
+      shutdownMcp, exec := execSession
+      authLabel := authRef, backend := backendName, costBase := ← IO.mkRef record.costUsd
+      launch, resident, budgetDay := ← IO.mkRef day
+      notes := ← IO.mkRef (if lostConversation then
+        ["Your previous conversation was lost; your memory directory is intact."] else [])
+      credentialsExpire := if kleisExpires == 0 then none else some kleisExpires
     }
     liveRef.set (some session)
     mgr.sessions.atomically do
       modify (·.push session)
-      mgr.starting.modify fun n => if n > 0 then n - 1 else 0
+      if resident.isSome then mgr.residentWaking.modify fun n => if n > 0 then n - 1 else 0
+      else mgr.starting.modify fun n => if n > 0 then n - 1 else 0
     -- Registered. From here the session owns the slot and the MCP server, and `fail` must not
     -- take either back — `teardown` is the only thing that may, and only via the table. A throw
     -- past this point would otherwise hand a running agent's clone slot to the queue.
@@ -680,12 +847,18 @@ streaming input mode. Backends that can: claude."
   if let some name := spec.identity then
     try let _ ← Identity.requireIdentity name
     catch e => return .error (toString e)
+  if spec.upstream.isSome != spec.fork.isSome then
+    return .error "a session names both an upstream and a fork, or neither"
   if let some why ← mgr.claimPlace then return .error why
-  let some slot ← mgr.reserveSlot spec.fork
+  -- A session without a repository has no clone to hold, so it takes no slot.
+  let slot ← match spec.fork with
+    | none   => pure (some 0)
+    | some f => mgr.reserveSlot f
+  let some slot := slot
     | do
         mgr.sessions.atomically <| mgr.starting.modify fun n => if n > 0 then n - 1 else 0
-        return .error s!"no free clone slot for {spec.fork}: every one is in use by a running \
-task or another session"
+        return .error s!"no free clone slot for {(spec.fork.map toString).getD "?"}: every one \
+is in use by a running task or another session"
   mgr.acquire appConfig spec.fork slot agentDef debug .failed do
     let id ← TaskStore.generateId
     let now ← TaskStore.currentIso8601
@@ -717,29 +890,47 @@ task or another session"
     are new, which is the whole point: they are what a session should not hold while nobody is
     talking to it, and the conversation is not one of them. -/
 def Manager.wake (mgr : Manager) (appConfig : AppConfig) (id : String) (debug : Bool := false)
+    (resident : Option (String × Identity.ResidentSettings) := none)
+    (budget? : Option Float := none)
     : IO (Except String SessionRecord) := do
-  let some peek ← loadSession id | return .error "no such session"
+  -- A resident is counted against `max_awake` by whoever woke it (`Manager.deliver`), never
+  -- against the session cap: a person opening a chat is not refused because a resident is up.
+  -- Its place is given back on every way out before `acquire`, which gives it back after.
+  let giveBack : IO Unit := mgr.sessions.atomically do
+    if resident.isSome then mgr.residentWaking.modify fun n => if n > 0 then n - 1 else 0
+    else mgr.starting.modify fun n => if n > 0 then n - 1 else 0
+  let early (why : String) : IO (Except String SessionRecord) := do
+    if resident.isSome then giveBack
+    return .error why
+  let some peek ← loadSession id | early "no such session"
   -- Cheap rejection before anything is reserved. The claim below is what actually decides — this
   -- only keeps the common "it is over" and "someone else is already waking it" cases from
   -- taking a place under the cap and a clone slot on the way to being refused.
-  unless peek.status == .dormant do return .error (← gone id)
+  unless peek.status == .dormant do return ← early (← gone id)
   let agentDef := TaskRunner.agentDefOfBackend (some peek.backend)
   if (agentDef.buildStreamArgs { mcpContext := "" }).isNone then
-    return .error s!"backend '{peek.backend}' cannot host an interactive session"
-  if let some why ← mgr.claimPlace then return .error why
+    return ← early s!"backend '{peek.backend}' cannot host an interactive session"
+  if resident.isNone then
+    if let some why ← mgr.claimPlace then return .error why
   -- The claim, and the point of no return for every other caller: from here the record reads
   -- `starting`, so a second turn arriving behind this one is told the session is coming up
   -- rather than starting a second one, and an end is refused rather than silently reversed.
   let some record ← mgr.claimRecord id .dormant .starting
     | do
-        mgr.sessions.atomically <| mgr.starting.modify fun n => if n > 0 then n - 1 else 0
+        giveBack
         return .error "this session is already waking up"
-  let some slot ← mgr.reserveSlot record.fork
+  let slot ← match record.fork with
+    | none   => pure (some 0)
+    | some f => mgr.reserveSlot f
+  let some slot := slot
     | do
-        mgr.sessions.atomically <| mgr.starting.modify fun n => if n > 0 then n - 1 else 0
-        return .error s!"no free clone slot for {record.fork}: every one is in use by a running \
-task or another session"
-  mgr.acquire appConfig record.fork slot agentDef debug .dormant do
+        giveBack
+        -- Back to sleep: the claim above left it `starting`, which nothing would ever undo.
+        saveSession { record with status := .dormant }
+        return .error s!"no free clone slot for {(record.fork.map toString).getD "?"}: every one \
+is in use by a running task or another session"
+  mgr.acquire appConfig record.fork slot agentDef debug .dormant (resident := resident)
+      (budget? := budget?) do
     let now ← TaskStore.currentIso8601
     let seq := record.lastEventSeq + 1
     appendEvent record.id seq now (.notice "info" "waking the session up")
@@ -787,6 +978,11 @@ private def claimTurn (s : LiveSession) (text : String) : IO (Except String Nat)
     an order nobody chose. -/
 def Manager.send (mgr : Manager) (appConfig : AppConfig) (id : String) (text : String)
     (debug : Bool := false) : IO (Except String Nat) := do
+  -- A resident's turns go through its inbox (`Manager.residentMessage`), never straight onto the
+  -- pipe: a turn written past the inbox would be one the delivery loop does not know is running.
+  if let some r ← loadSession id then
+    if let some name := r.resident then
+      return .error s!"this is resident {name}'s session; its turns go through its inbox"
   -- A turn posted to a session the daemon is not holding is not necessarily a mistake. A session
   -- whose process was put down for being idle, or whose daemon restarted under it, is dormant:
   -- the conversation is on disk and nothing is running. Posting to one is how you pick it up —
@@ -807,7 +1003,10 @@ def Manager.send (mgr : Manager) (appConfig : AppConfig) (id : String) (text : S
           | some s => pure s
           | none   => return .error "the session was woken but is not holding"
       | _ => return .error (← gone id)
-  if (← s.stream.hasExited) then
+  let some stream ← s.stream.get
+    | return .error "this session has no agent process right now; say something to it through \
+its resident's inbox"
+  if (← stream.hasExited) then
     -- Not the agent's stderr: it is unbounded output from a process holding a GitHub token, and
     -- this string is on its way to an HTTP client. The transcript carries the detail.
     teardown mgr s .failed (some "the agent process exited")
@@ -818,7 +1017,7 @@ def Manager.send (mgr : Manager) (appConfig : AppConfig) (id : String) (text : S
   let seq ← append s (.user text)
   let _ ← append s (.turnStarted turn)
   try
-    s.stream.sendLine (Wire.userTurn text)
+    stream.sendLine (Wire.userTurn text)
     return .ok seq
   catch e =>
     let _ ← append s (.notice "error" s!"the turn could not be delivered: {e}")
@@ -835,8 +1034,9 @@ def Manager.interrupt (mgr : Manager) (id : String) : IO (Except String Unit) :=
   if r.status != .running then
     return .error "this session is not working on a turn"
   let requestId ← TaskStore.generateId
+  let some stream ← s.stream.get | return .error "this session is not working on a turn"
   try
-    s.stream.sendLine (Wire.interrupt requestId)
+    stream.sendLine (Wire.interrupt requestId)
     let _ ← append s (.notice "info" "the turn was interrupted")
     return .ok ()
   catch e =>
@@ -844,6 +1044,13 @@ def Manager.interrupt (mgr : Manager) (id : String) : IO (Except String Unit) :=
 
 /-- End a session and release everything it holds. -/
 def Manager.close (mgr : Manager) (id : String) : IO (Except String Unit) := do
+  -- A resident's session does not end (`docs/design/resident-sessions.md` §3.2): it is paused or
+  -- reset, by name, and an end asked of it by id is refused rather than quietly obeyed.
+  if let some r ← loadSession id then
+    if let some name := r.resident then
+      return .error s!"this is resident {name}'s session, which does not end; pause it with \
+`orchestra resident pause {name}`, or start its conversation over with `orchestra resident reset \
+{name}`"
   let some s ← find mgr id | do
     match ← loadSession id with
     -- Already over: ending it again is not a failure, it is a request that no longer applies.
@@ -872,10 +1079,496 @@ def Manager.close (mgr : Manager) (id : String) : IO (Except String Unit) := do
   teardown mgr s .ended none
   return .ok ()
 
+/-! ## Residents
+
+A resident is an identity with one session that never ends (`docs/design/resident-sessions.md`).
+Its session is created asleep at start-up (`ensureResidentSession`), and from then on what drives it
+is its **inbox** (`Orchestra.Resident`): whenever the inbox has something ready and the session is
+not mid-turn, `Manager.deliver` hands it over as one turn — waking it first, from warm (a process
+started in the environment it kept) or from cold (`Manager.wake`, which opens a new one). A person's
+message goes through the inbox too, so writing to a busy resident queues rather than being refused.
+
+The paths that end or fail a session put a resident to sleep instead: a process found dead, a turn
+that could not be written, a wake that failed. The day's budget pauses it. Only an operator ends its
+conversation, and only by starting a new one (`Manager.resetResident`). -/
+
+/-- The id of resident `name`'s session: stable, so its environment — a task volume, keyed by
+    session — is the same one every wake, and a reset keeps it. -/
+def residentSessionId (name : String) : String := s!"resident-{name}"
+
+/-- How long before its credentials expire a warm resident is woken cold instead, for new ones. -/
+def credentialsMarginSeconds : Nat := 7200
+
+/-- Whether a paused resident's reason is gone: a budget pause once its day is over. A pause for
+    failures, or by an operator, is lifted only by `resumeResident`. -/
+def pauseLifted (reason : Option String) (today : String) : Bool :=
+  match reason with
+  | none   => true
+  | some r =>
+    if r.startsWith "budget:" then (r.drop "budget:".length).toString != today else false
+
+/-- What one delivery did. -/
+inductive Delivery where
+  /-- A turn was written, at transcript seq `seq`, carrying these inbox items. -/
+  | sent (seq : Nat) (items : List Nat)
+  /-- Nothing was ready. -/
+  | nothing
+  /-- Not now — mid-turn, batching, backing off, no room under `max_awake` — and why. The items
+      stay ready. -/
+  | waiting (why : String)
+  /-- Paused, and why. -/
+  | paused (why : String)
+  /-- Tried, and failed; the items stay ready and the failure counts toward the backoff. -/
+  | failed (why : String)
+deriving Repr
+
+/-- Tell the manager which residents configuration names, and their settings. -/
+def Manager.setConfigured (mgr : Manager) (rs : Array (String × Identity.ResidentSettings)) :
+    IO Unit :=
+  mgr.configured.set rs
+
+/-- The settings of resident `name`, if configuration names it. -/
+def Manager.settingsOf (mgr : Manager) (name : String) : IO (Option Identity.ResidentSettings) :=
+  return (← mgr.configured.get).find? (·.1 == name) |>.map (·.2)
+
+/-- The residents configuration names. -/
+def Manager.configuredResidents (mgr : Manager) : IO (Array String) :=
+  return (← mgr.configured.get).map (·.1)
+
+private def Manager.runtime (mgr : Manager) (name : String) : IO ResidentRuntime := do
+  let fresh ← Std.BaseMutex.new
+  mgr.residentState.atomically do
+    let m ← get
+    match m.get? name with
+    | some rt => return rt
+    | none =>
+      let rt : ResidentRuntime := { lock := fresh }
+      set (m.insert name rt)
+      return rt
+
+private def Manager.modifyRuntime (mgr : Manager) (name : String)
+    (f : ResidentRuntime → ResidentRuntime) : IO ResidentRuntime := do
+  let current ← mgr.runtime name
+  mgr.residentState.atomically do
+    let m ← get
+    let rt := f ((m.get? name).getD current)
+    set (m.insert name rt)
+    return rt
+
+/-- What the manager knows of a resident beyond its record: failures in a row, and when it may be
+    tried again. For `orchestra resident show`. -/
+def Manager.residentFailures (mgr : Manager) (name : String) : IO (Nat × Int) := do
+  let rt ← mgr.runtime name
+  return (rt.failures, rt.retryAfter)
+
+/-- Append a notice to a session that is not in the table. -/
+private def noticeOnRecord (r : SessionRecord) (level msg : String) : IO SessionRecord := do
+  let now ← TaskStore.currentIso8601
+  let seq := r.lastEventSeq + 1
+  appendEvent r.id seq now (.notice level msg)
+  let r := { r with lastEventSeq := seq, lastActivityAt := now }
+  saveSession r
+  return r
+
+/-- Make sure resident `name` has its session — a record, asleep, with no process — and keep what
+    the record says about it (backend, model, tools, budget) as configuration says, while it is
+    asleep: a wake is made from the record. -/
+def ensureResidentSession (name : String) (settings : Identity.ResidentSettings) :
+    IO SessionRecord := do
+  match ← loadResidentSession name with
+  | some r =>
+    if r.status == .dormant || r.status == .paused then
+      let r' := { r with backend := settings.agent, model := settings.model,
+                         tools := settings.tools, budget := settings.budgetPerDay }
+      unless r'.backend == r.backend && r'.model == r.model && r'.tools == r.tools &&
+          r'.budget == r.budget do
+        saveSession r'
+      return r'
+    return r
+  | none =>
+    let id := residentSessionId name
+    if let some other ← loadSession id then
+      throw (IO.userError s!"resident {name}: its session id {id} is already taken by a session \
+that is not its own ({other.resident.getD "not a resident"})")
+    let now ← TaskStore.currentIso8601
+    let r : SessionRecord := {
+      id, status := .dormant, createdAt := now, lastActivityAt := now
+      backend := settings.agent, model := settings.model, budget := settings.budgetPerDay
+      agentSessionId := some (← newUuid), tools := settings.tools
+      identity := some name, resident := some name, title := some s!"{name} (resident)" }
+    saveSession r
+    noticeOnRecord r "info" s!"resident {name}'s session was created; it is asleep until \
+something arrives in its inbox"
+
+/-- Put a session to `paused` for `reason`, saying `message` on its transcript: torn down if it is
+    live (a turn in flight is abandoned; its items stay ready), claimed on its record otherwise.
+    Answers whether it is now paused. -/
+private def Manager.pauseSession (mgr : Manager) (id reason message : String) : IO Bool := do
+  match ← find mgr id with
+  | some s =>
+    update s fun r => { r with status := .paused, pausedReason := some reason }
+    let _ ← append s (.notice "warning" message)
+    teardown mgr s .paused none
+    return true
+  | none =>
+    let some r ← loadSession id | return false
+    unless r.status == .dormant || r.status == .paused do return false
+    let some p ← mgr.claimRecord id r.status .paused | return false
+    let _ ← noticeOnRecord { p with pausedReason := some reason } "warning" message
+    return true
+
+/-- One more failure in a row for resident `name`: back off, and after `Resident.maxFailures`,
+    pause it until an operator resumes it (`docs/design/resident-sessions.md` §10). -/
+private def Manager.noteFailure (mgr : Manager) (name id why : String) : IO Unit := do
+  let now ← Usage.nowEpoch
+  let rt ← mgr.modifyRuntime name fun rt =>
+    let failures := rt.failures + 1
+    { rt with failures, retryAfter := now + Int.ofNat (Resident.backoffSeconds failures) }
+  IO.eprintln s!"resident {name}: failure {rt.failures} in a row: {why}"
+  if rt.failures ≥ Resident.maxFailures then
+    let _ ← mgr.pauseSession id "failed"
+      s!"{rt.failures} failures in a row (the last: {redactPaths why}); the resident is paused \
+until an operator resumes it (`orchestra resident resume {name}`)"
+
+/-- Take a place under `max_awake` for a resident about to have a process, or say there is none.
+    The resident idle longest is put to sleep (warm) to make one; a resident mid-turn never is.
+    The place is counted in `residentWaking` until the process is up or has failed. -/
+private def Manager.claimAwake (mgr : Manager) (forId : String) : IO Bool := do
+  for _ in [0:2] do
+    let (ok, victim) ← mgr.sessions.atomically do
+      let live ← get
+      let mut awake : Array LiveSession := #[]
+      for s in live do
+        if s.resident.isSome && s.id != forId && (← s.stream.get).isSome then
+          awake := awake.push s
+      let waking ← mgr.residentWaking.get
+      if awake.size + waking < mgr.cfg.residents.maxAwake then
+        mgr.residentWaking.set (waking + 1)
+        return (true, none)
+      -- The idle one asleep longest-awake: the least recent activity.
+      let mut best : Option (LiveSession × String) := none
+      for s in awake do
+        let r ← s.record.get
+        if r.status != .idle then continue
+        match best with
+        | some (_, at_) => if r.lastActivityAt < at_ then best := some (s, r.lastActivityAt)
+        | none => best := some (s, r.lastActivityAt)
+      return (false, best.map (·.1))
+    if ok then return true
+    let some v := victim | return false
+    let _ ← append v (.notice "info"
+      s!"put to sleep to make room for another resident (residents.max_awake is \
+{mgr.cfg.residents.maxAwake}); its environment is kept")
+    stopProcess v
+  return false
+
+private def Manager.dropAwake (mgr : Manager) : IO Unit :=
+  mgr.sessions.atomically <| mgr.residentWaking.modify fun n => if n > 0 then n - 1 else 0
+
+/-- Start a process for a warm resident in the environment it kept. -/
+private def Manager.relaunch (mgr : Manager) (s : LiveSession) (budget : Float) (day : String) :
+    IO (Except String Unit) := do
+  let r ← s.record.get
+  let resume := if r.agentStarted then r.agentSessionId else none
+  s.costBase.set r.costUsd
+  let _ ← append s (.notice "info" "waking the resident (its environment was kept)")
+  let res ← try s.launch resume budget catch e => pure (.error (toString e))
+  mgr.dropAwake
+  match res with
+  | .ok st =>
+    s.stream.set (some st)
+    s.budgetDay.set day
+    update s fun r => if r.status.isTerminal then r else { r with status := .idle, error := none }
+    return .ok ()
+  | .error e =>
+    let _ ← append s (.notice "error" s!"the agent process could not be started: {redactPaths e}")
+    teardown mgr s .dormant (some (redactPaths e))
+    return .error e
+
+/-- Write `items` into one turn of a resident's live, idle session. -/
+private def Manager.handTurn (mgr : Manager) (name : String) (s : LiveSession)
+    (items : Array Resident.InboxItem) : IO Delivery := do
+  let some stream ← s.stream.get | return .waiting "the resident has no process"
+  let notes ← s.notes.get
+  let text := Resident.renderTurn items notes
+  let turn ← match ← claimTurn s text with
+    | .error e => return .waiting e
+    | .ok t    => pure t
+  s.notes.set []
+  let ids := items.toList.map (·.id)
+  let seq ← append s (.user text)
+  let _ ← append s (.notice "info"
+    s!"this turn carries inbox item{if ids.length == 1 then "" else "s"} \
+{", ".intercalate (ids.map toString)}")
+  let _ ← append s (.turnStarted turn)
+  Resident.markSent ids turn seq
+  try
+    stream.sendLine (Wire.userTurn text)
+    let now ← Usage.nowEpoch
+    let _ ← mgr.modifyRuntime name fun rt =>
+      { rt with turnStamps := (rt.turnStamps.filter (· > now - 3600)).push now }
+    return .sent seq ids
+  catch e =>
+    -- Asleep, not failed: the items are marked sent and not confirmed, so the next turn carries
+    -- them again under the note that they may have been seen.
+    let why := s!"the turn could not be delivered: {e}"
+    let _ ← append s (.notice "error" s!"{why}; the resident is asleep and the turn will be \
+handed over again")
+    teardown mgr s .dormant (some why)
+    mgr.noteFailure name s.id why
+    return .failed why
+
+/-- Lift a paused resident's pause if its reason is gone. Answers the record as it now is. -/
+private def Manager.unpauseIfDue (mgr : Manager) (r : SessionRecord) (today : String) :
+    IO SessionRecord := do
+  unless r.status == .paused && pauseLifted r.pausedReason today do return r
+  match ← mgr.claimRecord r.id .paused .dormant with
+  | none   => return r
+  | some d =>
+    noticeOnRecord { d with pausedReason := none, error := none } "info"
+      "a new budget day; the resident is no longer paused"
+
+private def Manager.deliverLocked (mgr : Manager) (appConfig : AppConfig) (name : String)
+    (settings : Identity.ResidentSettings) (urgent debug : Bool) : IO Delivery := do
+  let some rec ← loadResidentSession name | return .failed s!"resident {name} has no session"
+  let items ← Resident.ready name
+  if items.isEmpty then return .nothing
+  let now ← Usage.nowEpoch
+  let rt ← mgr.runtime name
+  if !urgent && rt.retryAfter > now then
+    return .waiting s!"backing off after {rt.failures} failure(s) in a row"
+  if !urgent then
+    if let some due := Resident.batchDueAt items settings.batchWindowSeconds then
+      if due > now then return .waiting "waiting for the batch window"
+  if Resident.turnsInLastHour rt.turnStamps now ≥ mgr.cfg.residents.maxTurnsPerHour then
+    return .waiting s!"{mgr.cfg.residents.maxTurnsPerHour} turns in the last hour, which is \
+residents.max_turns_per_hour"
+  let day ← Resident.today mgr.cfg.residents.timezone
+  let rec ← mgr.unpauseIfDue rec day
+  if rec.status == .paused then
+    return .paused (rec.pausedReason.getD "paused")
+  -- The day's allowance, which is also the process's cap: what is left of it.
+  let remaining := settings.budgetPerDay - (← Resident.spentOn name day)
+  if remaining < 0.01 then
+    let _ ← mgr.pauseSession rec.id s!"budget:{day}"
+      s!"the day's budget (${settings.budgetPerDay}) is spent; the resident is paused until the \
+next budget day and its inbox keeps filling meanwhile"
+    return .paused s!"budget:{day}"
+  -- Woken from cold: a new environment, through `wake`.
+  let coldWake : IO (Except Delivery LiveSession) := do
+    let some r ← loadSession rec.id | return .error (.failed "the session is gone")
+    unless r.status == .dormant do
+      return .error (.waiting s!"the session is {Lean.Json.compress (Lean.ToJson.toJson r.status)}")
+    unless ← mgr.claimAwake rec.id do
+      return .error (.waiting s!"{mgr.cfg.residents.maxAwake} residents are awake, which is \
+residents.max_awake, and none is idle")
+    match ← mgr.wake appConfig rec.id debug (resident := some (name, settings))
+        (budget? := some remaining) with
+    | .error e =>
+      mgr.noteFailure name rec.id e
+      return .error (.failed e)
+    | .ok _ =>
+      match ← find mgr rec.id with
+      | some s => return .ok s
+      | none   => return .error (.failed "the resident was woken but is not holding")
+  -- Woken from warm: a process in the environment it kept — unless the credentials that
+  -- environment holds are close to expiring, when it goes cold and comes back with new ones.
+  let warmWake (s : LiveSession) : IO (Except Delivery LiveSession) := do
+    if let some exp := s.credentialsExpire then
+      if Int.ofNat exp ≤ now + Int.ofNat credentialsMarginSeconds then
+        let _ ← append s (.notice "info"
+          "the credentials this environment holds expire soon; waking from cold for new ones")
+        teardown mgr s .dormant none
+        return ← coldWake
+    unless ← mgr.claimAwake s.id do
+      return .error (.waiting s!"{mgr.cfg.residents.maxAwake} residents are awake, which is \
+residents.max_awake, and none is idle")
+    match ← mgr.relaunch s remaining day with
+    | .ok () => return .ok s
+    | .error e =>
+      mgr.noteFailure name s.id e
+      return .error (.failed e)
+  let got ← match ← find mgr rec.id with
+    | none => coldWake
+    | some s =>
+      let r ← s.record.get
+      if r.status == .running || r.status == .starting then
+        pure (.error (.waiting "working on a turn"))
+      else if r.status.isTerminal || r.status == .paused then
+        pure (.error (.waiting "being put to sleep"))
+      else
+        match ← s.stream.get with
+        | none => warmWake s
+        | some st =>
+          if ← st.hasExited then
+            let _ ← append s (.notice "error"
+              "the agent process exited; the resident is asleep and will be woken again")
+            teardown mgr s .dormant (some "the agent process exited")
+            mgr.noteFailure name s.id "the agent process exited"
+            pure (.error (.failed "the agent process exited"))
+          else if (← s.budgetDay.get) != day then
+            -- Cycled for the new day's allowance: its cap was yesterday's remainder.
+            let _ ← append s (.notice "info"
+              "a new budget day; restarting the agent process with the new day's allowance")
+            stopProcess s
+            warmWake s
+          else pure (.ok s)
+  match got with
+  | .error d => return d
+  | .ok s    => mgr.handTurn name s items
+
+/-- Hand resident `name` what its inbox holds, if anything is ready and it is not mid-turn —
+    waking it first. `urgent` is a person waiting on the answer: the batch window and the backoff
+    are skipped, and a delivery in progress is waited for rather than skipped. -/
+def Manager.deliver (mgr : Manager) (appConfig : AppConfig) (name : String)
+    (urgent : Bool := false) (debug : Bool := false) : IO Delivery := do
+  unless mgr.cfg.residents.enabled do
+    return .waiting "residents are disabled (residents.enabled is false)"
+  let some settings ← mgr.settingsOf name
+    | return .failed s!"no resident named {name} is configured"
+  let rt ← mgr.runtime name
+  if urgent then rt.lock.lock
+  else
+    unless ← rt.lock.tryLock do return .waiting "a delivery is in progress"
+  try
+    mgr.deliverLocked appConfig name settings urgent debug
+  catch e =>
+    return .failed (toString e)
+  finally
+    rt.lock.unlock
+
+/-- Read which identities are residents, make sure each has its session, and tell the manager.
+    Called at start-up and then now and again, so a resident added to configuration is picked up
+    without a restart. One removed is left as it is — asleep, with its inbox — and no longer
+    delivered to. -/
+def Manager.refreshResidents (mgr : Manager) : IO Unit := do
+  unless mgr.cfg.residents.enabled do
+    mgr.setConfigured #[]
+    return
+  let mut found : Array (String × Identity.ResidentSettings) := #[]
+  for idn in ← Identity.loadAllIdentities do
+    let some spec := idn.resident | continue
+    let settings := spec.settings mgr.cfg.residents
+    try
+      let _ ← ensureResidentSession idn.name settings
+      found := found.push (idn.name, settings)
+    catch e =>
+      IO.eprintln s!"resident {idn.name}: could not prepare its session: {e}"
+  let before ← mgr.configuredResidents
+  if before != found.map (·.1) then
+    let feeds := (← Identity.loadAllIdentities).filter fun i =>
+      (i.resident.map (!·.feeds.isEmpty)).getD false
+    IO.println s!"Residents: {if found.isEmpty then "none" else ", ".intercalate (found.map (·.1)).toList}"
+    for i in feeds do
+      IO.println s!"  Resident {i.name}: its feeds are not supported yet and are ignored; it is \
+reached through its inbox (the chat, and listeners with deliver_to)"
+  mgr.setConfigured found
+  -- A budget pause whose day is over is lifted here too, not only when something arrives: the
+  -- dashboard should not go on saying "paused: budget" all of the next day.
+  let today ← Resident.today mgr.cfg.residents.timezone
+  for (name, _) in found do
+    if let some r ← loadResidentSession name then
+      let _ ← mgr.unpauseIfDue r today
+
+/-- One pass of the delivery loop over every configured resident. Called on the daemon's tick. -/
+def Manager.tickResidents (mgr : Manager) (appConfig : AppConfig) (debug : Bool := false) :
+    IO Unit := do
+  unless mgr.cfg.residents.enabled do return
+  for name in ← mgr.configuredResidents do
+    -- Each on a thread of its own, and only when there is something to hand over: a cold wake
+    -- takes as long as a pod does, and the next resident's message should not wait for it. Two
+    -- ticks reaching one resident at once cannot both deliver — `deliver` skips a resident whose
+    -- delivery is in progress.
+    if (← Resident.ready name).isEmpty then continue
+    let _ ← IO.asTask (prio := .dedicated) do
+      try
+        match ← mgr.deliver appConfig name (debug := debug) with
+        | .sent seq items =>
+          IO.println s!"  Resident {name}: delivered item(s) {items} (transcript seq {seq})"
+        | .failed why => IO.eprintln s!"  Resident {name}: delivery failed: {redactPaths why}"
+        | _ => pure ()
+      catch e => IO.eprintln s!"  Resident {name}: delivery failed: {e}"
+
+/-- What became of a person's message to a resident. -/
+inductive HumanOutcome where
+  /-- Written into a turn at this transcript seq: stream from it. -/
+  | sent (seq : Nat)
+  /-- In the inbox as this item, to be handed over when the resident can take it, and why it
+      could not yet. -/
+  | queued (item : Nat) (why : String)
+
+/-- A person's message to resident `name`: into its inbox, and handed over at once if it can be,
+    with whatever else is ready. -/
+def Manager.residentMessage (mgr : Manager) (appConfig : AppConfig) (name text : String)
+    (debug : Bool := false) : IO (Except String HumanOutcome) := do
+  let some _ ← mgr.settingsOf name | return .error s!"no resident named {name} is configured"
+  let eventId ← TaskStore.generateId
+  let some item ← Resident.insert name "human" eventId true (Json.mkObj [("text", .str text)])
+    | return .error "the message could not be put in the inbox"
+  let outcome ← mgr.deliver appConfig name (urgent := true) (debug := debug)
+  -- Whatever the delivery did, the item knows whether it went: a turn the tick handed over a
+  -- moment ago may have carried it.
+  let why := match outcome with
+    | .waiting w | .paused w | .failed w => w
+    | _ => "it is waiting for the resident"
+  match ← Resident.find? item with
+  | some i => match i.sentSeq with
+    | some seq => return .ok (.sent seq)
+    | none     => return .ok (.queued item (redactPaths why))
+  | none => return .ok (.queued item (redactPaths why))
+
+/-- Pause resident `name` until an operator resumes it. -/
+def Manager.pauseResident (mgr : Manager) (name : String) : IO (Except String Unit) := do
+  let some r ← loadResidentSession name | return .error s!"resident {name} has no session"
+  if r.status == .paused then return .ok ()
+  if ← mgr.pauseSession r.id "operator" "paused by an operator; its inbox keeps filling" then
+    return .ok ()
+  return .error s!"resident {name} cannot be paused right now ({(← gone r.id)})"
+
+/-- Lift resident `name`'s pause, whatever its reason, and forget its failures. -/
+def Manager.resumeResident (mgr : Manager) (name : String) : IO (Except String Unit) := do
+  let some r ← loadResidentSession name | return .error s!"resident {name} has no session"
+  let _ ← mgr.modifyRuntime name fun rt => { rt with failures := 0, retryAfter := 0 }
+  unless r.status == .paused do return .ok ()
+  match ← mgr.claimRecord r.id .paused .dormant with
+  | none => return .error s!"resident {name} is being put to sleep; try again in a moment"
+  | some d =>
+    let _ ← noticeOnRecord { d with pausedReason := none, error := none } "info"
+      "resumed by an operator"
+    return .ok ()
+
+/-- End resident `name`'s conversation and start a new one, asleep: the only way a resident's
+    conversation ends. The identity's memory directory carries over; the conversation does not.
+    The inbox is kept — what is waiting in it is handed to the new conversation. -/
+def Manager.resetResident (mgr : Manager) (name : String) : IO (Except String Unit) := do
+  let some r ← loadResidentSession name | return .error s!"resident {name} has no session"
+  if let some s ← find mgr r.id then
+    let _ ← append s (.notice "info" "reset by an operator")
+    teardown mgr s .dormant none
+  let some r ← loadSession r.id | return .error s!"resident {name} has no session"
+  unless r.status == .dormant || r.status == .paused do
+    return .error s!"resident {name} is {Lean.Json.compress (Lean.ToJson.toJson r.status)}; try \
+again in a moment"
+  let some d ← mgr.claimRecord r.id r.status .dormant
+    | return .error s!"resident {name} is waking up; try again in a moment"
+  let _ ← mgr.modifyRuntime name fun rt => { rt with failures := 0, retryAfter := 0 }
+  let fresh ← newUuid
+  let renewed : SessionRecord :=
+    { d with agentSessionId := some fresh, agentStarted := false, pausedReason := none,
+             error := none }
+  let _ ← noticeOnRecord renewed "info"
+    "the conversation was reset; the next turn starts a new one (the resident's memory directory \
+carries over)"
+  return .ok ()
+
 /-! ## Keeping the table honest -/
 
 /-- Close sessions that have sat without a turn for longer than the timeout, and any whose agent
-    has gone without saying so. Called on the daemon's tick. -/
+    has gone without saying so. Called on the daemon's tick.
+
+    A resident is never closed: idle, its process is stopped after `process_idle_seconds` (warm)
+    and its environment after `pod_idle_seconds` (cold); a dead process puts it to sleep, to be
+    woken by the next delivery. -/
 def Manager.reap (mgr : Manager) : IO Unit := do
   let ss ← mgr.sessions.atomically get
   for s in ss do
@@ -891,11 +1584,36 @@ def Manager.reap (mgr : Manager) : IO Unit := do
     -- already said why it ended. A session that knows how it finished is not told it crashed.
     --
     -- `teardown` leaves an already-terminal record exactly as it is, so this releases what is
-    -- held without rewriting what happened.
-    if r.status.isTerminal then
+    -- held without rewriting what happened. A paused resident is released the same way.
+    if r.status.isTerminal || r.status == .paused then
       teardown mgr s r.status r.error
       continue
-    if ← s.stream.hasExited then
+    let stream ← s.stream.get
+    if let some (name, settings) := s.resident then
+      match stream with
+      | some st =>
+        if ← st.hasExited then
+          let _ ← append s (.notice "error"
+            "the agent process exited; the resident is asleep and the next delivery wakes it")
+          teardown mgr s .dormant (some "the agent process exited")
+          mgr.noteFailure name s.id "the agent process exited"
+          continue
+        if r.status != .idle then continue
+        if (← secondsSince r.lastActivityAt) ≥ settings.processIdleSeconds then
+          let _ ← append s (.notice "info"
+            s!"nothing to do for {settings.processIdleSeconds}s, so the agent process was \
+stopped; its environment is kept (warm)")
+          stopProcess s
+      | none =>
+        if r.status != .warm then continue
+        if (← secondsSince r.lastActivityAt) ≥ settings.podIdleSeconds then
+          let _ ← append s (.notice "info"
+            s!"nothing to do for {settings.podIdleSeconds}s, so the environment was released too \
+(cold)")
+          teardown mgr s .dormant none
+      continue
+    let some st := stream | continue
+    if ← st.hasExited then
       let _ ← append s (.notice "error" "the agent process exited")
       teardown mgr s .failed (some "the agent process exited")
       continue
@@ -945,10 +1663,11 @@ conversation up")
     stream waiting for it. What died is the process, though, not the conversation: the record and
     the transcript are exactly as they were, so these come back as `dormant` and the next turn
     posted to one starts an agent and resumes it. A session already dormant is left alone, or
-    every restart would append the same notice to a transcript nobody was adding to. -/
+    every restart would append the same notice to a transcript nobody was adding to — and so is a
+    paused resident, whose pause a restart does not lift. -/
 def reconcile : IO Unit := do
   for r in ← loadAllSessions do
-    unless r.status.isTerminal || r.status == .dormant do
+    unless r.status.isTerminal || r.status == .dormant || r.status == .paused do
       let now ← TaskStore.currentIso8601
       let seq := r.lastEventSeq + 1
       appendEvent r.id seq now (.notice "info"
