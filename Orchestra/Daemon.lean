@@ -563,6 +563,9 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   -- Sessions on disk describe agent processes that died with the last daemon. Closed before
   -- anything can read them, so a client never attaches to a conversation that will not answer.
   Interactive.reconcile
+  -- And the kleis tokens those processes held, which a daemon that died did not revoke.
+  try Interactive.revokeLeftoverSessionTokens appConfig.kleis
+  catch e => IO.eprintln s!"Could not revoke the sessions' leftover kleis tokens: {e}"
   -- Each resident's session, created asleep if it has none (`docs/design/resident-sessions.md`
   -- §3.1), before anything can address one by name. Never at the cost of the start.
   try interactive.refreshResidents
@@ -1114,8 +1117,7 @@ not polling until the window moves"
             let stamps := Listener.pruneDispatches limits
               ((← dispatchesRef.get).push (Usage.secsToIso8601 now)) now
             dispatchesRef.set stamps
-            let cur ← Listener.loadListenerState name
-            Listener.saveListenerState name { cur with dispatches := stamps }
+            let _ ← Listener.modifyListenerState name fun cur => { cur with dispatches := stamps }
           for (eventId, vars) in (events : Array (String × List (String × String))) do
             if !limits.isEmpty then
               -- The tick began with room and filled up part-way through it. What is left over
@@ -1332,12 +1334,12 @@ holding the rest of this tick until the window moves"
           let held ← heldRef.get
           let newIds := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)
-          -- Re-read enabled so a disable issued mid-tick is not overwritten.
-          let currentEnabled := (← Listener.loadListenerState name).enabled
           let nowIso ← TaskStore.currentIso8601
           let stamps ← dispatchesRef.get
           let nowEpoch ← Usage.nowEpoch
-          let newState : Listener.ListenerState := {
+          -- Applied to the row as it is now, under the state lock, so a disable issued mid-tick
+          -- is not overwritten.
+          let _ ← Listener.modifyListenerState name fun cur => { cur with
             -- For a source that pages by time, this is a fetch cursor and not just a display:
             -- advancing it past an event this tick held would drop that event rather than
             -- delay it. See `Listener.pagesByTime`. Re-reading the same slice next tick is
@@ -1346,13 +1348,10 @@ holding the rest of this tick until the window moves"
                             then state.lastChecked else nowIso
             processedIds := Listener.nextProcessedIds state.processedIds newIds held
                               processedIdsReplacement
-            enabled      := currentEnabled
             -- Pruned here as well as in `noteDispatch`, so that stamps left behind by a
             -- `rate_limits` since removed from the config are dropped rather than kept for
             -- ever: `pruneDispatches` answers `#[]` when there are no limits to count them.
-            dispatches   := Listener.pruneDispatches limits stamps nowEpoch
-          }
-          Listener.saveListenerState name newState
+            dispatches   := Listener.pruneDispatches limits stamps nowEpoch }
         catch e =>
           IO.eprintln s!"  Listener '{name}' poll error: {e}"
   let _listenerSupervisor ← IO.asTask (prio := .dedicated) do

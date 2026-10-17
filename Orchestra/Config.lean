@@ -1003,6 +1003,9 @@ structure ResidentsConfig where
       cycled — stopped and started again at once, on a new token — before the next turn is
       handed over (`docs/design/resident-sessions.md` §7). -/
   tokenRefreshMarginSeconds : Nat := 7200
+  /-- The longest a resident's turn may run. A turn still going after it is interrupted, the
+      resident is put to sleep, and the turn's items are handed over again with the next one. -/
+  turnTimeoutSeconds : Nat := 1800
 deriving Repr, Inhabited
 
 /-- A span of time as configuration writes it: a whole number of seconds, or a string with a
@@ -1038,8 +1041,13 @@ instance : FromJson ResidentsConfig where
       | .error _ | .ok .null =>
         pure (nat "token_refresh_margin_seconds" d.tokenRefreshMarginSeconds)
       | .ok v => (parseSpanSeconds v).mapError (s!"residents.token_refresh_margin: {·}")
+    let turnTimeoutSeconds ← match j.getObjVal? "turn_timeout_seconds" with
+      | .error _ | .ok .null => pure d.turnTimeoutSeconds
+      | .ok v => (parseSpanSeconds v).mapError (s!"residents.turn_timeout_seconds: {·}")
+    if turnTimeoutSeconds == 0 then
+      throw "residents.turn_timeout_seconds must be at least 1"
     return {
-      tokenRefreshMarginSeconds
+      tokenRefreshMarginSeconds, turnTimeoutSeconds
       enabled := j.getObjValAs? Bool "enabled" |>.toOption |>.getD d.enabled
       budgetPerDay
       processIdleSeconds := nat "process_idle_seconds" d.processIdleSeconds

@@ -535,4 +535,30 @@ def readEvents (id : String) (after : Nat := 0) (atMost : Nat := 500)
       docs := docs.push j
   return (docs, total.toNat)
 
+/-! ## The kleis tokens a session holds
+
+Recorded by revocation id from the moment a session derives or mints one until it is revoked, so a
+daemon that died holding some has them revoked by the next one at its start
+(`revokeLeftoverSessionTokens`). -/
+
+/-- Record that session `sessionId` holds the token with `revocationId`. -/
+def recordSessionToken (sessionId revocationId : String) : IO Unit := do
+  let now ← TaskStore.currentIso8601
+  Store.run <| HasModel.save
+    ({ revocation_id := revocationId, session_id := sessionId, recorded_at := now } :
+      Store.SessionTokenRow)
+
+/-- Forget a token once it is revoked. -/
+def forgetSessionToken (revocationId : String) : IO Unit := do
+  let _ ← Store.run <| HasModel.delete (α := Store.SessionTokenRow)
+    (.eq (.var Store.SessionTokenRowIndex.revocation_id .text) (.text revocationId))
+
+open Db.Query.DSL in
+/-- Every token a session was recorded holding and not since revoked: `(session, revocation id)`. -/
+def recordedSessionTokens : IO (Array (String × String)) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let t ← from Store.SessionTokenRow
+    select t
+  return rows.map fun r => (r.session_id, r.revocation_id)
+
 end Orchestra.Interactive

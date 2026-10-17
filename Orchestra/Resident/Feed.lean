@@ -233,11 +233,13 @@ def classify (feed : ZulipFeed) (bot : Bot) (watches : List WatchKey) (m : Zulip
   else
     let allowed := senderAllowed feed.allowSenders m.sender
     let isDm := m.type == "private"
-    let mentioned := m.flags.contains "mentioned" ||
-      (feed.notify.contains "wildcard" && wildcardFlagged m.flags) ||
-      (!isDm && mentionsByName bot m.content)
+    -- `mention` and `wildcard` are two switches: a feed may wake on `@**all**` and not on its
+    -- name, or the other way round.
+    let byName := m.flags.contains "mentioned" || (!isDm && mentionsByName bot m.content)
+    let mentioned := (feed.notify.contains "mention" && byName) ||
+      (feed.notify.contains "wildcard" && wildcardFlagged m.flags)
     if isDm && feed.notify.contains "dm" && allowed then some (.dm, allowed)
-    else if !isDm && feed.notify.contains "mention" && mentioned && allowed then
+    else if !isDm && mentioned && allowed then
       some (.mention, allowed)
     else if !isDm && watches.any (·.matches (m.stream.getD "") m.topic) &&
         (match feed.watchSenders with
@@ -335,16 +337,35 @@ def payloadOf (site : String) (bot : Bot) (reason : Reason) (m : ZulipMessage) :
     ("time", .str (isoOfEpoch m.timestamp)), ("content", .str content),
     ("link", .str (messageLink site m)), ("text", .str content)] : List (String × Json)) ++ place)
 
-/-- The `inbox` source of a Zulip feed's items. -/
-def zulipSource (site : String) : String := s!"zulip:{site}"
+/-- The `inbox` source of a Zulip feed's items: `zulip:<site>#<feed>`. The feed's name is part of
+    it because the inbox deduplicates by `(source, event_id)`: two feeds of one resident on one
+    site — with different senders allowed, say — would otherwise have one's item for a message
+    swallow the other's. -/
+def zulipSource (site feed : String) : String := s!"zulip:{site}#{feed}"
+
+/-- One line of a turn's heading, whatever was put in it: line breaks — which would let a field
+    from outside (a topic, a sender's name, an event id) start a line of its own and pass for a
+    heading — become spaces. -/
+def oneLine (s : String) : String :=
+  s.map fun c => if c == '\n' || c == '\r' || c == ' ' || c == ' ' then ' ' else c
+
+/-- `text` quoted, every line of it: what an item carries is shown as `  > ` lines, and nothing it
+    says can start a line that is not, so no content can pass for a heading — an item's source, its
+    trust, a note — however it is written. `\r` and the Unicode separators count as line breaks,
+    since a reader may take them for one. -/
+def quoteLines (text : String) : String :=
+  let unified := (text.replace "\r\n" "\n").map fun c =>
+    if c == '\r' || c == ' ' || c == ' ' then '\n' else c
+  "\n".intercalate ((unified.splitOn "\n").map ("  > " ++ ·))
 
 /-- How one Zulip item reads in a turn (§4.3): where, who, which message, when, and the message
     quoted. `itemId` names the inbox item, so the transcript shows what woke the resident. -/
 def renderZulipItem (payload : Json) (trusted : Bool) (itemId : Nat) : String :=
-  let s (k : String) := (payload.getObjValAs? String k).toOption.getD ""
+  -- Every field of the heading on one line: a topic or a name is written by whoever sent it.
+  let s (k : String) := oneLine ((payload.getObjValAs? String k).toOption.getD "")
   let sender := payload.getObjVal? "sender" |>.toOption |>.getD Json.null
-  let sname := (sender.getObjValAs? String "name").toOption.getD "someone"
-  let semail := (sender.getObjValAs? String "email").toOption.getD ""
+  let sname := oneLine ((sender.getObjValAs? String "name").toOption.getD "someone")
+  let semail := oneLine ((sender.getObjValAs? String "email").toOption.getD "")
   let who := if semail.isEmpty then sname else s!"{sname} <{semail}>"
   let mid := match payload.getObjValAs? Nat "message_id" with
     | .ok n => toString n
@@ -356,7 +377,7 @@ def renderZulipItem (payload : Json) (trusted : Bool) (itemId : Nat) : String :=
       let others := match payload.getObjVal? "participants" with
         | .ok (.arr ps) => ps.toList.filterMap fun (p : Json) =>
             let e := (p.getObjValAs? String "email").toOption.getD ""
-            if e == semail then none else (p.getObjValAs? String "name").toOption
+            if e == semail then none else (p.getObjValAs? String "name").toOption.map oneLine
         | _ => []
       let group := if others.isEmpty then ""
         else s!" (a group DM, with {", ".intercalate others})"
@@ -364,7 +385,7 @@ def renderZulipItem (payload : Json) (trusted : Bool) (itemId : Nat) : String :=
     | r =>
       let why := if r == "watch" then " (you are watching this topic)" else " (you were mentioned)"
       s!"#{s "stream"} > {s "topic"}, message {mid}{why}, from {who}, {time}"
-  let quoted := "\n".intercalate ((s "content").splitOn "\n" |>.map ("  > " ++ ·))
+  let quoted := quoteLines ((payload.getObjValAs? String "content").toOption.getD "")
   s!"- {mark}{head} (item {itemId}, {s "link"}):\n{quoted}"
 
 end Orchestra.Resident

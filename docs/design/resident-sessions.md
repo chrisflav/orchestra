@@ -387,8 +387,11 @@ agent's own compaction; the memory directory is the durable part.
   are revoked; feeds reconnect and catch up (§5.2); residents with ready items are woken.
 * **Feed failure** (Zulip down, kleis refusing): backoff up to 5 minutes; the error on the
   dashboard; the inbox untouched.
-* **Wake failure**: backoff; after three in a row the resident is **paused: failed** until an
-  operator resumes it. The count, the backoff and the turns counted against `max_turns_per_hour`
+* **Wake failure**, or a turn that ended in an error or ran past `turn_timeout_seconds` (default
+  1800; interrupted, put to sleep, its items handed over again): backoff; after three in a row the
+  resident is **paused: failed** for 30 minutes, then tried once more, or until an operator
+  resumes it. A wake that found no room (a full cluster, every account out of quota) is backed off
+  and never counted. The count, the backoff and the turns counted against `max_turns_per_hour`
   are kept in `resident_runtime` (a row per resident, not columns on the session record, which is
   written whole from the manager's copy), so a restart does not reset them.
 * **Limits**: `max_awake` residents with a process at once (§2); `max_turns_per_hour` (default 60)

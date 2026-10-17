@@ -7,6 +7,7 @@ import Orchestra.Store.Migrations.KleisSource
 import Orchestra.Store.Migrations.ResidentSessions
 import Orchestra.Store.Migrations.ResidentFeeds
 import Orchestra.Store.Migrations.ResidentRuntime
+import Orchestra.Store.Migrations.SessionTokens
 
 /-!
 # The shape of orchestra's database
@@ -256,6 +257,15 @@ structure ResidentRuntimeRow where
   token_expires : Option Int
   deriving Repr
 
+/-- A kleis token a session holds, by revocation id, until it is revoked: what a daemon that died
+    holding it revokes at the next start. See `Orchestra.Interactive`. -/
+@[model (dbName := "session_token") (primaryKey := ["revocation_id"]) orchestra]
+structure SessionTokenRow where
+  revocation_id : String
+  session_id : String
+  recorded_at : String
+  deriving Repr
+
 /-- The last poll of one backend's one authentication source: what the provider said, and when to
     ask again. See `Orchestra.Usage`. -/
 @[model (dbName := "usage_source") (primaryKey := ["backend", "label"]) orchestra]
@@ -400,6 +410,7 @@ def migrations : List Db.Migration.Migration :=
    Orchestra.Store.Migrations.migration_0005_kleis_source,
    Orchestra.Store.Migrations.migration_0006_resident_sessions,
    Orchestra.Store.Migrations.migration_0007_resident_feeds,
-   Orchestra.Store.Migrations.migration_0008_resident_runtime]
+   Orchestra.Store.Migrations.migration_0008_resident_runtime,
+   Orchestra.Store.Migrations.migration_0009_session_tokens]
 
 end Orchestra.Store

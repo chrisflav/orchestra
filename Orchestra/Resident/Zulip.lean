@@ -195,7 +195,7 @@ structure Handle where
   conn : IO.Ref (Option Conn)
   minted : IO.Ref (Option Kleis.Minted)
   queue : IO.Ref (Option String)
-  /-- `connecting`, `connected`, `error`, `disabled`. -/
+  /-- `connecting`, `connected`, `error`, `disabled`, `refused` (no kleis source of its own). -/
   status : IO.Ref String
   /-- When the last long poll was answered, epoch seconds; `0` before the first. -/
   lastPoll : IO.Ref Int
@@ -227,23 +227,38 @@ def feedsOf (resident : String) : IO (List (String × ZulipFeed)) := do
     | .zulipFeed f => if c.action.deliverTo == some resident then some (n, f) else none
     | _ => none
 
-/-- Update a feed's state row with `f`, re-reading it first so a change made meanwhile — the
-    dashboard's enable switch — is kept. -/
+/-- Update a feed's state row with `f`, applied to the row as it is now under the listener-state
+    lock (`Listener.modifyListenerState`), so a change made meanwhile — the dashboard's enable
+    switch — is kept. -/
 def updateState (listener : String) (f : Listener.ListenerState → Listener.ListenerState) :
     IO Unit := do
-  let st ← Listener.loadListenerState listener
-  Listener.saveListenerState listener (f st)
+  let _ ← Listener.modifyListenerState listener f
+
+/-- Why resident `resident` cannot have a feed, or `none` when it can: a feed reads Zulip with the
+    resident's *own* key — its identity's `kleis_spec` or `kleis_token` — and nothing else.
+    `kleis.default_spec` in particular is not the resident's: a feed on it would read Zulip as
+    whatever that spec allows, which is nobody's choice for this resident. -/
+def missingSource (idn : Option Identity.Identity) (resident : String) : Option String :=
+  match idn with
+  | none => some s!"there is no identity named {resident} to read Zulip as"
+  | some i =>
+    if i.kleisSpec.isNone && i.kleisToken.isNone then
+      some s!"identity {resident} has no kleis source of its own (kleis_spec or kleis_token); a \
+feed reads Zulip only with the resident's own key, never with kleis.default_spec, so it is not \
+started"
+    else none
 
 /-- Derive a token for the feed from the resident's identity, and record its revocation id
     before it is used. -/
 def deriveToken (kc : KleisConfig) (listener resident feed : String) : IO Kleis.Minted := do
-  let some idn ← Identity.loadIdentity resident
-    | throw (.userError s!"there is no identity named {resident} to read Zulip as")
-  let choice := Kleis.choose { identitySpec := idn.kleisSpec, identityToken := idn.kleisToken.isSome
-                               defaultSpec := kc.defaultSpec }
+  let idn? ← Identity.loadIdentity resident
+  if let some why := missingSource idn? resident then throw (.userError why)
+  let some idn := idn? | throw (.userError s!"there is no identity named {resident}")
+  -- The identity's own source only: no `defaultSpec` (see `missingSource`).
+  let choice := Kleis.choose { identitySpec := idn.kleisSpec, identityToken := idn.kleisToken.isSome }
   let some src ← Kleis.resolve choice idn.kleisToken
-    | throw (.userError s!"identity {resident} has no kleis source (kleis_spec or kleis_token), \
-and kleis.default_spec is unset; a feed reads Zulip only through kleis with the resident's key")
+    | throw (.userError s!"identity {resident} has no kleis source (kleis_spec or kleis_token); a \
+feed reads Zulip only through kleis with the resident's own key")
   let facts : Kleis.TaskFacts := { taskId := feedTaskId resident feed, identity := some resident
                                    readOnly := true }
   let minted ← Kleis.derive kc src facts (idn.kleisNarrow ++ feedNarrowings) (ttl := some tokenTtl)
@@ -297,7 +312,8 @@ def deliver (h : Handle) (bot : Bot) (watches : List WatchKey)
   let m := { m with sender := { m.sender with deliveryEmail := emails.get? m.sender.id } }
   let some (reason, trusted) := classify h.feed bot watches m | return false
   let payload := payloadOf h.feed.site bot reason m
-  match ← Resident.insert h.resident (zulipSource h.feed.site) (toString m.id) trusted payload with
+  match ← Resident.insert h.resident (zulipSource h.feed.site h.feed.name) (toString m.id) trusted
+      payload with
   | some item =>
     IO.println s!"  Feed '{h.listener}': message {m.id} ({reason.toString}) → resident \
 {h.resident}'s inbox (item {item})"
@@ -326,6 +342,24 @@ def catchUp (h : Handle) (c : Conn) (bot : Bot) (emails : Std.HashMap Nat String
       if newest || ms.isEmpty || last ≥ upTo || last == anchor then break
       anchor := last
 
+/-- Hand a batch of events to `deliverOne`, in order, moving `lastEvent` past each only once it is
+    in — an event that carries no message is past at once. Answers the ids of the messages handed
+    over. A `deliverOne` that throws stops the batch with `lastEvent` on the last event that got in.
+
+    `last_event_id` is what tells Zulip an event was taken. Moved before an insert that then
+    failed, the event was acknowledged and gone, and the message with it; left where it is, the
+    next long poll answers it again (and the runner registers the queue again besides, whose
+    catch-up reads it back from the checkpoint). -/
+def takeEvents (evs : Array (Int × Option ZulipMessage)) (lastEvent : IO.Ref Int)
+    (deliverOne : ZulipMessage → IO Unit) : IO (List Nat) := do
+  let mut ids : List Nat := []
+  for (eid, m?) in evs do
+    if let some m := m? then
+      deliverOne m
+      ids := m.id :: ids
+    if eid > (← lastEvent.get) then lastEvent.set eid
+  return ids
+
 /-! ## The runner -/
 
 /-- Run one feed until its listener goes away or the daemon stops: the long-poll loop. `stop`
@@ -345,6 +379,7 @@ partial def runFeed (kc : KleisConfig) (listener : String) (stop : IO Bool) : IO
   let emails ← IO.mkRef ({} : Std.HashMap Nat String)
   let registered ← IO.mkRef (none : Option Registered)
   let lastEvent ← IO.mkRef (-1 : Int)
+  let deliveryFailed ← IO.mkRef false
   let failures ← IO.mkRef 0
   let sleepUnlessStopped (secs : Nat) : IO Unit := do
     for _ in [0:secs] do
@@ -366,6 +401,21 @@ partial def runFeed (kc : KleisConfig) (listener : String) (stop : IO Bool) : IO
           h.status.set "disabled"
         sleepUnlessStopped 5
         continue
+      -- The resident's own key or nothing: a feed whose identity has no kleis source of its own is
+      -- not started — said on the listener, and looked at again a minute later, so one added to
+      -- the identity is picked up without a restart.
+      if let some why := missingSource (← Identity.loadIdentity resident) resident then
+        if (← h.status.get) != "refused" then
+          IO.eprintln s!"  Feed '{listener}': {why}"
+          release kc h
+          registered.set none
+          h.status.set "refused"
+          updateState listener fun s => { s with error := some why }
+        sleepUnlessStopped 60
+        continue
+      if (← h.status.get) == "refused" then
+        h.status.set "connecting"
+        updateState listener fun s => { s with error := none }
       try
         -- The token: derived when there is none or it is close to expiring.
         let now ← Usage.nowEpoch
@@ -434,12 +484,12 @@ partial def runFeed (kc : KleisConfig) (listener : String) (stop : IO Bool) : IO
             h.lastPoll.set (← Usage.nowEpoch)
             if !evs.isEmpty then
               let watches ← activeWatchKeys resident feedNow.name
-              let mut ids : List Nat := []
-              for (eid, m?) in evs do
-                if eid > (← lastEvent.get) then lastEvent.set eid
-                if let some m := m? then
-                  let _ ← deliver h bot watches (← emails.get) m
-                  ids := m.id :: ids
+              let ems ← emails.get
+              let ids ← try takeEvents evs lastEvent fun m => do
+                  let _ ← deliver h bot watches ems m
+                catch e =>
+                  deliveryFailed.set true
+                  throw e
               unless ids.isEmpty do
                 let nowIso ← TaskStore.currentIso8601
                 updateState listener fun s =>
@@ -457,6 +507,10 @@ partial def runFeed (kc : KleisConfig) (listener : String) (stop : IO Bool) : IO
         IO.eprintln s!"  Feed '{listener}': {msg}; trying again in {wait}s"
         updateState listener fun s => { s with error := some msg }
         h.status.set "error"
+        -- An event that did not reach the inbox: register again, so the catch-up reads it back.
+        if ← deliveryFailed.modifyGet (fun b => (b, false)) then
+          registered.set none
+          h.queue.set none
         -- A refusal may be the token's: derive a new one, and start the protocol over.
         if (msg.splitOn "403").length > 1 || (msg.splitOn "401").length > 1 || n % 3 == 0 then
           if let some m ← h.minted.get then

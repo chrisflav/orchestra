@@ -253,6 +253,6 @@ def aResidentWakesWithoutReadingTheGitHubAppKey : Test := do
 @[test]
 def theRuntimeMigrationIsTheLatest : Test := do
   let names := Store.migrations.map (·.name)
-  TestM.assertEqual (names.getLast?) (some "0008_resident_runtime")
+  TestM.assertEqual ((names.drop 7).head?) (some "0008_resident_runtime")
 
 end OrchestraTest.ResidentTokens

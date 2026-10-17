@@ -197,6 +197,10 @@ structure Runtime where
   /-- When the kleis token the resident's agent process holds expires, epoch seconds, while it
       has one: for the dashboard. -/
   tokenExpires : Option Int := none
+  /-- Wakes in a row that found no room — a full cluster, every account out of quota — which are
+      not failures (nothing is wrong with the resident) but are backed off all the same. Kept in
+      memory only: a restart may as well try again at once. -/
+  capacityWaits : Nat := 0
 deriving Repr, BEq, Inhabited
 
 open Db.Query.DSL in
@@ -275,8 +279,40 @@ def batchDueAt (items : Array InboxItem) (window : Nat) : Option Int := do
 def backoffSeconds (failures : Nat) : Nat :=
   if failures == 0 then 0 else min 300 (30 * 2 ^ (failures - 1))
 
-/-- Failures in a row after which a resident is paused until an operator resumes it. -/
+/-- Failures in a row after which a resident is paused (`paused: failed`). -/
 def maxFailures : Nat := 3
+
+/-- How long a resident paused for failures stays paused before the delivery loop lifts the pause
+    on its own and tries once more: what fails three times in a row is often a dependency that is
+    down for a while, and a resident nobody resumes by hand should not stay deaf for good. An
+    operator's pause is never lifted this way. -/
+def failedPauseSeconds : Nat := 1800
+
+/-- Whether a pause for failures is over: its reason is `failed` and the time it was paused until
+    (`retryAfter`, which pausing sets `failedPauseSeconds` ahead) has come. -/
+def failedPauseOver (reason : Option String) (retryAfter now : Int) : Bool :=
+  reason == some "failed" && retryAfter ≤ now
+
+/-- The most `refresh_kleis_token` calls one turn may make, and any hour. Each derives a token from
+    kleis; an agent that has convinced itself a new token will fix a refusal would otherwise call
+    it in a loop. -/
+def maxRefreshesPerTurn : Nat := 3
+def maxRefreshesPerHour : Nat := 10
+
+/-- Why one more `refresh_kleis_token` call is refused, given the earlier ones as
+    `(turn, epoch seconds)`, or `none` when it may go ahead. -/
+def refreshRefusal (past : Array (Nat × Int)) (turn : Nat) (now : Int) : Option String :=
+  let inTurn := (past.filter (·.1 == turn)).size
+  let inHour := (past.filter (·.2 > now - 3600)).size
+  let why := "the token you have is current; a refusal from kleis (HTTP 403) says which rule \
+refused the request, and a new token would not change it"
+  if inTurn ≥ maxRefreshesPerTurn then
+    some s!"refresh_kleis_token was already called {inTurn} times this turn, the most a turn may; \
+{why}"
+  else if inHour ≥ maxRefreshesPerHour then
+    some s!"refresh_kleis_token was already called {inHour} times in the last hour, the most an \
+hour may; {why}"
+  else none
 
 /-- How many of `stamps` (epoch seconds) fall within the hour before `now`. -/
 def turnsInLastHour (stamps : Array Int) (now : Int) : Nat :=
@@ -316,16 +352,22 @@ where
 def redeliveryNote : String :=
   "These may have reached you already; your previous turn was interrupted."
 
-/-- How one item reads in a turn. -/
+/-- How one item reads in a turn: a heading saying where it came from and whether it is trusted —
+    on one line, whatever its fields hold — and then what it carries, quoted line by line
+    (`quoteLines`), as a Zulip message is. Nothing an item carries can therefore start a line of the
+    turn that is not quoted, so no listener event or other text from outside can pass itself off
+    as a second item, a trusted one, or a note. -/
 def renderItem (i : InboxItem) : String :=
   let trust := if i.trusted then "" else " [not from a trusted source]"
-  if i.source == "human" then
-    s!"Message from the chat (item {i.id}){trust}:\n{i.text}"
-  else if i.source.startsWith "listener:" then
-    let name := (i.source.drop "listener:".length).toString
-    s!"Event from listener {name} (event {i.eventId}, item {i.id}){trust}:\n{i.text}"
-  else
-    s!"From {i.source} (event {i.eventId}, item {i.id}){trust}:\n{i.text}"
+  let head :=
+    if i.source == "human" then
+      s!"Message from the chat (item {i.id}){trust}:"
+    else if i.source.startsWith "listener:" then
+      let name := oneLine (i.source.drop "listener:".length).toString
+      s!"Event from listener {name} (event {oneLine i.eventId}, item {i.id}){trust}:"
+    else
+      s!"From {oneLine i.source} (event {oneLine i.eventId}, item {i.id}){trust}:"
+  head ++ "\n" ++ quoteLines i.text
 
 /-- Whether an item came from a Zulip feed. -/
 def InboxItem.isZulip (i : InboxItem) : Bool :=
@@ -334,7 +376,8 @@ def InboxItem.isZulip (i : InboxItem) : Bool :=
 
 /-- The site a Zulip item came from. -/
 def InboxItem.site (i : InboxItem) : String :=
-  (i.payload.getObjValAs? String "site").toOption.getD (i.source.drop "zulip:".length).toString
+  (i.payload.getObjValAs? String "site").toOption.getD
+    (((i.source.drop "zulip:".length).toString.splitOn "#").headD "")
 
 /-- A run of Zulip items from one site, as the turn shows them (§4.3): a heading naming the
     server, one entry per message with the untrusted ones marked, and how to answer. -/

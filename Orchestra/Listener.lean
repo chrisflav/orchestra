@@ -1,4 +1,5 @@
 import Lean.Data.Json
+import Std.Sync
 import Orchestra.Config
 import Orchestra.TaskStore
 import Orchestra.Queue
@@ -843,7 +844,9 @@ stored as '{name}'. A listener is named by its file; drop the field, or store th
   if cfg.source.isLongPoll && cfg.action.deliverTo.isNone then
     return .error "a zulip-feed source delivers to a resident: its action must name one in \
 'deliver_to', whose kleis key it reads Zulip with"
-  if cfg.intervalSeconds == 0 then
+  -- A long-polled source has no interval: its runner asks again as soon as it is answered, and a
+  -- listener file declaring one need not invent a number nothing reads.
+  if cfg.intervalSeconds == 0 && !cfg.source.isLongPoll then
     return .error "'interval_seconds' must be at least 1; a listener polling zero seconds apart \
 would spin against its source as fast as the network allows"
   -- A ceiling of nothing is not a ceiling; it is an off switch, and there is already one of
@@ -907,6 +910,23 @@ def loadListenerState (name : String) : IO ListenerState := do
 def saveListenerState (name : String) (state : ListenerState) : IO Unit := do
   Utils.ensureConfigName "listener" name
   Store.run <| HasModel.save (state.toRow name)
+
+/-- Serialises every read-modify-write of a listener's state in this process. Every writer is in
+    the daemon — the poll fibers, a feed's runner, the API's enable switch — and a blind write of
+    the whole row from a copy read a moment earlier would put back whatever another writer changed
+    meanwhile: a feed runner recording its checkpoint undid a `disable` issued while it held the
+    copy. -/
+initialize listenerStateLock : Std.BaseMutex ← Std.BaseMutex.new
+
+/-- Change a listener's state with `f`, applied to the row as it is now, atomically with respect to
+    every other writer that goes through here. Answers the state written. -/
+def modifyListenerState (name : String) (f : ListenerState → ListenerState) : IO ListenerState := do
+  listenerStateLock.lock
+  try
+    let next := f (← loadListenerState name)
+    saveListenerState name next
+    return next
+  finally listenerStateLock.unlock
 
 -- Template rendering
 

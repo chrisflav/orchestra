@@ -160,7 +160,7 @@ def failuresBackOffAndTurnsAreCountedPerHour : Test := do
 def aBudgetPauseLiftsWithTheDayAndNoOtherDoes : Test := do
   TestM.assert (!pauseLifted (some "budget:2026-10-16") "2026-10-16") (msg := "same day: still paused")
   TestM.assert (pauseLifted (some "budget:2026-10-16") "2026-10-17") (msg := "next day: lifted")
-  TestM.assert (!pauseLifted (some "failed") "2026-10-17") (msg := "failures need an operator")
+  TestM.assert (!pauseLifted (some "failed") "2026-10-17") (msg := "not by the day: a pause for failures lifts on its own clock (failedPauseOver)")
   TestM.assert (!pauseLifted (some "operator") "2026-10-17")
 
 /-! ## The inbox -/

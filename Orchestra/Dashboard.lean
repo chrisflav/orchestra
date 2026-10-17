@@ -1545,8 +1545,7 @@ private def setListenerEnabled (name : String) (body : String) : IO WriteResult 
       match j.getObjValAs? Bool "enabled" with
       | .ok b    => pure b
       | .error _ => return .badRequest "expected a JSON body of the form {\"enabled\": true}"
-  let st ← Listener.loadListenerState name
-  Listener.saveListenerState name { st with enabled }
+  let _ ← Listener.modifyListenerState name fun st => { st with enabled }
   return .ok ((← listenerDetailApi name).getD Json.null)
 
 /-! ### Roles -/

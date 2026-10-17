@@ -123,9 +123,17 @@ def onlyAllowedSendersWakeTheResidentAndTheBotNever : Test := do
     none (msg := "a silent mention is not one")
   TestM.assertEqual (classify feed bot [] (streamMsg 9 alice "ops" "t" (flags := ["wildcard_mentioned"])))
     none (msg := "wildcards only when notify says so")
+  -- `wildcard` and `mention` are two switches: a feed on `["wildcard"]` alone wakes on `@**all**`
+  -- (it used to wake on nothing at all) and not on its name.
   TestM.assertEqual (classify { feed with notify := ["wildcard"] } bot []
       (streamMsg 9 alice "ops" "t" (flags := ["stream_wildcard_mentioned"])))
-    none (msg := "notify without mention admits no mention")
+    (some (.mention, true)) (msg := "wildcard alone admits a wildcard mention")
+  TestM.assertEqual (classify { feed with notify := ["wildcard"] } bot []
+      (streamMsg 9 alice "ops" "t" (flags := ["mentioned"])))
+    none (msg := "and not a mention by name")
+  TestM.assertEqual (classify { feed with notify := ["wildcard"] } bot []
+      (streamMsg 9 eve "ops" "t" (flags := ["wildcard_mentioned"])))
+    none (msg := "from an allowed sender only")
   TestM.assertEqual (classify { feed with notify := ["mention", "wildcard"] } bot []
       (streamMsg 9 alice "ops" "t" (flags := ["stream_wildcard_mentioned"])))
     (some (.mention, true))
@@ -522,7 +530,7 @@ def zulipFeedEndToEnd : Test := do
   | some i =>
     TestM.assert i.trusted (msg := "from an allowed sender")
     TestM.assertEqual (i.payload.getObjValAs? String "reason").toOption (some "dm")
-  TestM.assert (items.all (·.source == s!"zulip:{site}")) (msg := "every item is the feed's")
+  TestM.assert (items.all (·.source.startsWith s!"zulip:{site}#")) (msg := "every item is the feed's")
   TestM.assert (items.all fun i => (i.payload.getObjVal? "sender" >>= (·.getObjValAs? Nat "id")).toOption != some 21)
     (msg := "none is the bot's own")
   TestM.assert (watched matches .ok _) (msg := s!"a private stream the bot is in can be watched: {repr watched}")

@@ -48,3 +48,4 @@ import OrchestraTest.RestartResumeTest
 import OrchestraTest.ResidentTest
 import OrchestraTest.ResidentFeedTest
 import OrchestraTest.ResidentTokenTest
+import OrchestraTest.ResidentReviewTest
