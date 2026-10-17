@@ -703,4 +703,14 @@ def cardPrompt (card : String) : String :=
   "refusal is HTTP 403 and says which rule refused it. This is what your token allows:\n\n" ++
   card.trimAscii.toString
 
+/-- The first line of `cardNote`, by which a note not yet delivered is found and replaced. -/
+def cardNoteHeading : String := "Your token card, current as of now:"
+
+/-- The card as a note on the next turn of a resumed conversation. A resumed agent keeps the
+    system prompt its conversation began with — Claude Code restores it with the conversation —
+    so the card a later process starts on would otherwise never reach it. -/
+def cardNote (card : String) : String :=
+  cardNoteHeading ++ " it replaces the one in your system prompt and any earlier one, which " ++
+  "describe tokens this conversation held before.\n\n" ++ card.trimAscii.toString ++ "\n"
+
 end Orchestra.Kleis

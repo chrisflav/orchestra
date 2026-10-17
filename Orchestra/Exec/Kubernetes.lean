@@ -701,7 +701,11 @@ def runnerScript (envFile : String) (workdir : String) (guard : Bool := false) :
     if guard then
       s!"if [ -f {agentPidPath} ]; then kill -9 \"$(cat {agentPidPath} 2>/dev/null)\" 2>/dev/null || true; fi\necho $$ > {agentPidPath}\n"
     else ""
-  s!". {envFile}\ncd {shellEscape workdir}\n{guardLines}exec \"$@\"\n"
+  -- `$HOME/.local/bin` on `PATH`: the image puts its own home's there, but `HOME` here is
+  -- `homePath` — on a task volume, not the image's — and that is where kleis's setup installs a
+  -- client such as `kleis-mail`.
+  let pathLine := "case \":$PATH:\" in *\":$HOME/.local/bin:\"*) ;; *) PATH=\"$HOME/.local/bin:$PATH\"; export PATH ;; esac\n"
+  s!". {envFile}\n{pathLine}cd {shellEscape workdir}\n{guardLines}exec \"$@\"\n"
 
 /-! ## Talking to the cluster -/
 

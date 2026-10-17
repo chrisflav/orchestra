@@ -708,6 +708,30 @@ def anAgentShootsWhateverTheLastOneLeftBehind : Test := do
   TestM.assert (!AgentDef.containsCI plain "kill") "the repository's own scripts kill nothing"
 
 @[test]
+def theRunnerPutsHomeLocalBinOnPath : Test := do
+  -- A pod's `HOME` is orchestra's, on a task volume, not the image's; a client kleis's setup
+  -- installs in `~/.local/bin` (kleis-mail) has to be found there all the same.
+  let dir := System.FilePath.mk s!"/tmp/orchestra-k8s-test-{← Exec.randomHex 6}"
+  IO.FS.createDirAll (dir / ".local" / "bin")
+  IO.FS.writeFile (dir / "env") (envFileContents #[])
+  IO.FS.writeFile (dir / ".local" / "bin" / "hello-client") "#!/bin/sh\necho found\n"
+  let _ ← IO.Process.output { cmd := "chmod", args := #["0755", (dir / ".local" / "bin" / "hello-client").toString] }
+  let run (path : String) : IO String := do
+    let out ← IO.Process.output {
+      cmd := "/bin/sh"
+      args := #["-c", runnerScript (dir / "env").toString dir.toString, "orchestra",
+                "/bin/sh", "-c", "hello-client; printf '%s' \"$PATH\""]
+      env := #[("HOME", some dir.toString), ("PATH", some path)] }
+    return out.stdout
+  let out ← run "/usr/bin:/bin"
+  let again ← run s!"{dir}/.local/bin:/usr/bin:/bin"
+  try IO.FS.removeDirAll dir catch _ => pure ()
+  TestM.assert (AgentDef.containsCI out "found") "a client in ~/.local/bin is found"
+  TestM.assert (AgentDef.containsCI out "/usr/bin:/bin") "and the rest of PATH is kept"
+  TestM.assertEqual (again.splitOn s!"{dir}/.local/bin").length 2
+    (msg := "a PATH that has it already is left as it is")
+
+@[test]
 def anEnvironmentValueCannotEndItsOwnAssignment : Test := do
   -- The values here are a GitHub token and an API key, but also a system prompt and a model name;
   -- one of them containing a quote must not turn into a second command.
