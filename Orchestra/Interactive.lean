@@ -955,6 +955,9 @@ a fresh token and the old ones are revoked; nothing for you to do." ++
     -- minted above; a later one in the same environment — a warm resident woken hours on — gets a
     -- fresh one rather than a token that has long expired.
     let firstLaunch ← IO.mkRef true
+    -- The card for the first turn of a session that resumes its conversation as it is acquired:
+    -- the session's notes do not exist until it is built below.
+    let pendingCardNote ← IO.mkRef (none : Option String)
     -- One agent process in this environment. Each goes through the resolver again, as a queued
     -- run does, so an account found out of quota since the last process is not handed the next.
     let launch (resume : Option String) (budget : Float) :
@@ -983,6 +986,16 @@ a fresh token and the old ones are revoked; nothing for you to do." ++
             pure (some (l, m))
           | none => pure none
       let systemPrompt ← systemPromptNow
+      -- A resumed conversation keeps the system prompt it began with, whatever this process is
+      -- started with, so the card goes to it as a note on the next turn too — replacing a card
+      -- note that has not been delivered yet, which describes a token about to be revoked.
+      if resume.isSome then
+        if let some c ← cardRef.get then
+          let note := Kleis.cardNote c
+          match ← liveRef.get with
+          | some s => s.notes.modify fun ns =>
+              ns.filter (fun n => !n.startsWith Kleis.cardNoteHeading) ++ [note]
+          | none => pendingCardNote.set (some note)
       -- The env file is emptied before the process starts: its own token is the current one, and
       -- whatever a refresh wrote there is about to be revoked.
       let (kleisLaunch, envFileVar) ← match creds, envFile with
@@ -1023,14 +1036,14 @@ a fresh token and the old ones are revoked; nothing for you to do." ++
       shutdownMcp, exec := execSession
       authLabel := authRef, backend := backendName, costBase := ← IO.mkRef record.costUsd
       launch, resident, budgetDay := ← IO.mkRef day
-      notes := ← IO.mkRef (if lostConversation then
+      notes := ← IO.mkRef ((if lostConversation then
           ["Your previous conversation was lost; your memory directory is intact."]
         -- A new conversation in a session that has had turns — after a reset, mostly. What it set
         -- up outside the last conversation is still there, and it should know.
         else if isResident && resumeAgentSession.isNone && record.turnCount > 0 then
           ["This is a new conversation; the earlier one (an operator reset it) is not available \
 to you. Your memory directory and your watches (list_watches) are as they were."]
-        else [])
+        else []) ++ (← pendingCardNote.get).toList)
       creds := credsRef
       torn := ← IO.mkRef false
       turnStartedAt := ← IO.mkRef 0

@@ -335,6 +335,14 @@ def launchDerived_setsNothingAboutAnyOneService : Test := do
 private def run (cmd : String) (args : Array String) : IO Unit := do
   let _ ← IO.Process.output { cmd, args }
 
+
+@[test]
+def aCardNoteReplacesTheSystemPromptsCard : Test := do
+  -- A resumed conversation keeps its first system prompt; the note is how a later card reaches it.
+  let n := Kleis.cardNote "This token acts as secretary.\n\nMail — mail/secretary@merten.dev\n"
+  TestM.assert (n.startsWith Kleis.cardNoteHeading) "the note is found by its heading"
+  TestM.assert (mentions n "Mail — mail/secretary@merten.dev") "and carries the card"
+  TestM.assert (mentions n "replaces the one in your system prompt") "and says what it replaces"
 @[test]
 def writeUnderHome_followsNoLink : Test := do
   let home ← IO.FS.createTempDir
