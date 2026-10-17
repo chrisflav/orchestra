@@ -141,6 +141,16 @@ export interface ListenerSummary {
   eventCount: number;
   /** Empty when the listener is not paced. */
   rateLimits: RateLimitStatus[];
+  /** Only for a resident's feed (a long-polled `zulip-feed` source). */
+  feed?: FeedStatus;
+}
+
+export interface FeedStatus {
+  connection: "connecting" | "connected" | "error" | "disabled" | "stopped";
+  resident: string | null;
+  /** The last message id it has seen. */
+  checkpoint: string | null;
+  error: string | null;
 }
 
 export interface ActionConfig {

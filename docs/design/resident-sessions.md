@@ -1,6 +1,8 @@
 # Resident sessions: agents that are always available
 
-*Status: proposal, revised once after review (changes at the end). Nothing here is implemented.*
+*Status: proposal, revised once after review (changes at the end). Phases 1 and 2 (§14) are
+implemented — `docs/interactive.md` § residents says how they work; §15.2 was verified (a Zulip
+long poll held open through kleis, answered by a heartbeat after ~46s). Phase 3 is not.*
 
 A **resident** is an identity with one session that never ends. It is not always running: when it
 has had nothing to do for a while it is put to sleep — first its process, later its pod — and the

@@ -38,7 +38,10 @@ export function Listeners() {
                 end={<EnabledStatus enabled={l.enabled} />}
                 meta={[
                   l.sourceType,
-                  `every ${interval(l.intervalSeconds)}`,
+                  // A feed is long-polled, not polled: its connection says more than an interval.
+                  l.feed
+                    ? `${l.feed.connection} → ${l.feed.resident ?? "?"}${l.feed.error ? `: ${l.feed.error}` : ""}`
+                    : `every ${interval(l.intervalSeconds)}`,
                   <>
                     checked <Time key="t" iso={l.lastCheckedAt ?? ""} />
                   </>,

@@ -229,7 +229,8 @@ write.
 ## residents
 
 A **resident** is an identity with one session that never ends — the design is
-[`design/resident-sessions.md`](design/resident-sessions.md); what is built so far is its phase 1.
+[`design/resident-sessions.md`](design/resident-sessions.md); what is built so far is its phases 1
+and 2 (the Zulip feed and watches).
 An identity becomes one with a `resident` block in its `identity.json`:
 
 ```json
@@ -241,7 +242,13 @@ An identity becomes one with a `resident` block in its `identity.json`:
     "process_idle_seconds": 1800,
     "pod_idle_seconds": 21600,
     "batch_window_seconds": 3,
-    "model": "claude-opus-5-5"
+    "model": "claude-opus-5-5",
+    "feeds": [
+      { "kind": "zulip", "site": "zulip.merten.dev",
+        "notify": ["dm", "mention"],
+        "allow_senders": ["christian@flavigny.de", "*@merten.dev", "id:8"],
+        "watch_senders": "any" }
+    ]
   }
 }
 ```
@@ -251,9 +258,9 @@ Every field is optional and falls back to the `residents` block of `config.json`
 (`21600`), `batch_window_seconds` (`3`), `timezone` (`"UTC"`, for the budget day), `max_awake`
 (`4`, residents with a process at once, counted apart from `interactive.max_sessions`),
 `max_turns_per_hour` (`60`) and `volume_size` (the backend's own size when absent). The block
-may carry `tools`, `agent` (the backend) and `feeds`; it may not carry `upstream` or `fork`. Feeds
-are read and ignored for now — the Zulip feed is the next phase — so a resident is reached
-through its inbox: the chat, and listeners with `deliver_to`.
+may carry `tools`, `agent` (the backend) and `feeds` (below); it may not carry `upstream` or
+`fork`. A resident is reached through its inbox: its feeds, the chat, and listeners with
+`deliver_to`.
 
 **One session, by name, never ended.** At start-up the daemon creates each resident's session
 asleep (id `resident-<name>`, no process), with no repository: a scratch workspace kept across
@@ -297,6 +304,39 @@ transcript and at the head of the next turn. A daemon stop puts residents to sle
 **`deliver_to`.** A listener action may name `"deliver_to": "<resident>"` instead of queueing a
 task: each event's rendered `prompt_template` becomes an inbox item from `listener:<name>`, keyed
 by the event's id, and is marked untrusted unless the action says `"trusted": true`.
+
+**Feeds.** Each entry of `feeds` is a Zulip event queue the daemon holds open for the resident: a
+listener named `resident-<name>-<feed>` (the feed's `name`, default `zulip`) with a `zulip-feed`
+source and a `deliver_to` action, on the dashboard and switched with `orchestra listener
+enable|disable` like any other. A listener file may declare one too (`"source": {"type":
+"zulip-feed", "site": …}`, with `deliver_to`). Instead of polling, the daemon long-polls it, through
+kleis with the **resident's own key**: a token derived from the identity's source, narrowed to
+`zulip: only read` and `services: zulip`, task id `resident:<name>/feed:<feed>`, living 4h and
+derived again half an hour before it expires, revoked when the feed stops; its revocation id is on
+the listener's state so a daemon that died holding it has it revoked by the next. Requests go to
+`https://<site>` through the proxy at kleis's `url` (not the pods' `proxy`), the token on curl's
+config stdin, with kleis's CA. The feed reads `users/me`, registers a queue for messages
+(`all_public_streams`), catches up from its checkpoint — the last message id it saw, on the
+listener's state — with one `GET /messages` per term (`is:dm`, `is:mentioned`, the bot's name in
+public streams, one per watch), then long-polls `GET /events` (`--max-time 120`), again at once;
+an expired queue is registered again. A feed with no checkpoint starts at the newest message.
+
+A message becomes an inbox item (source `zulip:<site>`, event id its message id) when it is not the
+bot's own and: it is a DM, or mentions the bot (`mentioned`, `@**<bot name>**` in a public stream
+it is not subscribed to, wildcards if `notify` has `wildcard`), from a sender in `allow_senders`;
+or it is in a watched topic, from a sender `watch_senders` admits (`"any"` or a list). An entry of
+`allow_senders` is an address pattern (`*` matches anything), matched against the address Zulip
+shows and, where the server lets the bot see it, the real one (`delivery_email`) — or a user id,
+`id:8`, for a server that hides addresses. Items are `trusted` when the sender is in
+`allow_senders`; the turn lists them under "New on Zulip (<site>)", marking the others "[not from
+an allowed sender]". A failure backs off up to five minutes and is shown on the listener
+(`feed.error`, `feed.connection`, `feed.checkpoint`) and on `GET /api/v1/residents/{name}`.
+
+**Watches.** A resident's MCP server, and only a resident's, offers `watch(feed?, key, until?,
+note?)` — `key` is `{stream, topic?}`, `until` an instant or a span (`12h`, `3d`) — `unwatch(feed?,
+key)` and `list_watches(feed?)`. `watch` asks the server, with the feed's own token, which streams
+the bot can see, and refuses a private stream it is not subscribed to. Watches are kept in
+`resident_watch`, read on every event and for the catch-up, and lapse on their own at `until`.
 
 **Control.** `orchestra resident list|show|inbox|pause|resume|reset <name>` and
 `orchestra resident send <name> <text…>` go through the API (`/api/v1/residents…`), as

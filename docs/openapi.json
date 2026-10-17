@@ -446,7 +446,7 @@
       "get": {
         "tags": ["residents"],
         "summary": "One resident",
-        "description": "The resident's state, as in the list, and the twenty most recent items of its inbox. Its transcript is its session's: `GET /api/v1/interactive/{sessionId}/events`.",
+        "description": "The resident's state, as in the list, the twenty most recent items of its inbox (`inbox`), what it is watching (`watches`: `feed`, `stream`, `topic`, `note`, `until`) and its feeds with how each stands (`feeds`: `listener`, `name`, `site`, `enabled`, `connection`, `checkpoint`, `error`, `lastEventAt`). Its transcript is its session's: `GET /api/v1/interactive/{sessionId}/events`.",
         "operationId": "getResident",
         "parameters": [
           { "name": "name", "in": "path", "required": true, "description": "The resident's name, which is its identity's.", "schema": { "type": "string" } }
@@ -1886,6 +1886,16 @@
             "type": "array",
             "description": "This listener's dispatch ceilings and where each stands. Empty when it is not paced.",
             "items": { "$ref": "#/components/schemas/RateLimitStatus" }
+          },
+          "feed": {
+            "type": "object",
+            "description": "Only for a long-polled source (`zulip-feed`): a resident's feed and how it stands.",
+            "properties": {
+              "connection": { "type": "string", "enum": ["connecting", "connected", "error", "disabled", "stopped"] },
+              "resident": { "type": ["string", "null"], "description": "The resident it delivers to, whose kleis key it reads with." },
+              "checkpoint": { "type": ["string", "null"], "description": "The last message id it has seen." },
+              "error": { "type": ["string", "null"], "description": "What went wrong on its last attempt, while it is still wrong." }
+            }
           }
         }
       },

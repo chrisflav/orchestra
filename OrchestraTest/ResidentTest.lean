@@ -68,7 +68,7 @@ def theResidentsBlockIsReadAndItsBudgetIsStrict : Test := do
 
 @[test]
 def anIdentitysResidentBlockFillsInFromConfiguration : Test := do
-  let j := Json.parse "{\"budget_per_day\": 7.5, \"process_idle_seconds\": 60, \"model\": \"m\", \"feeds\": [{\"kind\": \"zulip\"}]}"
+  let j := Json.parse "{\"budget_per_day\": 7.5, \"process_idle_seconds\": 60, \"model\": \"m\", \"feeds\": [{\"kind\": \"zulip\", \"site\": \"zulip.example.org\"}]}"
   match j >>= Identity.parseResidentSpec "identity 'secretary'" with
   | .error e => TestM.fail e
   | .ok spec =>
@@ -80,7 +80,7 @@ def anIdentitysResidentBlockFillsInFromConfiguration : Test := do
     TestM.assertEqual s.batchWindowSeconds 3 (msg := "absent fields come from configuration")
     TestM.assertEqual s.model (some "m")
     TestM.assertEqual s.agent "claude"
-    TestM.assertEqual spec.feeds.size 1 (msg := "feeds are kept, though not acted on yet")
+    TestM.assertEqual (spec.feeds.map (·.site)).toList ["zulip.example.org"] (msg := "its feeds")
 
 @[test]
 def aResidentBlockWithARepositoryOrAnUnknownFieldIsRefused : Test := do
@@ -374,7 +374,8 @@ def residentCommandsParse : Test := do
 /-! ## The migration -/
 
 @[test]
-def theResidentMigrationIsTheLatest : Test := do
-  TestM.assertEqual (Store.migrations.getLast?.map (·.name)) (some "0006_resident_sessions")
+def theResidentMigrationsAreTheLatest : Test := do
+  let names := Store.migrations.map (·.name)
+  TestM.assertEqual (names.drop (names.length - 2)) ["0006_resident_sessions", "0007_resident_feeds"]
 
 end OrchestraTest.Residents
