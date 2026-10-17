@@ -33,6 +33,7 @@ import Orchestra.Interactive.Wire
 import Orchestra.Interactive.Store
 import Orchestra.Interactive
 import Orchestra.Resident.Inbox
+import Orchestra.Resident.EnvFile
 import Orchestra.Resident.Cli
 import Orchestra.Resident.Feed
 import Orchestra.Resident.Watch

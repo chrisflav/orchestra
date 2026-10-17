@@ -6,6 +6,7 @@ import Orchestra.Store.Migrations.TaskRunState
 import Orchestra.Store.Migrations.KleisSource
 import Orchestra.Store.Migrations.ResidentSessions
 import Orchestra.Store.Migrations.ResidentFeeds
+import Orchestra.Store.Migrations.ResidentRuntime
 
 /-!
 # The shape of orchestra's database
@@ -242,6 +243,19 @@ structure ResidentSpendRow where
   usd : Float
   deriving Repr
 
+/-- What the delivery loop knows about a resident beyond its record: wake failures in a row, when
+    it may be tried again (epoch seconds), when recent turns were handed over (a JSON array of
+    epoch seconds), and when its agent process's kleis token expires. See
+    `Orchestra.Resident.Inbox`. -/
+@[model (dbName := "resident_runtime") (primaryKey := ["resident"]) orchestra]
+structure ResidentRuntimeRow where
+  resident : String
+  failures : Int
+  retry_after : Int
+  turn_stamps : String
+  token_expires : Option Int
+  deriving Repr
+
 /-- The last poll of one backend's one authentication source: what the provider said, and when to
     ask again. See `Orchestra.Usage`. -/
 @[model (dbName := "usage_source") (primaryKey := ["backend", "label"]) orchestra]
@@ -385,6 +399,7 @@ def migrations : List Db.Migration.Migration :=
    Orchestra.Store.Migrations.migration_0004_task_run_state,
    Orchestra.Store.Migrations.migration_0005_kleis_source,
    Orchestra.Store.Migrations.migration_0006_resident_sessions,
-   Orchestra.Store.Migrations.migration_0007_resident_feeds]
+   Orchestra.Store.Migrations.migration_0007_resident_feeds,
+   Orchestra.Store.Migrations.migration_0008_resident_runtime]
 
 end Orchestra.Store

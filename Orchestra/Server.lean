@@ -534,7 +534,7 @@ Call this tool exactly once when the task is complete."),
   inputTool ++ outputTool
 
 /-- The names of a resident's own tools. -/
-def residentToolNames : List String := ["watch", "unwatch", "list_watches"]
+def residentToolNames : List String := ["watch", "unwatch", "list_watches", "refresh_kleis_token"]
 
 private def watchKeySchema : Json := Json.mkObj [
   ("type", "object"),
@@ -574,6 +574,16 @@ span from now (90m, 12h, 3d, 2w). Leave out to watch until unwatch.")]),
     ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [
       ("feed", feedSchema)])])]]
 
+/-- `refresh_kleis_token` (`docs/design/resident-sessions.md` §7.3): offered to a resident that
+    reaches the network through kleis. -/
+def refreshKleisTokenToolDef : Json := Json.mkObj [
+  ("name", "refresh_kleis_token"),
+  ("description", "Get a new kleis token for your shell commands, for a turn that runs long or a \
+command refused with \"token expired\". Commands you start from now on use it; it answers when it \
+expires and what it allows. Your session is restarted on a fresh token after this turn — you need \
+not do anything for that."),
+  ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])]
+
 /-- The `tools/list` answer for `state`: the always-available tools, plus every optional one the
     task was granted.
 
@@ -595,7 +605,8 @@ def toolsList (state : State) : Json :=
         if acc.any (·.1 == name) then acc else acc ++ [(name, def_)]) []
     |>.map (·.2)
   let io := ioToolDefs state.inputType state.outputType ++
-    (if state.residentTools.isSome then residentToolDefs else #[])
+    (if state.residentTools.isSome then residentToolDefs else #[]) ++
+    (if state.residentTools.isSome && state.kleis.isSome then #[refreshKleisTokenToolDef] else #[])
   let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
   -- Gated on the policy rather than on a permission label, and on the hook as well: a queue this
   -- process cannot write to is a tool that would be listed and always refused.
@@ -686,7 +697,7 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
   | "health" => .health
   | "refresh_token" => .refreshToken
   | "project_info" => .project .projectInfo
-  | "watch" | "unwatch" | "list_watches" => .resident name args
+  | "watch" | "unwatch" | "list_watches" | "refresh_kleis_token" => .resident name args
   | "create_pr" =>
     let title := args.getObjValAs? String "title" |>.toOption |>.getD "Agent PR"
     let body  := args.getObjValAs? String "body"  |>.toOption |>.getD ""

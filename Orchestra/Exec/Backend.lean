@@ -334,6 +334,17 @@ structure Session where
       that runs the agent here — and so is shared by every task, and by the daemon. A backend that
       gives each run a home of its own writes it there instead. -/
   putHomeFile : String → String → String → IO Unit := hostPutHomeFile
+  /-- The run's home as the agent sees it — an absolute path where the agent runs — for a backend
+      that gives each run a home of its own, where `putHomeFile` writes. `none` for the backends
+      whose runs share this machine's `$HOME`: a file one session must not share with another
+      belongs somewhere else there (`Resident.EnvFile`). -/
+  agentHome : Option String := none
+  /-- Bring back what the agent wrote to a memory directory, without letting go of anything. For
+      an environment held for a long time between agent processes — a resident's pod while it is
+      warm (`docs/design/resident-sessions.md` §9) — whose memories would otherwise come back only
+      at `close`. A no-op for the backends that run the agent here, where the memory directory is
+      the daemon's own. -/
+  syncBack : IO Unit := pure ()
   /-- Finish: bring back anything that has to come back, and release whatever was held. Called once
       per task, including when the task failed. -/
   close : IO Unit

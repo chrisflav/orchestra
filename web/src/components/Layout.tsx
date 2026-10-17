@@ -50,6 +50,9 @@ export function Layout() {
             <NavLink to="/chat" className="nav-link">
               Chat
             </NavLink>
+            <NavLink to="/residents" className="nav-link">
+              Residents
+            </NavLink>
             <NavLink to="/tasks" className="nav-link">
               Tasks
             </NavLink>

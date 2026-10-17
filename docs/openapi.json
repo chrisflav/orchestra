@@ -426,7 +426,7 @@
       "get": {
         "tags": ["residents"],
         "summary": "List residents",
-        "description": "Every resident session (`docs/design/resident-sessions.md`): an identity with a `resident` block has one session, by name, that never ends. `state` is what it is doing — `running`, `idle`, `warm` (process stopped, environment kept), `cold` (nothing held), `waking` or `paused` (`pausedReason` says why: `budget:<day>`, `failed`, `operator`). `inboxReady` counts what is waiting to be handed over; `spentToday` is against `budgetPerDay` on `budgetDay`.",
+        "description": "Every resident session (`docs/design/resident-sessions.md`): an identity with a `resident` block has one session, by name, that never ends. `state` is what it is doing — `running`, `idle`, `warm` (process stopped, environment kept), `cold` (nothing held), `waking` or `paused` (`pausedReason` says why: `budget:<day>`, `failed`, `operator`). `inboxReady` counts what is waiting to be handed over; `spentToday` is against `budgetPerDay` on `budgetDay`. `failures` counts wakes that failed in a row (`retryAfter`: not tried again before then); `tokenExpiresAt` is when the kleis token of its running agent process expires (null while it has none); `lastEvent` is the newest inbox item (`source`, `receivedAt`, a `text` excerpt).",
         "operationId": "listResidents",
         "parameters": [
           { "$ref": "#/components/parameters/limit" },

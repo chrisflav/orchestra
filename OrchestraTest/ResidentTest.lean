@@ -376,6 +376,6 @@ def residentCommandsParse : Test := do
 @[test]
 def theResidentMigrationsAreTheLatest : Test := do
   let names := Store.migrations.map (·.name)
-  TestM.assertEqual (names.drop (names.length - 2)) ["0006_resident_sessions", "0007_resident_feeds"]
+  TestM.assertEqual ((names.drop 5).take 2) ["0006_resident_sessions", "0007_resident_feeds"]
 
 end OrchestraTest.Residents

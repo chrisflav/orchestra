@@ -438,7 +438,7 @@ private def textOf (j : Json) : String :=
 @[test]
 def onlyAResidentIsOfferedTheWatchTools : Test := do
   let calls ← IO.mkRef []
-  for t in Server.residentToolNames do
+  for t in Server.residentToolNames.filter (· != "refresh_kleis_token") do
     TestM.assert ((offered (serverState true calls)).contains t) (msg := s!"{t} for a resident")
     TestM.assert (!(offered (serverState false calls)).contains t) (msg := s!"{t} for nobody else")
   let refused ← Server.evalToolCall (serverState false calls)

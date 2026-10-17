@@ -47,3 +47,4 @@ import OrchestraTest.QueryTest
 import OrchestraTest.RestartResumeTest
 import OrchestraTest.ResidentTest
 import OrchestraTest.ResidentFeedTest
+import OrchestraTest.ResidentTokenTest

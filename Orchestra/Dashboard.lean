@@ -1294,7 +1294,22 @@ private def residentJson (configPath : Option System.FilePath) (r : Interactive.
   let day ← Resident.today cfg.timezone
   let spent ← Resident.spentOn name day
   let ready ← Resident.ready name
+  -- What the delivery loop records beside the record: failures and backoff, and the token the
+  -- running process holds (`Resident.Runtime`).
+  let rt ← try Resident.loadRuntime name catch _ => pure {}
+  let (latest, _) ← Resident.recent name 1
+  let epochIso (t : Int) : Json := Json.str (Usage.secsToIso8601 t)
   return Json.mkObj [
+    ("failures",       ToJson.toJson rt.failures),
+    ("retryAfter",     if rt.retryAfter > 0 then epochIso rt.retryAfter else Json.null),
+    ("tokenExpiresAt", match rt.tokenExpires with | some t => epochIso t | none => Json.null),
+    -- The newest thing to arrive in its inbox, whatever became of it.
+    ("lastEvent",      match latest[0]? with
+                       | some i => Json.mkObj [
+                           ("source", .str i.source), ("receivedAt", normIso i.receivedAt),
+                           ("text", .str (let t := i.text
+                             if t.length ≤ 200 then t else (t.take 197).toString ++ "..."))]
+                       | none => Json.null),
     ("name",           Json.str name),
     ("sessionId",      Json.str r.id),
     ("status",         ToJson.toJson r.status),

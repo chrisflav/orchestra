@@ -182,6 +182,46 @@ def addSpend (resident day : String) (usd : Float) : IO Unit := do
 
 /-! ## The budget day -/
 
+/-! ## What the delivery loop remembers -/
+
+/-- What the delivery loop knows about a resident beyond its record (`resident_runtime`): kept in
+    the database so a daemon restart does not forget a resident that keeps failing to wake — its
+    backoff, and the pause after `maxFailures` — nor let it past `max_turns_per_hour`. -/
+structure Runtime where
+  /-- Wakes (and processes) that failed in a row. -/
+  failures : Nat := 0
+  /-- Epoch seconds before which the delivery loop does not try again. -/
+  retryAfter : Int := 0
+  /-- When each recent turn was handed over, epoch seconds. -/
+  turnStamps : Array Int := #[]
+  /-- When the kleis token the resident's agent process holds expires, epoch seconds, while it
+      has one: for the dashboard. -/
+  tokenExpires : Option Int := none
+deriving Repr, BEq, Inhabited
+
+open Db.Query.DSL in
+/-- Resident `resident`'s runtime, or the empty one when nothing was ever recorded. -/
+def loadRuntime (resident : String) : IO Runtime := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let r ← from Store.ResidentRuntimeRow
+    guard r.resident = resident
+    select r
+  let some row := rows[0]? | return {}
+  let stamps : Array Int := match Json.parse row.turn_stamps with
+    | .ok (.arr xs) => xs.filterMap fun x => (x.getInt?).toOption
+    | _ => #[]
+  return { failures := row.failures.toNat, retryAfter := row.retry_after, turnStamps := stamps
+           tokenExpires := row.token_expires }
+
+/-- Record resident `resident`'s runtime. Turn stamps older than an hour are dropped: nothing reads
+    them. -/
+def saveRuntime (resident : String) (rt : Runtime) (now : Int) : IO Unit := do
+  let stamps := rt.turnStamps.filter (· > now - 3600)
+  Store.run <| HasModel.save ({
+    resident, failures := Int.ofNat rt.failures, retry_after := rt.retryAfter
+    turn_stamps := (Json.arr (stamps.map fun s => Json.num (Lean.JsonNumber.fromInt s))).compress
+    token_expires := rt.tokenExpires } : Store.ResidentRuntimeRow)
+
 /-- The budget day an instant falls on, `YYYY-MM-DD`, for a zone `offsetSeconds` east of UTC. -/
 def dayAt (epoch : Int) (offsetSeconds : Int := 0) : String :=
   ((Usage.secsToIso8601 (epoch + offsetSeconds)).take 10).toString
@@ -241,6 +281,36 @@ def maxFailures : Nat := 3
 /-- How many of `stamps` (epoch seconds) fall within the hour before `now`. -/
 def turnsInLastHour (stamps : Array Int) (now : Int) : Nat :=
   (stamps.filter (· > now - 3600)).size
+
+/-- Why a resident's running agent process is to be cycled — stopped and started again at once in
+    the environment it has, on a new kleis token and with the day's allowance — before the next
+    turn is handed to it (`docs/design/resident-sessions.md` §7, §8), or `none` to hand it over as
+    it is:
+
+    * its budget day (`processDay`) is over: its `--max-budget-usd` was yesterday's remainder;
+    * `refresh_kleis_token` replaced its commands' token during a turn: the cycle is what puts the
+      process itself on a current token and lets the replaced ones be revoked;
+    * the token it holds expires within `margin` seconds of `now`. -/
+def cycleReason (now : Int) (tokenExpires : Option Int) (margin : Nat) (refreshed : Bool)
+    (processDay today : String) : Option String :=
+  if processDay != today then
+    some "a new budget day; restarting the agent process with the new day's allowance"
+  else if refreshed then
+    some "refresh_kleis_token replaced this process's kleis token during the last turn; \
+restarting the agent process on a new one"
+  else match tokenExpires with
+    | some exp =>
+      if exp ≤ now + Int.ofNat margin then
+        some s!"the agent process's kleis token expires in {formatSpan (exp - now)}, within \
+residents.token_refresh_margin ({formatSpan (Int.ofNat margin)}); restarting it on a new one"
+      else none
+    | none => none
+where
+  formatSpan (secs : Int) : String :=
+    if secs ≤ 0 then "no time (it has expired)"
+    else if secs < 120 then s!"{secs}s"
+    else if secs < 7200 then s!"{secs / 60}m"
+    else s!"{secs / 3600}h"
 
 /-- The note heading a turn that carries items an interrupted turn already carried. -/
 def redeliveryNote : String :=

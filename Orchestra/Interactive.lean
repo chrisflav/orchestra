@@ -10,6 +10,7 @@ import Orchestra.TaskRunner
 import Orchestra.Usage
 import Orchestra.Resident.Inbox
 import Orchestra.Resident.Zulip
+import Orchestra.Resident.EnvFile
 import Std.Sync
 import Std.Data.HashMap
 
@@ -63,6 +64,25 @@ structure Config where
   /-- Defaults and limits for resident sessions (`docs/design/resident-sessions.md`). -/
   residents : ResidentsConfig := {}
 
+/-- The kleis tokens a session holds (`docs/design/resident-sessions.md` §7).
+
+    Every agent process is started on a token of its own — the first on the one derived when the
+    environment was opened, each later one (a warm wake, a cycle) on a new one — and the tokens it
+    replaces are revoked once it is up. `refresh_kleis_token` adds one more, for the commands of the
+    running process (through its env file), and sets `refreshed`, which has the process cycled
+    before its next turn. `held` is every token not yet revoked; all of them are revoked when the
+    session's environment goes. -/
+structure Creds where
+  held : Array Kleis.Minted := #[]
+  /-- The token the running agent process holds in its environment. -/
+  process : Option Kleis.Minted := none
+  /-- `refresh_kleis_token` was called since the process started. -/
+  refreshed : Bool := false
+
+/-- When the running process's token expires, epoch seconds, if it has one and kleis said. -/
+def Creds.processExpires (c : Creds) : Option Int :=
+  c.process.bind fun m => if m.expires == 0 then none else some (Int.ofNat m.expires)
+
 /-- A session the daemon is holding right now. Its on-disk record is the durable half; this is
     the half that cannot be written down. -/
 structure LiveSession where
@@ -106,23 +126,22 @@ structure LiveSession where
   budgetDay : IO.Ref String
   /-- Said at the head of the next turn: a conversation that was lost, for one. -/
   notes : IO.Ref (List String)
-  /-- When the credentials this environment holds expire, in epoch seconds, if known: the kleis
-      token. A warm resident whose credentials are close to it is woken cold, which derives new
-      ones — the seam token cycling (§7 of the design) will replace. -/
-  credentialsExpire : Option Nat := none
+  /-- The kleis tokens this session holds, and which of them its agent process was started with.
+      See `Creds`. -/
+  creds : IO.Ref Creds
+  /-- Revoke every kleis token the session holds and empty its env file: for a resident put to
+      sleep warm, whose next process is started on a token of its own (`launch`). -/
+  releaseCreds : IO Unit := pure ()
 
-/-- The delivery loop's memory of one resident: what a restart may forget.
-
-    `lock` serialises deliveries to it — the tick and a person's message can both want to hand it
-    a turn, and two at once would wake it twice. `failures` counts wakes (and processes) that
-    failed in a row, for the backoff and for pausing it after `Resident.maxFailures`. -/
+/-- The delivery loop's memory of one resident. `lock` serialises deliveries to it — the tick and a
+    person's message can both want to hand it a turn, and two at once would wake it twice — and
+    lives only here; the rest is `Resident.Runtime`, which is also on the database
+    (`resident_runtime`) so that a restart does not forget it: `failures` counts wakes (and
+    processes) that failed in a row, for the backoff and for pausing it after
+    `Resident.maxFailures`. -/
 structure ResidentRuntime where
   lock : Std.BaseMutex
-  failures : Nat := 0
-  /-- Epoch seconds before which the tick does not try again. -/
-  retryAfter : Int := 0
-  /-- When each recent turn was handed over, epoch seconds: for `max_turns_per_hour`. -/
-  turnStamps : Array Int := #[]
+  state : Resident.Runtime := {}
 
 /-- The daemon's table of live sessions, plus the two things it needs from the queue's own
     bookkeeping.
@@ -151,6 +170,38 @@ structure Manager where
   /-- The residents configuration names, with their settings. Refreshed by the daemon
       (`Manager.setConfigured`). -/
   private configured : IO.Ref (Array (String × Identity.ResidentSettings))
+
+/-- Resident `name`'s runtime: from memory, else from the database (`Resident.loadRuntime`) — so a
+    restarted daemon picks up the backoff and failure count where the last one left them. -/
+private def Manager.runtime (mgr : Manager) (name : String) : IO ResidentRuntime := do
+  if let some rt := (← mgr.residentState.atomically get).get? name then return rt
+  let stored ← try Resident.loadRuntime name catch e => do
+    IO.eprintln s!"resident {name}: could not read its runtime state: {e}"
+    pure {}
+  let fresh ← Std.BaseMutex.new
+  mgr.residentState.atomically do
+    let m ← get
+    match m.get? name with
+    | some rt => return rt
+    | none =>
+      let rt : ResidentRuntime := { lock := fresh, state := stored }
+      set (m.insert name rt)
+      return rt
+
+/-- Change resident `name`'s runtime, and write it through to the database when it changed. -/
+private def Manager.modifyRuntime (mgr : Manager) (name : String)
+    (f : Resident.Runtime → Resident.Runtime) : IO Resident.Runtime := do
+  let current ← mgr.runtime name
+  let (before, after) ← mgr.residentState.atomically do
+    let m ← get
+    let rt := (m.get? name).getD current
+    let next := f rt.state
+    set (m.insert name { rt with state := next })
+    return (rt.state, next)
+  if before != after then
+    try Resident.saveRuntime name after (← Usage.nowEpoch)
+    catch e => IO.eprintln s!"resident {name}: could not record its runtime state: {e}"
+  return after
 
 /-- A UUID the agent CLI will accept for `--session-id`. Version 4, from `/dev/urandom`. -/
 private def newUuid : IO String := do
@@ -261,9 +312,7 @@ is over) and its inbox keeps filling meanwhile")
       else
         try discard <| Resident.confirm name r.turnCount
         catch e => IO.eprintln s!"resident {name}: could not confirm turn {r.turnCount}: {e}"
-        mgr.residentState.atomically <| modify fun m => match m.get? name with
-          | some rt => m.insert name { rt with failures := 0, retryAfter := 0 }
-          | none    => m
+        let _ ← mgr.modifyRuntime name fun rt => { rt with failures := 0, retryAfter := 0 }
         update s fun r => { r with
           status  := if r.status.isTerminal || r.status == .paused then r.status else .idle
           costUsd := total }
@@ -390,6 +439,8 @@ private def teardown (mgr : Manager) (s : LiveSession) (status : SessionStatus)
   try s.shutdownMcp catch _ => pure ()
   if let some fork := s.fork then
     try mgr.releaseSlot fork s.slot catch _ => pure ()
+  if let some (name, _) := s.resident then
+    let _ ← mgr.modifyRuntime name fun rt => { rt with tokenExpires := none }
   let now ← TaskStore.currentIso8601
   try
     update s fun r =>
@@ -405,10 +456,20 @@ private def teardown (mgr : Manager) (s : LiveSession) (status : SessionStatus)
 
 /-- Stop a resident's agent process and keep everything else: its environment, its MCP server,
     its credentials. The session is then `warm`, and the next delivery starts a process on the
-    same environment (`Manager.relaunch`) — seconds, where a cold wake on Kubernetes is a pod. -/
-private def stopProcess (s : LiveSession) : IO Unit := do
+    same environment (`Manager.relaunch`) — seconds, where a cold wake on Kubernetes is a pod.
+
+    Asleep, the session holds no kleis token: they are revoked here, and the next process gets one
+    of its own. And what the agent wrote to its memory directory comes back now rather than when
+    the environment goes, which for a resident's pod may be hours later. A `cycle` — stopped to be
+    started again at once — keeps both: the tokens are revoked once the new process is up, and a
+    cycle is meant to take seconds. -/
+private def stopProcess (s : LiveSession) (cycle : Bool := false) : IO Unit := do
   if let some st ← s.stream.modifyGet (fun st => (st, none)) then
     try st.shutdown catch _ => pure ()
+  unless cycle do
+    try s.releaseCreds catch e => IO.eprintln s!"session {s.id}: could not release its tokens: {e}"
+    try s.exec.syncBack catch e =>
+      IO.eprintln s!"session {s.id}: could not bring its memory directory back: {e}"
   update s fun r =>
     if r.status.isTerminal || r.status == .paused then r else { r with status := .warm }
 
@@ -508,17 +569,36 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Opti
     let repoPair : Option RepoPair := match record.upstream, fork with
       | some upstream, some f => some { upstream, fork := f }
       | _, _                  => none
-    let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
     -- A session without a repository is installed where a repository-less task is: the configured
     -- installation, else the default organisation's, else none — and then it runs with no GitHub
     -- token at all rather than refusing to start (`TaskRunner`, the same choice).
-    let installationId : Option Nat ← match appConfig.installationId, repoPair with
-      | some i, _    => pure (some i)
-      | none, some p => some <$> GitHub.getInstallationId jwt p.fork.owner
-      | none, none   =>
-        match appConfig.defaultOrganization with
-        | some org => GitHub.getInstallationId? jwt org
-        | none     => pure none
+    --
+    -- And it needs no GitHub App to start. With kleis it reaches GitHub through the proxy on its
+    -- own token and no installation token is minted for it at all, so no JWT is signed — a daemon
+    -- whose App key is not readable (or not there: an orchestra that runs only residents) can still
+    -- wake one. Without kleis the installation token is a convenience it may lack: one that cannot
+    -- be had is said in the daemon's log and the session starts without it.
+    let installationId : Option Nat ← match repoPair with
+      | some p => match appConfig.installationId with
+        | some i => pure (some i)
+        | none   => some <$> GitHub.getInstallationId
+                      (← GitHub.createJWT appConfig.appId appConfig.privateKeyPath) p.fork.owner
+      | none =>
+        if appConfig.kleis.isSome then pure none
+        else try
+            match appConfig.installationId, appConfig.defaultOrganization with
+            | some i, _ => pure (some i)
+            | none, some org =>
+              GitHub.getInstallationId? (← GitHub.createJWT appConfig.appId
+                appConfig.privateKeyPath) org
+            | none, none => pure none
+          catch e =>
+            IO.eprintln s!"interactive: {record.id}: no GitHub installation token for a session \
+without a repository ({e}); starting it without one"
+            pure none
+    let jwt ← match installationId with
+      | some _ => some <$> GitHub.createJWT appConfig.appId appConfig.privateKeyPath
+      | none   => pure none
     -- Deliberately no `GitHub.setupGhAuth`: that writes the token into
     -- `~/.config/gh/hosts.yml`, which every concurrently running task in this daemon shares.
     -- `TaskRunner` avoids it for the same reason, and it is not needed — the token reaches the
@@ -529,9 +609,9 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Opti
       | some i => do GitHub.createInstallationToken (← GitHub.createJWT appConfig.appId
                        appConfig.privateKeyPath) i
       | none   => pure ""
-    let token ← match installationId with
-      | some i => GitHub.createInstallationToken jwt i
-      | none   => pure ""
+    let token ← match installationId, jwt with
+      | some i, some jwt => GitHub.createInstallationToken jwt i
+      | _, _ => pure ""
     -- `resumeFrom` on the assignment is what keeps a working tree instead of resetting it, and
     -- it is checked against the slot's recorded occupant, so asking for it is safe even when the
     -- tree has since been taken. Without it a resumed conversation was restored onto a wiped
@@ -594,16 +674,26 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Opti
       tools := allowedTools
       identity := identity.map (·.name), pushPrefix := appConfig.kleis.bind (·.pushPrefix)
       org := appConfig.defaultOrganization }
-    let kleisPrepared ← Kleis.prepareFor appConfig.kleis
-      { identitySpec := identity.bind (·.kleisSpec)
-        identityToken := (identity.bind (·.kleisToken)).isSome }
-      (identity.bind (·.kleisToken)) kleisFacts ((identity.map (·.kleisNarrow)).getD [])
-    let revokePrepared : IO Unit := match appConfig.kleis, kleisPrepared with
-      | some kc, some p => do
-        try Kleis.revoke kc p.minted catch e =>
-          IO.eprintln s!"interactive: could not revoke the session's kleis token: {e}"
-      | _, _ => pure ()
-    shutdownRef.set (some revokePrepared)
+    let prepareKleis : IO (Option Kleis.Prepared) :=
+      Kleis.prepareFor appConfig.kleis
+        { identitySpec := identity.bind (·.kleisSpec)
+          identityToken := (identity.bind (·.kleisToken)).isSome }
+        (identity.bind (·.kleisToken)) kleisFacts ((identity.map (·.kleisNarrow)).getD [])
+    let kleisPrepared ← prepareKleis
+    -- Every token this session derives or mints is in `credsRef` until it is revoked, and
+    -- `revokeHeld` is what revokes them — all of them when the session goes, all but the running
+    -- process's once a new process is up (`Creds`).
+    let credsRef ← IO.mkRef ({ held := (kleisPrepared.map (·.minted)).toArray } : Creds)
+    let revokeHeld (keep : Option String) : IO Unit := do
+      let some kc := appConfig.kleis | return
+      let gone ← credsRef.modifyGet fun c =>
+        let gone := c.held.filter (fun m => some m.revocationId != keep)
+        (gone, { c with held := c.held.filter (fun m => some m.revocationId == keep)
+                        process := c.process.filter (fun m => some m.revocationId == keep) })
+      for m in gone do
+        try Kleis.revoke kc m catch e =>
+          IO.eprintln s!"interactive: could not revoke one of the session's kleis tokens: {e}"
+    shutdownRef.set (some (revokeHeld none))
     -- Granted at open, as for a queued task: see `Kleis.bundleGrant`.
     let kleisBundle ← match appConfig.kleis, kleisPrepared with
       | some kc, some p => some <$> Kleis.setupBundle kc p.setup
@@ -640,6 +730,11 @@ private def Manager.acquire (mgr : Manager) (appConfig : AppConfig) (fork : Opti
         { execSession with close := do
             try execSession.close finally Repo.removeTaskDir repoPath }
       else execSession
+    -- And its env file (`Resident.EnvFile`), where this machine keeps it.
+    let execSession := if isResident then
+        { execSession with close := do
+            try execSession.close finally Resident.EnvFile.removeHost record.id }
+      else execSession
     execRef.set (some execSession)
     -- A resident whose conversation did not survive — its volume was lost, or this backend keeps
     -- none — starts a new one in the same session rather than failing every wake: it says so in
@@ -665,6 +760,61 @@ one in this session (the resident's memory directory is intact)")
     -- history in the transcript and the agent does not.
     if resumeAgentSession.isSome && !execSession.carriesAgentState then
       return ← fail s!"this conversation was left in an environment that no longer exists ({execSession.id} is new every time). Enable per-task workspaces for this execution backend — execution.options.task_volumes for kubernetes — to wake sessions on it."
+    -- A session reaches GitHub through kleis the same way a queued task does, on a token of its
+    -- own: derived when it has a source, and otherwise minted, per agent process
+    -- (`docs/design/resident-sessions.md` §7) — the first on the token derived above, which its
+    -- setup and card were fetched for.
+    let installLaunch (p : Kleis.Prepared) : IO Kleis.Launch := do
+      let some kc := appConfig.kleis | throw (IO.userError "no kleis is configured")
+      let bundle ← Kleis.setupBundle kc p.setup
+      let fileGrants ← Kleis.installFiles execSession p.setup.files
+      return Kleis.launchDerived kc p bundle fileGrants
+    let mintLaunch : IO (Kleis.Launch × Kleis.Minted) := do
+      let some kc := appConfig.kleis | throw (IO.userError "no kleis is configured")
+      let minted ← Kleis.mint kc kleisFacts
+      credsRef.modify fun c => { c with held := c.held.push minted }
+      let bundle ← match kleisBundle with
+        | some b => pure b
+        | none   => Kleis.caBundle kc
+      return (Kleis.launch kc minted bundle, minted)
+    -- A new token for this session — derived from its source as the first was, or minted — with
+    -- what its sandbox needs to use it, and its card when there is one.
+    let newCredentials : IO (Option (Kleis.Launch × Kleis.Minted × Option String)) := do
+      if appConfig.kleis.isNone then return none
+      match kleisPrepared with
+      | some _ =>
+        let some p ← prepareKleis | return none
+        credsRef.modify fun c => { c with held := c.held.push p.minted }
+        return some (← installLaunch p, p.minted, some p.card)
+      | none =>
+        let (l, m) ← mintLaunch
+        return some (l, m, none)
+    -- What the first process starts with: the token derived above, or one minted now.
+    let firstCredentials ← IO.mkRef (none : Option (Kleis.Launch × Kleis.Minted))
+    match appConfig.kleis, kleisPrepared with
+    | some _, some p => firstCredentials.set (some (← installLaunch p, p.minted))
+    | some _, none   => firstCredentials.set (some (← mintLaunch))
+    | none, _        => pure ()
+    -- A resident's commands can be handed a new token mid-turn (`refresh_kleis_token`), through
+    -- an env file of its own that `CLAUDE_ENV_FILE` points the agent's command shell at.
+    let envFile ← if isResident && appConfig.kleis.isSome then
+        some <$> Resident.EnvFile.locate execSession record.id
+      else pure none
+    let refreshKleisToken : IO (Except String String) := do
+      let some loc := envFile
+        | return .error "this session reaches nothing through kleis, so it has no token to refresh"
+      let some (l, m, card) ← newCredentials
+        | return .error "no kleis is configured"
+      loc.writeEnv (Resident.EnvFile.contents l.env)
+      credsRef.modify fun c => { c with refreshed := true }
+      let now ← Usage.nowEpoch
+      let expiry := if m.expires == 0 then "kleis did not say when it expires"
+        else s!"it expires at {Usage.secsToIso8601 (Int.ofNat m.expires)} \
+(in {(Int.ofNat m.expires - now) / 60} minutes)"
+      return .ok (s!"A new kleis token is in place for the shell commands you start from now on; \
+{expiry}. Commands already running keep the old one. After this turn your session is restarted on \
+a fresh token and the old ones are revoked; nothing for you to do." ++
+        ((card.map fun c => s!"\n\nWhat it allows:\n\n{c.trimAscii}").getD ""))
     let (port, shutdownMcp) ← Server.start {
       repo := repoPair
       allowedTools
@@ -674,30 +824,18 @@ one in this session (the resident's memory directory is intact)")
       identity
       authToken := mcpToken
       kleis := appConfig.kleis
-      -- A resident's own tools: its watches (`docs/design/resident-sessions.md` §6).
-      residentTools := resident.map fun (name, _) => (name, Resident.Zulip.residentTool name)
+      -- A resident's own tools: its watches (`docs/design/resident-sessions.md` §6), and a new
+      -- kleis token for its commands (§7).
+      residentTools := resident.map fun (name, _) => (name, fun tool args =>
+        if tool == "refresh_kleis_token" then refreshKleisToken
+        else Resident.Zulip.residentTool name tool args)
     } (bindHost := mcpBind) (portRange := mcpPorts)
-    -- The derived token, if there is one, is revoked with the MCP server: the one closure every
-    -- way out of a session runs, so the token cannot outlive the session that held it.
+    -- Every token the session holds is revoked with the MCP server: the one closure every way out
+    -- of a session runs, so no token can outlive the session that held it.
     let shutdownMcp : IO Unit := do
       try shutdownMcp catch _ => pure ()
-      revokePrepared
+      revokeHeld none
     shutdownRef.set (some shutdownMcp)
-    -- A session reaches GitHub through kleis the same way a queued task does, on a token of its
-    -- own: derived above when it has a source, and otherwise minted here, per start and per wake.
-    let (kleisLaunch, shutdownMcp, kleisExpires) ← match appConfig.kleis, kleisPrepared, kleisBundle with
-      | some kc, some p, some bundle => do
-        let fileGrants ← Kleis.installFiles execSession p.setup.files
-        pure (some (Kleis.launchDerived kc p bundle fileGrants), shutdownMcp, p.minted.expires)
-      | some kc, none, some bundle => do
-        let minted ← Kleis.mint kc kleisFacts
-        let shutdownBoth : IO Unit := do
-          try shutdownMcp catch _ => pure ()
-          try Kleis.revoke kc minted catch e =>
-            IO.eprintln s!"interactive: could not revoke the session's kleis token: {e}"
-        shutdownRef.set (some shutdownBoth)
-        pure (some (Kleis.launch kc minted bundle), shutdownBoth, minted.expires)
-      | _, _, _ => pure (none, shutdownMcp, 0)
     let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
       |>.map (·.extraPorts) |>.getD #[]
     let recordRef ← IO.mkRef record
@@ -746,16 +884,37 @@ one in this session (the resident's memory directory is intact)")
       if let some l := authLabel then Usage.markUsed backendName l
       authRef.set authLabel
       let apiKeyEnv ← TaskRunner.resolveAuthEnv appConfig agentDef backendName authLabel
+      -- A token of its own: the first process the one derived with the environment, every later
+      -- one — a warm wake, a cycle — a new one, so the card in its prompt and the token it holds
+      -- are current however long the session has been asleep (§7.1).
+      let creds ← match ← firstCredentials.modifyGet (fun c => (c, none)) with
+        | some c => pure (some c)
+        | none   => pure ((← newCredentials).map fun (l, m, _) => (l, m))
+      -- The env file is emptied before the process starts: its own token is the current one, and
+      -- whatever a refresh wrote there is about to be revoked.
+      let (kleisLaunch, envFileVar) ← match creds, envFile with
+        | some (l, _), some loc => do
+          loc.writeStub
+          loc.writeEnv Resident.EnvFile.emptyContents
+          pure (some { l with files := l.files ++ loc.grant.toArray },
+                #[("CLAUDE_ENV_FILE", some loc.stubPath)])
+        | some (l, _), none => pure (some l, #[])
+        | none, _ => pure (none, #[])
       let some stream ← Sandbox.launchStreaming agentDef repoPath port ghToken
           { mcpContext := "", model := record.model, systemPrompt,
             resume, sessionId := (← recordRef.get).agentSessionId,
             budget := max 0.01 budget }
           onEvent (debug := debug)
-          (extraEnv := apiKeyEnv) (pluginDirs := pluginDirs)
+          (extraEnv := apiKeyEnv ++ envFileVar) (pluginDirs := pluginDirs)
           (memoryDirs := identityMemory.toArray)
           (extraPorts := extraPorts) (additionalPaths := appConfig.additionalSandboxPaths)
           (session := execSession) (mcpToken := mcpToken) (kleis := kleisLaunch)
         | return .error s!"backend '{backendName}' cannot host an interactive session"
+      -- Up: this process's token is the one to keep, and every token it replaces — the last
+      -- process's, any a refresh handed its commands — is revoked now (§7.2).
+      if let some (_, m) := creds then
+        credsRef.modify fun c => { c with process := some m, refreshed := false }
+        revokeHeld (some m.revocationId)
       return .ok stream
     -- What is *left* of the budget, not all of it. `--max-budget-usd` bounds the process, and a
     -- woken session is a second process: handing it the whole figure again would give a session
@@ -772,8 +931,19 @@ one in this session (the resident's memory directory is intact)")
       authLabel := authRef, backend := backendName, costBase := ← IO.mkRef record.costUsd
       launch, resident, budgetDay := ← IO.mkRef day
       notes := ← IO.mkRef (if lostConversation then
-        ["Your previous conversation was lost; your memory directory is intact."] else [])
-      credentialsExpire := if kleisExpires == 0 then none else some kleisExpires
+          ["Your previous conversation was lost; your memory directory is intact."]
+        -- A new conversation in a session that has had turns — after a reset, mostly. What it set
+        -- up outside the last conversation is still there, and it should know.
+        else if isResident && resumeAgentSession.isNone && record.turnCount > 0 then
+          ["This is a new conversation; the earlier one (an operator reset it) is not available \
+to you. Your memory directory and your watches (list_watches) are as they were."]
+        else [])
+      creds := credsRef
+      -- Emptied before the revocation, so the file never names a revoked token.
+      releaseCreds := do
+        if let some loc := envFile then
+          try loc.writeEnv Resident.EnvFile.emptyContents catch _ => pure ()
+        revokeHeld none
     }
     liveRef.set (some session)
     mgr.sessions.atomically do
@@ -1109,9 +1279,6 @@ conversation, and only by starting a new one (`Manager.resetResident`). -/
     session — is the same one every wake, and a reset keeps it. -/
 def residentSessionId (name : String) : String := s!"resident-{name}"
 
-/-- How long before its credentials expire a warm resident is woken cold instead, for new ones. -/
-def credentialsMarginSeconds : Nat := 7200
-
 /-- Whether a paused resident's reason is gone: a budget pause once its day is over. A pause for
     failures, or by an operator, is lifted only by `resumeResident`. -/
 def pauseLifted (reason : Option String) (today : String) : Bool :=
@@ -1148,31 +1315,11 @@ def Manager.settingsOf (mgr : Manager) (name : String) : IO (Option Identity.Res
 def Manager.configuredResidents (mgr : Manager) : IO (Array String) :=
   return (← mgr.configured.get).map (·.1)
 
-private def Manager.runtime (mgr : Manager) (name : String) : IO ResidentRuntime := do
-  let fresh ← Std.BaseMutex.new
-  mgr.residentState.atomically do
-    let m ← get
-    match m.get? name with
-    | some rt => return rt
-    | none =>
-      let rt : ResidentRuntime := { lock := fresh }
-      set (m.insert name rt)
-      return rt
-
-private def Manager.modifyRuntime (mgr : Manager) (name : String)
-    (f : ResidentRuntime → ResidentRuntime) : IO ResidentRuntime := do
-  let current ← mgr.runtime name
-  mgr.residentState.atomically do
-    let m ← get
-    let rt := f ((m.get? name).getD current)
-    set (m.insert name rt)
-    return rt
-
 /-- What the manager knows of a resident beyond its record: failures in a row, and when it may be
     tried again. For `orchestra resident show`. -/
 def Manager.residentFailures (mgr : Manager) (name : String) : IO (Nat × Int) := do
   let rt ← mgr.runtime name
-  return (rt.failures, rt.retryAfter)
+  return (rt.state.failures, rt.state.retryAfter)
 
 /-- Append a notice to a session that is not in the table. -/
 private def noticeOnRecord (r : SessionRecord) (level msg : String) : IO SessionRecord := do
@@ -1273,10 +1420,17 @@ private def Manager.claimAwake (mgr : Manager) (forId : String) : IO Bool := do
       s!"put to sleep to make room for another resident (residents.max_awake is \
 {mgr.cfg.residents.maxAwake}); its environment is kept")
     stopProcess v
+    if let some (vname, _) := v.resident then
+      let _ ← mgr.modifyRuntime vname fun rt => { rt with tokenExpires := none }
   return false
 
 private def Manager.dropAwake (mgr : Manager) : IO Unit :=
   mgr.sessions.atomically <| mgr.residentWaking.modify fun n => if n > 0 then n - 1 else 0
+
+/-- Record when the token resident `name`'s process holds expires, for the dashboard. -/
+private def Manager.noteToken (mgr : Manager) (name : String) (s : LiveSession) : IO Unit := do
+  let exp := (← s.creds.get).processExpires
+  let _ ← mgr.modifyRuntime name fun rt => { rt with tokenExpires := exp }
 
 /-- Start a process for a warm resident in the environment it kept. -/
 private def Manager.relaunch (mgr : Manager) (s : LiveSession) (budget : Float) (day : String) :
@@ -1356,7 +1510,7 @@ private def Manager.deliverLocked (mgr : Manager) (appConfig : AppConfig) (name 
   let items ← Resident.ready name
   if items.isEmpty then return .nothing
   let now ← Usage.nowEpoch
-  let rt ← mgr.runtime name
+  let rt := (← mgr.runtime name).state
   if !urgent && rt.retryAfter > now then
     return .waiting s!"backing off after {rt.failures} failure(s) in a row"
   if !urgent then
@@ -1391,22 +1545,19 @@ residents.max_awake, and none is idle")
       return .error (.failed e)
     | .ok _ =>
       match ← find mgr rec.id with
-      | some s => return .ok s
+      | some s =>
+        mgr.noteToken name s
+        return .ok s
       | none   => return .error (.failed "the resident was woken but is not holding")
-  -- Woken from warm: a process in the environment it kept — unless the credentials that
-  -- environment holds are close to expiring, when it goes cold and comes back with new ones.
+  -- Woken from warm: a process in the environment it kept, on a token of its own (`launch`).
   let warmWake (s : LiveSession) : IO (Except Delivery LiveSession) := do
-    if let some exp := s.credentialsExpire then
-      if Int.ofNat exp ≤ now + Int.ofNat credentialsMarginSeconds then
-        let _ ← append s (.notice "info"
-          "the credentials this environment holds expire soon; waking from cold for new ones")
-        teardown mgr s .dormant none
-        return ← coldWake
     unless ← mgr.claimAwake s.id do
       return .error (.waiting s!"{mgr.cfg.residents.maxAwake} residents are awake, which is \
 residents.max_awake, and none is idle")
     match ← mgr.relaunch s remaining day with
-    | .ok () => return .ok s
+    | .ok () =>
+      mgr.noteToken name s
+      return .ok s
     | .error e =>
       mgr.noteFailure name s.id e
       return .error (.failed e)
@@ -1428,13 +1579,20 @@ residents.max_awake, and none is idle")
             teardown mgr s .dormant (some "the agent process exited")
             mgr.noteFailure name s.id "the agent process exited"
             pure (.error (.failed "the agent process exited"))
-          else if (← s.budgetDay.get) != day then
-            -- Cycled for the new day's allowance: its cap was yesterday's remainder.
-            let _ ← append s (.notice "info"
-              "a new budget day; restarting the agent process with the new day's allowance")
-            stopProcess s
-            warmWake s
-          else pure (.ok s)
+          else
+            -- A cycle (§7, §8): for the new day's allowance — its cap was yesterday's remainder —
+            -- or for a new kleis token, when its own is close to expiring or a refresh replaced
+            -- its commands' one. Stopped and started again at once in the environment it has; the
+            -- tokens it held are revoked once the new process is up.
+            let creds ← s.creds.get
+            match Resident.cycleReason now creds.processExpires
+                mgr.cfg.residents.tokenRefreshMarginSeconds creds.refreshed
+                (← s.budgetDay.get) day with
+            | some why =>
+              let _ ← append s (.notice "info" why)
+              stopProcess s (cycle := true)
+              warmWake s
+            | none => pure (.ok s)
   match got with
   | .error d => return d
   | .ok s    => mgr.handTurn name s items
@@ -1575,7 +1733,7 @@ again in a moment"
              error := none }
   let _ ← noticeOnRecord renewed "info"
     "the conversation was reset; the next turn starts a new one (the resident's memory directory \
-carries over)"
+and its watches carry over)"
   return .ok ()
 
 /-! ## Keeping the table honest -/
@@ -1621,6 +1779,7 @@ def Manager.reap (mgr : Manager) : IO Unit := do
             s!"nothing to do for {settings.processIdleSeconds}s, so the agent process was \
 stopped; its environment is kept (warm)")
           stopProcess s
+          let _ ← mgr.modifyRuntime name fun rt => { rt with tokenExpires := none }
       | none =>
         if r.status != .warm then continue
         if (← secondsSince r.lastActivityAt) ≥ settings.podIdleSeconds then

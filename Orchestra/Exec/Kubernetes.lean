@@ -1798,6 +1798,14 @@ from the start ({n} bytes read before)"
     -- Into the pod's own home, which is the run's alone (on a task volume, the chain's).
     putHomeFile := fun rel mode content =>
       putHomeFileInPod cfg podName ecfg.homePath rel mode content
+    agentHome := some ecfg.homePath
+    -- The memory directories, as `close` brings them back, with the pod kept: for a resident whose
+    -- pod outlives many agent processes, at each warm sleep. Never throws — `syncOut` warns.
+    syncBack := do
+      for st in staged do
+        if st.writable && !st.isFile && !st.isWorkspace then
+          try syncOut cfg podName st.hostPath st.podPath (merge := true)
+          catch e => IO.eprintln s!"  [k8s] could not bring {st.hostPath} back from {podName}: {e}"
     runScript := fun script => do
       -- The repository's own scripts, run where the agent works. `bash` because that is what the
       -- daemon used when it ran them itself, and repositories were written against it. Detached,

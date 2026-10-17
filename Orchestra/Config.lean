@@ -999,7 +999,28 @@ structure ResidentsConfig where
   volumeSize : Option String := none
   /-- Turns a resident may be handed in any hour: a bound on a loop with another bot. -/
   maxTurnsPerHour : Nat := 60
+  /-- How long before the kleis token a resident's agent process holds expires the process is
+      cycled — stopped and started again at once, on a new token — before the next turn is
+      handed over (`docs/design/resident-sessions.md` §7). -/
+  tokenRefreshMarginSeconds : Nat := 7200
 deriving Repr, Inhabited
+
+/-- A span of time as configuration writes it: a whole number of seconds, or a string with a
+    unit — `90s`, `30m`, `2h`, `1d`. -/
+def parseSpanSeconds (j : Json) : Except String Nat :=
+  match j with
+  | .num _ => match j.getNat? with
+    | .ok n => .ok n
+    | .error _ => .error "a span is a whole number of seconds"
+  | .str s =>
+    let s := s.trimAscii.toString
+    let mult : Option Nat := match s.back with
+      | 's' => some 1 | 'm' => some 60 | 'h' => some 3600 | 'd' => some 86400 | _ => none
+    match mult, (s.dropEnd 1).toString.toNat?, s.toNat? with
+    | some m, some n, _ => .ok (n * m)
+    | _, _, some n => .ok n
+    | _, _, _ => .error s!"'{s}' is not a span (7200, \"90m\", \"2h\")"
+  | _ => .error "a span is a number of seconds or a string such as \"2h\""
 
 instance : FromJson ResidentsConfig where
   fromJson? j := do
@@ -1013,7 +1034,12 @@ instance : FromJson ResidentsConfig where
         | .ok n => pure n.toFloat
         | .error _ => throw "residents.budget_per_day must be a number of USD"
     if budgetPerDay < 0.0 then throw "residents.budget_per_day must not be negative"
+    let tokenRefreshMarginSeconds ← match j.getObjVal? "token_refresh_margin" with
+      | .error _ | .ok .null =>
+        pure (nat "token_refresh_margin_seconds" d.tokenRefreshMarginSeconds)
+      | .ok v => (parseSpanSeconds v).mapError (s!"residents.token_refresh_margin: {·}")
     return {
+      tokenRefreshMarginSeconds
       enabled := j.getObjValAs? Bool "enabled" |>.toOption |>.getD d.enabled
       budgetPerDay
       processIdleSeconds := nat "process_idle_seconds" d.processIdleSeconds
