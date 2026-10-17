@@ -5,6 +5,7 @@ import Orchestra.Store.Migrations.ResolvedAuthSource
 import Orchestra.Store.Migrations.TaskRunState
 import Orchestra.Store.Migrations.KleisSource
 import Orchestra.Store.Migrations.ResidentSessions
+import Orchestra.Store.Migrations.ResidentFeeds
 
 /-!
 # The shape of orchestra's database
@@ -285,6 +286,28 @@ structure ListenerStateRow where
   enabled : Bool
   processed_ids : String
   dispatches : String
+  /-- A long-poll source's checkpoint — for a Zulip feed, the last message id it has seen. -/
+  checkpoint : Option String
+  /-- What went wrong on the last attempt, while it is still wrong; for the dashboard. -/
+  error : Option String
+  /-- The revocation ids of the kleis tokens the source holds, as a JSON array: what a run that
+      died without revoking them left live, revoked by the next one at its start. -/
+  revocations : Option String
+  deriving Repr
+
+/-- A topic a resident asked to be told about (`docs/design/resident-sessions.md` §6). `key` is
+    the feed's own key as compact JSON — for Zulip `{"stream": …, "topic": …}` — and
+    `(resident, feed, key)` is unique. `expires_at` is when it lapses (the tool's `until`), if
+    ever. -/
+@[model (dbName := "resident_watch") orchestra]
+structure ResidentWatchRow where
+  id : AutoKey
+  resident : String
+  feed : String
+  key : String
+  note : Option String
+  created_at : String
+  expires_at : Option String
   deriving Repr
 
 /-- One store the legacy JSON import has carried over. The row is the marker that says so: it is
@@ -345,6 +368,10 @@ def target : DatabaseRecipe :=
            unique := true },
          { name := "idx_resident_inbox_resident_confirmed",
            keys := [{ column := .resident }, { column := .confirmed }] }])
+    |>.withIndexes "resident_watch" (tableIndexes ResidentWatchRowIndex
+        [{ name := "idx_resident_watch_key",
+           keys := [{ column := .resident }, { column := .feed }, { column := .key }],
+           unique := true }])
     |>.withIndexes "usage_window" (tableIndexes UsageWindowRowIndex
         [{ name := "idx_usage_window_backend_label_id",
            keys := [{ column := .backend }, { column := .label }, { column := .id }] }])
@@ -357,6 +384,7 @@ def migrations : List Db.Migration.Migration :=
    Orchestra.Store.Migrations.migration_0003_resolved_auth_source,
    Orchestra.Store.Migrations.migration_0004_task_run_state,
    Orchestra.Store.Migrations.migration_0005_kleis_source,
-   Orchestra.Store.Migrations.migration_0006_resident_sessions]
+   Orchestra.Store.Migrations.migration_0006_resident_sessions,
+   Orchestra.Store.Migrations.migration_0007_resident_feeds]
 
 end Orchestra.Store

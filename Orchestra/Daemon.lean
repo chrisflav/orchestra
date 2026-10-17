@@ -8,6 +8,7 @@ import Orchestra.Listener
 import Orchestra.Project
 import Orchestra.Queue
 import Orchestra.Interactive
+import Orchestra.Resident.Zulip
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.TaskRunner
@@ -1366,9 +1367,22 @@ holding the rest of this tick until the window moves"
         else if !fresh.isEmpty then
           IO.println s!"Picked up {fresh.size} new listener(s): \
 {String.intercalate ", " (fresh.toList.map (·.1))}"
-        for (name, _) in fresh do
-          listenerFibers.modify (·.insert name)
-          spawnListener name
+        for (name, c) in fresh do
+          if c.source.isLongPoll then
+            -- A feed: long-polled in a fiber of its own, through kleis with the key of the
+            -- resident it delivers to (`docs/design/resident-sessions.md` §5).
+            unless appConfig.residents.enabled do continue
+            let some kc := appConfig.kleis
+              | Resident.Zulip.updateState name fun s => { s with
+                  error := some "a feed reads Zulip only through kleis, and no kleis is configured" }
+            listenerFibers.modify (·.insert name)
+            let _feedTask ← IO.asTask (prio := .dedicated) do
+              try Resident.Zulip.runFeed kc name shutdownToken.isCancelled
+              catch e => IO.eprintln s!"  Feed '{name}' stopped: {e}"
+              listenerFibers.modify (·.erase name)
+          else
+            listenerFibers.modify (·.insert name)
+            spawnListener name
       catch e =>
         IO.eprintln s!"  Listener scan failed: {e}"
       firstScan := false
@@ -1518,6 +1532,8 @@ pods keep running and it carries them on from where they are."
             IO.sleep 100
           IO.println "  Tool calls in flight are done; closing interactive sessions."
           try interactive.closeAll catch e => IO.eprintln s!"  Closing sessions failed: {e}"
+          -- The feeds' event queues and kleis tokens: the next daemon derives its own.
+          try Resident.Zulip.stopAll appConfig.kleis catch _ => pure ()
           try Queue.deletePid catch _ => pure ()
           IO.println "Queue daemon handed over."
           Utils.Signals.exitNow 0
@@ -1547,6 +1563,8 @@ or until they are done."
     -- without closing one leaves an agent process holding a clone slot with nothing left to
     -- talk to it, and a record on disk that `reconcile` will have to close on the way back up.
     try interactive.closeAll catch e => IO.eprintln s!"  Closing sessions failed: {e}"
+    -- The feeds stop with the daemon, and their tokens are revoked (§10).
+    try Resident.Zulip.stopAll appConfig.kleis catch e => IO.eprintln s!"  Stopping feeds failed: {e}"
     match ← socketServerRef.get with
     | some s => try s.close catch _ => pure ()
     | none   => pure ()

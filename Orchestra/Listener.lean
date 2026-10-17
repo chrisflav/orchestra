@@ -6,6 +6,8 @@ import Orchestra.Project
 import Orchestra.GitHub
 import Orchestra.Utils.Files
 import Orchestra.Usage
+import Orchestra.Identity
+import Orchestra.Resident.Feed
 
 open Lean (Json FromJson ToJson)
 
@@ -97,6 +99,12 @@ inductive SourceConfig where
       `is_pr` (`"true"` / `"false"`), `upstream`, `fork`. -/
   | githubLabels (repos : List RepoEntry) (labels : List String) (kind : String)
                  (authorizedUsers : List String)
+  /-- A Zulip event queue, long-polled rather than polled (`docs/design/resident-sessions.md`
+      §5): the daemon holds it open through kleis with the key of the resident the action
+      delivers to (`deliver_to`, which this source requires), calls it again as soon as it
+      returns, and hands what it admits to that resident's inbox. A resident's `feeds` become
+      listeners of this kind (`residentFeedListeners`); `interval_seconds` is unused. -/
+  | zulipFeed (feed : Resident.ZulipFeed)
 
 instance : ToJson SourceConfig where
   toJson
@@ -145,6 +153,11 @@ instance : ToJson SourceConfig where
                     ("labels", ToJson.toJson labels),
                     ("kind", kind),
                     ("authorized_users", ToJson.toJson authorizedUsers)]
+    | .zulipFeed feed =>
+        match ToJson.toJson feed with
+        | .obj kvs => Json.mkObj ([("type", Json.str "zulip-feed")] ++
+            (kvs.toArray.toList.filter (·.1 != "kind")))
+        | j => j
 
 /-- Parse a `repos` list from JSON.  If `"repos"` is absent, fall back to the singular
     `"fork"` string (treated as both `upstream` and `fork`). -/
@@ -212,6 +225,11 @@ instance : FromJson SourceConfig where
         let kind            := j.getObjValAs? String "kind" |>.toOption |>.getD "all"
         let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
         return .githubLabels repos labels kind authorizedUsers
+    | "zulip-feed" =>
+        let .obj kvs := j | .error "a source is an object"
+        let asFeed := Json.mkObj ([("kind", Json.str "zulip")] ++
+          (kvs.toArray.toList.filter (·.1 != "type")))
+        return .zulipFeed (← Resident.parseZulipFeed "zulip-feed source" asFeed)
     | _ => .error s!"unknown source type: {ty}"
 
 -- Action template
@@ -608,6 +626,13 @@ structure ListenerState where
       still count, oldest first. Pruned to the longest window on every write, so a listener with
       no `rate_limits` carries none of these at all. -/
   dispatches   : Array String := #[]
+  /-- A long-poll source's checkpoint: for a Zulip feed, the last message id it has seen. `none`
+      for every polling source, and for a feed that has never connected. -/
+  checkpoint   : Option String := none
+  /-- What went wrong on a long-poll source's last attempt, while it is still wrong. -/
+  error        : Option String := none
+  /-- The revocation ids of the kleis tokens a long-poll source holds. -/
+  revocations  : Array String := #[]
 
 instance : ToJson ListenerState where
   toJson s := Json.mkObj [
@@ -636,16 +661,25 @@ def ListenerState.toRow (name : String) (s : ListenerState) : Store.ListenerStat
     last_checked  := s.lastChecked
     enabled       := s.enabled
     processed_ids := Store.jsonColumn s.processedIds
-    dispatches    := Store.jsonColumn s.dispatches }
+    dispatches    := Store.jsonColumn s.dispatches
+    checkpoint    := s.checkpoint
+    error         := s.error
+    revocations   := if s.revocations.isEmpty then none else some (Store.jsonColumn s.revocations) }
 
 /-- The state a row holds, or why this build cannot read it. -/
 def ListenerState.ofRow? (row : Store.ListenerStateRow) : Except String ListenerState := do
   let processedIds ← Store.jsonOfColumn? "processed_ids" row.processed_ids
   let dispatches   ← Store.jsonOfColumn? "dispatches" row.dispatches
+  let revocations  ← match row.revocations with
+    | none => pure #[]
+    | some r => Store.jsonOfColumn? "revocations" r
   return { lastChecked  := row.last_checked
            processedIds := processedIds
            enabled      := row.enabled
-           dispatches   := dispatches }
+           dispatches   := dispatches
+           checkpoint   := row.checkpoint
+           error        := row.error
+           revocations }
 
 -- Directories
 
@@ -670,6 +704,34 @@ def listenersConfigDir : IO System.FilePath := do
 def legacyListenerStateDir : IO System.FilePath :=
   return (← Dirs.dataBase) / "listeners" / "state"
 
+/-! ## Long-poll sources, and the listeners a resident's feeds become -/
+
+/-- Whether a source is long-polled by a feed runner rather than polled on an interval. -/
+def SourceConfig.isLongPoll : SourceConfig → Bool
+  | .zulipFeed _ => true
+  | _ => false
+
+/-- The listener a resident's feed is: `resident-<resident>-<feed>`. -/
+def residentFeedListenerName (resident feed : String) : String :=
+  s!"resident-{resident}-{feed}"
+
+/-- The listener one of a resident's feeds becomes: its source the feed, its action delivering to
+    the resident. -/
+def residentFeedListener (resident : String) (feed : Resident.ZulipFeed) : ListenerConfig :=
+  { source := .zulipFeed feed
+    action := { promptTemplate := "", deliverTo := some resident }
+    intervalSeconds := 0 }
+
+/-- Every listener a resident's `feeds` make, by name. Read from the identities each time, so a
+    feed added to or removed from a `resident` block is picked up the way a listener file is. -/
+def residentFeedListeners : IO (Array (String × ListenerConfig)) := do
+  let mut out := #[]
+  for idn in ← (try Identity.loadAllIdentities catch _ => pure #[]) do
+    let some r := idn.resident | continue
+    for f in r.feeds do
+      out := out.push (residentFeedListenerName idn.name f.name, residentFeedListener idn.name f)
+  return out
+
 -- Config I/O
 
 def listenerConfigFile (name : String) : IO System.FilePath := do
@@ -678,7 +740,9 @@ def listenerConfigFile (name : String) : IO System.FilePath := do
 def loadListenerConfig (name : String) : IO (Option ListenerConfig) := do
   Utils.ensureConfigName "listener" name
   let path := (← listenersConfigDir) / s!"{name}.json"
-  if !(← path.pathExists) then return none
+  if !(← path.pathExists) then
+    -- Not a file: perhaps one of a resident's feeds, which its identity defines.
+    return (← residentFeedListeners).find? (·.1 == name) |>.map (·.2)
   let secrets ← loadSecrets
   let raw := applySecrets secrets (← IO.FS.readFile path)
   match Json.parse raw with
@@ -704,7 +768,7 @@ def listenerNameOfFile (fileName : String) : String :=
     which of two spellings to trust. -/
 def loadAllListenerConfigs : IO (Array (String × ListenerConfig)) := do
   let dir ← listenersConfigDir
-  if !(← dir.pathExists) then return #[]
+  if !(← dir.pathExists) then return ← residentFeedListeners
   let secrets ← loadSecrets
   let entries ← System.FilePath.readDir dir
   let mut configs : Array (String × ListenerConfig) := #[]
@@ -726,7 +790,7 @@ def loadAllListenerConfigs : IO (Array (String × ListenerConfig)) := do
       match FromJson.fromJson? j (α := ListenerConfig) with
       | .error e => IO.eprintln s!"Warning: failed to load listener config {file}: {e}"
       | .ok cfg  => configs := configs.push (name, cfg)
-  return configs
+  return configs ++ (← residentFeedListeners).filter fun (n, _) => !configs.any (·.1 == n)
 
 /-! ### Editing a listener config
 
@@ -773,6 +837,12 @@ def validateListenerConfig (name : String) (raw : String) :
       return .error s!"the body carries a legacy 'name' field of '{stale}', but it is being \
 stored as '{name}'. A listener is named by its file; drop the field, or store this under \
 '{stale}'"
+  if (← residentFeedListeners).any (·.1 == name) then
+    return .error s!"'{name}' is the listener of a resident's feed, which its identity's \
+'resident' block defines; edit that, or name this listener otherwise"
+  if cfg.source.isLongPoll && cfg.action.deliverTo.isNone then
+    return .error "a zulip-feed source delivers to a resident: its action must name one in \
+'deliver_to', whose kleis key it reads Zulip with"
   if cfg.intervalSeconds == 0 then
     return .error "'interval_seconds' must be at least 1; a listener polling zero seconds apart \
 would spin against its source as fast as the network allows"
@@ -1884,5 +1954,9 @@ def pollSource (source : SourceConfig) (state : ListenerState) (patFor : Reposit
     -- followed by re-application causes the listener to fire again.
     let prunedProcessed := state.processedIds.filter currentIds.contains
     return (allEvents, some (prunedProcessed ++ allEvents.map (·.1)))
+
+  -- Not polled: the daemon runs a long-poll source in a fiber of its own
+  -- (`Orchestra.Resident.Zulip.runFeed`), which delivers into an inbox itself.
+  | .zulipFeed _ => return (#[], none)
 
 end Orchestra.Listener

@@ -2,6 +2,7 @@ import Lean.Data.Json
 import Orchestra.Config
 import Orchestra.Dirs
 import Orchestra.Utils.Files
+import Orchestra.Resident.Feed
 
 open Lean (Json FromJson ToJson)
 
@@ -83,8 +84,8 @@ namespace Orchestra.Identity
     (`docs/design/resident-sessions.md`). Every field is optional; what is absent falls back to the
     `residents` block of `config.json` (`ResidentSpec.settings`).
 
-    `feeds` is read and kept, not acted on: the feeds themselves — Zulip first — are a later phase,
-    and a block written for them should not stop the resident from working without them. -/
+    `feeds` are the long-lived connections the daemon holds for it (`Orchestra.Resident.Feed`):
+    each becomes a listener owned by the resident, whose events go to its inbox. -/
 structure ResidentSpec where
   budgetPerDay : Option Float := none
   processIdleSeconds : Option Nat := none
@@ -95,8 +96,8 @@ structure ResidentSpec where
   tools : Option (List String) := none
   /-- The agent backend, as a session's `backend`. -/
   agent : Option String := none
-  /-- The feeds, as written. Not acted on yet. -/
-  feeds : Array Json := #[]
+  /-- Its feeds: Zulip event queues, read through kleis with its own key. -/
+  feeds : Array Resident.ZulipFeed := #[]
 deriving Inhabited
 
 /-- A resident's settings with every default filled in. -/
@@ -157,7 +158,7 @@ def parseResidentSpec (who : String) (j : Json) : Except String ResidentSpec := 
       | .error _ => throw s!"{who}: resident.tools must be a list of tool names"
   let feeds ← match j.getObjVal? "feeds" with
     | .error _ => pure #[]
-    | .ok (.arr fs) => pure fs
+    | .ok (.arr fs) => Resident.parseFeeds s!"{who}: resident.feeds" fs
     | .ok _ => throw s!"{who}: resident.feeds must be a list"
   return { budgetPerDay, tools, feeds
            processIdleSeconds := ← optNat "process_idle_seconds"

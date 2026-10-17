@@ -1,6 +1,7 @@
 import Orchestra.Store
 import Orchestra.Usage
 import Orchestra.TaskStore
+import Orchestra.Resident.Feed
 import Lean.Data.Json
 
 open Lean (Json ToJson FromJson)
@@ -256,19 +257,55 @@ def renderItem (i : InboxItem) : String :=
   else
     s!"From {i.source} (event {i.eventId}, item {i.id}){trust}:\n{i.text}"
 
+/-- Whether an item came from a Zulip feed. -/
+def InboxItem.isZulip (i : InboxItem) : Bool :=
+  i.source.startsWith "zulip:" &&
+    (i.payload.getObjValAs? String "kind").toOption == some "zulip"
+
+/-- The site a Zulip item came from. -/
+def InboxItem.site (i : InboxItem) : String :=
+  (i.payload.getObjValAs? String "site").toOption.getD (i.source.drop "zulip:".length).toString
+
+/-- A run of Zulip items from one site, as the turn shows them (§4.3): a heading naming the
+    server, one entry per message with the untrusted ones marked, and how to answer. -/
+def renderZulipGroup (site : String) (items : List InboxItem) : String :=
+  let entries := items.map fun i => renderZulipItem i.payload i.trusted i.id
+  s!"New on Zulip ({site}):\n" ++ "\n".intercalate entries ++
+    "\nReply in the same place with the zulip client (your token card says how)."
+
+/-- Items in order, with each source's Zulip items gathered into one group where the first of
+    them stood. -/
+def groupItems (items : List InboxItem) : List (Sum InboxItem (String × List InboxItem)) :=
+  Id.run do
+    let mut out : Array (Sum InboxItem (String × List InboxItem)) := #[]
+    let mut seen : List String := []
+    for i in items do
+      if i.isZulip then
+        if seen.contains i.source then continue
+        seen := i.source :: seen
+        out := out.push (.inr (i.site, items.filter (fun j => j.isZulip && j.source == i.source)))
+      else out := out.push (.inl i)
+    return out.toList
+
 /-- The one turn a batch of items becomes.
 
     A single human message with nothing to say about it is handed over as written, so a chat
     reads as a chat; anything else is a list, each item saying where it came from, whether it is
-    trusted, and its id — the transcript then shows what woke the resident. `notes` come first:
-    a lost conversation, an interrupted turn. -/
+    trusted, and its id — the transcript then shows what woke the resident. A feed's items are
+    gathered under one heading per server. `notes` come first: a lost conversation, an
+    interrupted turn. -/
 def renderTurn (items : Array InboxItem) (notes : List String := []) : String :=
   let interrupted := items.any (·.sentIn.isSome)
   let notes := notes ++ (if interrupted then [redeliveryNote] else [])
   match items.toList, notes with
-  | [i], [] => if i.source == "human" && i.trusted then i.text else renderItem i
+  | [i], [] =>
+    if i.source == "human" && i.trusted then i.text
+    else if i.isZulip then renderZulipGroup i.site [i]
+    else renderItem i
   | _, _ =>
-    let body := "\n\n".intercalate (items.toList.map renderItem)
+    let body := "\n\n".intercalate ((groupItems items.toList).map fun
+      | .inl i => renderItem i
+      | .inr (site, is) => renderZulipGroup site is)
     if notes.isEmpty then body else "\n".intercalate notes ++ "\n\n" ++ body
 
 end Orchestra.Resident

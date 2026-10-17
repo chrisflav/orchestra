@@ -159,6 +159,15 @@ def mint (cfg : KleisConfig) (t : TaskFacts) : IO Minted := do
     let expires := (j.getObjValAs? Nat "expires").toOption.getD 0
     return { token, revocationId, expires }
 
+/-- Revoke a token by its revocation id. A token kleis no longer knows is already as good as
+    revoked. -/
+def revokeId (cfg : KleisConfig) (revocationId : String) : IO Unit := do
+  if revocationId.isEmpty then return
+  let body := Json.mkObj [("revocation_id", .str revocationId)]
+  let (status, out) ← postAdmin cfg "/.kleis/v1/revoke" body.compress
+  if status != 200 && status != 404 then
+    throw (.userError s!"kleis refused to revoke a token ({status}): {errorOf out}")
+
 /-- Revoke a task's token. A token kleis no longer knows is already as good as revoked. -/
 def revoke (cfg : KleisConfig) (m : Minted) : IO Unit := do
   if m.revocationId.isEmpty then return
@@ -438,7 +447,8 @@ def resolve (c : Choice) (identityToken : Option String) : IO (Option Source) :=
     from a token: the token and the bearer, no facts. Either way the TTL and the narrowings —
     omitted when there are none. -/
 def deriveBody (cfg : KleisConfig) (src : Source) (facts : TaskFacts) (narrow : List String)
-    : Json :=
+    (ttl : Option String := none) : Json :=
+  let cfg := { cfg with ttl := ttl.getD cfg.ttl }
   let narrowField : List (String × Json) :=
     if narrow.isEmpty then [] else [("narrow", .arr (narrow.map Json.str).toArray)]
   match src with
@@ -469,10 +479,12 @@ def parseDerived (body : String) : Except String Minted := do
   let card := (j.getObjValAs? String "card").toOption.filter (!·.trimAscii.isEmpty)
   return { token, revocationId, expires, card }
 
-/-- Derive a task token (`POST /.kleis/v1/derive`, with the issuer credential). -/
+/-- Derive a task token (`POST /.kleis/v1/derive`, with the issuer credential). `ttl` overrides
+    `kleis.ttl`, for a token that is renewed rather than held for a task's life. -/
 def derive (cfg : KleisConfig) (src : Source) (facts : TaskFacts) (narrow : List String)
-    : IO Minted := do
-  let (status, out) ← postAdmin cfg "/.kleis/v1/derive" (deriveBody cfg src facts narrow).compress
+    (ttl : Option String := none) : IO Minted := do
+  let (status, out) ← postAdmin cfg "/.kleis/v1/derive"
+    (deriveBody cfg src facts narrow ttl).compress
   if status != 200 then
     let what := match src with
       | .spec s => s!"from spec '{s}'"

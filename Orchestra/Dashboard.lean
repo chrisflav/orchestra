@@ -13,6 +13,7 @@ import Orchestra.Secret
 import Orchestra.Skill
 import Orchestra.Interactive.Store
 import Orchestra.Resident.Inbox
+import Orchestra.Resident.Zulip
 import Orchestra.Identity
 import Orchestra.Utils.UnixSocket
 import Orchestra.Utils.Files
@@ -836,6 +837,8 @@ private def sourceSummary : Listener.SourceConfig → (String × String)
   | .githubLabels repos labels kind _ =>
       let r := String.intercalate ", " (repos.map (·.upstream.toString))
       ("github-labels", s!"{r} kind={kind} labels=[{String.intercalate "," labels}]")
+  | .zulipFeed f =>
+      ("zulip-feed", s!"{f.site} ({f.name}) notify=[{String.intercalate "," f.notify}]")
 
 private def sourceExtras : Listener.SourceConfig → List (String × String)
   | .githubIssues _ _ trig authU
@@ -873,15 +876,26 @@ private def rateLimitsJson (c : Listener.ListenerConfig) (st : Listener.Listener
 private def listenerSummaryJson (name : String) (c : Listener.ListenerConfig)
     (st : Listener.ListenerState) : IO Json := do
   let (srcType, _) := sourceSummary c.source
-  return Json.mkObj [
-    ("name",            name),
+  return Json.mkObj (([
+    ("name",            Json.str name),
     ("enabled",         Json.bool st.enabled),
     ("sourceType",      srcType),
     ("intervalSeconds", ToJson.toJson c.intervalSeconds),
     ("lastCheckedAt",   optNormIso (if st.lastChecked.isEmpty then none else some st.lastChecked)),
     ("eventCount",      ToJson.toJson st.processedIds.size),
     ("rateLimits",      ← rateLimitsJson c st)
-  ]
+  ] : List (String × Json)) ++ (← feedFields name c st))
+where
+  /-- A feed's connection, checkpoint, last error and resident, for the dashboard (§10). -/
+  feedFields (name : String) (c : Listener.ListenerConfig) (st : Listener.ListenerState) :
+      IO (List (String × Json)) := do
+    unless c.source.isLongPoll do return []
+    let conn := (← Resident.Zulip.statusOf name).getD (if st.enabled then "stopped" else "disabled")
+    return [("feed", Json.mkObj [
+      ("connection", .str conn),
+      ("resident", optStr c.action.deliverTo),
+      ("checkpoint", optStr st.checkpoint),
+      ("error", optStr st.error)])]
 
 private def listenersApi (p : Page) : IO Json := do
   pageOverUnordered p (← Listener.loadAllListenerConfigs) fun (name, c) => do
@@ -1312,8 +1326,21 @@ private def residentDetailApi (configPath : Option System.FilePath) (name : Stri
   let some r ← Interactive.loadResidentSession name | return none
   let base ← residentJson configPath r
   let (recent, total) ← Resident.recent name 20
+  let watches ← Resident.listWatches name
+  -- Its feeds and how each stands: the listener they are, connected or not, the last error.
+  let feeds ← (← Resident.Zulip.feedsOf name).mapM fun (listener, f) => do
+    let st ← Listener.loadListenerState listener
+    pure (Json.mkObj [
+      ("listener", .str listener), ("name", .str f.name), ("site", .str f.site),
+      ("enabled", .bool st.enabled),
+      ("connection", .str ((← Resident.Zulip.statusOf listener).getD
+        (if st.enabled then "stopped" else "disabled"))),
+      ("checkpoint", optStr st.checkpoint), ("error", optStr st.error),
+      ("lastEventAt", optNormIso (if st.lastChecked.isEmpty then none else some st.lastChecked))])
   return some (base.setObjVal! "inbox" (Json.mkObj [
-    ("items", Json.arr (recent.map ToJson.toJson)), ("total", ToJson.toJson total)]))
+    ("items", Json.arr (recent.map ToJson.toJson)), ("total", ToJson.toJson total)])
+    |>.setObjVal! "watches" (Json.arr (watches.map ToJson.toJson))
+    |>.setObjVal! "feeds" (Json.arr feeds.toArray))
 
 private def residentInboxApi (name : String) (atMost : Nat) : IO (Option Json) := do
   let some _ ← Interactive.loadResidentSession name | return none

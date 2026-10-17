@@ -9,6 +9,7 @@ import Orchestra.Secret
 import Orchestra.TaskRunner
 import Orchestra.Usage
 import Orchestra.Resident.Inbox
+import Orchestra.Resident.Zulip
 import Std.Sync
 import Std.Data.HashMap
 
@@ -673,6 +674,8 @@ one in this session (the resident's memory directory is intact)")
       identity
       authToken := mcpToken
       kleis := appConfig.kleis
+      -- A resident's own tools: its watches (`docs/design/resident-sessions.md` §6).
+      residentTools := resident.map fun (name, _) => (name, Resident.Zulip.residentTool name)
     } (bindHost := mcpBind) (portRange := mcpPorts)
     -- The derived token, if there is one, is revoked with the MCP server: the one closure every
     -- way out of a session runs, so the token cannot outlive the session that held it.
@@ -1475,12 +1478,7 @@ def Manager.refreshResidents (mgr : Manager) : IO Unit := do
       IO.eprintln s!"resident {idn.name}: could not prepare its session: {e}"
   let before ← mgr.configuredResidents
   if before != found.map (·.1) then
-    let feeds := (← Identity.loadAllIdentities).filter fun i =>
-      (i.resident.map (!·.feeds.isEmpty)).getD false
     IO.println s!"Residents: {if found.isEmpty then "none" else ", ".intercalate (found.map (·.1)).toList}"
-    for i in feeds do
-      IO.println s!"  Resident {i.name}: its feeds are not supported yet and are ignored; it is \
-reached through its inbox (the chat, and listeners with deliver_to)"
   mgr.setConfigured found
   -- A budget pause whose day is over is lifted here too, not only when something arrives: the
   -- dashboard should not go on saying "paused: budget" all of the next day.
