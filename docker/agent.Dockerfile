@@ -76,10 +76,9 @@ RUN apt-get update \
       jq \
       procps \
       ripgrep \
-      `# Calendars, through kleis's CalDAV extension: vdirsyncer keeps a local copy and syncs it,` \
-      `# khal reads and edits it. Both are configured by kleis's setup; neither holds a credential.` \
+      `# Calendars, through kleis's CalDAV extension: khal reads and edits the local copy vdirsyncer` \
+      `# keeps (vdirsyncer itself is installed below, from PyPI). Configured by kleis's setup.` \
       khal \
-      vdirsyncer \
  && rm -rf /var/lib/apt/lists/*
 
 # gh, the GitHub CLI. Agents review and open pull requests with it (`gh pr diff`, `gh pr checkout`,
@@ -169,6 +168,15 @@ RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/
  && install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /tmp/uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/ \
  && rm -rf /tmp/uv-x86_64-unknown-linux-gnu \
  && uv --version
+
+# vdirsyncer 0.20, from PyPI rather than Debian: Debian's 0.19.0 opens its aiohttp sessions without
+# `trust_env`, so it ignores HTTPS_PROXY and goes to the server directly -- past kleis, with the
+# placeholder login kleis's setup writes, and is refused. 0.20 honours the proxy. Installed as a
+# uv tool on the system Python into /usr/local/bin, outside $HOME, which is masked at runtime.
+ARG VDIRSYNCER_VERSION=0.20.0
+RUN UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
+      uv tool install --python /usr/bin/python3 "vdirsyncer==${VDIRSYNCER_VERSION}" \
+ && vdirsyncer --version
 
 # kubectl, for the agent that is meant to deploy something onto the cluster it is running in.
 #
