@@ -76,6 +76,10 @@ RUN apt-get update \
       jq \
       procps \
       ripgrep \
+      `# Calendars, through kleis's CalDAV extension: vdirsyncer keeps a local copy and syncs it,` \
+      `# khal reads and edits it. Both are configured by kleis's setup; neither holds a credential.` \
+      khal \
+      vdirsyncer \
  && rm -rf /var/lib/apt/lists/*
 
 # gh, the GitHub CLI. Agents review and open pull requests with it (`gh pr diff`, `gh pr checkout`,
