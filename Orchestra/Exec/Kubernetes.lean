@@ -1493,18 +1493,22 @@ private def collectRun (cfg : Config) (podName id : String) (seconds : Option Na
   let err ← spawnFollower cfg podName id "err"
   let outTask ← IO.asTask (prio := .dedicated) out.stdout.readToEnd
   let errTask ← IO.asTask (prio := .dedicated) err.stdout.readToEnd
+  -- The status `tryWait` returned, if it did: it has reaped the follower, so a `wait` after it
+  -- finds no child (ECHILD) -- which failed every finish command's report until 2026-10-16.
+  let mut reaped : Option UInt32 := none
   if let some s := seconds then
     let deadline := (← IO.monoMsNow) + s * 1000
-    let mut code? : Option UInt32 := none
-    while code?.isNone && (← IO.monoMsNow) < deadline do
-      code? ← out.tryWait
-      if code?.isNone then IO.sleep 1000
-    if code?.isNone then
+    while reaped.isNone && (← IO.monoMsNow) < deadline do
+      reaped ← out.tryWait
+      if reaped.isNone then IO.sleep 1000
+    if reaped.isNone then
       try out.kill catch _ => pure ()
       try err.kill catch _ => pure ()
       discard out.wait; discard err.wait
       return none
-  let code ← out.wait
+  let code ← match reaped with
+    | some c => pure c
+    | none => out.wait
   discard err.wait
   let code ← confirmExit cfg podName id code
   let o ← IO.ofExcept (← IO.wait outTask)
