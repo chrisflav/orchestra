@@ -229,8 +229,9 @@ write.
 ## residents
 
 A **resident** is an identity with one session that never ends — the design is
-[`design/resident-sessions.md`](design/resident-sessions.md); what is built so far is its phases 1
-and 2 (the Zulip feed and watches).
+[`design/resident-sessions.md`](design/resident-sessions.md), all three of whose phases are built:
+resident sessions, the Zulip feed and watches, and token cycling with `refresh_kleis_token` and the
+dashboard's residents page.
 An identity becomes one with a `resident` block in its `identity.json`:
 
 ```json
@@ -257,7 +258,8 @@ Every field is optional and falls back to the `residents` block of `config.json`
 (`true`), `budget_per_day` (`100`, USD), `process_idle_seconds` (`1800`), `pod_idle_seconds`
 (`21600`), `batch_window_seconds` (`3`), `timezone` (`"UTC"`, for the budget day), `max_awake`
 (`4`, residents with a process at once, counted apart from `interactive.max_sessions`),
-`max_turns_per_hour` (`60`) and `volume_size` (the backend's own size when absent). The block
+`max_turns_per_hour` (`60`), `token_refresh_margin` (`"2h"`, or seconds; config only, below) and
+`volume_size` (the backend's own size when absent). The block
 may carry `tools`, `agent` (the backend) and `feeds` (below); it may not carry `upstream` or
 `fork`. A resident is reached through its inbox: its feeds, the chat, and listeners with
 `deliver_to`.
@@ -265,13 +267,35 @@ may carry `tools`, `agent` (the backend) and `feeds` (below); it may not carry `
 **One session, by name, never ended.** At start-up the daemon creates each resident's session
 asleep (id `resident-<name>`, no process), with no repository: a scratch workspace kept across
 wakes (`<data>/workspaces/sessions/<id>` on landrun, its task volume on Kubernetes), no clone
-slot, no repository-scoped tools, and the repository-less form of the kleis task facts. Its
-kleis token is derived from the identity's source at every cold wake. What ends or fails another
+slot, no repository-scoped tools, and the repository-less form of the kleis task facts. Behind
+kleis it needs no GitHub App either: no installation token is minted for it and no JWT signed, so
+a daemon whose App key is unreadable still wakes it (without kleis a repository-less session tries
+for an installation token and starts without one if it cannot have it). What ends or fails another
 session puts a resident to sleep instead — a dead process, a turn that could not be written, a
 failed wake — and the next delivery wakes it, with a backoff; three failures in a row pause it
-(`paused: failed`) until an operator resumes it. `DELETE /api/v1/interactive/{id}` is refused for
-it. Only `orchestra resident reset` ends its conversation, by starting a new one in the same
-session: the memory directory and the inbox carry over.
+(`paused: failed`) until an operator resumes it. The failure count, the backoff and the recent
+turns counted against `max_turns_per_hour` are kept in `resident_runtime`, so a daemon restart does
+not reset them. `DELETE /api/v1/interactive/{id}` is refused for it. Only `orchestra resident
+reset` ends its conversation, by starting a new one in the same session: the memory directory, the
+inbox and the **watches** carry over — watches are the resident's standing configuration, not part
+of the conversation — and the new conversation's first turn says so (`unwatch` drops one).
+
+**Tokens** (§7 of the design). Every agent process a resident starts holds a kleis token of its
+own, derived from the identity's source (or minted): the first with the environment, each later
+one — a warm wake, a cycle — anew, so the token and the card in its prompt are current however long
+it slept; the tokens a new process replaces are revoked once it is up, and a warm sleep revokes
+everything the session holds. Before a turn is handed to a running resident it is **cycled** —
+stopped and started again at once in the environment it has, the conversation resumed — when its
+budget day is over, when its token expires within `residents.token_refresh_margin` (default `2h`),
+or when `refresh_kleis_token` was called during its last turn. That tool, offered to a resident
+behind kleis, derives a new token for the agent's shell commands mid-turn and answers its expiry
+and card: the agent's command shell is pointed (`CLAUDE_ENV_FILE`) at a stub that sources a
+per-session env file, which the tool rewrites with the new `HTTPS_PROXY`; the CLI replays the
+stub's content before every Bash command, so the next command uses the new token while the agent
+process itself keeps its own until the cycle. The files live in `<data>/session-env/<id>/` (granted
+read-only to the run) on landrun and local, and in `~/.orchestra/env/` of the pod's own home on
+Kubernetes; the env file is emptied before the tokens it named are revoked. Queued tasks are not
+offered the tool: their token lives `kleis.ttl` (12h) and they are not cycled.
 
 **The inbox.** Everything a resident is handed goes through `resident_inbox`: a person's message
 (source `human`), a listener event (`listener:<name>`). Items are unique per
@@ -292,10 +316,11 @@ to pick up the new allowance. A spent day pauses the resident (`paused: budget:<
 keeps filling and the next day it is woken with everything that arrived.
 
 **Asleep: warm, then cold.** After `process_idle_seconds` idle the agent process is stopped and
-everything else kept — the environment (on Kubernetes, the pod), the MCP server, the credentials:
-`warm`, and the next turn is a process start (`--resume`). After `pod_idle_seconds` the
-environment goes too: `cold` (`dormant` on the record), and the next turn is a full wake. A warm
-resident whose kleis token expires within two hours is woken cold instead, for a new one. On
+everything else kept — the environment (on Kubernetes, the pod), the MCP server — but its kleis
+tokens are revoked and, on Kubernetes, its memory directory is copied back from the pod then
+rather than only when the pod goes: `warm`, and the next turn is a process start (`--resume`) on a
+new token. After `pod_idle_seconds` the environment goes too: `cold` (`dormant` on the record),
+and the next turn is a full wake. On
 Kubernetes a resident's pod has no `deadline_seconds`, and its task volume — keyed by its session
 — is labelled `orchestra.dev/resident` and exempt from `retention_days`. A volume lost anyway (or
 a backend that keeps none) starts a fresh conversation in the same session, said in the
@@ -340,4 +365,8 @@ the bot can see, and refuses a private stream it is not subscribed to. Watches a
 
 **Control.** `orchestra resident list|show|inbox|pause|resume|reset <name>` and
 `orchestra resident send <name> <text…>` go through the API (`/api/v1/residents…`), as
-`orchestra chat` does; `orchestra chat --resident <name>` attaches to its session.
+`orchestra chat` does; `orchestra chat --resident <name>` attaches to its session. The
+dashboard's **Residents** page lists each one's state (running, idle, warm, cold, waking, paused
+and why), inbox depth, last event, today's spend against its budget, failures and backoff, and when
+its process's token expires; a resident's own page adds its feeds' connection and last error, its
+watches and its recent inbox, pause / resume / reset buttons, and a link to its chat.

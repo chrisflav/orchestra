@@ -1,8 +1,9 @@
 # Resident sessions: agents that are always available
 
-*Status: proposal, revised once after review (changes at the end). Phases 1 and 2 (§14) are
-implemented — `docs/interactive.md` § residents says how they work; §15.2 was verified (a Zulip
-long poll held open through kleis, answered by a heartbeat after ~46s). Phase 3 is not.*
+*Status: proposal, revised once after review (changes at the end). All three phases (§14) are
+implemented — `docs/interactive.md` § residents says how they work. §15.1 and §15.2 were verified:
+§15.1 with a finding that changed §7.3 (a stub that sources the env file, not the env file itself),
+§15.2 with a Zulip long poll held open through kleis, answered by a heartbeat after ~46s.*
 
 A **resident** is an identity with one session that never ends. It is not always running: when it
 has had nothing to do for a while it is put to sleep — first its process, later its pod — and the
@@ -129,7 +130,11 @@ sleep instead:
 
 Wake accepts `asleep` and `paused` (once the reason is gone). A resident ends only by an operator:
 `orchestra resident reset secretary` ends the conversation and starts a fresh one asleep — the
-identity's memory directory carries over, the conversation does not.
+identity's memory directory carries over, the conversation does not. Its inbox and its **watches**
+(§6) carry over too: a watch is standing configuration the resident chose — "tell me about #ops >
+deploys until the release" — not part of the conversation, and a reset is usually about the
+conversation going wrong; the new conversation's first turn says that its watches are as they were
+(`list_watches`, `unwatch`).
 
 ### 3.3 Without a repository
 
@@ -323,10 +328,20 @@ So:
    to be cycled after this turn. The env file is per session, in a directory granted at launch (on
    landrun under the session's own data directory, not the shared `$HOME`; on Kubernetes written into
    the pod with `Session.putHomeFile`), and the agent's command shell is pointed at it with Claude
-   Code's `CLAUDE_ENV_FILE` (sourced before each Bash command; **to be verified**, §15). The next
-   command uses the new token; the agent's own process keeps its token until the cycle, which is why
-   the margin is hours. The token the tool replaced is revoked at that cycle, and the env file is
-   removed then — never left naming a revoked token.
+   Code's `CLAUDE_ENV_FILE` — **indirectly** (§15.1): `CLAUDE_ENV_FILE` names a *stub*, written
+   before each process starts and never changed while it runs, that sources the env file
+   (`if [ -r <env> ]; then . <env>; fi`). The CLI keeps the stub's content and replays it before
+   each Bash command, and the `.` reads the env file afresh every time. The next command uses the
+   new token; the agent's own process keeps its token until the cycle, which is why the margin is
+   hours. The token the tool replaced is revoked at that cycle, and the env file is emptied first —
+   never left naming a revoked token.
+
+   *As built:* the env file sets only the four proxy variables (the rest of a launch's environment
+   does not change with the token, and re-exporting it would undo the rule that the agent's own
+   variables win over a setup's). Every process — not only every wake — gets a token of its own,
+   and a warm sleep revokes all the session holds. The tool is offered only to residents behind
+   kleis; queued tasks are not offered it, since their token outlives any task's deadline at the
+   default ttl and nothing would cycle them.
 
 With a 12h ttl and a 2h margin, only a single turn longer than 2h needs the tool; it exists for
 that, and for a command refused with "token expired".
@@ -351,6 +366,9 @@ the agent — tens of seconds, not seconds. So sleep has two stages:
 
 * after `process_idle_seconds` (default 1800): **warm** — the agent process stops; the pod, the task
   volume mount and the MCP relay stay. A wake from warm is a process start (`--resume`): seconds.
+  *As built:* a warm sleep also revokes the session's kleis tokens (the next process gets its
+  own, §7) and copies the memory directory back from the pod (`Session.syncBack`), so what the
+  resident learned reaches the daemon's disk at each sleep rather than only when the pod goes.
 * after `pod_idle_seconds` (default 21600): **cold** — the pod is deleted too. A wake from cold is a
   pod start; the first reply takes that long.
 
@@ -370,7 +388,9 @@ agent's own compaction; the memory directory is the durable part.
 * **Feed failure** (Zulip down, kleis refusing): backoff up to 5 minutes; the error on the
   dashboard; the inbox untouched.
 * **Wake failure**: backoff; after three in a row the resident is **paused: failed** until an
-  operator resumes it.
+  operator resumes it. The count, the backoff and the turns counted against `max_turns_per_hour`
+  are kept in `resident_runtime` (a row per resident, not columns on the session record, which is
+  written whole from the manager's copy), so a restart does not reset them.
 * **Limits**: `max_awake` residents with a process at once (§2); `max_turns_per_hour` (default 60)
   against loops with another bot; every turn's cost against the day.
 
@@ -417,8 +437,26 @@ needs. The design bounds it in layers:
 
 ## 15. Open questions, and what to verify first
 
-1. **Verify** `CLAUDE_ENV_FILE` (or an equivalent) makes Claude Code's Bash tool pick up a file
-   written mid-session; otherwise `refresh_kleis_token` can only schedule a cycle.
+1. **Verified**, with a finding (Claude Code 2.1.280, headless `--print --input-format stream-json
+   --output-format stream-json`, as orchestra launches it; two turns, each running
+   `echo $KLEIS_PROBE` through the Bash tool, the file rewritten from `one` to `two` between them;
+   driven through a scripted stand-in for the Messages API, `ANTHROPIC_BASE_URL`):
+
+   | mechanism | turn 1 | turn 2 |
+   | --- | --- | --- |
+   | `CLAUDE_ENV_FILE` → a file rewritten mid-session | one | **one** |
+   | `CLAUDE_ENV_FILE` → a stub that sources a file rewritten mid-session | one | **two** |
+   | `env` in a `--settings <file>` file rewritten mid-session | one | **one** |
+   | `env` in `$HOME/.claude/settings.json` rewritten mid-session | one | **two** |
+
+   So the CLI reads `CLAUDE_ENV_FILE`'s *content* once and replays it before each command; a file
+   it sources is read again each time. The user settings file is watched and its `env` applied,
+   but it is `$HOME`'s — shared by every session on landrun — so the stub is what §7.3 uses. The
+   same held with `SHELL` (and `CLAUDE_CODE_SHELL`) pointing at zsh 5.9: the CLI ran its commands
+   under bash regardless, which is the case `BASH_ENV` was dropped for; the stub is plain POSIX
+   `.`, so it does not depend on which. An end-to-end run (a resident on the local backend, the
+   real CLI, a real kleis) confirmed it: after `refresh_kleis_token`, the next command in the same
+   process carried the new token.
 2. **Verify** a 90s Zulip `GET /events` through kleisd end to end, from the daemon's network.
 3. **Several Zulip servers**: one feed per site (proposed), or one per Zulip account the spec reaches?
 4. **Owner notifications**: the dashboard reports *paused: budget* and *paused: failed*; should they
