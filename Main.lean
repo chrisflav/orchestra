@@ -16,6 +16,7 @@ import Orchestra.Project
 import Orchestra.Store.Import
 import Orchestra.Queue
 import Orchestra.Repo
+import Orchestra.Resident.Cli
 import Orchestra.RepoConfig
 import Orchestra.Sandbox
 import Orchestra.Secret
@@ -1679,6 +1680,7 @@ private def chatHandler (p : Parsed) : IO UInt32 := do
     let modes := [("--list", p.hasFlag "list"),
                   ("--end", (p.flag? "end").isSome),
                   ("--session", (p.flag? "session").isSome),
+                  ("--resident", (p.flag? "resident").isSome),
                   (", ".intercalate startFlags, !startFlags.isEmpty)]
       |>.filter (·.2) |>.map (·.1)
     if modes.length > 1 then
@@ -1712,6 +1714,15 @@ private def chatHandler (p : Parsed) : IO UInt32 := do
       match ← Client.get cfg (chatSessionPath id) with
       | .error e => IO.eprintln e; return 1
       | .ok _    => return ← chatAttach cfg id 0
+    -- A resident, by name: its session is the one it always has. Its transcript is long, so the
+    -- replay starts near its end rather than at the beginning of its life.
+    if let some nameFlag := p.flag? "resident" then
+      let name := nameFlag.as! String
+      match ← Client.get cfg s!"/api/v1/residents/{Client.encodeSegment name}" with
+      | .error e => IO.eprintln e; return 1
+      | .ok j =>
+        let seq := Client.nat j "lastEventSeq"
+        return ← chatAttach cfg (Client.str j "sessionId") (if seq > 40 then seq - 40 else 0)
     -- Otherwise start one.
     let some upstream := p.flag? "upstream" |>.map (·.as! String)
       | do IO.eprintln "Give --upstream and --fork to start a session, --session to attach to \
@@ -1761,6 +1772,7 @@ private def chatCmd : Cmd := `[Cli|
     upstream     : String; "Upstream repository in 'owner/repo' format"
     fork         : String; "Fork repository in 'owner/repo' format"
     session      : String; "Attach to an existing session by id instead of starting one"
+    resident     : String; "Talk to this resident (its one session, through its inbox)"
     list;                  "List sessions and exit"
     "end"        : String; "End the session with this id and exit"
     backend      : String; "Agent backend (default: claude; it is the only one that can host a session)"
@@ -1774,6 +1786,102 @@ agent, and where it has a taxis token, the session's tracker writes are recorded
 http://127.0.0.1:8080)"
     "api-token" : String; "Shared secret (default: $ORCHESTRA_DASHBOARD_PASSWORD, or the \
 persisted one)"
+]
+
+/-! ## `orchestra resident` — the residents the daemon keeps
+
+A resident is an identity with one session that never ends (`docs/design/resident-sessions.md`).
+Everything here goes through the API, as `orchestra chat` does. -/
+
+/-- Dollars to the cent. -/
+private def usd (x : Float) : String :=
+  let cents := (x * 100.0).round.toUInt64.toNat
+  s!"${cents / 100}.{if cents % 100 < 10 then "0" else ""}{cents % 100}"
+
+private def residentLine (r : Lean.Json) : String :=
+  let paused := match (r.getObjValAs? String "pausedReason").toOption with
+    | some why => s!" ({why})"
+    | none => ""
+  let budget := match (r.getObjValAs? Float "budgetPerDay").toOption with
+    | some b => s!"{usd ((r.getObjValAs? Float "spentToday").toOption.getD 0.0)} of {usd b}"
+    | none   => "not configured"
+  s!"{padRight (Client.str r "name") 20} {padRight (Client.str r "state" ++ paused) 22} \
+{padRight (toString (Client.nat r "inboxReady")) 6} {budget}"
+
+private def inboxLine (i : Lean.Json) : String :=
+  let text := ((i.getObjVal? "payload").toOption.bind (·.getObjValAs? String "text" |>.toOption))
+    |>.getD ""
+  let first := (text.splitOn "\n").headD "" |>.trimAscii.toString
+  let first := if first.length > 60 then (first.take 57).toString ++ "..." else first
+  s!"{padRight (toString (Client.nat i "id")) 6} {padRight (Client.str i "state") 10} \
+{padRight (Client.str i "source") 22} {padRight (Client.str i "receivedAt") 21} {first}"
+
+private def residentHandler (p : Parsed) : IO UInt32 := do
+  let args := (p.variableArgsAs? String |>.getD #[]).toList
+  let cmd ← match Resident.parseCommand args with
+    | .ok c    => pure c
+    | .error e => IO.eprintln e; return 1
+  withClient p fun cfg => do
+    let (path, write) := cmd.route
+    if write then
+      let body := match cmd with
+        | .send _ text => Lean.Json.compress (Lean.Json.mkObj [("text", Lean.Json.str text)])
+        | _            => "{}"
+      return ← apiCall (Client.post cfg path body (maxTime := 900)) fun j => do
+        match cmd with
+        | .send name _ =>
+          if (j.getObjValAs? Bool "queued").toOption.getD false then
+            IO.println s!"Queued in {name}'s inbox as item {Client.nat j "inboxItem"}: \
+{Client.str j "why"}."
+          else
+            IO.println s!"Handed to {name}; follow it with `orchestra chat --resident {name}`."
+        | .pause n  => IO.println s!"Resident {n} paused."
+        | .resume n => IO.println s!"Resident {n} resumed."
+        | .reset n  => IO.println s!"Resident {n}'s conversation was reset; the next turn starts a \
+new one."
+        | _ => pure ()
+    apiCall (Client.get cfg path) fun j => do
+      match cmd with
+      | .list =>
+        let (rows, _) := Client.items j
+        if rows.isEmpty then IO.println "No residents."
+        else
+          IO.println s!"{padRight "RESIDENT" 20} {padRight "STATE" 22} {padRight "INBOX" 6} TODAY"
+          IO.println (String.ofList (List.replicate 72 '-'))
+          for r in rows do IO.println (residentLine r)
+      | .show _ =>
+        IO.println (residentLine j)
+        IO.println s!"  session {Client.str j "sessionId"}, {Client.nat j "turnCount"} turns, \
+last active {Client.str j "lastActivityAt"}, budget day {Client.str j "budgetDay"}"
+        if let .ok e := j.getObjValAs? String "error" then IO.println s!"  last error: {e}"
+        let inbox := (j.getObjVal? "inbox").toOption.getD Lean.Json.null
+        let (items, total) := Client.items inbox
+        unless items.isEmpty do
+          IO.println s!"\n  Inbox ({total} item{if total == 1 then "" else "s"}, newest first):"
+          for i in items do IO.println s!"  {inboxLine i}"
+      | .inbox _ =>
+        let (items, total) := Client.items j
+        if items.isEmpty then IO.println "The inbox is empty."
+        else
+          IO.println s!"{padRight "ITEM" 6} {padRight "STATE" 10} {padRight "SOURCE" 22} \
+{padRight "RECEIVED" 21} TEXT"
+          for i in items do IO.println (inboxLine i)
+          if total > items.size then IO.println s!"\n{items.size} of {total}."
+      | _ => pure ()
+
+private def residentCmd : Cmd := `[Cli|
+  resident VIA residentHandler; ["0.1.0"]
+  "Residents: identities with one session that never ends. \
+`list`, `show NAME`, `inbox NAME`, `pause NAME`, `resume NAME`, `reset NAME`, `send NAME TEXT…`."
+
+  FLAGS:
+    "api-url" : String; "Backend to talk to (default: $ORCHESTRA_API_URL, or \
+http://127.0.0.1:8080)"
+    "api-token" : String; "Shared secret (default: $ORCHESTRA_DASHBOARD_PASSWORD, or the \
+persisted one)"
+
+  ARGS:
+    ...args : String; "The command and the resident's name"
 ]
 
 private def interactiveHandler (p : Parsed) : IO UInt32 := do
@@ -2010,6 +2118,7 @@ def orchestraCmd : Cmd := `[Cli|
     runCmd';
     interactiveCmd;
     chatCmd;
+    residentCmd;
     mcpServerCmd;
     prepareCmd;
     cleanupCmd;

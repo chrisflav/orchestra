@@ -23,8 +23,8 @@ private def sampleRecord (id : String) : SessionRecord := {
   id
   createdAt      := "2026-08-21T10:04:12Z"
   lastActivityAt := "2026-08-21T10:04:12Z"
-  upstream       := { owner := "owner", name := "repo" }
-  fork           := { owner := "your-org", name := "repo" }
+  upstream       := some { owner := "owner", name := "repo" }
+  fork           := some { owner := "your-org", name := "repo" }
 }
 
 @[test]
@@ -50,8 +50,8 @@ def aSessionRoundTripsThroughTheDatabase : Test := do
     TestM.assertEqual r.turnCount 3 (msg := "turn count")
     TestM.assertEqual r.lastEventSeq 128 (msg := "the cursor a client compares against")
     TestM.assertEqual r.title (some "why does the queue stall") (msg := "title")
-    TestM.assertEqual r.upstream.toString "owner/repo" (msg := "upstream")
-    TestM.assertEqual r.fork.toString "your-org/repo" (msg := "fork")
+    TestM.assertEqual (r.upstream.map toString) (some "owner/repo") (msg := "upstream")
+    TestM.assertEqual (r.fork.map toString) (some "your-org/repo") (msg := "fork")
     -- The columns that are not scalars. A dormant session is woken from this record, and one
     -- that came back with different tools, a different prompt or a different identity would not
     -- be the same conversation.

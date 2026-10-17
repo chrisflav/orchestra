@@ -12,6 +12,9 @@ import Orchestra.Usage
 import Orchestra.Secret
 import Orchestra.Skill
 import Orchestra.Interactive.Store
+import Orchestra.Resident.Inbox
+import Orchestra.Resident.Zulip
+import Orchestra.Identity
 import Orchestra.Utils.UnixSocket
 import Orchestra.Utils.Files
 
@@ -834,6 +837,8 @@ private def sourceSummary : Listener.SourceConfig → (String × String)
   | .githubLabels repos labels kind _ =>
       let r := String.intercalate ", " (repos.map (·.upstream.toString))
       ("github-labels", s!"{r} kind={kind} labels=[{String.intercalate "," labels}]")
+  | .zulipFeed f =>
+      ("zulip-feed", s!"{f.site} ({f.name}) notify=[{String.intercalate "," f.notify}]")
 
 private def sourceExtras : Listener.SourceConfig → List (String × String)
   | .githubIssues _ _ trig authU
@@ -871,15 +876,26 @@ private def rateLimitsJson (c : Listener.ListenerConfig) (st : Listener.Listener
 private def listenerSummaryJson (name : String) (c : Listener.ListenerConfig)
     (st : Listener.ListenerState) : IO Json := do
   let (srcType, _) := sourceSummary c.source
-  return Json.mkObj [
-    ("name",            name),
+  return Json.mkObj (([
+    ("name",            Json.str name),
     ("enabled",         Json.bool st.enabled),
     ("sourceType",      srcType),
     ("intervalSeconds", ToJson.toJson c.intervalSeconds),
     ("lastCheckedAt",   optNormIso (if st.lastChecked.isEmpty then none else some st.lastChecked)),
     ("eventCount",      ToJson.toJson st.processedIds.size),
     ("rateLimits",      ← rateLimitsJson c st)
-  ]
+  ] : List (String × Json)) ++ (← feedFields name c st))
+where
+  /-- A feed's connection, checkpoint, last error and resident, for the dashboard (§10). -/
+  feedFields (name : String) (c : Listener.ListenerConfig) (st : Listener.ListenerState) :
+      IO (List (String × Json)) := do
+    unless c.source.isLongPoll do return []
+    let conn := (← Resident.Zulip.statusOf name).getD (if st.enabled then "stopped" else "disabled")
+    return [("feed", Json.mkObj [
+      ("connection", .str conn),
+      ("resident", optStr c.action.deliverTo),
+      ("checkpoint", optStr st.checkpoint),
+      ("error", optStr st.error)])]
 
 private def listenersApi (p : Page) : IO Json := do
   pageOverUnordered p (← Listener.loadAllListenerConfigs) fun (name, c) => do
@@ -1178,8 +1194,8 @@ private def interactiveSummaryJson (r : Interactive.SessionRecord) : Json :=
     ("createdAt",      normIso r.createdAt),
     ("lastActivityAt", normIso r.lastActivityAt),
     ("endedAt",        optNormIso r.endedAt),
-    ("upstream",       Json.str r.upstream.toString),
-    ("fork",           Json.str r.fork.toString),
+    ("upstream",       optStr (r.upstream.map toString)),
+    ("fork",           optStr (r.fork.map toString)),
     ("backend",        Json.str r.backend),
     ("model",          optStr r.model),
     ("turnCount",      ToJson.toJson r.turnCount),
@@ -1189,7 +1205,10 @@ private def interactiveSummaryJson (r : Interactive.SessionRecord) : Json :=
     ("error",          optStr r.error),
     -- Who the session is being held as (`Orchestra.Identity`), so a list of conversations says
     -- which of them are speaking on the tracker as somebody other than orchestra.
-    ("identity",       optStr r.identity)
+    ("identity",       optStr r.identity),
+    -- The resident this session is, when it is one, and why it is paused, when it is.
+    ("resident",       optStr r.resident),
+    ("pausedReason",   optStr r.pausedReason)
   ]
 
 private def interactiveApi (p : Page) : IO Json := do
@@ -1204,8 +1223,8 @@ private def interactiveDetailApi (id : String) : IO (Option Json) := do
     ("createdAt",      normIso r.createdAt),
     ("lastActivityAt", normIso r.lastActivityAt),
     ("endedAt",        optNormIso r.endedAt),
-    ("upstream",       Json.str r.upstream.toString),
-    ("fork",           Json.str r.fork.toString),
+    ("upstream",       optStr (r.upstream.map toString)),
+    ("fork",           optStr (r.fork.map toString)),
     ("backend",        Json.str r.backend),
     ("model",          optStr r.model),
     ("budget",         ToJson.toJson r.budget),
@@ -1217,7 +1236,10 @@ private def interactiveDetailApi (id : String) : IO (Option Json) := do
     ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
     ("title",          optStr r.title),
     ("error",          optStr r.error),
-    ("identity",       optStr r.identity)
+    ("identity",       optStr r.identity),
+    -- The resident this session is, when it is one, and why it is paused, when it is.
+    ("resident",       optStr r.resident),
+    ("pausedReason",   optStr r.pausedReason)
   ]
 
 /-- A page of the transcript, from a cursor.
@@ -1238,6 +1260,110 @@ private def interactiveEventsApi (id : String) (after : Nat) (atMost : Nat) : IO
     ("limit",  ToJson.toJson atMost),
     ("after",  ToJson.toJson after)
   ]
+
+/-! ### Residents
+
+A resident is an identity with one session that never ends (`docs/design/resident-sessions.md`).
+Read here off its session record, its inbox and its spend; the writes go to the daemon. -/
+
+/-- The residents configuration, and the resident's settings as it gives them — `none` when no
+    identity names it a resident any more. -/
+private def residentSettingsFor (configPath : Option System.FilePath) (name : String) :
+    IO (ResidentsConfig × Option Identity.ResidentSettings) := do
+  let cfg := (← try some <$> loadAppConfig configPath catch _ => pure none).map (·.residents)
+    |>.getD {}
+  let idn ← try Identity.loadIdentity name catch _ => pure none
+  return (cfg, idn.bind (·.resident) |>.map (·.settings cfg))
+
+/-- What a resident is doing, in the words the design uses: running, idle, warm, cold, paused —
+    and waking, between cold and idle. -/
+def residentState : Interactive.SessionStatus → String
+  | .running  => "running"
+  | .idle     => "idle"
+  | .warm     => "warm"
+  | .dormant  => "cold"
+  | .paused   => "paused"
+  | .starting => "waking"
+  | .ended    => "ended"
+  | .failed   => "failed"
+
+private def residentJson (configPath : Option System.FilePath) (r : Interactive.SessionRecord) :
+    IO Json := do
+  let name := r.resident.getD ""
+  let (cfg, settings) ← residentSettingsFor configPath name
+  let day ← Resident.today cfg.timezone
+  let spent ← Resident.spentOn name day
+  let ready ← Resident.ready name
+  -- What the delivery loop records beside the record: failures and backoff, and the token the
+  -- running process holds (`Resident.Runtime`).
+  let rt ← try Resident.loadRuntime name catch _ => pure {}
+  let (latest, _) ← Resident.recent name 1
+  let epochIso (t : Int) : Json := Json.str (Usage.secsToIso8601 t)
+  return Json.mkObj [
+    ("failures",       ToJson.toJson rt.failures),
+    ("retryAfter",     if rt.retryAfter > 0 then epochIso rt.retryAfter else Json.null),
+    ("tokenExpiresAt", match rt.tokenExpires with | some t => epochIso t | none => Json.null),
+    -- The newest thing to arrive in its inbox, whatever became of it.
+    ("lastEvent",      match latest[0]? with
+                       | some i => Json.mkObj [
+                           ("source", .str i.source), ("receivedAt", normIso i.receivedAt),
+                           ("text", .str (let t := i.text
+                             if t.length ≤ 200 then t else (t.take 197).toString ++ "..."))]
+                       | none => Json.null),
+    ("name",           Json.str name),
+    ("sessionId",      Json.str r.id),
+    ("status",         ToJson.toJson r.status),
+    ("state",          Json.str (residentState r.status)),
+    ("pausedReason",   optStr r.pausedReason),
+    ("error",          optStr r.error),
+    -- Configuration no longer naming it: it is left asleep and is not delivered to.
+    ("configured",     Json.bool settings.isSome),
+    ("budgetDay",      Json.str day),
+    ("spentToday",     ToJson.toJson spent),
+    ("budgetPerDay",   match settings with
+                       | some s => ToJson.toJson s.budgetPerDay
+                       | none   => Json.null),
+    ("inboxReady",     ToJson.toJson ready.size),
+    ("oldestReadyAt",  optNormIso (ready[0]?.map (·.receivedAt))),
+    ("lastActivityAt", normIso r.lastActivityAt),
+    ("turnCount",      ToJson.toJson r.turnCount),
+    ("costUsd",        ToJson.toJson r.costUsd),
+    ("lastEventSeq",   ToJson.toJson r.lastEventSeq),
+    ("backend",        Json.str r.backend),
+    ("model",          optStr r.model)
+  ]
+
+private def residentsApi (configPath : Option System.FilePath) (p : Page) : IO Json := do
+  pageOverUnordered p (← Interactive.loadResidentSessions) (residentJson configPath)
+
+private def residentDetailApi (configPath : Option System.FilePath) (name : String) :
+    IO (Option Json) := do
+  let some r ← Interactive.loadResidentSession name | return none
+  let base ← residentJson configPath r
+  let (recent, total) ← Resident.recent name 20
+  let watches ← Resident.listWatches name
+  -- Its feeds and how each stands: the listener they are, connected or not, the last error.
+  let feeds ← (← Resident.Zulip.feedsOf name).mapM fun (listener, f) => do
+    let st ← Listener.loadListenerState listener
+    pure (Json.mkObj [
+      ("listener", .str listener), ("name", .str f.name), ("site", .str f.site),
+      ("enabled", .bool st.enabled),
+      ("connection", .str ((← Resident.Zulip.statusOf listener).getD
+        (if st.enabled then "stopped" else "disabled"))),
+      ("checkpoint", optStr st.checkpoint), ("error", optStr st.error),
+      ("lastEventAt", optNormIso (if st.lastChecked.isEmpty then none else some st.lastChecked))])
+  return some (base.setObjVal! "inbox" (Json.mkObj [
+    ("items", Json.arr (recent.map ToJson.toJson)), ("total", ToJson.toJson total)])
+    |>.setObjVal! "watches" (Json.arr (watches.map ToJson.toJson))
+    |>.setObjVal! "feeds" (Json.arr feeds.toArray))
+
+private def residentInboxApi (name : String) (atMost : Nat) : IO (Option Json) := do
+  let some _ ← Interactive.loadResidentSession name | return none
+  let (items, total) ← Resident.recent name atMost
+  return some <| Json.mkObj [
+    ("items", Json.arr (items.map ToJson.toJson)),
+    ("total", ToJson.toJson total),
+    ("limit", ToJson.toJson atMost)]
 
 /-- Dispatch an `/api/…` or `/sse/…` kind to the matching builder.
 
@@ -1272,6 +1398,7 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
     | .ok n    => return ← plain (usageApi configPath n)
   if kind == "queue"     then return ← paged queueApi
   if kind == "interactive" then return ← paged interactiveApi
+  if kind == "residents" then return ← unpaged (residentsApi configPath)
   if kind == "concerts"  then return ← paged concertsApi
   if kind == "tasks"     then return ← paged tasksApi
   if kind == "listeners" then return ← unpaged listenersApi
@@ -1307,6 +1434,20 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
         | none   => return .notFound
     let some seg := safeSegment rest | return .notFound
     match ← interactiveDetailApi seg with
+    | some j => return .ok j
+    | none   => return .notFound
+  if kind.startsWith "residents/" then
+    let rest := (kind.drop "residents/".length).toString
+    if rest.endsWith "/inbox" then
+      let some seg := safeSegment (rest.dropEnd "/inbox".length).toString | return .notFound
+      match natParam q "limit" defaultLimit maxLimit with
+      | .error e => return .badRequest e
+      | .ok atMost =>
+        match ← residentInboxApi seg atMost with
+        | some j => return .ok j
+        | none   => return .notFound
+    let some seg := safeSegment rest | return .notFound
+    match ← residentDetailApi configPath seg with
     | some j => return .ok j
     | none   => return .notFound
   if kind.startsWith "tasks/" then
@@ -1404,8 +1545,7 @@ private def setListenerEnabled (name : String) (body : String) : IO WriteResult 
       match j.getObjValAs? Bool "enabled" with
       | .ok b    => pure b
       | .error _ => return .badRequest "expected a JSON body of the form {\"enabled\": true}"
-  let st ← Listener.loadListenerState name
-  Listener.saveListenerState name { st with enabled }
+  let _ ← Listener.modifyListenerState name fun st => { st with enabled }
   return .ok ((← listenerDetailApi name).getD Json.null)
 
 /-! ### Roles -/
@@ -1667,8 +1807,44 @@ private def sendInteractive (id : String) (body : String) : IO WriteResult := do
       ("type", Json.str "interactive_message"), ("id", Json.str id), ("text", Json.str text)]) with
   | .error why => return .conflict why
   | .ok reply =>
+    -- A resident's session takes its turns through its inbox, and a person writing to it while it
+    -- is busy is queued rather than refused: the answer is then the inbox item, and the seq comes
+    -- once the item is handed over (`GET /residents/{name}/inbox` says when).
+    if let .ok item := reply.getObjValAs? Nat "queued" then
+      return .ok (Json.mkObj [("id", Json.str id), ("queued", Json.bool true),
+        ("inboxItem", ToJson.toJson item),
+        ("why", Json.str ((reply.getObjValAs? String "why").toOption.getD ""))])
     let seq := (reply.getObjValAs? String "id" |>.toOption).bind (·.toNat?) |>.getD 0
     return .ok (Json.mkObj [("id", Json.str id), ("seq", ToJson.toJson seq)])
+
+/-- A person's message to a resident, by name: through its inbox, as `sendInteractive` does for
+    its session. Answers the seq once it is handed over, or the inbox item while it waits. -/
+private def sendResident (name : String) (body : String) : IO WriteResult := do
+  let some j := (Json.parse body).toOption | return .badRequest "the body is not JSON"
+  let some text := j.getObjValAs? String "text" |>.toOption
+    | return .badRequest "the body must carry the message as \"text\""
+  if text.trimAscii.isEmpty then return .badRequest "the message is empty"
+  let some r ← Interactive.loadResidentSession name | return .notFound
+  match ← askDaemon (Json.mkObj [
+      ("type", Json.str "resident_message"), ("name", Json.str name), ("text", Json.str text)]) with
+  | .error why => return .conflict why
+  | .ok reply =>
+    if let .ok item := reply.getObjValAs? Nat "queued" then
+      return .ok (Json.mkObj [("name", Json.str name), ("sessionId", Json.str r.id),
+        ("queued", Json.bool true), ("inboxItem", ToJson.toJson item),
+        ("why", Json.str ((reply.getObjValAs? String "why").toOption.getD ""))])
+    let seq := (reply.getObjValAs? String "id" |>.toOption).bind (·.toNat?) |>.getD 0
+    return .ok (Json.mkObj [("name", Json.str name), ("sessionId", Json.str r.id),
+      ("queued", Json.bool false), ("seq", ToJson.toJson seq)])
+
+/-- Pause, resume or reset a resident. -/
+private def controlResident (name action : String) : IO WriteResult := do
+  if (← Interactive.loadResidentSession name).isNone then return .notFound
+  match ← askDaemon (Json.mkObj [
+      ("type", Json.str "resident_control"), ("name", Json.str name),
+      ("action", Json.str action)]) with
+  | .error why => return .conflict why
+  | .ok _ => return .ok (Json.mkObj [("name", Json.str name), ("action", Json.str action)])
 
 /-- Abandon the turn in flight. The session stays up; only the turn is over. -/
 private def interruptInteractive (id : String) : IO WriteResult := do
@@ -1734,6 +1910,12 @@ PUT /api/v1/listeners/{name}")
   | ["interactive", id],            .delete => return some (← endInteractive id)
   | ["interactive", id, "messages"], .post  => return some (← sendInteractive id body)
   | ["interactive", id, "interrupt"], .post => return some (← interruptInteractive id)
+  -- A resident, by name: a person's message through its inbox, and the three things an operator
+  -- does to one. None of them ends it — a resident's session does not end.
+  | ["residents", name, "messages"], .post  => return some (← sendResident name body)
+  | ["residents", name, "pause"], .post     => return some (← controlResident name "pause")
+  | ["residents", name, "resume"], .post    => return some (← controlResident name "resume")
+  | ["residents", name, "reset"], .post     => return some (← controlResident name "reset")
   | _, _ => return none
 
 /-! ## Server configuration and session state -/
@@ -2194,6 +2376,7 @@ checks the two against each other, so a route added without a spec entry fails t
 /-- The OpenAPI description of this API, embedded from `docs/openapi.json`. -/
 def openApiSpec : String := include_str "../docs/openapi.json"
 
+
 /-- Where the spec is served, and the prefix everything it describes lives under. -/
 def apiVersion : String := "v1"
 
@@ -2213,6 +2396,13 @@ def apiRoutes : Array (String × Array String) :=
     ("interactive/{id}/events",  #["get"]),
     ("interactive/{id}/messages",   #["post"]),
     ("interactive/{id}/interrupt",  #["post"]),
+    ("residents",                #["get"]),
+    ("residents/{name}",         #["get"]),
+    ("residents/{name}/inbox",   #["get"]),
+    ("residents/{name}/messages", #["post"]),
+    ("residents/{name}/pause",   #["post"]),
+    ("residents/{name}/resume",  #["post"]),
+    ("residents/{name}/reset",   #["post"]),
     ("tasks",                    #["get"]),
     ("tasks/{id}",               #["get"]),
     ("concerts",                 #["get"]),

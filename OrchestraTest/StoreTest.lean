@@ -205,8 +205,8 @@ def aNonFiniteNumberDoesNotCostTheRecord : Test := do
     Interactive.saveSession {
       id := "i-nan", createdAt := "2026-09-13T10:04:12Z"
       lastActivityAt := "2026-09-13T10:04:12Z"
-      upstream := { owner := "acme", name := "widgets" }
-      fork := { owner := "bot", name := "widgets" }
+      upstream := some { owner := "acme", name := "widgets" }
+      fork := some { owner := "bot", name := "widgets" }
       budget := inf, costUsd := nan }
     pure (← TaskStore.loadTask "t-full", ← Queue.loadEntry "q-full",
           ← Interactive.loadSession "i-nan")

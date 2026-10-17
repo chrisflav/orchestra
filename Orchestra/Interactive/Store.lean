@@ -57,6 +57,16 @@ inductive SessionStatus where
       agent-side history, so it picks up where it left off. Deliberately **not** terminal: this
       is a session that is waiting, not one that is over. -/
   | dormant
+  /-- Asleep with its environment kept: the agent process is stopped, the pod (on a backend that
+      has one), the MCP server and the credentials stay, so the next turn costs a process start
+      rather than a pod start. Only a resident session sleeps this way (`docs/design/resident-sessions.md`
+      §9); every other session goes straight to `dormant`. Never on disk across a restart:
+      `reconcile` puts it to `dormant` with the rest. -/
+  | warm
+  /-- A resident that may not be woken until the reason on its record (`pausedReason`) is gone:
+      its day's budget is spent (until the next budget day), it failed to wake three times in a
+      row, or an operator paused it. Not terminal: its inbox keeps filling. -/
+  | paused
   /-- Closed by request, or out of budget. -/
   | ended
   /-- The agent process died, or the session could not be started at all. -/
@@ -69,6 +79,8 @@ instance : ToJson SessionStatus where
     | .idle     => "idle"
     | .running  => "running"
     | .dormant  => "dormant"
+    | .warm     => "warm"
+    | .paused   => "paused"
     | .ended    => "ended"
     | .failed   => "failed"
 
@@ -78,6 +90,8 @@ instance : FromJson SessionStatus where
     | .str "idle"     => .ok .idle
     | .str "running"  => .ok .running
     | .str "dormant"  => .ok .dormant
+    | .str "warm"     => .ok .warm
+    | .str "paused"   => .ok .paused
     | .str "ended"    => .ok .ended
     | .str "failed"   => .ok .failed
     | j => .error s!"expected session status string, got {j}"
@@ -100,8 +114,10 @@ structure SessionRecord where
       reaper measures against. -/
   lastActivityAt : String
   endedAt : Option String := none
-  upstream : Repository
-  fork : Repository
+  /-- The repository pair, or neither: a session without a repository (a resident) works in a
+      scratch workspace and holds no clone slot. -/
+  upstream : Option Repository := none
+  fork : Option Repository := none
   backend : String := "claude"
   model : Option String := none
   /-- Maximum spend for the whole session, in USD. -/
@@ -151,6 +167,11 @@ structure SessionRecord where
   title : Option String := none
   /-- Why it failed, when it did. -/
   error : Option String := none
+  /-- The resident this session is, by name, when it is one: the one session of an identity with a
+      `resident` block. Unique across sessions. -/
+  resident : Option String := none
+  /-- Why a `paused` session is paused: `budget:<day>`, `failed` or `operator`. -/
+  pausedReason : Option String := none
 
 private def optStr : Option String → Json
   | some s => Json.str s
@@ -183,7 +204,9 @@ instance : ToJson SessionRecord where
                        | some ts => Json.arr (ts.map Json.str).toArray
                        | none    => Json.null),
     ("systemPrompt",   optStr r.systemPrompt),
-    ("identity",       optStr r.identity)
+    ("identity",       optStr r.identity),
+    ("resident",       optStr r.resident),
+    ("pausedReason",   optStr r.pausedReason)
   ]
 
 instance : FromJson SessionRecord where
@@ -192,8 +215,8 @@ instance : FromJson SessionRecord where
     let status         ← j.getObjValAs? SessionStatus "status"
     let createdAt      ← j.getObjValAs? String "createdAt"
     let lastActivityAt ← j.getObjValAs? String "lastActivityAt"
-    let upstream       ← j.getObjValAs? Repository "upstream"
-    let fork           ← j.getObjValAs? Repository "fork"
+    let upstream       := j.getObjValAs? Repository "upstream" |>.toOption
+    let fork           := j.getObjValAs? Repository "fork"     |>.toOption
     return {
       id, status, createdAt, lastActivityAt, upstream, fork
       endedAt        := j.getObjValAs? String "endedAt"        |>.toOption
@@ -212,6 +235,8 @@ instance : FromJson SessionRecord where
       tools          := j.getObjValAs? (List String) "tools"   |>.toOption
       systemPrompt   := j.getObjValAs? String "systemPrompt"   |>.toOption
       identity       := j.getObjValAs? String "identity"       |>.toOption
+      resident       := j.getObjValAs? String "resident"       |>.toOption
+      pausedReason   := j.getObjValAs? String "pausedReason"   |>.toOption
     }
 
 /-- What a caller asks for when it starts a session.
@@ -219,8 +244,9 @@ instance : FromJson SessionRecord where
     Here rather than beside the manager so that the control-socket protocol can name it without
     importing the sandbox, the MCP server and the task runner along with it. -/
 structure SessionSpec where
-  upstream : Repository
-  fork : Repository
+  /-- Both or neither: a session without a repository gets a scratch workspace and no clone slot. -/
+  upstream : Option Repository := none
+  fork : Option Repository := none
   backend : Option String := none
   model : Option String := none
   budget : Option Float := none
@@ -309,8 +335,10 @@ def SessionRecord.toRow (r : SessionRecord) : Store.InteractiveSessionRow :=
     created_at       := r.createdAt
     last_activity_at := r.lastActivityAt
     ended_at         := r.endedAt
-    upstream         := r.upstream.toString
-    fork             := r.fork.toString
+    -- Empty for a session without a repository: the columns predate such sessions and are not
+    -- nullable, and `""` is never a repository name, so it cannot be mistaken for one.
+    upstream         := (r.upstream.map (·.toString)).getD ""
+    fork             := (r.fork.map (·.toString)).getD ""
     backend          := r.backend
     model            := r.model
     -- NaN and the infinities have no SQL literal; a session's budget and its cost are not
@@ -327,7 +355,9 @@ def SessionRecord.toRow (r : SessionRecord) : Store.InteractiveSessionRow :=
     cost_usd         := Store.floatColumn r.costUsd
     last_event_seq   := Store.natColumn r.lastEventSeq
     title            := r.title
-    error            := r.error }
+    error            := r.error
+    resident         := r.resident
+    paused_reason    := r.pausedReason }
 
 /-- The record a row holds, or why this build cannot read it.
 
@@ -337,8 +367,10 @@ def SessionRecord.toRow (r : SessionRecord) : Store.InteractiveSessionRow :=
     `session.json` that would not parse cost. -/
 def SessionRecord.ofRow? (row : Store.InteractiveSessionRow) : Except String SessionRecord := do
   let status   ← Store.enumOfColumn? "status" row.status
-  let upstream ← Repository.parse row.upstream
-  let fork     ← Repository.parse row.fork
+  let repo (s : String) : Except String (Option Repository) :=
+    if s.isEmpty then pure none else some <$> Repository.parse s
+  let upstream ← repo row.upstream
+  let fork     ← repo row.fork
   let tools ← match row.tools with
     | none   => pure none
     | some s => some <$> Store.jsonOfColumn? (α := List String) "tools" s
@@ -363,7 +395,9 @@ def SessionRecord.ofRow? (row : Store.InteractiveSessionRow) : Except String Ses
            costUsd        := row.cost_usd
            lastEventSeq   := row.last_event_seq.toNat
            title          := row.title
-           error          := row.error }
+           error          := row.error
+           resident       := row.resident
+           pausedReason   := row.paused_reason }
 
 /-! ## Reading and writing the record -/
 
@@ -389,6 +423,25 @@ def loadSession (id : String) : IO (Option SessionRecord) := do
     guard s.id = id
     select s
   return (← Store.keepConvertible "session" (·.id) SessionRecord.ofRow? rows)[0]?
+
+open Db.Query.DSL in
+/-- The session of resident `name`, if it has one. -/
+def loadResidentSession (name : String) : IO (Option SessionRecord) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let s ← from Store.InteractiveSessionRow
+    guard s.resident = name
+    select s
+  return (← Store.keepConvertible "session" (·.id) SessionRecord.ofRow? rows)[0]?
+
+open Db.Query.DSL in
+/-- Every resident's session, in name order. -/
+def loadResidentSessions : IO (Array SessionRecord) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let s ← from Store.InteractiveSessionRow
+    guard s.resident.isSome
+    select s
+    order_by s.resident
+  Store.keepConvertible "session" (·.id) SessionRecord.ofRow? rows
 
 open Db.Query.DSL in
 /-- Every session, newest first.
@@ -481,5 +534,31 @@ def readEvents (id : String) (after : Nat := 0) (atMost : Nat := 500)
     if let .ok j := Json.parse row.doc then
       docs := docs.push j
   return (docs, total.toNat)
+
+/-! ## The kleis tokens a session holds
+
+Recorded by revocation id from the moment a session derives or mints one until it is revoked, so a
+daemon that died holding some has them revoked by the next one at its start
+(`revokeLeftoverSessionTokens`). -/
+
+/-- Record that session `sessionId` holds the token with `revocationId`. -/
+def recordSessionToken (sessionId revocationId : String) : IO Unit := do
+  let now ← TaskStore.currentIso8601
+  Store.run <| HasModel.save
+    ({ revocation_id := revocationId, session_id := sessionId, recorded_at := now } :
+      Store.SessionTokenRow)
+
+/-- Forget a token once it is revoked. -/
+def forgetSessionToken (revocationId : String) : IO Unit := do
+  let _ ← Store.run <| HasModel.delete (α := Store.SessionTokenRow)
+    (.eq (.var Store.SessionTokenRowIndex.revocation_id .text) (.text revocationId))
+
+open Db.Query.DSL in
+/-- Every token a session was recorded holding and not since revoked: `(session, revocation id)`. -/
+def recordedSessionTokens : IO (Array (String × String)) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let t ← from Store.SessionTokenRow
+    select t
+  return rows.map fun r => (r.session_id, r.revocation_id)
 
 end Orchestra.Interactive

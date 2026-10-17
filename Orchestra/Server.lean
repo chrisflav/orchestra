@@ -123,6 +123,12 @@ structure State where
       the task may (`task_tool("create_repository")`, `task_org`), and kleis lets the token that
       created a repository push to it. -/
   kleis : Option KleisConfig := none
+  /-- The resident this server's session is, and how its own tools — `watch`, `unwatch`,
+      `list_watches` (`docs/design/resident-sessions.md` §6) — are served: given the tool and its
+      arguments, the text the agent is shown or why the call was refused. `none` for every
+      session and task that is not a resident, which is what keeps the tools out of
+      `tools/list` and refused by `evalToolCall`. A hook, so this module need not know feeds. -/
+  residentTools : Option (String × (String → Json → IO (Except String String))) := none
 
 
 /-! ## Across a daemon restart
@@ -527,6 +533,57 @@ Call this tool exactly once when the task is complete."),
       ]]
   inputTool ++ outputTool
 
+/-- The names of a resident's own tools. -/
+def residentToolNames : List String := ["watch", "unwatch", "list_watches", "refresh_kleis_token"]
+
+private def watchKeySchema : Json := Json.mkObj [
+  ("type", "object"),
+  ("description", "For Zulip: the stream, and the topic — without one, every topic in it."),
+  ("properties", Json.mkObj [
+    ("stream", Json.mkObj [("type", "string")]),
+    ("topic", Json.mkObj [("type", "string")])]),
+  ("required", .arr #["stream"])]
+
+private def feedSchema : Json := Json.mkObj [("type", "string"),
+  ("description", "The feed, by name (\"zulip\" unless it was named otherwise); may be left out \
+when there is only one.")]
+
+/-- A resident's tools (`docs/design/resident-sessions.md` §6): offered only to a resident. -/
+def residentToolDefs : Array Json := #[
+  Json.mkObj [
+    ("name", "watch"),
+    ("description", "Be told about every new message in a topic (or a whole stream) on one of \
+your feeds, from now on — and, after a reconnect, about what arrived meanwhile. Refused for a \
+private stream the bot is not subscribed to. Take watch requests only from trusted senders."),
+    ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [
+      ("feed", feedSchema), ("key", watchKeySchema),
+      ("until", Json.mkObj [("type", "string"), ("description",
+        "When the watch lapses on its own: an instant (2026-11-01T00:00:00Z, or a date) or a \
+span from now (90m, 12h, 3d, 2w). Leave out to watch until unwatch.")]),
+      ("note", Json.mkObj [("type", "string"), ("description",
+        "Why you are watching it, for yourself and for list_watches.")])]),
+      ("required", .arr #["key"])])],
+  Json.mkObj [
+    ("name", "unwatch"),
+    ("description", "Stop watching a topic or stream you watched."),
+    ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [
+      ("feed", feedSchema), ("key", watchKeySchema)]), ("required", .arr #["key"])])],
+  Json.mkObj [
+    ("name", "list_watches"),
+    ("description", "What you are watching, with notes and when each lapses."),
+    ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [
+      ("feed", feedSchema)])])]]
+
+/-- `refresh_kleis_token` (`docs/design/resident-sessions.md` §7.3): offered to a resident that
+    reaches the network through kleis. -/
+def refreshKleisTokenToolDef : Json := Json.mkObj [
+  ("name", "refresh_kleis_token"),
+  ("description", "Get a new kleis token for your shell commands, for a turn that runs long or a \
+command refused with \"token expired\". Commands you start from now on use it; it answers when it \
+expires and what it allows. Your session is restarted on a fresh token after this turn — you need \
+not do anything for that."),
+  ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])]
+
 /-- The `tools/list` answer for `state`: the always-available tools, plus every optional one the
     task was granted.
 
@@ -547,7 +604,9 @@ def toolsList (state : State) : Json :=
     |>.foldl (fun acc (name, def_) =>
         if acc.any (·.1 == name) then acc else acc ++ [(name, def_)]) []
     |>.map (·.2)
-  let io := ioToolDefs state.inputType state.outputType
+  let io := ioToolDefs state.inputType state.outputType ++
+    (if state.residentTools.isSome then residentToolDefs else #[]) ++
+    (if state.residentTools.isSome && state.kleis.isSome then #[refreshKleisTokenToolDef] else #[])
   let projectInfo := if state.projectId.isSome then #[Project.Tools.projectInfoToolDef] else #[]
   -- Gated on the policy rather than on a permission label, and on the hook as well: a queue this
   -- process cannot write to is a tool that would be listed and always refused.
@@ -600,6 +659,8 @@ inductive ToolCall where
   | submitTaskOutput (value : Json)
   /-- A project / issue tool from `Orchestra.Project.Tools`. -/
   | project (call : Project.Tools.ProjectTool)
+  /-- One of a resident's own tools (`residentToolNames`), with its arguments as given. -/
+  | resident (tool : String) (args : Json)
   | unknown (name : String)
   | parseError (msg : String)
 
@@ -636,6 +697,7 @@ def parseToolCall (name : String) (args : Json) : ToolCall :=
   | "health" => .health
   | "refresh_token" => .refreshToken
   | "project_info" => .project .projectInfo
+  | "watch" | "unwatch" | "list_watches" | "refresh_kleis_token" => .resident name args
   | "create_pr" =>
     let title := args.getObjValAs? String "title" |>.toOption |>.getD "Agent PR"
     let body  := args.getObjValAs? String "body"  |>.toOption |>.getD ""
@@ -1069,6 +1131,17 @@ created in; there is no other destination this tool will use)"
       , scopeRoot       := state.scopeRoot
       , identity        := state.identity }
     Project.Tools.evalProjectTool env call
+  | .resident tool args =>
+    match state.residentTools with
+    | none =>
+      log s!"tool {tool}: denied (not a resident)"
+      return toolContent s!"{tool} is a resident's tool, and this session is not a resident's"
+        (isError := true)
+    | some (name, serve) =>
+      log s!"tool {tool} (resident {name})"
+      match ← (try serve tool args catch e => pure (.error (toString e))) with
+      | .ok text => return toolContent text
+      | .error e => return toolContent e (isError := true)
   | .unknown name =>
     log s!"tool {name}: unknown"
     return toolContent s!"unknown tool: {name}" (isError := true)

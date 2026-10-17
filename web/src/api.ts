@@ -141,6 +141,16 @@ export interface ListenerSummary {
   eventCount: number;
   /** Empty when the listener is not paced. */
   rateLimits: RateLimitStatus[];
+  /** Only for a resident's feed (a long-polled `zulip-feed` source). */
+  feed?: FeedStatus;
+}
+
+export interface FeedStatus {
+  connection: "connecting" | "connected" | "error" | "disabled" | "stopped";
+  resident: string | null;
+  /** The last message id it has seen. */
+  checkpoint: string | null;
+  error: string | null;
 }
 
 export interface ActionConfig {
@@ -383,6 +393,10 @@ export type SessionStatus =
   | "running"
   /** Nothing running, conversation intact: posting a turn starts an agent again and resumes it. */
   | "dormant"
+  /** A resident asleep with its environment kept: the next turn starts a process in it. */
+  | "warm"
+  /** A resident that is not woken until `pausedReason` is gone; its inbox keeps filling. */
+  | "paused"
   | "ended"
   | "failed";
 
@@ -392,8 +406,9 @@ export interface SessionSummary {
   createdAt: string;
   lastActivityAt: string;
   endedAt: string | null;
-  upstream: string;
-  fork: string;
+  /** Both null for a session without a repository, such as a resident's. */
+  upstream: string | null;
+  fork: string | null;
   backend: string;
   model: string | null;
   turnCount: number;
@@ -404,6 +419,10 @@ export interface SessionSummary {
   error: string | null;
   /** Who the session is held as, when it is held as anyone but the instance itself. */
   identity: string | null;
+  /** The resident this session is, when it is one: its turns go through the resident's inbox. */
+  resident: string | null;
+  /** Why a paused resident is paused: `budget:<day>`, `failed` or `operator`. */
+  pausedReason: string | null;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -480,6 +499,7 @@ export interface Endpoints {
   auth: AuthView;
   usage: UsageHistory;
   interactive: Collection<SessionSummary>;
+  residents: Collection<ResidentSummary>;
 }
 
 export type DetailEndpoint =
@@ -487,7 +507,8 @@ export type DetailEndpoint =
   | `concerts/${string}`
   | `listeners/${string}`
   | `projects/${string}`
-  | `interactive/${string}`;
+  | `interactive/${string}`
+  | `residents/${string}`;
 
 export type Endpoint = keyof Endpoints | DetailEndpoint;
 
@@ -504,7 +525,9 @@ export type PayloadOf<E extends Endpoint> = E extends keyof Endpoints
           ? ProjectDetail
           : E extends `interactive/${string}`
             ? SessionDetail
-            : never;
+            : E extends `residents/${string}`
+              ? ResidentDetail
+              : never;
 
 /** The version prefix every read lives under. See `docs/openapi.json`. */
 export const API_VERSION = "v1";
@@ -663,10 +686,20 @@ export async function startSession(request: SessionRequest): Promise<SessionDeta
   return (await (await sessionCall(path, "POST", request)).json()) as SessionDetail;
 }
 
+/** What posting a turn answers: the seq it landed at, or, for a resident that could not take it
+ *  yet, the inbox item it waits as and why. */
+export interface TurnPosted {
+  id: string;
+  seq?: number;
+  queued?: boolean;
+  inboxItem?: number;
+  why?: string;
+}
+
 /** Post a turn. Answers the seq it was written at, so a reader knows where it landed. */
-export async function sendTurn(id: string, text: string): Promise<{ id: string; seq: number }> {
+export async function sendTurn(id: string, text: string): Promise<TurnPosted> {
   const path = `/api/${API_VERSION}/interactive/${encodeURIComponent(id)}/messages`;
-  return (await (await sessionCall(path, "POST", { text })).json()) as { id: string; seq: number };
+  return (await (await sessionCall(path, "POST", { text })).json()) as TurnPosted;
 }
 
 /** Abandon the turn in flight. The session, the clone and the conversation all survive. */
@@ -687,4 +720,104 @@ export async function checkSession(): Promise<boolean> {
   if (!response.ok) return false;
   const body = (await response.json()) as { authenticated?: boolean };
   return body.authenticated === true;
+}
+
+
+/* ── Residents ──────────────────────────────────────────────────────────────────────────── */
+
+/** What a resident is doing, in the design's words; `cold` is a dormant session. */
+export type ResidentState =
+  | "running"
+  | "idle"
+  | "warm"
+  | "cold"
+  | "paused"
+  | "waking"
+  | "ended"
+  | "failed";
+
+export interface ResidentLastEvent {
+  source: string;
+  receivedAt: string;
+  /** A short excerpt. */
+  text: string;
+}
+
+export interface ResidentSummary {
+  name: string;
+  sessionId: string;
+  status: SessionStatus;
+  state: ResidentState;
+  /** `budget:<day>`, `failed` or `operator`. */
+  pausedReason: string | null;
+  error: string | null;
+  /** False once configuration no longer names it: it is left asleep and not delivered to. */
+  configured: boolean;
+  budgetDay: string;
+  spentToday: number;
+  budgetPerDay: number | null;
+  inboxReady: number;
+  oldestReadyAt: string | null;
+  lastActivityAt: string;
+  turnCount: number;
+  costUsd: number;
+  lastEventSeq: number;
+  backend: string;
+  model: string | null;
+  /** Wake failures in a row; may be absent on an older daemon. */
+  failures?: number | null;
+  /** When the delivery loop next tries after a failure. */
+  retryAfter?: string | null;
+  /** When the kleis token of its agent process expires. */
+  tokenExpiresAt?: string | null;
+  lastEvent?: ResidentLastEvent | null;
+}
+
+export interface InboxItem {
+  id: number;
+  resident: string;
+  source: string;
+  eventId: string;
+  trusted: boolean;
+  receivedAt: string;
+  payload: unknown;
+  sentIn: number | null;
+  sentSeq: number | null;
+  confirmed: boolean;
+  state: "waiting" | "sent" | "confirmed";
+}
+
+export interface ResidentWatch {
+  id: number;
+  feed: string;
+  stream: string;
+  topic: string | null;
+  note: string | null;
+  createdAt: string;
+  until: string | null;
+}
+
+export interface ResidentFeed {
+  listener: string;
+  name: string;
+  site: string;
+  enabled: boolean;
+  connection: string;
+  checkpoint: string | null;
+  error: string | null;
+  lastEventAt: string | null;
+}
+
+export interface ResidentDetail extends ResidentSummary {
+  inbox: { items: InboxItem[]; total: number };
+  watches: ResidentWatch[];
+  feeds: ResidentFeed[];
+}
+
+export type ResidentAction = "pause" | "resume" | "reset";
+
+/** Pause, resume or reset a resident. A `409` carries the daemon's reason. */
+export async function controlResident(name: string, action: ResidentAction): Promise<void> {
+  const path = `/api/${API_VERSION}/residents/${encodeURIComponent(name)}/${action}`;
+  await sessionCall(path, "POST", {});
 }

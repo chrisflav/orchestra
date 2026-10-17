@@ -4,6 +4,10 @@ import Orchestra.Store.Migrations.UsageEstimate
 import Orchestra.Store.Migrations.ResolvedAuthSource
 import Orchestra.Store.Migrations.TaskRunState
 import Orchestra.Store.Migrations.KleisSource
+import Orchestra.Store.Migrations.ResidentSessions
+import Orchestra.Store.Migrations.ResidentFeeds
+import Orchestra.Store.Migrations.ResidentRuntime
+import Orchestra.Store.Migrations.SessionTokens
 
 /-!
 # The shape of orchestra's database
@@ -195,6 +199,9 @@ structure InteractiveSessionRow where
   last_event_seq : Int
   title : Option String
   error : Option String
+  /-- The resident this session is, by name; unique. See `Orchestra.Interactive.SessionRecord`. -/
+  resident : Option String
+  paused_reason : Option String
   deriving Repr
 
 /-- One line of a session's transcript, keyed as the transcript addresses it.
@@ -208,6 +215,55 @@ structure InteractiveEventRow where
   seq : Int
   occurred_at : String
   doc : String
+  deriving Repr
+
+/-- One thing for a resident to be handed: a feed event, a human message, a listener event. See
+    `Orchestra.Resident.Inbox`. `(resident, source, event_id)` is unique, which is what makes a
+    replaying source insert each event once. `sent_in` is the turn it was written into and
+    `sent_seq` the transcript seq of that turn's text; `confirmed` says the turn produced a
+    result. Ready is not confirmed. -/
+@[model (dbName := "resident_inbox") orchestra]
+structure ResidentInboxRow where
+  id : AutoKey
+  resident : String
+  source : String
+  event_id : String
+  trusted : Bool
+  received_at : String
+  payload : String
+  sent_in : Option Int
+  sent_seq : Option Int
+  confirmed : Bool
+  deriving Repr
+
+/-- What a resident has spent on one budget day, in USD. See `Orchestra.Resident.Inbox`. -/
+@[model (dbName := "resident_spend") (primaryKey := ["resident", "day"]) orchestra]
+structure ResidentSpendRow where
+  resident : String
+  day : String
+  usd : Float
+  deriving Repr
+
+/-- What the delivery loop knows about a resident beyond its record: wake failures in a row, when
+    it may be tried again (epoch seconds), when recent turns were handed over (a JSON array of
+    epoch seconds), and when its agent process's kleis token expires. See
+    `Orchestra.Resident.Inbox`. -/
+@[model (dbName := "resident_runtime") (primaryKey := ["resident"]) orchestra]
+structure ResidentRuntimeRow where
+  resident : String
+  failures : Int
+  retry_after : Int
+  turn_stamps : String
+  token_expires : Option Int
+  deriving Repr
+
+/-- A kleis token a session holds, by revocation id, until it is revoked: what a daemon that died
+    holding it revokes at the next start. See `Orchestra.Interactive`. -/
+@[model (dbName := "session_token") (primaryKey := ["revocation_id"]) orchestra]
+structure SessionTokenRow where
+  revocation_id : String
+  session_id : String
+  recorded_at : String
   deriving Repr
 
 /-- The last poll of one backend's one authentication source: what the provider said, and when to
@@ -254,6 +310,28 @@ structure ListenerStateRow where
   enabled : Bool
   processed_ids : String
   dispatches : String
+  /-- A long-poll source's checkpoint — for a Zulip feed, the last message id it has seen. -/
+  checkpoint : Option String
+  /-- What went wrong on the last attempt, while it is still wrong; for the dashboard. -/
+  error : Option String
+  /-- The revocation ids of the kleis tokens the source holds, as a JSON array: what a run that
+      died without revoking them left live, revoked by the next one at its start. -/
+  revocations : Option String
+  deriving Repr
+
+/-- A topic a resident asked to be told about (`docs/design/resident-sessions.md` §6). `key` is
+    the feed's own key as compact JSON — for Zulip `{"stream": …, "topic": …}` — and
+    `(resident, feed, key)` is unique. `expires_at` is when it lapses (the tool's `until`), if
+    ever. -/
+@[model (dbName := "resident_watch") orchestra]
+structure ResidentWatchRow where
+  id : AutoKey
+  resident : String
+  feed : String
+  key : String
+  note : Option String
+  created_at : String
+  expires_at : Option String
   deriving Repr
 
 /-- One store the legacy JSON import has carried over. The row is the marker that says so: it is
@@ -305,7 +383,19 @@ def target : DatabaseRecipe :=
         [{ name := "idx_interactive_session_created_at_id",
            keys := [{ column := .created_at, direction := .desc },
                     { column := .id, direction := .desc }] },
-         { name := "idx_interactive_session_status", keys := [{ column := .status }] }])
+         { name := "idx_interactive_session_status", keys := [{ column := .status }] },
+         { name := "idx_interactive_session_resident", keys := [{ column := .resident }],
+           unique := true }])
+    |>.withIndexes "resident_inbox" (tableIndexes ResidentInboxRowIndex
+        [{ name := "idx_resident_inbox_key",
+           keys := [{ column := .resident }, { column := .source }, { column := .event_id }],
+           unique := true },
+         { name := "idx_resident_inbox_resident_confirmed",
+           keys := [{ column := .resident }, { column := .confirmed }] }])
+    |>.withIndexes "resident_watch" (tableIndexes ResidentWatchRowIndex
+        [{ name := "idx_resident_watch_key",
+           keys := [{ column := .resident }, { column := .feed }, { column := .key }],
+           unique := true }])
     |>.withIndexes "usage_window" (tableIndexes UsageWindowRowIndex
         [{ name := "idx_usage_window_backend_label_id",
            keys := [{ column := .backend }, { column := .label }, { column := .id }] }])
@@ -317,6 +407,10 @@ def migrations : List Db.Migration.Migration :=
    Orchestra.Store.Migrations.migration_0002_usage_estimate,
    Orchestra.Store.Migrations.migration_0003_resolved_auth_source,
    Orchestra.Store.Migrations.migration_0004_task_run_state,
-   Orchestra.Store.Migrations.migration_0005_kleis_source]
+   Orchestra.Store.Migrations.migration_0005_kleis_source,
+   Orchestra.Store.Migrations.migration_0006_resident_sessions,
+   Orchestra.Store.Migrations.migration_0007_resident_feeds,
+   Orchestra.Store.Migrations.migration_0008_resident_runtime,
+   Orchestra.Store.Migrations.migration_0009_session_tokens]
 
 end Orchestra.Store

@@ -225,3 +225,188 @@ way to run an agent, with a repository, credentials and tools, to a surface gate
 shared secret that already grants every read and every write. No separate credential and no
 additional gate: the same secret, the same cookie, the same content-type rule as every other
 write.
+
+## residents
+
+A **resident** is an identity with one session that never ends — the design is
+[`design/resident-sessions.md`](design/resident-sessions.md), all three of whose phases are built:
+resident sessions, the Zulip feed and watches, and token cycling with `refresh_kleis_token` and the
+dashboard's residents page.
+An identity becomes one with a `resident` block in its `identity.json`:
+
+```json
+{
+  "name": "secretary",
+  "kleis_spec": "secretary",
+  "resident": {
+    "budget_per_day": 20,
+    "process_idle_seconds": 1800,
+    "pod_idle_seconds": 21600,
+    "batch_window_seconds": 3,
+    "model": "claude-opus-5-5",
+    "feeds": [
+      { "kind": "zulip", "site": "zulip.merten.dev",
+        "notify": ["dm", "mention"],
+        "allow_senders": ["christian@flavigny.de", "*@merten.dev", "id:8"],
+        "watch_senders": "any" }
+    ]
+  }
+}
+```
+
+Every field is optional and falls back to the `residents` block of `config.json`: `enabled`
+(`true`), `budget_per_day` (`100`, USD), `process_idle_seconds` (`1800`), `pod_idle_seconds`
+(`21600`), `batch_window_seconds` (`3`), `timezone` (`"UTC"`, for the budget day), `max_awake`
+(`4`, residents with a process at once, counted apart from `interactive.max_sessions`),
+`max_turns_per_hour` (`60`), `token_refresh_margin` (`"2h"`, or seconds; config only, below),
+`turn_timeout_seconds` (`1800`, or a span; config only, below) and
+`volume_size` (the backend's own size when absent). The block
+may carry `tools`, `agent` (the backend) and `feeds` (below); it may not carry `upstream` or
+`fork`. A resident is reached through its inbox: its feeds, the chat, and listeners with
+`deliver_to`.
+
+**One session, by name, never ended.** At start-up the daemon creates each resident's session
+asleep (id `resident-<name>`, no process), with no repository: a scratch workspace kept across
+wakes (`<data>/workspaces/sessions/<id>` on landrun, its task volume on Kubernetes), no clone
+slot, no repository-scoped tools, and the repository-less form of the kleis task facts. Behind
+kleis it needs no GitHub App either: no installation token is minted for it and no JWT signed, so
+a daemon whose App key is unreadable still wakes it (without kleis a repository-less session tries
+for an installation token and starts without one if it cannot have it). What ends or fails another
+session puts a resident to sleep instead — a dead process, a turn that could not be written, a
+failed wake — and the next delivery wakes it, with a backoff. A turn that ended in an error (any
+result but a clean `success`: `error_during_execution`, an API error, a refused credential) counts
+as a failure too, and its items stay in the inbox. A turn still running after
+`residents.turn_timeout_seconds` is interrupted, the resident put to sleep (warm), and the turn
+counted as a failure; its items go again with the next turn. Three failures in a row pause it
+(`paused: failed`) for 30 minutes, after which the delivery loop tries it once more (one more
+failure pauses it again), or until an operator resumes it; `orchestra resident pause` on it makes
+the pause the operator's, which nothing lifts on its own. A wake that found **no room** — the
+cluster full or at its quota, every account out of quota — is not a failure: it is backed off
+(30s, doubling, at most five minutes) and tried again, and never pauses the resident. The failure
+count, the backoff and the recent
+turns counted against `max_turns_per_hour` are kept in `resident_runtime`, so a daemon restart does
+not reset them. `DELETE /api/v1/interactive/{id}` is refused for it. Only `orchestra resident
+reset` ends its conversation, by starting a new one in the same session: the memory directory, the
+inbox and the **watches** carry over — watches are the resident's standing configuration, not part
+of the conversation — and the new conversation's first turn says so (`unwatch` drops one).
+
+**Tokens** (§7 of the design). Every agent process a resident starts holds a kleis token of its
+own, derived from the identity's source (or minted): the first with the environment, each later
+one — a warm wake, a cycle — anew, so the token and the card in its prompt are current however long
+it slept; the tokens a new process replaces are revoked once it is up, and a warm sleep revokes
+everything the session holds. Every token a session holds is also recorded by revocation id
+(`session_token`) until it is revoked, and a daemon starting revokes whatever the last one left
+there — one that was killed or crashed holding tokens. The system prompt's card is the one of the
+token the process starts on, so it too is current after every wake and cycle. Before a turn is
+handed to a running resident it is **cycled** —
+stopped and started again at once in the environment it has, the conversation resumed — when its
+budget day is over, when its token expires within `residents.token_refresh_margin` (default `2h`),
+or when `refresh_kleis_token` was called during its last turn. That tool, offered to a resident
+behind kleis, derives a new token for the agent's shell commands mid-turn and answers its expiry
+and card: the agent's command shell is pointed (`CLAUDE_ENV_FILE`) at a stub that sources a
+per-session env file, which the tool rewrites with the new `HTTPS_PROXY`; the CLI replays the
+stub's content before every Bash command, so the next command uses the new token while the agent
+process itself keeps its own until the cycle. The files live in `<data>/session-env/<id>/` (granted
+read-only to the run) on landrun and local, and in `~/.orchestra/env/` of the pod's own home on
+Kubernetes; the env file is emptied before the tokens it named are revoked. Queued tasks are not
+offered the tool: their token lives `kleis.ttl` (12h) and they are not cycled. A resident may call
+it at most three times a turn and ten times an hour; past that it is refused with a message saying
+why.
+
+**The inbox.** Everything a resident is handed goes through `resident_inbox`: a person's message
+(source `human`), a listener event (`listener:<name>`). Items are unique per
+`(resident, source, event_id)`, so a source that replays delivers once. The daemon's delivery
+loop, once a second, waits `batch_window_seconds` from the oldest ready item (not at all when a
+person is waiting), wakes the resident if needed, renders every ready item into **one turn** and
+marks them `sent_in` it; the turn's `result`, if it is a clean `success`, marks them
+`confirmed`. A turn that never got a result, or ended in an error, leaves its items ready, and the
+next turn carries them again headed "these may have reached you already; your previous turn was
+interrupted". In the turn, each item is a heading on one line — where it came from, its id, and
+"[not from a trusted source]" where it is not — and then its text quoted, every line prefixed
+`  > `, so nothing an item carries can start a line that passes for a heading, a trusted item or
+a note. A lone trusted chat message is handed over as written. A message posted to a resident's
+session (`POST /interactive/{id}/messages` or `/residents/{name}/messages`) is queued rather than
+refused while it is busy: the answer is the turn's `seq` once it is sent, or `queued` with the
+inbox item and why.
+
+**The day's budget** is enforced by the process: every agent process a resident starts gets
+`--max-budget-usd` = what is left of today's `budget_per_day` (spend is recorded per turn in
+`resident_spend`). A process whose budget day has rolled over is restarted before its next turn,
+to pick up the new allowance. A spent day pauses the resident (`paused: budget:<day>`); its inbox
+keeps filling and the next day it is woken with everything that arrived.
+
+**Asleep: warm, then cold.** After `process_idle_seconds` idle the agent process is stopped and
+everything else kept — the environment (on Kubernetes, the pod), the MCP server — but its kleis
+tokens are revoked and, on Kubernetes, its memory directory is copied back from the pod then
+rather than only when the pod goes: `warm`, and the next turn is a process start (`--resume`) on a
+new token. After `pod_idle_seconds` the environment goes too: `cold` (`dormant` on the record),
+and the next turn is a full wake. On
+Kubernetes a resident's pod has no `deadline_seconds`, and its task volume — keyed by its session
+— is labelled `orchestra.dev/resident` and exempt from `retention_days`. A volume lost anyway (or
+a backend that keeps none) starts a fresh conversation in the same session, said in the
+transcript and at the head of the next turn. A daemon stop puts residents to sleep cold.
+
+**`deliver_to`.** A listener action may name `"deliver_to": "<resident>"` instead of queueing a
+task: each event's rendered `prompt_template` becomes an inbox item from `listener:<name>`, keyed
+by the event's id, and is marked untrusted unless the action says `"trusted": true`.
+
+**Feeds.** Each entry of `feeds` is a Zulip event queue the daemon holds open for the resident: a
+listener named `resident-<name>-<feed>` (the feed's `name`, default `zulip`) with a `zulip-feed`
+source and a `deliver_to` action, on the dashboard and switched with `orchestra listener
+enable|disable` like any other. A listener file may declare one too (`"source": {"type":
+"zulip-feed", "site": …}`, with `deliver_to`; no `interval_seconds`). Instead of polling, the
+daemon long-polls it, through kleis with the **resident's own key**: a token derived from the
+identity's own source (its `kleis_spec` or `kleis_token` — never `kleis.default_spec`; a feed whose
+identity has neither is not started, and says so on the listener), narrowed to
+`zulip: only read` and `services: zulip`, task id `resident:<name>/feed:<feed>`, living 4h and
+derived again half an hour before it expires, revoked when the feed stops; its revocation id is on
+the listener's state so a daemon that died holding it has it revoked by the next. Requests go to
+`https://<site>` through the proxy at kleis's `url` (not the pods' `proxy`), the token on curl's
+config stdin, with kleis's CA. The feed reads `users/me`, registers a queue for messages
+(`all_public_streams`), catches up from its checkpoint — the last message id it saw, on the
+listener's state — with one `GET /messages` per term (`is:dm`, `is:mentioned`, the bot's name in
+public streams, one per watch), then long-polls `GET /events` (`--max-time 120`), again at once;
+an expired queue is registered again. A feed with no checkpoint starts at the newest message. An
+event is acknowledged (`last_event_id`) only once its message is in the inbox; an insert that
+fails registers the queue again, so the catch-up reads the message back.
+
+A message becomes an inbox item (source `zulip:<site>#<feed>`, event id its message id) when it is not the
+bot's own and: it is a DM (if `notify` has `dm`), or mentions the bot — by name (`mentioned`,
+`@**<bot name>**` in a public stream it is not subscribed to) if `notify` has `mention`, or with a
+wildcard (`@**all**`, `@**topic**`) if it has `wildcard`, each on its own — from a sender in
+`allow_senders`;
+or it is in a watched topic, from a sender `watch_senders` admits (`"any"` or a list). An entry of
+`allow_senders` is an address pattern (`*` matches anything), matched against the address Zulip
+shows and, where the server lets the bot see it, the real one (`delivery_email`) — or a user id,
+`id:8`, for a server that hides addresses. Items are `trusted` when the sender is in
+`allow_senders`; the turn lists them under "New on Zulip (<site>)", marking the others "[not from
+an allowed sender]". A failure backs off up to five minutes and is shown on the listener
+(`feed.error`, `feed.connection`, `feed.checkpoint`) and on `GET /api/v1/residents/{name}`.
+
+**Watches.** A resident's MCP server, and only a resident's, offers `watch(feed?, key, until?,
+note?)` — `key` is `{stream, topic?}`, `until` an instant or a span (`12h`, `3d`) — `unwatch(feed?,
+key)` and `list_watches(feed?)`. `watch` asks the server, with the feed's own token, which streams
+the bot can see, and refuses a private stream it is not subscribed to. Watches are kept in
+`resident_watch`, read on every event and for the catch-up, and lapse on their own at `until`.
+
+**Control.** `orchestra resident list|show|inbox|pause|resume|reset <name>` and
+`orchestra resident send <name> <text…>` go through the API (`/api/v1/residents…`), as
+`orchestra chat` does; `orchestra chat --resident <name>` attaches to its session. The
+dashboard's **Residents** page lists each one's state (running, idle, warm, cold, waking, paused
+and why), inbox depth, last event, today's spend against its budget, failures and backoff, and when
+its process's token expires; a resident's own page adds its feeds' connection and last error, its
+watches and its recent inbox, pause / resume / reset buttons, and a link to its chat.
+
+**Who can do what.** Two consequences of the above that are easy to miss:
+
+* **Writing listener files is as privileged as owning an identity.** A listener file with
+  `deliver_to` puts items into a resident's inbox, and its action's `"trusted": true` marks them
+  trusted — instructions the resident is told it may follow. A `zulip-feed` listener file defines
+  a feed on the resident's own kleis key, with its own `allow_senders` (who is trusted, and who may
+  wake it) and `watch_senders`. Whoever can write to the listeners directory, or to the listeners
+  API, can therefore make a resident read, and act on, what they choose: grant it only to those
+  you would let edit the identity's `resident` block.
+* **Dashboard readers see residents' inboxes.** The residents page and its API
+  (`GET /api/v1/residents/{name}`, the inbox) show each item's payload — the Zulip messages a feed
+  admitted, DMs included, and listener events — as well as the transcript. Anyone with the
+  dashboard password can read them; treat it accordingly.

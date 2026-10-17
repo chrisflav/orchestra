@@ -8,6 +8,7 @@ import Orchestra.Listener
 import Orchestra.Project
 import Orchestra.Queue
 import Orchestra.Interactive
+import Orchestra.Resident.Zulip
 import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.TaskRunner
@@ -89,6 +90,10 @@ def handleSocketRequest
     (reapIfAbandoned  : String → IO Bool)
     (interactive      : Interactive.Manager)
     : IO Unit := do
+  let residentReply : Except String Interactive.HumanOutcome → IO DaemonRequest.DaemonResponse
+    | .ok (.sent seq)        => pure (.withId (toString seq))
+    | .ok (.queued item why) => pure (.queued item why)
+    | .error e               => pure (.error e)
   try
     let line ← conn.recvLine
     let response : DaemonRequest.DaemonResponse ← match Lean.Json.parse line with
@@ -189,8 +194,23 @@ Marked unfinished.")
           | .ok record => pure (.withId record.id)
           | .error e   => pure (.error e)
         | .interactiveMessage id text =>
-          match ← interactive.send appConfig id text debug with
-          | .ok seq  => pure (.withId (toString seq))
+          -- A resident's turns go through its inbox: a person writing while it is busy is
+          -- queued rather than refused (`docs/design/resident-sessions.md` §4.2).
+          match ← (try (·.bind (·.resident)) <$> Interactive.loadSession id catch _ => pure none) with
+          | some name => residentReply (← interactive.residentMessage appConfig name text debug)
+          | none =>
+            match ← interactive.send appConfig id text debug with
+            | .ok seq  => pure (.withId (toString seq))
+            | .error e => pure (.error e)
+        | .residentMessage name text =>
+          residentReply (← interactive.residentMessage appConfig name text debug)
+        | .residentControl name action =>
+          let result ← match action with
+            | "pause"  => interactive.pauseResident name
+            | "resume" => interactive.resumeResident name
+            | _        => interactive.resetResident name
+          match result with
+          | .ok ()   => pure (.withId name)
           | .error e => pure (.error e)
         | .interactiveInterrupt id =>
           match ← interactive.interrupt id with
@@ -227,7 +247,7 @@ def isLeftoverStatus (task : Option TaskStore.TaskStatus)
     (session : Option Interactive.SessionStatus) : Bool :=
   match task, session with
   | some t, _    => t != .running
-  | none, some s => s == .dormant || s.isTerminal
+  | none, some s => s == .dormant || s == .paused || s.isTerminal
   | none, none   => false
 
 /-- `isLeftoverStatus`, for the id as the database has it. An id that cannot even be looked up — a
@@ -537,11 +557,19 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
     finally claimMutex.unlock
   let interactive ← Interactive.Manager.new
     { maxSessions        := appConfig.interactive.maxSessions
-      idleTimeoutSeconds := appConfig.interactive.idleTimeoutSeconds }
+      idleTimeoutSeconds := appConfig.interactive.idleTimeoutSeconds
+      residents          := appConfig.residents }
     reserveInteractiveSlot releaseInteractiveSlot
   -- Sessions on disk describe agent processes that died with the last daemon. Closed before
   -- anything can read them, so a client never attaches to a conversation that will not answer.
   Interactive.reconcile
+  -- And the kleis tokens those processes held, which a daemon that died did not revoke.
+  try Interactive.revokeLeftoverSessionTokens appConfig.kleis
+  catch e => IO.eprintln s!"Could not revoke the sessions' leftover kleis tokens: {e}"
+  -- Each resident's session, created asleep if it has none (`docs/design/resident-sessions.md`
+  -- §3.1), before anything can address one by name. Never at the cost of the start.
+  try interactive.refreshResidents
+  catch e => IO.eprintln s!"Could not prepare the residents: {e}"
   -- What the last daemon left running on the execution backend — pods, for kubernetes — goes
   -- now: after the sweeps and `Interactive.reconcile`, so every run and session this database
   -- knows of has stopped being `running`, and before the first worker or session of this daemon
@@ -1089,8 +1117,7 @@ not polling until the window moves"
             let stamps := Listener.pruneDispatches limits
               ((← dispatchesRef.get).push (Usage.secsToIso8601 now)) now
             dispatchesRef.set stamps
-            let cur ← Listener.loadListenerState name
-            Listener.saveListenerState name { cur with dispatches := stamps }
+            let _ ← Listener.modifyListenerState name fun cur => { cur with dispatches := stamps }
           for (eventId, vars) in (events : Array (String × List (String × String))) do
             if !limits.isEmpty then
               -- The tick began with room and filled up part-way through it. What is left over
@@ -1233,7 +1260,19 @@ holding the rest of this tick until the window moves"
                     {scope} ({label}) → {entry.id}"
               continue
             | _ => pure ()
-            if let some wfPath := liveCfg.action.workflowPath then
+            if let some resident := liveCfg.action.deliverTo then
+              -- Into a resident's inbox instead of the queue (`docs/design/resident-sessions.md`
+              -- §5.5). Deduplicated by the event's id, so an event a dying tick already delivered
+              -- is not delivered twice; the delivery loop hands it over.
+              let (source, itemEvent, trusted, payload) :=
+                Listener.inboxItemFor liveCfg.action vars name eventId (← TaskStore.generateId)
+              match ← Resident.insert resident source itemEvent trusted payload with
+              | some item =>
+                noteDispatch
+                IO.println s!"  Listener '{name}': delivered event {itemEvent} to resident \
+{resident} (inbox item {item})"
+              | none => pure ()
+            else if let some wfPath := liveCfg.action.workflowPath then
               -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
               let resolvedPath := Listener.renderTemplate wfPath vars
               try
@@ -1295,12 +1334,12 @@ holding the rest of this tick until the window moves"
           let held ← heldRef.get
           let newIds := events.filterMap (fun ev =>
             if (ev.1 : String).isEmpty then none else some ev.1)
-          -- Re-read enabled so a disable issued mid-tick is not overwritten.
-          let currentEnabled := (← Listener.loadListenerState name).enabled
           let nowIso ← TaskStore.currentIso8601
           let stamps ← dispatchesRef.get
           let nowEpoch ← Usage.nowEpoch
-          let newState : Listener.ListenerState := {
+          -- Applied to the row as it is now, under the state lock, so a disable issued mid-tick
+          -- is not overwritten.
+          let _ ← Listener.modifyListenerState name fun cur => { cur with
             -- For a source that pages by time, this is a fetch cursor and not just a display:
             -- advancing it past an event this tick held would drop that event rather than
             -- delay it. See `Listener.pagesByTime`. Re-reading the same slice next tick is
@@ -1309,13 +1348,10 @@ holding the rest of this tick until the window moves"
                             then state.lastChecked else nowIso
             processedIds := Listener.nextProcessedIds state.processedIds newIds held
                               processedIdsReplacement
-            enabled      := currentEnabled
             -- Pruned here as well as in `noteDispatch`, so that stamps left behind by a
             -- `rate_limits` since removed from the config are dropped rather than kept for
             -- ever: `pruneDispatches` answers `#[]` when there are no limits to count them.
-            dispatches   := Listener.pruneDispatches limits stamps nowEpoch
-          }
-          Listener.saveListenerState name newState
+            dispatches   := Listener.pruneDispatches limits stamps nowEpoch }
         catch e =>
           IO.eprintln s!"  Listener '{name}' poll error: {e}"
   let _listenerSupervisor ← IO.asTask (prio := .dedicated) do
@@ -1330,9 +1366,22 @@ holding the rest of this tick until the window moves"
         else if !fresh.isEmpty then
           IO.println s!"Picked up {fresh.size} new listener(s): \
 {String.intercalate ", " (fresh.toList.map (·.1))}"
-        for (name, _) in fresh do
-          listenerFibers.modify (·.insert name)
-          spawnListener name
+        for (name, c) in fresh do
+          if c.source.isLongPoll then
+            -- A feed: long-polled in a fiber of its own, through kleis with the key of the
+            -- resident it delivers to (`docs/design/resident-sessions.md` §5).
+            unless appConfig.residents.enabled do continue
+            let some kc := appConfig.kleis
+              | Resident.Zulip.updateState name fun s => { s with
+                  error := some "a feed reads Zulip only through kleis, and no kleis is configured" }
+            listenerFibers.modify (·.insert name)
+            let _feedTask ← IO.asTask (prio := .dedicated) do
+              try Resident.Zulip.runFeed kc name shutdownToken.isCancelled
+              catch e => IO.eprintln s!"  Feed '{name}' stopped: {e}"
+              listenerFibers.modify (·.erase name)
+          else
+            listenerFibers.modify (·.insert name)
+            spawnListener name
       catch e =>
         IO.eprintln s!"  Listener scan failed: {e}"
       firstScan := false
@@ -1380,6 +1429,20 @@ holds it. Marked unfinished."
       for _ in List.range 30 do
         if ← shutdownToken.isCancelled then break
         IO.sleep 1000
+  -- The residents' delivery loop: once a second, hand each resident what its inbox holds when it
+  -- can take it (`Interactive.Manager.deliver`), and now and again re-read which identities are
+  -- residents. Its own fiber, for the reaper's reason: a delivery may wake a resident, which takes
+  -- as long as starting a session does.
+  let _residentLoop ← IO.asTask (prio := .dedicated) do
+    let mut ticks := 0
+    while !(← shutdownToken.isCancelled) do
+      if ticks % 30 == 29 then
+        try interactive.refreshResidents
+        catch e => IO.eprintln s!"  Resident refresh error: {e}"
+      try interactive.tickResidents appConfig cfg.debug
+      catch e => IO.eprintln s!"  Resident delivery error: {e}"
+      ticks := ticks + 1
+      IO.sleep 1000
   -- Queue worker loop: claim and run one entry at a time.
   -- Spawning parallelLimit copies of this loop enables parallel execution.
   let workerLoop : IO Unit := do
@@ -1468,6 +1531,8 @@ pods keep running and it carries them on from where they are."
             IO.sleep 100
           IO.println "  Tool calls in flight are done; closing interactive sessions."
           try interactive.closeAll catch e => IO.eprintln s!"  Closing sessions failed: {e}"
+          -- The feeds' event queues and kleis tokens: the next daemon derives its own.
+          try Resident.Zulip.stopAll appConfig.kleis catch _ => pure ()
           try Queue.deletePid catch _ => pure ()
           IO.println "Queue daemon handed over."
           Utils.Signals.exitNow 0
@@ -1497,6 +1562,8 @@ or until they are done."
     -- without closing one leaves an agent process holding a clone slot with nothing left to
     -- talk to it, and a record on disk that `reconcile` will have to close on the way back up.
     try interactive.closeAll catch e => IO.eprintln s!"  Closing sessions failed: {e}"
+    -- The feeds stop with the daemon, and their tokens are revoked (§10).
+    try Resident.Zulip.stopAll appConfig.kleis catch e => IO.eprintln s!"  Stopping feeds failed: {e}"
     match ← socketServerRef.get with
     | some s => try s.close catch _ => pure ()
     | none   => pure ()

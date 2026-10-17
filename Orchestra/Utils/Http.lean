@@ -109,6 +109,10 @@ def bearerConfig (token : String) : String :=
 def dataConfig (body : String) : String :=
   s!"data-raw = \"{configEscape body}\"\n"
 
+/-- A proxy's credentials as a curl config line (`-U`), for the same reason as `bearerConfig`. -/
+def proxyUserConfig (user password : String) : String :=
+  s!"proxy-user = \"{configEscape user}:{configEscape password}\"\n"
+
 /-- Failure text for a curl invocation that exited non-zero. Arguments are deliberately never
     included: they carry bearer tokens. -/
 private def curlFailure (code : UInt32) (stdout stderr : String) : String :=
@@ -134,8 +138,11 @@ def curlFull (args : Array String) (connectTimeout : Nat := 10) (maxTime : Nat :
     (bearer : Option String := none)
     -- A request body that must not be an argument either (`dataConfig`); sent as `--data-raw`.
     (data : Option String := none)
+    -- More curl config lines for stdin, for any other setting that carries a secret — a proxy's
+    -- credentials (`proxyUserConfig`).
+    (extraConfig : String := "")
     : IO (Nat × Array (String × String) × String) := do
-  let config := (bearer.map bearerConfig).getD "" ++ (data.map dataConfig).getD ""
+  let config := (bearer.map bearerConfig).getD "" ++ (data.map dataConfig).getD "" ++ extraConfig
   let full := #["-sS", "--connect-timeout", toString connectTimeout,
                 "--max-time", toString maxTime, "-D", "-",
                 "-w", statusMarker ++ "%{http_code}"]

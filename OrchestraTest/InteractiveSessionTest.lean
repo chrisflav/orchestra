@@ -20,8 +20,8 @@ private def sampleRecord (id : String) (status : SessionStatus) : SessionRecord 
   id, status
   createdAt      := "2026-08-21T10:04:12Z"
   lastActivityAt := "2026-08-21T10:04:12Z"
-  upstream       := { owner := "owner", name := "repo" }
-  fork           := { owner := "your-org", name := "repo" }
+  upstream       := some { owner := "owner", name := "repo" }
+  fork           := some { owner := "your-org", name := "repo" }
 }
 
 /-! ## A restart
@@ -132,8 +132,8 @@ def aBackendWithNoStreamingModeIsRefusedBeforeAnythingIsAcquired : Test := do
     (fun _ _ => pure ())
   let cfg : AppConfig := { appId := 0, privateKeyPath := "" }
   let spec : SessionSpec := {
-    upstream := { owner := "owner", name := "repo" }
-    fork     := { owner := "your-org", name := "repo" }
+    upstream := some { owner := "owner", name := "repo" }
+    fork     := some { owner := "your-org", name := "repo" }
     backend  := some "pi"
   }
   match ← mgr.start cfg spec with
@@ -156,8 +156,8 @@ def theSessionCapIsCheckedBeforeAnythingIsAcquired : Test := do
     (fun _ => do acquired.set true; return some 0)
     (fun _ _ => pure ())
   let cfg : AppConfig := { appId := 0, privateKeyPath := "" }
-  match ← mgr.start cfg { upstream := { owner := "o", name := "r" },
-                          fork := { owner := "f", name := "r" } } with
+  match ← mgr.start cfg { upstream := some { owner := "o", name := "r" },
+                          fork := some { owner := "f", name := "r" } } with
   | .ok _ => TestM.fail "the cap should have refused this"
   | .error e =>
     TestM.assert ((e.splitOn "limit").length ≥ 2)
@@ -181,7 +181,7 @@ def theCapCountsSessionsThatAreStillStarting : Test := do
     (fun _ _ => released.modify (· + 1))
   let cfg : AppConfig := { appId := 0, privateKeyPath := "" }
   let spec : SessionSpec := {
-    upstream := { owner := "o", name := "r" }, fork := { owner := "f", name := "r" } }
+    upstream := some { owner := "o", name := "r" }, fork := some { owner := "f", name := "r" } }
   let outcome ← withTempSessions do
     let first ← mgr.start cfg spec
     let second ← mgr.start cfg spec
@@ -207,8 +207,8 @@ def aFailedStartLeavesNoSlotBehind : Test := do
     (fun _ _ => released.modify (· + 1))
   let cfg : AppConfig := { appId := 0, privateKeyPath := "/nonexistent/key.pem" }
   let _ ← withTempSessions do
-    mgr.start cfg { upstream := { owner := "o", name := "r" },
-                    fork := { owner := "f", name := "r" } }
+    mgr.start cfg { upstream := some { owner := "o", name := "r" },
+                    fork := some { owner := "f", name := "r" } }
   TestM.assertEqual (← reserved.get) 1 (msg := "a slot was taken")
   TestM.assertEqual (← released.get) 1 (msg := "and given back when the start failed")
 
@@ -244,8 +244,8 @@ def aFailedStartDoesNotNameTheDaemonsFilesystem : Test := do
     (fun _ => pure (some 0)) (fun _ _ => pure ())
   let cfg : AppConfig := { appId := 0, privateKeyPath := "/etc/orch/secrets/app.pem" }
   let outcome ← withTempSessions do
-    mgr.start cfg { upstream := { owner := "o", name := "r" },
-                    fork := { owner := "f", name := "r" } }
+    mgr.start cfg { upstream := some { owner := "o", name := "r" },
+                    fork := some { owner := "f", name := "r" } }
   match outcome with
   | .ok _ => TestM.fail "a start with no GitHub App cannot succeed"
   | .error msg =>

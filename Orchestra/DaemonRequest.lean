@@ -38,6 +38,10 @@ inductive DaemonRequest where
   | interactiveInterrupt (id : String)
   /-- End a session and release everything it holds. -/
   | interactiveEnd (id : String)
+  /-- A person's message to a resident: into its inbox, and handed over at once if it can be. -/
+  | residentMessage (name : String) (text : String)
+  /-- `pause`, `resume` or `reset` a resident. -/
+  | residentControl (name : String) (action : String)
   /-- Acquire the orchestra-project claim on `issueId` for `taskId`.
       Routed to `ClaimManager.tryClaim` inside the daemon so the in-process
       mutex serialises CLI claims against agent claims. -/
@@ -66,8 +70,15 @@ instance : FromJson DaemonRequest where
       return .shutdown force handOff
     | "interactive_start" =>
       let specJson ← j.getObjVal? "spec"
-      let upstream ← specJson.getObjValAs? Repository "upstream"
-      let fork     ← specJson.getObjValAs? Repository "fork"
+      -- Both or neither: a session without a repository is one with no upstream and no fork.
+      -- Present and unreadable is refused rather than read as absent, which would start a
+      -- repository-less session somebody meant to have a repository.
+      let repo (k : String) : Except String (Option Repository) :=
+        match specJson.getObjVal? k with
+        | .error _ | .ok Json.null => pure none
+        | .ok v => some <$> FromJson.fromJson? v
+      let upstream ← repo "upstream"
+      let fork     ← repo "fork"
       return .interactiveStart {
         upstream, fork
         backend      := specJson.getObjValAs? String "backend"       |>.toOption
@@ -86,6 +97,13 @@ instance : FromJson DaemonRequest where
       return .interactiveInterrupt (← j.getObjValAs? String "id")
     | "interactive_end" =>
       return .interactiveEnd (← j.getObjValAs? String "id")
+    | "resident_message" =>
+      return .residentMessage (← j.getObjValAs? String "name") (← j.getObjValAs? String "text")
+    | "resident_control" =>
+      let action ← j.getObjValAs? String "action"
+      unless ["pause", "resume", "reset"].contains action do
+        throw s!"unknown resident action '{action}' (pause, resume or reset)"
+      return .residentControl (← j.getObjValAs? String "name") action
     | "claim_issue" =>
       let pid    ← j.getObjValAs? Taxis.IssueId "project_id"
       let iid    ← j.getObjValAs? Taxis.IssueId "issue_id"
@@ -103,11 +121,14 @@ inductive DaemonResponse where
   | withId  (id      : String)
   /-- The request failed. -/
   | error   (message : String)
+  /-- A message went into a resident's inbox as `item` and could not be handed over yet, and why. -/
+  | queued  (item : Nat) (why : String)
 
 instance : ToJson DaemonResponse where
   toJson
     | .ok         => Json.mkObj [("ok",    Json.bool true)]
     | .withId id  => Json.mkObj [("id",    Json.str  id)]
     | .error msg  => Json.mkObj [("error", Json.str  msg)]
+    | .queued i w => Json.mkObj [("queued", Lean.toJson i), ("why", Json.str w)]
 
 end Orchestra.DaemonRequest

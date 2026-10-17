@@ -224,8 +224,8 @@ def tasksInSeriesAreThatSeriesTasks : Test := do
 
 private def session (id stamp : String) : Interactive.SessionRecord :=
   { id, createdAt := stamp, lastActivityAt := stamp
-    upstream := { owner := "acme", name := "widgets" }
-    fork     := { owner := "bot",  name := "widgets" } }
+    upstream := some { owner := "acme", name := "widgets" }
+    fork     := some { owner := "bot",  name := "widgets" } }
 
 @[test]
 def sessionsPageWindowsAndCountsTheWhole : Test := do

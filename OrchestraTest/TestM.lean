@@ -229,7 +229,13 @@ def runTests (configPath : Option System.FilePath := none) : IO Bool := do
     IO.eprintln   "[orchestra-test] running tests with a default (empty) config"
     pure none
   let cfg := cfgResult.getD { appId := 0, privateKeyPath := "" }
-  let tests ← testRegistryRef.get
+  -- `ORCHESTRA_TEST_ONLY=<text>` runs the tests whose name contains it, for a run against
+  -- something real (`ResidentFeedTest.zulipFeedEndToEnd`) that need not repeat the suite.
+  let only := (← IO.getEnv "ORCHESTRA_TEST_ONLY").filter (!·.isEmpty)
+  let tests := (← testRegistryRef.get).filter fun (name, _) =>
+    match only with
+    | some o => decide ((name.splitOn o).length > 1)
+    | none => true
   if tests.isEmpty then
     IO.println "[orchestra-test] No tests registered."
     return true
