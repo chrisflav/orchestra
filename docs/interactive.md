@@ -261,9 +261,17 @@ Every field is optional and falls back to the `residents` block of `config.json`
 `max_turns_per_hour` (`60`), `token_refresh_margin` (`"2h"`, or seconds; config only, below),
 `turn_timeout_seconds` (`1800`, or a span; config only, below) and
 `volume_size` (the backend's own size when absent). The block
-may carry `tools`, `agent` (the backend) and `feeds` (below); it may not carry `upstream` or
-`fork`. A resident is reached through its inbox: its feeds, the chat, and listeners with
-`deliver_to`.
+may carry `tools`, `agent` (the backend), `feeds` (below) and `spawn_policy`; it may not carry
+`upstream` or `fork`. A resident is reached through its inbox: its feeds, the chat, and listeners
+with `deliver_to`.
+
+**Queueing work.** With a `spawn_policy` ([queue-task.md](queue-task.md)) a resident is offered
+`queue_task`. What it queues is not the resident: the task runs under no identity, so it has
+neither the resident's memory nor its kleis spec, and its token comes from wherever a task's would
+(`kleis.default_spec`, for a task with no identity). A resident has no repository to inherit, so a
+task that is to work on one names it, and the policy's `repos` says which it may name. `max_tasks`
+counts per budget day (`spawned_by` is `resident-<name>@<day>`): a resident never ends, and an
+allowance over its whole life would run out once and stay out.
 
 **One session, by name, never ended.** At start-up the daemon creates each resident's session
 asleep (id `resident-<name>`, no process), with no repository: a scratch workspace kept across

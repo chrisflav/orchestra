@@ -461,4 +461,34 @@ def permissionLabelDoesNotEnableIt : Test := do
   let s := { baseState none true with allowedTools := ["work_issues", "queue_task"] }
   TestM.assert (!listsQueueTask s) "a label is not a policy and must not turn the tool on"
 
+/-- A resident is no task: no repository, no task id. It queues as itself, its tasks inherit no
+    identity, and they have to name a repository its policy lists. -/
+@[test]
+def aResidentQueuesAsItselfAndPassesNoIdentityOn : Test := do
+  let seen ← IO.mkRef (none : Option (ResolvedSpawn × String))
+  let s : Orchestra.Server.State :=
+    { repo := none, allowedTools := []
+    , appId := 1, privateKeyPath := "/dev/null", installationId := none, pat := ""
+    , spawnPolicy := some { repos := [repoOf "acme/widgets"], tools := ["create_pr"] }
+    , spawnContext := { backend := some "claude" }
+    , spawnerId := some "resident-pm"
+    , enqueueTask := some fun r who => do seen.set (some (r, who)); return .ok "q-1" }
+  TestM.assert (listsQueueTask s) "a resident with a policy is offered the tool"
+  let call := Orchestra.Server.parseToolCall "queue_task" (Json.mkObj
+    [("prompt", .str "fix the flaky test"), ("repo", .str "acme/widgets"),
+     ("tools", Json.arr #[.str "create_pr"])])
+  let out ← Orchestra.Server.evalToolCall s call
+  match ← seen.get with
+  | none => TestM.fail s!"nothing was queued: {out.compress}"
+  | some (r, who) =>
+    TestM.assertEqual who "resident-pm" (msg := "recorded as queued by the resident")
+    TestM.assertEqual r.identity none (msg := "the resident's identity is not handed on")
+    TestM.assertEqual (r.repo.map (·.toString)) (some "acme/widgets")
+    TestM.assertEqual r.tools ["create_pr"]
+  seen.set none
+  let other := Orchestra.Server.parseToolCall "queue_task" (Json.mkObj
+    [("prompt", .str "x"), ("repo", .str "acme/secret")])
+  let _ ← Orchestra.Server.evalToolCall s other
+  TestM.assert (← seen.get).isNone "a repository the policy does not list is refused"
+
 end OrchestraTest.SpawnTask

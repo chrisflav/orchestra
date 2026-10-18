@@ -82,6 +82,9 @@ structure State where
   /-- Hook that puts an approved spawn on the queue. Plumbed to
       `Project.Tools.Env.enqueueTask`. -/
   enqueueTask : Option (ResolvedSpawn → String → IO (Except String String)) := none
+  /-- Who a `queue_task` call is recorded as queued by, for a session that is not a task: a
+      resident (`Orchestra.Interactive`). A task is its own `taskId`. -/
+  spawnerId : Option String := none
   /-- The subtree this task may write at or below, when it was queued with one. Plumbed to
       `Project.Tools.Env.scopeRoot`. -/
   scopeRoot : Option Taxis.IssueId := none
@@ -1128,6 +1131,7 @@ created in; there is no other destination this tool will use)"
       , spawnPolicy     := state.spawnPolicy
       , spawnContext    := state.spawnContext
       , enqueueTask     := state.enqueueTask
+      , spawnerId       := state.spawnerId
       , scopeRoot       := state.scopeRoot
       , identity        := state.identity }
     Project.Tools.evalProjectTool env call

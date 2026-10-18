@@ -714,6 +714,8 @@ structure Env where
       the daemon's path and `orchestra run`'s alike); `none` in the contexts that serve tools
       without running a queued task, such as an interactive session. -/
   enqueueTask : Option (ResolvedSpawn → String → IO (Except String String)) := none
+  /-- Who queued it, when the caller is not a task (`Server.State.spawnerId`). -/
+  spawnerId : Option String := none
   /-- The subtree this task may write at or below, when it was queued with one
       (`Config.IOTask.scopeRoot`). Overrides what `writeScopeRoot` would otherwise derive. -/
   scopeRoot : Option Taxis.IssueId := none
@@ -1235,7 +1237,7 @@ def evalProjectTool (env : Env) (call : ProjectTool) : IO Json := do
       | return content "this task may not queue tasks: it has no spawn policy" (isError := true)
     let some enqueue := env.enqueueTask
       | return content "queueing tasks is not available in this context" (isError := true)
-    let some taskId := env.taskId
+    let some taskId := env.taskId <|> env.spawnerId
       | return content "no task id in context (a queued task has to record who queued it)"
           (isError := true)
     -- Scoped before the policy is consulted: binding an issue is what decides which work the

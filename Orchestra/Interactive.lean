@@ -910,6 +910,17 @@ a fresh token and the old ones are revoked; nothing for you to do." ++
       residentTools := resident.map fun (name, _) => (name, fun tool args =>
         if tool == "refresh_kleis_token" then refreshKleisToken
         else Resident.Zulip.residentTool name tool args)
+      -- A resident may queue tasks when its block has a policy (`Identity.ResidentSpec`). What
+      -- it queues is not the resident: no identity — its memory, tracker token and kleis spec
+      -- stay its own — and no repository to inherit, so each task names one the policy lists
+      -- and gets a task's token for it (`kleis.default_spec`). Counted per budget day: a
+      -- resident never ends, and a lifetime allowance would run out once and stay out.
+      spawnPolicy := resident.bind (·.2.spawnPolicy)
+      spawnContext := { backend := some backendName, model := record.model }
+      enqueueTask := resident.map fun _ => fun resolved _ => do
+        let day ← Resident.today mgr.cfg.residents.timezone
+        TaskRunner.enqueueTaskImpl appConfig resolved s!"{record.id}@{day}"
+      spawnerId := resident.map fun _ => record.id
     } (bindHost := mcpBind) (portRange := mcpPorts)
     -- Every token the session holds is revoked with the MCP server: the one closure every way out
     -- of a session runs, so no token can outlive the session that held it.
