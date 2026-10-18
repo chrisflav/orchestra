@@ -3,6 +3,7 @@ import Orchestra.Config
 import Orchestra.Dirs
 import Orchestra.Utils.Files
 import Orchestra.Resident.Feed
+import Orchestra.Project.Role
 
 open Lean (Json FromJson ToJson)
 
@@ -98,6 +99,10 @@ structure ResidentSpec where
   agent : Option String := none
   /-- Its feeds: Zulip event queues, read through kleis with its own key. -/
   feeds : Array Resident.ZulipFeed := #[]
+  /-- What it may put on the queue (`queue_task`, `Orchestra.Spawn`); without one it may not.
+      Its tasks are not the resident: they run under no identity, so their kleis source is
+      whatever a task's would be (`kleis.default_spec`), and `max_tasks` is per budget day. -/
+  spawnPolicy : Option SpawnPolicy := none
 deriving Inhabited
 
 /-- A resident's settings with every default filled in. -/
@@ -109,6 +114,7 @@ structure ResidentSettings where
   model : Option String
   tools : Option (List String)
   agent : String
+  spawnPolicy : Option SpawnPolicy := none
 deriving Inhabited, Repr
 
 /-- The block's own values, and the configuration's where it has none. -/
@@ -119,7 +125,8 @@ def ResidentSpec.settings (r : ResidentSpec) (cfg : ResidentsConfig) : ResidentS
     podIdleSeconds     := max (r.podIdleSeconds.getD cfg.podIdleSeconds)
                             (r.processIdleSeconds.getD cfg.processIdleSeconds)
     batchWindowSeconds := r.batchWindowSeconds.getD cfg.batchWindowSeconds
-    model := r.model, tools := r.tools, agent := r.agent.getD "claude" }
+    model := r.model, tools := r.tools, agent := r.agent.getD "claude"
+    spawnPolicy := r.spawnPolicy }
 
 /-- Read a `resident` block. Strict: a block that half-parsed would be a resident running on
     defaults nobody wrote — a hundred dollars a day instead of the five the operator asked for. -/
@@ -129,7 +136,7 @@ def parseResidentSpec (who : String) (j : Json) : Except String ResidentSpec := 
     if (j.getObjVal? key).isOk then
       throw s!"{who}: a resident has no repository, so its block may not set '{key}'"
   let known := ["budget_per_day", "process_idle_seconds", "pod_idle_seconds",
-    "batch_window_seconds", "model", "tools", "agent", "feeds"]
+    "batch_window_seconds", "model", "tools", "agent", "feeds", "spawn_policy"]
   for (k, _) in kvs.toArray do
     unless known.contains k do
       throw s!"{who}: unknown field '{k}' in 'resident' (known: {", ".intercalate known})"
@@ -160,7 +167,14 @@ def parseResidentSpec (who : String) (j : Json) : Except String ResidentSpec := 
     | .error _ => pure #[]
     | .ok (.arr fs) => Resident.parseFeeds s!"{who}: resident.feeds" fs
     | .ok _ => throw s!"{who}: resident.feeds must be a list"
-  return { budgetPerDay, tools, feeds
+  let spawnPolicy ← match parseSpawnPolicy? j with
+    | .error e => throw s!"{who}: resident.spawn_policy: {e}"
+    | .ok none => pure none
+    | .ok (some p) =>
+      match p.validate Project.Role.knownPermissions with
+      | .error e => throw s!"{who}: resident.{e}"
+      | .ok () => pure (some p)
+  return { budgetPerDay, tools, feeds, spawnPolicy
            processIdleSeconds := ← optNat "process_idle_seconds"
            podIdleSeconds     := ← optNat "pod_idle_seconds"
            batchWindowSeconds := ← optNat "batch_window_seconds"

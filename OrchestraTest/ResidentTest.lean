@@ -91,6 +91,22 @@ def aResidentBlockWithARepositoryOrAnUnknownFieldIsRefused : Test := do
     | .error e => TestM.assert (mentions e needle) (msg := s!"{body}: {e}")
 
 @[test]
+def aResidentBlockMayCarryASpawnPolicy : Test := do
+  let body := "{\"spawn_policy\": {\"repos\": [\"acme/widgets\"], \"tools\": [\"create_pr\"], \"max_tasks\": 4}}"
+  match Json.parse body >>= Identity.parseResidentSpec "identity 'pm'" with
+  | .error e => TestM.fail e
+  | .ok spec =>
+    match (spec.settings {}).spawnPolicy with
+    | none => TestM.fail "the policy was dropped between the block and the settings"
+    | some p =>
+      TestM.assertEqual (p.repos.map (·.toString)) ["acme/widgets"]
+      TestM.assertEqual p.maxTasks 4
+  -- Checked as a role's or a listener's is: a tool no role could be given is not a typo to keep.
+  match Json.parse "{\"spawn_policy\": {\"tools\": [\"rm_rf\"]}}" >>= Identity.parseResidentSpec "identity 'pm'" with
+  | .ok _ => TestM.fail "an unknown tool must be refused"
+  | .error e => TestM.assert (mentions e "rm_rf") (msg := e)
+
+@[test]
 def anIdentityFileCarriesItsResidentBlock : Test := do
   let (plain, resident) ← withIdentities do
     for (name, body) in [("plain", "{\"name\": \"plain\"}"),

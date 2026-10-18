@@ -32,6 +32,7 @@ described:
 | queue entry | `spawn_policy` on the entry | that entry's run |
 | listener | `action.spawn_policy` | every task the listener queues |
 | role | `spawn_policy` on the role document | every task dispatched for that role, whether the dispatcher spawned it or `orchestra spawn` did |
+| resident | `resident.spawn_policy` in `identity.json` | the resident's session; its tasks run under no identity and `max_tasks` is per budget day ([interactive.md](interactive.md#residents)) |
 
 A listener that names a `workflow_path` starts a concert instead of queueing a task, and never
 reads its `action` block's policy. The workflow YAML has no `spawn_policy` key of its own, so a
