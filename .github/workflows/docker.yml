@@ -41,9 +41,12 @@ jobs:
       # Base images from Docker Hub are pulled through Google's public mirror. Anonymous pulls from
       # GitHub's runners share their addresses' Docker Hub quota, and on 2026-10-09 every attempt
       # for half an hour was refused with 429 before a single layer was fetched. The mirror serves
-      # the same digests; buildkit falls back to Docker Hub for anything it does not carry.
+      # the same digests; buildkit falls back to Docker Hub for anything it does not carry. The
+      # builder's own image is a Docker Hub pull too, made before that configuration applies, so it
+      # is named through the mirror explicitly.
       - uses: docker/setup-buildx-action@v3
         with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
