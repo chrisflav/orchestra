@@ -57,9 +57,11 @@ Two fields of a spawn policy mean something different for a client, and are hand
 Its kleis source. The client's `kleis_spec` is what every task it queues derives its token from,
 as a spawning task's source is inherited by what it queues; a request may add narrowings
 (`kleis_narrow`) and never name another source. A client file without one leaves its tasks to
-`kleis.default_spec`, like any task with no source of its own — set one. Nor does a request choose the fork: a read-only
-task works in the upstream itself, as the auto-reviewer does, and a writable one gets its fork
-resolved by the same rule every other dispatch path uses (`GitHub.resolveFork`).
+`kleis.default_spec`, like any task with no source of its own — set one.
+
+Nor does a request choose the fork: a read-only task works in the upstream itself, as the
+auto-reviewer does, and a writable one gets its fork resolved by the same rule every other
+dispatch path uses (`GitHub.resolveFork`).
 
 ## The token
 

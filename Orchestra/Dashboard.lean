@@ -818,13 +818,14 @@ private def queueApi (p : Page) : IO Json := do
   return collection p total (entries.map queueEntryJson)
 
 /-- One entry, by its own id or the id of the run it became (as `queue/{id}/cancel` takes it),
-    with `continuedBy`: the entry that carries its run on, when a restart resume or a retry has
-    queued one. That is how a client that only knows the id it was given follows its work past
-    an interrupted run, which ends `unfinished` and is continued under a new id. -/
+    with `continuedBy`: the entry that carries its run on, when a restart resume or a retry of an
+    interrupted run has queued one — for a client's entry, one that is the client's too. That is
+    how a client that only knows the id it was given follows its work past an interrupted run,
+    which ends `unfinished` and is continued under a new id. -/
 private def queueEntryDetailApi (id : String) : IO (Option Json) := do
   let some e ← Queue.findEntry id | return none
   let next ← match e.taskId with
-    | some tid => pure ((← Queue.continuationOf tid).map (·.id))
+    | some tid => pure ((← Queue.continuationOf tid e.apiClient).map (·.id))
     | none     => pure none
   return some ((queueEntryJson e).setObjVal! "continuedBy" (optStr next))
 
@@ -1737,28 +1738,15 @@ the task record still said running and has been marked unfinished"
 private initialize clientQueueLock : Std.BaseMutex ← Std.BaseMutex.new
 
 /-- The half of `queueForClient` that runs under `clientQueueLock`: count the client's active
-    entries, resolve a fork if the task needs one, and hand the entry to the daemon. -/
-private def queueLocked (configPath : Option System.FilePath) (c : ApiClient.ApiClient)
-    (r : ApiClient.QueueRequest) (resolved : ResolvedSpawn) (existing : IO (Option Json)) :
+    entries and hand the entry to the daemon — one local query and one socket round trip, so the
+    lock is never held across GitHub. -/
+private def queueLocked (c : ApiClient.ApiClient) (r : ApiClient.QueueRequest)
+    (resolved : ResolvedSpawn) (fork : Option Repository) (existing : IO (Option Json)) :
     IO WriteResult := do
   let active ← Queue.countActiveOfClient c.name
   if active ≥ c.maxActive then
     return .tooManyRequests s!"client '{c.name}' already has {active} task(s) pending or running, \
 which is all it may have at once (max_active {c.maxActive})"
-  -- A read-only task works in the upstream itself and pushes nothing, as the auto-reviewer does;
-  -- forking for it would create a repository per reviewed upstream for nothing. A writable one
-  -- gets its fork by the rule every other dispatch path uses.
-  let fork ← match resolved.repo with
-    | none => pure none
-    | some upstream =>
-      if resolved.readOnly then pure none
-      else
-        let appConfig ← loadAppConfig configPath
-        match ← GitHub.resolveFork appConfig upstream with
-        | some f => pure (some f)
-        | none =>
-          return .conflict s!"no task was queued: the GitHub App cannot push to {upstream} and \
-could not fork it"
   let id ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
   let entry := c.entry r resolved fork id createdAt
@@ -1797,24 +1785,41 @@ private def queueForClient (configPath : Option System.FilePath) (c : ApiClient.
   let resolved ← match c.resolve r with
     | .error e => return .badRequest e
     | .ok x    => pure x
-  -- One lock for every client rather than one each: queueing is a socket round trip, and the
-  -- only slow part, resolving a fork, is rare (read-only tasks need none).
+  -- A read-only task works in the upstream itself and pushes nothing, as the auto-reviewer does;
+  -- forking for it would create a repository per reviewed upstream for nothing. A writable one
+  -- gets its fork by the rule every other dispatch path uses — outside the lock, since probing
+  -- GitHub retries with sleeps and may create a repository.
+  let fork ← match resolved.repo with
+    | none => pure none
+    | some upstream =>
+      if resolved.readOnly then pure none
+      else
+        let appConfig ← loadAppConfig configPath
+        match ← GitHub.resolveFork appConfig upstream with
+        | some f => pure (some f)
+        | none =>
+          return .conflict s!"no task was queued: the GitHub App cannot push to {upstream} and \
+could not fork it"
+  -- One lock for every client rather than one each: what it covers is a local count and a
+  -- socket round trip.
   clientQueueLock.lock
-  try queueLocked configPath c r resolved existing
+  try queueLocked c r resolved fork existing
   finally clientQueueLock.unlock
 
 /-- Cancel for an API client: a running entry is stopped by the daemon, as for the operator, and
     a pending one is withdrawn — which is the case a client has most often, since it is what
     `max_active` counts.
 
-    Withdrawn with the re-read guard the queue's cascade uses (`Queue.cancelIfStillPending`). The
-    daemon claims entries in its own process, so a claim can still land between that read and
-    the write; the run then goes ahead, and its own status overwrites `cancelled` when it ends. -/
+    Withdrawn by the daemon (`withdraw` over its socket), under the lock its claims take, so the
+    entry is either withdrawn or claimed and never both; this server writes no queue entry. One
+    claimed in the meantime is no longer pending, and is cancelled as a running one. -/
 private def cancelForClient (id : String) : IO WriteResult := do
   let some entry ← Queue.findEntry id | return .notFound
   if entry.status == .pending then
-    if ← Queue.cancelIfStillPending entry.id then
-      return .ok (Json.mkObj [("id", Json.str entry.id), ("taskId", optStr entry.taskId)])
+    match ← askDaemon (Json.mkObj [("type", Json.str "withdraw"), ("id", Json.str entry.id)]) with
+    | .ok _ => return .ok (Json.mkObj [("id", Json.str entry.id), ("taskId", Json.null)])
+    | .error why =>
+      unless (why.splitOn "is no longer pending").length > 1 do return .conflict why
   cancelEntry id
 
 /-- Whether client `c` may act on the entry `id` names: only on one it queued. -/

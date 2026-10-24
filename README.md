@@ -1685,7 +1685,8 @@ A client reaches three more routes, and only for entries it queued — anyone el
 `GET /api/v1/queue/{id}`, its stream at `/sse/v1/queue/{id}`, which is how a client follows its
 work to the end, and `POST /api/v1/queue/{id}/cancel`, which stops a running entry and withdraws a
 pending one. A run a daemon restart interrupted ends `unfinished` and is carried on under a new
-id; the entry's `continuedBy` names it, and it carries the client's name, so the client may read
+id (so is one `orchestra queue retry` picks up after an interrupted run); the entry's
+`continuedBy` names it, and it carries the client's name, so the client may read
 and cancel it too.
 `orchestra queue retry` keeps a client's entries the client's, with the tools, budget and
 read-only flag they were queued with. Every other route answers a client `403`,

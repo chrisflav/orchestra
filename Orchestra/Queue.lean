@@ -739,16 +739,22 @@ def findByExternalId (client externalId : String) : IO (Option QueueEntry) := do
   return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
 
 open Db.Query.DSL in
-/-- The entry that continues the run `taskId`, if one has been queued: a restart resume, or
-    `orchestra queue retry`. Newest first, since a run can be retried more than once. -/
-def continuationOf (taskId : String) : IO (Option QueueEntry) := do
+/-- The entry that continues the run `taskId`, if one has been queued: a restart resume, or a
+    retry of an interrupted run. Newest first, since a run can be retried more than once. With
+    `client`, only an entry that client queued: an operator's `--continues` of a client's run is
+    not the client's, and would point it at an entry it cannot read. -/
+def continuationOf (taskId : String) (client : Option String := none) :
+    IO (Option QueueEntry) := do
   let rows ← Store.run <| HasModel.fetch <| query% do
     let e ← from Store.QueueEntryRow
     guard e.continues_from = some taskId
     select e
     order_by_desc e.created_at
     order_by_desc e.id
-  return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
+  let entries ← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
+  return match client with
+    | some c => entries.find? (·.apiClient == some c)
+    | none   => entries[0]?
 
 open Db.Query.DSL in
 /-- How many of `client`'s entries are pending or running: what `ApiClient.maxActive` bounds. -/

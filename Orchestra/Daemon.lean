@@ -88,6 +88,8 @@ def handleSocketRequest
     (activeTaskTokens : Std.Mutex (Array ActiveTask))
     -- Repairs an entry that is `running` with no worker; see `run`. Answers whether it did.
     (reapIfAbandoned  : String → IO Bool)
+    -- Withdraws an entry that is still pending, under the claim lock; see `run`.
+    (withdrawPending  : String → IO Bool)
     (interactive      : Interactive.Manager)
     : IO Unit := do
   let residentReply : Except String Interactive.HumanOutcome → IO DaemonRequest.DaemonResponse
@@ -220,6 +222,9 @@ Marked unfinished.")
           match ← interactive.close id with
           | .ok ()   => pure (.withId id)
           | .error e => pure (.error e)
+        | .withdraw id =>
+          if ← withdrawPending id then pure (.withId id)
+          else pure (.error s!"entry {id} is no longer pending")
         | .claimIssue pid iid taskId agent series =>
           let now ← TaskStore.currentIso8601
           match ← Project.tryClaim TaskRunner.globalClaimManager pid iid taskId agent now series with
@@ -530,6 +535,13 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
       return true
     finally
       claimMutex.unlock
+  -- Withdraw one pending entry, deciding and writing under the lock a claim takes, for the same
+  -- reason `reapIfAbandoned` does: an entry claimed between a read and a write would otherwise
+  -- run while its row says `cancelled`.
+  let withdrawPending (entryId : String) : IO Bool := do
+    claimMutex.lock
+    try Queue.cancelIfStillPending entryId
+    finally claimMutex.unlock
   -- Concert manager: handles suspended concert fibers waiting for task results.
   let concertMgr ← ConcertManager.new
   -- Interactive sessions. Their clone slots come out of the same table the queue claims from,
@@ -612,6 +624,7 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
         let _h ← IO.asTask (prio := .dedicated) do
           handleSocketRequest conn appConfig concertMgr cfg.debug shutdownToken activeTaskTokens
             reapIfAbandoned
+            withdrawPending
             interactive
     catch _ => pure ()
   -- Signal watcher: turns SIGTERM/SIGINT into the same graceful drain as `queue shutdown`.

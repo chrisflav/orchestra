@@ -267,15 +267,25 @@ def aContinuationIsFoundAndAPendingEntryWithdrawn : Test := do
     Queue.saveEntry { first with
       id := "b", createdAt := "2026-10-24T01:00:00Z", status := .pending, taskId := none,
       continuesFrom := some "t1" }
-    let next ← Queue.continuationOf "t1"
+    let next ← Queue.continuationOf "t1" (some "reviews")
+    let notOthers ← Queue.continuationOf "t1" (some "other")
     let withdrawn ← Queue.cancelIfStillPending "b"
     let again ← Queue.cancelIfStillPending "b"
     let status := (← Queue.loadEntry "b").map (·.status)
-    return (next.map (·.id), withdrawn, again, status)
-  let (next, withdrawn, again, status) := outcome
+    return (next.map (·.id), notOthers.isNone, withdrawn, again, status)
+  let (next, notOthers, withdrawn, again, status) := outcome
   TestM.assertEqual next (some "b") (msg := "the resume carries the run on")
+  TestM.assert notOthers "another client's view does not see it"
   TestM.assert withdrawn "a pending entry is withdrawn"
   TestM.assert (!again) "and only once"
   TestM.assert (status == some .cancelled) "it lands as cancelled"
+
+@[test]
+def theDaemonReadsAWithdraw : Test := do
+  let j := parseJson "{\"type\": \"withdraw\", \"id\": \"e1\"}"
+  match (FromJson.fromJson? j : Except String DaemonRequest.DaemonRequest) with
+  | .ok (.withdraw id) => TestM.assertEqual id "e1"
+  | .ok _ => TestM.fail "a withdraw message read as something else"
+  | .error e => TestM.fail s!"a withdraw message should parse: {e}"
 
 end OrchestraTest.ApiClient

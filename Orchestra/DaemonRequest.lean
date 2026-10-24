@@ -22,6 +22,12 @@ inductive DaemonRequest where
       before there was one: `orchestra queue cancel` sends `{"type": "cancel"}` and keeps
       working unchanged. -/
   | cancel     (id : Option String := none)
+  /-- Withdraw a *pending* entry: mark it `cancelled` before any worker claims it.
+
+      The daemon's because the claim is: done under the lock a claim takes, so an entry is either
+      withdrawn or claimed, never claimed and then stamped `cancelled` under its running worker.
+      `POST /api/v1/queue/{id}/cancel` sends it for an API client's pending entry. -/
+  | withdraw   (id : String)
   /-- Shut down the daemon, optionally cancelling running tasks first (`force`), or handing them
       over to the next daemon rather than waiting for them (`handOff`, what a termination signal
       does; see `Exec.tryHandOff`). Neither: drain, as it always did. -/
@@ -64,6 +70,8 @@ instance : FromJson DaemonRequest where
     | "cancel"   =>
       let id := j.getObjValAs? String "id" |>.toOption
       return .cancel id
+    | "withdraw" =>
+      return .withdraw (← j.getObjValAs? String "id")
     | "shutdown" =>
       let force := j.getObjValAs? Bool "force" |>.toOption |>.getD false
       let handOff := j.getObjValAs? Bool "hand_off" |>.toOption |>.getD false
