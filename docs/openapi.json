@@ -4,7 +4,7 @@
     "title": "orchestra dashboard API",
     "version": "1.0.0",
     "summary": "HTTP API over a running orchestra backend: reads everything it knows, and changes what it is configured with.",
-    "description": "Everything the daemon knows about its queue, task history, listeners, projects and authentication sources, as JSON. Every read is also available as a Server-Sent Events stream at the same path under `/sse/v1/`, pushed every two seconds and only when the payload has changed.\n\nThree resources are configuration and are writable: **listeners**, **roles** and **skills**. Everything else — the queue, task history, concerts, projects, authentication sources — is a record of something that already happened or is owned by another system, and is read-only here. Nothing in this API enqueues work; that is the daemon's control socket. The one exception is `POST /api/v1/queue/{id}/cancel`, which stops one task the daemon is running \u2014 it writes nothing, and forwards a single message naming that entry to the socket, which stays off the network itself.\n\n## Writing\n\n- Every route that is not a `GET` requires a credential. `POST /api/login` is the only exception, since it is how one is obtained.\n- Every write must be sent as `application/json`. A request without that content type is a `415`. This is the second of the two locks on a cookie-authenticated write: the session cookie is `SameSite=Strict`, so a cross-site request carries no credential, and an HTML form cannot send JSON, so it cannot form the request at all.\n- `POST` to a collection creates and refuses to overwrite (`409`), taking the name from the body. `PUT` to a member creates or replaces, taking the name from the path; a body naming a different one is a `400`. Listeners are the exception and have no `POST`: a listener config carries no name of its own — its file names it — so `PUT /api/v1/listeners/{name}` is both how one is created and how it is replaced.\n- `DELETE` answers `204`, or `404` when there was nothing there.\n- A rejected body changes nothing on disk: validation runs to completion before anything is written, and every write is a write-and-rename, so a reader never sees a partial file.\n- Listener configs and roles are stored **verbatim**, not re-serialised. That is what keeps `{{secret}}` placeholders — and any field a client does not know about — intact across an edit. Fetch the `config` field of a detail response, change it, and `PUT` it back.\n\n## Conventions\n\n- Instants are RFC 3339 in UTC (`2026-07-23T10:04:11Z`) and live in a field named `...At`.\n- Durations are integer seconds, in a field named `...Seconds`.\n- An absent value is `null`, never an empty string.\n- Enumerations are the lower-case names the daemon itself uses.\n- Collections answer in a common envelope (`items`, `total`, `limit`, `offset`) and accept `limit`, `offset` and — where the collection is ordered by time — `since`.\n- A parameter that is malformed, or that the collection cannot honour, is a `400`. Parameters this version does not define are ignored.",
+    "description": "Everything the daemon knows about its queue, task history, listeners, projects and authentication sources, as JSON. Every read is also available as a Server-Sent Events stream at the same path under `/sse/v1/`, pushed every two seconds and only when the payload has changed.\n\nThree resources are configuration and are writable: **listeners**, **roles** and **skills**. Everything else — the queue, task history, concerts, projects, authentication sources — is a record of something that already happened or is owned by another system, and is read-only here. The operator's credential enqueues nothing; that is the daemon's control socket. `POST /api/v1/queue/{id}/cancel` stops one task the daemon is running \u2014 it writes nothing, and forwards a single message naming that entry to the socket, which stays off the network itself. `POST /api/v1/queue` puts a task on the queue for an **API client**: a system with a token of its own, held to the policy in its client file, and reaching its own entries and nothing else.\n\n## Writing\n\n- Every route that is not a `GET` requires a credential. `POST /api/login` is the only exception, since it is how one is obtained.\n- Every write must be sent as `application/json`. A request without that content type is a `415`. This is the second of the two locks on a cookie-authenticated write: the session cookie is `SameSite=Strict`, so a cross-site request carries no credential, and an HTML form cannot send JSON, so it cannot form the request at all.\n- `POST` to a collection creates and refuses to overwrite (`409`), taking the name from the body. `PUT` to a member creates or replaces, taking the name from the path; a body naming a different one is a `400`. Listeners are the exception and have no `POST`: a listener config carries no name of its own — its file names it — so `PUT /api/v1/listeners/{name}` is both how one is created and how it is replaced.\n- `DELETE` answers `204`, or `404` when there was nothing there.\n- A rejected body changes nothing on disk: validation runs to completion before anything is written, and every write is a write-and-rename, so a reader never sees a partial file.\n- Listener configs and roles are stored **verbatim**, not re-serialised. That is what keeps `{{secret}}` placeholders — and any field a client does not know about — intact across an edit. Fetch the `config` field of a detail response, change it, and `PUT` it back.\n\n## Conventions\n\n- Instants are RFC 3339 in UTC (`2026-07-23T10:04:11Z`) and live in a field named `...At`.\n- Durations are integer seconds, in a field named `...Seconds`.\n- An absent value is `null`, never an empty string.\n- Enumerations are the lower-case names the daemon itself uses.\n- Collections answer in a common envelope (`items`, `total`, `limit`, `offset`) and accept `limit`, `offset` and — where the collection is ordered by time — `since`.\n- A parameter that is malformed, or that the collection cannot honour, is a `400`. Parameters this version does not define are ignored.",
     "license": { "name": "See repository" }
   },
   "servers": [
@@ -725,13 +725,106 @@
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
+      },
+      "post": {
+        "tags": ["queue"],
+        "summary": "Queue a task, as an API client",
+        "description": "Puts one task on the queue for the API client whose token authenticates the request. A client is a file, `<config>/clients/<name>.json`, holding a bearer token (a `{{secret}}` reference into `secrets.json`) and the bounds on what it may queue: its own `backend`, `model`, `tools`, `read_only`, `kleis_spec` and `kleis_narrow` are what a request inherits when it names nothing, and its `queue_policy` \u2014 a `spawn_policy`, held to the same rules as the `queue_task` tool \u2014 says what a request may name instead. The operator's password cannot use this route: the operator queues from a shell, and a request made with the password would have no policy to be held to.\n\nThe entry is built here and handed to the daemon over its control socket as `add_task`, the message `orchestra queue add` sends. A read-only task works in the upstream itself; a writable one has its fork resolved by the rule every other dispatch path uses. The kleis source is always the client's own; a request may add narrowings and never name another source.\n\n`external_id` makes the request idempotent: the client's id for the work, unique per client. A request naming one the client has already queued answers that entry with `200` and queues nothing, so a client that never received an answer can safely ask again.\n\n`400` for a body the client's policy refuses, naming the field. `403` for the operator's password. `409` when the daemon is not running or refused the entry, or the GitHub App can neither push to the upstream nor fork it. `429` when the client already has `max_active` entries pending or running.",
+        "operationId": "queueTask",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["prompt"],
+                "additionalProperties": false,
+                "properties": {
+                  "prompt": { "type": "string", "description": "The instruction the agent is given." },
+                  "goal": { "type": "string", "description": "One checkable sentence the run is held to (`claude` backend only)." },
+                  "upstream": { "type": "string", "description": "`owner/repo` to work on; one the policy's `repos` lists. Omitted, the task is repository-independent." },
+                  "backend": { "type": "string", "description": "One the policy's `backends` lists; omitted, the client's own." },
+                  "model": { "type": "string", "description": "One the policy's `models` lists; omitted, the client's own." },
+                  "tools": { "type": "array", "items": { "type": "string" }, "description": "Optional tools, each held by the client or listed in its policy. Omitted, the client's own; `[]`, none." },
+                  "budget": { "type": "number", "minimum": 0.01, "description": "USD, at least 0.01 and at most the policy's `max_budget`, which is also the default. Refused when the policy sets none." },
+                  "issue_number": { "type": "integer", "minimum": 0, "description": "The GitHub issue or pull request of `upstream` the task is about; it is the `task_issue` fact on the task's kleis token." },
+                  "external_id": { "type": "string", "minLength": 1, "maxLength": 200, "description": "The client's own id for this work, unique per client." },
+                  "kleis_narrow": { "type": "array", "items": { "type": "string" }, "description": "Narrowings added to the client's own on the task's kleis token." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The client had already queued this `external_id`; that entry, and nothing queued.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueEntry" } } }
+          },
+          "201": {
+            "description": "Queued.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueEntry" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": {
+            "description": "The queue daemon is not running or refused the entry, or no fork could be had for a writable task.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "429": {
+            "description": "The client already has `max_active` entries pending or running.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/queue/{id}": {
+      "get": {
+        "tags": ["queue"],
+        "summary": "One queue entry",
+        "description": "The entry this id names: a queue entry's id, or the id of the run it became, with `continuedBy` \u2014 the entry that carries its run on, when a restart resume or a retry of an interrupted run has queued one (for an API client's entry, only one the client owns). An API client may read only the entries it queued; anyone else's is a `404`, as if it did not exist. Also a stream at `/sse/v1/queue/{id}`, which is how a client follows its work to the end.",
+        "operationId": "getQueueEntry",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "A queue entry id, or the id of the run it became.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The entry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/QueueEntry" },
+                    {
+                      "type": "object",
+                      "required": ["continuedBy"],
+                      "properties": {
+                        "continuedBy": { "type": ["string", "null"], "description": "The id of the entry that continues this one's run, if any." }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
       }
     },
     "/api/v1/queue/{id}/cancel": {
       "post": {
         "tags": ["queue"],
         "summary": "Cancel one running task",
-        "description": "Asks the queue daemon to stop the task this id names, and only that one. Everything else it is running carries on, the queue is untouched, and the entry lands as `cancelled` \u2014 which `orchestra queue retry` re-enqueues.\n\nThe id may be a queue entry's id or the id of the run it became; both are ids this API hands out for the same piece of work. The request carries no arguments beyond it \u2014 the body is an empty JSON object \u2014 because only the daemon holds the cancellation token, and naming the entry is the whole of what it needs.\n\n`404` if no entry and no run carries the id. `409` if it exists and is not running, naming the status it is in; `409` also if the daemon is not running or did not answer, which is a statement about the daemon rather than about this server. The status the entry ends in is written by the worker that was running it, as it lands, not here.\n\nOne exception, and it is a repair rather than a verdict: a `409` for an entry that is not running also marks the run's own record `unfinished` if that record still says `running`. The two halves can disagree when a worker died without landing its task \u2014 the entry is repaired on the daemon's next sweep, the record was not \u2014 and the reply says so when it has closed that gap.",
+        "description": "Asks the queue daemon to stop the task this id names, and only that one. Everything else it is running carries on, the queue is untouched, and the entry lands as `cancelled` \u2014 which `orchestra queue retry` re-enqueues.\n\nThe id may be a queue entry's id or the id of the run it became; both are ids this API hands out for the same piece of work. The request carries no arguments beyond it \u2014 the body is an empty JSON object \u2014 because only the daemon holds the cancellation token, and naming the entry is the whole of what it needs.\n\nAn API client may cancel the entries it queued, and no others; anyone else's is a `404`. For a client, a pending entry is withdrawn (it lands as `cancelled`) rather than refused with a `409`; the daemon does it under the lock its claims take, so an entry is withdrawn or claimed, never both.\n\n`404` if no entry and no run carries the id. `409` if it exists and is not running, naming the status it is in; `409` also if the daemon is not running or did not answer, which is a statement about the daemon rather than about this server. The status the entry ends in is written by the worker that was running it, as it lands, not here.\n\nOne exception, and it is a repair rather than a verdict: a `409` for an entry that is not running also marks the run's own record `unfinished` if that record still says `running`. The two halves can disagree when a worker died without landing its task \u2014 the entry is repaired on the daemon's next sweep, the record was not \u2014 and the reply says so when it has closed that gap.",
         "operationId": "cancelTask",
         "parameters": [
           {
@@ -767,6 +860,7 @@
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": {
             "description": "The task is not running, or the queue daemon is not.",
@@ -1335,7 +1429,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "The dashboard password, sent as `Authorization: Bearer <password>`. This is the path for scripts. The password comes from `--password`, `$ORCHESTRA_DASHBOARD_PASSWORD`, or `<data>/dashboard.secret`."
+        "description": "The dashboard password, sent as `Authorization: Bearer <password>`. This is the path for scripts. The password comes from `--password`, `$ORCHESTRA_DASHBOARD_PASSWORD`, or `<data>/dashboard.secret`.\n\nAn API client's token (`<config>/clients/<name>.json`) is sent the same way. It reaches `POST /api/v1/queue`, `GET /api/v1/queue/{id}` and its stream, and `POST /api/v1/queue/{id}/cancel` \u2014 the last two for its own entries only \u2014 and every other route answers it `403`."
       },
       "sessionCookie": {
         "type": "apiKey",
@@ -1396,6 +1490,10 @@
       },
       "Conflict": {
         "description": "A record of that name already exists. `POST` never overwrites; `PUT` does.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Forbidden": {
+        "description": "The credential is valid and does not reach this route: an API client outside its own routes, or the operator on a client's.",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
       },
       "UnsupportedMediaType": {
@@ -1786,7 +1884,7 @@
       "QueueEntry": {
         "type": "object",
         "description": "Work waiting or running. Becomes a Task when it is claimed; `taskId` is that run.",
-        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity"],
+        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity", "apiClient", "externalId"],
         "properties": {
           "id": { "type": "string" },
           "status": { "$ref": "#/components/schemas/QueueStatus" },
@@ -1802,7 +1900,9 @@
           "concertId": { "type": ["string", "null"] },
           "concertStepKey": { "type": ["string", "null"] },
           "spawnedBy": { "type": ["string", "null"], "description": "The task that queued this entry with the `queue_task` tool, when one did. Without it an entry that appeared out of a running agent's turn is indistinguishable from one a person added." },
-          "identity": { "type": ["string", "null"], "description": "The identity this entry is performed under: the name of a directory under `<config>/identities/`. It gives the run a memory of its own and, where the record carries a taxis token, makes the run's tracker writes come from that identity rather than from orchestra." }
+          "identity": { "type": ["string", "null"], "description": "The identity this entry is performed under: the name of a directory under `<config>/identities/`. It gives the run a memory of its own and, where the record carries a taxis token, makes the run's tracker writes come from that identity rather than from orchestra." },
+          "apiClient": { "type": ["string", "null"], "description": "The API client that queued this entry over HTTP (`POST /api/v1/queue`), when one did." },
+          "externalId": { "type": ["string", "null"], "description": "The client's own id for this entry, unique per client." }
         }
       },
       "Task": {

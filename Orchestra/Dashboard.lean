@@ -17,6 +17,8 @@ import Orchestra.Resident.Zulip
 import Orchestra.Identity
 import Orchestra.Utils.UnixSocket
 import Orchestra.Utils.Files
+import Orchestra.ApiClient
+import Orchestra.GitHub
 
 open Lean (Json ToJson FromJson)
 open Std.Net
@@ -35,7 +37,8 @@ open Orchestra.Project (Project Issue IssueStatus Claim
   * `POST /api/login`, `POST /api/logout`, `GET /api/session` — the authentication surface.
   * `GET /api/v1/<kind>` — the read API: resources and collections, described by that spec.
   * `POST`/`PUT`/`DELETE /api/v1/<kind>` — the write API: orchestra's configuration, plus the
-    one action that is not configuration at all (`POST /api/v1/queue/{id}/cancel`).
+    actions that are not configuration at all (`POST /api/v1/queue` and
+    `POST /api/v1/queue/{id}/cancel`).
   * `GET /sse/v1/<kind>` — the read payloads pushed as Server-Sent Events when they change.
   * everything else — the compiled front-end from `--site`, with a single-page-app fallback.
 
@@ -80,6 +83,13 @@ because that is the decision the person looking at the page is making: the other
 this host are not part of it. Nothing here stamps a status: the worker running the task is the one
 that writes `cancelled` onto its entry, and a second writer would race it.
 
+`POST /api/v1/queue` puts a task on the queue, for an **API client** (`Orchestra.ApiClient`)
+rather than for the operator: another system holding a token of its own, bounded by a policy in
+its client file. The entry is built here and handed to the daemon over the same socket, as the
+`add_task` message `orchestra queue add` sends, so the daemon stays the one writer of new entries.
+A client may also read (`GET /api/v1/queue/{id}`, and its stream) and cancel the entries it
+queued, and nothing else — see *Authentication*.
+
 Two properties every write holds to:
 
   * **A rejected body changes nothing.** Validation runs to completion against the *text the
@@ -109,7 +119,15 @@ One shared secret, presented two ways:
   * **Scripts** send `Authorization: Bearer <secret>` directly. This is how `orchestra`, the
     CLI, talks to this server.
 
-Both comparisons are constant-time (`Secret.constantTimeEq`). There is no CORS header anywhere:
+A third credential reaches a handful of routes only: an **API client's** token
+(`Orchestra.ApiClient`), sent as `Authorization: Bearer <token>`. It may `POST /api/v1/queue`, and
+`GET /api/v1/queue/{id}` (or stream it), and `POST /api/v1/queue/{id}/cancel` — the last two only
+for entries it queued; anyone else's is a `404`, as if it did not exist. Every other route answers
+it `403`. `POST /api/v1/queue` is a client's route alone: the operator queues from a shell, where
+the queue's socket already is, and a request that came with the password would have no policy to
+be held to.
+
+Every comparison is constant-time (`Secret.constantTimeEq`). There is no CORS header anywhere:
 the site and the API are the same origin, and a wildcard `Access-Control-Allow-Origin` is
 incompatible with cookie credentials in the first place. Development against Vite's dev server
 goes through its proxy (`web/vite.config.ts`), which keeps that property.
@@ -495,7 +513,11 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     ("kleisSpec",      optStr e.kleisSpec),
     ("kleisToken",     optStr e.kleisToken),
     ("kleisRoleSpec",  optStr e.kleisRoleSpec),
-    ("kleisNarrow",    ToJson.toJson e.kleisNarrow)
+    ("kleisNarrow",    ToJson.toJson e.kleisNarrow),
+    -- Provenance for an entry queued over HTTP (`Orchestra.ApiClient`), and the client's own id
+    -- for it.
+    ("apiClient",      optStr e.apiClient),
+    ("externalId",     optStr e.externalId)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
@@ -794,6 +816,18 @@ private def overviewApi (configPath : Option System.FilePath) : IO Json := do
 private def queueApi (p : Page) : IO Json := do
   let (entries, total) ← Queue.entriesPage p.since p.skip p.size
   return collection p total (entries.map queueEntryJson)
+
+/-- One entry, by its own id or the id of the run it became (as `queue/{id}/cancel` takes it),
+    with `continuedBy`: the entry that carries its run on, when a restart resume or a retry of an
+    interrupted run has queued one — for a client's entry, one that is the client's too. That is
+    how a client that only knows the id it was given follows its work past an interrupted run,
+    which ends `unfinished` and is continued under a new id. -/
+private def queueEntryDetailApi (id : String) : IO (Option Json) := do
+  let some e ← Queue.findEntry id | return none
+  let next ← match e.taskId with
+    | some tid => pure ((← Queue.continuationOf tid e.apiClient).map (·.id))
+    | none     => pure none
+  return some ((queueEntryJson e).setObjVal! "continuedBy" (optStr next))
 
 private def concertsApi (p : Page) : IO Json := do
   let (runs, total) ← Queue.concertRunsPage p.since p.skip p.size
@@ -1414,6 +1448,7 @@ private def renderApi (configPath : Option System.FilePath) (kind : String) (q :
     match ← f seg with
     | some j => return some (.ok j)
     | none   => return some .notFound
+  if let some r ← detail "queue/"     queueEntryDetailApi then return r
   if let some r ← detail "projects/"  projectDetailApi  then return r
   if let some r ← detail "concerts/"  concertDetailApi  then return r
   if let some r ← detail "listeners/" listenerDetailApi then return r
@@ -1474,6 +1509,12 @@ that is not there is a `404`, since it is the answer to a different question tha
 
 Every arm validates the text it was given and only then touches the disk. -/
 
+/-- Who a request is from, once it has been authenticated: the operator (the password, or a
+    session obtained with it), or an API client (`Orchestra.ApiClient`). -/
+private inductive Principal
+  | operator
+  | client (c : ApiClient.ApiClient)
+
 private inductive WriteResult
   | created (payload : Json)
   | ok (payload : Json)
@@ -1481,6 +1522,8 @@ private inductive WriteResult
   | notFound
   | badRequest (why : String)
   | conflict (why : String)
+  | forbidden (why : String)
+  | tooManyRequests (why : String)
 
 /-- Split an `/api/v1/…` kind into path components, rejecting any component that could name
     something other than itself.
@@ -1691,6 +1734,100 @@ the task record still said running and has been marked unfinished"
       ("taskId", optStr entry.taskId)
     ])
 
+/-- The lock `queueForClient` counts and queues under. -/
+private initialize clientQueueLock : Std.BaseMutex ← Std.BaseMutex.new
+
+/-- The half of `queueForClient` that runs under `clientQueueLock`: count the client's active
+    entries and hand the entry to the daemon — one local query and one socket round trip, so the
+    lock is never held across GitHub. -/
+private def queueLocked (c : ApiClient.ApiClient) (r : ApiClient.QueueRequest)
+    (resolved : ResolvedSpawn) (fork : Option Repository) (existing : IO (Option Json)) :
+    IO WriteResult := do
+  let active ← Queue.countActiveOfClient c.name
+  if active ≥ c.maxActive then
+    return .tooManyRequests s!"client '{c.name}' already has {active} task(s) pending or running, \
+which is all it may have at once (max_active {c.maxActive})"
+  let id ← TaskStore.generateId
+  let createdAt ← TaskStore.currentIso8601
+  let entry := c.entry r resolved fork id createdAt
+  match ← askDaemon (Json.mkObj [("type", Json.str "add_task"), ("entry", ToJson.toJson entry)]) with
+  | .ok _ => return .created (queueEntryJson entry)
+  | .error why =>
+    -- The save the daemon refused may be the unique index answering a request that raced this
+    -- one with the same `external_id`; if so, that one's entry is the answer to both.
+    if let some e ← existing then return .ok e
+    return .conflict why
+
+/-- Queue a task for API client `c` (`Orchestra.ApiClient`). The body is a queue request; the
+    answer is the entry, `201` when this call queued it and `200` when the client had already
+    queued one under the same `external_id`.
+
+    Everything the client may choose is checked against its policy before anything else happens,
+    and the entry is then handed to the daemon as `add_task` over its socket — the message
+    `orchestra queue add` sends — so this server never writes a queue entry itself.
+
+    `max_active` is counted and the entry queued under one lock, so parallel requests cannot all
+    pass the same count. `external_id` is also held by the store: the pair is unique, so the
+    second of two racing requests fails to be saved and is answered with the first one's entry. -/
+private def queueForClient (configPath : Option System.FilePath) (c : ApiClient.ApiClient)
+    (body : String) : IO WriteResult := do
+  let some j := (Json.parse body).toOption | return .badRequest "the body is not JSON"
+  let r ← match ApiClient.parseRequest j with
+    | .error e => return .badRequest e
+    | .ok r    => pure r
+  let existing : IO (Option Json) := do
+    match r.externalId with
+    | none     => return none
+    | some ext => return (← Queue.findByExternalId c.name ext).map queueEntryJson
+  -- Before the policy: a retry of work already queued is answered with that work, even if the
+  -- policy has been tightened since — that is the promise `external_id` makes.
+  if let some e ← existing then return .ok e
+  let resolved ← match c.resolve r with
+    | .error e => return .badRequest e
+    | .ok x    => pure x
+  -- A read-only task works in the upstream itself and pushes nothing, as the auto-reviewer does;
+  -- forking for it would create a repository per reviewed upstream for nothing. A writable one
+  -- gets its fork by the rule every other dispatch path uses — outside the lock, since probing
+  -- GitHub retries with sleeps and may create a repository.
+  let fork ← match resolved.repo with
+    | none => pure none
+    | some upstream =>
+      if resolved.readOnly then pure none
+      else
+        let appConfig ← loadAppConfig configPath
+        match ← GitHub.resolveFork appConfig upstream with
+        | some f => pure (some f)
+        | none =>
+          return .conflict s!"no task was queued: the GitHub App cannot push to {upstream} and \
+could not fork it"
+  -- One lock for every client rather than one each: what it covers is a local count and a
+  -- socket round trip.
+  clientQueueLock.lock
+  try queueLocked c r resolved fork existing
+  finally clientQueueLock.unlock
+
+/-- Cancel for an API client: a running entry is stopped by the daemon, as for the operator, and
+    a pending one is withdrawn — which is the case a client has most often, since it is what
+    `max_active` counts.
+
+    Withdrawn by the daemon (`withdraw` over its socket), under the lock its claims take, so the
+    entry is either withdrawn or claimed and never both; this server writes no queue entry. One
+    claimed in the meantime is no longer pending, and is cancelled as a running one. -/
+private def cancelForClient (id : String) : IO WriteResult := do
+  let some entry ← Queue.findEntry id | return .notFound
+  if entry.status == .pending then
+    match ← askDaemon (Json.mkObj [("type", Json.str "withdraw"), ("id", Json.str entry.id)]) with
+    | .ok _ => return .ok (Json.mkObj [("id", Json.str entry.id), ("taskId", Json.null)])
+    | .error why =>
+      unless (why.splitOn "is no longer pending").length > 1 do return .conflict why
+  cancelEntry id
+
+/-- Whether client `c` may act on the entry `id` names: only on one it queued. -/
+private def clientOwns (c : ApiClient.ApiClient) (id : String) : IO Bool := do
+  match ← Queue.findEntry id with
+  | some e => return e.apiClient == some c.name
+  | none   => return false
+
 /-! ### Interactive sessions, the writing half
 
 Four routes, and not one of them stores a file. Every one forwards to the daemon, because a
@@ -1873,8 +2010,8 @@ private def endInteractive (id : String) : IO WriteResult := do
     path that exists but not for this method answers `405`, which is reported by the `none` case
     the caller turns into one — telling a client that `PATCH /api/v1/roles/x` is the wrong verb
     is more useful than telling it the role does not exist. -/
-private def renderWrite (method : Method) (kind : String) (body : String) :
-    IO (Option WriteResult) := do
+private def renderWrite (configPath : Option System.FilePath) (principal : Principal)
+    (method : Method) (kind : String) (body : String) : IO (Option WriteResult) := do
   -- The name comes from the body for a `POST`, so a body that does not carry one is a `400`
   -- about the body rather than a route that failed to match.
   let create (what : String) (write : String → String → Bool → IO WriteResult) :
@@ -1902,7 +2039,18 @@ PUT /api/v1/listeners/{name}")
   -- Not a resource: an action on one running entry, which is why it is a `POST` to a verb
   -- under it rather than a `PUT` to a thing. The body carries nothing — the entry is named by
   -- the path, and there is no second argument to give.
-  | ["queue", id, "cancel"],        .post   => return some (← cancelEntry id)
+  | ["queue", id, "cancel"],        .post   =>
+    match principal with
+    | .client _ => return some (← cancelForClient id)
+    | .operator => return some (← cancelEntry id)
+  -- An API client's route alone: the operator queues over the socket, from a shell, and a
+  -- request made with the password would have no policy to be held to (`Orchestra.ApiClient`).
+  | ["queue"],                      .post   =>
+    match principal with
+    | .client c => return some (← queueForClient configPath c body)
+    | .operator =>
+      return some (.forbidden "POST /api/v1/queue is for API clients, each held to the policy in \
+its client file; queue as the operator with `orchestra queue add`")
   -- The interactive routes. None of them writes a file; each forwards to the daemon, which is
   -- the only process that can hold a live session. `POST /interactive` is the one route in this
   -- API that starts an agent — see the module docs.
@@ -1974,16 +2122,20 @@ private def revokeSession (st : ServeState) (id : String) : IO Unit := do
 private def requestSession (req : Request Body.Stream) : Option String :=
   (reqHeader req "cookie").bind (cookieValue · sessionCookieName)
 
-/-- Whether a request may reach the API: a valid session cookie, or the shared secret as a
-    bearer token. Both comparisons are constant-time. -/
-private def authenticated (st : ServeState) (req : Request Body.Stream) : IO Bool := do
+/-- Who a request is from: the operator, for a valid session cookie or the shared secret as a
+    bearer token; an API client, for a bearer token one of them holds; or nobody. Every
+    comparison is constant-time. -/
+private def authenticate (st : ServeState) (req : Request Body.Stream) : IO (Option Principal) := do
   if let some auth := reqHeader req "authorization" then
     if auth.startsWith "Bearer " then
-      if constantTimeEq (auth.drop "Bearer ".length).trimAscii.toString st.cfg.password then
-        return true
+      let token := (auth.drop "Bearer ".length).trimAscii.toString
+      if constantTimeEq token st.cfg.password then
+        return some .operator
+      if let some c ← ApiClient.authenticate token then
+        return some (.client c)
   if let some sid := requestSession req then
-    return ← sessionValid st sid
-  return false
+    if ← sessionValid st sid then return some .operator
+  return none
 
 private def cookieHeader (st : ServeState) (value : String) (maxAge : Nat) : String :=
   let attrs := s!"{sessionCookieName}={value}; HttpOnly; SameSite=Strict; Path=/; \
@@ -2020,7 +2172,12 @@ private def logoutHandler (st : ServeState) (req : Request Body.Stream)
     it discloses nothing but a boolean the caller could learn by trying any other endpoint. -/
 private def sessionHandler (st : ServeState) (req : Request Body.Stream)
     : Async (Response Body.Any) := do
-  jsonResp (Json.mkObj [("authenticated", Json.bool (← authenticated st req))])
+  -- The operator's question: the front-end asks it, and an API client's token opens nothing the
+  -- front-end could show.
+  let isOperator := match ← authenticate st req with
+    | some .operator => true
+    | _              => false
+  jsonResp (Json.mkObj [("authenticated", Json.bool isOperator)])
 
 /-! ## Static single-page-app serving -/
 
@@ -2148,13 +2305,13 @@ private def jsonContentType (req : Request Body.Stream) : Bool :=
     A `204` carries no body by definition, which is why it is built here rather than through
     `jsonResp`: an empty JSON document would be a body, and a client that reads one where the
     status promised none has been given something to misparse. -/
-private def writeResponse (kind : String) (method : Method) (body : String) :
-    Async (Option (Response Body.Any)) := do
+private def writeResponse (st : ServeState) (principal : Principal) (kind : String)
+    (method : Method) (body : String) : Async (Option (Response Body.Any)) := do
   -- A writer that throws must still produce a response, for the same reason a reader must: the
   -- store is a filesystem, and a full disk or a permission change is an ordinary runtime
   -- condition rather than a bug in the route.
   match ← (try
-      Except.ok <$> renderWrite method kind body
+      Except.ok <$> renderWrite st.cfg.configPath principal method kind body
     catch e => pure (Except.error (toString e))) with
   | .error e            => return some (← errorResp e .internalServerError)
   | .ok none            => return none
@@ -2166,6 +2323,8 @@ private def writeResponse (kind : String) (method : Method) (body : String) :
   | .ok (some .notFound)       => return some (← notFoundJsonResp)
   | .ok (some (.badRequest e)) => return some (← errorResp e .badRequest)
   | .ok (some (.conflict e))   => return some (← errorResp e .conflict)
+  | .ok (some (.forbidden e))  => return some (← errorResp e .forbidden)
+  | .ok (some (.tooManyRequests e)) => return some (← errorResp e .tooManyRequests)
 
 /-! ## SSE streaming -/
 
@@ -2389,7 +2548,8 @@ def apiVersion : String := "v1"
     is how the spec names them. -/
 def apiRoutes : Array (String × Array String) :=
   #[("overview",                 #["get"]),
-    ("queue",                    #["get"]),
+    ("queue",                    #["get", "post"]),
+    ("queue/{id}",               #["get"]),
     ("queue/{id}/cancel",        #["post"]),
     ("interactive",              #["get", "post"]),
     ("interactive/{id}",         #["get", "delete"]),
@@ -2438,6 +2598,23 @@ def apiKinds : Array String :=
 def publicPaths : Array String :=
   #["/api/login", "/api/logout", "/api/session", "/api/openapi.json"]
 
+/-- What an API client may reach (`Orchestra.ApiClient`): `none` for anything it may not, and
+    otherwise the entry id the route names, if it names one, for the ownership check.
+
+    Matched on method and path together, before any arm runs, for the reason the credential is
+    checked up front: a route a client can reach by omission is a route that was never meant for
+    it. Not `private`, so that `OrchestraTest.ApiClient` can pin exactly what it lets through. -/
+def clientRoute? (method : Method) (path : String) : Option (Option String) := do
+  let (kind, isSse) ← match apiKind s!"/api/{apiVersion}/" path with
+    | some k => pure (k, false)
+    | none   => (apiKind s!"/sse/{apiVersion}/" path).map (·, true)
+  let segs ← kindSegments kind
+  match segs, method with
+  | ["queue"], .post => if isSse then none else some none
+  | ["queue", id], .get => some (some id)
+  | ["queue", id, "cancel"], .post => if isSse then none else some (some id)
+  | _, _ => none
+
 /-- Everything the dashboard answers, in one place.
 
     The credential is required **first**, before any arm runs, with two exemptions: the four
@@ -2454,8 +2631,22 @@ private def route (st : ServeState) (req : Request Body.Stream) : Async (Respons
   let method := req.line.method
 
   let isSite := method == .get && !(path.startsWith "/api/") && !(path.startsWith "/sse/")
-  unless publicPaths.contains path || isSite || (← authenticated st req) do
+  let principal ← authenticate st req
+  unless publicPaths.contains path || isSite || principal.isSome do
     return ← unauthorizedResp
+  -- An API client reaches its few routes and nothing else, besides what needs no credential at
+  -- all; an entry it did not queue is a `404`, as if it did not exist, rather than a `403`
+  -- confirming that it does.
+  if let some (.client c) := principal then
+    unless publicPaths.contains path || isSite do
+      match clientRoute? method path with
+      | none =>
+        return ← errorResp "an API client may only queue tasks and read and cancel its own"
+          .forbidden
+      | some none => pure ()
+      | some (some id) =>
+        unless ← clientOwns c id do return ← notFoundJsonResp
+  let principal := principal.getD .operator
 
   if path == "/api/login" then
     unless method == .post do return ← methodNotAllowedResp
@@ -2500,7 +2691,7 @@ private def route (st : ServeState) (req : Request Body.Stream) : Async (Respons
     unless jsonContentType req do
       return ← errorResp "writes must be sent as application/json" .unsupportedMediaType
   let body : String ← req.body.readAll (maximumSize := some maxWriteBytes)
-  match ← writeResponse kind method body with
+  match ← writeResponse st principal kind method body with
   | some resp => return resp
   | none      => methodNotAllowedResp
 

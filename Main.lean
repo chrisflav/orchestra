@@ -1133,6 +1133,16 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
       kleisSpec     := entry.kleisSpec
       kleisRoleSpec := entry.kleisRoleSpec
       kleisNarrow   := entry.kleisNarrow
+      -- And within the same bounds. Without these a read-only review retried as the default — a
+      -- writable task holding `create_pr`, on the default budget — and an entry an API client
+      -- queued came back as one the client could neither see nor cancel.
+      tools         := entry.tools
+      readOnly      := entry.readOnly
+      budget        := entry.budget
+      memory        := entry.memory
+      issueNumber   := entry.issueNumber
+      prLabels      := entry.prLabels
+      apiClient     := entry.apiClient
     }
     Queue.saveEntry newEntry
     IO.println newEntry.id

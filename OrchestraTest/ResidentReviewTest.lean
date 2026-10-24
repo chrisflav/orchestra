@@ -279,7 +279,7 @@ def aSessionsTokensAreRecordedUntilRevoked : Test := do
   TestM.assertEqual (kept.map (·.2)).toList ["rev-2"] (msg := "not forgotten until revoked")
 
 @[test]
-def theSessionTokenMigrationIsTheLatest : Test := do
-  TestM.assertEqual ((Store.migrations.map (·.name)).getLast?) (some "0009_session_tokens")
+def theSessionTokenMigrationIsApplied : Test := do
+  TestM.assert ((Store.migrations.map (·.name)).contains "0009_session_tokens")
 
 end OrchestraTest.ResidentReview

@@ -223,6 +223,15 @@ structure QueueEntry where
       its own issue and project (`Config.IOTask.scopeRoot`). Set only on an entry `queue_task`
       created, where it holds the queueing task's own scope. -/
   scopeRoot : Option Taxis.IssueId := none
+  /-- The API client (`Orchestra.ApiClient`) that queued this entry over HTTP, when one did.
+
+      Provenance, and the ownership check behind the client's own routes: a client may read and
+      cancel the entries carrying its name and no others. -/
+  apiClient : Option String := none
+  /-- The client's own id for this piece of work, unique per client. Queueing the same one twice
+      answers the entry already there rather than queueing a second, so a client that retries a
+      request whose answer it never received cannot double the work. -/
+  externalId : Option String := none
 
 /-- The pool this entry draws its workspace slot from.
 
@@ -284,6 +293,8 @@ instance : ToJson QueueEntry where
     let fields := if let some p := e.spawnPolicy  then fields ++ [("spawn_policy",  ToJson.toJson p)] else fields
     let fields := if let some s := e.spawnedBy    then fields ++ [("spawned_by",    Json.str s)]      else fields
     let fields := if let some r := e.scopeRoot    then fields ++ [("scope_root",    ToJson.toJson r)]  else fields
+    let fields := if let some s := e.apiClient    then fields ++ [("api_client",    Json.str s)]      else fields
+    let fields := if let some s := e.externalId   then fields ++ [("external_id",   Json.str s)]      else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -342,13 +353,15 @@ instance : FromJson QueueEntry where
     let spawnPolicy  := (parseSpawnPolicy? j).toOption.getD none
     let spawnedBy    := j.getObjValAs? String "spawned_by"       |>.toOption
     let scopeRoot    := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
+    let apiClient    := j.getObjValAs? String "api_client"       |>.toOption
+    let externalId   := j.getObjValAs? String "external_id"      |>.toOption
     return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec, kleisNarrow,
              authSource, resolvedAuthSource, authSources, authMode, tools,
              readOnly, priority, concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
-             listenerName, spawnPolicy, spawnedBy, scopeRoot }
+             listenerName, spawnPolicy, spawnedBy, scopeRoot, apiClient, externalId }
 
 -- Directories and paths
 
@@ -433,7 +446,9 @@ def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
     listener_name        := e.listenerName
     spawn_policy         := e.spawnPolicy.map Store.jsonColumn
     spawned_by           := e.spawnedBy
-    scope_root           := Store.issueIdColumn e.scopeRoot }
+    scope_root           := Store.issueIdColumn e.scopeRoot
+    api_client           := e.apiClient
+    external_id          := e.externalId }
 
 /-- The entry a row holds, or why this build cannot read it.
 
@@ -512,7 +527,9 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
            listenerName := row.listener_name
            spawnPolicy
            spawnedBy := row.spawned_by
-           scopeRoot }
+           scopeRoot
+           apiClient := row.api_client
+           externalId := row.external_id }
 
 /-- The concert run as a row of the `concert_run` table. -/
 def ConcertRun.toRow (r : ConcertRun) : Store.ConcertRunRow :=
@@ -707,6 +724,46 @@ def countSpawnedBy (taskId : String) : IO Nat := do
   let n ← Store.run <| HasModel.count <| query% do
     let e ← from Store.QueueEntryRow
     guard e.spawned_by = some taskId
+    select e
+  return n.toNat
+
+open Db.Query.DSL in
+/-- The entry `client` queued under `externalId`, if it has queued one. At most one exists: the
+    pair is unique (`idx_queue_entry_client_external_id`). -/
+def findByExternalId (client externalId : String) : IO (Option QueueEntry) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.api_client = some client
+    guard e.external_id = some externalId
+    select e
+  return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
+
+open Db.Query.DSL in
+/-- The entry that continues the run `taskId`, if one has been queued: a restart resume, or a
+    retry of an interrupted run. Newest first, since a run can be retried more than once. With
+    `client`, only an entry that client queued: an operator's `--continues` of a client's run is
+    not the client's, and would point it at an entry it cannot read. -/
+def continuationOf (taskId : String) (client : Option String := none) :
+    IO (Option QueueEntry) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.continues_from = some taskId
+    select e
+    order_by_desc e.created_at
+    order_by_desc e.id
+  let entries ← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows
+  return match client with
+    | some c => entries.find? (·.apiClient == some c)
+    | none   => entries[0]?
+
+open Db.Query.DSL in
+/-- How many of `client`'s entries are pending or running: what `ApiClient.maxActive` bounds. -/
+def countActiveOfClient (client : String) : IO Nat := do
+  let n ← Store.run <| HasModel.count <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.api_client = some client
+    guard e.status = Store.enumColumn QueueStatus.pending
+       ∨ e.status = Store.enumColumn QueueStatus.running
     select e
   return n.toNat
 
@@ -990,7 +1047,7 @@ def daemonRunning : IO Bool := do
     iterates over a snapshot from `pendingEntries`, and a worker can claim and start any entry in
     that snapshot while the loop is still running; writing the snapshot's version back would
     stamp `cancelled` onto an entry that is at that moment executing. -/
-private def cancelIfStillPending (id : String) : IO Bool := do
+def cancelIfStillPending (id : String) : IO Bool := do
   let some cur ← loadEntry id | return false
   if cur.status != .pending then return false
   saveEntry { cur with status := .cancelled }
@@ -1293,6 +1350,8 @@ structure ResumeFacts where
       sending it again in the middle would read as a new instruction.
     * `spawnedBy`: the resume was queued by the daemon, not by the spawning task, and carrying it
       would spend that task's allowance a second time for the same piece of work.
+    * `externalId`: it is unique per client and names the entry the client queued, which keeps
+      it. `apiClient` is carried, so the client can still read and cancel the work it asked for.
     * The concert fields, the slot, the task id and the output, which belong to the dead run. -/
 def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (facts : ResumeFacts)
     (id createdAt : String) : Except String QueueEntry := do
@@ -1346,7 +1405,8 @@ def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (facts :
     triageRemoveLabels := entry.triageRemoveLabels
     listenerName  := entry.listenerName
     spawnPolicy   := entry.spawnPolicy
-    scopeRoot     := entry.scopeRoot }
+    scopeRoot     := entry.scopeRoot
+    apiClient     := entry.apiClient }
 
 /-- Queue a restart resume (`resumeEntryFor`) for each entry recorded in `interruptedFile`, and
     answer how many were queued. The caller decides whether to call this at all: only with

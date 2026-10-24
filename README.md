@@ -293,7 +293,7 @@ orchestra separates configuration from state:
 
 | Path | Contents |
 | --- | --- |
-| `$XDG_CONFIG_HOME/orchestra/` (or `~/.config/orchestra/`) | `config.json`, `secrets.json`, `prompts/`, `listeners/`, `roles/`, `skills/`, `identities/` |
+| `$XDG_CONFIG_HOME/orchestra/` (or `~/.config/orchestra/`) | `config.json`, `secrets.json`, `prompts/`, `listeners/`, `roles/`, `skills/`, `identities/`, `clients/` |
 | `$XDG_DATA_HOME/orchestra/` (or `~/.local/share/orchestra/`) | `orchestra.db`, clones, logs, per-project role overrides, per-identity memory |
 
 The records — task history, queue entries, concert runs, interactive sessions and their
@@ -1542,8 +1542,9 @@ curl -H "Authorization: Bearer $PASSWORD" \
 
 Three resources are configuration, and all three are writable: **listeners**, **roles** and
 **skills**. Everything else the API serves is a record of something that already happened, or is
-owned by another system, and stays read-only. Nothing here enqueues a *task* — the queue is fed
-over the daemon's control socket, which is not on the network at all.
+owned by another system, and stays read-only. The operator's credential enqueues no *task* — the
+queue is fed over the daemon's control socket, which is not on the network at all. The one route
+that queues work is for [API clients](#queueing-over-http), each held to a policy of its own.
 
 Some routes are actions rather than documents. None of them writes a file; each forwards a single
 message to that same control socket, which is where the CLI sends its own. `POST
@@ -1613,6 +1614,84 @@ What a write costs: a listener change takes effect on that listener's next tick,
 *added* or *deleted* within fifteen seconds, which is how often the daemon rescans the directory.
 A role change takes effect on the dispatcher's next tick, since roles are read per dispatch. A
 skill change applies to tasks launched after it. Nothing here needs a restart.
+
+### queueing over HTTP
+
+Another system — a review platform asking for a review of one pull request, say — can put tasks
+on the queue with `POST /api/v1/queue`. It does so as an **API client**, never with the dashboard
+password: the password can rewrite every listener and read every run, which is far more than
+something that only queues work should hold. A client is a file, `<config>/clients/<name>.json`:
+
+```json
+{
+  "token": "{{review_platform_token}}",
+  "backend": "claude",
+  "model": "sonnet",
+  "read_only": true,
+  "kleis_spec": "reviewer",
+  "queue_policy": {
+    "repos": ["acme/widgets"],
+    "models": ["opus"],
+    "max_budget": 3.0,
+    "priority": 20
+  },
+  "max_active": 20
+}
+```
+
+- `token` — a `{{secret}}` reference into `secrets.json`, never the token itself, at least 32
+  characters (`openssl rand -hex 32`). The client sends it as `Authorization: Bearer <token>`.
+- `backend`, `model`, `tools`, `read_only`, `kleis_spec`, `kleis_narrow` — what a task the client
+  queues gets when the request names nothing.
+- `queue_policy` — a [`spawn_policy`](docs/queue-task.md), with the rules the `queue_task` tool is
+  held to: the client's own fields play the spawning task, and the policy says what a request may
+  name instead. `max_tasks` and `allow_pre_claim` are refused here: a client has no run to count
+  over, and cannot bind a taxis issue.
+- `max_active` — how many of the client's entries may be pending or running at once (default
+  `10`); past it a request is a `429`.
+
+The client file is read on every request, so adding, changing or removing one needs no restart.
+
+```sh
+curl -X POST -H "Authorization: Bearer $CLIENT_TOKEN" -H 'Content-Type: application/json' \
+     --data '{"prompt": "Review pull request #7.", "upstream": "acme/widgets",
+              "issue_number": 7, "external_id": "review-job-381"}' \
+     http://127.0.0.1:8080/api/v1/queue
+# → 201, and the queue entry
+```
+
+A request may carry `prompt` (required), `goal`, `upstream`, `backend`, `model`, `tools`,
+`budget` (at least 0.01), `issue_number`, `external_id` and `kleis_narrow`; any other field is a
+`400`, so a `priority` or a `fork` the client believes it set is never silently ignored. What it
+never chooses:
+
+- **its kleis source** — every task a client queues derives its token from the client's
+  `kleis_spec` (a client file without one leaves its tasks to `kleis.default_spec`, so set one);
+  a request may add narrowings and nothing else. `issue_number` becomes the token's
+  `task_issue` fact, which is what lets a kleis grant confine a review task to its own pull
+  request.
+- **the fork** — a read-only task works in the upstream itself, as the auto-reviewer does; a
+  writable one gets its fork by the rule every other dispatch path uses.
+- **the priority** — the policy's.
+- **a series** — a series is a name the operator's own runs share, and `orchestra resume`
+  continues whatever task its pointer names.
+
+`external_id` is the client's own id for the work, unique per client. Asking again with one the
+client has already queued answers that entry with `200` and queues nothing, so a client that
+never received an answer can simply retry. The entry is handed to the daemon as the same `add_task`
+message `orchestra queue add` sends, so the daemon stays the one writer of the queue.
+
+A client reaches three more routes, and only for entries it queued — anyone else's is a `404`:
+`GET /api/v1/queue/{id}`, its stream at `/sse/v1/queue/{id}`, which is how a client follows its
+work to the end, and `POST /api/v1/queue/{id}/cancel`, which stops a running entry and withdraws a
+pending one. A run a daemon restart interrupted ends `unfinished` and is carried on under a new
+id (so is one `orchestra queue retry` picks up after an interrupted run); the entry's
+`continuedBy` names it, and it carries the client's name, so the client may read
+and cancel it too.
+`orchestra queue retry` keeps a client's entries the client's, with the tools, budget and
+read-only flag they were queued with. Every other route answers a client `403`,
+and `POST /api/v1/queue` answers the password `403` in turn: the operator queues from a shell, and
+a request made with the password would have no policy to be held to.
 
 ## native app
 

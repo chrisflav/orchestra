@@ -63,6 +63,8 @@ narrowing needs a source; on the legacy mint, which cannot narrow, it is an erro
 | identity (`identity.json`) | yes | yes, usually as `{{secret}}`, substituted when the record is read | yes |
 | role | yes | no | yes |
 | listener action | yes | no | yes |
+| API client (`clients/<name>.json`), as the queued task's own | yes | no | yes |
+| `POST /api/v1/queue` request | no — the client's | no | yes, added to the client's |
 | `queue_task` | no — inherited | no — inherited | yes, added to what is inherited |
 
 A task's `kleis_token` is held as the reference and never as the token: a task is stored in the
