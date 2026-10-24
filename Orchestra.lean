@@ -26,6 +26,7 @@ import Orchestra.Repo
 import Orchestra.RepoConfig
 import Orchestra.Sandbox
 import Orchestra.Spawn
+import Orchestra.ApiClient
 import Orchestra.Dashboard
 import Orchestra.Server
 import Orchestra.StreamFormat

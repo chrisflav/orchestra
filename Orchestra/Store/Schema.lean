@@ -8,6 +8,7 @@ import Orchestra.Store.Migrations.ResidentSessions
 import Orchestra.Store.Migrations.ResidentFeeds
 import Orchestra.Store.Migrations.ResidentRuntime
 import Orchestra.Store.Migrations.SessionTokens
+import Orchestra.Store.Migrations.ApiClients
 
 /-!
 # The shape of orchestra's database
@@ -143,6 +144,10 @@ structure QueueEntryRow where
   kleis_spec : Option String
   kleis_role_spec : Option String
   kleis_narrow : Option String
+  /-- The API client that queued the entry over HTTP, and its own id for it (`Orchestra.ApiClient`).
+      The pair is unique, which is what makes queueing the same work twice answer the first entry. -/
+  api_client : Option String
+  external_id : Option String
   deriving Repr
 
 /-- Where a running task has got to, for a daemon that picks the task up after a restart instead of
@@ -374,7 +379,10 @@ def target : DatabaseRecipe :=
          { name := "idx_queue_entry_spawned_by", keys := [{ column := .spawned_by }] },
          { name := "idx_queue_entry_listener_name", keys := [{ column := .listener_name }] },
          { name := "idx_queue_entry_project_id", keys := [{ column := .project_id }] },
-         { name := "idx_queue_entry_issue_id", keys := [{ column := .issue_id }] }])
+         { name := "idx_queue_entry_issue_id", keys := [{ column := .issue_id }] },
+         { name := "idx_queue_entry_client_external_id",
+           keys := [{ column := .api_client }, { column := .external_id }],
+           unique := true }])
     |>.withIndexes "concert_run" (tableIndexes ConcertRunRowIndex
         [{ name := "idx_concert_run_started_at_id",
            keys := [{ column := .started_at, direction := .desc },
@@ -411,6 +419,7 @@ def migrations : List Db.Migration.Migration :=
    Orchestra.Store.Migrations.migration_0006_resident_sessions,
    Orchestra.Store.Migrations.migration_0007_resident_feeds,
    Orchestra.Store.Migrations.migration_0008_resident_runtime,
-   Orchestra.Store.Migrations.migration_0009_session_tokens]
+   Orchestra.Store.Migrations.migration_0009_session_tokens,
+   Orchestra.Store.Migrations.migration_0010_api_clients]
 
 end Orchestra.Store
