@@ -739,6 +739,18 @@ def findByExternalId (client externalId : String) : IO (Option QueueEntry) := do
   return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
 
 open Db.Query.DSL in
+/-- The entry that continues the run `taskId`, if one has been queued: a restart resume, or
+    `orchestra queue retry`. Newest first, since a run can be retried more than once. -/
+def continuationOf (taskId : String) : IO (Option QueueEntry) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let e ← from Store.QueueEntryRow
+    guard e.continues_from = some taskId
+    select e
+    order_by_desc e.created_at
+    order_by_desc e.id
+  return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
+
+open Db.Query.DSL in
 /-- How many of `client`'s entries are pending or running: what `ApiClient.maxActive` bounds. -/
 def countActiveOfClient (client : String) : IO Nat := do
   let n ← Store.run <| HasModel.count <| query% do
@@ -1029,7 +1041,7 @@ def daemonRunning : IO Bool := do
     iterates over a snapshot from `pendingEntries`, and a worker can claim and start any entry in
     that snapshot while the loop is still running; writing the snapshot's version back would
     stamp `cancelled` onto an entry that is at that moment executing. -/
-private def cancelIfStillPending (id : String) : IO Bool := do
+def cancelIfStillPending (id : String) : IO Bool := do
   let some cur ← loadEntry id | return false
   if cur.status != .pending then return false
   saveEntry { cur with status := .cancelled }

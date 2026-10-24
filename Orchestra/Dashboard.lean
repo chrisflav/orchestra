@@ -817,9 +817,16 @@ private def queueApi (p : Page) : IO Json := do
   let (entries, total) ← Queue.entriesPage p.since p.skip p.size
   return collection p total (entries.map queueEntryJson)
 
-/-- One entry, by its own id or the id of the run it became (as `queue/{id}/cancel` takes it). -/
+/-- One entry, by its own id or the id of the run it became (as `queue/{id}/cancel` takes it),
+    with `continuedBy`: the entry that carries its run on, when a restart resume or a retry has
+    queued one. That is how a client that only knows the id it was given follows its work past
+    an interrupted run, which ends `unfinished` and is continued under a new id. -/
 private def queueEntryDetailApi (id : String) : IO (Option Json) := do
-  return (← Queue.findEntry id).map queueEntryJson
+  let some e ← Queue.findEntry id | return none
+  let next ← match e.taskId with
+    | some tid => pure ((← Queue.continuationOf tid).map (·.id))
+    | none     => pure none
+  return some ((queueEntryJson e).setObjVal! "continuedBy" (optStr next))
 
 private def concertsApi (p : Page) : IO Json := do
   let (runs, total) ← Queue.concertRunsPage p.since p.skip p.size
@@ -1726,32 +1733,14 @@ the task record still said running and has been marked unfinished"
       ("taskId", optStr entry.taskId)
     ])
 
-/-- Queue a task for API client `c` (`Orchestra.ApiClient`). The body is a queue request; the
-    answer is the entry, `201` when this call queued it and `200` when the client had already
-    queued one under the same `external_id`.
+/-- The lock `queueForClient` counts and queues under. -/
+private initialize clientQueueLock : Std.BaseMutex ← Std.BaseMutex.new
 
-    Everything the client may choose is checked against its policy before anything else happens,
-    and the entry is then handed to the daemon as `add_task` over its socket — the message
-    `orchestra queue add` sends — so this server never writes a queue entry itself.
-
-    `max_active` is checked against the queue as it stands, and two requests arriving together
-    can both pass it; it bounds how far a client can run ahead of the queue, not an exact count.
-    `external_id` has no such gap: the pair is unique in the store, so the second of two racing
-    requests fails to be saved, and is answered with the first one's entry. -/
-private def queueForClient (configPath : Option System.FilePath) (c : ApiClient.ApiClient)
-    (body : String) : IO WriteResult := do
-  let some j := (Json.parse body).toOption | return .badRequest "the body is not JSON"
-  let r ← match ApiClient.parseRequest j with
-    | .error e => return .badRequest e
-    | .ok r    => pure r
-  let resolved ← match c.resolve r with
-    | .error e => return .badRequest e
-    | .ok x    => pure x
-  let existing : IO (Option Json) := do
-    match r.externalId with
-    | none     => return none
-    | some ext => return (← Queue.findByExternalId c.name ext).map queueEntryJson
-  if let some e ← existing then return .ok e
+/-- The half of `queueForClient` that runs under `clientQueueLock`: count the client's active
+    entries, resolve a fork if the task needs one, and hand the entry to the daemon. -/
+private def queueLocked (configPath : Option System.FilePath) (c : ApiClient.ApiClient)
+    (r : ApiClient.QueueRequest) (resolved : ResolvedSpawn) (existing : IO (Option Json)) :
+    IO WriteResult := do
   let active ← Queue.countActiveOfClient c.name
   if active ≥ c.maxActive then
     return .tooManyRequests s!"client '{c.name}' already has {active} task(s) pending or running, \
@@ -1780,6 +1769,53 @@ could not fork it"
     -- one with the same `external_id`; if so, that one's entry is the answer to both.
     if let some e ← existing then return .ok e
     return .conflict why
+
+/-- Queue a task for API client `c` (`Orchestra.ApiClient`). The body is a queue request; the
+    answer is the entry, `201` when this call queued it and `200` when the client had already
+    queued one under the same `external_id`.
+
+    Everything the client may choose is checked against its policy before anything else happens,
+    and the entry is then handed to the daemon as `add_task` over its socket — the message
+    `orchestra queue add` sends — so this server never writes a queue entry itself.
+
+    `max_active` is counted and the entry queued under one lock, so parallel requests cannot all
+    pass the same count. `external_id` is also held by the store: the pair is unique, so the
+    second of two racing requests fails to be saved and is answered with the first one's entry. -/
+private def queueForClient (configPath : Option System.FilePath) (c : ApiClient.ApiClient)
+    (body : String) : IO WriteResult := do
+  let some j := (Json.parse body).toOption | return .badRequest "the body is not JSON"
+  let r ← match ApiClient.parseRequest j with
+    | .error e => return .badRequest e
+    | .ok r    => pure r
+  let existing : IO (Option Json) := do
+    match r.externalId with
+    | none     => return none
+    | some ext => return (← Queue.findByExternalId c.name ext).map queueEntryJson
+  -- Before the policy: a retry of work already queued is answered with that work, even if the
+  -- policy has been tightened since — that is the promise `external_id` makes.
+  if let some e ← existing then return .ok e
+  let resolved ← match c.resolve r with
+    | .error e => return .badRequest e
+    | .ok x    => pure x
+  -- One lock for every client rather than one each: queueing is a socket round trip, and the
+  -- only slow part, resolving a fork, is rare (read-only tasks need none).
+  clientQueueLock.lock
+  try queueLocked configPath c r resolved existing
+  finally clientQueueLock.unlock
+
+/-- Cancel for an API client: a running entry is stopped by the daemon, as for the operator, and
+    a pending one is withdrawn — which is the case a client has most often, since it is what
+    `max_active` counts.
+
+    Withdrawn with the re-read guard the queue's cascade uses (`Queue.cancelIfStillPending`). The
+    daemon claims entries in its own process, so a claim can still land between that read and
+    the write; the run then goes ahead, and its own status overwrites `cancelled` when it ends. -/
+private def cancelForClient (id : String) : IO WriteResult := do
+  let some entry ← Queue.findEntry id | return .notFound
+  if entry.status == .pending then
+    if ← Queue.cancelIfStillPending entry.id then
+      return .ok (Json.mkObj [("id", Json.str entry.id), ("taskId", optStr entry.taskId)])
+  cancelEntry id
 
 /-- Whether client `c` may act on the entry `id` names: only on one it queued. -/
 private def clientOwns (c : ApiClient.ApiClient) (id : String) : IO Bool := do
@@ -1998,7 +2034,10 @@ PUT /api/v1/listeners/{name}")
   -- Not a resource: an action on one running entry, which is why it is a `POST` to a verb
   -- under it rather than a `PUT` to a thing. The body carries nothing — the entry is named by
   -- the path, and there is no second argument to give.
-  | ["queue", id, "cancel"],        .post   => return some (← cancelEntry id)
+  | ["queue", id, "cancel"],        .post   =>
+    match principal with
+    | .client _ => return some (← cancelForClient id)
+    | .operator => return some (← cancelEntry id)
   -- An API client's route alone: the operator queues over the socket, from a shell, and a
   -- request made with the password would have no policy to be held to (`Orchestra.ApiClient`).
   | ["queue"],                      .post   =>

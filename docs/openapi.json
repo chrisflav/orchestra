@@ -746,9 +746,8 @@
                   "backend": { "type": "string", "description": "One the policy's `backends` lists; omitted, the client's own." },
                   "model": { "type": "string", "description": "One the policy's `models` lists; omitted, the client's own." },
                   "tools": { "type": "array", "items": { "type": "string" }, "description": "Optional tools, each held by the client or listed in its policy. Omitted, the client's own; `[]`, none." },
-                  "budget": { "type": "number", "description": "USD, at most the policy's `max_budget`, which is also the default. Refused when the policy sets none." },
+                  "budget": { "type": "number", "minimum": 0.01, "description": "USD, at least 0.01 and at most the policy's `max_budget`, which is also the default. Refused when the policy sets none." },
                   "issue_number": { "type": "integer", "minimum": 0, "description": "The GitHub issue or pull request of `upstream` the task is about; it is the `task_issue` fact on the task's kleis token." },
-                  "series": { "type": "string", "description": "The series the run belongs to." },
                   "external_id": { "type": "string", "minLength": 1, "maxLength": 200, "description": "The client's own id for this work, unique per client." },
                   "kleis_narrow": { "type": "array", "items": { "type": "string" }, "description": "Narrowings added to the client's own on the task's kleis token." }
                 }
@@ -784,7 +783,7 @@
       "get": {
         "tags": ["queue"],
         "summary": "One queue entry",
-        "description": "The entry this id names: a queue entry's id, or the id of the run it became. An API client may read only the entries it queued; anyone else's is a `404`, as if it did not exist. Also a stream at `/sse/v1/queue/{id}`, which is how a client follows its work to the end.",
+        "description": "The entry this id names: a queue entry's id, or the id of the run it became, with `continuedBy` \u2014 the entry that carries its run on, when a restart resume or `orchestra queue retry` has queued one. An API client may read only the entries it queued; anyone else's is a `404`, as if it did not exist. Also a stream at `/sse/v1/queue/{id}`, which is how a client follows its work to the end.",
         "operationId": "getQueueEntry",
         "parameters": [
           {
@@ -798,9 +797,25 @@
         "responses": {
           "200": {
             "description": "The entry.",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueEntry" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/QueueEntry" },
+                    {
+                      "type": "object",
+                      "required": ["continuedBy"],
+                      "properties": {
+                        "continuedBy": { "type": ["string", "null"], "description": "The id of the entry that continues this one's run, if any." }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
@@ -809,7 +824,7 @@
       "post": {
         "tags": ["queue"],
         "summary": "Cancel one running task",
-        "description": "Asks the queue daemon to stop the task this id names, and only that one. Everything else it is running carries on, the queue is untouched, and the entry lands as `cancelled` \u2014 which `orchestra queue retry` re-enqueues.\n\nThe id may be a queue entry's id or the id of the run it became; both are ids this API hands out for the same piece of work. The request carries no arguments beyond it \u2014 the body is an empty JSON object \u2014 because only the daemon holds the cancellation token, and naming the entry is the whole of what it needs.\n\nAn API client may cancel the entries it queued, and no others; anyone else's is a `404`.\n\n`404` if no entry and no run carries the id. `409` if it exists and is not running, naming the status it is in; `409` also if the daemon is not running or did not answer, which is a statement about the daemon rather than about this server. The status the entry ends in is written by the worker that was running it, as it lands, not here.\n\nOne exception, and it is a repair rather than a verdict: a `409` for an entry that is not running also marks the run's own record `unfinished` if that record still says `running`. The two halves can disagree when a worker died without landing its task \u2014 the entry is repaired on the daemon's next sweep, the record was not \u2014 and the reply says so when it has closed that gap.",
+        "description": "Asks the queue daemon to stop the task this id names, and only that one. Everything else it is running carries on, the queue is untouched, and the entry lands as `cancelled` \u2014 which `orchestra queue retry` re-enqueues.\n\nThe id may be a queue entry's id or the id of the run it became; both are ids this API hands out for the same piece of work. The request carries no arguments beyond it \u2014 the body is an empty JSON object \u2014 because only the daemon holds the cancellation token, and naming the entry is the whole of what it needs.\n\nAn API client may cancel the entries it queued, and no others; anyone else's is a `404`. For a client, a pending entry is withdrawn (it lands as `cancelled`) rather than refused with a `409`.\n\n`404` if no entry and no run carries the id. `409` if it exists and is not running, naming the status it is in; `409` also if the daemon is not running or did not answer, which is a statement about the daemon rather than about this server. The status the entry ends in is written by the worker that was running it, as it lands, not here.\n\nOne exception, and it is a repair rather than a verdict: a `409` for an entry that is not running also marks the run's own record `unfinished` if that record still says `running`. The two halves can disagree when a worker died without landing its task \u2014 the entry is repaired on the daemon's next sweep, the record was not \u2014 and the reply says so when it has closed that gap.",
         "operationId": "cancelTask",
         "parameters": [
           {
@@ -845,6 +860,7 @@
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": {
             "description": "The task is not running, or the queue daemon is not.",

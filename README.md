@@ -1661,17 +1661,20 @@ curl -X POST -H "Authorization: Bearer $CLIENT_TOKEN" -H 'Content-Type: applicat
 ```
 
 A request may carry `prompt` (required), `goal`, `upstream`, `backend`, `model`, `tools`,
-`budget`, `issue_number`, `series`, `external_id` and `kleis_narrow`; any other field is a `400`,
-so a `priority` or a `fork` the client believes it set is never silently ignored. What it never
-chooses:
+`budget` (at least 0.01), `issue_number`, `external_id` and `kleis_narrow`; any other field is a
+`400`, so a `priority` or a `fork` the client believes it set is never silently ignored. What it
+never chooses:
 
 - **its kleis source** — every task a client queues derives its token from the client's
-  `kleis_spec`; a request may add narrowings and nothing else. `issue_number` becomes the token's
+  `kleis_spec` (a client file without one leaves its tasks to `kleis.default_spec`, so set one);
+  a request may add narrowings and nothing else. `issue_number` becomes the token's
   `task_issue` fact, which is what lets a kleis grant confine a review task to its own pull
   request.
 - **the fork** — a read-only task works in the upstream itself, as the auto-reviewer does; a
   writable one gets its fork by the rule every other dispatch path uses.
 - **the priority** — the policy's.
+- **a series** — a series is a name the operator's own runs share, and `orchestra resume`
+  continues whatever task its pointer names.
 
 `external_id` is the client's own id for the work, unique per client. Asking again with one the
 client has already queued answers that entry with `200` and queues nothing, so a client that
@@ -1680,7 +1683,12 @@ message `orchestra queue add` sends, so the daemon stays the one writer of the q
 
 A client reaches three more routes, and only for entries it queued — anyone else's is a `404`:
 `GET /api/v1/queue/{id}`, its stream at `/sse/v1/queue/{id}`, which is how a client follows its
-work to the end, and `POST /api/v1/queue/{id}/cancel`. Every other route answers a client `403`,
+work to the end, and `POST /api/v1/queue/{id}/cancel`, which stops a running entry and withdraws a
+pending one. A run a daemon restart interrupted ends `unfinished` and is carried on under a new
+id; the entry's `continuedBy` names it, and it carries the client's name, so the client may read
+and cancel it too.
+`orchestra queue retry` keeps a client's entries the client's, with the tools, budget and
+read-only flag they were queued with. Every other route answers a client `403`,
 and `POST /api/v1/queue` answers the password `403` in turn: the operator queues from a shell, and
 a request made with the password would have no policy to be held to.
 

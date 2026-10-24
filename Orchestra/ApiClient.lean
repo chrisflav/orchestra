@@ -56,7 +56,8 @@ Two fields of a spawn policy mean something different for a client, and are hand
 
 Its kleis source. The client's `kleis_spec` is what every task it queues derives its token from,
 as a spawning task's source is inherited by what it queues; a request may add narrowings
-(`kleis_narrow`) and never name another source. Nor does a request choose the fork: a read-only
+(`kleis_narrow`) and never name another source. A client file without one leaves its tasks to
+`kleis.default_spec`, like any task with no source of its own — set one. Nor does a request choose the fork: a read-only
 task works in the upstream itself, as the auto-reviewer does, and a writable one gets its fork
 resolved by the same rule every other dispatch path uses (`GitHub.resolveFork`).
 
@@ -205,12 +206,19 @@ def loadAllClients : IO (Array ApiClient) := do
   return out
 
 /-- The client `token` belongs to, if any. Every client is compared, in constant time each, so
-    the answer takes as long for the first client as for none. -/
+    the answer takes as long for the first client as for none.
+
+    A token two clients share names neither: which of them a request came from would depend on
+    the order the directory happens to list, and so would every policy it is held to. -/
 def authenticate (token : String) : IO (Option ApiClient) := do
-  let mut found := none
+  let mut found : Array ApiClient := #[]
   for c in ← loadAllClients do
-    if Secret.constantTimeEq c.token token then found := some c
-  return found
+    if Secret.constantTimeEq c.token token then found := found.push c
+  if found.size > 1 then
+    IO.eprintln s!"[clients] {String.intercalate ", " (found.map (·.name)).toList} share a \
+token; refusing it for all of them"
+    return none
+  return found[0]?
 
 /-! ## Queueing -/
 
@@ -220,12 +228,11 @@ structure QueueRequest where
   spawn       : SpawnRequest
   goal        : Option String := none
   issueNumber : Option Nat := none
-  series      : Option String := none
   externalId  : Option String := none
 deriving Inhabited
 
 private def requestKeys : List String :=
-  ["prompt", "goal", "upstream", "backend", "model", "tools", "budget", "issue_number", "series",
+  ["prompt", "goal", "upstream", "backend", "model", "tools", "budget", "issue_number",
    "external_id", "kleis_narrow"]
 
 /-- Read a queue request out of a request body, strictly: an unknown field is refused, because a
@@ -261,7 +268,12 @@ def parseRequest (j : Json) : Except String QueueRequest := do
   let budget ← match j.getObjVal? "budget" with
     | .error _ | .ok .null => pure none
     | .ok v => match v.getNum? with
-      | .ok n => pure (some n.toFloat)
+      | .ok n =>
+        -- A floor as well as the policy's ceiling, as for an interactive session: a budget under
+        -- a cent reaches the agent as `--max-budget-usd 0.000000`, a run that clones, mints a
+        -- token and launches a sandbox in order to refuse its first turn.
+        if n.toFloat < 0.01 then .error "'budget' must be at least 0.01 USD"
+        else pure (some n.toFloat)
       | .error _ => .error "'budget' must be a number of USD"
   let issueNumber ← match j.getObjVal? "issue_number" with
     | .error _ | .ok .null => pure none
@@ -270,16 +282,17 @@ def parseRequest (j : Json) : Except String QueueRequest := do
       | .error _ => .error "'issue_number' must be a whole number"
   if issueNumber.isSome && repo.isNone then
     .error "'issue_number' names an issue or pull request, which needs an 'upstream' to be one of"
+  -- No `series`: a series is a name the operator's own runs share, and a client naming one would
+  -- move its pointer to the client's task, which `orchestra resume` then continues outside the
+  -- client's policy.
   let goal ← optString j "goal" "the request"
-  let series ← optString j "series" "the request"
-  if let some s := series then Utils.checkConfigName "series" s
   let externalId ← optString j "external_id" "the request"
   if let some e := externalId then
     if e.trimAscii.isEmpty || e.length > 200 then
       .error "'external_id' must be between 1 and 200 characters"
   let kleisNarrow ← parseKleisNarrow? j
   return { spawn := { prompt, backend, model, tools, repo, budget, kleisNarrow }
-         , goal, issueNumber, series, externalId }
+         , goal, issueNumber, externalId }
 
 /-- Check `r` against the client's policy and fill in everything it left out. Pure. -/
 def ApiClient.resolve (c : ApiClient) (r : QueueRequest) : Except String ResolvedSpawn :=
@@ -307,7 +320,6 @@ def ApiClient.entry (c : ApiClient) (r : QueueRequest) (resolved : ResolvedSpawn
   , budget := resolved.budget
   , readOnly := resolved.readOnly
   , priority := resolved.priority
-  , series := r.series
   , issueNumber := r.issueNumber
   , kleisSpec := resolved.kleisSpec
   , kleisNarrow := resolved.kleisNarrow

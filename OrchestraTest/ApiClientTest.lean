@@ -113,6 +113,18 @@ def anUnknownRequestFieldIsRefused : Test := do
   | .error e => TestM.assert (mentions e "priority") e
 
 @[test]
+def aSeriesIsRefused : Test := do
+  match requestOf "{\"prompt\": \"review\", \"series\": \"parser\"}" with
+  | .ok _ => TestM.fail "a client naming a series could move the operator's series pointer"
+  | .error e => TestM.assert (mentions e "series") e
+
+@[test]
+def aBudgetUnderACentIsRefused : Test := do
+  match requestOf "{\"prompt\": \"review\", \"budget\": -1}" with
+  | .ok _ => TestM.fail "a negative budget should be refused"
+  | .error e => TestM.assert (mentions e "0.01") e
+
+@[test]
 def anIssueNumberNeedsAnUpstream : Test := do
   match requestOf "{\"prompt\": \"review\", \"issue_number\": 7}" with
   | .ok _ => TestM.fail "an issue number without a repository names nothing"
@@ -244,5 +256,26 @@ def anExternalIdIsUniquePerClient : Test := do
   TestM.assert (!second) "a second entry under the same client and external_id must be refused"
   TestM.assertEqual found (some "a")
   TestM.assertEqual active 1
+
+@[test]
+def aContinuationIsFoundAndAPendingEntryWithdrawn : Test := do
+  let outcome ← Orchestra.withTempData "api-client-continue" do
+    let first : Queue.QueueEntry :=
+      { id := "a", createdAt := "2026-10-24T00:00:00Z", repo := none, prompt := "p"
+      , status := .unfinished, taskId := some "t1", apiClient := some "reviews" }
+    Queue.saveEntry first
+    Queue.saveEntry { first with
+      id := "b", createdAt := "2026-10-24T01:00:00Z", status := .pending, taskId := none,
+      continuesFrom := some "t1" }
+    let next ← Queue.continuationOf "t1"
+    let withdrawn ← Queue.cancelIfStillPending "b"
+    let again ← Queue.cancelIfStillPending "b"
+    let status := (← Queue.loadEntry "b").map (·.status)
+    return (next.map (·.id), withdrawn, again, status)
+  let (next, withdrawn, again, status) := outcome
+  TestM.assertEqual next (some "b") (msg := "the resume carries the run on")
+  TestM.assert withdrawn "a pending entry is withdrawn"
+  TestM.assert (!again) "and only once"
+  TestM.assert (status == some .cancelled) "it lands as cancelled"
 
 end OrchestraTest.ApiClient
