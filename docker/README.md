@@ -227,6 +227,18 @@ If step 2 fails while step 1 succeeds, the narrow fix is a seccomp profile that 
 `landlock_create_ruleset`, `landlock_add_rule` and `landlock_restrict_self` on top of Docker's
 default.
 
+### bubblewrap
+
+landrun alone does not stop an agent connecting to a Unix socket or signalling another process
+(see "what landrun does and does not confine" in `docs/execution.md`), so the landrun backend also
+runs each agent in a mount namespace built with `bwrap` (installed in the image). That needs
+unprivileged user namespaces, which Docker's default seccomp profile refuses, and without it the
+backend refuses to run agents. Either allow them for this container, or opt in to landrun alone
+with `ORCHESTRA_UNCONFINED_SOCKETS_OK=1` (it renders `execution.options.unconfined_sockets_ok:
+true` into a generated `config.json`). Inside the container that leaves reachable what the
+container has: the daemon's own control socket, which requires its token, and a shared `/tmp`. Do
+not mount the Docker socket, or anything else you would not hand an agent, into this container.
+
 ## Troubleshooting
 
 ### Tasks fail with "error connecting to api.github.com"

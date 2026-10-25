@@ -22,6 +22,7 @@ import OrchestraTest.ExamplesTest
 import OrchestraTest.ExecTest
 import OrchestraTest.DaemonAuthTest
 import OrchestraTest.RepoHardeningTest
+import OrchestraTest.LandrunContainmentTest
 import OrchestraTest.KubernetesTest
 import OrchestraTest.ReattachTest
 import OrchestraTest.KubernetesLiveTest

@@ -144,7 +144,8 @@ once, for all backends. That is most of the code, and none of it had to move.
   paths (`Landrun.canonicalize`: symlinks followed, `..` resolved), and orchestra's own grants may
   lie inside those directories but not contain one. A backend's `sandboxPaths` names precise home
   subpaths for the same reason. It also drops a listening grant on a port orchestra answers on
-  (`Exec.orchestraPorts`: the dashboard's).
+  (`Exec.orchestraPorts`: the dashboard's). landrun alone does not confine everything; see below
+  for what is put around it.
 - **`local`** — a plain child process, with no confinement at all. For machines where Landlock is
   unavailable. It says what it is on every launch, and it means it: an agent under it can read and
   write everything the daemon can, orchestra's own configuration and credentials included.
@@ -165,6 +166,78 @@ Selected in `config.json`:
 `execution.options` is an arbitrary JSON object handed to the backend uninterpreted, so a backend
 can grow settings of its own — a namespace, an image, a service account — without the core
 configuration type learning about any of them.
+
+## what landrun does and does not confine
+
+landrun builds a Landlock ruleset for the filesystem and for TCP ports. On Linux 6.12 (Landlock ABI
+6) with landrun 0.1.15, that ruleset does **not** stop an agent from:
+
+- **connecting to a pathname Unix socket.** Landlock does not mediate `connect(2)` on one, so a
+  socket is reachable without any grant on its directory. On a desktop host that includes the
+  systemd user bus (`systemd-run --user` then runs anything, unconfined), `/run/docker.sock` (root,
+  for a user in the `docker` group), incus's socket, the gpg and ssh agents, tmux's sockets, and
+  orchestra's own control socket.
+- **connecting to an abstract Unix socket,** such as an X server's `@/tmp/.X11-unix/X0`, which
+  lets it type into the operator's session.
+- **signalling any process of the same user.**
+- **reaching the rest of `/tmp`**, which every agent backend grants and every other process of the
+  user shares.
+
+All of this was verified on a real host from inside a sandbox with exactly the claude backend's
+grants. So the landrun backend wraps landrun in two more layers (`Orchestra/Exec/Landrun.lean`,
+`Orchestra/Exec/Scope.lean`):
+
+1. **Landlock scopes.** The daemon re-executes itself as `__landlock-scope` and applies a ruleset
+   that handles no filesystem or network access, only the abstract-socket and signal scopes (ABI
+   6). Then it executes the rest. Landlock layers stack, so every process below stays in them.
+2. **A mount namespace** built with `bwrap` from the grants and nothing else. A path no grant names
+   does not exist inside it, and neither does any socket under such a path. `/run` is reduced to
+   what name resolution needs (`Landrun.runAllowlist`), and `/run/user/<uid>`, docker's, dbus's
+   and the other daemons' sockets are not in it. `/tmp` is the session's own directory. It has a
+   PID namespace and a fresh `/proc`, so nothing outside is visible, and every process of the
+   agent dies with the run (`--die-with-parent`). A run without a terminal gets `--new-session`.
+3. **landrun** inside it, with the same grants as before.
+
+The namespace also gives each session its own copy of the home paths that something outside the
+sandbox later runs or trusts (`Landrun.homeLayout`):
+
+| path | in the session | why |
+| --- | --- | --- |
+| `~/.elan` | an overlay over the operator's: toolchains read through, writes kept | `~/.elan/bin` is on the operator's `PATH`, and its toolchains run every build |
+| `~/.cache` | an empty directory, with `execution.options.shared_caches` (default `["mathlib"]`) overlaid read-through | build tools re-run what they find there. It also holds the operator's password stores, backups, mail and browser profiles |
+| `~/.claude`, `~/.config/claude` | a fresh directory holding a copy of `.credentials.json`; conversations go to `<data>/agent-state/claude/projects`, so `--resume` still works across tasks | the operator's own Claude Code runs hooks, `mcpServers`, skills and `CLAUDE.md` from there |
+| `~/.claude.json` | a copy of the operator's without `mcpServers` and `projects` | the same |
+
+When a session ends, a `.credentials.json` that Claude Code refreshed is copied back, because its
+OAuth refresh tokens rotate. Nothing else is copied back.
+
+The repository's scripts (`init.sh`, `before.sh`, `validation.sh`, `after.sh`) run in the same
+sandbox as the agent, with the same grants plus the system paths a shell needs
+(`Landrun.scriptBaseGrants`). TCP is limited to `execution.options.script_ports` (default 80 and
+443). The script is the daemon's copy from the default branch, bound read-only over the checkout's
+`.orchestra/`. They used to run on the host, where `validation.sh` running `lake build` executed
+the agent's lakefile unconfined.
+
+**Without bwrap, or below Linux 6.12**, only landrun is left, and it confines none of the above.
+The backend then refuses to start a task unless `config.json` says
+
+```json
+{ "execution": { "backend": "landrun", "options": { "unconfined_sockets_ok": true } } }
+```
+
+and then prints a warning on every session. In that mode the per-session copies are pointed at by
+environment instead (`XDG_CACHE_HOME`, `CLAUDE_CONFIG_DIR`, `TMPDIR`). The operator's `~/.cache`
+and `~/.claude` are not granted, and `~/.elan` is read-only, so install toolchains beforehand.
+`/tmp` stays shared.
+
+**Recommendation.** Whatever the containment, run the agents as a dedicated user. That user should
+not be in the `docker`, `incus`, `lxd` or `libvirt` groups, should have no login session (so no
+user bus and no gpg or ssh agent), and should have nothing of the operator's in its home. Every
+escape above becomes harmless, or impossible, under such a user. The namespace and the scopes
+cover what that user's own sockets and processes would still expose.
+
+Other `execution.options` for this backend: `scratch_dir`, where the per-session directories are
+made (the system's temporary directory by default).
 
 ## adding a backend
 

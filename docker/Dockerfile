@@ -87,6 +87,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       `# work, pg_stat_activity is the thing to look at, and a container with no client is a` \
       `# container where that means installing one first.` \
       libpq5 postgresql-client \
+      `# bubblewrap: the landrun backend runs each agent in a mount namespace of its own, which` \
+      `# is what keeps it off Unix sockets and other processes (docs/execution.md).` \
+      bubblewrap \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
          -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \

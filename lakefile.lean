@@ -78,6 +78,9 @@ extern_lib UnixSocket pkg := ffiStaticLib pkg "UnixSocket"
 /-- Termination-signal shim, backing `Orchestra.Utils.Signals`. -/
 extern_lib Signal pkg := ffiStaticLib pkg "Signal"
 
+/-- Landlock scoping shim, backing `Orchestra.Exec.Scope`. -/
+extern_lib Landlock pkg := ffiStaticLib pkg "Landlock"
+
 @[default_target]
 lean_lib Orchestra
 
