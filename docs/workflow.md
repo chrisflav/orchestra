@@ -472,9 +472,11 @@ setting `workflow_path`:
 
 When `workflow_path` is set the listener:
 
-1. Reads the YAML workflow from `workflow_path` exactly as written. The path is not a template:
-   an event that chose which file runs could point it at a workflow somebody else put on this
-   disk, and a clone's checkout is one.
+1. Reads the YAML workflow from `workflow_path`. The path may name `{{upstream}}`, `{{fork}}`,
+   `{{upstream_escaped}}` and `{{fork_escaped}}`, which come from the listener's own
+   configuration, and nothing else: any other placeholder is refused when the listener is
+   loaded. An event that chose which file runs could point it at a workflow somebody else put on
+   this disk, and a clone's checkout is one.
 2. Parses it, and only then fills in what the event supplies (see below).
 3. Substitutes `upstream` and `fork` from the event into the parsed program, where the event
    has them. A listener with neither leaves the workflow's own values in place.
@@ -500,10 +502,13 @@ workflow, and they reach them after the YAML has been parsed:
   (`issue-number: {{pr_number}}`, quoted or not), and only if the event's value is a whole number.
   Anything else is refused and the workflow is not started.
 
-Nothing else is a template. A `{{...}}` in `tools`, `read-only`, `kleis-*`, `backend`, `model`,
-`budget`, `upstream`/`fork`, `system-prompt`, `prepend-prompt`, `context` or any other field stays
-the literal text it is. Those fields decide what a step may do and where, and that is the
-operator's to write, not something whoever opened the issue gets to say.
+Nothing else is a template, and a `{{` anywhere else — `tools`, `read-only`, `kleis-spec`,
+`backend`, `model`, `budget`, `upstream`/`fork`, `system-prompt`, `prepend-prompt`, `context`,
+`triage-add`/`triage-remove`, the description — is refused when the workflow is loaded, naming the
+field. So is an unquoted `{{x}}` in a field that wants a string, which YAML reads as a mapping. Those
+fields decide what a step may do and where, and that is the operator's to write, not something
+whoever opened the issue gets to say. The one exception is `kleis-token`, whose value is a
+`"{{secret}}"` reference into `secrets.json` and never an event's variable.
 
 This is a change from earlier versions, which rendered the whole YAML file with the event's
 variables and then parsed the result. That let an issue title such as

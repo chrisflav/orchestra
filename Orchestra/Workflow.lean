@@ -189,6 +189,18 @@ where
     | c :: rest, name => closing rest (c :: name)
     | [], _ => none
 
+/-- The names of the `{{name}}` placeholders in `s`, as `renderPlaceholders` reads them. -/
+partial def placeholderNames (s : String) : List String :=
+  go s.toList []
+where
+  go : List Char → List String → List String
+    | [], acc => acc.reverse
+    | '{' :: '{' :: rest, acc =>
+      match renderPlaceholders.closing rest [] with
+      | some (name, after) => go after (String.ofList name :: acc)
+      | none => go rest acc
+    | _ :: rest, acc => go rest acc
+
 /-- The program with an event's variables filled in: every task step's `prompt`, and the
     `issue-number` of a step that names a variable for it.
 

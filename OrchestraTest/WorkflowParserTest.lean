@@ -332,11 +332,7 @@ def aPlaceholderNoEventSuppliesIsLeftStanding : Test := do
   | .ok prog =>
     TestM.assertEqual ((onlyTask prog).map (·.prompt)) (some "Review: {{title}}")
 
-/-- Placeholders in any field but the prompt stay the text they are: the model, the context label,
-    the system prompt and the repositories are the operator's. -/
-@[test]
-def onlyThePromptIsRendered : Test := do
-  let yaml := "name: review
+private def stepWith (field : String) : String := s!"name: review
 upstream: acme/widgets
 fork: acme/widgets
 
@@ -344,20 +340,47 @@ steps:
   review:
     task:
       prompt: \"go\"
-      model: \"{{model}}\"
-      context: \"{{title}}\"
-      system-prompt: \"{{title}}\"
+      {field}
 "
-  match WorkflowProgram.parseYamlFor yaml [("model", "opus"), ("title", "t")] with
-  | .error e => TestM.fail s!"parse failed: {e}"
+
+/-- A placeholder in any field but `prompt` and `issue-number` is refused when the workflow is
+    loaded, naming the field and pointing at "what an event fills in": it would otherwise stay the
+    literal braces, and a workflow written for the old rendering would run on them quietly. -/
+@[test]
+def aPlaceholderWhereNoEventReachesIsRefused : Test := do
+  for field in ["model: \"{{model}}\"", "context: \"issue-{{title}}\"",
+                "system-prompt: \"{{title}}\"", "prepend-prompt: \"{{title}}\"",
+                "triage-add:\n        - \"{{label}}\"", "backend: \"{{b}}\"",
+                "upstream: \"{{upstream}}\""] do
+    match WorkflowProgram.parseYamlFor (stepWith field) [("model", "opus"), ("title", "t")] with
+    | .ok _ => TestM.fail s!"{field}: a placeholder no event can reach was accepted"
+    | .error e =>
+      TestM.assert ((e.splitOn "what an").length ≥ 2) s!"{field}: points at the docs: {e}"
+  match WorkflowProgram.parseYaml "name: n\ndescription: \"about {{title}}\"\nsteps: {}\n" with
+  | .ok _ => TestM.fail "a placeholder in the description was accepted"
+  | .error e => TestM.assert ((e.splitOn "description").length ≥ 2) e
+
+/-- Unquoted, `{{x}}` is a flow mapping to YAML: a field of the wrong type, not one read as
+    absent. -/
+@[test]
+def anUnquotedPlaceholderIsAFieldOfTheWrongType : Test := do
+  match WorkflowProgram.parseYaml (stepWith "system-prompt: {{x}}") with
+  | .ok _ => TestM.fail "an unquoted placeholder was dropped instead of refused"
+  | .error e =>
+    TestM.assert ((e.splitOn "system-prompt").length ≥ 2) s!"names the field: {e}"
+    TestM.assert ((e.splitOn "mapping").length ≥ 2) s!"and what it is: {e}"
+  match WorkflowProgram.parseYaml (stepWith "model:\n        - opus") with
+  | .ok _ => TestM.fail "a list where a string belongs was read as absent"
+  | .error e => TestM.assert ((e.splitOn "model").length ≥ 2) e
+
+/-- `kleis-token` keeps its braces: a `{{secret}}` reference into `secrets.json`, not an event's
+    variable. -/
+@[test]
+def aKleisTokenReferenceIsNotAPlaceholder : Test := do
+  match WorkflowProgram.parseYaml (stepWith "kleis-token: \"{{review_token}}\"") with
+  | .error e => TestM.fail s!"a secret reference should still parse: {e}"
   | .ok prog =>
-    match onlyTask prog with
-    | none => TestM.fail "expected exactly one task step"
-    | some t =>
-      TestM.assertEqual t.model (some "{{model}}")
-      TestM.assertEqual t.context (some "{{title}}")
-      TestM.assertEqual t.systemPrompt (some "{{title}}")
-      TestM.assertEqual (prog.upstream.map (·.toString)) (some "acme/widgets")
+    TestM.assertEqual ((onlyTask prog).bind (·.kleisToken)) (some "{{review_token}}")
 
 private def posterWorkflow (issue : String) : String := s!"name: poster
 upstream: acme/widgets

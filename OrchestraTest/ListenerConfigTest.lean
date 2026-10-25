@@ -285,3 +285,41 @@ def githubLabelsRoundTrip : Test := do
     TestM.assertEqual kind "pulls" (msg := "kind")
     TestM.assertEqual authorizedUsers ["carol", "dave"] (msg := "authorized_users")
   | .ok _ => TestM.fail "wrong variant"
+
+/-! ## What an event may fill into a path or a series -/
+
+private def actionOf (body : String) : Except String ActionConfig :=
+  Json.parse body >>= FromJson.fromJson?
+
+/-- `workflow_path` may name the repositories, which come from the listener's configuration, and
+    nothing an event says: a path chosen by an event could run a workflow somebody else put on
+    this disk. -/
+@[test]
+def aWorkflowPathNamesOnlyTheRepositories : Test := do
+  match actionOf "{\"prompt_template\": \"x\", \"workflow_path\": \"/wf/{{upstream_escaped}}.yaml\"}" with
+  | .error e => TestM.fail s!"a path naming the repository should load: {e}"
+  | .ok a =>
+    let path := renderRestricted (a.workflowPath.getD "") [("upstream_escaped", "acme_widgets"),
+      ("title", "../../evil")] workflowPathVars
+    TestM.assertEqual path "/wf/acme_widgets.yaml"
+  match actionOf "{\"prompt_template\": \"x\", \"workflow_path\": \"/wf/{{title}}.yaml\"}" with
+  | .ok _ => TestM.fail "a path naming an event's variable was accepted"
+  | .error e => TestM.assert ((e.splitOn "workflow_path").length ≥ 2) e
+  -- Rendered in one pass, and only with the allowed variables, whatever got past the check.
+  TestM.assertEqual (renderRestricted "/wf/{{fork}}/{{title}}"
+      [("fork", "{{title}}"), ("title", "x")] workflowPathVars)
+    "/wf/{{title}}/{{title}}"
+
+/-- A single-task listener's `series` may name the numbers and the repositories: a series built
+    from an issue title would let whoever wrote it choose which series the task joins. -/
+@[test]
+def aSeriesNamesOnlyNumbersAndRepositories : Test := do
+  match actionOf "{\"prompt_template\": \"x\", \"series\": \"pr-{{pr_number}}-{{upstream_escaped}}\"}" with
+  | .error e => TestM.fail s!"a series naming the number should load: {e}"
+  | .ok a =>
+    let entry ← buildQueueEntry a [("pr_number", "7"), ("upstream_escaped", "acme_widgets"),
+      ("title", "evil")]
+    TestM.assertEqual entry.series (some "pr-7-acme_widgets")
+  match actionOf "{\"prompt_template\": \"x\", \"series\": \"{{title}}\"}" with
+  | .ok _ => TestM.fail "a series naming an event's title was accepted"
+  | .error e => TestM.assert ((e.splitOn "series").length ≥ 2) e

@@ -1280,7 +1280,17 @@ Fields:
   Left out, they fall back to the `{{upstream}}`/`{{fork}}` variables the event source supplies —
   every GitHub source supplies both. A `shell` source supplies neither, so a listener on one that
   names neither queues a [repository-independent task](#repository-independent-tasks)
-- `action.workflow_path` — path to a `.yaml` workflow file; when set the listener starts a concert instead of enqueueing a single task. The path is used as written, not rendered with the event's variables, and the event fills in only the steps' prompts and `issue-number` → [what an event fills in](docs/workflow.md#what-an-event-fills-in)
+- `action.series` — the series the queued task joins, as a template that may name only
+  `{{issue_number}}`, `{{pr_number}}`, `{{upstream}}`, `{{fork}}`, `{{upstream_escaped}}` and
+  `{{fork_escaped}}` (`"pr-{{pr_number}}"`); any other placeholder is refused when the listener is
+  loaded. A series named after an issue's title would let whoever wrote it choose which series the
+  task joins, and so what `orchestra resume` continues
+- `action.workflow_path` — path to a `.yaml` workflow file; when set the listener starts a concert
+  instead of enqueueing a single task. It may name only `{{upstream}}`, `{{fork}}`,
+  `{{upstream_escaped}}` and `{{fork_escaped}}`, which come from the listener's own configuration;
+  any other placeholder is refused when the listener is loaded, since a path an event chose could
+  run a workflow somebody else put on this disk. The event fills in only the steps' prompts and
+  `issue-number` → [what an event fills in](docs/workflow.md#what-an-event-fills-in)
 - `action.auth_sources` / `action.auth_mode` — candidate authentication sources for the tasks this
   listener queues, and how to pick among them. A listener that fires repeatedly is the case
   several accounts exist for: it keeps producing runnable work after one account's weekly window

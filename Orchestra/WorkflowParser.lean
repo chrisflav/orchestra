@@ -30,6 +30,62 @@ private def mappingLookup (pairs : Array (Node × Node)) (key : String) : Option
 
 private def strTrim (s : String) : String := s.trimAscii.toString
 
+private def nodeKind : Node → String
+  | .scalar .. => "string"
+  | .sequence .. => "list"
+  | .mapping .. => "mapping"
+  | .alias .. => "alias"
+
+/-- An optional string field, strictly: absent is `none`, and anything but a scalar is an error
+    naming the field, rather than the field silently read as absent. -/
+private def optStr (pairs : Array (Node × Node)) (key : String) : Except String (Option String) :=
+  match mappingLookup pairs key with
+  | none => .ok none
+  | some (.scalar _ _ v) => .ok (some v)
+  | some n => .error s!"'{key}' must be a string, not a {nodeKind n}"
+
+/-- Where an event's variables may stand: a task step's `prompt` and `issue-number`, the two
+    fields `WorkflowProgram.instantiate` fills in. A step's `kleis-token` is a `{{secret}}`
+    reference into `secrets.json`, never an event's variable, and keeps its braces too. -/
+private def placeholderAllowedAt : List String → Bool
+  | ["steps", _, "task", "prompt"] => true
+  | ["steps", _, "task", "issue-number"] => true
+  | ["steps", _, "task", "kleis-token"] => true
+  | _ => false
+
+private def whatAnEventFillsIn : String :=
+  "an event's variables reach only a task step's 'prompt' and 'issue-number' (see \"what an \
+event fills in\" in docs/workflow.md)"
+
+/-- Refuse a `{{` anywhere but where `placeholderAllowedAt` allows one, before anything is read.
+
+    Everywhere else a placeholder used to be rendered into the YAML text with the event, and is now
+    left as the literal braces (`WorkflowProgram.instantiate`). A workflow written for the old
+    behaviour would therefore run with `{{title}}` as its context label or its system prompt's
+    name, and say nothing; refusing it at load time says which field and why. An unquoted `{{x}}`
+    is a flow mapping to YAML, so a mapping keyed by a mapping is refused here too, as the field of
+    the wrong type it is. -/
+private partial def refusePlaceholders (path : List String) (node : Node) : Except String Unit := do
+  if placeholderAllowedAt path then return
+  let field := if path.isEmpty then "the document" else s!"'{".".intercalate path}'"
+  match node with
+  | .scalar _ _ v =>
+    if (v.splitOn "{{").length > 1 then
+      .error s!"{field} contains '\{\{', but {whatAnEventFillsIn}; write it without a placeholder"
+  | .sequence _ _ items =>
+    for (item, i) in items.zipIdx do refusePlaceholders (path ++ [toString i]) item
+  | .mapping _ _ pairs =>
+    for (k, v) in pairs do
+      match k with
+      | .scalar _ _ key =>
+        if (key.splitOn "{{").length > 1 then
+          .error s!"{field} has a key containing '\{\{', but {whatAnEventFillsIn}"
+        refusePlaceholders (path ++ [key]) v
+      | _ =>
+        .error s!"{field} is a mapping where a string belongs: YAML reads an unquoted \
+'\{\{…}}' as one, and {whatAnEventFillsIn}"
+  | .alias _ => pure ()
+
 /-- The variable a `{{name}}` placeholder names, when `node` is exactly one: quoted, a scalar
     `"{{name}}"`; unquoted, what YAML reads `{{name}}` as — a flow mapping whose one key is a flow
     mapping whose one key is `name`. -/
@@ -113,22 +169,19 @@ private def parseOutputSpec (name : String) (node : Node) : Except String Output
 private def parseTaskSpec (node : Node) : Except String TaskSpec := do
   let pairs    ← nodeAsMapping node
   let prompt   ← nodeAsString (← orError (mappingLookup pairs "prompt") "task missing 'prompt'")
-  let agent    := (mappingLookup pairs "agent").bind   (nodeAsString · |>.toOption)
-  let model    := (mappingLookup pairs "model").bind   (nodeAsString · |>.toOption)
-  let budget   := (mappingLookup pairs "budget").bind  (nodeAsString · |>.toOption)
-                  |>.bind parseBudget
-  let context  := (mappingLookup pairs "context").bind (nodeAsString · |>.toOption)
-  let readOnly :=
-    (mappingLookup pairs "read-only").bind (nodeAsString · |>.toOption)
-    |>.map (· == "true") |>.getD false
-  let upstream      := (mappingLookup pairs "upstream").bind       (nodeAsString · |>.toOption)
-                       |>.map (Repository.parse · |>.toOption) |>.join
-  let fork          := (mappingLookup pairs "fork").bind           (nodeAsString · |>.toOption)
-                       |>.map (Repository.parse · |>.toOption) |>.join
-  let systemPrompt  := (mappingLookup pairs "system-prompt").bind  (nodeAsString · |>.toOption)
-  let prependPrompt := (mappingLookup pairs "prepend-prompt").bind (nodeAsString · |>.toOption)
-  let backend       := (mappingLookup pairs "backend").bind        (nodeAsString · |>.toOption)
-  let identity      := (mappingLookup pairs "identity").bind       (nodeAsString · |>.toOption)
+  -- Strict about their type: a list or a mapping where a string belongs is an error naming the
+  -- field, not a field read as absent. What a string field may *say* is unchanged.
+  let agent    ← optStr pairs "agent"
+  let model    ← optStr pairs "model"
+  let budget   := (← optStr pairs "budget").bind parseBudget
+  let context  ← optStr pairs "context"
+  let readOnly := (← optStr pairs "read-only").map (· == "true") |>.getD false
+  let upstream      := (← optStr pairs "upstream").bind (Repository.parse · |>.toOption)
+  let fork          := (← optStr pairs "fork").bind (Repository.parse · |>.toOption)
+  let systemPrompt  ← optStr pairs "system-prompt"
+  let prependPrompt ← optStr pairs "prepend-prompt"
+  let backend       ← optStr pairs "backend"
+  let identity      ← optStr pairs "identity"
   -- Strict, unlike the fields above: each decides what the step's kleis token reaches, and a
   -- dropped one would run the step under whatever the next level names.
   let kleisSpec ← match mappingLookup pairs "kleis-spec" with
@@ -269,6 +322,8 @@ def WorkflowProgram.parseTemplate (input : String) : Except String WorkflowProgr
     | .error _ e => .error s!"YAML parse error: {e}"
   let doc   ← orError stream.documents[0]? "empty YAML document"
   let root  ← orError doc.root "YAML document has no root node"
+  -- Before anything is read, so a placeholder where no event can reach is the error a reader sees.
+  refusePlaceholders [] root
   let pairs ← nodeAsMapping root
   let name     ← nodeAsString (← orError (mappingLookup pairs "name") "missing 'name'")
   let description := (mappingLookup pairs "description").bind (nodeAsString · |>.toOption)
