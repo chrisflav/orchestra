@@ -351,4 +351,108 @@ def usableDropsWhatReachesTheDataDirectory : Test := do
   TestM.assert (!paths.contains s!"{data}/logs") "nor anything inside it"
   TestM.assert (paths.contains "/usr") "the rest is"
 
+/-! ## The guard compares what landrun opens, not what the grant spells
+
+landrun follows symlinks and the kernel resolves `..`, so a grant is compared with the guarded
+directories after both are resolved (`Landrun.canonicalize`). And orchestra's own provenance lets a
+grant lie *inside* the data directory, never contain it. -/
+
+@[test]
+def dotDotDoesNotWalkPastTheGuard : Test := do
+  TestM.assertEqual (Landrun.normalizeLexical "/a//b/./c/../d/") "/a/b/d"
+  TestM.assertEqual (Landrun.normalizeLexical "/../..") "/" (msg := "`..` at the root stays there")
+  let g : PathGrant := { path := "/home/u/.local/bin/../share/orchestra", access := .ro }
+  let (_, refused) := Landrun.withoutGuarded #[g] #[dataDir, configDir]
+  TestM.assertEqual (refused.map (·.path)) #[g.path]
+    (msg := "a path that walks back up into the data directory is the data directory")
+  let g2 : PathGrant := { path := "/home/u/.config/orchestra/../gh", access := .ro }
+  let (kept, _) := Landrun.withoutGuarded #[g2] #[dataDir, configDir]
+  TestM.assertEqual (kept.map (·.path)) #[g2.path] (msg := "one that walks out of it is not")
+
+@[test]
+def orchestrasProvenanceDoesNotCoverAContainingDirectory : Test := do
+  let plugin (path : String) : PathGrant := { path, access := .rox, from_ := .orchestra }
+  let (kept, refused) := Landrun.withoutGuarded
+    #[plugin "/home/u/.local", plugin dataDir, plugin s!"{dataDir}/repos/acme/widgets-0",
+      plugin s!"{configDir}/skills"]
+    #[dataDir, configDir]
+  TestM.assertEqual (refused.map (·.path)) #["/home/u/.local", dataDir]
+    (msg := "a plugin directory that is or contains the data directory is refused")
+  TestM.assertEqual (kept.map (·.path))
+    #[s!"{dataDir}/repos/acme/widgets-0", s!"{configDir}/skills"]
+    (msg := "the checkout and the skills inside them are orchestra's to grant")
+
+/-- Run `act` with `Dirs.dataBase` pointed at a fresh directory under `/tmp`, removed afterwards.
+    No database: these tests only need the directory. -/
+private def withScratchData (label : String) (act : System.FilePath → IO α) : IO α := do
+  let root := System.FilePath.mk "/tmp" / s!"orchestra-{label}-{← IO.monoNanosNow}"
+  let data := root / "data"
+  IO.FS.createDirAll data
+  let previous ← Dirs.dataBaseOverride.get
+  Dirs.setDataBaseOverride (some data)
+  try act root
+  finally
+    Dirs.setDataBaseOverride previous
+    try IO.FS.removeDirAll root catch _ => pure ()
+
+@[test]
+def aSymlinkToTheDataDirectoryIsTheDataDirectory : Test := do
+  let (paths, link, sneaky) ← withScratchData "guard-symlink" fun root => do
+    let link := root / "innocent"
+    discard <| IO.Process.output { cmd := "ln", args := #["-s", (root / "data").toString,
+      link.toString] }
+    IO.FS.createDirAll (root / "data" / "logs")
+    IO.FS.createDirAll (root / "elsewhere")
+    let sneaky := (root / "elsewhere" / ".." / "data" / "logs").toString
+    let spec : RunSpec :=
+      { command := "true", workdir := System.FilePath.mk "/tmp"
+      , grants := #[{ path := link.toString, access := .ro }, { path := sneaky, access := .ro },
+                    { path := (root / "elsewhere").toString, access := .ro }] }
+    let spec ← Landrun.usable spec (warn := false)
+    return (spec.grants.map (·.path), link.toString, sneaky)
+  TestM.assert (!paths.contains link) "a symlink to the data directory is refused"
+  TestM.assert (!paths.contains sneaky) "so is a path that walks into it with `..`"
+  TestM.assert (paths.any (·.endsWith "elsewhere")) "a sibling is kept"
+
+@[test]
+def canonicalizeResolvesWhatDoesNotExistAgainstWhatDoes : Test := do
+  let out ← withScratchData "guard-canon" fun root => do
+    let link := root / "link"
+    discard <| IO.Process.output { cmd := "ln", args := #["-s", (root / "data").toString,
+      link.toString] }
+    let resolvedRoot ← IO.FS.realPath root
+    return (← Landrun.canonicalize (link / "not-yet" / ".." / "later").toString,
+            (resolvedRoot / "data" / "later").toString)
+  TestM.assertEqual out.1 out.2
+    (msg := "the existing prefix is resolved through the symlink and the rest appended")
+
+/-! ## No agent listens where orchestra answers -/
+
+@[test]
+def noAgentBindsAPortOrchestraUses : Test := do
+  let ports : Ports := { connect := #[4711, 443, 8080, 11434], bind := #[8080, 11434] }
+  let (kept, refused) := Landrun.withoutReservedBinds ports #[8080]
+  TestM.assertEqual kept.bind #[11434] (msg := "the dashboard's port is not bound")
+  TestM.assertEqual refused #[8080] (msg := "and the caller is told which")
+  TestM.assertEqual kept.connect ports.connect (msg := "connecting is left alone")
+  let spec ← Landrun.usable
+    { command := "true", workdir := System.FilePath.mk "/tmp", ports } (warn := false)
+  TestM.assert (!spec.ports.bind.contains 8080) "usable takes the default dashboard port out"
+  TestM.assert (spec.ports.bind.contains 11434) "and keeps the rest"
+
+@[test]
+def anExtraPortThatIsTheMcpServersIsNeverBound : Test := do
+  let mcp : McpEndpoint := { host := "127.0.0.1", port := 40000 }
+  let p := Sandbox.portsFor {} {} mcp #[40000, 11434]
+  TestM.assert (p.connect.contains 40000) "the MCP server is connected to"
+  TestM.assertEqual p.bind #[11434] (msg := "and never listened on")
+
+@[test]
+def theCliPortIsReadFromALoopbackUrl : Test := do
+  TestM.assertEqual (loopbackPort? "http://127.0.0.1:9090/api") (some 9090)
+  TestM.assertEqual (loopbackPort? "http://localhost") (some 80)
+  TestM.assertEqual (loopbackPort? "https://orchestra.example:8443") none
+    (msg := "a remote server is not this machine's port")
+  TestM.assertEqual (loopbackPort? "http://10.0.0.1:8080") none
+
 end OrchestraTest.Exec

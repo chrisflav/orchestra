@@ -156,12 +156,14 @@ def grantsFor (paths additional : SandboxPaths) (repoPath : System.FilePath) (re
     Everything but the MCP port and 443 is granted in both directions, because the reason a port
     is named here is a local service the agent both starts and talks to (an Ollama, a language
     server). The two orchestra grants are outbound only: the agent has no business listening on
-    them. -/
+    them, so an extra port that happens to be the MCP server's is connected to and never bound.
+    Nor may it listen where orchestra's own dashboard does; `Landrun.usable` takes those out
+    (`Exec.orchestraPorts`). -/
 def portsFor (paths additional : SandboxPaths) (mcp : McpEndpoint) (extraPorts : Array Nat)
     : Ports := Id.run do
   let extra : Array UInt16 :=
     paths.extraPorts.toArray ++ additional.extraPorts.toArray ++ extraPorts.map UInt16.ofNat
-  return { connect := #[mcp.port, 443] ++ extra, bind := extra }
+  return { connect := #[mcp.port, 443] ++ extra, bind := extra.filter (· != mcp.port) }
 
 /-- The environment every agent run starts with, whichever way it was launched.
 

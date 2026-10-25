@@ -795,9 +795,19 @@ clients. No grant may be one of them, lie inside one, or contain one: the agent 
 grants name precise subpaths (`~/.local/bin`, `~/.local/share/claude`, …) rather than `~/.local`,
 and landrun drops any grant that would reach either directory — from a backend, from
 `additional_sandbox_paths` or anywhere else — with a warning, since a Landlock rule on a directory
-covers everything below it and cannot carve out an exception. The task's own checkout, plugins and
-memories are the one exception: orchestra grants those itself, deliberately. Keep the GitHub App's
-private key inside the configuration directory, or anywhere no grant reaches.
+covers everything below it and cannot carve out an exception. The comparison is made on the
+resolved path, the one landrun will actually open: a symlink to the data directory, or
+`~/.local/bin/../share/orchestra`, is refused like the directory itself. The task's own checkout,
+plugins and memories are the one exception: orchestra grants those itself, deliberately, and they
+may lie inside these directories but never contain one, so a `plugin_dirs` entry of `~/.local` is
+refused too. Keep the GitHub App's private key inside the configuration directory, or anywhere no
+grant reaches.
+
+**No agent listens where orchestra answers.** An `extra_ports` entry is granted for both connecting
+and listening, but never listening on the dashboard's port (8080 by default, or whatever
+`orchestrad dashboard --port` bound, or the port of a loopback `$ORCHESTRA_API_URL`), nor on the
+task's own MCP port. An agent listening on 8080 while the dashboard is down would be handed the
+bearer password by the next `orchestra` command; such a grant is dropped with a warning.
 
 Two more home paths are held back for the same reason. `~/.gitconfig` and `~/.config/git` are
 granted read-only: the daemon runs `git` as the same user outside the sandbox, and an agent that

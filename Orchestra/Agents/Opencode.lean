@@ -68,8 +68,11 @@ def opencode : AgentDef where
     -- `~/.config/gh`: its `hosts.yml` is the operator's own GitHub login, and the agent's `gh`
     -- authenticates with the `GH_TOKEN` orchestra gives it.
     homeRox := [".local/bin", ".local/lib", ".opencode", ".gitconfig", ".config/git"]
-    homeRw  := [".config/opencode", ".local/share/opencode"]
-    homeRwx := [".elan", ".cache"]
+    -- `~/.local/share/opencode` is written *and run from*: opencode downloads the tools it uses
+    -- (ripgrep, language servers) there and executes them. `~/.local/state/opencode` is where it
+    -- keeps what it remembers between runs.
+    homeRw  := [".config/opencode", ".local/state/opencode"]
+    homeRwx := [".elan", ".cache", ".local/share/opencode"]
     extraPorts := [4096]
   }
   setupMcp mcp _ _ := do

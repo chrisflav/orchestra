@@ -19,6 +19,7 @@ import Orchestra.Utils.UnixSocket
 import Orchestra.Utils.Files
 import Orchestra.ApiClient
 import Orchestra.GitHub
+import Orchestra.Exec.Backend
 
 open Lean (Json ToJson FromJson)
 open Std.Net
@@ -2736,6 +2737,8 @@ def serve (cfg : ServeConfig) : IO (UInt16 × IO Unit) := do
     | some (.v4 a) => a.port
     | some (.v6 a) => a.port
     | none         => cfg.port
+  -- No agent may listen where this answers: see `Exec.orchestraPorts`.
+  Exec.reserveOrchestraPort boundPort
   return (boundPort, Async.block server.shutdownAndWait)
 
 end Orchestra.Dashboard
