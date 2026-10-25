@@ -136,7 +136,13 @@ once, for all backends. That is most of the code, and none of it had to move.
 ## what ships
 
 - **`landrun`** (default) — Landlock on this machine, which is what orchestra has always done.
-  `Orchestra/Exec/Landrun.lean`.
+  `Orchestra/Exec/Landrun.lean`. Before rendering, it drops every grant that is, lies inside or
+  contains orchestra's data or configuration directory, other than what orchestra grants of its
+  own (the checkout, plugins, memories): `Landrun.withoutGuarded`. The comparison is on resolved
+  paths (`Landrun.canonicalize`: symlinks followed, `..` resolved), and orchestra's own grants may
+  lie inside those directories but not contain one. A backend's `sandboxPaths` names precise home
+  subpaths for the same reason. It also drops a listening grant on a port orchestra answers on
+  (`Exec.orchestraPorts`: the dashboard's).
 - **`local`** — a plain child process, with no confinement at all. For machines where Landlock is
   unavailable. It says what it is on every launch, and it means it: an agent under it can read and
   write everything the daemon can, orchestra's own configuration and credentials included.

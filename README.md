@@ -226,8 +226,9 @@ variable.
 
 `additional_sandbox_paths` grants every agent launched by this instance extra filesystem access on
 top of what its backend already needs — `rox`/`ro`/`rw` for absolute paths, `home_rox`/`home_rw`/
-`home_rwx` for `$HOME`-relative ones. It is the usual fix when a repository's build needs a shared
-cache directory:
+`home_rwx` for `$HOME`-relative ones. A path that is or contains orchestra's own data or
+configuration directory is refused (see [sandboxing](#sandboxing)). It is the usual fix when a
+repository's build needs a shared cache directory:
 
 ```json
 {
@@ -792,6 +793,34 @@ involved, so this works inside the Docker image as well. A task's agent gets:
 With `kleis` configured the sandbox gets no `GH_TOKEN`: it reaches GitHub — and whatever else the
 task's kleis spec names — through a credential proxy on a token made for the task, and may connect
 to the proxy's port as well. See [docs/kleis.md](docs/kleis.md).
+
+**Nothing reaches orchestra's own directories.** The data directory (`$XDG_DATA_HOME/orchestra`,
+by default `~/.local/share/orchestra`) holds every clone of every repository, every task's log,
+the queue's control socket and `dashboard.secret`; the configuration directory
+(`$XDG_CONFIG_HOME/orchestra`, by default `~/.config/orchestra`) holds `secrets.json` and the API
+clients. No grant may be one of them, lie inside one, or contain one: the agent backends' home
+grants name precise subpaths (`~/.local/bin`, `~/.local/share/claude`, …) rather than `~/.local`,
+and landrun drops any grant that would reach either directory — from a backend, from
+`additional_sandbox_paths` or anywhere else — with a warning, since a Landlock rule on a directory
+covers everything below it and cannot carve out an exception. The comparison is made on the
+resolved path, the one landrun will actually open: a symlink to the data directory, or
+`~/.local/bin/../share/orchestra`, is refused like the directory itself. The task's own checkout,
+plugins and memories are the one exception: orchestra grants those itself, deliberately, and they
+may lie inside these directories but never contain one, so a `plugin_dirs` entry of `~/.local` is
+refused too. Keep the GitHub App's private key inside the configuration directory, or anywhere no
+grant reaches.
+
+**No agent listens where orchestra answers.** An `extra_ports` entry is granted for both connecting
+and listening, but never listening on the dashboard's port (8080 by default, or whatever
+`orchestrad dashboard --port` bound, or the port of a loopback `$ORCHESTRA_API_URL`), nor on the
+task's own MCP port. An agent listening on 8080 while the dashboard is down would be handed the
+bearer password by the next `orchestra` command; such a grant is dropped with a warning.
+
+Two more home paths are held back for the same reason. `~/.gitconfig` and `~/.config/git` are
+granted read-only: the daemon runs `git` as the same user outside the sandbox, and an agent that
+could set `core.hooksPath` or a `url.*.insteadOf` there would run code, or redirect a fetch, the
+next time the daemon touched a clone. `~/.config/gh` is not granted at all: its `hosts.yml` is the
+operator's own GitHub login, and an agent's `gh` authenticates with the `GH_TOKEN` it is given.
 
 `orchestra run --debug` prints the exact landrun invocation before executing it, which is the
 quickest way to find out why an agent cannot see a path. A path that does not exist cannot be

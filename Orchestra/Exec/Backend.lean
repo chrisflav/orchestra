@@ -728,4 +728,37 @@ def randomHex (bytes : Nat) : IO String := do
 def hostHome : IO String :=
   return (← IO.getEnv "HOME").getD ""
 
+/-- The ports orchestra itself answers on, which no agent may listen on (`Landrun.usable`).
+
+    Starts with `8080`, where `orchestrad dashboard` listens unless told otherwise and where the
+    CLI sends the bearer password unless told otherwise (`Client.defaultBaseUrl`) — whether or not
+    a dashboard runs in this process, since the one the CLI will talk to may be in another.
+    `orchestrad dashboard` and `serve` add the port they actually bound (`reserveOrchestraPort`). -/
+initialize orchestraPortsRef : IO.Ref (Array UInt16) ← IO.mkRef #[8080]
+
+/-- Record that orchestra answers on `port`, so that no agent is let listen on it. -/
+def reserveOrchestraPort (port : UInt16) : IO Unit :=
+  orchestraPortsRef.modify fun ps => if ps.contains port then ps else ps.push port
+
+/-- The port of a loopback `http://` URL, if it is one: `http://127.0.0.1:9090/x` is `9090`,
+    `http://localhost/` is `80`. Anything else is `none`. -/
+def loopbackPort? (url : String) : Option UInt16 := do
+  let rest ← if url.startsWith "http://" then some (url.drop "http://".length).toString else none
+  let hostPort := (rest.splitOn "/").headD ""
+  let (host, port) := match hostPort.splitOn ":" with
+    | [h, p] => (h, p.toNat?)
+    | [h]    => (h, some 80)
+    | _      => ("", none)
+  unless host == "127.0.0.1" || host == "localhost" do none
+  let p ← port
+  if p < 65536 then some (UInt16.ofNat p) else none
+
+/-- `orchestraPortsRef`, plus the port of `$ORCHESTRA_API_URL` when it names this machine: that
+    is where the CLI on this machine sends the password. -/
+def orchestraPorts : IO (Array UInt16) := do
+  let ps ← orchestraPortsRef.get
+  match (← IO.getEnv "ORCHESTRA_API_URL").bind loopbackPort? with
+  | some p => return if ps.contains p then ps else ps.push p
+  | none   => return ps
+
 end Orchestra.Exec
