@@ -1,6 +1,7 @@
 import Lean.Data.Json
 import Std.Sync
 import Orchestra.Config
+import Orchestra.Workflow
 import Orchestra.TaskStore
 import Orchestra.Queue
 import Orchestra.Project
@@ -349,6 +350,34 @@ instance : ToJson ActionConfig where
     let fields := if a.trusted                    then fields ++ [("trusted",        Json.bool true)]           else fields
     Json.mkObj fields
 
+/-- The variables a `workflow_path` may name: the repositories, which come from the listener's own
+    configuration (its source's `repos`), never from what an event says. A path chosen by an event
+    could point the listener at a workflow somebody else put on this disk — a clone's checkout is
+    one — and that workflow would then run with whatever tools and access it names. -/
+def workflowPathVars : List String := ["upstream", "fork", "upstream_escaped", "fork_escaped"]
+
+/-- The variables a single-task listener's `series` may name: the repositories, and the issue or
+    pull request number the event is about. A series is a name the operator's own runs share and
+    `orchestra resume` continues; built from an issue title, it would let whoever wrote the title
+    choose which series the task joins — another listener's, a person's. A number only says which
+    issue. -/
+def seriesVars : List String := workflowPathVars ++ ["issue_number", "pr_number"]
+
+/-- Why `template` names a placeholder outside `allowed`, or `none`. -/
+def placeholdersOutside (field : String) (template : String) (allowed : List String) :
+    Option String :=
+  match (Orchestra.placeholderNames template).filter (!allowed.contains ·) with
+  | [] => none
+  | bad => some s!"'{field}' names {String.intercalate ", " (bad.map (s!"\{\{{·}}}"))}, but it \
+may only name {String.intercalate ", " (allowed.map (s!"\{\{{·}}}"))}"
+
+/-- `template` rendered with `vars`, in one pass, with only the variables `allowed` names: what
+    `workflow_path` and `series` are rendered with, so a placeholder that slipped past the check at
+    load time is left standing rather than filled from the event. -/
+def renderRestricted (template : String) (vars : List (String × String))
+    (allowed : List String) : String :=
+  Orchestra.renderPlaceholders template (vars.filter (allowed.contains ·.1))
+
 instance : FromJson ActionConfig where
   fromJson? j := do
     let upstream       := j.getObjValAs? String "upstream" |>.toOption |>.getD ""
@@ -396,6 +425,10 @@ instance : FromJson ActionConfig where
           if let .error e := Utils.checkConfigName "deliver_to resident" r then throw e
           pure (some r)
         | .error _ => throw "'deliver_to' must name a resident"
+    if let some p := workflowPath then
+      if let some e := placeholdersOutside "workflow_path" p workflowPathVars then throw e
+    if let some s := series then
+      if let some e := placeholdersOutside "series" s seriesVars then throw e
     if deliverTo.isSome && workflowPath.isSome then
       throw "an action delivers to a resident (deliver_to) or starts a workflow (workflow_path), not both"
     let trusted := j.getObjValAs? Bool "trusted" |>.toOption |>.getD false
@@ -941,7 +974,8 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
   let id        ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
   let prompt    := renderTemplate action.promptTemplate vars
-  let series    := action.series.map (renderTemplate · vars)
+  -- Only the numbers and the repositories, in one pass (`seriesVars` says why).
+  let series    := action.series.map (renderRestricted · vars seriesVars)
   let mode      := action.mode
   -- Render upstream/fork through templates; fall back to {{upstream}}/{{fork}} vars if empty.
   let lookupVar (key : String) : String :=

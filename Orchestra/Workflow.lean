@@ -69,6 +69,11 @@ structure TaskSpec where
   backend       : Option String   := none
   /-- Issue or PR number to act on (required for the `triage` backend). -/
   issueNumber   : Option Nat      := none
+  /-- The event variable `issue-number` names instead of a number — `issue-number: {{pr_number}}`
+      — resolved into `issueNumber` by `WorkflowProgram.instantiate` once the event is known.
+      The one field other than `prompt` an event fills in, and only with a whole number: see
+      `instantiate` for why nothing else is. -/
+  issueNumberVar : Option String  := none
   /-- Labels to add to the issue or PR when using the `triage` backend. -/
   triageAddLabels    : List String := []
   /-- Labels to remove from the issue or PR when using the `triage` backend. -/
@@ -156,6 +161,84 @@ def WorkflowProgram.withListenerKleis (prog : WorkflowProgram) (spec : Option St
           kleisRoleSpec := t.kleisRoleSpec <|> spec
           kleisNarrow := (t.kleisNarrow ++ narrow).eraseDups } }
       | _ => s }
+
+/-- Replace each `{{name}}` in `template` whose name `vars` holds with its value, in one pass.
+
+    One pass, so that what a value says is never read as a template itself: an issue title that
+    contains `{{body}}` lands in the prompt as those eight characters, not as the issue's body.
+    A placeholder `vars` does not hold is left standing, as `Listener.renderTemplate` leaves it. -/
+partial def renderPlaceholders (template : String) (vars : List (String × String)) : String :=
+  go template.toList []
+where
+  go : List Char → List Char → String
+    | [], acc => String.ofList acc.reverse
+    | '{' :: '{' :: rest, acc =>
+      match closing rest [] with
+      | some (name, after) =>
+        match vars.lookup (String.ofList name) with
+        | some value => go after (value.toList.reverse ++ acc)
+        | none => go after (('}' :: '}' :: name.reverse) ++ '{' :: '{' :: acc)
+      | none => go rest ('{' :: '{' :: acc)
+    | c :: rest, acc => go rest (c :: acc)
+  /-- The name up to the next `}}`, and what follows it; `none` when a `{` or a newline comes
+      first, so `{{ {{x}}` renders its inner placeholder rather than swallowing the outer brace. -/
+  closing : List Char → List Char → Option (List Char × List Char)
+    | '}' :: '}' :: rest, name => some (name.reverse, rest)
+    | '{' :: _, _ => none
+    | '\n' :: _, _ => none
+    | c :: rest, name => closing rest (c :: name)
+    | [], _ => none
+
+/-- The names of the `{{name}}` placeholders in `s`, as `renderPlaceholders` reads them. -/
+partial def placeholderNames (s : String) : List String :=
+  go s.toList []
+where
+  go : List Char → List String → List String
+    | [], acc => acc.reverse
+    | '{' :: '{' :: rest, acc =>
+      match renderPlaceholders.closing rest [] with
+      | some (name, after) => go after (String.ofList name :: acc)
+      | none => go rest acc
+    | _ :: rest, acc => go rest acc
+
+/-- The program with an event's variables filled in: every task step's `prompt`, and the
+    `issue-number` of a step that names a variable for it.
+
+    Filled in after the YAML is parsed, never before. Rendering the whole file first — which is
+    what a listener used to do — put the event's text into the YAML *source*, so an issue title
+    with a quote and a newline in it could close the prompt's string and write any field of the
+    step after it: `read-only: false`, `tools`, `kleis-spec`, its `backend` and `budget`. Here an
+    event can only ever be text inside a prompt, whatever it contains.
+
+    The prompt is the only field rendered as text, because it is the only one meant to carry what
+    somebody else wrote. `issue-number` takes a variable whole, and only when it reads as a whole
+    number: it is what the event is *about*, which a workflow started by an event has no other way
+    to name, and a number cannot say anything but which issue. Every other field — the tools, the
+    access, the backend, the model, the budget, the repositories, the context label, the system
+    prompt — is what the operator wrote, and a placeholder in one stays exactly the text it is.
+
+    `vars` empty is a workflow run by hand, which has no event: prompts keep their placeholders,
+    and a step whose issue number was to come from one is refused rather than run without it. -/
+def WorkflowProgram.instantiate (prog : WorkflowProgram) (vars : List (String × String)) :
+    Except String WorkflowProgram := do
+  let steps ← prog.steps.mapM fun s => do
+    match s.action with
+    | .task t =>
+      let issueNumber ← match t.issueNumberVar with
+        | none => pure t.issueNumber
+        | some v =>
+          match vars.lookup v with
+          | none => throw s!"step '{s.name}': issue-number is '{"{{"}{v}{"}}"}', which the event \
+did not supply"
+          | some value =>
+            match value.trimAscii.toString.toNat? with
+            | some n => pure (some n)
+            | none => throw s!"step '{s.name}': issue-number is '{"{{"}{v}{"}}"}', which the event \
+supplied as '{value}', not a whole number"
+      pure { s with action := .task { t with
+        prompt := renderPlaceholders t.prompt vars, issueNumber, issueNumberVar := none } }
+    | _ => pure s
+  return { prog with steps }
 
 namespace Workflow
 
