@@ -354,6 +354,37 @@ def pinsAndTheAllowedListAreReadStrictly : Test := do
   TestM.assert ((clusterWith [("images", Json.mkObj [("a/b", .str "x:1")])]).toOption.map
     (·.repoImages) == some #[("a/b", { image := "x:1" })]) "a plain string is an ordinary pin"
 
+/-- GitHub treats the two spellings as one repository, so a pin must match either. -/
+@[test]
+def aPinMatchesWithoutRegardToCase : Test := do
+  match clusterWith [("images", Json.mkObj
+      [ ("Acme/Widgets", .str "ghcr.io/acme/widgets-ci:pinned")
+      , ("ACME/Secrets", Json.mkObj [("image", .str "ghcr.io/acme/hardened:3"),
+                                     ("absolute", .bool true)]) ])] with
+  | .error e => TestM.fail s!"the pins should parse: {e}"
+  | .ok c =>
+    let imageOf (spec : SessionSpec) : String :=
+      match Kubernetes.imageFor c spec with | .ok i => i | .error e => s!"<refused: {e}>"
+    TestM.assertEqual (imageOf (session "acme/widgets" (some "ghcr.io/acme/own:1") none))
+      "ghcr.io/acme/widgets-ci:pinned" (msg := "an ordinary pin under another spelling")
+    TestM.assertEqual (imageOf (session "acme/secrets" none (some reviewerImage)))
+      "ghcr.io/acme/hardened:3" (msg := "and an absolute one, which a task cannot slip past")
+    TestM.assertEqual (c.unmatchedPins ["acme/widgets", "acme/secrets"]) []
+      (msg := "known repositories match whatever their case")
+    TestM.assertEqual (c.unmatchedPins ["acme/widgets"]) ["ACME/Secrets"]
+      (msg := "a key no configured repository names is reported")
+
+/-- The daemon refuses to start on settings the backend cannot read (`Daemon.run`), which is what
+    makes a malformed pin an error at startup rather than a guarantee that silently does not hold. -/
+@[test]
+def aMalformedPinIsABackendThatCannotBeBuilt : Test := do
+  match Exec.factoryOf? "kubernetes" with
+  | none => TestM.fail "the kubernetes backend should be registered"
+  | some f =>
+    let opts := Json.mkObj [("mcp_host", .str "orchestra.svc"),
+      ("images", Json.mkObj [("a/b", Json.mkObj [("absolute", .bool true)])])]
+    TestM.assert (f.make opts).toOption.isNone "an object pin with no image cannot be built"
+
 @[test]
 def namingTheInheritedImagePassesUnlisted : Test := do
   let ctx := { parent with executionImage := some reviewerImage }

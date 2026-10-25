@@ -354,6 +354,13 @@ or inherited image can move that repository's tasks into another image. The daem
 task asked for something else. To bound task images everywhere rather than per repository, set
 `allowed_task_images`.
 
+Pins are matched against `owner/name` without regard to case, as GitHub matches them. They are
+read strictly: an entry that is neither an image nor `{"image": …, "absolute": …}`, or names no
+usable image, stops the daemon from starting, since an `absolute` pin that silently failed to read
+would be a guarantee that does not hold. At startup the daemon also warns about any key no
+listener, role, API client or spawn policy names — a misspelt key pins nothing. Projects on the
+tracker are not consulted for that warning.
+
 **On landrun and local** there is no image to change. A task that names one says so once, in the
 daemon's log, and runs as usual on the host — so the tools its image would carry have to be
 installed there, or reachable through `additional_sandbox_paths` under landrun.

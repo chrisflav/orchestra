@@ -493,6 +493,20 @@ $HOME. Use task_volumes, which gives each task chain its own checkout and home"
 def validImageRef (ref : String) : Bool :=
   (imageRefError? ref).isNone
 
+/-- The operator's pin for repository `repo` (`owner/name`), matched without regard to case.
+
+    GitHub treats `Acme/Widgets` and `acme/widgets` as one repository, and so do the URLs a task is
+    cloned from; a pin keyed by one spelling and a task naming the other must not slip past each
+    other, least of all an `absolute` one. -/
+def Config.pinFor (cfg : Config) (repo : String) : Option RepoPin :=
+  cfg.repoImages.find? (·.1.toLower == repo.toLower) |>.map (·.2)
+
+/-- The keys of `images` that name no repository in `known` (compared without regard to case):
+    almost always a typo, and a pin that never matches pins nothing. -/
+def Config.unmatchedPins (cfg : Config) (known : List String) : List String :=
+  let lower := known.map (·.toLower)
+  cfg.repoImages.toList.map (·.1) |>.filter (!lower.contains ·.toLower)
+
 /-- Whether `image` is one `allowed_task_images` permits: listed exactly, or under a listed prefix
     ending in `/`. An empty list permits any. -/
 def taskImageAllowed (cfg : Config) (image : String) : Bool :=
@@ -531,7 +545,7 @@ def taskImageAllowed (cfg : Config) (image : String) : Bool :=
     and a row of the queue table are read leniently (`FromJson QueueEntry`, `QueueEntry.ofRow?`),
     since orchestra wrote them — and what is returned here goes into the pod manifest verbatim. -/
 def imageFor (cfg : Config) (spec : SessionSpec) : Except String String :=
-  let pin := spec.repo.bind (fun r => cfg.repoImages.find? (·.1 == r)) |>.map (·.2)
+  let pin := spec.repo.bind (cfg.pinFor ·)
   match pin with
   | some p =>
     if p.absolute then .ok p.image else fromTask (some p.image)
