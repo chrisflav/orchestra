@@ -194,7 +194,9 @@ by task {e.taskId}"
       , kleisNarrow := resolved.kleisNarrow
       , spawnedBy := some spawnerTaskId
       -- The queueing task's scope, not one derived from the bound issue (`Tools.writeScopeRoot`).
-      , scopeRoot := resolved.scopeRoot }
+      , scopeRoot := resolved.scopeRoot
+      -- The spawning task's image, or one the policy's `images` lists.
+      , executionImage := resolved.executionImage }
     -- A claim taken for an entry that then failed to be written is held by an id no entry has,
     -- and nothing downstream would ever release it: the daemon releases on behalf of the entry
     -- it is running, and there would be none.
@@ -258,7 +260,8 @@ private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : S
                  , from_ := .orchestra }]
     label   := initialRecord.id
     repo    := some pr.repo.toString
-    image   := repoConfig.image }
+    image   := repoConfig.image
+    taskImage := ioTask.executionImage }
   let (valid, validOutput) ← try
       RepoConfig.runValidation session repoPath
     finally
@@ -994,6 +997,8 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     -- way as `resolveMemoryDirs` just above, and as `runMerger`.
     repo    := ioTask.repo.map (·.upstream.toString)
     image   := repoConfig.image
+    -- What kind of work this is, which beats what the repository asked for (`Kubernetes.imageFor`).
+    taskImage := ioTask.executionImage
     -- Past this point the pod is gone and the task cannot be handed to another daemon: see
     -- `Exec.enterReattachable` below.
     beforeRelease := Exec.leaveReattachable taskId }
@@ -1103,7 +1108,9 @@ of its own.")
                       , projectId := ioTask.projectId
                       , identity := ioTask.identity
                       , kleisSpec := inheritedSpec, kleisToken := inheritedToken
-                      , kleisNarrow }
+                      , kleisNarrow
+                      -- A follow-up of the same kind of work needs the same tools.
+                      , executionImage := ioTask.executionImage }
       enqueueTask  := some (enqueueTaskImpl appConfig)
       scopeRoot    := ioTask.scopeRoot
       prLabels  := ioTask.prLabels

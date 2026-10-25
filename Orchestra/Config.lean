@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Orchestra.Dirs
+import Orchestra.Exec.Spec
 import Orchestra.Taxis
 import Std.Sync
 
@@ -405,6 +406,15 @@ structure SpawnPolicy where
       task had. Set it explicitly for the case the tool exists for: a read-only planner queueing
       an implementor that has to write. -/
   readOnly      : Option Bool := none
+  /-- Images a queued task may be run in (`execution_image`). Empty: only the spawning task's
+      own, which for most tasks is none — so the queued task runs wherever its repository and the
+      operator's configuration put it.
+
+      A list rather than a prefix, unlike `allowed_image_prefixes` for what a repository asks for:
+      a task's image beats the operator's per-repository pin (`docs/kubernetes.md`), so naming one
+      is the strongest thing a policy can let an agent or an API client say about where its work
+      runs, and an operator granting it should be able to read off exactly what was granted. -/
+  images        : List String := []
 deriving Repr, Inhabited
 
 instance : ToJson SpawnPolicy where
@@ -414,6 +424,7 @@ instance : ToJson SpawnPolicy where
     let f := if p.models.isEmpty   then f else f ++ [("models",   ToJson.toJson p.models)]
     let f := if p.tools.isEmpty    then f else f ++ [("tools",    ToJson.toJson p.tools)]
     let f := if p.repos.isEmpty    then f else f ++ [("repos",    ToJson.toJson p.repos)]
+    let f := if p.images.isEmpty   then f else f ++ [("images",   ToJson.toJson p.images)]
     let f := f ++ [("max_tasks", Json.num p.maxTasks)]
     let f := if p.allowPreClaim then f ++ [("allow_pre_claim", Json.bool true)] else f
     let f := match p.maxBudget with
@@ -438,6 +449,7 @@ instance : FromJson SpawnPolicy where
     let backends ← listOr "backends"
     let models   ← listOr "models"
     let tools    ← listOr "tools"
+    let images   ← listOr "images"
     let repos ← match j.getObjVal? "repos" with
       | .error _ => pure []
       | .ok v    => (FromJson.fromJson? v : Except String (List Repository))
@@ -447,7 +459,7 @@ instance : FromJson SpawnPolicy where
     let priority      := j.getObjValAs? Nat   "priority"        |>.toOption |>.getD 10
     let readOnly      := j.getObjValAs? Bool  "read_only"       |>.toOption
     return { backends, models, tools, repos, maxTasks, allowPreClaim, maxBudget, priority,
-             readOnly }
+             readOnly, images }
 
 /-- Read a `spawn_policy` out of the object `j`.
 
@@ -474,6 +486,9 @@ def SpawnPolicy.validate (p : SpawnPolicy) (knownTools : List String) : Except S
   unless unknown.isEmpty do
     .error s!"spawn_policy names unknown tool(s) {String.intercalate ", " unknown}; \
 the tools a queued task may be granted are {String.intercalate ", " knownTools}"
+  for ref in p.images do
+    if let some e := Exec.imageRefError? ref then
+      .error s!"spawn_policy 'images': {e}"
   if p.maxTasks == 0 then
     .error "spawn_policy 'max_tasks' is 0, which refuses every call; drop the whole \
 'spawn_policy' block to take the tool away instead"
@@ -547,6 +562,23 @@ def parseKleisTokenRef? (j : Json) : Except String (Option String) :=
     | some e => .error e
     | none => .ok (some s)
   | .ok _ => .error "kleis_token must be a string: a reference to a secret, such as \"{{my_token}}\""
+
+/-! ## The image a task runs in (`docs/kubernetes.md`) -/
+
+/-- Read an optional `execution_image` out of `j`, strictly: present and not a usable image
+    reference is an error, since an image read as absent would run the task without the tools it
+    was configured to have, and fail somewhere in the middle of its run for a reason nothing in
+    the log points at. `key` is the spelling — a workflow step says `execution-image`. -/
+def parseExecutionImage? (j : Json) (what : String := "execution_image")
+    (key : String := "execution_image") : Except String (Option String) :=
+  match j.getObjVal? key with
+  | .error _ => .ok none
+  | .ok .null => .ok none
+  | .ok (.str s) => match Exec.imageRefError? s with
+    | some e => .error s!"{what}: {e}"
+    | none => .ok (some s)
+  | .ok _ => .error s!"{what} must be a string naming an image, such as \
+\"ghcr.io/acme/reviewer:1.4\""
 
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
@@ -676,6 +708,21 @@ structure IOTask (i o : ResultType) where
       bound to (`Project.projectRootOf`), which walks up to the nearest project anchor and can
       land above the scope the task that queued it was held to — see `writeScopeRoot`. -/
   scopeRoot : Option Taxis.IssueId := none
+  /-- The image this task runs in, on a backend that runs tasks in images (`kubernetes`).
+
+      A property of the *task*, where the image a repository asks for is a property of the
+      repository: what kind of work this is — a review that drives a review platform's CLI, a
+      release that needs signing tools — decides what has to be installed as much as the
+      repository does, and it does not change with the repository. So it beats both the operator's
+      per-repository pin, unless that pin is `absolute`, and the repository's own
+      `.orchestra/config.json` (`Kubernetes.imageFor`, and `docs/kubernetes.md` for the whole
+      order). A backend that runs tasks on this machine
+      cannot change images; it says so once and runs the task as usual (`Exec.SessionSpec`).
+
+      Set by whatever describes the task: a task file, a role, a listener action, a workflow step.
+      An agent's `queue_task` and an API client's request may name one only from their policy's
+      `images` (`Orchestra.Spawn`). -/
+  executionImage : Option String := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -829,12 +876,15 @@ instance : FromJson Task where
       | .ok v => parseKleisSpec? (Json.mkObj [("kleis_spec", v)]) "kleis_role_spec"
       | .error _ => pure none
     let kleisNarrow ← parseKleisNarrow? j
+    -- Strict too: an image dropped as unreadable runs the task without the tools it needs.
+    let executionImage ← parseExecutionImage? j
     return { i, o, ioTask := { repo, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec,
                                 kleisNarrow, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,
-                                triageAddLabels, triageRemoveLabels, spawnPolicy, scopeRoot } }
+                                triageAddLabels, triageRemoveLabels, spawnPolicy, scopeRoot,
+                                executionImage } }
 
 /-- Filesystem paths to expose inside the landrun sandbox. -/
 structure SandboxPaths where

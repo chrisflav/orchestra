@@ -39,10 +39,10 @@ queue:
 
 What a client may queue is decided by exactly the rules an agent's `queue_task` is held to
 (`Orchestra.Spawn`): the client's own fields — `backend`, `model`, `tools`, `read_only`,
-`kleis_spec`, `kleis_narrow` — play the part of the spawning task, so they are what a request
-inherits when it names nothing, and `queue_policy` is a `spawn_policy` saying what it may name
-instead. One set of rules rather than two, so the two ways of putting work on the queue from
-outside a person's shell cannot drift apart.
+`kleis_spec`, `kleis_narrow`, `execution_image` — play the part of the spawning task, so they are
+what a request inherits when it names nothing, and `queue_policy` is a `spawn_policy` saying what
+it may name instead. One set of rules rather than two, so the two ways of putting work on the
+queue from outside a person's shell cannot drift apart.
 
 Two fields of a spawn policy mean something different for a client, and are handled here:
 
@@ -51,6 +51,15 @@ Two fields of a spawn policy mean something different for a client, and are hand
     pending or running at once.
   * `allow_pre_claim` binds a taxis issue, which a client cannot ask for in this version: the
     request has no `issue_id`. It is refused rather than accepted and ignored.
+
+## The image its tasks run in
+
+A client's work is usually of one kind — reviews driving a review platform's CLI, say — and the
+tools that work needs belong in an image of the operator's choosing rather than in orchestra's
+default one. `execution_image` in the client file is that image: every task the client queues
+runs in it, unless the request names another from `queue_policy.images`. As for any task, it beats
+the repository's own image and the operator's per-repository pin (`docs/kubernetes.md`), because
+it says what kind of work this is, which does not change with the repository.
 
 ## What a client never chooses
 
@@ -86,7 +95,7 @@ structure ApiClient where
     what another system may spend is refused rather than read as absent. -/
 private def knownKeys : List String :=
   ["description", "token", "backend", "model", "tools", "read_only", "kleis_spec", "kleis_narrow",
-   "queue_policy", "max_active"]
+   "queue_policy", "max_active", "execution_image"]
 
 private def unknownKeys (j : Json) (known : List String) : List String :=
   match j.getObj? with
@@ -139,6 +148,7 @@ queued task may be granted are {String.intercalate ", " Project.Role.knownPermis
     | .ok _ => .error s!"{what}: 'read_only' must be true or false"
   let kleisSpec ← parseKleisSpec? j s!"{what}: kleis_spec"
   let kleisNarrow ← parseKleisNarrow? j s!"{what}: kleis_narrow"
+  let executionImage ← parseExecutionImage? j s!"{what}: execution_image"
   let policyJson ← match j.getObjVal? "queue_policy" with
     | .error _ | .ok .null => pure (Json.mkObj [])
     | .ok v => pure v
@@ -161,7 +171,7 @@ client to take its access away instead"
       | .ok n => pure n
       | .error _ => .error s!"{what}: 'max_active' must be a positive whole number"
   return { name, token, policy, maxActive
-         , defaults := { backend, model, tools, readOnly, kleisSpec, kleisNarrow } }
+         , defaults := { backend, model, tools, readOnly, kleisSpec, kleisNarrow, executionImage } }
 
 /-! ## Filesystem layout -/
 
@@ -235,7 +245,7 @@ deriving Inhabited
 
 private def requestKeys : List String :=
   ["prompt", "goal", "upstream", "backend", "model", "tools", "budget", "issue_number",
-   "external_id", "kleis_narrow"]
+   "external_id", "kleis_narrow", "execution_image"]
 
 /-- Read a queue request out of a request body, strictly: an unknown field is refused, because a
     field the client believes it set — a `priority`, a `fork` — and the server ignored is a task
@@ -293,7 +303,9 @@ def parseRequest (j : Json) : Except String QueueRequest := do
     if e.trimAscii.isEmpty || e.length > 200 then
       .error "'external_id' must be between 1 and 200 characters"
   let kleisNarrow ← parseKleisNarrow? j
-  return { spawn := { prompt, backend, model, tools, repo, budget, kleisNarrow }
+  -- Checked for being an image reference here, and against `queue_policy.images` by `resolve`.
+  let executionImage ← parseExecutionImage? j
+  return { spawn := { prompt, backend, model, tools, repo, budget, kleisNarrow, executionImage }
          , goal, issueNumber, externalId }
 
 /-- Check `r` against the client's policy and fill in everything it left out. Pure. -/
@@ -328,6 +340,8 @@ def ApiClient.entry (c : ApiClient) (r : QueueRequest) (resolved : ResolvedSpawn
   -- Never a policy of its own: what a client queues cannot queue more.
   , spawnPolicy := none
   , apiClient := some c.name
-  , externalId := r.externalId }
+  , externalId := r.externalId
+  -- The client's image, or one its policy lists that the request named.
+  , executionImage := resolved.executionImage }
 
 end Orchestra.ApiClient

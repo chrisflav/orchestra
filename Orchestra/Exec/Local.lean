@@ -80,7 +80,9 @@ def session : Session where
 def backend : Backend where
   name := "local"
   preflight := preflight
-  openSession _ := pure session
+  openSession spec := do
+    spec.noteImageIgnored "local"
+    pure session
 
 def factory : BackendFactory where
   name := "local"

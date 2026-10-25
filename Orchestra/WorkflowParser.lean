@@ -202,6 +202,14 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
         match kleisTokenRefError? s with
         | some e => .error e
         | none   => pure (some s)
+  -- Strict too: an image dropped as unreadable runs the step without the tools it needs.
+  let executionImage ← match mappingLookup pairs "execution-image" with
+    | none => pure none
+    | some n =>
+      let s := strTrim (← nodeAsString n)
+      match Exec.imageRefError? s with
+      | some e => .error s!"execution-image: {e}"
+      | none   => pure (some s)
   let kleisNarrow ← match mappingLookup pairs "kleis-narrow" with
     | none      => pure []
     | some node => do
@@ -268,7 +276,7 @@ private def parseTaskSpec (node : Node) : Except String TaskSpec := do
           parseOutputSpec name v
   return { agent, model, budget, tools, prompt, readOnly, input, output, context, upstream, fork,
            systemPrompt, prependPrompt, backend, issueNumber, triageAddLabels, triageRemoveLabels,
-           identity, kleisToken, kleisSpec, kleisNarrow, issueNumberVar }
+           identity, kleisToken, kleisSpec, kleisNarrow, issueNumberVar, executionImage }
 
 private def parseWriteAction (node : Node) : Except String StepAction := do
   let s ← nodeAsString node

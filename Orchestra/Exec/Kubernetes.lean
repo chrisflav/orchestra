@@ -124,6 +124,18 @@ structure TaskVolumes where
   finishCommand : Option String := none
 deriving Repr, Inhabited
 
+/-- An operator's image for one repository (`execution.options.images`), written as the image
+    alone or as `{"image": "…", "absolute": true}`.
+
+    An ordinary pin beats what the repository asks for and loses to what the task asks for, since
+    a task's image says what kind of work it is (`imageFor`). An `absolute` pin beats that too:
+    for the repository whose tasks must run in one image whatever they are — a namespace's only
+    scanned image, a repository that must never be checked out next to another tool. -/
+structure RepoPin where
+  image    : String
+  absolute : Bool := false
+deriving Repr, Inhabited, BEq
+
 /-- What this backend needs from `execution.options`.
 
     `mcp_host` is the only one without a default — nothing can guess where a pod reaches this
@@ -171,8 +183,21 @@ structure Config where
       three answers, not the only one. See `imageFor`. -/
   image : String := defaultImage
   /-- Image per repository, by `owner/name`, for an operator who would rather decide centrally than
-      take what a repository asks for. Beats the repository's own choice. -/
-  repoImages : Array (String × String) := #[]
+      take what a repository asks for. Beats the repository's own choice; an `absolute` one beats
+      the task's own image as well (`RepoPin`). -/
+  repoImages : Array (String × RepoPin) := #[]
+  /-- The images a task may name for itself (`SessionSpec.taskImage`), whichever path it came by:
+      a task file, a role, a listener action, a workflow step, an API client, `queue_task`. Each
+      entry is an image reference matched exactly, or a prefix ending in `/` that matches every
+      image under it (`"ghcr.io/acme/tools/"`).
+
+      Empty — the default — means any. That is the right default because every source of a task
+      image is either the operator's own configuration or bounded by a policy's `images`, which
+      the operator wrote too; this list is for the operator who would rather hold all of them to
+      one registry or one set of images in a single place than audit every role and policy that
+      could name one. A task image outside it fails the task, naming the list, rather than being
+      quietly replaced: the task would otherwise run without the tools it was configured for. -/
+  allowedTaskImages : Array String := #[]
   /-- Whether a repository may name its own image in its `.orchestra/config.json`.
 
       On by default, because the repository is what knows what it needs to build, and because
@@ -397,6 +422,41 @@ a plain path inside the checkout"
 label value (1–63 of letters, digits, '.', '_' and '-', starting and ending with a letter or digit)"
     | .ok other     => throw s!"kubernetes: execution.options.instance must be a string, not \
 {other.compress}"
+  -- Strict, unlike the lists around it: a pin that failed to read would be a repository running
+  -- in whatever its tasks or its own config ask for, which for an `absolute` pin is exactly the
+  -- thing it was written to prevent.
+  let repoImages ← match j.getObjVal? "images" with
+    | .error _ | .ok .null => pure #[]
+    | .ok (.obj kvs) => kvs.toArray.mapM fun (repo, v) => do
+        let pin ← match v with
+          | .str i => pure ({ image := i } : RepoPin)
+          | .obj _ =>
+            let some i := (v.getObjValAs? String "image").toOption
+              | throw s!"kubernetes: execution.options.images.{repo} has no 'image'"
+            let absolute ← match v.getObjVal? "absolute" with
+              | .error _ | .ok .null => pure false
+              | .ok (.bool b) => pure b
+              | .ok _ => throw s!"kubernetes: execution.options.images.{repo}.absolute must be \
+true or false"
+            pure { image := i, absolute }
+          | other => throw s!"kubernetes: execution.options.images.{repo} must be an image or \
+{"{"}\"image\": …, \"absolute\": true}, not {other.compress}"
+        if let some e := imageRefError? pin.image then
+          throw s!"kubernetes: execution.options.images.{repo}: {e}"
+        pure (repo, pin)
+    | .ok other => throw s!"kubernetes: execution.options.images must be an object keyed by \
+owner/name, not {other.compress}"
+  let allowedTaskImages ← match j.getObjVal? "allowed_task_images" with
+    | .error _ | .ok .null => pure #[]
+    | .ok (.arr vs) => vs.mapM fun v => match v with
+      | .str s =>
+        if s.isEmpty then throw "kubernetes: execution.options.allowed_task_images has an empty \
+entry, which would match nothing"
+        else pure s
+      | other => throw s!"kubernetes: execution.options.allowed_task_images must list image \
+references or prefixes ending in '/', not {other.compress}"
+    | .ok other => throw s!"kubernetes: execution.options.allowed_task_images must be a list, not \
+{other.compress}"
   if j.getObjVal? "home_claim" |>.toOption |>.isSome then
     throw "kubernetes: execution.options.home_claim is gone: it gave every agent one shared \
 $HOME. Use task_volumes, which gives each task chain its own checkout and home"
@@ -423,52 +483,98 @@ $HOME. Use task_volumes, which gives each task chain its own checkout and home"
     excludes
     homePath := (jsonStr? j "home_path").getD "/home/agent"
     taskVolumes
-    repoImages := match j.getObjVal? "images" with
-      | .ok (.obj kvs) => kvs.toArray.filterMap fun (k, v) =>
-          match v with | .str i => some (k, i) | _ => none
-      | _              => #[]
+    repoImages
+    allowedTaskImages
     allowRepoImage := j.getObjValAs? Bool "allow_repo_image" |>.toOption |>.getD true
     inst
   }
 
-/-- Whether `ref` is something that can be an image reference at all.
-
-    Not a parse of the OCI grammar — the registry is the authority on that, and a reference this
-    accepts and the registry rejects fails as an unstartable pod with the registry's own message.
-    What this is for is the one case where the string is not the operator's: a repository names its
-    own image in a file in the repository, so a name with a space, a quote or a newline in it
-    should be refused here rather than turned into a manifest field. -/
+/-- Whether `ref` is something that can be an image reference at all (`Exec.imageRefError?`). -/
 def validImageRef (ref : String) : Bool :=
-  !ref.isEmpty && ref.length ≤ 512 &&
-    ref.all fun c =>
-      c.isAlphanum || c == '.' || c == '_' || c == '-' || c == '/' || c == ':' || c == '@'
+  (imageRefError? ref).isNone
+
+/-- The operator's pin for repository `repo` (`owner/name`), matched without regard to case.
+
+    GitHub treats `Acme/Widgets` and `acme/widgets` as one repository, and so do the URLs a task is
+    cloned from; a pin keyed by one spelling and a task naming the other must not slip past each
+    other, least of all an `absolute` one. -/
+def Config.pinFor (cfg : Config) (repo : String) : Option RepoPin :=
+  cfg.repoImages.find? (·.1.toLower == repo.toLower) |>.map (·.2)
+
+/-- The keys of `images` that name no repository in `known` (compared without regard to case):
+    almost always a typo, and a pin that never matches pins nothing. -/
+def Config.unmatchedPins (cfg : Config) (known : List String) : List String :=
+  let lower := known.map (·.toLower)
+  cfg.repoImages.toList.map (·.1) |>.filter (!lower.contains ·.toLower)
+
+/-- Whether `image` is one `allowed_task_images` permits: listed exactly, or under a listed prefix
+    ending in `/`. An empty list permits any. -/
+def taskImageAllowed (cfg : Config) (image : String) : Bool :=
+  cfg.allowedTaskImages.isEmpty ||
+    cfg.allowedTaskImages.any fun a => a == image || (a.endsWith "/" && image.startsWith a)
 
 /-- The image a task runs in, or why the one it asked for cannot be used.
 
-    An operator's per-repository pin first, because that is the one someone chose deliberately for
-    this repository and nothing in the repository should be able to override it. Then what the
-    repository itself asked for, which is where the answer usually belongs — the repository is what
-    knows whether its tests need a JDK or a browser. Then the configured default, for everything
-    that has not said otherwise.
+    Five answers, in this order:
 
-    The middle one is the only one checked, because it is the only one that did not come from this
-    daemon's own configuration. Refused rather than quietly replaced by the default: a repository
-    that asked for a JDK image and silently got one without would fail its validation script for a
-    reason nothing in the log points at. -/
+    1. **An absolute pin** for the repository (`RepoPin.absolute`). The operator has said this
+       repository runs in this image whatever the task is, and nothing else may talk it out of
+       that — not the repository, and not the task.
+    2. **The task's own image** (`SessionSpec.taskImage`), because it says what kind of work this
+       is — a review driving a review platform's CLI, a release that needs signing tools — and the
+       tools that work needs do not change with the repository it is done on. A task that needs
+       them fails without them whatever the repository is. It is held to `allowed_task_images`,
+       and refused when outside it.
+    3. **An ordinary pin** for the repository: a statement about the repository, chosen
+       deliberately, which nothing *in* the repository can override.
+    4. **What the repository asked for**, which is where the answer usually belongs — the
+       repository is what knows whether its tests need a JDK or a browser — held to
+       `allow_repo_image` and `allowed_image_prefixes`.
+    5. **The configured default**, for everything that has not said otherwise.
+
+    `allow_repo_image` and `allowed_image_prefixes` are about the repository's request and nothing
+    else; `allowed_task_images` is the task's counterpart.
+
+    A refusal is never quietly replaced by the default: a task that asked for a reviewer's image,
+    or a repository that asked for a JDK one, and silently got one without would fail for a reason
+    nothing in the log points at.
+
+    The task's image is checked again for being an image reference at all, and that check is
+    load-bearing rather than belt and braces. Every place a task is *described* checks it when it
+    is read, but an entry reaches the daemon by other ways too — `add_task` over the control socket
+    and a row of the queue table are read leniently (`FromJson QueueEntry`, `QueueEntry.ofRow?`),
+    since orchestra wrote them — and what is returned here goes into the pod manifest verbatim. -/
 def imageFor (cfg : Config) (spec : SessionSpec) : Except String String :=
-  match spec.repo.bind (fun r => cfg.repoImages.find? (·.1 == r)) with
-  | some (_, pinned) => .ok pinned
-  | none =>
-    match (if cfg.allowRepoImage then spec.image else none) with
-    | none          => .ok cfg.image
-    | some declared =>
-      if !validImageRef declared then
-        .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not a usable image reference"
-      else if cfg.allowedImagePrefixes.isEmpty
-              || cfg.allowedImagePrefixes.any (fun p => declared.startsWith p) then
-        .ok declared
-      else
-        .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not under any of the image prefixes this daemon allows a repository to name ({String.intercalate ", " cfg.allowedImagePrefixes.toList}). Pin the repository under execution.options.images instead, or widen allowed_image_prefixes."
+  let pin := spec.repo.bind (cfg.pinFor ·)
+  match pin with
+  | some p =>
+    if p.absolute then .ok p.image else fromTask (some p.image)
+  | none => fromTask none
+where
+  fromTask (pinned : Option String) : Except String String :=
+    match spec.taskImage with
+    | some image =>
+      match imageRefError? image with
+      | some e => .error s!"the task asks to run in an unusable image: {e}"
+      | none =>
+        if taskImageAllowed cfg image then .ok image
+        else .error s!"the task asks to run in '{image}', which is not one of the task images \
+this daemon allows ({String.intercalate ", " cfg.allowedTaskImages.toList}); widen \
+execution.options.allowed_task_images, or name an image it lists"
+    | none =>
+      match pinned with
+      | some p => .ok p
+      | none =>
+        match (if cfg.allowRepoImage then spec.image else none) with
+        | none          => .ok cfg.image
+        | some declared =>
+          if !validImageRef declared then
+            .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not a usable image reference"
+          else if cfg.allowedImagePrefixes.isEmpty
+                  || cfg.allowedImagePrefixes.any (fun p => declared.startsWith p) then
+            .ok declared
+          else
+            .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not under any of the image prefixes this daemon allows a repository to name ({String.intercalate ", " cfg.allowedImagePrefixes.toList}). Pin the repository under execution.options.images instead, or widen allowed_image_prefixes."
 
 /-! ## The pod
 
@@ -1913,6 +2019,12 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
   let image ← match imageFor cfg spec with
     | .ok i    => pure i
     | .error e => throw (IO.userError s!"kubernetes: {e}")
+  -- Said once, so the pod running something other than what the task asked for is explained in
+  -- the log rather than discovered when the task's first command is missing.
+  if let some asked := spec.taskImage then
+    if asked != image then
+      IO.eprintln s!"  [k8s] {spec.label} asks to run in {asked}; {spec.repo.getD "its repository"} \
+is pinned absolutely to {image} (execution.options.images), which wins"
   -- A task volume only for what asks for one (`taskId`): the merger and `prepare` have nothing
   -- to continue and nothing worth keeping, and get the throwaway pod they always had.
   let volume : Option (TaskVolumes × String × Bool) ← match cfg.taskVolumes, spec.taskId with

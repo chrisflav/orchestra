@@ -409,6 +409,15 @@ structure SessionSpec where
       database client. A backend that runs tasks in an image of some kind reads this to decide
       which; one that runs them on this machine has nothing to choose and ignores it. -/
   image : Option String := none
+  /-- The image the *task* asked for, whatever its repository asked for
+      (`Config.IOTask.executionImage`): what kind of work this is, said by whatever queued it.
+
+      Kept apart from `image` rather than folded into it by the caller, because the two are
+      ranked on either side of the operator's per-repository pin (`Kubernetes.imageFor`), and
+      because the repository's is checked against `allowed_image_prefixes` and this one is not —
+      it has already been held to whatever policy let it be named. A backend that runs tasks on
+      this machine has no image to change and says so (`SessionSpec.noteImageIgnored`). -/
+  taskImage : Option String := none
   /-- The task, interactive session or `orchestra interactive` run this environment is for, for a
       backend that keeps its workspace after it ends (`Backend.persistentWorkspaces`). `none` for
       what keeps nothing — the merger, `orchestra prepare` — which gets a throwaway one. -/
@@ -465,6 +474,21 @@ structure SessionSpec where
   resident : Option String := none
   /-- The size of a new workspace volume, where the backend makes one; `none` is its own default. -/
   volumeSize : Option String := none
+
+/-- Say, once for the task, that the image it asked for (`taskImage`) is not where it runs: for
+    the backends that run tasks on this machine, which have no image to change. The task then runs
+    as usual, and the tools its image would have carried have to be on this machine instead — on
+    the host, or reachable through `additional_sandbox_paths` under landrun.
+
+    Run anyway rather than refused. The daemon that queued the task and the daemon that runs it
+    may be configured differently — a test instance on landrun beside a cluster deployment — and a
+    task that names an image for the cluster should still run on a machine that happens to have
+    its tools. When it does not, the failure is the missing command's, with this line above it. -/
+def SessionSpec.noteImageIgnored (backendName : String) (spec : SessionSpec) : IO Unit := do
+  if let some image := spec.taskImage then
+    IO.eprintln s!"  [exec] {spec.label} asks to run in the image {image}; the '{backendName}' \
+backend runs tasks on this machine and cannot change images, so it runs here as usual and the \
+tools that image would carry have to be installed on the host"
 
 /-- What `Backend.probe` found of an environment a previous daemon left. -/
 inductive ProbeResult where

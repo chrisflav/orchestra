@@ -217,6 +217,88 @@ def anEntryRoundTripsItsClientFields : Test := do
       TestM.assertEqual back.apiClient e.apiClient
       TestM.assertEqual back.externalId e.externalId
 
+/-! ## The image a client's tasks run in -/
+
+private def imagedClientFile : String :=
+  "{\"token\": \"{{review_token}}\", \"read_only\": true,
+    \"execution_image\": \"ghcr.io/acme/reviewer:1.4\",
+    \"queue_policy\": {\"repos\": [\"acme/widgets\"],
+                       \"images\": [\"ghcr.io/acme/reviewer:2.0\"]}}"
+
+private def imagedClient : ApiClient :=
+  match clientOf imagedClientFile with
+  | .ok c    => c
+  | .error _ => { name := "?", token := "", defaults := {}, policy := {} }
+
+@[test]
+def aClientFileCarriesAnImage : Test := do
+  match clientOf imagedClientFile with
+  | .error e => TestM.fail s!"a client with an image should parse: {e}"
+  | .ok c =>
+    TestM.assertEqual c.defaults.executionImage (some "ghcr.io/acme/reviewer:1.4")
+      (msg := "what a request inherits")
+    TestM.assertEqual c.policy.images ["ghcr.io/acme/reviewer:2.0"]
+  match clientOf "{\"token\": \"{{review_token}}\", \"execution_image\": \"a b\"}" with
+  | .ok _ => TestM.fail "a client naming a malformed image should be refused"
+  | .error e => TestM.assert (mentions e "execution_image") e
+  match clientOf "{\"token\": \"{{review_token}}\", \"execution_image\": \"\"}" with
+  | .ok _ => TestM.fail "an empty image should be refused"
+  | .error e => TestM.assert (mentions e "execution_image") e
+  match clientOf "{\"token\": \"{{review_token}}\",
+                   \"queue_policy\": {\"images\": [\"no good\"]}}" with
+  | .ok _ => TestM.fail "a policy listing a malformed image should be refused"
+  | .error e => TestM.assert (mentions e "images") e
+
+@[test]
+def aRequestInheritsTheClientsImage : Test := do
+  match requestOf "{\"prompt\": \"review\", \"upstream\": \"acme/widgets\"}" with
+  | .error e => TestM.fail s!"the request should parse: {e}"
+  | .ok r =>
+    match imagedClient.resolve r with
+    | .error e => TestM.fail s!"inheriting the client's image needs no listing: {e}"
+    | .ok res =>
+      let e := imagedClient.entry r res none "e1" "2026-10-25T00:00:00Z"
+      TestM.assertEqual e.executionImage (some "ghcr.io/acme/reviewer:1.4")
+        (msg := "the entry carries the client's image")
+
+@[test]
+def aRequestMayNameOnlyAnImageThePolicyLists : Test := do
+  match requestOf "{\"prompt\": \"review\", \"execution_image\": \"ghcr.io/acme/reviewer:2.0\"}" with
+  | .error e => TestM.fail s!"a request naming an image should parse: {e}"
+  | .ok r =>
+    match imagedClient.resolve r with
+    | .error e => TestM.fail s!"a listed image should be allowed: {e}"
+    | .ok res => TestM.assertEqual res.executionImage (some "ghcr.io/acme/reviewer:2.0")
+  match requestOf "{\"prompt\": \"review\", \"execution_image\": \"docker.io/evil:1\"}" with
+  | .error e => TestM.fail s!"the request should parse: {e}"
+  | .ok r =>
+    match imagedClient.resolve r with
+    | .ok _ => TestM.fail "an image the client's policy does not list should be refused"
+    | .error e =>
+      TestM.assert (mentions e "client 'reviews'") e
+      TestM.assert (mentions e "queue_policy") e
+  -- The reviewer client lists no images at all: it may name none, however well-formed.
+  match requestOf "{\"prompt\": \"review\", \"execution_image\": \"ghcr.io/acme/reviewer:2.0\"}" with
+  | .error e => TestM.fail s!"the request should parse: {e}"
+  | .ok r =>
+    match reviewer.resolve r with
+    | .ok _ => TestM.fail "a client whose policy lists no images may name none"
+    | .error e => TestM.assert (mentions e "image") e
+  match requestOf "{\"prompt\": \"review\", \"execution_image\": \"a b\"}" with
+  | .ok _ => TestM.fail "a malformed image in a request should be refused where it is read"
+  | .error e => TestM.assert (mentions e "execution_image") e
+
+@[test]
+def aRequestCannotSetTheClientsOwnFieldsByAnotherName : Test := do
+  -- `execution_image` is accepted, and bounded; a misspelling is refused rather than ignored,
+  -- since an image the client believes it set and the server dropped is a task without its tools.
+  match requestOf "{\"prompt\": \"review\", \"executionImage\": \"ghcr.io/acme/reviewer:2.0\"}" with
+  | .ok _ => TestM.fail "a misspelt execution_image should be refused, not ignored"
+  | .error e => TestM.assert (mentions e "executionImage") e
+  match requestOf "{\"prompt\": \"review\", \"image\": \"ghcr.io/acme/reviewer:2.0\"}" with
+  | .ok _ => TestM.fail "'image' is not a request field"
+  | .error e => TestM.assert (mentions e "image") e
+
 /-! ## The routes a client reaches -/
 
 @[test]

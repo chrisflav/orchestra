@@ -18,6 +18,7 @@ import Orchestra.Utils.Signals
 import Orchestra.Utils.UnixSocket
 import Orchestra.Workflow
 import Orchestra.WorkflowParser
+import Orchestra.ApiClient
 
 /-!
 # The queue daemon
@@ -388,11 +389,51 @@ def abandonAdoption (appConfig : AppConfig) (r : TaskRunner.Reattach) : IO Bool 
     IO.eprintln s!"  Could not remove the pod of task {tid}: {e}"
     return false
 
+/-- The repositories a listener's source watches, for the sources that name any. -/
+private def sourceRepos : Listener.SourceConfig → List Listener.RepoEntry
+  | .githubIssues (repos := r) .. => r
+  | .githubPrReviews (repos := r) .. => r
+  | .githubComments (repos := r) .. => r
+  | .githubLabelCount (repos := r) .. => r
+  | .githubLabels (repos := r) .. => r
+  | _ => []
+
+/-- Say once, at startup, which `execution.options.images` keys name no repository orchestra has
+    been told about anywhere — a listener's sources and action, a role's or a listener's
+    `spawn_policy.repos`, an API client's `queue_policy.repos`. A pin under a misspelt key pins
+    nothing, and an absolute one that matches nothing is a guarantee that does not hold.
+
+    Only what is on this disk is read; projects live on the tracker and are not consulted, so a
+    repository only a project names is reported here too, and the line says so. Best effort. -/
+def warnUnmatchedPins (appConfig : AppConfig) : IO Unit := do
+  try
+    unless appConfig.execution.backend == "kubernetes" do return
+    let .ok kcfg := Exec.Kubernetes.Config.fromJson appConfig.execution.options | return
+    if kcfg.repoImages.isEmpty then return
+    let mut known : Array String := #[]
+    for (_, l) in ← Listener.loadAllListenerConfigs do
+      known := known ++ ((sourceRepos l.source).map (·.upstream.toString)).toArray
+      if !l.action.upstream.isEmpty && (l.action.upstream.splitOn "{{").length == 1 then
+        known := known.push l.action.upstream
+      known := known ++ ((l.action.spawnPolicy.map (·.repos)).getD []).toArray.map (·.toString)
+    for r in ← Project.loadGlobalRoles do
+      known := known ++ ((r.spawnPolicy.map (·.repos)).getD []).toArray.map (·.toString)
+    for c in ← ApiClient.loadAllClients do
+      known := known ++ c.policy.repos.toArray.map (·.toString)
+    let unmatched := kcfg.unmatchedPins known.toList
+    unless unmatched.isEmpty do
+      IO.eprintln s!"Warning: execution.options.images pins {String.intercalate ", " unmatched}, \
+which no listener, role, API client or spawn policy names (projects on the tracker were not \
+checked; matching ignores case). A misspelt key pins nothing."
+  catch e => IO.eprintln s!"Could not check execution.options.images against the configured \
+repositories: {e}"
+
 /-- Run the queue daemon in the foreground until it is asked to stop, and exit the process.
 
     Does not return: a graceful shutdown ends in `IO.Process.exit 0` once the last in-flight task
     has landed, which is what the drain on `SIGTERM` depends on. Returns `1` without starting
-    anything if a daemon is already running. -/
+    anything if a daemon is already running, or if
+    the execution backend's settings cannot be read. -/
 def run (cfg : Config) : IO UInt32 := do
   -- Foreground mode
   if ← Queue.daemonRunning then
@@ -410,6 +451,16 @@ def run (cfg : Config) : IO UInt32 := do
   -- Read before the sweep, which now depends on it: what a task can be carried on in is the
   -- execution backend's business.
   let appConfig ← loadAppConfig (cfg.configPath.map System.FilePath.mk)
+  -- The execution backend's own settings, read once now. A backend whose `execution.options`
+  -- cannot be read fails every task it is given, and some of what it reads strictly is a statement
+  -- of what must not happen — an `absolute` image pin, an `allowed_task_images` list — so a daemon
+  -- that started anyway would be one running tasks while its operator believes those hold.
+  if let some f := Exec.factoryOf? appConfig.execution.backend then
+    if let .error e := f.make appConfig.execution.options then
+      IO.eprintln s!"Not starting: execution backend '{f.name}' is misconfigured: {e}"
+      Queue.deletePid
+      return 1
+  warnUnmatchedPins appConfig
   -- Tasks the previous daemon handed over when it stopped (`Exec.tryHandOff`), still running in
   -- their pods: decided before the sweep, which would otherwise mark them interrupted, and carried
   -- on below once the daemon is up (`findAdoptions`). Their MCP ports are set aside at once, so
@@ -881,6 +932,7 @@ its workspace; it will start from a clean checkout."
         triageRemoveLabels := entry.triageRemoveLabels
         spawnPolicy        := entry.spawnPolicy
         scopeRoot          := entry.scopeRoot
+        executionImage     := entry.executionImage
       }
     }
     -- If this entry holds a pre-claimed issue, release it back to open on any
@@ -1319,6 +1371,8 @@ holding the rest of this tick until the window moves"
                   -- The action's kleis spec and narrowings hold of every task the workflow runs.
                   let prog := prog.withListenerKleis liveCfg.action.kleisSpec
                     liveCfg.action.kleisNarrow
+                  -- And its image, for the steps that name none of their own.
+                  let prog := prog.withListenerImage liveCfg.action.executionImage
                   let jsonVars := vars.map fun (k, value) => (k, Lean.Json.str value)
                   let concert := Workflow.WorkflowProgram.toConcert prog jsonVars
                   IO.println s!"  Listener '{name}': starting concert from {resolvedPath}"

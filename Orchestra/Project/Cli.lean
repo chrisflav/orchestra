@@ -439,6 +439,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     , identity      := role.identity
     , kleisRoleSpec := role.kleisSpec
     , kleisNarrow   := role.kleisNarrow
+    , executionImage := role.executionImage
     , role          := some role.name }
   -- 7. Persist the entry. The daemon picks it up on its next poll.
   Queue.saveEntry entry
@@ -540,6 +541,8 @@ def issueContinueHandler (p : Parsed) : IO UInt32 := do
     , kleisSpec     := prevRecord.kleisSpec
     , kleisRoleSpec := prevRecord.kleisRoleSpec
     , kleisNarrow   := prevRecord.kleisNarrow
+    -- And in the same image, which the record does not keep and the entry that ran it does.
+    , executionImage := (← Queue.imageForContinuation claim.taskId)
     , tools        := some (toolsOverride?.getD defaultContinueTools) }
   -- 4. Drop into the queue dir; the running daemon picks it up on next poll.
   --    No daemon-running precheck — the entry persists and runs whenever the

@@ -172,9 +172,11 @@ Primary keys in **bold**; `?` marks a nullable column; `json` is a `text` column
   input_type json, output_type json, input_json json?, output_json json?, issue_number int?,
   project_id?, issue_id?, role?, pr_labels json, triage_add_labels json,
   triage_remove_labels json, listener_name?, spawn_policy json?, spawned_by?, scope_root?,
-  resolved_auth_source?. `auth_source` is the source the entry asked for; `resolved_auth_source`
-  is the one the daemon chose when it claimed it (migration 0003; before it, the choice was
-  written over `auth_source`).
+  resolved_auth_source?, kleis_token?, kleis_spec?, kleis_role_spec?, kleis_narrow json?,
+  api_client?, external_id?, execution_image?. `auth_source` is the source the entry asked for;
+  `resolved_auth_source` is the one the daemon chose when it claimed it (migration 0003; before
+  it, the choice was written over `auth_source`). `execution_image` is the image the task asked
+  to run in (migration 0011).
   Indexes: (created_at desc, id desc), (status), (task_id), (concert_id), (spawned_by),
   (listener_name), (project_id), (issue_id).
 - `concert_run` — **id**, started_at, status, name?, workflow_file?, finished_at?.

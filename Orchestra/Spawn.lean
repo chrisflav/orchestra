@@ -26,16 +26,24 @@ build their entries from). See `docs/queue-task.md`.
 
 ## The rules a policy states
 
-Three of the four choices follow one rule:
+The choices a policy bounds — `backend`, `model`, `repo`, `execution_image` and `tools` — all
+follow one rule:
 
 > **Omitted means "the same as mine".** A named value must appear in the policy's list for that
 > field; an empty list means nothing may be named, so the child inherits and the agent has no
 > say at all.
 
-That holds for `backend`, `model` and `repo` alike, and it is why an empty policy is still a
-useful one: it lets a task queue more of *itself* — the same backend, model and repository, with
-the tools it already holds — and nothing else. The lists widen what may be named; they never
-take away what the spawning task already has.
+That holds for `backend`, `model`, `repo` and `execution_image` alike, and it is why an empty
+policy is still a useful one: it lets a task queue more of *itself* — the same backend, model,
+repository and image, with the tools it already holds — and nothing else. The lists widen what
+may be named; they never take away what the spawning task already has.
+
+`execution_image` has one leniency the others do not: naming the image the task would inherit
+anyway is allowed whether or not it is listed. A client or an agent that always says which image
+it wants — because it cannot know whether the default changed — would otherwise be refused for
+asking for exactly what it already has. The others keep refusing it, because for them it is
+harmless to omit and the list is the only statement of what a request may say; an image is the
+one field where "what I have" is a value a caller reasonably wants to make explicit.
 
 `tools` follows the same rule with one wrinkle worth stating out loud: the policy's list may name
 tools the spawning task does not hold, and that is deliberate rather than an oversight. A
@@ -84,6 +92,11 @@ structure SpawnRequest where
       inherits whatever it asks. A task may narrow what it hands on; it may not widen it, and it
       may not name another source (`SpawnContext.kleisSpec`). -/
   kleisNarrow : List String := []
+  /-- The image the queued task runs in (`Config.IOTask.executionImage`). Bounded by the policy's
+      `images`, like `backend` and `model`: a task's image beats the operator's per-repository pin,
+      so an agent that could name any image could move its work off everything the operator
+      chose for that repository. -/
+  executionImage : Option String := none
 deriving Repr, Inhabited
 
 /-- What the spawning task itself has, which is what every omitted field inherits. -/
@@ -112,6 +125,9 @@ structure SpawnContext where
   /-- Every narrowing the spawning task's token carries. The queued task's token carries them
       too, and whatever the agent adds (`SpawnRequest.kleisNarrow`). -/
   kleisNarrow : List String := []
+  /-- The image the spawning task runs in, when it names one — which is what the queued task
+      inherits: a review that queues a follow-up review needs the same tools for it. -/
+  executionImage : Option String := none
 deriving Repr, Inhabited
 
 /-- A spawn the policy has approved, in the shape the queue needs it. -/
@@ -140,6 +156,8 @@ structure ResolvedSpawn where
   kleisSpec   : Option String := none
   kleisToken  : Option String := none
   kleisNarrow : List String := []
+  /-- The image the queued task runs in: the spawning task's own, or one the policy lists. -/
+  executionImage : Option String := none
   /-- Carried through so the enqueuing side can report the ceiling it enforced with the number
       in it, rather than saying "too many" and leaving the agent to guess. -/
   maxTasks  : Nat
@@ -169,6 +187,11 @@ def SpawnPolicy.resolve (p : SpawnPolicy) (ctx : SpawnContext) (r : SpawnRequest
 instruction"
   let backend ← chooseFrom "backend" p.backends ctx.backend r.backend
   let model   ← chooseFrom "model"   p.models   ctx.model   r.model
+  -- Naming the image it would inherit anyway is not a choice, and is allowed unlisted (see the
+  -- module docs for why this one field and not the others).
+  let executionImage ← if r.executionImage.isSome && r.executionImage == ctx.executionImage
+    then .ok ctx.executionImage
+    else chooseFrom "image" p.images ctx.executionImage r.executionImage
   let repo ← match r.repo with
     | none => .ok ctx.repo
     | some want =>
@@ -217,6 +240,7 @@ set 'allow_pre_claim'"
          , identity := ctx.identity
          , kleisSpec := ctx.kleisSpec, kleisToken := ctx.kleisToken
          , kleisNarrow := (ctx.kleisNarrow ++ r.kleisNarrow).eraseDups
+         , executionImage
          , maxTasks := p.maxTasks }
 
 end Orchestra

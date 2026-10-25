@@ -85,6 +85,8 @@ mutual
           -- Or the same step would carry a spawn policy when the concert runs in process and
           -- lose it when the daemon runs it.
           spawnPolicy   := spec.spawnPolicy
+          -- Likewise the step's image, which decides what tools it has.
+          executionImage := spec.executionImage
           concertStepKey := some stepKey
           concertId
           inputType     := ResultType.unit

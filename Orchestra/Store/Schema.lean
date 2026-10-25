@@ -9,6 +9,7 @@ import Orchestra.Store.Migrations.ResidentFeeds
 import Orchestra.Store.Migrations.ResidentRuntime
 import Orchestra.Store.Migrations.SessionTokens
 import Orchestra.Store.Migrations.ApiClients
+import Orchestra.Store.Migrations.ExecutionImage
 
 /-!
 # The shape of orchestra's database
@@ -148,6 +149,9 @@ structure QueueEntryRow where
       The pair is unique, which is what makes queueing the same work twice answer the first entry. -/
   api_client : Option String
   external_id : Option String
+  /-- The image the entry's task runs in, when whatever queued it named one
+      (`Config.IOTask.executionImage`). -/
+  execution_image : Option String
   deriving Repr
 
 /-- Where a running task has got to, for a daemon that picks the task up after a restart instead of
@@ -420,6 +424,7 @@ def migrations : List Db.Migration.Migration :=
    Orchestra.Store.Migrations.migration_0007_resident_feeds,
    Orchestra.Store.Migrations.migration_0008_resident_runtime,
    Orchestra.Store.Migrations.migration_0009_session_tokens,
-   Orchestra.Store.Migrations.migration_0010_api_clients]
+   Orchestra.Store.Migrations.migration_0010_api_clients,
+   Orchestra.Store.Migrations.migration_0011_execution_image]
 
 end Orchestra.Store

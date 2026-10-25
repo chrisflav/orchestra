@@ -308,6 +308,12 @@ structure ActionConfig where
       from this block (`buildRoleEntry`), so a dispatched role takes its policy from its own
       `spawn_policy` field. -/
   spawnPolicy    : Option SpawnPolicy := none
+  /-- The image the tasks this listener queues run in (`Config.IOTask.executionImage`), and the
+      tasks of the workflow it starts, for the steps that name none of their own.
+
+      Not read by the two dispatcher sources, which take it off the role (`buildRoleEntry`), as
+      they do the identity and the kleis spec. -/
+  executionImage : Option String := none
   /-- Hand each event to this resident's inbox instead of queueing a task
       (`docs/design/resident-sessions.md` §5.5): the rendered `prompt_template` becomes an inbox
       item from `listener:<name>`, keyed by the event's id so a replayed event is delivered once.
@@ -346,6 +352,7 @@ instance : ToJson ActionConfig where
     let fields := if let some n := a.issueNumber  then fields ++ [("issue_number",   Json.str n)]          else fields
     let fields := if !a.prLabels.isEmpty          then fields ++ [("pr_labels",      ToJson.toJson a.prLabels)] else fields
     let fields := if let some p := a.spawnPolicy  then fields ++ [("spawn_policy",   ToJson.toJson p)]         else fields
+    let fields := if let some i := a.executionImage then fields ++ [("execution_image", Json.str i)]          else fields
     let fields := if let some r := a.deliverTo    then fields ++ [("deliver_to",     Json.str r)]               else fields
     let fields := if a.trusted                    then fields ++ [("trusted",        Json.bool true)]           else fields
     Json.mkObj fields
@@ -433,9 +440,10 @@ instance : FromJson ActionConfig where
       throw "an action delivers to a resident (deliver_to) or starts a workflow (workflow_path), not both"
     let trusted := j.getObjValAs? Bool "trusted" |>.toOption |>.getD false
     let kleisNarrow ← parseKleisNarrow? j
+    let executionImage ← parseExecutionImage? j
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
              budget, memory, identity, kleisSpec, kleisNarrow, authSource, authSources, authMode, tools, readOnly, priority,
-             workflowPath, issueNumber, prLabels, spawnPolicy, deliverTo, trusted }
+             workflowPath, issueNumber, prLabels, spawnPolicy, deliverTo, trusted, executionImage }
 
 -- Dispatch rate limits
 
@@ -1026,6 +1034,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String))
     issueNumber
     prLabels     := action.prLabels
     spawnPolicy  := action.spawnPolicy
+    executionImage := action.executionImage
     listenerName
   }
 
@@ -1489,6 +1498,7 @@ def buildRoleEntry (appConfig : AppConfig) (project : Project.Project) (role : P
     -- The role's spec, consulted after the identity's (`Kleis.choose`); its narrowings always.
     , kleisRoleSpec := role.kleisSpec
     , kleisNarrow   := role.kleisNarrow
+    , executionImage := role.executionImage
     , role          := some role.name }
 
 -- Source polling
