@@ -750,7 +750,7 @@
                   "issue_number": { "type": "integer", "minimum": 0, "description": "The GitHub issue or pull request of `upstream` the task is about; it is the `task_issue` fact on the task's kleis token." },
                   "external_id": { "type": "string", "minLength": 1, "maxLength": 200, "description": "The client's own id for this work, unique per client." },
                   "kleis_narrow": { "type": "array", "items": { "type": "string" }, "description": "Narrowings added to the client's own on the task's kleis token." },
-                  "execution_image": { "type": "string", "minLength": 1, "maxLength": 512, "description": "The image the task runs in on the `kubernetes` backend: one the policy's `images` lists. Omitted, the client file's own `execution_image`, or none. A task's image beats the repository's own and the operator's per-repository pin." }
+                  "execution_image": { "type": "string", "minLength": 1, "maxLength": 512, "description": "The image the task runs in on the `kubernetes` backend: one the policy's `images` lists. Omitted, the client file's own `execution_image`, or none. A task's image beats the repository's own and the operator's per-repository pin, unless that pin is absolute, and is held to the backend's `allowed_task_images`." }
                 }
               }
             }
@@ -1904,7 +1904,7 @@
           "identity": { "type": ["string", "null"], "description": "The identity this entry is performed under: the name of a directory under `<config>/identities/`. It gives the run a memory of its own and, where the record carries a taxis token, makes the run's tracker writes come from that identity rather than from orchestra." },
           "apiClient": { "type": ["string", "null"], "description": "The API client that queued this entry over HTTP (`POST /api/v1/queue`), when one did." },
           "externalId": { "type": ["string", "null"], "description": "The client's own id for this entry, unique per client." },
-          "executionImage": { "type": ["string", "null"], "description": "The image the entry's task runs in, when whatever queued it named one. On the `kubernetes` backend it beats the repository's own image and the operator's per-repository pin; on landrun and local it is logged and the task runs on the host." }
+          "executionImage": { "type": ["string", "null"], "description": "The image the entry's task runs in, when whatever queued it named one. On the `kubernetes` backend it beats the repository's own image and the operator's per-repository pin unless that pin is absolute; on landrun and local it is logged and the task runs on the host." }
         }
       },
       "Task": {

@@ -714,8 +714,9 @@ structure IOTask (i o : ResultType) where
       repository: what kind of work this is — a review that drives a review platform's CLI, a
       release that needs signing tools — decides what has to be installed as much as the
       repository does, and it does not change with the repository. So it beats both the operator's
-      per-repository pin and the repository's own `.orchestra/config.json` (`Kubernetes.imageFor`,
-      and `docs/kubernetes.md` for the whole order). A backend that runs tasks on this machine
+      per-repository pin, unless that pin is `absolute`, and the repository's own
+      `.orchestra/config.json` (`Kubernetes.imageFor`, and `docs/kubernetes.md` for the whole
+      order). A backend that runs tasks on this machine
       cannot change images; it says so once and runs the task as usual (`Exec.SessionSpec`).
 
       Set by whatever describes the task: a task file, a role, a listener action, a workflow step.

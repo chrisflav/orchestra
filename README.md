@@ -713,7 +713,8 @@ Fields:
   [queueing tasks from inside a task](docs/queue-task.md)
 - `execution_image` — the container image the task runs in, on the `kubernetes` backend, for work
   that needs tools of its own. It beats the repository's own image and the operator's
-  per-repository pin; on landrun and local it is logged and the task runs on the host as usual.
+  per-repository pin, unless that pin is `absolute`, and is held to `allowed_task_images`; on
+  landrun and local it is logged and the task runs on the host as usual.
   Roles, listener actions, workflow steps (`execution-image`) and API clients take it too →
   [what is installed, when repositories
   disagree](docs/kubernetes.md#what-is-installed-when-repositories-disagree)
@@ -1663,7 +1664,8 @@ something that only queues work should hold. A client is a file, `<config>/clien
 - `execution_image` — the image the client's tasks run in, on the `kubernetes` backend: for work
   that needs a tool of its own — a review platform's CLI that its review agents call, say — which
   has no business in orchestra's default agent image. It beats the repository's image and the
-  operator's per-repository pin, because it says what kind of work this is ([what is installed,
+  operator's per-repository pin (unless the pin is `absolute`), because it says what kind of work
+  this is ([what is installed,
   when repositories disagree](docs/kubernetes.md#what-is-installed-when-repositories-disagree));
   on landrun and local it is logged and the tools must be on the host. A request may name another
   only from `queue_policy.images`.
