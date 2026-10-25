@@ -1286,12 +1286,16 @@ holding the rest of this tick until the window moves"
 {resident} (inbox item {item})"
               | none => pure ()
             else if let some wfPath := liveCfg.action.workflowPath then
-              -- Concert mode: parse the YAML, apply template vars, start a concert fiber.
-              let resolvedPath := Listener.renderTemplate wfPath vars
+              -- Concert mode: parse the YAML, fill in what the event supplies, start a concert
+              -- fiber. The path is read as written, never rendered: an event naming which file
+              -- is run could point it at a workflow somebody else put on this disk — a clone's
+              -- checkout is one. And the event's variables go into the parsed program, never into
+              -- the YAML text (`WorkflowProgram.instantiate`): rendered into the text, an issue
+              -- title could write any field of a step — its tools, its access, its image.
+              let resolvedPath := wfPath
               try
                 let rawYaml ← IO.FS.readFile resolvedPath
-                let yaml := Listener.renderTemplate rawYaml vars
-                match Workflow.WorkflowProgram.parseYaml yaml with
+                match Workflow.WorkflowProgram.parseYamlFor rawYaml vars with
                 | .error e =>
                   IO.eprintln s!"  Listener '{name}': workflow parse error: {e}"
                 | .ok prog =>

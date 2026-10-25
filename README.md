@@ -1280,7 +1280,7 @@ Fields:
   Left out, they fall back to the `{{upstream}}`/`{{fork}}` variables the event source supplies —
   every GitHub source supplies both. A `shell` source supplies neither, so a listener on one that
   names neither queues a [repository-independent task](#repository-independent-tasks)
-- `action.workflow_path` — path to a `.yaml` workflow file; when set the listener starts a concert instead of enqueueing a single task
+- `action.workflow_path` — path to a `.yaml` workflow file; when set the listener starts a concert instead of enqueueing a single task. The path is used as written, not rendered with the event's variables, and the event fills in only the steps' prompts and `issue-number` → [what an event fills in](docs/workflow.md#what-an-event-fills-in)
 - `action.auth_sources` / `action.auth_mode` — candidate authentication sources for the tasks this
   listener queues, and how to pick among them. A listener that fires repeatedly is the case
   several accounts exist for: it keeps producing runnable work after one account's weekly window
