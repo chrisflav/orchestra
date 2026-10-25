@@ -510,6 +510,8 @@ def issueContinueHandler (p : Parsed) : IO UInt32 := do
       return 1
   -- 3. Build the continuation entry. projectId/issueId are inherited from the
   --    issue (so the daemon's claim-release hook fires on terminal status).
+  -- The image and the checkout, which the record does not keep and the entry that ran it does.
+  let (carriedImage, carriedCheckout) ← Queue.carriedForContinuation claim.taskId
   let id ← TaskStore.generateId
   let createdAt ← currentIso8601
   let entry : Queue.QueueEntry :=
@@ -541,8 +543,8 @@ def issueContinueHandler (p : Parsed) : IO UInt32 := do
     , kleisSpec     := prevRecord.kleisSpec
     , kleisRoleSpec := prevRecord.kleisRoleSpec
     , kleisNarrow   := prevRecord.kleisNarrow
-    -- And in the same image, which the record does not keep and the entry that ran it does.
-    , executionImage := (← Queue.imageForContinuation claim.taskId)
+    , executionImage := carriedImage
+    , checkout      := carriedCheckout
     , tools        := some (toolsOverride?.getD defaultContinueTools) }
   -- 4. Drop into the queue dir; the running daemon picks it up on next poll.
   --    No daemon-running precheck — the entry persists and runs whenever the

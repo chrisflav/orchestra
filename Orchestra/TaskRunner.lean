@@ -196,7 +196,10 @@ by task {e.taskId}"
       -- The queueing task's scope, not one derived from the bound issue (`Tools.writeScopeRoot`).
       , scopeRoot := resolved.scopeRoot
       -- The spawning task's image, or one the policy's `images` lists.
-      , executionImage := resolved.executionImage }
+      , executionImage := resolved.executionImage
+      -- What the agent asked for, already checked to name a commit (`parseCheckout?`); that it is
+      -- one of the upstream's is checked when the task's checkout is made (`Repo.applyCheckout`).
+      , checkout := resolved.checkout }
     -- A claim taken for an entry that then failed to be written is held by an id no entry has,
     -- and nothing downstream would ever release it: the daemon releases on behalf of the entry
     -- it is running, and there would be none.
@@ -815,7 +818,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- 2. Prepare the workspace: the task slot, or the shared repo clone when running outside the
   -- queue — and for a repository-independent task, an empty scratch directory in place of either.
   -- On a backend that keeps workspaces, a checkout of its own for this task instead.
-  let repoPath ← if let some r := reattach then do
+  -- A checkout names a commit of the task's repository; with none there is nothing to name.
+  if ioTask.checkout.isSome && ioTask.repo.isNone then
+    throw (.userError "the task asks for a checkout but works on no repository")
+  let checkout := ioTask.checkout
+  let preparedPath ← if let some r := reattach then do
       -- The checkout the task was opened on is still on this machine (a task keeps its per-task
       -- checkout until it ends, and the startup sweep leaves a day's worth alone); it is what the
       -- repository's configuration and scripts are read from. Gone is a task that cannot be
@@ -827,16 +834,17 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     else match ioTask.repo with
     | some repo =>
       if taskCheckout then
-        Repo.ensureTaskCheckout repo.fork repo.upstream taskId (token := some token)
+        Repo.ensureTaskCheckout repo.fork repo.upstream taskId (token := some token) checkout
       else match slotOverride with
         | some assign => do
           IO.println s!"Preparing slot {assign.slot} for {repo.fork}..."
-          let p ← Repo.ensureSlot repo.fork repo.upstream assign (token := some token)
+          let p ← Repo.ensureSlot repo.fork repo.upstream assign (token := some token) checkout
           IO.println s!"  Slot at {p}"
           pure p
         | none => do
           IO.println s!"Cloning/updating {repo.fork}..."
           let p ← Repo.ensureCloned repo.fork repo.upstream interactive (token := some token)
+          if let some c := checkout then Repo.applyCheckout p c (token := some token)
           IO.println s!"  Repo at {p}"
           pure p
     | none =>
@@ -857,8 +865,26 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
           let p ← Repo.ensureAdhocWorkspace (occupant := some taskId) (resumeFrom := continuesFrom)
           IO.println s!"  Workspace at {p}"
           pure p
-  -- A per-task checkout is this task's alone, and goes when the task does — however it ends.
-  let removeTaskCheckout : IO Unit := if taskCheckout then Repo.removeTaskDir repoPath else pure ()
+  -- An isolated checkout is made from the prepared one, already at the commit, into a repository
+  -- of its own that holds nothing past it (`Repo.isolateCheckout`, which says why the slot itself
+  -- cannot be that). The task runs there, and the slot it came from is left for the next reset.
+  -- Not for a picked-up task: the path it recorded is already the isolated one.
+  let isolated := reattach.isNone && (checkout.map (·.isolate)).getD false
+  let repoPath ← match isolated, ioTask.repo, checkout with
+    | true, some repo, some c =>
+      let dest ← Repo.isolatedCheckoutPath repo.fork taskId
+      (try Repo.isolateCheckout preparedPath dest c.commit
+       catch e => do
+         Repo.removeTaskDir dest
+         if taskCheckout then Repo.removeTaskDir preparedPath
+         throw e)
+      pure dest
+    | _, _, _ => pure preparedPath
+  -- A per-task checkout is this task's alone, and goes when the task does — however it ends. An
+  -- isolated one likewise, and the per-task checkout it was made from with it.
+  let removeTaskCheckout : IO Unit := do
+    if taskCheckout then Repo.removeTaskDir preparedPath
+    if isolated then Repo.removeTaskDir repoPath
   -- 3. Open the environment this task runs in.
   --
   -- One session for the whole task, not one per agent launch, because a task is not one command:

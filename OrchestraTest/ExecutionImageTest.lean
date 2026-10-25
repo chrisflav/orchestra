@@ -401,8 +401,8 @@ def namingTheInheritedImagePassesUnlisted : Test := do
 def aContinuationTakesTheImageOfTheEntryThatRanTheTask : Test := do
   let (found, missing) ← Orchestra.withTempData "execution-image-continue" do
     Queue.saveEntry { imaged with status := .done, taskId := some "t-ran" }
-    let found ← Queue.imageForContinuation "t-ran"
-    let missing ← Queue.imageForContinuation "t-run-by-hand"
+    let found := (← Queue.carriedForContinuation "t-ran").1
+    let missing := (← Queue.carriedForContinuation "t-run-by-hand").1
     return (found, missing)
   TestM.assertEqual found (some reviewerImage)
   TestM.assertEqual missing none (msg := "no entry ran it: nothing to carry")

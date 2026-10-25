@@ -378,6 +378,108 @@ private def resetSlot (slotPath : System.FilePath) (token : Option String) : IO 
     throw (.userError s!"could not determine the default branch in {slotPath}; refusing to \
       start a task on an unknown base commit")
 
+/-- The ref a checkout's `fetch_ref` is fetched into, for as long as it takes to check it out.
+    Under `refs/orchestra/` so it cannot collide with anything the repository itself has. -/
+private def checkoutRef : String := "refs/orchestra/checkout"
+
+/-- Whether `commit` is an ancestor of `ref` (or is it), in `path`. -/
+private def isAncestor (path : System.FilePath) (commit ref : String) : IO Bool := do
+  try runGit' #["merge-base", "--is-ancestor", commit, ref] path; pure true
+  catch _ => pure false
+
+/-- Fetch the commit a task asked for (`CheckoutSpec`) from `remote` and check it out on a
+    detached `HEAD`, in the clone at `path`. Throws, naming the commit, when it cannot be had —
+    a task that asked for a commit and ran on another would review the wrong code or see the
+    answer it is being scored against, so there is no falling back to the default branch.
+
+    The commit has to be **reachable from the upstream**, which is the rule that makes a commit
+    named by an untrusted party — an API client's request, an agent's `queue_task` — safe to
+    check out: it can only ever name code the upstream has published.
+
+      * With a `fetch_ref`, that ref is fetched from the upstream and the commit must be it or an
+        ancestor of it.
+      * Without one, the upstream's branches are fetched and the commit must be reachable from
+        one of them.
+
+    Never fetched by its name alone, though most servers allow it. The clone's object store is
+    shared with the repository's cache clone, which also holds the fork's objects, and git skips
+    the request entirely when every object it would ask for is already here — so a fetch by name
+    that succeeds says nothing about whether the upstream has the commit. Reachability from a ref
+    the upstream just sent does.
+
+    The clone is left on a detached `HEAD` rather than a branch: the commit is not the tip of
+    anything this repository has a name for, and a branch named after it would outlive the task
+    in a pooled slot. The next task's reset (`resetSlot`) puts the default branch back. -/
+def applyCheckout (path : System.FilePath) (spec : CheckoutSpec) (token : Option String := none)
+    (remote : String := "upstream") : IO Unit := do
+  let sha := spec.commit
+  let source := spec.fetchRef.getD s!"the branches of {remote}"
+  try
+    match spec.fetchRef with
+    | some ref => runGit' #["fetch", "--no-tags", remote, s!"+{ref}:{checkoutRef}"] path token
+    | none     => runGit' #["fetch", "--no-tags", remote] path token
+  catch e =>
+    throw (.userError s!"checkout: could not fetch {source} to find commit {sha}: {e}")
+  let present ← try runGit' #["cat-file", "-e", s!"{sha}^\{commit}"] path; pure true
+    catch _ => pure false
+  let reachable ← if !present then pure false else match spec.fetchRef with
+    | some _ => isAncestor path sha checkoutRef
+    | none =>
+      let refs ← runGit #["for-each-ref", "--format=%(refname)", s!"--contains={sha}",
+        s!"refs/remotes/{remote}/"] path
+      pure !refs.isEmpty
+  try runGit' #["update-ref", "-d", checkoutRef] path catch _ => pure ()
+  unless reachable do
+    throw (.userError s!"checkout: commit {sha} is not reachable from {source} on the upstream; \
+the task asked to run on it and will not run on anything else")
+  runGit' #["checkout", "--detach", "--force", "--quiet", sha] path
+  let head ← runGit #["rev-parse", "HEAD"] path
+  unless head == sha do
+    throw (.userError s!"checkout: HEAD is {head} after checking out {sha}")
+  IO.println s!"  Checked out {sha} (from {source}) on a detached HEAD"
+
+/-- Make `dest` a repository of its own holding the commit `commit` of `source` and nothing else:
+    every object reachable from it, a detached `HEAD` on it, and no refs, no reflog, no
+    `FETCH_HEAD` or `ORIG_HEAD` — so `git log --all`, `git branch -a`, `git tag` and `git reflog`
+    reach nothing that came after it. What came *before* it is still there, through its parents:
+    that is the history the commit has, and a task that sees the commit sees how it was reached.
+
+    A repository of its own rather than the slot with its refs deleted. A slot's object store is
+    hardlinked from the cache clone and holds every object the repository has ever fetched — the
+    later commits, the merged result, the fork's branches — and an object no ref reaches is still
+    one `git cat-file --batch-all-objects` or `git fsck --lost-found` lists. Fetching only the
+    commit into an empty repository is what makes "the commit's own objects are all there is" true;
+    and it leaves the pooled slot as every other task expects to find it.
+
+    The fetch goes through `upload-pack` on the local path, which sends a pack of what is reachable
+    from the ref it is asked for, and not the hardlinks `git clone --local` makes. -/
+def isolateCheckout (source dest : System.FilePath) (commit : String) : IO Unit := do
+  if ← dest.pathExists then IO.FS.removeDirAll dest
+  IO.FS.createDirAll dest
+  let format ← try runGit #["rev-parse", "--show-object-format"] source catch _ => pure "sha1"
+  runGit' #["init", "--quiet", s!"--object-format={format}", dest.toString]
+  let tmp := "refs/orchestra/isolate"
+  runGit' #["update-ref", tmp, commit] source
+  try
+    runGit' #["fetch", "--no-tags", "--quiet", source.toString, tmp] dest
+  finally
+    try runGit' #["update-ref", "-d", tmp] source catch _ => pure ()
+  runGit' #["checkout", "--detach", "--quiet", commit] dest
+  let refs ← runGit #["for-each-ref", "--format=%(refname)"] dest
+  for ref in refs.splitOn "\n" do
+    unless ref.isEmpty do runGit' #["update-ref", "-d", ref] dest
+  for f in ["FETCH_HEAD", "ORIG_HEAD"] do
+    let p := dest / ".git" / f
+    if ← p.pathExists then IO.FS.removeFile p
+  try runGit' #["reflog", "expire", "--expire=now", "--all"] dest catch _ => pure ()
+  let logs := dest / ".git" / "logs"
+  if ← logs.pathExists then IO.FS.removeDirAll logs
+  let head ← runGit #["rev-parse", "HEAD"] dest
+  unless head == commit do
+    throw (.userError s!"checkout: the isolated checkout's HEAD is {head}, not {commit}")
+  excludeOrchestraArtifacts dest
+  IO.println s!"  Isolated {commit} at {dest}: no other refs, no reflog"
+
 /-- Point a clone made from the cache at the fork and the upstream, with the credential helper and
     the excludes every checkout orchestra prepares carries. Shared by the pooled slots and by the
     per-task checkouts of a backend that keeps workspaces itself. -/
@@ -407,7 +509,8 @@ private def configureClone (fork upstream : Repository) (path : System.FilePath)
     references to files it had just edited and would otherwise wake up to a wiped tree. The
     tree is only kept when the slot's recorded occupant still matches; see `SlotAssignment`. -/
 def ensureSlot (fork upstream : Repository) (assign : SlotAssignment)
-    (token : Option String := none) : IO System.FilePath := do
+    (token : Option String := none) (checkout : Option CheckoutSpec := none) :
+    IO System.FilePath := do
   let slot := assign.slot
   let mainPath ← ensureCacheClone fork upstream token
   let sPath ← slotPath fork slot
@@ -458,6 +561,9 @@ its session refers to."
     IO.println s!"  Keeping slot {slot} as-is (continuation of {pred})"
   else
     resetSlot sPath token
+    -- Only on a reset tree: a continuation that keeps its predecessor's tree keeps the commit
+    -- that tree was checked out at, edits and all.
+    if let some c := checkout then applyCheckout sPath c token
   -- Stamped after preparation, so a task that dies during `resetSlot` does not leave the slot
   -- claiming to hold a tree it never produced.
   setSlotOccupant sPath assign.occupant
@@ -481,7 +587,8 @@ def seedPath (fork : Repository) : IO System.FilePath := do
     away. A leftover directory of the same name — a task that died before it was removed — is
     replaced. -/
 def ensureTaskCheckout (fork upstream : Repository) (taskId : String)
-    (token : Option String := none) : IO System.FilePath := do
+    (token : Option String := none) (checkout : Option CheckoutSpec := none) :
+    IO System.FilePath := do
   let mainPath ← ensureCacheClone fork upstream token
   let path ← taskCheckoutPath fork taskId
   if ← path.pathExists then IO.FS.removeDirAll path
@@ -490,7 +597,13 @@ def ensureTaskCheckout (fork upstream : Repository) (taskId : String)
   runGit' #["clone", "--local", mainPath.toString, path.toString]
   configureClone fork upstream path
   resetSlot path token
+  if let some c := checkout then applyCheckout path c token
   return path
+
+/-- Where an isolated checkout (`isolateCheckout`) of task `taskId` is made: beside the per-task
+    checkouts, so the startup sweep (`sweepTaskDirs`) removes one a dead task left behind. -/
+def isolatedCheckoutPath (fork : Repository) (taskId : String) : IO System.FilePath :=
+  taskCheckoutPath fork s!"{taskId}.isolated"
 
 
 /-- Base directory for the scratch workspaces repository-independent tasks run in.

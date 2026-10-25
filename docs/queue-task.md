@@ -145,7 +145,14 @@ the same backend, model, repository and image, and the tools it already holds, a
 }
 ```
 
-Only `prompt` is required; everything else is inherited when omitted. `tools` distinguishes
+Only `prompt` is required; everything else is inherited when omitted — except `checkout`, which
+names the commit the queued task's workspace is checked out at (`{"commit": "<full sha>",
+"fetch_ref": "refs/pull/7/head", "isolate": true}`, see [checking out a
+commit](../README.md#checking-out-a-commit)). It is never inherited, because it describes one
+piece of work: a planner reviewing one commit that queues an implementor wants the implementor on
+the default branch. Nor is it bounded by the policy: it can only name a commit the queued task's
+own upstream has published — the daemon refuses anything the upstream's refs do not reach — so it
+narrows which published code the task sees and never what it may do. `tools` distinguishes
 absent (inherit the spawning task's set) from `[]` (a task with no optional tools at all), which
 is a thing worth being able to ask for.
 

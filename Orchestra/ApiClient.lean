@@ -245,7 +245,7 @@ deriving Inhabited
 
 private def requestKeys : List String :=
   ["prompt", "goal", "upstream", "backend", "model", "tools", "budget", "issue_number",
-   "external_id", "kleis_narrow", "execution_image"]
+   "external_id", "kleis_narrow", "execution_image", "checkout"]
 
 /-- Read a queue request out of a request body, strictly: an unknown field is refused, because a
     field the client believes it set — a `priority`, a `fork` — and the server ignored is a task
@@ -305,7 +305,14 @@ def parseRequest (j : Json) : Except String QueueRequest := do
   let kleisNarrow ← parseKleisNarrow? j
   -- Checked for being an image reference here, and against `queue_policy.images` by `resolve`.
   let executionImage ← parseExecutionImage? j
-  return { spawn := { prompt, backend, model, tools, repo, budget, kleisNarrow, executionImage }
+  -- Checked for its shape here — a full commit name, a `fetch_ref` under `refs/pull/` or
+  -- `refs/heads/` — and for being the upstream's when the checkout is made: a client can only
+  -- ever name code the upstream has published (`Repo.applyCheckout`).
+  let checkout ← parseCheckout? j
+  if checkout.isSome && repo.isNone then
+    .error "'checkout' names a commit of the 'upstream', and the request names none"
+  return { spawn := { prompt, backend, model, tools, repo, budget, kleisNarrow, executionImage,
+                      checkout }
          , goal, issueNumber, externalId }
 
 /-- Check `r` against the client's policy and fill in everything it left out. Pure. -/
@@ -342,6 +349,7 @@ def ApiClient.entry (c : ApiClient) (r : QueueRequest) (resolved : ResolvedSpawn
   , apiClient := some c.name
   , externalId := r.externalId
   -- The client's image, or one its policy lists that the request named.
-  , executionImage := resolved.executionImage }
+  , executionImage := resolved.executionImage
+  , checkout := resolved.checkout }
 
 end Orchestra.ApiClient

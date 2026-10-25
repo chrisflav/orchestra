@@ -580,6 +580,104 @@ def parseExecutionImage? (j : Json) (what : String := "execution_image")
   | .ok _ => .error s!"{what} must be a string naming an image, such as \
 \"ghcr.io/acme/reviewer:1.4\""
 
+/-! ## The commit a task's workspace is checked out at (`Repo.applyCheckout`) -/
+
+/-- Where a task's checkout should stand, when the default branch is the wrong place: a review of a
+    pull request's head, a task that is scored against a past commit and must not see what came
+    after it.
+
+    The daemon fetches and checks it out before the sandbox exists, with its own token, because a
+    read-only checkout is exactly the one whose agent cannot do it itself. -/
+structure CheckoutSpec where
+  /-- The commit, as a full 40- or 64-hex object name, lower case. A full name rather than a
+      branch or an abbreviation because it is the only spelling that cannot come to mean another
+      commit between the time a task is queued and the time it runs. -/
+  commit   : String
+  /-- The upstream ref to fetch it from — `refs/pull/<n>/head` or `refs/heads/<branch>` — and that
+      it must be reachable from. Without one the commit must be reachable from one of the
+      upstream's branches as fetched when the task starts. -/
+  fetchRef : Option String := none
+  /-- Leave the checkout with no other refs and no reflog, in a repository of its own holding only
+      the objects reachable from `commit`, so nothing that came after it is there to be found. -/
+  isolate  : Bool := false
+deriving Repr, Inhabited, BEq
+
+instance : ToJson CheckoutSpec where
+  toJson c := Json.mkObj <|
+    [("commit", Json.str c.commit)]
+    ++ (match c.fetchRef with | some r => [("fetch_ref", Json.str r)] | none => [])
+    ++ (if c.isolate then [("isolate", Json.bool true)] else [])
+
+/-- Why `sha` cannot be a checkout's `commit`, or `none` when it can: 40 hex digits (SHA-1) or 64
+    (SHA-256), lower case. -/
+def commitNameError? (sha : String) : Option String :=
+  if (sha.length == 40 || sha.length == 64) && sha.all (fun c => c.isDigit || ('a' ≤ c && c ≤ 'f'))
+  then none
+  else some s!"'{sha}' is not a full commit name (40 or 64 lower-case hex digits)"
+
+/-- Why `ref` cannot be a checkout's `fetch_ref`, or `none` when it can.
+
+    Only `refs/pull/<n>/head`, `refs/pull/<n>/merge` and `refs/heads/<branch>`: the refs a commit
+    of the task's *own upstream* is found under, which is all a checkout is for. Nothing else is
+    fetched — not a tag that can be moved, not `refs/remotes/…` or a local ref, which would name
+    something on this machine rather than on the upstream — and the branch name is held to what
+    `git check-ref-format` accepts, so it reaches `git fetch` as a ref and never as an option. -/
+def fetchRefError? (ref : String) : Option String :=
+  let bad := some s!"'{ref}' is not a ref a checkout may fetch: refs/pull/<number>/head, \
+refs/pull/<number>/merge or refs/heads/<branch>"
+  if ref.startsWith "refs/pull/" then
+    match (ref.drop 10).toString.splitOn "/" with
+    | [n, kind] =>
+      if !n.isEmpty && n.all Char.isDigit && (kind == "head" || kind == "merge") then none else bad
+    | _ => bad
+  else if ref.startsWith "refs/heads/" then
+    let branch := (ref.drop 11).toString
+    let parts := branch.splitOn "/"
+    let okChar (c : Char) : Bool :=
+      c.isAlphanum || c == '-' || c == '_' || c == '.' || c == '/' || c == '+'
+    if branch.isEmpty || !branch.all okChar || (branch.splitOn "..").length > 1
+        || branch.endsWith ".lock" || branch.endsWith "/" || branch.endsWith "."
+        || parts.any (fun p => p.isEmpty || p.startsWith ".") then bad
+    else none
+  else bad
+
+/-- Read an optional `checkout` out of `j`, strictly: a checkout read as absent runs the task on the
+    default branch, which for a review is the wrong code and for a scored task is the answer. -/
+def parseCheckout? (j : Json) (what : String := "checkout") :
+    Except String (Option CheckoutSpec) :=
+  match j.getObjVal? "checkout" with
+  | .error _ | .ok .null => .ok none
+  | .ok v => do
+    let .obj kvs := v | .error s!"{what} must be an object such as \
+{"{"}\"commit\": \"<sha>\", \"fetch_ref\": \"refs/pull/7/head\"}"
+    let unknown := kvs.toList.map (·.1) |>.filter (!["commit", "fetch_ref", "isolate"].contains ·)
+    unless unknown.isEmpty do
+      .error s!"{what}: unknown field(s) {String.intercalate ", " unknown}; a checkout carries \
+commit, fetch_ref and isolate"
+    let commit ← match v.getObjVal? "commit" with
+      | .ok (.str s) => match commitNameError? s with
+        | some e => .error s!"{what}: {e}"
+        | none => pure s
+      | .ok _ => .error s!"{what}: 'commit' must be a string"
+      | .error _ => .error s!"{what} has no 'commit'"
+    let fetchRef ← match v.getObjVal? "fetch_ref" with
+      | .error _ | .ok .null => pure none
+      | .ok (.str s) => match fetchRefError? s with
+        | some e => .error s!"{what}: {e}"
+        | none => pure (some s)
+      | .ok _ => .error s!"{what}: 'fetch_ref' must be a string"
+    let isolate ← match v.getObjVal? "isolate" with
+      | .error _ | .ok .null => pure false
+      | .ok (.bool b) => pure b
+      | .ok _ => .error s!"{what}: 'isolate' must be true or false"
+    return some { commit, fetchRef, isolate }
+
+instance : FromJson CheckoutSpec where
+  fromJson? j := do
+    match ← parseCheckout? (Json.mkObj [("checkout", j)]) with
+    | some c => pure c
+    | none => throw "a checkout is an object with a 'commit'"
+
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
   /-- The repositories this task works on, or `none` for a **repository-independent** task.
@@ -723,6 +821,10 @@ structure IOTask (i o : ResultType) where
       An agent's `queue_task` and an API client's request may name one only from their policy's
       `images` (`Orchestra.Spawn`). -/
   executionImage : Option String := none
+  /-- The commit the task's workspace is checked out at, instead of the default branch
+      (`CheckoutSpec`, `Repo.applyCheckout`). Set by a task file, a queue entry, `queue_task` and
+      an API client's request; meaningless, and refused, for a task with no repository. -/
+  checkout : Option CheckoutSpec := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -878,13 +980,16 @@ instance : FromJson Task where
     let kleisNarrow ← parseKleisNarrow? j
     -- Strict too: an image dropped as unreadable runs the task without the tools it needs.
     let executionImage ← parseExecutionImage? j
+    let checkout ← parseCheckout? j
+    if checkout.isSome && repo.isNone then
+      throw "'checkout' names a commit of the task's repository, and this task has none"
     return { i, o, ioTask := { repo, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec,
                                 kleisNarrow, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,
                                 triageAddLabels, triageRemoveLabels, spawnPolicy, scopeRoot,
-                                executionImage } }
+                                executionImage, checkout } }
 
 /-- Filesystem paths to expose inside the landrun sandbox. -/
 structure SandboxPaths where

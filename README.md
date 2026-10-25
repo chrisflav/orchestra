@@ -718,6 +718,44 @@ Fields:
   Roles, listener actions, workflow steps (`execution-image`) and API clients take it too →
   [what is installed, when repositories
   disagree](docs/kubernetes.md#what-is-installed-when-repositories-disagree)
+- `checkout` — the commit to check the workspace out at instead of the default branch:
+  `{"commit": "<full sha>", "fetch_ref": "refs/pull/7/head", "isolate": true}`. The daemon fetches
+  and checks it out on a detached `HEAD` before the sandbox exists — which a read-only task cannot
+  do for itself — and fails the task if the commit cannot be had. → [checking out a
+  commit](#checking-out-a-commit)
+
+## checking out a commit
+
+A task normally starts on an up-to-date default branch. A review of a pull request wants the pull
+request's head instead, and a task scored against a past commit must not see what was merged after
+it. `checkout` says where the workspace should stand:
+
+```json
+{ "upstream": "acme/widgets", "fork": "acme/widgets", "read_only": true,
+  "prompt": "Review pull request #7.",
+  "checkout": { "commit": "4f1c…e9a2", "fetch_ref": "refs/pull/7/head", "isolate": true } }
+```
+
+- `commit` — the full 40- or 64-hex commit name, lower case. A branch or an abbreviation could
+  come to mean another commit between queueing and running.
+- `fetch_ref` — `refs/pull/<n>/head`, `refs/pull/<n>/merge` or `refs/heads/<branch>` on the
+  upstream: fetched, and the commit must be it or an ancestor of it. Without one, the upstream's
+  branches are fetched and the commit must be reachable from one of them. Either way a commit is
+  only ever checked out if the task's own upstream has published it; it is never fetched by its
+  name alone, since git cannot tell a commit the server sent from one already in the shared object
+  store.
+- `isolate` — run the task in a repository of its own holding only the commit and its history:
+  no branches, no tags, no remote-tracking refs, no reflog, and none of the objects that came
+  after it, so `git log --all` and `git cat-file --batch-all-objects` reach nothing past it. The
+  commit's parents are still there: a task that sees a commit sees how it was reached. An isolated
+  checkout has no remotes, so it suits read-only work; it is made fresh for each task, from the
+  slot, and removed when the task ends.
+
+The checkout is made with the daemon's own token, in the slot (or the per-task checkout of a
+backend that keeps workspaces), and the slot's next reset puts the default branch back. A task
+file, a queue entry, `queue_task` and an API client's request may carry one; a retry, a restart
+resume and the continuations built from a task record carry it on. A continuation that is handed
+its predecessor's tree back keeps that tree, and with it the commit.
 
 ## repository-independent tasks
 
@@ -1687,8 +1725,9 @@ curl -X POST -H "Authorization: Bearer $CLIENT_TOKEN" -H 'Content-Type: applicat
 ```
 
 A request may carry `prompt` (required), `goal`, `upstream`, `backend`, `model`, `tools`,
-`budget` (at least 0.01), `issue_number`, `external_id`, `kleis_narrow` and `execution_image`
-(one `queue_policy.images` lists); any other field is a
+`budget` (at least 0.01), `issue_number`, `external_id`, `kleis_narrow`, `execution_image`
+(one `queue_policy.images` lists) and `checkout` (a commit of the request's `upstream`, see
+[checking out a commit](#checking-out-a-commit)); any other field is a
 `400`, so a `priority` or a `fork` the client believes it set is never silently ignored. What it
 never chooses:
 

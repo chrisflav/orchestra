@@ -240,6 +240,10 @@ structure QueueEntry where
       task runs: the role or listener it came from may have been edited by then, and a retry or a
       restart resume of the same work needs the same tools as the run it continues. -/
   executionImage : Option String := none
+  /-- The commit the task's workspace is checked out at (`Config.CheckoutSpec`), when whatever
+      queued it named one. On the entry for the reason the image is: a retry or a resume of a
+      review of a pull request's head has to review the same head, not the default branch. -/
+  checkout : Option CheckoutSpec := none
 
 /-- The pool this entry draws its workspace slot from.
 
@@ -304,6 +308,7 @@ instance : ToJson QueueEntry where
     let fields := if let some s := e.apiClient    then fields ++ [("api_client",    Json.str s)]      else fields
     let fields := if let some s := e.externalId   then fields ++ [("external_id",   Json.str s)]      else fields
     let fields := if let some s := e.executionImage then fields ++ [("execution_image", Json.str s)]  else fields
+    let fields := if let some c := e.checkout     then fields ++ [("checkout",      ToJson.toJson c)] else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -365,6 +370,9 @@ instance : FromJson QueueEntry where
     let apiClient    := j.getObjValAs? String "api_client"       |>.toOption
     let externalId   := j.getObjValAs? String "external_id"      |>.toOption
     let executionImage := j.getObjValAs? String "execution_image" |>.toOption
+    -- Strict, unlike the fields around it: a checkout dropped as unreadable would run a review of
+    -- one commit on the default branch, or show a scored task the answer.
+    let checkout ← parseCheckout? j
     return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec, kleisNarrow,
@@ -372,7 +380,7 @@ instance : FromJson QueueEntry where
              readOnly, priority, concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
              listenerName, spawnPolicy, spawnedBy, scopeRoot, apiClient, externalId,
-             executionImage }
+             executionImage, checkout }
 
 -- Directories and paths
 
@@ -460,7 +468,8 @@ def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
     scope_root           := Store.issueIdColumn e.scopeRoot
     api_client           := e.apiClient
     external_id          := e.externalId
-    execution_image      := e.executionImage }
+    execution_image      := e.executionImage
+    checkout             := e.checkout.map Store.jsonColumn }
 
 /-- The entry a row holds, or why this build cannot read it.
 
@@ -500,6 +509,10 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
                               (Store.jsonOfColumn? (α := SpawnPolicy) "spawn_policy" s).toOption
   -- Strict, unlike the lists above: a narrowing that fell back to none would run the task with
   -- access somebody took away from it.
+  -- Strict, for the reason `FromJson QueueEntry` gives: a checkout that fell back to none would
+  -- run the task on the default branch.
+  let checkout           ← row.checkout.mapM fun s =>
+                              Store.jsonOfColumn? (α := CheckoutSpec) "checkout" s
   let kleisNarrow        ← (row.kleis_narrow.mapM fun s =>
                               Store.jsonOfColumn? (α := List String) "kleis_narrow" s).map (·.getD [])
   return { id := row.id
@@ -542,7 +555,8 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
            scopeRoot
            apiClient := row.api_client
            externalId := row.external_id
-           executionImage := row.execution_image }
+           executionImage := row.execution_image
+           checkout }
 
 /-- The concert run as a row of the `concert_run` table. -/
 def ConcertRun.toRow (r : ConcertRun) : Store.ConcertRunRow :=
@@ -709,21 +723,25 @@ def entryForTask (taskId : String) : IO (Option QueueEntry) := do
     order_by_desc e.id
   return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
 
-/-- The image a continuation of task `taskId` runs in: the one the entry that ran it carried.
+/-- What a continuation of task `taskId` built from its task record takes from the entry that ran
+    it, since the record keeps neither: the image and the checkout. The checkout is carried for the
+    same reason as the image — the second half of a review of one commit is a review of that
+    commit — and only matters when the continuation does not get its predecessor's tree back,
+    since a kept tree is already at it.
 
-    For the continuations built from a *task record* rather than from an entry — `orchestra resume
-    <series>`, `orchestra queue add --resume`, `orchestra issue continue` — which would otherwise
-    run the second half of a piece of work without the tools the first half had. The record does
-    not keep the image; the entry does, and the entry is still there for every task the daemon
-    ran. A task run directly by `orchestra run` has none, and the continuation says so rather than
-    silently running without one. -/
-def imageForContinuation (taskId : String) : IO (Option String) := do
+    For `orchestra resume <series>`, `orchestra queue add --resume` and `orchestra issue
+    continue`, which would otherwise run the second half of a piece of work without the tools, or
+    on another commit than, the first half. The entry is still there for every task the daemon
+    ran; a task run directly by `orchestra run` has none, and the continuation says so rather
+    than silently carrying nothing. -/
+def carriedForContinuation (taskId : String) : IO (Option String × Option CheckoutSpec) := do
   match ← entryForTask taskId with
-  | some e => return e.executionImage
+  | some e => return (e.executionImage, e.checkout)
   | none =>
-    IO.eprintln s!"  note: no queue entry ran task {taskId}, so there is no execution_image to \
-carry; the continuation runs in whatever its repository and the configuration choose"
-    return none
+    IO.eprintln s!"  note: no queue entry ran task {taskId}, so there is no execution_image or \
+checkout to carry; the continuation runs in whatever image its repository and the configuration \
+choose, on the default branch"
+    return (none, none)
 
 open Db.Query.DSL in
 /-- The entry addressed by either of the two ids it answers to: its own, or the task its run
@@ -1438,7 +1456,8 @@ def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (facts :
     spawnPolicy   := entry.spawnPolicy
     scopeRoot     := entry.scopeRoot
     apiClient     := entry.apiClient
-    executionImage := entry.executionImage }
+    executionImage := entry.executionImage
+    checkout      := entry.checkout }
 
 /-- The entry `orchestra queue retry` queues for `entry`, continuing from `continuesFrom` — which
     the caller decides, since it takes the task store to know whether the dead run left a
@@ -1483,7 +1502,8 @@ def retryEntryFor (entry : QueueEntry) (continuesFrom : Option String) (id creat
     issueNumber   := entry.issueNumber
     prLabels      := entry.prLabels
     apiClient     := entry.apiClient
-    executionImage := entry.executionImage }
+    executionImage := entry.executionImage
+    checkout      := entry.checkout }
 
 /-- Queue a restart resume (`resumeEntryFor`) for each entry recorded in `interruptedFile`, and
     answer how many were queued. The caller decides whether to call this at all: only with

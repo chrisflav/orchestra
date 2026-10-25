@@ -521,7 +521,9 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     -- The image the entry's task runs in, where whatever queued it named one: on a cluster this
     -- beats the repository's own and the operator's pin, so it is what explains a pod running
     -- something other than either (`Kubernetes.imageFor`).
-    ("executionImage", optStr e.executionImage)
+    ("executionImage", optStr e.executionImage),
+    -- The commit the task is checked out at instead of the default branch, where it names one.
+    ("checkout",       ToJson.toJson e.checkout)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
