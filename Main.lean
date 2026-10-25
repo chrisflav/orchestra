@@ -199,7 +199,11 @@ private def prepareHandler (p : Parsed) : IO UInt32 := do
     -- Through the configured execution backend, because that is where the hook has to run to be
     -- worth anything: on a daemon that dispatches into a cluster, this machine may have no
     -- toolchain to install and nothing that reads what it installed.
-    let repoConfig ← RepoConfig.loadRepoConfig slotPath
+    -- From the default branch, like a task's (`RepoConfig.Scripts`): a slot is a tree agents have
+    -- written.
+    let label := s!"prepare-{fork.owner}-{fork.name}-{slot}"
+    let scripts ← RepoConfig.Scripts.prepare slotPath label
+    let repoConfig ← RepoConfig.loadRepoConfig scripts
     let session ← execBackend.openSession {
       workdir := slotPath
       grants  := #[{ path := slotPath.toString, access := .rwx, required := true
@@ -208,9 +212,10 @@ private def prepareHandler (p : Parsed) : IO UInt32 := do
       repo    := some upstream.toString
       image   := repoConfig.image }
     try
-      RepoConfig.runInitIfNeeded session slotPath
+      RepoConfig.runInitIfNeeded session slotPath scripts
     finally
       session.close
+      RepoConfig.Scripts.discard label
     IO.println slotPath.toString
   return (0 : UInt32)
 
@@ -2020,7 +2025,7 @@ execution.options.task_volumes); this one starts every session afresh."
     Usage.markUsed backendName label
   -- The same session a queued task gets, for the same reasons: it is what carries the checkout
   -- to wherever the agent runs, and what brings it back when the person is done with it.
-  let repoConfig ← RepoConfig.loadRepoConfig repoPath
+  let repoConfig ← if repo.isSome then RepoConfig.loadDefaultBranchConfig repoPath else pure {}
   -- The conversation to reopen, when picking up a queued task: the session id its run recorded. An
   -- earlier interactive session recorded none; its conversation is in the restored home all the
   -- same, and the agent's own `/resume` lists it.

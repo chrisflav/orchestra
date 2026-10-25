@@ -715,7 +715,9 @@ without a repository ({e}); starting it without one"
       | .error e  => return ← fail s!"cannot run the agent: {e}"
     let (mcpBind, mcpPorts, mcpToken) ← Exec.mcpBinding execBackend
     let pluginDirs ← TaskRunner.defaultPluginDirs appConfig
-    let repoConfig ← RepoConfig.loadRepoConfig repoPath
+    -- The default branch's, not the checkout's: a session that came back to a tree its agent wrote
+    -- must not have that agent choose what it runs in (`RepoConfig.Scripts`).
+    let repoConfig ← if fork.isSome then RepoConfig.loadDefaultBranchConfig repoPath else pure {}
     let seedDir ← match keepsWorkspaces, fork with
       | true, some f => some <$> Repo.seedPath f
       | _, _         => pure none
