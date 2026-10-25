@@ -107,6 +107,7 @@ else
     --arg key_path     "${ORCHESTRA_GITHUB_PRIVATE_KEY_PATH:-}" \
     --arg claude_token "${ORCHESTRA_CLAUDE_TOKEN:-}" \
     --arg api_key      "${ORCHESTRA_ANTHROPIC_API_KEY:-}" \
+    --arg unconfined   "${ORCHESTRA_UNCONFINED_SOCKETS_OK:-}" \
     '{
        github_app: { app_id: ($app_id | tonumber), private_key_path: $key_path },
        github: { pat: $pat },
@@ -114,7 +115,10 @@ else
                + (if $taxis_token == "" then {} else { token: $taxis_token } end))
      }
      + (if $claude_token == "" then {} else { claude_token: $claude_token } end)
-     + (if $api_key == "" then {} else { anthropic_api_key: $api_key } end)' \
+     + (if $api_key == "" then {} else { anthropic_api_key: $api_key } end)
+     + (if $unconfined == "1" or $unconfined == "true"
+        then { execution: { backend: "landrun", options: { unconfined_sockets_ok: true } } }
+        else {} end)' \
     > "$tmp"
   mv "$tmp" "$CONFIG_FILE"
 
@@ -160,6 +164,18 @@ if ! landrun $probe_args -- /bin/true >/dev/null 2>&1; then
   echo "[entrypoint] warning: landrun could not create a Landlock sandbox here." >&2
   echo "[entrypoint] Agent tasks will fail. Check that the host kernel has Landlock enabled" >&2
   echo "[entrypoint] (grep landlock /sys/kernel/security/lsm) and see docker/README.md." >&2
+fi
+
+# landrun alone does not confine Unix-socket connects or signals (docs/execution.md, "what landrun
+# does and does not confine"), so the backend also wants bubblewrap to build a mount namespace, and
+# that needs unprivileged user namespaces — which Docker's default seccomp profile refuses. Say so
+# now: without it every task is refused unless ORCHESTRA_UNCONFINED_SOCKETS_OK=1 opts in.
+if ! bwrap --ro-bind / / --unshare-pid --die-with-parent -- /bin/true >/dev/null 2>&1; then
+  echo "[entrypoint] warning: bubblewrap cannot build a namespace in this container, so the" >&2
+  echo "[entrypoint] landrun backend refuses to run agents unless execution.options" >&2
+  echo "[entrypoint] .unconfined_sockets_ok is true (ORCHESTRA_UNCONFINED_SOCKETS_OK=1)." >&2
+  echo "[entrypoint] Inside this container that leaves the daemon's own (authenticated) socket" >&2
+  echo "[entrypoint] reachable, and /tmp shared. See docker/README.md." >&2
 fi
 
 exec "$BIN" "$@"

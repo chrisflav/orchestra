@@ -46,8 +46,9 @@ instance : FromJson RepoConfig where
     into a directory only the daemon can reach (`Repo.snapshotScripts`).
 
     Everything in this module reads from here and never from the checkout. The checkout is the
-    agent's to write, `.orchestra/` included, and these scripts run outside the agent's run — on
-    this machine, under the landrun and local backends. Read from the working tree, an agent that
+    agent's to write, `.orchestra/` included, and these scripts are run by the daemon — on this
+    machine under the local backend, and in the agent's sandbox, with the daemon choosing what runs,
+    under landrun. Read from the working tree, an agent that
     rewrote `validation.sh` had the daemon run whatever it wrote, and a task checked out at a pull
     request's head ran that pull request's scripts. The copy is made before the agent starts and
     removed when the task ends (`discard`). -/

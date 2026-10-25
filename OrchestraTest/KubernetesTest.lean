@@ -777,7 +777,7 @@ def anExposedServerAlwaysGetsAToken : Test := do
   match token with
   | none   => TestM.fail "a server reachable over a network was left unauthenticated"
   | some t => TestM.assert (t.length ≥ 32) "and the token is long enough to be worth having"
-  let (loopbackBind, loopbackPorts, loopbackToken) ← Exec.mcpBinding Landrun.backend
+  let (loopbackBind, loopbackPorts, loopbackToken) ← Exec.mcpBinding (Landrun.backend {})
   TestM.assertEqual loopbackBind "127.0.0.1" (msg := "a local run still binds loopback")
   TestM.assertEqual loopbackToken none
     (msg := "and needs no token: only this machine can connect at all")

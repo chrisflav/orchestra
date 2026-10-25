@@ -108,7 +108,10 @@ automatically when using the provided container image):
 
 - [Lean 4 / Lake](https://leanprover.github.io/lean4/doc/setup.html) to build
   the tool
-- [landrun](https://github.com/Zouuup/landrun) for sandboxing
+- [landrun](https://github.com/Zouuup/landrun) for sandboxing, and
+  [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) with unprivileged user
+  namespaces allowed, plus Linux 6.12 or later for Landlock's scopes: landrun alone does not keep
+  an agent off Unix sockets or other processes (see [sandboxing](#sandboxing))
 - at least one agent CLI, installed and authenticated: `claude` (Claude Code), `vibe`
   (mistral-vibe), `opencode`, or `pi`
 - `gh` (GitHub CLI) for repository operations
@@ -778,6 +781,9 @@ involved, so this works inside the Docker image as well. A task's agent gets:
 - read+execute on the toolchain paths its backend declares, and read+write on the `$HOME`
   subdirectories that backend needs for its own configuration and state
 - read+execute on plugin directories, read+write on the memory directories permitted by `memory`
+- a mount namespace holding only those paths, with a `/tmp`, a `~/.cache`, a `~/.claude` and a
+  `~/.claude.json` of the session's own and `~/.elan` as an overlay, a PID namespace, and Landlock's
+  abstract-socket and signal scopes (see below)
 - outbound TCP to port 443 and to the local MCP server port, plus any `extra_ports` configured for
   the backend
 - `GH_TOKEN` (the installation token) and the selected authentication source's key in the
@@ -814,6 +820,19 @@ granted read-only: the daemon runs `git` as the same user outside the sandbox, a
 could set `core.hooksPath` or a `url.*.insteadOf` there would run code, or redirect a fetch, the
 next time the daemon touched a clone. `~/.config/gh` is not granted at all: its `hosts.yml` is the
 operator's own GitHub login, and an agent's `gh` authenticates with the `GH_TOKEN` it is given.
+
+**landrun alone is not enough.** Landlock (ABI 6, landrun 0.1.15) does not mediate `connect` on a
+Unix socket, abstract sockets or signals. An agent under landrun alone could reach the systemd user
+bus, the docker socket, the ssh and gpg agents and orchestra's own control socket, signal any of
+the user's processes, and read the rest of `/tmp`. So the landrun backend runs it inside Landlock's
+scopes and a `bwrap` mount namespace built from the grants. It gives each session its own `/tmp`,
+`~/.cache` (with `execution.options.shared_caches`, default `["mathlib"]`, read through),
+`~/.claude` and `~/.claude.json`, and an overlay over `~/.elan`, so nothing an agent writes there
+runs later outside the sandbox. The repository's hooks run inside the same sandbox. Without bwrap,
+or below Linux 6.12, the backend refuses to run agents unless
+`"execution": {"options": {"unconfined_sockets_ok": true}}` opts in. In any case, run agents as a
+dedicated user with no `docker`/`incus` group and no login session. See
+[what landrun does and does not confine](docs/execution.md#what-landrun-does-and-does-not-confine).
 
 `orchestra run --debug` prints the exact landrun invocation before executing it, which is the
 quickest way to find out why an agent cannot see a path. A path that does not exist cannot be
@@ -1264,8 +1283,8 @@ file:
 
 The failing script's output is available to the retry prompt as `{{validation_output}}`.
 
-The hooks run wherever the agent runs: on this machine under the default landrun backend, and
-inside the task's pod under the `kubernetes` one — `validation.sh` decides whether the agent is
+The hooks run wherever the agent runs: on this machine, inside the agent's sandbox, under the
+default landrun backend, and inside the task's pod under the `kubernetes` one — `validation.sh` decides whether the agent is
 finished, so it has to see the tree the agent worked on and the toolchain that builds it.
 
 **They come from the default branch.** The checkout is the agent's to write, `.orchestra/`

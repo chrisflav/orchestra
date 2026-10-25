@@ -50,6 +50,9 @@ in
     # Lean version manager
     elan
     landrun
+    # The landrun backend runs each agent in a bwrap mount namespace: landrun alone does not keep it
+    # off Unix sockets or other processes (docs/execution.md).
+    bubblewrap
     # Coding agents
     unstable.opencode
     unstable.claude-code

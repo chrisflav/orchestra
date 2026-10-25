@@ -163,6 +163,10 @@ def orchestradCmd : Cmd := `[Cli|
 ]
 
 def main (args : List String) : IO UInt32 := do
+  -- Before anything else: the landrun backend runs `<this binary> __landlock-scope -- landrun …`
+  -- to put the agent in Landlock's signal and abstract-socket scopes (`Exec.Scope`). It must not
+  -- touch the database or the configuration on the way.
+  if let some code ← Exec.Scope.handle? args then return code
   Utils.unbufferIfPiped
   Project.ensureTaxisConfigured
   -- The one-time carry-over of the JSON record directories. Before anything reads a record, and

@@ -707,12 +707,17 @@ def randomHex (bytes : Nat) : IO String := do
   catch _ =>
     return toString (← IO.monoNanosNow)
 
+/-- A `$HOME` to use instead of this process's, for tests that run the landrun backend for real
+    against a stand-in home rather than the operator's. -/
+initialize hostHomeOverride : IO.Ref (Option String) ← IO.mkRef none
+
 /-- This machine's `$HOME`, or `""` when it is unset.
 
     `""` rather than an error: a home-scoped grant then resolves to a path that does not exist,
     which the host backends already drop with a warning, and that is a better failure than
     refusing to launch. -/
-def hostHome : IO String :=
+def hostHome : IO String := do
+  if let some h ← hostHomeOverride.get then return h
   return (← IO.getEnv "HOME").getD ""
 
 /-- The ports orchestra itself answers on, which no agent may listen on (`Landrun.usable`).

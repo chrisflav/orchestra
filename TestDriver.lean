@@ -9,7 +9,10 @@
 -/
 import OrchestraTest
 
-def main : IO UInt32 := do
+def main (args : List String) : IO UInt32 := do
+  -- The landrun backend re-executes this binary as `__landlock-scope` (`Orchestra.Exec.Scope`),
+  -- and the tests that run it for real run it from here.
+  if let some code ← Orchestra.Exec.Scope.handle? args then return code
   let passed ← Orchestra.runTests
   (← IO.getStdout).flush
   -- Exited rather than returned, for the same reason the queue daemon exits (`Daemon.run`): a
