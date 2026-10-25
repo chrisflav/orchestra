@@ -448,6 +448,15 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
     if taskFileData.tasks.isEmpty then
       IO.eprintln "No tasks found in task file"
       return 1
+    -- A checkout the execution backend would refuse is refused before anything is queued
+    -- (`ExecutionConfig.checkoutRefusal?`), as it is again when the task runs.
+    if taskFileData.tasks.any (·.ioTask.checkout.isSome) then
+      let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+      for task in taskFileData.tasks do
+        if let some e := appConfig.execution.checkoutRefusal? task.ioTask.checkout
+            task.ioTask.backend then
+          IO.eprintln s!"Not queued: {e}"
+          return 1
     let tasks := match taskIdx with
       | some idx =>
         if h : idx < taskFileData.tasks.size then #[taskFileData.tasks[idx]]

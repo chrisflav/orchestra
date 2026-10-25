@@ -763,21 +763,36 @@ large repository is a large pack, and a tree that starts without the build outpu
 **Its configuration is the default branch's.** The commit's own `.orchestra/` is part of what the
 task looks at, and nothing more: `config.json` (`execution.image` among it), `init.sh`, `before.sh`,
 `validation.sh` and `after.sh` are taken from the upstream's default branch, copied by the daemon
-into a directory of its own before the commit is checked out, and run from there.
+into a directory of its own before the commit is checked out, and run from there. A symlink in
+that copy that leads outside it, or nowhere, fails the task: the hooks would otherwise run a file
+the copy does not hold.
+
+**Hooks still run in the commit's tree**, and what they call reads it: `lake` and elan follow the
+commit's `lean-toolchain` and `lakefile`, `npm`, `uv` and `make` its scripts. Anyone can publish a
+commit to an upstream as a pull request. So on `landrun` and `local`, which run hooks on the
+daemon's machine outside any sandbox, a checkout is refused — when it is queued, from every path,
+and again when it runs — unless `"execution": {"allow_checkout_hooks_on_host": true}` is set, for a
+deployment where everyone who can name a commit is trusted; each such task then logs a warning.
+Use the `kubernetes` backend, which runs hooks in the task's pod, for checkouts named by API
+clients or agents. A checkout is refused for the `merger` and `triage` backends, which run no agent
+on one.
 
 **What isolation is not.** It holds within git only. The agent still has the network, the token
 the task was given, and the memories it is granted; a determined task can fetch what came after
 the commit from GitHub itself. For a scored task, withhold those as well — a read-only token, a
-kleis narrowing, `memory: "none"`.
+kleis narrowing, `memory: "none"`. On `landrun` an isolated task gets a scratch directory of its
+own as `TMPDIR` instead of the shared `/tmp`, so it cannot read what other tasks leave there; on
+`local`, which confines nothing, `isolate` is refused.
 
 A task file, a queue entry, `queue_task` and an API client's request may carry a checkout; a retry,
-a restart resume and the continuations built from a task record carry it on. A continuation gets a
-fresh tree at the same commit: the conversation is resumed, the tree is not, so a writable task
+a restart resume and the continuations built from a task record carry it on. On `kubernetes` with
+task volumes a continuation gets its predecessor's workspace back, tree and edits included, and no
+new tree is built for it; elsewhere it gets a fresh tree at the same commit, so a writable task
 checked out at a commit loses its uncommitted edits across a continuation. `orchestra run` outside
-the queue builds the same per-task tree and never touches the cache clone. The tree, the source and
-the configuration copy are removed when the task ends, by a daemon that picked the task up too;
-a crash's leftovers go with the startup sweep, and any temporary `refs/orchestra/*` with them,
-whatever their age.
+the queue builds the same per-task tree and never touches the cache clone. The tree, the source,
+the configuration copy and the scratch directory are removed when the task ends, by a daemon that
+picked the task up too; a crash's leftovers go with the startup sweep, which leaves a picked-up
+task's alone, and any temporary `refs/orchestra/*` with them, whatever their age.
 
 ## repository-independent tasks
 

@@ -1793,6 +1793,11 @@ private def queueForClient (configPath : Option System.FilePath) (c : ApiClient.
   let resolved ← match c.resolve r with
     | .error e => return .badRequest e
     | .ok x    => pure x
+  -- Refused here as well as when it runs: a client should hear it now, not from a failed task.
+  if resolved.checkout.isSome then
+    let appConfig ← loadAppConfig configPath
+    if let some e := appConfig.execution.checkoutRefusal? resolved.checkout resolved.backend then
+      return .badRequest e
   -- A read-only task works in the upstream itself and pushes nothing, as the auto-reviewer does;
   -- forking for it would create a repository per reviewed upstream for nothing. A writable one
   -- gets its fork by the rule every other dispatch path uses — outside the lock, since probing

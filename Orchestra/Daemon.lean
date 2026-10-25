@@ -474,9 +474,13 @@ def run (cfg : Config) : IO UInt32 := do
   Server.reservePorts (adoptions.map fun (_, r) => UInt16.ofNat r.state.mcpPort)
   -- The per-task checkouts they were opened on are what their configuration is read from; the
   -- sweep of old ones below goes by age, and a task that has run for a day is still this one's.
+  -- A checkout task's configuration copy and scratch directory sit beside its tree under the same
+  -- name (`Repo.checkoutConfigPath`), and are as much the live task's.
   for (_, r) in adoptions do
-    try discard <| IO.Process.output { cmd := "touch", args := #[r.state.repoPath] }
-    catch _ => pure ()
+    for p in [r.state.repoPath, r.state.repoPath ++ ".config", r.state.repoPath ++ ".tmp"] do
+      if ← System.FilePath.pathExists p then
+        try discard <| IO.Process.output { cmd := "touch", args := #[p] }
+        catch _ => pure ()
   -- Startup cleanup. The entries swept here are recorded (`Queue.interruptedFile`): they are the
   -- tasks this restart interrupted, which `Queue.resumeInterrupted` below may pick up again.
   let _ ← Queue.markStaleRunningAsUnfinished (keep := adoptions.map (·.1.id))

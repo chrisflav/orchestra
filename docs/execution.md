@@ -88,9 +88,18 @@ built from a repository only the daemon touches (`Repo.prepareCheckout`), with t
 token, since a read-only workspace is one whose agent cannot fetch or check out anything itself.
 With `isolate`, that tree holds only the commit and its history (`Repo.isolateCheckout`). A
 checkout task's configuration and hooks come from a copy of the upstream default branch's
-`.orchestra/` rather than from the tree; the copy is one of the session's grants marked
-`.orchestra`, so a backend that runs the hooks elsewhere carries it there like any other. A backend
-sees whichever tree it is handed as `workdir`, and needs to know nothing else about it.
+`.orchestra/` rather than from the tree; on a backend that runs hooks elsewhere the copy is one of
+the session's grants marked `.orchestra`, so it is carried there like any other. A backend sees
+whichever tree it is handed as `workdir`, and needs to know nothing else about it.
+
+That the hooks are the default branch's does not make it safe to run them on this machine: they
+run *in the checked-out tree*, and what they call reads it — `lake` and elan follow its
+`lean-toolchain` and `lakefile`, `npm`, `uv` and `make` its scripts. On `landrun` and `local`, which
+run hooks on the daemon's machine with its environment, a checkout is therefore refused when it is
+queued and when it runs (`ExecutionConfig.checkoutRefusal?`), unless the operator sets
+`execution.allow_checkout_hooks_on_host` — and then every such task says so loudly in the log.
+`isolate` is refused on `local` outright. `kubernetes` runs the hooks in the task's pod and needs
+neither.
 
 A session is opened with a `SessionSpec`, which also carries the repository and the image it asked
 for in its own `.orchestra/config.json`: what a task needs installed varies by repository, and a

@@ -151,8 +151,12 @@ names the commit the queued task's workspace is checked out at (`{"commit": "<fu
 commit](../README.md#checking-out-a-commit)). It is never inherited, because it describes one
 piece of work: a planner reviewing one commit that queues an implementor wants the implementor on
 the default branch. Nor is it bounded by the policy: it can only name a commit the queued task's
-own upstream has published — the daemon refuses anything the upstream's refs do not reach — so it
-narrows which published code the task sees and never what it may do. `tools` distinguishes
+own upstream has published — the daemon refuses anything the upstream's refs do not reach. That
+is not the same as harmless: anyone can publish a commit as a pull request, and the task's hooks
+run in that commit's tree, where `lake`, `npm`, `uv` or `make` follow what the commit says. So a
+checkout is refused on an execution backend that runs hooks on the daemon's own machine
+(`landrun`, `local`) unless `execution.allow_checkout_hooks_on_host` is set — the refusal comes
+back from `queue_task` at once. `tools` distinguishes
 absent (inherit the spawning task's set) from `[]` (a task with no optional tools at all), which
 is a thing worth being able to ask for.
 

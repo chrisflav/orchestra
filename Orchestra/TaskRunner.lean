@@ -111,6 +111,9 @@ def enqueueReviewerImpl (project : Project.Project) (iid : Taxis.IssueId)
 def enqueueTaskImpl (appConfig : AppConfig) (resolved : ResolvedSpawn) (spawnerTaskId : String) :
     IO (Except String String) := do
   try
+    -- Refused when queued as well as when run, so the agent hears it in the same turn.
+    if let some e := appConfig.execution.checkoutRefusal? resolved.checkout resolved.backend then
+      return .error s!"no task was queued: {e}"
     -- Counted over the queue rather than kept in memory: entries outlive the daemon, and an
     -- allowance that reset on restart is not an allowance. Terminal entries count too — the
     -- ceiling is on how much work a task may create, not on how much of it is still running.
@@ -822,6 +825,18 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   if ioTask.checkout.isSome && ioTask.repo.isNone then
     throw (.userError "the task asks for a checkout but works on no repository")
   let checkout := ioTask.checkout
+  -- The same refusal a checkout met when it was queued (`ExecutionConfig.checkoutRefusal?`), for
+  -- one queued some other way — a task file run directly, an entry written before the rule.
+  if let some e := appConfig.execution.checkoutRefusal? checkout ioTask.backend then
+    throw (.userError s!"refusing to run: {e}")
+  -- Allowed on a backend that runs the repository's scripts on this machine only because the
+  -- operator said so; said again on every such task, because what it accepts is code from
+  -- whoever named the commit running outside the sandbox.
+  if checkout.isSome && appConfig.execution.scriptsRunOnHost then
+    IO.eprintln s!"  WARNING: {taskId} is checked out at a commit someone named, and its hooks \
+run in that commit's tree on this machine, outside any sandbox \
+(execution.allow_checkout_hooks_on_host). Whatever the commit's lakefile, package scripts or \
+toolchain file say runs as the daemon's user."
   -- Where a checkout task's configuration and hooks are read from: the upstream default branch's
   -- `.orchestra/`, copied by the daemon (`Repo.prepareCheckout`), never the named commit's.
   let configRoot : Option System.FilePath ← match checkout, ioTask.repo with
@@ -835,6 +850,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       let p := System.FilePath.mk r.state.repoPath
       unless ← p.pathExists do
         throw (Exec.reattachFailed s!"its checkout {p} is gone")
+      -- Its hooks are read from the configuration copy; without it they would be read from the
+      -- commit's own tree, which is the one thing that copy exists to prevent.
+      if let some c := configRoot then
+        unless ← c.pathExists do
+          throw (Exec.reattachFailed s!"its configuration copy {c} is gone")
       pure p
     else match ioTask.repo with
     | some repo =>
@@ -842,7 +862,13 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       -- queue: a tree of its own, built from a repository only the daemon touches
       -- (`Repo.prepareCheckout` says why). The same for every backend and for `orchestra run`.
       if let some c := checkout then do
+        -- A continuation on a backend that keeps workspaces gets its predecessor's workspace back
+        -- (a task volume, or the task fails: tasks never set `continuationOptional`), tree and all;
+        -- a tree built here would never be used. The source is still fetched — the commit checked
+        -- and the configuration copied — since the hooks are read from that copy either way.
+        let reused := persistent && continuesFrom.isSome
         let (tree, _) ← Repo.prepareCheckout repo.fork repo.upstream taskId c (token := some token)
+          (buildTree := !reused)
         pure tree
       else if taskCheckout then
         Repo.ensureTaskCheckout repo.fork repo.upstream taskId (token := some token)
@@ -878,6 +904,17 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- No build output carried in or out of an isolated checkout (`seedDir` below): what a seed holds
   -- was built from later commits, and what this task built from its commit is no one else's.
   let isolated := (checkout.map (·.isolate)).getD false
+  -- An isolated task's agent gets a scratch directory of its own instead of `/tmp`, on a backend
+  -- that runs it on this machine: `/tmp` is shared with every other task and what they leave in
+  -- it. A pod's `/tmp` is the pod's own already.
+  let tmpDir : Option System.FilePath ← match isolated, ioTask.repo with
+    | true, some repo =>
+      if appConfig.execution.scriptsRunOnHost then do
+        let p ← Repo.checkoutTmpPath repo.fork taskId
+        IO.FS.createDirAll p
+        pure (some p)
+      else pure none
+    | _, _ => pure none
   -- A per-task checkout is this task's alone, and goes when the task does — however it ends, and
   -- for a picked-up task too. A checkout task's tree, source and configuration copy likewise. A
   -- continuation of a checkout task gets a fresh tree at the same commit: the conversation is
@@ -886,6 +923,10 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     match checkout, ioTask.repo with
     | some _, some repo => Repo.removeCheckoutDirs repo.fork taskId
     | _, _ => if taskCheckout then Repo.removeTaskDir repoPath
+  -- Every step between here and the session that can throw goes through this, so a task that fails
+  -- in setup takes its checkout with it rather than leaving it for the startup sweep.
+  let guardCheckout : ∀ {α : Type}, IO α → IO α := fun act => do
+    try act catch e => do removeTaskCheckout; throw e
   -- 3. Open the environment this task runs in.
   --
   -- One session for the whole task, not one per agent launch, because a task is not one command:
@@ -902,7 +943,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- A picked-up task keeps the token its agent already holds: the agent's relay presents it on
   -- every reconnection (`McpEndpoint.relayScript`), and a fresh one would be refused.
   let (mcpBind, mcpPorts, mcpToken) ← do
-    let (bind, ports, minted) ← Exec.mcpBinding execBackend
+    let (bind, ports, minted) ← guardCheckout (Exec.mcpBinding execBackend)
     pure (bind, ports, match reattach with
       | some r => r.state.mcpToken
       | none => minted)
@@ -917,8 +958,9 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- built from (`Sandbox.grantsFor`): a backend running the agent elsewhere reads them to know
   -- what to carry there — the workspace, the plugin directories, the memories — and one running
   -- it here ignores them and builds its ruleset per launch.
-  let pluginDirs ← defaultPluginDirs appConfig
-  let sharedMemoryDirs ← resolveMemoryDirs ioTask.memory (ioTask.repo.map (·.upstream))
+  let pluginDirs ← guardCheckout (defaultPluginDirs appConfig)
+  let sharedMemoryDirs ←
+    guardCheckout (resolveMemoryDirs ioTask.memory (ioTask.repo.map (·.upstream)))
   -- The identity's own memory is not selected by `memory`: that field chooses among the *shared*
   -- memories, and an identity's is part of the identity rather than one of them (see
   -- `Orchestra.Identity`). It is appended to the same array so it is mounted, described and
@@ -930,15 +972,16 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- agent is told about and cannot read.
   let identityMemoryDir : Option String ← match identity with
     | none     => pure none
-    | some idn => pure (some (← Identity.ensureMemoryDir idn.name).toString)
+    | some idn => pure (some (← guardCheckout (Identity.ensureMemoryDir idn.name)).toString)
   let memoryDirs := sharedMemoryDirs ++ identityMemoryDir.toArray
   -- Read before the environment is opened, because one of the things it says is which environment
   -- to open: what a task needs installed is a property of the repository, and the repository is
   -- where that is written down.
-  let repoConfig ← RepoConfig.loadRepoConfig repoPath configRoot
+  let repoConfig ← guardCheckout (RepoConfig.loadRepoConfig repoPath configRoot)
   -- Where build output carried between task chains lives for this repository, on a backend that
   -- keeps workspaces. See `Exec.SessionSpec.seedDir`.
-  let seedDir ← if persistent && !isolated then ioTask.repo.mapM (Repo.seedPath ·.fork)
+  let seedDir ← if persistent && !isolated then
+      guardCheckout (ioTask.repo.mapM (Repo.seedPath ·.fork))
     else pure none
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat.
   -- Here rather than beside the MCP server that serves them, because they are part of what the
@@ -951,7 +994,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   if usingModeFallback && !requestedTools.isEmpty then
     IO.eprintln s!"  Deprecation warning: the 'mode' field is deprecated. \
       Use 'tools' instead (e.g. {repr requestedTools}) and optionally 'read_only: true/false'."
-  let allowedTools ← Server.withoutRepoScopedTools ioTask.repo requestedTools
+  let allowedTools ← guardCheckout (Server.withoutRepoScopedTools ioTask.repo requestedTools)
   -- What the task's kleis token says about it: the task facts orchestra states, whichever path
   -- the token takes. kleis decides which grants read them; orchestra only says what it knows.
   let facts : Kleis.TaskFacts := {
@@ -1017,12 +1060,16 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       | none   => pure false
     grants  := Sandbox.grantsFor (agentDefOfBackend ioTask.backend).sandboxPaths
                  appConfig.additionalSandboxPaths repoPath ioTask.readOnly pluginDirs memoryDirs
+                 ((tmpDir.map (·.toString)).getD "/tmp")
                  ++ (kleisBundle.map Kleis.bundleGrant).toArray
                  -- A checkout task's hooks are read from the daemon's copy of the default branch's
                  -- `.orchestra/`, which a backend that runs them elsewhere has to carry there.
-                 ++ (configRoot.map fun p =>
-                      ({ path := p.toString, access := .rox, from_ := .orchestra }
-                        : Exec.PathGrant)).toArray
+                 -- Only where the hooks run somewhere else, which has to be given the copy: on this
+                 -- machine they read it in place, and the agent has no business seeing it.
+                 ++ (if appConfig.execution.scriptsRunOnHost then #[] else
+                      (configRoot.map fun p =>
+                        ({ path := p.toString, access := .rox, from_ := .orchestra }
+                          : Exec.PathGrant)).toArray)
     label   := taskId
     -- The upstream, not the fork: what a repository runs in is a property of the project, and an
     -- operator writing `execution.options.images` writes down the name the project is known by.
@@ -1280,7 +1327,9 @@ handed to the next daemon"
         (debug := debug) (pluginDirs := pluginDirs) (memoryDirs := memoryDirs)
         (subAgent := ioTask.agent) (model := ioTask.model) (systemPrompt := systemPrompt)
         (resume := resume) (budget := ioTask.budget.getD 4.0) (cancelToken := cancelToken)
-        (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
+        (extraEnv := apiKeyEnv ++ (tmpDir.map fun p => ("TMPDIR", some p.toString)).toArray)
+        (tmpDir := (tmpDir.map (·.toString)).getD "/tmp")
+        (debugLogFile := debugLogFile) (logFile := taskLogFile)
         (readOnly := ioTask.readOnly) (extraPorts := extraPorts)
         (additionalPaths := appConfig.additionalSandboxPaths)
         (interactiveAgent := interactiveAgent) (goal := ioTask.goal) (session := session)

@@ -116,7 +116,7 @@ belong in one place so they cannot drift between execution backends either. -/
     reported (`PathGrant.required`), while the configured list is advisory — it exists to grant
     access to directories that may or may not be there — and stays quiet. -/
 def grantsFor (paths additional : SandboxPaths) (repoPath : System.FilePath) (readOnly : Bool)
-    (pluginDirs memoryDirs : Array String) : Array PathGrant := Id.run do
+    (pluginDirs memoryDirs : Array String) (tmpDir : String := "/tmp") : Array PathGrant := Id.run do
   let ofList (scope : Scope) (access : Access) (required : Bool) (ps : List String) :=
     ps.toArray.map fun p => { path := p, access, scope, required : PathGrant }
   let mut grants : Array PathGrant := #[]
@@ -126,7 +126,9 @@ def grantsFor (paths additional : SandboxPaths) (repoPath : System.FilePath) (re
   grants := grants.push
     { path := repoPath.toString, access := if readOnly then .rox else .rwx, required := true
     , from_ := .orchestra }
-  grants := grants.push { path := "/tmp", access := .rw, required := true }
+  -- `/tmp` unless the task has a scratch directory of its own (`tmpDir`): an isolated checkout's,
+  -- since `/tmp` is shared with every other task on the machine and with what they leave there.
+  grants := grants.push { path := tmpDir, access := .rw, required := true }
   -- The agent backend's declared needs.
   grants := grants ++ ofList .absolute .rox false paths.rox
   grants := grants ++ ofList .absolute .ro  false paths.ro
@@ -190,11 +192,12 @@ def remoteMcpEnv (mcp : McpEndpoint) : Array (String × String) :=
 def specFor (agentDef : AgentDef) (repoPath : System.FilePath) (mcp : McpEndpoint)
     (ghToken : String) (agentEnv extraEnv : Array (String × Option String))
     (pluginDirs memoryDirs : Array String) (readOnly : Bool) (extraPorts : Array Nat)
-    (additionalPaths : SandboxPaths) (kleis : Option Kleis.Launch := none) : RunSpec :=
+    (additionalPaths : SandboxPaths) (kleis : Option Kleis.Launch := none)
+    (tmpDir : String := "/tmp") : RunSpec :=
   { command := agentDef.command
     workdir := repoPath
     grants  := grantsFor agentDef.sandboxPaths additionalPaths repoPath readOnly
-                 pluginDirs memoryDirs
+                 pluginDirs memoryDirs tmpDir
                  ++ (kleis.map (·.files)).getD #[]
     ports   := portsFor agentDef.sandboxPaths additionalPaths mcp
                  (extraPorts ++ (kleis.map (·.port)).toArray)
@@ -272,6 +275,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (systemPrompt : Option String := none)
     (resume : Option String := none)
     (budget : Float := 4.0)
+    (tmpDir : String := "/tmp")
     (cancelToken : Option Std.CancellationToken := none)
     (debugLogFile : Option System.FilePath := none)
     (logFile : Option System.FilePath := none)
@@ -349,7 +353,7 @@ goal; running without the goal condition."
       agentDef.buildArgs mcpContext allPluginDirs subAgent model systemPrompt resume budget prompt
   let spec : RunSpec :=
     { specFor agentDef repoPath mcp ghToken agentEnv extraEnv pluginDirs memoryDirs readOnly
-        extraPorts additionalPaths kleis with
+        extraPorts additionalPaths kleis tmpDir with
       args  := goalArgs ++ agentArgs
       stdio := if interactiveAgent then .inherit else .piped
       runId }

@@ -1043,6 +1043,10 @@ structure ExecutionConfig where
       one — a namespace, an image, a service account — is a change to the backend that reads it
       and to nothing else. The two backends that ship today read nothing. -/
   options : Json := Json.null
+  /-- Whether a task checked out at a commit (`CheckoutSpec`) may run on a backend whose
+      repository scripts run on this machine. Off by default; see `ExecutionConfig.checkoutRefusal?`
+      for why, and what turning it on accepts. -/
+  allowCheckoutHooksOnHost : Bool := false
 
 instance : Repr ExecutionConfig where
   reprPrec c _ := Std.Format.text s!"\{ backend := {c.backend}, options := {c.options.compress} }"
@@ -1054,7 +1058,48 @@ instance : FromJson ExecutionConfig where
   fromJson? j := do
     let backend := j.getObjValAs? String "backend" |>.toOption |>.getD "landrun"
     let options := j.getObjVal? "options" |>.toOption |>.getD Json.null
-    return { backend, options }
+    let allowCheckoutHooksOnHost :=
+      j.getObjValAs? Bool "allow_checkout_hooks_on_host" |>.toOption |>.getD false
+    return { backend, options, allowCheckoutHooksOnHost }
+
+/-- Whether this backend runs a repository's scripts — `init.sh`, `before.sh`, `validation.sh`,
+    `after.sh` — on this machine, outside any sandbox, with the daemon's own environment: `landrun`
+    and `local` do; `kubernetes` runs them in the task's pod. -/
+def ExecutionConfig.scriptsRunOnHost (c : ExecutionConfig) : Bool :=
+  c.backend == "landrun" || c.backend == "local"
+
+/-- Why a task with checkout `c`, on agent backend `agentBackend`, may not run under `exec`, or
+    `none`. Checked when such a task is queued, wherever it is queued from, and again when it runs.
+
+    * **Scripts on the host.** A checkout task's hooks are the upstream default branch's
+      (`Repo.prepareCheckout`), but they run *in the checked-out tree*: on `landrun` and `local`
+      that is on this machine, unsandboxed, with the daemon's environment. And what a hook runs
+      reads the tree — `lake` and elan follow its `lean-toolchain` and `lakefile`, `npm`, `uv` and
+      `make` run its scripts — so a commit named by an API client or an agent would run its own
+      code outside the sandbox through a perfectly trustworthy hook. Refused unless the operator
+      sets `execution.allow_checkout_hooks_on_host`, for a deployment where everyone who can name
+      a commit is trusted already; the task then says so loudly every time it runs.
+    * **Isolation on `local`.** `local` confines nothing, so an isolated checkout would promise
+      what the agent can walk straight past.
+    * **The merger and triage.** Neither runs an agent on a checkout: the merger checks out the
+      pull request it merges, and triage reads none. A checkout there would be ignored, which is
+      worse than refused. -/
+def ExecutionConfig.checkoutRefusal? (exec : ExecutionConfig) (c : Option CheckoutSpec)
+    (agentBackend : Option String) : Option String := Id.run do
+  let some spec := c | return none
+  if agentBackend == some "merger" || agentBackend == some "triage" then
+    return some s!"the '{agentBackend.getD ""}' backend runs no agent on a checkout; 'checkout' \
+is for tasks that do"
+  if spec.isolate && exec.backend == "local" then
+    return some "'isolate' is refused on the 'local' execution backend, which confines nothing: \
+the agent could read past the isolated checkout to everything the daemon can"
+  if exec.scriptsRunOnHost && !exec.allowCheckoutHooksOnHost then
+    return some s!"a task checked out at a commit runs its repository's hooks in that commit's \
+tree, and the '{exec.backend}' execution backend runs them on this machine outside any sandbox; \
+a commit someone else named would run its own code (a lakefile, package scripts) there. Use the \
+kubernetes backend, or set execution.allow_checkout_hooks_on_host if everyone who can name a \
+commit is trusted"
+  return none
 
 /-- Queue daemon concurrency and restart behaviour, from the `queue` object in `config.json`.
 

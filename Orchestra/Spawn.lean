@@ -97,12 +97,17 @@ structure SpawnRequest where
       so an agent that could name any image could move its work off everything the operator
       chose for that repository. -/
   executionImage : Option String := none
-  /-- The commit the queued task is checked out at (`Config.CheckoutSpec`). Not bounded by the
-      policy and never inherited: it can only name a commit of the queued task's own upstream —
-      `Repo.prepareCheckout` refuses anything the upstream's refs do not reach — and so can only
-      narrow which of the repository's published code the task sees, never widen what it may do.
-      Not inherited because it describes one piece of work: a planner reviewing one commit that
-      queues an implementor wants the implementor on the default branch. -/
+  /-- The commit the queued task is checked out at (`Config.CheckoutSpec`). Never inherited, because
+      it describes one piece of work: a planner reviewing one commit that queues an implementor
+      wants the implementor on the default branch.
+
+      Not bounded by the policy, but not harmless either. It can only name a commit of the queued
+      task's own upstream — `Repo.prepareCheckout` refuses anything the upstream's refs do not
+      reach — yet anyone may publish a commit to an upstream as a pull request, and the task's
+      hooks run in that commit's tree, where what they run (a `lakefile`, package scripts, a
+      toolchain file) is the commit's. That is why a checkout is refused outright on an execution
+      backend that runs those hooks on the daemon's machine, unless the operator allows it
+      (`ExecutionConfig.checkoutRefusal?`, checked when the task is queued). -/
   checkout : Option CheckoutSpec := none
 deriving Repr, Inhabited
 

@@ -102,6 +102,8 @@ private def prepare (f : Fixture) (spec : CheckoutSpec) (taskId := "t-1") :
 private def refusal (f : Fixture) (spec : CheckoutSpec) : IO (Option String) := do
   try let _ ← prepare f spec; pure none catch e => pure (some s!"{e}")
 
+private def sha1 : String := "0123456789abcdef0123456789abcdef01234567"
+
 /-! ## Checking out a commit -/
 
 @[test]
@@ -193,13 +195,13 @@ def aRefPlantedInTheSlotDoesNotVouchForACommit : Test := do
 @[test]
 def replacementsAndGraftsAddNothingToAnIsolatedCheckout : Test := do
   let r ← withFixture fun f => do
-    -- A replacement of `c2` claiming `c4` as a second parent, and a graft saying the same, in the
-    -- repository the checkout is fetched from.
+    -- A replacement of `c2` claiming `c4` as a second parent in the repository the checkout is
+    -- fetched from, and the same replacement and a graft in the slot, which plays no part at all.
     let tree ← git f.bare #["rev-parse", s!"{f.c2}^\{tree}"]
     let fake ← git f.bare #["commit-tree", "-p", f.c1, "-p", f.c4, "-m", "fake", tree]
     let _ ← git f.bare #["replace", "-f", f.c2, fake]
-    IO.FS.createDirAll (f.bare / "info")
-    IO.FS.writeFile (f.bare / "info" / "grafts") s!"{f.c2} {f.c1} {f.c4}\n"
+    let _ ← git f.slot #["fetch", "--quiet", f.bare.toString, "refs/replace/*:refs/replace/*"]
+    IO.FS.writeFile (f.slot / ".git" / "info" / "grafts") s!"{f.c2} {f.c1} {f.c4}\n"
     let (dest, _) ← prepare f { commit := f.c2, isolate := true }
     return (← gitOk dest #["cat-file", "-e", f.c4], ← git dest #["rev-list", "--all", "HEAD"],
             f.c2History)
@@ -234,6 +236,81 @@ def anIsolatedCheckoutHasNothingPastItsCommit : Test := do
   TestM.assert isDetached "HEAD is detached"
   TestM.assertEqual remotes "" (msg := "and no remotes")
 
+/-- A symlink in the default branch's `.orchestra/` that leads outside it fails the checkout: the
+    hooks would otherwise run a file the configuration copy does not hold. -/
+@[test]
+def aSymlinkOutOfTheConfigurationIsRefused : Test := do
+  let outcome ← withFixture fun f => do
+    let work := f.dir / "work"
+    let _ ← git work #["checkout", "--quiet", "main"]
+    IO.FS.writeFile (work / "evil.sh") "echo outside\n"
+    let _ ← git work #["rm", "--quiet", ".orchestra/init.sh"]
+    let _ ← IO.Process.output { cmd := "ln", args := #["-s", "../evil.sh", ".orchestra/init.sh"]
+                                cwd := work }
+    let _ ← git work #["add", "evil.sh", ".orchestra/init.sh"]
+    let _ ← git work #["commit", "--quiet", "-m", "link"]
+    let _ ← git work #["push", "--quiet", f.bare.toString, "main:refs/heads/main"]
+    refusal f { commit := f.c1 }
+  match outcome with
+  | none => TestM.fail "a configuration with a symlink out of it was accepted"
+  | some e => TestM.assert (mentions e "symlink") e
+
+/-- For a continuation whose backend hands back the predecessor's workspace, no tree is built, but
+    the commit is still checked and the configuration still copied. -/
+@[test]
+def withoutATreeTheConfigurationIsStillCopied : Test := do
+  let r ← withFixture fun f => do
+    let spec : CheckoutSpec := { commit := f.c3, fetchRef := some "refs/pull/7/head" }
+    let (tree, config) ← Repo.prepareCheckout fork fork "t-1" spec
+      (url := some f.bare.toString) (buildTree := false)
+    return ((← tree.readDir).size, ← (config / ".orchestra" / "init.sh").pathExists)
+  let (entries, hasConfig) := r
+  TestM.assertEqual entries 0 (msg := "an empty directory stands where the tree would")
+  TestM.assert hasConfig "the configuration copy is made"
+
+@[test]
+def clearingRefsNeverReachesAnEnclosingRepository : Test := do
+  let outer ← withFixture fun f => do
+    -- The slot is a repository; a plain directory inside it is not one of its own.
+    let _ ← git f.slot #["update-ref", "refs/orchestra/keep", f.x]
+    let inner := f.slot / "plain"
+    IO.FS.createDirAll inner
+    Repo.clearOrchestraRefs inner
+    git f.slot #["for-each-ref", "--format=%(refname)", "refs/orchestra/"]
+  TestM.assertEqual outer "refs/orchestra/keep"
+    (msg := "a directory that is no repository is left alone, and so is the one around it")
+
+/-! ## Where a checkout may run -/
+
+private def exec (backend : String) (allow : Bool := false) : ExecutionConfig :=
+  { backend, allowCheckoutHooksOnHost := allow }
+
+@[test]
+def aCheckoutIsRefusedWhereHooksRunOnTheHost : Test := do
+  let c : Option CheckoutSpec := some { commit := sha1 }
+  let iso : Option CheckoutSpec := some { commit := sha1, isolate := true }
+  TestM.assert ((exec "landrun").checkoutRefusal? c none).isSome "landrun runs hooks on the host"
+  TestM.assert ((exec "local").checkoutRefusal? c none).isSome "and so does local"
+  TestM.assert ((exec "kubernetes").checkoutRefusal? c none).isNone "a pod does not"
+  TestM.assert ((exec "landrun" (allow := true)).checkoutRefusal? c none).isNone
+    "unless the operator allows it"
+  TestM.assert ((exec "local" (allow := true)).checkoutRefusal? iso none).isSome
+    "isolation is refused on local whatever is allowed"
+  TestM.assert ((exec "kubernetes").checkoutRefusal? c (some "merger")).isSome "nor for the merger"
+  TestM.assert ((exec "kubernetes").checkoutRefusal? c (some "triage")).isSome "nor for triage"
+  TestM.assert ((exec "landrun").checkoutRefusal? none none).isNone "no checkout, no refusal"
+  match (FromJson.fromJson? (Json.mkObj [("backend", .str "landrun"),
+      ("allow_checkout_hooks_on_host", .bool true)]) : Except String ExecutionConfig) with
+  | .error e => TestM.fail e
+  | .ok x => TestM.assert x.allowCheckoutHooksOnHost "the setting is read from config.json"
+
+@[test]
+def anIsolatedTaskGetsItsOwnScratchDirectory : Test := do
+  let paths := (Sandbox.grantsFor {} {} (System.FilePath.mk "/work/t") true #[] #[]
+    "/data/repos/acme/widgets-tasks/t.tmp").map (·.path)
+  TestM.assert (paths.contains "/data/repos/acme/widgets-tasks/t.tmp") "its own scratch directory"
+  TestM.assert (!paths.contains "/tmp") "and not the shared /tmp"
+
 @[test]
 def leftoverOrchestraRefsAreClearedAtStartup : Test := do
   let refs ← withFixture fun f => do
@@ -250,7 +327,6 @@ private def checkoutOf (body : String) : Except String (Option CheckoutSpec) :=
   | .ok j => parseCheckout? j
   | .error e => .error e
 
-private def sha1 : String := "0123456789abcdef0123456789abcdef01234567"
 
 @[test]
 def aCheckoutIsReadStrictly : Test := do
