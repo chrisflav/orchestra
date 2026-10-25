@@ -20,6 +20,7 @@ import Orchestra.Utils.Files
 import Orchestra.ApiClient
 import Orchestra.GitHub
 import Orchestra.Exec.Backend
+import Orchestra.DaemonRequest
 
 open Lean (Json ToJson FromJson)
 open Std.Net
@@ -1650,6 +1651,9 @@ private def deleteSkill (name : String) : IO WriteResult := do
     server answering, which is why neither is a `500`. -/
 private def askDaemon (request : Json) : IO (Except String Json) := do
   let reply : Except String String ← try
+      -- The token first: a server that cannot read it is told so, rather than refused by a
+      -- daemon for a reason it never sees.
+      let request ← DaemonRequest.withToken request
       let conn ← Orchestra.Utils.UnixSocket.Connection.connect (← Queue.socketFile)
       -- The round trip is its own `try` so that the descriptor is closed on the way out of a
       -- failure as well as a success. A daemon that dies mid-request throws here, and a handler
@@ -2180,6 +2184,19 @@ private def sessionHandler (st : ServeState) (req : Request Body.Stream)
     | _              => false
   jsonResp (Json.mkObj [("authenticated", Json.bool isOperator)])
 
+/-- `GET /api/proof?nonce=<hex>`: proof that this server can read the daemon's token, for a CLI
+    deciding whether to send it the password (`Secret.daemonProof`). The nonce is held to 16–128
+    hex digits, so the answer cannot be made to sign anything but a nonce. A server that cannot
+    read the token says so with a `503`, and a CLI that can read it then refuses to go on. -/
+private def proofHandler (q : Query) : Async (Response Body.Any) := do
+  let nonce := (q.get "nonce").getD ""
+  unless 16 ≤ nonce.length && nonce.length ≤ 128 && nonce.all (fun c => c.isDigit ||
+      ('a' ≤ c && c ≤ 'f')) do
+    return ← errorResp "'nonce' must be 16 to 128 lowercase hex digits" .badRequest
+  match ← Secret.lookupDaemonToken with
+  | none => errorResp "this server cannot read the daemon's token" .serviceUnavailable
+  | some t => jsonResp (Json.mkObj [("proof", Json.str (Secret.daemonProof t nonce))])
+
 /-! ## Static single-page-app serving -/
 
 private def contentTypeOf (name : String) : String :=
@@ -2592,12 +2609,15 @@ def apiKinds : Array String :=
       * `/api/session` — a boolean the caller could learn by trying any other endpoint.
       * `/api/openapi.json` — a client has to be able to discover what it is talking to, and how
         to authenticate, before it can authenticate.
+      * `/api/proof` — the CLI asks it *before* sending the password, to learn that what answers
+        is orchestrad and not something squatting on the port (`Secret.daemonProof`). It answers
+        an HMAC of the caller's nonce and nothing else.
 
-    A value rather than the shape of four `if`s, so that the gate below can be one check and so
-    that `OrchestraTest.Dashboard` can assert this list is still exactly those four. Nothing
+    A value rather than the shape of five `if`s, so that the gate below can be one check and so
+    that `OrchestraTest.Dashboard` can assert this list is still exactly those five. Nothing
     under `/api/v1/` is here, and in particular no write is. -/
 def publicPaths : Array String :=
-  #["/api/login", "/api/logout", "/api/session", "/api/openapi.json"]
+  #["/api/login", "/api/logout", "/api/session", "/api/openapi.json", "/api/proof"]
 
 /-- What an API client may reach (`Orchestra.ApiClient`): `none` for anything it may not, and
     otherwise the entry id the route names, if it names one, for the ownership check.
@@ -2659,6 +2679,9 @@ private def route (st : ServeState) (req : Request Body.Stream) : Async (Respons
   if path == "/api/session" then
     unless method == .get do return ← methodNotAllowedResp
     return ← sessionHandler st req
+  if path == "/api/proof" then
+    unless method == .get do return ← methodNotAllowedResp
+    return ← proofHandler query
 
   -- Served without a credential and outside the version prefix: a client has to be able to
   -- discover what it is talking to, and how to authenticate, before it can authenticate.

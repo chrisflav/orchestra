@@ -20,6 +20,7 @@ import OrchestraTest.ProjectFieldsTest
 import OrchestraTest.ProjectMetaTest
 import OrchestraTest.ExamplesTest
 import OrchestraTest.ExecTest
+import OrchestraTest.DaemonAuthTest
 import OrchestraTest.KubernetesTest
 import OrchestraTest.ReattachTest
 import OrchestraTest.KubernetesLiveTest

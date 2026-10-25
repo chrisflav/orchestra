@@ -610,6 +610,40 @@
         }
       }
     },
+    "/api/proof": {
+      "get": {
+        "tags": ["session"],
+        "summary": "Proof that this server can read the daemon's token",
+        "description": "Asked by the CLI before it sends the password: the answer is HMAC-SHA256(token, \"orchestrad-proof:\" + nonce) under the daemon's token (`daemon.token` in the configuration directory), which only a process that can read that directory can compute. A CLI on the daemon's machine refuses to send the password to a server that cannot answer. Reachable without a credential, deliberately: it answers nothing but the HMAC of the caller's nonce.",
+        "security": [],
+        "operationId": "getProof",
+        "parameters": [
+          {
+            "name": "nonce",
+            "in": "query",
+            "required": true,
+            "description": "16 to 128 lowercase hex digits, fresh for each request.",
+            "schema": { "type": "string", "pattern": "^[0-9a-f]{16,128}$" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The proof.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["proof"],
+                  "properties": { "proof": { "type": "string", "description": "Lowercase hex HMAC-SHA256." } }
+                }
+              }
+            }
+          },
+          "400": { "description": "The nonce is missing or malformed." },
+          "503": { "description": "This server cannot read the daemon's token." }
+        }
+      }
+    },
     "/api/login": {
       "post": {
         "tags": ["session"],

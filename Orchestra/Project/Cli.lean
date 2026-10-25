@@ -324,6 +324,7 @@ private def daemonClaim (pid : Taxis.IssueId) (iid : Taxis.IssueId) (taskId : St
     , match series with
       | some s => ("series", Lean.Json.str s)
       | none   => ("series", Lean.Json.null) ]
+  let req ← DaemonRequest.withToken req
   conn.sendLine req.compress
   let line ← conn.recvLine
   conn.close

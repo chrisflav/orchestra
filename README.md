@@ -294,7 +294,7 @@ orchestra separates configuration from state:
 
 | Path | Contents |
 | --- | --- |
-| `$XDG_CONFIG_HOME/orchestra/` (or `~/.config/orchestra/`) | `config.json`, `secrets.json`, `prompts/`, `listeners/`, `roles/`, `skills/`, `identities/`, `clients/` |
+| `$XDG_CONFIG_HOME/orchestra/` (or `~/.config/orchestra/`) | `config.json`, `secrets.json`, `daemon.token`, `prompts/`, `listeners/`, `roles/`, `skills/`, `identities/`, `clients/` |
 | `$XDG_DATA_HOME/orchestra/` (or `~/.local/share/orchestra/`) | `orchestra.db`, clones, logs, per-project role overrides, per-identity memory |
 
 The records — task history, queue entries, concert runs, interactive sessions and their
@@ -790,8 +790,8 @@ to the proxy's port as well. See [docs/kleis.md](docs/kleis.md).
 **Nothing reaches orchestra's own directories.** The data directory (`$XDG_DATA_HOME/orchestra`,
 by default `~/.local/share/orchestra`) holds every clone of every repository, every task's log,
 the queue's control socket and `dashboard.secret`; the configuration directory
-(`$XDG_CONFIG_HOME/orchestra`, by default `~/.config/orchestra`) holds `secrets.json` and the API
-clients. No grant may be one of them, lie inside one, or contain one: the agent backends' home
+(`$XDG_CONFIG_HOME/orchestra`, by default `~/.config/orchestra`) holds `secrets.json`, the API
+clients and the control socket's token. No grant may be one of them, lie inside one, or contain one: the agent backends' home
 grants name precise subpaths (`~/.local/bin`, `~/.local/share/claude`, …) rather than `~/.local`,
 and landrun drops any grant that would reach either directory — from a backend, from
 `additional_sandbox_paths` or anywhere else — with a warning, since a Landlock rule on a directory
@@ -1210,6 +1210,33 @@ orchestra queue retry --series my-series
 Unfinished entries resume the partial agent session they died in; cancelled ones start over. On
 `SIGTERM` the daemon stops accepting work and drains what is in flight, so a `docker compose down`
 does not lose a running task.
+
+### the control socket
+
+The daemon takes its commands — queue a task, start a concert, cancel, shut down, start an
+interactive session, claim an issue — over a Unix socket in `<data>/queue/daemon.sock`. File
+permissions do not protect it from an agent: agents run as the daemon's user, and Landlock does
+not mediate `connect(2)` on a Unix socket. So every request carries a token, which the daemon
+compares in constant time and refuses without. The token is `daemon.token` in the configuration
+directory, mode 0600, written by the daemon on its first start and kept across restarts. The CLI,
+the dashboard (which forwards some API calls to the daemon) and `orchestra project claim` read it
+from there. It is never put in any process's environment, and no agent grant reaches the
+configuration directory, so no agent can learn it. A client running as another user is told it
+cannot read the file.
+
+A task's `config_path` (`orchestra queue add --config`, or a concert's) is privileged: it decides
+which execution backend confines the agent. The daemon only reads one that lies in the
+configuration directory (after resolving symlinks and `..`), and only if it sandboxes agents
+exactly as the daemon's own configuration does: the same `execution` block,
+`additional_sandbox_paths`, `plugin_dirs`, per-backend `extra_ports` and `kleis`. Anything else
+fails the entry, naming the setting. An operator who wants another backend runs another daemon.
+
+**The CLI checks it is talking to orchestrad.** Before it first sends the password to a
+loopback `http://` URL (the default `http://127.0.0.1:8080` included), a CLI that can read
+`daemon.token` sends a fresh nonce to `GET /api/proof` and checks the answer is an HMAC of it under
+the token. Only a process that can read the configuration directory can answer, so something else
+holding the port while the dashboard is down is never sent the password. A CLI on another machine
+has no token to check with and skips this.
 
 ## per-repository configuration
 

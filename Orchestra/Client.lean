@@ -1,6 +1,7 @@
 import Lean.Data.Json
 import Orchestra.Secret
 import Orchestra.Utils.Http
+import Orchestra.Exec.Backend
 
 open Lean (Json)
 
@@ -32,6 +33,13 @@ That last point is what keeps the split from costing the single-host user anythi
 serve` and `orchestra listener list` share a filesystem and therefore share a secret. Pointing
 the CLI at a *remote* orchestra is the case that needs `$ORCHESTRA_API_URL` and
 `$ORCHESTRA_DASHBOARD_PASSWORD` set, and it is a case that did not exist before.
+
+## Who it is talking to
+
+The default URL is a port on loopback, and whatever listens there is sent the password. While the
+dashboard is down that could be anything running as this user. So a CLI on the daemon's machine
+first has the server prove it can read the daemon's token (`verifyServer`, `Secret.daemonProof`)
+and refuses to go on when it cannot.
 -/
 
 namespace Orchestra.Client
@@ -107,6 +115,45 @@ private def errorText (status : Nat) (body : String) : String :=
   | .error _ =>
     if body.trimAscii.isEmpty then s!"HTTP {status}" else s!"HTTP {status}: {body.trimAscii}"
 
+/-- The base URLs this process has already seen prove themselves (`verifyServer`), so the proof
+    costs one round trip per process rather than one per request. -/
+initialize verifiedServersRef : IO.Ref (Array String) ← IO.mkRef #[]
+
+/-- Whether the server at `cfg.baseUrl` may be sent the password: `.ok` when it proved it can read
+    the daemon's token (`Secret.daemonProof`), or when there is nothing to check it against.
+
+    Checked when the URL is plain HTTP on this machine's loopback — the default, and the one place
+    something other than orchestrad could be listening as this user while the dashboard is down —
+    and the CLI can read `daemon.token`, which is to say it runs on the daemon's machine as the
+    daemon's user. A CLI elsewhere has no token to check with and talks to whatever it was pointed
+    at, as before; a server elsewhere is behind TLS and a name the operator chose. -/
+def verifyServer (cfg : Config) : IO (Except String Unit) := do
+  if (← verifiedServersRef.get).contains cfg.baseUrl then return .ok ()
+  if (Exec.loopbackPort? cfg.baseUrl).isNone then return .ok ()
+  let some token ← Secret.lookupDaemonToken | return .ok ()
+  let nonce ← Exec.randomSecret 16
+  let refuse (why : String) : IO (Except String Unit) :=
+    return .error s!"Not sending the orchestra password to {cfg.baseUrl}: {why}\n\
+Whatever answers there could not prove it is orchestrad (it cannot read daemon.token in the \
+configuration directory). If the dashboard is not running, start it with 'orchestrad serve'; if \
+something else holds the port, stop it."
+  let (status, body) ← try
+      Utils.Http.curlWithStatus #[s!"{cfg.baseUrl}/api/proof?nonce={nonce}"] (maxTime := 10)
+    catch e =>
+      -- Nothing listening: the request proper would fail the same way, and says so better.
+      return .error s!"Could not reach the orchestra API at {cfg.baseUrl}: {e}\n\
+Is the backend running? Start it with 'orchestrad serve', or point the CLI elsewhere with \
+--api-url / ${urlEnvVar}."
+  unless status == 200 do return ← refuse s!"it answered the proof request with HTTP {status}."
+  let proof := (Json.parse body).toOption.bind (·.getObjValAs? String "proof" |>.toOption)
+  match proof with
+  | some p =>
+    if Secret.constantTimeEq p (Secret.daemonProof token nonce) then
+      verifiedServersRef.modify (·.push cfg.baseUrl)
+      return .ok ()
+    else refuse "its proof is wrong."
+  | none => refuse "its answer to the proof request carries no proof."
+
 /-- One request. `body` is sent as `application/json`, which is what the server requires of a
     write (see the CSRF discussion in `Orchestra.Dashboard`).
 
@@ -114,6 +161,7 @@ private def errorText (status : Nat) (body : String) : String :=
     are the successful answer to a `DELETE`, not a malformed one to anything. -/
 def request (cfg : Config) (method : String) (path : String) (body : Option String := none)
     (maxTime : Nat := 30) : IO (Except String Json) := do
+  if let .error e ← verifyServer cfg then return .error e
   let url := cfg.baseUrl ++ path
   let mut args := #["-X", method]
   if let some b := body then
@@ -189,7 +237,8 @@ The one thing this client does that is not a request and a reply. -/
     The caller reads frames off the returned stream and closes it when it is done. Detaching is
     not ending: closing this leaves the session up on the daemon, which is what lets a person
     close a laptop and pick the conversation up from somewhere else. -/
-def openTranscript (cfg : Config) (id : String) (after : Nat) : IO Utils.Http.Stream :=
+def openTranscript (cfg : Config) (id : String) (after : Nat) : IO Utils.Http.Stream := do
+  if let .error e ← verifyServer cfg then throw (.userError e)
   Utils.Http.openStream
     s!"{cfg.baseUrl}/sse/v1/interactive/{encodeSegment id}/events?after={after}" cfg.token
 

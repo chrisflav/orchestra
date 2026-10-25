@@ -1464,6 +1464,70 @@ def loadAppConfig (path : Option System.FilePath := none) : IO AppConfig := do
   let secrets ← loadSecrets
   loadJsonFileWithSecrets AppConfig configPath secrets
 
+/-- What in an application config decides how far an agent reaches, rendered for comparison:
+    the execution backend and its options, `additional_sandbox_paths`, `plugin_dirs` (granted on
+    orchestra's own authority), each agent backend's `extra_ports`, and the kleis proxy that stands
+    between the agents and GitHub. Two configs that agree on these sandbox agents identically. -/
+def AppConfig.securityFingerprint (c : AppConfig) : List (String × String) :=
+  [ ("execution",                s!"{c.execution.backend} {c.execution.options.compress}")
+  , ("additional_sandbox_paths", reprStr c.additionalSandboxPaths)
+  , ("plugin_dirs",              reprStr c.pluginDirs)
+  , ("agents[].extra_ports",     reprStr (c.agentAuthConfigs.map fun a => (a.name, a.extraPorts)))
+  , ("kleis",                    reprStr c.kleis) ]
+
+/-- The settings in which `entry` differs from `daemon`'s security settings
+    (`AppConfig.securityFingerprint`), by name; empty when it may run under the daemon. -/
+def AppConfig.securityDifferences (entry daemon : AppConfig) : List String :=
+  (entry.securityFingerprint.zip daemon.securityFingerprint).filterMap fun ((k, a), (_, b)) =>
+    if a == b then none else some k
+
+/-- Whether `path` is `dir` or lies below it, both already resolved (`IO.FS.realPath`), by whole
+    components. -/
+def pathInside (path dir : System.FilePath) : Bool :=
+  let p := path.toString
+  let d := (dir.toString.dropEndWhile (· == '/')).toString
+  p == d || d.isEmpty || p.startsWith (d ++ "/")
+
+/-- Load the configuration a queue entry, a concert or `add_task` names in its `config_path`, on
+    the daemon's behalf, or throw saying why it may not be used.
+
+    A `config_path` is privileged. It is read by the daemon, as the daemon, and decides everything
+    the run is: which execution backend confines the agent — `local` confines nothing —, which
+    paths and ports it is granted, which plugins ride in on orchestra's authority, and whether its
+    GitHub traffic goes through kleis. Whoever chooses the file chooses all of that, so two rules
+    hold:
+
+    * **It lies in the configuration directory.** That directory is orchestra's own; no agent can
+      write there (`Landrun.withoutGuarded`), so a config in it is one the operator wrote. Compared
+      after resolving symlinks and `..`, so neither a link planted in `/tmp` nor
+      `<config>/../../tmp/x` passes for one.
+    * **It sandboxes agents exactly as the daemon's own does** (`AppConfig.securityDifferences`).
+      An entry may name another file for its auth sources, its model defaults, its taxis — not
+      for a weaker sandbox. An operator who wants a different execution backend runs a daemon on
+      it.
+
+    Before this, any process that could reach the daemon's control socket — an agent among them,
+    since Landlock does not mediate `connect(2)` on a Unix socket — could queue a task with a
+    `config_path` in `/tmp` naming `"execution": {"backend": "local"}` and have its next task run
+    unconfined. -/
+def loadEntryConfig (daemon : AppConfig) (configPath : String) : IO AppConfig := do
+  let dir ← Dirs.configBase
+  let dirReal ← try IO.FS.realPath dir catch _ =>
+    throw (.userError s!"config_path {configPath}: the configuration directory {dir} cannot be \
+resolved, so nothing can be shown to lie inside it")
+  let path ← expandHome configPath
+  let real ← try IO.FS.realPath path catch e =>
+    throw (.userError s!"config_path {configPath}: {e}")
+  unless pathInside real dirReal do
+    throw (.userError s!"config_path {configPath} is outside orchestra's configuration directory \
+({dirReal}); a per-entry config must be one the operator put there")
+  let cfg ← loadAppConfig (some real)
+  match cfg.securityDifferences daemon with
+  | [] => return cfg
+  | ds => throw (.userError s!"config_path {configPath} changes how agents are sandboxed \
+({String.intercalate ", " ds}) compared with the daemon's own configuration; a per-entry config \
+may not")
+
 def loadTaskFile (path : System.FilePath) : IO TaskFile :=
   loadJsonFile TaskFile path
 
