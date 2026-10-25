@@ -41,17 +41,27 @@ instance : FromJson RepoConfig where
       e.getObjValAs? String "image" |>.toOption
     return { validation, image }
 
-/-- Return the per-repo config directory, preferring `.orchestra/` and falling back to `.agent/`. -/
-private def orchestraDir (repoPath : System.FilePath) : IO System.FilePath := do
-  let newDir := repoPath / ".orchestra"
+/-- Return the per-repo config directory, preferring `.orchestra/` and falling back to `.agent/`.
+
+    Read from `configRoot` when one is given rather than from the checkout: for a task checked out
+    at a commit somebody named (`Config.CheckoutSpec`), the `.orchestra/` that commit carries is
+    exactly as trustworthy as whoever wrote the commit, and its scripts run outside the agent's
+    sandbox. Such a task's configuration and hooks come from the upstream's default branch instead,
+    copied by the daemon into a directory of its own (`Repo.prepareCheckout`). -/
+private def orchestraDir (repoPath : System.FilePath) (configRoot : Option System.FilePath := none) :
+    IO System.FilePath := do
+  let root := configRoot.getD repoPath
+  let newDir := root / ".orchestra"
   if ← newDir.pathExists then return newDir
-  let oldDir := repoPath / ".agent"
+  let oldDir := root / ".agent"
   if ← oldDir.pathExists then return oldDir
   return newDir
 
-/-- Load `.orchestra/config.json` (or `.agent/config.json`) from the repository. Returns defaults if absent or unparseable. -/
-def loadRepoConfig (repoPath : System.FilePath) : IO RepoConfig := do
-  let configPath := (← orchestraDir repoPath) / "config.json"
+/-- Load `.orchestra/config.json` (or `.agent/config.json`) from the repository, or from
+    `configRoot` (see `orchestraDir`). Returns defaults if absent or unparseable. -/
+def loadRepoConfig (repoPath : System.FilePath) (configRoot : Option System.FilePath := none) :
+    IO RepoConfig := do
+  let configPath := (← orchestraDir repoPath configRoot) / "config.json"
   if !(← configPath.pathExists) then return {}
   let contents ← IO.FS.readFile configPath
   match Json.parse contents with
@@ -80,8 +90,8 @@ Run `.orchestra/<name>` (or `.agent/<name>`) as a bash script with the repositor
 directory. Does nothing if the script does not exist. Throws if the script exits non-zero.
 -/
 def runHook (session : Exec.Session) (repoPath : System.FilePath) (name : String)
-    (runId : Option String := none) : IO Unit := do
-  let hookPath := (← orchestraDir repoPath) / name
+    (runId : Option String := none) (configRoot : Option System.FilePath := none) : IO Unit := do
+  let hookPath := (← orchestraDir repoPath configRoot) / name
   if !(← hookPath.pathExists) then return
   let result ← session.runScript {
     path := hookPath.toString, workdir := repoPath, stdio := .inherit, runId }
@@ -100,17 +110,18 @@ hook every task, marker or no marker. A repository's `init.sh` should be idempot
 that install a toolchain or warm a cache already are: they check before they fetch.
 -/
 def runInitIfNeeded (session : Exec.Session) (repoPath : System.FilePath)
-    (runId : Option String := none) : IO Unit := do
-  let dir ← orchestraDir repoPath
+    (runId : Option String := none) (configRoot : Option System.FilePath := none) : IO Unit := do
+  let dir ← orchestraDir repoPath configRoot
   if !(← dir.pathExists) then return
   let markerPath := dir / ".initialized"
   if (← markerPath.pathExists) && !session.freshEnvironment then return
-  runHook session repoPath "init.sh" runId
+  runHook session repoPath "init.sh" runId configRoot
   IO.FS.writeFile markerPath ""
 
 /-- Returns `true` if `validation.sh` exists in the repo's `.orchestra/` or `.agent/` directory. -/
-def hasValidationScript (repoPath : System.FilePath) : IO Bool := do
-  return (← (← orchestraDir repoPath) / "validation.sh" |>.pathExists)
+def hasValidationScript (repoPath : System.FilePath) (configRoot : Option System.FilePath := none) :
+    IO Bool := do
+  return (← (← orchestraDir repoPath configRoot) / "validation.sh" |>.pathExists)
 
 /--
 Run `.orchestra/validation.sh` (or `.agent/validation.sh`).
@@ -119,9 +130,10 @@ Returns `(false, output)` if the script exits non-zero, where `output` is the
 combined stdout and stderr of the script. Does not throw.
 -/
 def runValidation (session : Exec.Session) (repoPath : System.FilePath)
-    (runId : Option String := none) : IO (Bool × String) := do
-  if !(← hasValidationScript repoPath) then return (true, "")
-  let hookPath := (← orchestraDir repoPath) / "validation.sh"
+    (runId : Option String := none) (configRoot : Option System.FilePath := none) :
+    IO (Bool × String) := do
+  if !(← hasValidationScript repoPath configRoot) then return (true, "")
+  let hookPath := (← orchestraDir repoPath configRoot) / "validation.sh"
   let result ← session.runScript {
     path := hookPath.toString, workdir := repoPath, stdio := .piped, runId }
   return (result.exitCode == 0, result.output)

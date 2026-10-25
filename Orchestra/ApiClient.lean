@@ -307,7 +307,7 @@ def parseRequest (j : Json) : Except String QueueRequest := do
   let executionImage ← parseExecutionImage? j
   -- Checked for its shape here — a full commit name, a `fetch_ref` under `refs/pull/` or
   -- `refs/heads/` — and for being the upstream's when the checkout is made: a client can only
-  -- ever name code the upstream has published (`Repo.applyCheckout`).
+  -- ever name code the upstream has published (`Repo.prepareCheckout`).
   let checkout ← parseCheckout? j
   if checkout.isSome && repo.isNone then
     .error "'checkout' names a commit of the 'upstream', and the request names none"

@@ -580,7 +580,7 @@ def parseExecutionImage? (j : Json) (what : String := "execution_image")
   | .ok _ => .error s!"{what} must be a string naming an image, such as \
 \"ghcr.io/acme/reviewer:1.4\""
 
-/-! ## The commit a task's workspace is checked out at (`Repo.applyCheckout`) -/
+/-! ## The commit a task's workspace is checked out at (`Repo.prepareCheckout`) -/
 
 /-- Where a task's checkout should stand, when the default branch is the wrong place: a review of a
     pull request's head, a task that is scored against a past commit and must not see what came
@@ -822,7 +822,7 @@ structure IOTask (i o : ResultType) where
       `images` (`Orchestra.Spawn`). -/
   executionImage : Option String := none
   /-- The commit the task's workspace is checked out at, instead of the default branch
-      (`CheckoutSpec`, `Repo.applyCheckout`). Set by a task file, a queue entry, `queue_task` and
+      (`CheckoutSpec`, `Repo.prepareCheckout`). Set by a task file, a queue entry, `queue_task` and
       an API client's request; meaningless, and refused, for a task with no repository. -/
   checkout : Option CheckoutSpec := none
 deriving Repr, Inhabited

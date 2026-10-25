@@ -511,7 +511,11 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   let slotsHoldTrees := !Exec.keepsWorkspaces appConfig.execution
   if !slotsHoldTrees then
     IO.println "Execution backend keeps task workspaces itself; clone slots only count tasks."
-    Repo.sweepTaskDirs
+  -- Per-task checkouts a dead task left: on every backend, since a task checked out at a commit
+  -- gets one wherever it runs. And whatever their age, the temporary refs a checkout made while it
+  -- was being prepared (`Repo.clearCrashLeftovers`).
+  Repo.sweepTaskDirs
+  Repo.clearCrashLeftovers
   -- Shared concurrency primitives
   let shutdownToken  ← Std.CancellationToken.new
   -- Every task running right now and the token that stops it (one row per worker), which is

@@ -99,7 +99,7 @@ structure SpawnRequest where
   executionImage : Option String := none
   /-- The commit the queued task is checked out at (`Config.CheckoutSpec`). Not bounded by the
       policy and never inherited: it can only name a commit of the queued task's own upstream —
-      `Repo.applyCheckout` refuses anything the upstream's refs do not reach — and so can only
+      `Repo.prepareCheckout` refuses anything the upstream's refs do not reach — and so can only
       narrow which of the repository's published code the task sees, never widen what it may do.
       Not inherited because it describes one piece of work: a planner reviewing one commit that
       queues an implementor wants the implementor on the default branch. -/

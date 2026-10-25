@@ -198,7 +198,7 @@ by task {e.taskId}"
       -- The spawning task's image, or one the policy's `images` lists.
       , executionImage := resolved.executionImage
       -- What the agent asked for, already checked to name a commit (`parseCheckout?`); that it is
-      -- one of the upstream's is checked when the task's checkout is made (`Repo.applyCheckout`).
+      -- one of the upstream's is checked when the task's checkout is made (`Repo.prepareCheckout`).
       , checkout := resolved.checkout }
     -- A claim taken for an entry that then failed to be written is held by an id no entry has,
     -- and nothing downstream would ever release it: the daemon releases on behalf of the entry
@@ -822,7 +822,12 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   if ioTask.checkout.isSome && ioTask.repo.isNone then
     throw (.userError "the task asks for a checkout but works on no repository")
   let checkout := ioTask.checkout
-  let preparedPath ← if let some r := reattach then do
+  -- Where a checkout task's configuration and hooks are read from: the upstream default branch's
+  -- `.orchestra/`, copied by the daemon (`Repo.prepareCheckout`), never the named commit's.
+  let configRoot : Option System.FilePath ← match checkout, ioTask.repo with
+    | some _, some repo => some <$> Repo.checkoutConfigPath repo.fork taskId
+    | _, _ => pure none
+  let repoPath ← if let some r := reattach then do
       -- The checkout the task was opened on is still on this machine (a task keeps its per-task
       -- checkout until it ends, and the startup sweep leaves a day's worth alone); it is what the
       -- repository's configuration and scripts are read from. Gone is a task that cannot be
@@ -833,18 +838,23 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
       pure p
     else match ioTask.repo with
     | some repo =>
-      if taskCheckout then
-        Repo.ensureTaskCheckout repo.fork repo.upstream taskId (token := some token) checkout
+      -- A task that names a commit is never prepared in a slot, nor in the cache clone outside the
+      -- queue: a tree of its own, built from a repository only the daemon touches
+      -- (`Repo.prepareCheckout` says why). The same for every backend and for `orchestra run`.
+      if let some c := checkout then do
+        let (tree, _) ← Repo.prepareCheckout repo.fork repo.upstream taskId c (token := some token)
+        pure tree
+      else if taskCheckout then
+        Repo.ensureTaskCheckout repo.fork repo.upstream taskId (token := some token)
       else match slotOverride with
         | some assign => do
           IO.println s!"Preparing slot {assign.slot} for {repo.fork}..."
-          let p ← Repo.ensureSlot repo.fork repo.upstream assign (token := some token) checkout
+          let p ← Repo.ensureSlot repo.fork repo.upstream assign (token := some token)
           IO.println s!"  Slot at {p}"
           pure p
         | none => do
           IO.println s!"Cloning/updating {repo.fork}..."
           let p ← Repo.ensureCloned repo.fork repo.upstream interactive (token := some token)
-          if let some c := checkout then Repo.applyCheckout p c (token := some token)
           IO.println s!"  Repo at {p}"
           pure p
     | none =>
@@ -865,26 +875,17 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
           let p ← Repo.ensureAdhocWorkspace (occupant := some taskId) (resumeFrom := continuesFrom)
           IO.println s!"  Workspace at {p}"
           pure p
-  -- An isolated checkout is made from the prepared one, already at the commit, into a repository
-  -- of its own that holds nothing past it (`Repo.isolateCheckout`, which says why the slot itself
-  -- cannot be that). The task runs there, and the slot it came from is left for the next reset.
-  -- Not for a picked-up task: the path it recorded is already the isolated one.
-  let isolated := reattach.isNone && (checkout.map (·.isolate)).getD false
-  let repoPath ← match isolated, ioTask.repo, checkout with
-    | true, some repo, some c =>
-      let dest ← Repo.isolatedCheckoutPath repo.fork taskId
-      (try Repo.isolateCheckout preparedPath dest c.commit
-       catch e => do
-         Repo.removeTaskDir dest
-         if taskCheckout then Repo.removeTaskDir preparedPath
-         throw e)
-      pure dest
-    | _, _, _ => pure preparedPath
-  -- A per-task checkout is this task's alone, and goes when the task does — however it ends. An
-  -- isolated one likewise, and the per-task checkout it was made from with it.
+  -- No build output carried in or out of an isolated checkout (`seedDir` below): what a seed holds
+  -- was built from later commits, and what this task built from its commit is no one else's.
+  let isolated := (checkout.map (·.isolate)).getD false
+  -- A per-task checkout is this task's alone, and goes when the task does — however it ends, and
+  -- for a picked-up task too. A checkout task's tree, source and configuration copy likewise. A
+  -- continuation of a checkout task gets a fresh tree at the same commit: the conversation is
+  -- resumed, the tree is not (`README.md`, "checking out a commit").
   let removeTaskCheckout : IO Unit := do
-    if taskCheckout then Repo.removeTaskDir preparedPath
-    if isolated then Repo.removeTaskDir repoPath
+    match checkout, ioTask.repo with
+    | some _, some repo => Repo.removeCheckoutDirs repo.fork taskId
+    | _, _ => if taskCheckout then Repo.removeTaskDir repoPath
   -- 3. Open the environment this task runs in.
   --
   -- One session for the whole task, not one per agent launch, because a task is not one command:
@@ -934,10 +935,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Read before the environment is opened, because one of the things it says is which environment
   -- to open: what a task needs installed is a property of the repository, and the repository is
   -- where that is written down.
-  let repoConfig ← RepoConfig.loadRepoConfig repoPath
+  let repoConfig ← RepoConfig.loadRepoConfig repoPath configRoot
   -- Where build output carried between task chains lives for this repository, on a backend that
   -- keeps workspaces. See `Exec.SessionSpec.seedDir`.
-  let seedDir ← if persistent then ioTask.repo.mapM (Repo.seedPath ·.fork) else pure none
+  let seedDir ← if persistent && !isolated then ioTask.repo.mapM (Repo.seedPath ·.fork)
+    else pure none
   -- Resolve allowed tools: prefer explicit `tools` list, fall back to `mode` for backwards compat.
   -- Here rather than beside the MCP server that serves them, because they are part of what the
   -- task's kleis token says, and that token is derived before the session is opened (below).
@@ -1016,6 +1018,11 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
     grants  := Sandbox.grantsFor (agentDefOfBackend ioTask.backend).sandboxPaths
                  appConfig.additionalSandboxPaths repoPath ioTask.readOnly pluginDirs memoryDirs
                  ++ (kleisBundle.map Kleis.bundleGrant).toArray
+                 -- A checkout task's hooks are read from the daemon's copy of the default branch's
+                 -- `.orchestra/`, which a backend that runs them elsewhere has to carry there.
+                 ++ (configRoot.map fun p =>
+                      ({ path := p.toString, access := .rox, from_ := .orchestra }
+                        : Exec.PathGrant)).toArray
     label   := taskId
     -- The upstream, not the fork: what a repository runs in is a property of the project, and an
     -- operator writing `execution.options.images` writes down the name the project is known by.
@@ -1205,6 +1212,7 @@ handed to the next daemon"
     if reattach.all (·.state.phase == .init) then
       recordStep .init 0
       RepoConfig.runInitIfNeeded session repoPath (runId := some (stepRunId "init"))
+        (configRoot := configRoot)
     -- 6. Validation loop: before.sh → agent → validation.sh, retry on failure
     let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
     -- Ordered: what the operator wrote, then who the agent is, then the directories it may write
@@ -1237,8 +1245,8 @@ handed to the next daemon"
     let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
     -- A task picked up at a retry needs the validation output that retry's prompt quotes. It is in
     -- the pod, in the run of the attempt before (`validate-<k>`), which this replays.
-    if firstAttempt > 0 && (← RepoConfig.hasValidationScript repoPath) then
-      let (_, out) ← RepoConfig.runValidation session repoPath
+    if firstAttempt > 0 && (← RepoConfig.hasValidationScript repoPath configRoot) then
+      let (_, out) ← RepoConfig.runValidation session repoPath (configRoot := configRoot)
         (runId := some (stepRunId "validate" (some (firstAttempt - 1))))
       lastValidationOutput := out
     let mut lastAttempt := firstAttempt
@@ -1248,7 +1256,8 @@ handed to the next daemon"
       if attempt < firstAttempt then continue
       lastAttempt := attempt
       recordStep .attempt attempt
-      RepoConfig.runHook session repoPath "before.sh" (runId := some (stepRunId "before" (some attempt)))
+      RepoConfig.runHook session repoPath "before.sh"
+        (runId := some (stepRunId "before" (some attempt))) (configRoot := configRoot)
       let prompt :=
         if attempt == 0 then baseTaskPrompt
         else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
@@ -1304,11 +1313,12 @@ handed to the next daemon"
           Usage.markLimited backendName label ioTask.model "agent reported a usage limit"
             (resetHint := result.rateLimitReset)
         break
-      if !(← RepoConfig.hasValidationScript repoPath) then
+      if !(← RepoConfig.hasValidationScript repoPath configRoot) then
         IO.println "  No validation script found, skipping validation."
         break
       IO.println "  Running validation script..."
-      let (valid, validationOutput) ← RepoConfig.runValidation session repoPath
+      let (valid, validationOutput) ←
+        RepoConfig.runValidation session repoPath (configRoot := configRoot)
         (runId := some (stepRunId "validate" (some attempt)))
       lastValidationOutput := validationOutput
       if !validationOutput.isEmpty then
@@ -1323,6 +1333,7 @@ handed to the next daemon"
     -- 7. Run after hook and shut down MCP server
     recordStep .after lastAttempt
     RepoConfig.runHook session repoPath "after.sh" (runId := some (stepRunId "after"))
+      (configRoot := configRoot)
     -- Here as well as in the `finally`, so the agent's tool endpoint is gone before the task's
     -- bookkeeping runs rather than merely by the time the task is over. `shutdownOnce` is what
     -- makes saying it twice safe.

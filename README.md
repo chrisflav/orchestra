@@ -741,21 +741,43 @@ it. `checkout` says where the workspace should stand:
 - `fetch_ref` — `refs/pull/<n>/head`, `refs/pull/<n>/merge` or `refs/heads/<branch>` on the
   upstream: fetched, and the commit must be it or an ancestor of it. Without one, the upstream's
   branches are fetched and the commit must be reachable from one of them. Either way a commit is
-  only ever checked out if the task's own upstream has published it; it is never fetched by its
-  name alone, since git cannot tell a commit the server sent from one already in the shared object
-  store.
-- `isolate` — run the task in a repository of its own holding only the commit and its history:
-  no branches, no tags, no remote-tracking refs, no reflog, and none of the objects that came
-  after it, so `git log --all` and `git cat-file --batch-all-objects` reach nothing past it. The
-  commit's parents are still there: a task that sees a commit sees how it was reached. An isolated
-  checkout has no remotes, so it suits read-only work; it is made fresh for each task, from the
-  slot, and removed when the task ends.
+  only ever checked out if the task's own upstream has published it. Prefer `refs/pull/<n>/head`:
+  GitHub stops updating `merge` once a pull request is closed or conflicts, and drops it.
+- `isolate` — run the task in a repository holding only the commit and its history: no branches,
+  no tags, no remote-tracking refs, no remotes, no reflog, and none of the objects that came after
+  it, so `git log --all` and `git cat-file --batch-all-objects` reach nothing past it. The commit's
+  parents are still there: a task that sees a commit sees how it was reached. With no remotes, a
+  `gh` call in it has to say `--repo owner/name`, and nothing can be pushed from it, so it suits
+  read-only work. No build output is carried into it or out of it on a backend that keeps
+  workspaces.
 
-The checkout is made with the daemon's own token, in the slot (or the per-task checkout of a
-backend that keeps workspaces), and the slot's next reset puts the default branch back. A task
-file, a queue entry, `queue_task` and an API client's request may carry one; a retry, a restart
-resume and the continuations built from a task record carry it on. A continuation that is handed
-its predecessor's tree back keeps that tree, and with it the commit.
+**How it is made.** Never in a pooled slot. For each such task the daemon fetches the upstream's
+branches and the `fetch_ref`, by the upstream's URL and with its own token, into a repository only
+it touches, with replacement objects, grafts, hooks and every configuration file but that
+repository's own switched off. It checks the commit there, against the refs that fetch just wrote,
+and builds the task's tree from it: an ordinary repository on a detached `HEAD` at the commit, or
+the isolated one. A slot an earlier agent wrote into — a planted ref, a `refs/replace/`, a hook —
+plays no part. The cost is a fresh fetch of the upstream's history for every such task, which for a
+large repository is a large pack, and a tree that starts without the build output a slot keeps.
+
+**Its configuration is the default branch's.** The commit's own `.orchestra/` is part of what the
+task looks at, and nothing more: `config.json` (`execution.image` among it), `init.sh`, `before.sh`,
+`validation.sh` and `after.sh` are taken from the upstream's default branch, copied by the daemon
+into a directory of its own before the commit is checked out, and run from there.
+
+**What isolation is not.** It holds within git only. The agent still has the network, the token
+the task was given, and the memories it is granted; a determined task can fetch what came after
+the commit from GitHub itself. For a scored task, withhold those as well — a read-only token, a
+kleis narrowing, `memory: "none"`.
+
+A task file, a queue entry, `queue_task` and an API client's request may carry a checkout; a retry,
+a restart resume and the continuations built from a task record carry it on. A continuation gets a
+fresh tree at the same commit: the conversation is resumed, the tree is not, so a writable task
+checked out at a commit loses its uncommitted edits across a continuation. `orchestra run` outside
+the queue builds the same per-task tree and never touches the cache clone. The tree, the source and
+the configuration copy are removed when the task ends, by a daemon that picked the task up too;
+a crash's leftovers go with the startup sweep, and any temporary `refs/orchestra/*` with them,
+whatever their age.
 
 ## repository-independent tasks
 

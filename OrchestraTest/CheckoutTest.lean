@@ -8,9 +8,10 @@ open Orchestra
 # A task's checkout at a given commit
 
 A task may ask for its workspace at a commit rather than on the default branch (`CheckoutSpec`):
-a review of a pull request's head, a task scored against a past commit. The daemon fetches and
-checks it out before the sandbox exists (`Repo.applyCheckout`), and with `isolate` makes a
-repository of its own holding nothing past the commit (`Repo.isolateCheckout`).
+a review of a pull request's head, a task scored against a past commit. The daemon builds it in a
+repository only it touches, fetched from the upstream for this task (`Repo.prepareCheckout`), and
+reads the task's configuration and hooks from the upstream default branch's `.orchestra/`, never
+from the named commit's.
 
 The git half runs against a bare repository on this disk standing in for the upstream, so none of
 it needs the network. The rest is the field's validation where it is read, and the entry carrying
@@ -37,68 +38,109 @@ private def gitOk (cwd : System.FilePath) (args : Array String) : IO Bool := do
   try let _ ← git cwd args; pure true catch _ => pure false
 
 private def commitFile (repo : System.FilePath) (name content : String) : IO String := do
+  if let some parent := (repo / name).parent then IO.FS.createDirAll parent
   IO.FS.writeFile (repo / name) content
   let _ ← git repo #["add", name]
   let _ ← git repo #["commit", "--quiet", "-m", name]
   git repo #["rev-parse", "HEAD"]
 
-/-- An upstream with history `c1 — c2 — c4` on `main` and a pull request `c2 — c3` under
-    `refs/pull/7/head`, and a clone of it with the upstream added as `upstream`, the way a slot has
-    it. `c4` is what came after: the merged result a scored task must not see. -/
+/-- An upstream (`bare`) with history `c1 — c2 — c4` on `main` and a pull request `c2 — c3` under
+    `refs/pull/7/head`. `c1` carries the repository's own `.orchestra/`; `c3` rewrites it — a hook
+    that would run outside the sandbox, and an image to run in. `c4` is what came after: the merged
+    result a scored task must not see. `slot` is a clone of it, standing in for the pooled slot an
+    agent may have written into, with a commit `x` only it has. -/
 private structure Fixture where
-  clone : System.FilePath
-  dir   : System.FilePath
+  bare : System.FilePath
+  slot : System.FilePath
+  dir  : System.FilePath
   c1 : String
   c2 : String
   c3 : String
   c4 : String
+  x  : String
+  /-- `c2` and every commit before it, newest first: all an isolated checkout of `c2` may hold. -/
+  c2History : List String
 
-private def withFixture (act : Fixture → IO α) : IO α := do
-  let tmp ← IO.Process.output { cmd := "mktemp", args := #["-d"] }
-  let dir := System.FilePath.mk tmp.stdout.trimAscii.toString
-  try
+private def goodConfig : String := "{\"execution\": {\"image\": \"ghcr.io/acme/good:1\"}}"
+private def evilConfig : String := "{\"execution\": {\"image\": \"evil.example/pwn:1\"}}"
+
+private def fork : Repository := { owner := "acme", name := "widgets" }
+
+private def withFixture (act : Fixture → IO α) : IO α :=
+  Orchestra.withTempData "checkout-git" do
+    let dir ← Dirs.dataBase
     let bare := dir / "upstream.git"
     let work := dir / "work"
-    let clone := dir / "clone"
+    let slot := dir / "slot"
     IO.FS.createDirAll work
-    let _ ← git dir #["init", "--quiet", "--bare", bare.toString]
+    let _ ← git dir #["init", "--quiet", "--bare", "-b", "main", bare.toString]
     let _ ← git dir #["init", "--quiet", "-b", "main", work.toString]
-    let c1 ← commitFile work "a.txt" "one"
+    let _ ← commitFile work ".orchestra/config.json" goodConfig
+    let c1 ← commitFile work ".orchestra/init.sh" "echo good\n"
     let c2 ← commitFile work "b.txt" "two"
     let _ ← git work #["push", "--quiet", bare.toString, "main:refs/heads/main"]
     let _ ← git work #["checkout", "--quiet", "-b", "pr"]
+    let _ ← commitFile work ".orchestra/config.json" evilConfig
+    let _ ← commitFile work ".orchestra/init.sh" "echo pwned\n"
     let c3 ← commitFile work "pr.txt" "the change under review"
     let _ ← git work #["push", "--quiet", bare.toString, "pr:refs/pull/7/head"]
     let _ ← git work #["checkout", "--quiet", "main"]
     let c4 ← commitFile work "merged.txt" "the answer"
     let _ ← git work #["push", "--quiet", bare.toString, "main:refs/heads/main"]
-    let _ ← git dir #["clone", "--quiet", bare.toString, clone.toString]
-    let _ ← git clone #["remote", "add", "upstream", bare.toString]
-    act { clone, dir, c1, c2, c3, c4 }
-  finally
-    IO.FS.removeDirAll dir
+    let _ ← git dir #["clone", "--quiet", bare.toString, slot.toString]
+    let x ← commitFile slot "fork-only.txt" "only the slot has this"
+    let c2History := (← git work #["rev-list", c2]).splitOn "\n"
+    act { bare, slot, dir, c1, c2, c3, c4, x, c2History }
 
 private def detached (repo : System.FilePath) : IO Bool := do
   return !(← gitOk repo #["symbolic-ref", "-q", "HEAD"])
+
+private def prepare (f : Fixture) (spec : CheckoutSpec) (taskId := "t-1") :
+    IO (System.FilePath × System.FilePath) :=
+  Repo.prepareCheckout fork fork taskId spec (url := some f.bare.toString)
+
+private def refusal (f : Fixture) (spec : CheckoutSpec) : IO (Option String) := do
+  try let _ ← prepare f spec; pure none catch e => pure (some s!"{e}")
 
 /-! ## Checking out a commit -/
 
 @[test]
 def aPullRequestsHeadIsCheckedOutDetached : Test := do
-  let (head, isDetached, file) ← withFixture fun f => do
-    Repo.applyCheckout f.clone { commit := f.c3, fetchRef := some "refs/pull/7/head" }
-    return (← git f.clone #["rev-parse", "HEAD"], ← detached f.clone,
-            ← (f.clone / "pr.txt").pathExists)
-  TestM.assert isDetached "HEAD is detached, not a branch"
+  let r ← withFixture fun f => do
+    let (tree, _) ← prepare f { commit := f.c3, fetchRef := some "refs/pull/7/head" }
+    return (← git tree #["rev-parse", "HEAD"], f.c3, ← detached tree,
+            ← (tree / "pr.txt").pathExists, ← gitOk tree #["rev-parse", "refs/remotes/upstream/main"],
+            ← git tree #["for-each-ref", "--format=%(refname)", "refs/orchestra/"],
+            ← (← Repo.checkoutSourcePath fork "t-1").pathExists)
+  let (head, c3, isDetached, file, upstreamMain, orchestraRefs, sourceLeft) := r
+  TestM.assertEqual head c3 (msg := "HEAD is the pull request's head")
+  TestM.assert isDetached "on a detached HEAD"
   TestM.assert file "the pull request's change is in the tree"
-  TestM.assert (head.length == 40) s!"HEAD is a commit: {head}"
+  TestM.assert upstreamMain "the upstream's branches are there to compare against"
+  TestM.assertEqual orchestraRefs "" (msg := "no temporary ref is left in the tree")
+  TestM.assert (!sourceLeft) "the daemon's source repository is gone once the tree is built"
+
+/-- The commit's own `.orchestra/` is what the task reviews, not what it runs: the hooks and the
+    image come from the upstream's default branch, copied where only the daemon reads them. -/
+@[test]
+def aCommitsOwnOrchestraDirectoryIsIgnored : Test := do
+  let r ← withFixture fun f => do
+    let (tree, config) ← prepare f { commit := f.c3, fetchRef := some "refs/pull/7/head" }
+    let used ← RepoConfig.loadRepoConfig tree (configRoot := some config)
+    let theCommits ← RepoConfig.loadRepoConfig tree
+    return (← IO.FS.readFile (config / ".orchestra" / "init.sh"), used.image, theCommits.image)
+  let (initSh, used, theCommits) := r
+  TestM.assertEqual initSh "echo good\n" (msg := "init.sh is the default branch's")
+  TestM.assertEqual used (some "ghcr.io/acme/good:1") (msg := "and so is execution.image")
+  TestM.assertEqual theCommits (some "evil.example/pwn:1")
+    (msg := "while the tree itself is the commit, as the review needs")
 
 @[test]
 def aCommitOnABranchNeedsNoFetchRef : Test := do
-  let (ok, head, c1, merged) ← withFixture fun f => do
-    Repo.applyCheckout f.clone { commit := f.c1 }
-    return (true, ← git f.clone #["rev-parse", "HEAD"], f.c1, ← (f.clone / "merged.txt").pathExists)
-  TestM.assert ok "checked out"
+  let r ← withFixture fun f => do
+    let (tree, _) ← prepare f { commit := f.c1 }
+    return (← git tree #["rev-parse", "HEAD"], f.c1, ← (tree / "merged.txt").pathExists)
+  let (head, c1, merged) := r
   TestM.assertEqual head c1 (msg := "HEAD is the commit asked for")
   TestM.assert (!merged) "the tree is the commit's, not the default branch's"
 
@@ -106,20 +148,18 @@ def aCommitOnABranchNeedsNoFetchRef : Test := do
 def aCommitNoUpstreamRefReachesIsRefused : Test := do
   -- `c3` is only under `refs/pull/7/head`. Asked for without that ref, it is not reachable from
   -- any of the upstream's branches, which is the rule without a `fetch_ref`.
-  let outcome ← withFixture fun f => do
-    try Repo.applyCheckout f.clone { commit := f.c3 }; pure (none : Option String)
-    catch e => pure (some s!"{e}")
+  let (outcome, left) ← withFixture fun f => do
+    let o ← refusal f { commit := f.c3 }
+    return (o, ← (← Repo.taskCheckoutPath fork "t-1").pathExists)
   match outcome with
   | none => TestM.fail "a commit no upstream branch reaches was checked out"
   | some e => TestM.assert (mentions e "not reachable") e
+  TestM.assert (!left) "a refused checkout leaves nothing behind"
 
 @[test]
 def anUnreachableCommitFailsClearly : Test := do
   let sha := "0123456789abcdef0123456789abcdef01234567"
-  let outcome ← withFixture fun f => do
-    try Repo.applyCheckout f.clone { commit := sha, fetchRef := some "refs/pull/7/head" }
-        pure (none : Option String)
-    catch e => pure (some s!"{e}")
+  let outcome ← withFixture fun f => refusal f { commit := sha, fetchRef := some "refs/pull/7/head" }
   match outcome with
   | none => TestM.fail "a commit the upstream does not have was checked out"
   | some e =>
@@ -129,40 +169,79 @@ def anUnreachableCommitFailsClearly : Test := do
 @[test]
 def aCommitOnAnotherRefThanTheOneNamedIsRefused : Test := do
   -- `c4` is on `main`, not under the pull request's ref: naming that ref does not vouch for it.
-  let outcome ← withFixture fun f => do
-    try Repo.applyCheckout f.clone { commit := f.c4, fetchRef := some "refs/pull/7/head" }
-        pure (none : Option String)
-    catch e => pure (some s!"{e}")
+  let outcome ← withFixture fun f => refusal f { commit := f.c4, fetchRef := some "refs/pull/7/head" }
   TestM.assert outcome.isSome "a commit the named ref does not reach is refused"
+
+/-! ## Nothing an agent wrote counts
+
+The repro the review found: a ref planted under `refs/remotes/upstream/` in the slot made a
+fork-only commit pass the reachability check, and a `refs/replace/` or an `info/grafts` in the
+repository a pack was built from added later commits to an isolated checkout. The checkout is now
+built from a repository fetched for the task alone, with replacements and grafts switched off on
+both sides of every transfer. -/
+
+@[test]
+def aRefPlantedInTheSlotDoesNotVouchForACommit : Test := do
+  let outcome ← withFixture fun f => do
+    let _ ← git f.slot #["update-ref", "refs/remotes/upstream/evil", f.x]
+    let _ ← git f.slot #["update-ref", "refs/remotes/origin/main", f.x]
+    refusal f { commit := f.x }
+  match outcome with
+  | none => TestM.fail "a commit only the slot has was checked out on the strength of a planted ref"
+  | some e => TestM.assert (mentions e "not reachable") e
+
+@[test]
+def replacementsAndGraftsAddNothingToAnIsolatedCheckout : Test := do
+  let r ← withFixture fun f => do
+    -- A replacement of `c2` claiming `c4` as a second parent, and a graft saying the same, in the
+    -- repository the checkout is fetched from.
+    let tree ← git f.bare #["rev-parse", s!"{f.c2}^\{tree}"]
+    let fake ← git f.bare #["commit-tree", "-p", f.c1, "-p", f.c4, "-m", "fake", tree]
+    let _ ← git f.bare #["replace", "-f", f.c2, fake]
+    IO.FS.createDirAll (f.bare / "info")
+    IO.FS.writeFile (f.bare / "info" / "grafts") s!"{f.c2} {f.c1} {f.c4}\n"
+    let (dest, _) ← prepare f { commit := f.c2, isolate := true }
+    return (← gitOk dest #["cat-file", "-e", f.c4], ← git dest #["rev-list", "--all", "HEAD"],
+            f.c2History)
+  let (hasLater, all, history) := r
+  TestM.assert (!hasLater) "the later commit is not in the isolated object store"
+  TestM.assertEqual (all.splitOn "\n") history
+    (msg := "the commit and its real history, nothing else")
 
 /-! ## Isolation -/
 
 @[test]
 def anIsolatedCheckoutHasNothingPastItsCommit : Test := do
   let r ← withFixture fun f => do
-    Repo.applyCheckout f.clone { commit := f.c2 }
-    let dest := f.dir / "isolated"
-    Repo.isolateCheckout f.clone dest f.c2
+    let (dest, _) ← prepare f { commit := f.c2, isolate := true }
     let refs ← git dest #["for-each-ref", "--format=%(refname)"]
     let all ← git dest #["rev-list", "--all", "HEAD"]
     let hasLater ← gitOk dest #["cat-file", "-e", f.c4]
     let hasPr ← gitOk dest #["cat-file", "-e", f.c3]
     let reflog ← git dest #["reflog"]
     let logs ← (dest / ".git" / "logs").pathExists
-    let head ← git dest #["rev-parse", "HEAD"]
-    let sourceRefs ← git f.clone #["for-each-ref", "--format=%(refname)", "refs/orchestra/"]
-    return (refs, all.splitOn "\n", hasLater, hasPr, reflog, logs, head, ← detached dest,
-            sourceRefs, f.c1, f.c2)
-  let (refs, all, hasLater, hasPr, reflog, logs, head, isDetached, sourceRefs, c1, c2) := r
+    let remotes ← git dest #["remote"]
+    return (refs, all.splitOn "\n", hasLater, hasPr, reflog, logs, ← git dest #["rev-parse", "HEAD"],
+            ← detached dest, remotes, f.c2History, f.c2)
+  let (refs, all, hasLater, hasPr, reflog, logs, head, isDetached, remotes, history, c2) := r
   TestM.assertEqual refs "" (msg := "no branches, tags or remote-tracking refs")
-  TestM.assertEqual all [c2, c1] (msg := "`--all` reaches the commit and its parents, nothing else")
+  TestM.assertEqual all history (msg := "`--all` reaches the commit and its history, nothing else")
   TestM.assert (!hasLater) "the commit that came after is not in the object store at all"
   TestM.assert (!hasPr) "nor is the pull request's"
   TestM.assertEqual reflog "" (msg := "no reflog")
   TestM.assert (!logs) "no logs directory"
   TestM.assertEqual head c2
   TestM.assert isDetached "HEAD is detached"
-  TestM.assertEqual sourceRefs "" (msg := "the source is left without the temporary ref")
+  TestM.assertEqual remotes "" (msg := "and no remotes")
+
+@[test]
+def leftoverOrchestraRefsAreClearedAtStartup : Test := do
+  let refs ← withFixture fun f => do
+    let _ ← git f.slot #["update-ref", "refs/orchestra/checkout", f.x]
+    let _ ← git f.slot #["update-ref", "refs/orchestra/isolate", f.x]
+    Repo.clearOrchestraRefs f.slot
+    git f.slot #["for-each-ref", "--format=%(refname)", "refs/orchestra/"]
+  TestM.assertEqual refs "" (msg := "every refs/orchestra/* is gone")
 
 /-! ## Validation where it is read -/
 

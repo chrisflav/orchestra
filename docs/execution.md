@@ -83,12 +83,14 @@ environment is new each time and the checkout is the one thing carried into it. 
 `RepoConfig.runInitIfNeeded` run the hook every task instead of trusting the marker.
 
 Before a session is opened, the workspace is prepared on this machine: a slot reset onto the
-default branch, or — for a task with a `checkout` — a slot reset and then checked out at the
-commit the task named (`Repo.applyCheckout`), with the daemon's own token, since a read-only
-workspace is one whose agent cannot fetch or check out anything itself. With `isolate`, the task
-runs instead in a repository made fresh from the slot that holds only that commit and its history
-(`Repo.isolateCheckout`). A backend sees whichever of the two it is handed as `workdir`, and needs
-to know nothing about either.
+default branch, or — for a task with a `checkout` — a tree of its own at the commit the task named,
+built from a repository only the daemon touches (`Repo.prepareCheckout`), with the daemon's own
+token, since a read-only workspace is one whose agent cannot fetch or check out anything itself.
+With `isolate`, that tree holds only the commit and its history (`Repo.isolateCheckout`). A
+checkout task's configuration and hooks come from a copy of the upstream default branch's
+`.orchestra/` rather than from the tree; the copy is one of the session's grants marked
+`.orchestra`, so a backend that runs the hooks elsewhere carries it there like any other. A backend
+sees whichever tree it is handed as `workdir`, and needs to know nothing else about it.
 
 A session is opened with a `SessionSpec`, which also carries the repository and the image it asked
 for in its own `.orchestra/config.json`: what a task needs installed varies by repository, and a
