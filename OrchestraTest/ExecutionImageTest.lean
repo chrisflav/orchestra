@@ -291,4 +291,89 @@ def aMalformedTaskImageIsRefusedNotReplaced : Test := do
   | .ok i => TestM.fail s!"a malformed image was turned into {i}"
   | .error e => TestM.assert (mentions e "unusable image") e
 
+/-! ## The operator's absolute pins and allowed task images -/
+
+private def clusterWith (extra : List (String × Json)) : Except String Kubernetes.Config :=
+  Kubernetes.Config.fromJson (Json.mkObj ([ ("image", .str "ghcr.io/example/agent:1")
+    , ("mcp_host", .str "orchestra.orchestra.svc.cluster.local") ] ++ extra))
+
+private def strict : Kubernetes.Config :=
+  match clusterWith
+      [ ("images", Json.mkObj
+          [ ("acme/widgets", .str "ghcr.io/acme/widgets-ci:pinned")
+          , ("acme/secrets", Json.mkObj [("image", .str "ghcr.io/acme/hardened:3"),
+                                         ("absolute", .bool true)]) ])
+      , ("allowed_task_images", .arr #[.str reviewerImage, .str "ghcr.io/acme/tools/"]) ] with
+  | .ok c    => c
+  | .error _ => { image := "unparsed", mcpHost := "unparsed" }
+
+private def strictImageOf (spec : SessionSpec) : String :=
+  match Kubernetes.imageFor strict spec with | .ok i => i | .error e => s!"<refused: {e}>"
+
+@[test]
+def anAbsolutePinBeatsTheTasksImage : Test := do
+  TestM.assertEqual (strictImageOf (session "acme/secrets" none (some reviewerImage)))
+    "ghcr.io/acme/hardened:3" (msg := "absolute: the task cannot move it")
+  TestM.assertEqual (strictImageOf (session "acme/secrets" (some "ghcr.io/acme/own:1") none))
+    "ghcr.io/acme/hardened:3" (msg := "nor can the repository")
+  TestM.assertEqual (strictImageOf (session "acme/widgets" none (some reviewerImage)))
+    reviewerImage (msg := "an ordinary pin still loses to the task")
+  -- Absolute is settled before the task image is checked against the allowed list: the task's
+  -- image is irrelevant on that repository, so it is not a reason to refuse the task.
+  TestM.assertEqual (strictImageOf (session "acme/secrets" none (some "docker.io/evil:1")))
+    "ghcr.io/acme/hardened:3"
+
+@[test]
+def taskImagesAreHeldToTheAllowedList : Test := do
+  TestM.assertEqual (strictImageOf (session "acme/gadgets" none (some "ghcr.io/acme/tools/lint:2")))
+    "ghcr.io/acme/tools/lint:2" (msg := "under a listed prefix")
+  match Kubernetes.imageFor strict (session "acme/gadgets" none (some "ghcr.io/acme/reviewer:1.45")) with
+  | .ok i => TestM.fail s!"an exact entry is not a prefix, but {i} was accepted"
+  | .error e => TestM.assert (mentions e "allowed_task_images") e
+  match Kubernetes.imageFor strict (session "acme/widgets" none (some "docker.io/evil:1")) with
+  | .ok i => TestM.fail s!"an image outside the list was accepted as {i}"
+  | .error e => TestM.assert (mentions e reviewerImage) s!"the refusal names the list: {e}"
+  TestM.assertEqual (strictImageOf (session "acme/gadgets" none none)) "ghcr.io/example/agent:1"
+    (msg := "the list says nothing about tasks that name no image")
+
+@[test]
+def pinsAndTheAllowedListAreReadStrictly : Test := do
+  TestM.assert (clusterWith [("images", Json.mkObj [("a/b", Json.mkObj [("absolute", .bool true)])])]
+    |>.toOption.isNone) "an object pin needs an image"
+  TestM.assert (clusterWith [("images", Json.mkObj [("a/b", Json.mkObj
+      [("image", .str "x:1"), ("absolute", .str "yes")])])] |>.toOption.isNone)
+    "absolute must be a boolean"
+  TestM.assert (clusterWith [("images", Json.mkObj [("a/b", .str "not an image")])]
+    |>.toOption.isNone) "a pin must be an image reference"
+  TestM.assert (clusterWith [("images", Json.mkObj [("a/b", .num 3)])] |>.toOption.isNone)
+    "nor a number"
+  TestM.assert (clusterWith [("allowed_task_images", .str reviewerImage)] |>.toOption.isNone)
+    "the allowed list must be a list"
+  TestM.assert (clusterWith [("allowed_task_images", .arr #[.str ""])] |>.toOption.isNone)
+    "an empty entry matches nothing and is refused"
+  TestM.assert ((clusterWith [("images", Json.mkObj [("a/b", .str "x:1")])]).toOption.map
+    (·.repoImages) == some #[("a/b", { image := "x:1" })]) "a plain string is an ordinary pin"
+
+@[test]
+def namingTheInheritedImagePassesUnlisted : Test := do
+  let ctx := { parent with executionImage := some reviewerImage }
+  match ({} : SpawnPolicy).resolve ctx (ask (some reviewerImage)) with
+  | .error e => TestM.fail s!"asking for what it would inherit anyway should pass: {e}"
+  | .ok r => TestM.assertEqual r.executionImage (some reviewerImage)
+  match ({} : SpawnPolicy).resolve ctx (ask (some "ghcr.io/acme/other:1")) with
+  | .ok _ => TestM.fail "any other image is still a choice, and unlisted"
+  | .error _ => TestM.assert true
+
+/-! ## Continuations built from a task record -/
+
+@[test]
+def aContinuationTakesTheImageOfTheEntryThatRanTheTask : Test := do
+  let (found, missing) ← Orchestra.withTempData "execution-image-continue" do
+    Queue.saveEntry { imaged with status := .done, taskId := some "t-ran" }
+    let found ← Queue.imageForContinuation "t-ran"
+    let missing ← Queue.imageForContinuation "t-run-by-hand"
+    return (found, missing)
+  TestM.assertEqual found (some reviewerImage)
+  TestM.assertEqual missing none (msg := "no entry ran it: nothing to carry")
+
 end OrchestraTest.ExecutionImage

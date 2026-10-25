@@ -506,11 +506,11 @@ workflow, and they reach them after the YAML has been parsed:
   Anything else is refused and the workflow is not started.
 
 Nothing else is a template, and a `{{` anywhere else — `tools`, `read-only`, `kleis-spec`,
-`backend`, `model`, `budget`, `upstream`/`fork`, `system-prompt`, `prepend-prompt`, `context`,
-`triage-add`/`triage-remove`, the description — is refused when the workflow is loaded, naming the
-field. So is an unquoted `{{x}}` in a field that wants a string, which YAML reads as a mapping. Those
-fields decide what a step may do and where, and that is the operator's to write, not something
-whoever opened the issue gets to say. The one exception is `kleis-token`, whose value is a
+`backend`, `model`, `budget`, `upstream`/`fork`, `execution-image`, `system-prompt`,
+`prepend-prompt`, `context`, `triage-add`/`triage-remove`, the description — is refused when the
+workflow is loaded, naming the field. So is an unquoted `{{x}}` in a field that wants a string,
+which YAML reads as a mapping. Those fields decide what a step may do and where, and that is the
+operator's to write, not something whoever opened the issue gets to say. The one exception is `kleis-token`, whose value is a
 `"{{secret}}"` reference into `secrets.json` and never an event's variable.
 
 This is a change from earlier versions, which rendered the whole YAML file with the event's

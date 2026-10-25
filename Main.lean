@@ -336,6 +336,8 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
       prependPrompt := prevRecord.prependPrompt
       budget        := budgetFlag.orElse (fun _ => prevRecord.budget)
       priority      := prevRecord.priority
+      -- The record keeps no image; the entry that ran it does (`Queue.imageForContinuation`).
+      executionImage := (← Queue.imageForContinuation prevId)
     }
   }
   let _ ← TaskRunner.runTask appConfig task 0 debug
@@ -404,6 +406,8 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       prependPrompt := prevRecord.prependPrompt
       budget        := budgetFlag.orElse (fun _ => prevRecord.budget)
       priority      := priorityFlag.getD prevRecord.priority
+      -- As for `orchestra resume`: the image comes from the entry that ran the task.
+      executionImage := (← Queue.imageForContinuation prevId)
     }
     let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
     let _ ← daemonRequest req

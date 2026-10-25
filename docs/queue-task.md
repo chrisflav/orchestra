@@ -62,7 +62,8 @@ statement about planners, not about the listener that happens to dispatch them.
 }
 ```
 
-Three of the four choices follow one rule:
+The choices a policy bounds — `backend`, `model`, `repo`, `execution_image` and `tools` — all
+follow one rule:
 
 > **Omitted means "the same as mine".** A value the agent names has to appear in the policy's
 > list for that field; an empty list means nothing may be named, so the field is inherited and
@@ -90,8 +91,11 @@ the same backend, model, repository and image, and the tools it already holds, a
   repository ([what is installed, when repositories
   disagree](kubernetes.md#what-is-installed-when-repositories-disagree)) — which is why this is an
   exact list rather than a prefix: it is the strongest thing a policy can let an agent say about
-  where its work runs, and the operator should be able to read off exactly what was granted.
-  Leave it empty for a repository whose pin should hold whatever an agent asks.
+  where its work runs, and the operator should be able to read off exactly what was granted. Only
+  an `absolute` pin beats it, and every task image is also held to the backend's
+  `allowed_task_images`. Unlike the other fields, naming the image the task would inherit anyway
+  is allowed unlisted: a caller that always states its image should not be refused for asking for
+  what it already has.
 - **`tools`** — by the same names a role's `permissions` use, and checked against the same
   vocabulary (`create_pr`, `comment`, `label_issue`, `manage_issues`, `work_issues`,
   `review_issues`) wherever a policy is validated (see below), so a policy cannot *list*

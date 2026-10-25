@@ -709,6 +709,22 @@ def entryForTask (taskId : String) : IO (Option QueueEntry) := do
     order_by_desc e.id
   return (← Store.keepConvertible "queue entry" (·.id) QueueEntry.ofRow? rows)[0]?
 
+/-- The image a continuation of task `taskId` runs in: the one the entry that ran it carried.
+
+    For the continuations built from a *task record* rather than from an entry — `orchestra resume
+    <series>`, `orchestra queue add --resume`, `orchestra issue continue` — which would otherwise
+    run the second half of a piece of work without the tools the first half had. The record does
+    not keep the image; the entry does, and the entry is still there for every task the daemon
+    ran. A task run directly by `orchestra run` has none, and the continuation says so rather than
+    silently running without one. -/
+def imageForContinuation (taskId : String) : IO (Option String) := do
+  match ← entryForTask taskId with
+  | some e => return e.executionImage
+  | none =>
+    IO.eprintln s!"  note: no queue entry ran task {taskId}, so there is no execution_image to \
+carry; the continuation runs in whatever its repository and the configuration choose"
+    return none
+
 open Db.Query.DSL in
 /-- The entry addressed by either of the two ids it answers to: its own, or the task its run
     became.

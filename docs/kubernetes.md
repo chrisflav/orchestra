@@ -266,19 +266,21 @@ nothing that turns it off.
 ## what is installed, when repositories disagree
 
 Build and dev dependencies are a property of the repository, and the tools a kind of work needs are
-a property of the task, so `image` is a default rather than the answer. Four sources, settled in
+a property of the task, so `image` is a default rather than the answer. Five sources, settled in
 this order:
 
-1. **What the task asked for**, its own `execution_image`. Set where the task is described: a task
+1. **An absolute pin**, an entry of `images` written as `{"image": "…", "absolute": true}`. The
+   operator has said this repository runs in this image whatever the task is.
+2. **What the task asked for**, its own `execution_image`, if `allowed_task_images` permits it. Set where the task is described: a task
    file, a role, a listener action (which also covers the steps of the workflow it starts, unless a
    step names its own), a workflow step (`execution-image`), an API client's file, and — bounded by
    their policy's `images` — an agent's `queue_task` and an API client's request.
-2. **An operator's pin**, `images` in the options, keyed by `owner/name`. Deliberate, and nothing
+3. **An operator's pin**, `images` in the options, keyed by `owner/name`. Deliberate, and nothing
    inside the repository can talk it out of it.
-3. **What the repository asked for**, `execution.image` in its own `.orchestra/config.json`. The
+4. **What the repository asked for**, `execution.image` in its own `.orchestra/config.json`. The
    repository already writes this down for its own CI, and it is the thing that knows whether its
    tests need a JDK, a browser or a database client. Set `allow_repo_image: false` to ignore it.
-4. **`image`**, for everything that has not said otherwise.
+5. **`image`**, for everything that has not said otherwise.
 
 ```json
 {
@@ -288,8 +290,10 @@ this order:
       "image": "ghcr.io/chrisflav/orchestra-agent:latest",
       "images": {
         "acme/widgets": "ghcr.io/acme/widgets-ci:latest",
-        "acme/mobile":  "ghcr.io/acme/android-ci:latest"
-      }
+        "acme/mobile":  "ghcr.io/acme/android-ci:latest",
+        "acme/secrets": { "image": "ghcr.io/acme/hardened:3", "absolute": true }
+      },
+      "allowed_task_images": ["ghcr.io/acme/reviewer:1.4", "ghcr.io/acme/tools/"]
     }
   }
 }
@@ -314,31 +318,55 @@ image orchestra publishes, or from the repository's own CI image when the work a
 code, and adds what the work needs; it must still have what [every image
 needs](#what-you-need), a non-root `USER` included.
 
-**Who may name one.** Everything in the first source that is configuration — a task file, a role,
-a listener action, a workflow — is written by the operator, as the pin is. The two paths an
-untrusted party can drive are bounded by a policy, like every other choice they make
-(`docs/queue-task.md`): an agent's `queue_task` and an API client's `POST /api/v1/queue` may name an
-image only if the policy's `images` lists it. Omitted, a queued task runs in the same image as the
-task that queued it — for an API client, the client file's `execution_image` — and an empty list,
-the default, means nothing may be named. Neither `allow_repo_image` nor `allowed_image_prefixes`
-applies to a task's image: they are about what a *repository* may ask for, and what bounds a
-task's image is the policy that let it be named.
+**Who may name one.** Every source of a task image, and who writes it:
 
-**Making a pin absolute.** An operator who wants a repository to run in its pinned image whatever
-the task lists no `images` in the `spawn_policy` of anything that may queue onto it and in the
-`queue_policy` of any API client whose `repos` include it, and writes no `execution_image` into
-the roles, listeners and task files that reach it. A task queued by an agent or a client then
-runs in its parent's image or in none, and with none the pin decides.
+| source | written by | bounded by |
+| --- | --- | --- |
+| task file (`execution_image`) | the operator | — |
+| role (`execution_image`) | the operator | — |
+| listener action (`execution_image`), also for its workflow's steps that name none | the operator | — |
+| workflow step (`execution-image`) | the operator: since workflows are parsed before an event is filled in, no event text can reach this field ([what an event fills in](workflow.md#what-an-event-fills-in)) | — |
+| API client file (`execution_image`) | the operator | — |
+| an API client's request (`POST /api/v1/queue`) | the client | its `queue_policy.images` |
+| an agent's `queue_task` | the agent | its `spawn_policy.images` |
+| inheritance: a task queued by `queue_task`, or by a client, that names none | — | the parent's own image, onto any repository the policy's `repos` reaches |
+
+The last row is the one to read twice. A task's image travels with what it queues, and the
+policy's `repos` decides where that can be: a reviewer running in `ghcr.io/acme/reviewer:1.4` whose
+`spawn_policy.repos` lists `acme/secrets` can queue a task onto `acme/secrets` that runs in the
+reviewer's image, with no `images` listed anywhere. The same holds for an API client whose file
+names an `execution_image` and whose `queue_policy.repos` reaches a repository. A request naming
+the image it would inherit anyway passes unlisted, for the same reason.
+
+Every task image, from any row, is also held to **`allowed_task_images`**: image references
+matched exactly, or prefixes ending in `/`. Empty — the default — permits any, since every row is
+either the operator's configuration or bounded by a policy the operator wrote; it is there for an
+operator who would rather state the set once than audit every role and policy that can name one.
+An image outside it fails the task with the list in the message, rather than quietly running in
+something else.
+
+Neither `allow_repo_image` nor `allowed_image_prefixes` applies to a task's image: they are about
+what a *repository* may ask for.
+
+**Making a pin absolute.** Write the pin as `{"image": "…", "absolute": true}`. It is settled
+before the task's image, so no task file, role, listener, workflow, API client, `queue_task` call
+or inherited image can move that repository's tasks into another image. The daemon logs it when a
+task asked for something else. To bound task images everywhere rather than per repository, set
+`allowed_task_images`.
 
 **On landrun and local** there is no image to change. A task that names one says so once, in the
 daemon's log, and runs as usual on the host — so the tools its image would carry have to be
 installed there, or reachable through `additional_sandbox_paths` under landrun.
 
+**Continuations keep the image.** `orchestra queue retry` and a restart resume copy it from entry
+to entry. The three continuations built from a *task record* — `orchestra resume <series>`,
+`orchestra queue add --resume <series>` and `orchestra issue continue` — take it from the queue
+entry that ran the task being continued, since the record itself does not keep one; when no entry
+ran it (a task started directly with `orchestra run`), they say so on stderr and carry none.
+
 **Not yet a source:** an interactive session, a resident and `orchestra prepare` take no image of
-their own, and `orchestra resume <series>` builds its task from the series' last task record, which
-does not keep one — the queue entry does, which is what a retry and a restart resume copy. Nothing
-about the order above would change for any of them; it is a matter of where the field would be
-read.
+their own. Nothing about the order above would change for them; it is a matter of where the field
+would be read.
 
 Allowing a repository to name its image grants nothing that is not already granted: the agent runs
 that repository's code, with this task's credentials in the environment, either way. It is worth
@@ -879,7 +907,7 @@ the cluster was actually asked for.
 | key | default | what it does |
 | --- | --- | --- |
 | `image` | `ghcr.io/chrisflav/orchestra-agent:latest` | image tasks run in, unless something more specific applies |
-| `images` | `{}` | image per repository, by `owner/name`; beats what the repository asks for |
+| `images` | `{}` | image per repository, by `owner/name`: a string beats what the repository asks for, `{"image": …, "absolute": true}` beats the task's own image too |
 | `allow_repo_image` | `true` | whether a repository's own `execution.image` is honoured |
 | `mcp_host` | *required* | where the pod reaches this daemon's MCP server; a hostname or IP, refused otherwise |
 | `namespace` | `default` | namespace the pod is created in |
@@ -888,6 +916,7 @@ the cluster was actually asked for.
 | `image_pull_secrets` | `[]` | `imagePullSecrets` names; the Secrets must already exist in the namespace |
 | `image_pull_policy` | *(cluster default)* | `Always`, `IfNotPresent` or `Never` |
 | `allowed_image_prefixes` | `[]` | prefixes a repository-declared image must start with; empty allows any |
+| `allowed_task_images` | `[]` | images a task's `execution_image` must be (exact, or under a prefix ending in `/`); empty allows any |
 | `node_selector` | *(none)* | `nodeSelector`, verbatim |
 | `resources` | *(none)* | `resources` for the container, verbatim |
 | `volumes` / `volume_mounts` | `[]` | extra volumes and mounts, verbatim — a build cache, most usefully |

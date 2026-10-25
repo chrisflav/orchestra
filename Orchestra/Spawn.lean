@@ -26,7 +26,8 @@ build their entries from). See `docs/queue-task.md`.
 
 ## The rules a policy states
 
-Three of the four choices follow one rule:
+The choices a policy bounds — `backend`, `model`, `repo`, `execution_image` and `tools` — all
+follow one rule:
 
 > **Omitted means "the same as mine".** A named value must appear in the policy's list for that
 > field; an empty list means nothing may be named, so the child inherits and the agent has no
@@ -36,6 +37,13 @@ That holds for `backend`, `model`, `repo` and `execution_image` alike, and it is
 policy is still a useful one: it lets a task queue more of *itself* — the same backend, model,
 repository and image, with the tools it already holds — and nothing else. The lists widen what
 may be named; they never take away what the spawning task already has.
+
+`execution_image` has one leniency the others do not: naming the image the task would inherit
+anyway is allowed whether or not it is listed. A client or an agent that always says which image
+it wants — because it cannot know whether the default changed — would otherwise be refused for
+asking for exactly what it already has. The others keep refusing it, because for them it is
+harmless to omit and the list is the only statement of what a request may say; an image is the
+one field where "what I have" is a value a caller reasonably wants to make explicit.
 
 `tools` follows the same rule with one wrinkle worth stating out loud: the policy's list may name
 tools the spawning task does not hold, and that is deliberate rather than an oversight. A
@@ -179,7 +187,11 @@ def SpawnPolicy.resolve (p : SpawnPolicy) (ctx : SpawnContext) (r : SpawnRequest
 instruction"
   let backend ← chooseFrom "backend" p.backends ctx.backend r.backend
   let model   ← chooseFrom "model"   p.models   ctx.model   r.model
-  let executionImage ← chooseFrom "image" p.images ctx.executionImage r.executionImage
+  -- Naming the image it would inherit anyway is not a choice, and is allowed unlisted (see the
+  -- module docs for why this one field and not the others).
+  let executionImage ← if r.executionImage.isSome && r.executionImage == ctx.executionImage
+    then .ok ctx.executionImage
+    else chooseFrom "image" p.images ctx.executionImage r.executionImage
   let repo ← match r.repo with
     | none => .ok ctx.repo
     | some want =>
