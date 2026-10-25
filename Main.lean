@@ -322,6 +322,8 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
     | throw (.userError s!"series '{seriesName}' not found")
   let some prevRecord ← TaskStore.loadTask prevId
     | throw (.userError s!"task '{prevId}' not found in store")
+  -- The record keeps neither the image nor the checkout; the entry that ran it does.
+  let (carriedImage, carriedCheckout) ← Queue.carriedForContinuation prevId
   let task : Task := {
     i := .unit, o := .unit
     ioTask := {
@@ -336,8 +338,8 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
       prependPrompt := prevRecord.prependPrompt
       budget        := budgetFlag.orElse (fun _ => prevRecord.budget)
       priority      := prevRecord.priority
-      -- The record keeps no image; the entry that ran it does (`Queue.imageForContinuation`).
-      executionImage := (← Queue.imageForContinuation prevId)
+      executionImage := carriedImage
+      checkout      := carriedCheckout
     }
   }
   let _ ← TaskRunner.runTask appConfig task 0 debug
@@ -388,6 +390,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       | throw (.userError s!"series '{seriesName}' not found")
     let some prevRecord ← TaskStore.loadTask prevId
       | throw (.userError s!"task '{prevId}' not found in store")
+    let (carriedImage, carriedCheckout) ← Queue.carriedForContinuation prevId
     let id ← TaskStore.generateId
     let createdAt ← TaskStore.currentIso8601
     let entry : Queue.QueueEntry := {
@@ -406,8 +409,9 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       prependPrompt := prevRecord.prependPrompt
       budget        := budgetFlag.orElse (fun _ => prevRecord.budget)
       priority      := priorityFlag.getD prevRecord.priority
-      -- As for `orchestra resume`: the image comes from the entry that ran the task.
-      executionImage := (← Queue.imageForContinuation prevId)
+      -- As for `orchestra resume`: from the entry that ran the task.
+      executionImage := carriedImage
+      checkout      := carriedCheckout
     }
     let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
     let _ ← daemonRequest req
@@ -444,6 +448,15 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
     if taskFileData.tasks.isEmpty then
       IO.eprintln "No tasks found in task file"
       return 1
+    -- A checkout the execution backend would refuse is refused before anything is queued
+    -- (`ExecutionConfig.checkoutRefusal?`), as it is again when the task runs.
+    if taskFileData.tasks.any (·.ioTask.checkout.isSome) then
+      let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+      for task in taskFileData.tasks do
+        if let some e := appConfig.execution.checkoutRefusal? task.ioTask.checkout
+            task.ioTask.backend then
+          IO.eprintln s!"Not queued: {e}"
+          return 1
     let tasks := match taskIdx with
       | some idx =>
         if h : idx < taskFileData.tasks.size then #[taskFileData.tasks[idx]]
@@ -493,6 +506,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         kleisNarrow      := task.ioTask.kleisNarrow
         -- And the image it runs in, which `orchestra run` would have used.
         executionImage   := task.ioTask.executionImage
+        checkout         := task.ioTask.checkout
       }
       let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
       let _ ← daemonRequest req

@@ -521,7 +521,9 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     -- The image the entry's task runs in, where whatever queued it named one: on a cluster this
     -- beats the repository's own and the operator's pin, so it is what explains a pod running
     -- something other than either (`Kubernetes.imageFor`).
-    ("executionImage", optStr e.executionImage)
+    ("executionImage", optStr e.executionImage),
+    -- The commit the task is checked out at instead of the default branch, where it names one.
+    ("checkout",       ToJson.toJson e.checkout)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
@@ -1791,6 +1793,11 @@ private def queueForClient (configPath : Option System.FilePath) (c : ApiClient.
   let resolved ← match c.resolve r with
     | .error e => return .badRequest e
     | .ok x    => pure x
+  -- Refused here as well as when it runs: a client should hear it now, not from a failed task.
+  if resolved.checkout.isSome then
+    let appConfig ← loadAppConfig configPath
+    if let some e := appConfig.execution.checkoutRefusal? resolved.checkout resolved.backend then
+      return .badRequest e
   -- A read-only task works in the upstream itself and pushes nothing, as the auto-reviewer does;
   -- forking for it would create a repository per reviewed upstream for nothing. A writable one
   -- gets its fork by the rule every other dispatch path uses — outside the lock, since probing

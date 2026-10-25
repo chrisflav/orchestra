@@ -10,6 +10,7 @@ import Orchestra.Store.Migrations.ResidentRuntime
 import Orchestra.Store.Migrations.SessionTokens
 import Orchestra.Store.Migrations.ApiClients
 import Orchestra.Store.Migrations.ExecutionImage
+import Orchestra.Store.Migrations.Checkout
 
 /-!
 # The shape of orchestra's database
@@ -152,6 +153,8 @@ structure QueueEntryRow where
   /-- The image the entry's task runs in, when whatever queued it named one
       (`Config.IOTask.executionImage`). -/
   execution_image : Option String
+  /-- The commit the entry's task is checked out at (`Config.CheckoutSpec`), as JSON. -/
+  checkout : Option String
   deriving Repr
 
 /-- Where a running task has got to, for a daemon that picks the task up after a restart instead of
@@ -425,6 +428,7 @@ def migrations : List Db.Migration.Migration :=
    Orchestra.Store.Migrations.migration_0008_resident_runtime,
    Orchestra.Store.Migrations.migration_0009_session_tokens,
    Orchestra.Store.Migrations.migration_0010_api_clients,
-   Orchestra.Store.Migrations.migration_0011_execution_image]
+   Orchestra.Store.Migrations.migration_0011_execution_image,
+   Orchestra.Store.Migrations.migration_0012_checkout]
 
 end Orchestra.Store

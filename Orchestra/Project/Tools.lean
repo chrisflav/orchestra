@@ -430,7 +430,15 @@ def queueTaskToolDef : Json :=
         , ("execution_image", strProp
             ("The container image to run it in, where orchestra runs tasks in images — for " ++
              "work that needs tools only that image has. Default: the same as this task's, " ++
-             "or else whatever its repository runs in.")) ]
+             "or else whatever its repository runs in."))
+        , ("checkout", Json.mkObj
+            [ ("type", "object")
+            , ("description",
+                "The commit of the queued task's repository to check its workspace out at, " ++
+                "instead of the default branch: {\"commit\": <full sha>, \"fetch_ref\": " ++
+                "\"refs/pull/<n>/head\" or \"refs/heads/<branch>\", \"isolate\": true to " ++
+                "leave it with no other refs}. The commit must be reachable from fetch_ref, or " ++
+                "from one of the repository's branches. Default: the default branch.") ]) ]
         ["prompt"]) ]
 
 /-- Tool definition for `project_info`, exposed separately because it is
@@ -673,8 +681,9 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
       let kleisNarrow ← parseKleisNarrow? args
       -- Checked for being an image reference here, and against the policy's `images` later.
       let executionImage ← parseExecutionImage? args
+      let checkout ← parseCheckout? args
       return .queueTask { prompt, backend, model, tools, repo, budget, issueId, preClaim,
-                          kleisNarrow, executionImage }
+                          kleisNarrow, executionImage, checkout }
   | "project_info" => some (.ok .projectInfo)
   | _ => none
 

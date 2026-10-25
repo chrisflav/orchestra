@@ -49,12 +49,13 @@ private def credentialArgs (token : Option String) : Array String :=
          "-c", s!"{credentialConfigKey}={credentialHelperScript}"]
 
 private def runGit (args : Array String) (cwd : Option System.FilePath := none)
-    (token : Option String := none) : IO String := do
+    (token : Option String := none) (extraEnv : Array (String × Option String) := #[]) :
+    IO String := do
   let child ← IO.Process.spawn {
     cmd := "git"
     args := credentialArgs token ++ args
     cwd
-    env := tokenEnv token
+    env := tokenEnv token ++ extraEnv
     stdout := .piped
     stderr := .piped
   }
@@ -492,6 +493,255 @@ def ensureTaskCheckout (fork upstream : Repository) (taskId : String)
   resetSlot path token
   return path
 
+/-! ## A task's checkout at a commit (`Config.CheckoutSpec`)
+
+A task that names a commit is never prepared in a pooled slot. Everything about it is built from a
+repository only the daemon ever touches, fetched from the upstream's URL for this task alone:
+
+1. `prepareCheckoutSource` makes that repository (`<fork>-tasks/<task>.src`), fetches the upstream's
+   branches and the `fetch_ref` into it, checks that the commit is reachable from what it just
+   fetched, and copies the default branch's `.orchestra/` (and `.agent/`) into
+   `<fork>-tasks/<task>.config`, which is what the task's configuration and hooks are read from.
+2. `buildCheckoutTree` makes the tree the task runs in (`<fork>-tasks/<task>`) from that source: an
+   ordinary repository with the upstream's branches on a detached `HEAD` at the commit, or with
+   `isolate`, one holding the commit and its history and nothing else (`isolateCheckout`).
+
+Why not the slot. A slot is mounted into the agent's sandbox read-write whenever a task is not
+read-only, and survives from one task to the next, so anything in it may have been written by an
+earlier agent: a ref under `refs/remotes/upstream/` that makes a fork-only commit look like the
+upstream's, a `refs/replace/` or an `info/grafts` that rewrites which commits are a commit's parents
+— and with them what a pack built from it contains — a hook that runs on the next checkout, a
+`url.*.insteadOf` that sends a fetch elsewhere. A repository made for one task and never granted to
+any agent has none of those, and every `git` run against it is also told to ignore replacements,
+grafts, hooks and every configuration file but its own (`hardened`).
+
+Why the configuration comes from the default branch. A commit named by an API client or an agent
+carries an `.orchestra/` of its author's choosing, and `init.sh`, `before.sh`, `validation.sh` and
+`after.sh` run outside the agent's sandbox, and `execution.image` decides where it runs. The task
+reviews the commit; it runs under the upstream's own configuration.
+
+Costs: the source is a fresh fetch of the upstream's history over the network for each such task,
+which for a large repository is a large pack, and the tree starts without the gitignored build
+output a reused slot would have kept. -/
+
+/-- The environment for `git` runs that nothing an agent wrote may steer: no replacement objects,
+    no system or global configuration — a global `core.hooksPath` or `insteadOf` would otherwise
+    reach in — and no prompt for a password. Inherited by the `upload-pack` a local fetch runs,
+    which is what builds the pack an isolated checkout is filled from.
+
+    No `GIT_GRAFT_FILE`: grafts are read from the repository's own `info/grafts`, and every
+    repository these runs touch is one this module just made, which has none. -/
+private def hardenedEnv : Array (String × Option String) :=
+  #[("GIT_NO_REPLACE_OBJECTS", some "1"),
+    ("GIT_CONFIG_NOSYSTEM", some "1"), ("GIT_CONFIG_GLOBAL", some "/dev/null"),
+    ("GIT_TERMINAL_PROMPT", some "0")]
+
+/-- `git` with `hardenedEnv`, hooks switched off, and replacement refs ignored. -/
+private def hardened (args : Array String) (cwd : Option System.FilePath := none)
+    (token : Option String := none) : IO String :=
+  runGit (#["-c", "core.hooksPath=/dev/null", "--no-replace-objects"] ++ args) cwd token hardenedEnv
+
+private def hardened' (args : Array String) (cwd : Option System.FilePath := none)
+    (token : Option String := none) : IO Unit := do
+  let _ ← hardened args cwd token
+
+private def hardenedOk (args : Array String) (cwd : System.FilePath) : IO Bool := do
+  try hardened' args cwd; pure true catch _ => pure false
+
+/-- The daemon-only source repository of task `taskId`'s checkout. -/
+def checkoutSourcePath (fork : Repository) (taskId : String) : IO System.FilePath :=
+  taskCheckoutPath fork s!"{taskId}.src"
+
+/-- Where the default branch's `.orchestra/` of task `taskId` is copied (`prepareCheckoutSource`). -/
+def checkoutConfigPath (fork : Repository) (taskId : String) : IO System.FilePath :=
+  taskCheckoutPath fork s!"{taskId}.config"
+
+/-- The scratch directory an isolated checkout task gets instead of the shared `/tmp`, on a backend
+    that runs the agent on this machine. -/
+def checkoutTmpPath (fork : Repository) (taskId : String) : IO System.FilePath :=
+  taskCheckoutPath fork s!"{taskId}.tmp"
+
+/-- Everything a checkout task leaves: its tree, its source, its configuration copy and its
+    scratch directory. -/
+def removeCheckoutDirs (fork : Repository) (taskId : String) : IO Unit := do
+  for p in [← taskCheckoutPath fork taskId, ← checkoutSourcePath fork taskId,
+            ← checkoutConfigPath fork taskId, ← checkoutTmpPath fork taskId] do
+    try if ← p.pathExists then IO.FS.removeDirAll p
+    catch e => IO.eprintln s!"  Warning: could not remove {p}: {e}"
+
+private def freshDir (p : System.FilePath) : IO Unit := do
+  if ← p.pathExists then IO.FS.removeDirAll p
+  IO.FS.createDirAll p
+
+/-- Every path under `root`, recursively, without following symlinks into directories. -/
+private partial def walk (root : System.FilePath) : IO (Array System.FilePath) := do
+  let mut out := #[]
+  for e in ← root.readDir do
+    out := out.push e.path
+    let md ← e.path.symlinkMetadata
+    if md.type == .dir then out := out ++ (← walk e.path)
+  return out
+
+/-- Refuse a copied `.orchestra/` holding a symlink that leads outside it, or nowhere.
+
+    The default branch's hooks are run from the copy, and a symlink in it would run, or read, a
+    file the copy does not hold — the checked-out commit's own `init.sh`, a file elsewhere on this
+    machine — under the name of a trusted one. A link within the copy is fine. -/
+def refuseEscapingSymlinks (root : System.FilePath) : IO Unit := do
+  let base ← IO.FS.realPath root
+  for p in ← walk root do
+    if (← p.symlinkMetadata).type == .symlink then
+      let target ← try IO.FS.realPath p
+        catch _ => throw (.userError s!"checkout: the default branch's {p} is a symlink to \
+nothing; refusing to run hooks from a configuration that names files it does not hold")
+      unless target.toString.startsWith (base.toString ++ "/") do
+        throw (.userError s!"checkout: the default branch's {p} is a symlink to {target}, outside \
+its .orchestra/; refusing to run hooks from a configuration that names files it does not hold")
+
+/-- Make the daemon-only repository at `source` for a checkout of `spec`, fetched from `url`, and
+    copy the upstream default branch's `.orchestra/` and `.agent/` into `config`. Throws, naming the
+    commit, when it is not to be had — a task that asked for a commit and ran on another would
+    review the wrong code or see the answer it is being scored against.
+
+    The commit has to be **reachable from what this fetch wrote**: the `fetch_ref`, or without one
+    one of the upstream's branches. That is what makes a commit named by an API client or an agent
+    safe to check out: it can only ever name code the upstream has published. It is never fetched
+    by name alone, which git would skip if the object were already local; here nothing is local to
+    begin with, but the rule is the one that holds wherever the objects came from. -/
+def prepareCheckoutSource (url : String) (spec : CheckoutSpec) (source config : System.FilePath)
+    (token : Option String := none) : IO Unit := do
+  let sha := spec.commit
+  freshDir source
+  hardened' #["init", "--quiet", "--bare", source.toString]
+  let symref ← try hardened #["ls-remote", "--symref", url, "HEAD"] source token
+    catch e => throw (.userError s!"checkout: could not reach the upstream: {e}")
+  let some defaultBranch := (symref.splitOn "\n").findSome? fun line =>
+      if line.startsWith "ref: refs/heads/" then
+        some ((line.drop 16).toString.takeWhile (· != '\t')).toString
+      else none
+    | throw (.userError "checkout: the upstream names no default branch")
+  let heads := "refs/orchestra/fetch/heads"
+  let refspecs := #[s!"+refs/heads/*:{heads}/*"] ++
+    (spec.fetchRef.map (fun r => #[s!"+{r}:refs/orchestra/fetch/ref"])).getD #[]
+  let source' := spec.fetchRef.getD "the upstream's branches"
+  try hardened' (#["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", url] ++ refspecs) source token
+  catch e => throw (.userError s!"checkout: could not fetch {source'} to find commit {sha}: {e}")
+  let present ← hardenedOk #["cat-file", "-e", s!"{sha}^\{commit}"] source
+  let reachable ← if !present then pure false else match spec.fetchRef with
+    | some _ => hardenedOk #["merge-base", "--is-ancestor", sha, "refs/orchestra/fetch/ref"] source
+    | none => do
+      let refs ← hardened #["for-each-ref", "--format=%(refname)", s!"--contains={sha}",
+        s!"{heads}/"] source
+      pure !refs.isEmpty
+  unless reachable do
+    throw (.userError s!"checkout: commit {sha} is not reachable from {source'} on the upstream; \
+the task asked to run on it and will not run on anything else")
+  -- The upstream's own configuration, never the commit's.
+  freshDir config
+  let tip := s!"{heads}/{defaultBranch}"
+  for dir in [".orchestra", ".agent"] do
+    if ← hardenedOk #["cat-file", "-e", s!"{tip}:{dir}"] source then
+      hardened' #["--git-dir", source.toString, "--work-tree", config.toString,
+        "checkout", tip, "--", dir] source
+  refuseEscapingSymlinks config
+  IO.println s!"  Verified {sha} against {source'}; configuration from {defaultBranch}"
+
+/-- Make `dest` a repository of its own holding the commit `commit` of `source` and nothing else:
+    every object reachable from it, a detached `HEAD` on it, and no refs, no reflog, no
+    `FETCH_HEAD` or `ORIG_HEAD` — so `git log --all`, `git branch -a`, `git tag` and `git reflog`
+    reach nothing that came after it, and neither does `git cat-file --batch-all-objects`. What
+    came *before* it is still there, through its parents: that is the history the commit has, and
+    a task that sees the commit sees how it was reached.
+
+    Filled by a fetch over the local path, which runs `upload-pack` on `source` with the hardened
+    environment: a pack of what is reachable from the commit, with no replacement or graft able to
+    add a parent it does not have. -/
+def isolateCheckout (source dest : System.FilePath) (commit : String) : IO Unit := do
+  freshDir dest
+  let format ← try hardened #["rev-parse", "--show-object-format"] source catch _ => pure "sha1"
+  hardened' #["init", "--quiet", s!"--object-format={format}", dest.toString]
+  let tmp := "refs/orchestra/isolate"
+  hardened' #["update-ref", tmp, commit] source
+  try
+    hardened' #["fetch", "--no-tags", "--quiet", source.toString, tmp] dest
+  finally
+    try hardened' #["update-ref", "-d", tmp] source catch _ => pure ()
+  hardened' #["checkout", "--detach", "--quiet", commit] dest
+  let refs ← hardened #["for-each-ref", "--format=%(refname)"] dest
+  for ref in refs.splitOn "\n" do
+    unless ref.isEmpty do hardened' #["update-ref", "-d", ref] dest
+  for f in ["FETCH_HEAD", "ORIG_HEAD"] do
+    let p := dest / ".git" / f
+    if ← p.pathExists then IO.FS.removeFile p
+  try hardened' #["reflog", "expire", "--expire=now", "--all"] dest catch _ => pure ()
+  let logs := dest / ".git" / "logs"
+  if ← logs.pathExists then IO.FS.removeDirAll logs
+  let head ← hardened #["rev-parse", "HEAD"] dest
+  unless head == commit do
+    throw (.userError s!"checkout: the isolated checkout's HEAD is {head}, not {commit}")
+  excludeOrchestraArtifacts dest
+  IO.println s!"  Isolated {commit} at {dest}: no other refs, no reflog"
+
+/-- Make `dest` the tree task runs in, from the verified `source` (`prepareCheckoutSource`).
+
+    With `isolate`, `isolateCheckout`. Otherwise an ordinary repository: the upstream's branches as
+    `upstream/*`, the fork and the upstream as remotes with the credential helper a slot has, and a
+    detached `HEAD` at the commit, checked to be it. -/
+def buildCheckoutTree (fork upstream : Repository) (source dest : System.FilePath)
+    (spec : CheckoutSpec) : IO Unit := do
+  if spec.isolate then
+    isolateCheckout source dest spec.commit
+    return
+  freshDir dest
+  let format ← try hardened #["rev-parse", "--show-object-format"] source catch _ => pure "sha1"
+  hardened' #["init", "--quiet", s!"--object-format={format}", dest.toString]
+  let refspecs := #["+refs/orchestra/fetch/heads/*:refs/remotes/upstream/*"] ++
+    (if spec.fetchRef.isSome then #["+refs/orchestra/fetch/ref:refs/orchestra/checkout"] else #[])
+  hardened' (#["fetch", "--no-tags", "--quiet", source.toString] ++ refspecs) dest
+  hardened' #["checkout", "--detach", "--quiet", "--force", spec.commit] dest
+  try hardened' #["update-ref", "-d", "refs/orchestra/checkout"] dest catch _ => pure ()
+  let head ← hardened #["rev-parse", "HEAD"] dest
+  unless head == spec.commit do
+    throw (.userError s!"checkout: HEAD is {head} after checking out {spec.commit}")
+  runGit' #["remote", "add", "origin", githubUrl fork] dest
+  configureClone fork upstream dest
+  IO.println s!"  Checked out {spec.commit} at {dest} on a detached HEAD"
+
+/-- Prepare task `taskId`'s checkout of `spec` from scratch (see the section docs) and return the
+    tree it runs in and the directory its configuration is read from. `url` is the upstream's,
+    unless a test points it at a repository on this disk. -/
+def prepareCheckout (fork upstream : Repository) (taskId : String) (spec : CheckoutSpec)
+    (token : Option String := none) (url : Option String := none) (buildTree : Bool := true) :
+    IO (System.FilePath × System.FilePath) := do
+  let source ← checkoutSourcePath fork taskId
+  let config ← checkoutConfigPath fork taskId
+  let tree ← taskCheckoutPath fork taskId
+  try
+    prepareCheckoutSource (url.getD (githubUrl upstream)) spec source config token
+    -- Without a tree, for a continuation whose backend hands it its predecessor's workspace: an
+    -- empty directory stands where the tree would, for what reads the path.
+    if buildTree then buildCheckoutTree fork upstream source tree spec else freshDir tree
+  catch e =>
+    removeCheckoutDirs fork taskId
+    throw e
+  -- The source has served its purpose; only the tree and the configuration are used from here.
+  try IO.FS.removeDirAll source catch _ => pure ()
+  return (tree, config)
+
+/-- Remove every `refs/orchestra/*` a crash left in `repo`: the temporary refs a checkout uses
+    while it runs, which nothing should find afterwards. Best effort. -/
+def clearOrchestraRefs (repo : System.FilePath) : IO Unit := do
+  try
+    -- The repository at `repo` and no other: named by `--git-dir`, so git's discovery cannot climb
+    -- out of a directory that is not one into an enclosing repository — a git-tracked `$HOME`.
+    let gitDir ← if ← (repo / ".git").pathExists then pure (repo / ".git")
+      else if (← (repo / "HEAD").pathExists) && (← (repo / "objects").pathExists) then pure repo
+      else return
+    let g := #["--git-dir", gitDir.toString]
+    let refs ← hardened (g ++ #["for-each-ref", "--format=%(refname)", "refs/orchestra/"]) repo
+    for ref in refs.splitOn "\n" do
+      unless ref.isEmpty do hardened' (g ++ #["update-ref", "-d", ref]) repo
+  catch _ => pure ()
 
 /-- Base directory for the scratch workspaces repository-independent tasks run in.
 
@@ -720,6 +970,26 @@ def listClones : IO (Array (System.FilePath × Array System.FilePath)) := do
       let slots := slotsByRepo.getD name #[]
       result := result.push (e.path, slots.qsort (fun a b => decide (a.toString < b.toString)))
   return result
+
+/-- Remove the `refs/orchestra/*` a crash left behind, at startup and whatever their age: in every
+    cache clone and slot (an earlier version made checkouts there), and in every per-task
+    checkout — the source a checkout was verified in, its tree, an isolated one. A task the next
+    daemon picks up again loses nothing by it: those refs only live while a checkout is being
+    made. Best effort. -/
+def clearCrashLeftovers : IO Unit := do
+  try
+    for (clone, slots) in ← listClones do
+      clearOrchestraRefs clone
+      for slot in slots do clearOrchestraRefs slot
+    let base ← workDir
+    if ← base.pathExists then
+      for ownerEntry in ← base.readDir do
+        if !(← ownerEntry.path.isDir) then continue
+        for e in ← ownerEntry.path.readDir do
+          unless e.fileName.endsWith "-tasks" && (← e.path.isDir) do continue
+          for t in ← e.path.readDir do
+            if ← t.path.isDir then clearOrchestraRefs t.path
+  catch _ => pure ()
 
 /-- Remove all cloned repositories, task slots and scratch workspaces. -/
 def cleanup : IO Unit := do

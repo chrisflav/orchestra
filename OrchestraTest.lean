@@ -40,6 +40,7 @@ import OrchestraTest.RepolessTaskTest
 import OrchestraTest.SpawnTaskTest
 import OrchestraTest.ApiClientTest
 import OrchestraTest.ExecutionImageTest
+import OrchestraTest.CheckoutTest
 import OrchestraTest.StaleTaskTest
 import OrchestraTest.RebootOrderingTest
 import OrchestraTest.GitHubPatTest

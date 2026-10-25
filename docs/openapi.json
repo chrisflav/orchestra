@@ -750,6 +750,7 @@
                   "issue_number": { "type": "integer", "minimum": 0, "description": "The GitHub issue or pull request of `upstream` the task is about; it is the `task_issue` fact on the task's kleis token." },
                   "external_id": { "type": "string", "minLength": 1, "maxLength": 200, "description": "The client's own id for this work, unique per client." },
                   "kleis_narrow": { "type": "array", "items": { "type": "string" }, "description": "Narrowings added to the client's own on the task's kleis token." },
+                  "checkout": { "$ref": "#/components/schemas/Checkout" },
                   "execution_image": { "type": "string", "minLength": 1, "maxLength": 512, "description": "The image the task runs in on the `kubernetes` backend: one the policy's `images` lists. Omitted, the client file's own `execution_image`, or none. A task's image beats the repository's own and the operator's per-repository pin, unless that pin is absolute, and is held to the backend's `allowed_task_images`." }
                 }
               }
@@ -1885,7 +1886,7 @@
       "QueueEntry": {
         "type": "object",
         "description": "Work waiting or running. Becomes a Task when it is claimed; `taskId` is that run.",
-        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity", "apiClient", "externalId", "executionImage"],
+        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity", "apiClient", "externalId", "executionImage", "checkout"],
         "properties": {
           "id": { "type": "string" },
           "status": { "$ref": "#/components/schemas/QueueStatus" },
@@ -1904,6 +1905,7 @@
           "identity": { "type": ["string", "null"], "description": "The identity this entry is performed under: the name of a directory under `<config>/identities/`. It gives the run a memory of its own and, where the record carries a taxis token, makes the run's tracker writes come from that identity rather than from orchestra." },
           "apiClient": { "type": ["string", "null"], "description": "The API client that queued this entry over HTTP (`POST /api/v1/queue`), when one did." },
           "externalId": { "type": ["string", "null"], "description": "The client's own id for this entry, unique per client." },
+          "checkout": { "oneOf": [{ "$ref": "#/components/schemas/Checkout" }, { "type": "null" }], "description": "The commit the entry's task is checked out at instead of the default branch, when whatever queued it named one." },
           "executionImage": { "type": ["string", "null"], "description": "The image the entry's task runs in, when whatever queued it named one. On the `kubernetes` backend it beats the repository's own image and the operator's per-repository pin unless that pin is absolute; on landrun and local it is logged and the task runs on the host." }
         }
       },
@@ -2059,6 +2061,17 @@
           "trigger": { "type": "string", "enum": ["has_open_issues", "has_in_review_issues", "idle", "always"] },
           "max": { "type": "integer", "description": "Default cap when a dispatcher config omits one. `0` means auto-spawn is opt-in." },
           "preClaim": { "type": "boolean", "description": "For `has_open_issues` roles: claim the issue at spawn time." }
+        }
+      },
+      "Checkout": {
+        "type": "object",
+        "description": "The commit a task's workspace is checked out at, instead of the default branch. The daemon fetches it from the task's own upstream and checks it out on a detached HEAD before the agent starts, and fails the task if the commit cannot be had. The commit must be reachable from `fetch_ref`, or without one from one of the upstream's branches, so only code the upstream has published is ever checked out.",
+        "required": ["commit"],
+        "additionalProperties": false,
+        "properties": {
+          "commit": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$", "description": "The full commit name, lower case." },
+          "fetch_ref": { "type": "string", "pattern": "^refs/(pull/[0-9]+/(head|merge)|heads/.+)$", "description": "The upstream ref to fetch the commit from and that must reach it: `refs/pull/<n>/head`, `refs/pull/<n>/merge` or `refs/heads/<branch>`." },
+          "isolate": { "type": "boolean", "default": false, "description": "Run in a repository of its own holding only the commit and its history: no other refs, no reflog, no later objects." }
         }
       },
       "SpawnPolicy": {

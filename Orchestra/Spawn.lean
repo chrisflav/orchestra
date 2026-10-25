@@ -97,6 +97,18 @@ structure SpawnRequest where
       so an agent that could name any image could move its work off everything the operator
       chose for that repository. -/
   executionImage : Option String := none
+  /-- The commit the queued task is checked out at (`Config.CheckoutSpec`). Never inherited, because
+      it describes one piece of work: a planner reviewing one commit that queues an implementor
+      wants the implementor on the default branch.
+
+      Not bounded by the policy, but not harmless either. It can only name a commit of the queued
+      task's own upstream — `Repo.prepareCheckout` refuses anything the upstream's refs do not
+      reach — yet anyone may publish a commit to an upstream as a pull request, and the task's
+      hooks run in that commit's tree, where what they run (a `lakefile`, package scripts, a
+      toolchain file) is the commit's. That is why a checkout is refused outright on an execution
+      backend that runs those hooks on the daemon's machine, unless the operator allows it
+      (`ExecutionConfig.checkoutRefusal?`, checked when the task is queued). -/
+  checkout : Option CheckoutSpec := none
 deriving Repr, Inhabited
 
 /-- What the spawning task itself has, which is what every omitted field inherits. -/
@@ -158,6 +170,8 @@ structure ResolvedSpawn where
   kleisNarrow : List String := []
   /-- The image the queued task runs in: the spawning task's own, or one the policy lists. -/
   executionImage : Option String := none
+  /-- The commit the queued task is checked out at, as asked for. -/
+  checkout : Option CheckoutSpec := none
   /-- Carried through so the enqueuing side can report the ceiling it enforced with the number
       in it, rather than saying "too many" and leaving the agent to guess. -/
   maxTasks  : Nat
@@ -202,6 +216,8 @@ own ({ctx.repo.map (·.toString) |>.getD "none"}); no repositories are listed in
       else
         .error s!"repository {want} is not one this task may queue onto; the spawn policy \
 allows {String.intercalate ", " (p.repos.map (·.toString))}"
+  if r.checkout.isSome && repo.isNone then
+    .error "'checkout' names a commit of the queued task's repository, and it has none"
   let tools ← match r.tools with
     | none => .ok ctx.tools
     | some want =>
@@ -241,6 +257,7 @@ set 'allow_pre_claim'"
          , kleisSpec := ctx.kleisSpec, kleisToken := ctx.kleisToken
          , kleisNarrow := (ctx.kleisNarrow ++ r.kleisNarrow).eraseDups
          , executionImage
+         , checkout := r.checkout
          , maxTasks := p.maxTasks }
 
 end Orchestra
