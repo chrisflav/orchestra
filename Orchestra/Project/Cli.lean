@@ -439,6 +439,7 @@ def spawnHandler (p : Parsed) : IO UInt32 := do
     , identity      := role.identity
     , kleisRoleSpec := role.kleisSpec
     , kleisNarrow   := role.kleisNarrow
+    , executionImage := role.executionImage
     , role          := some role.name }
   -- 7. Persist the entry. The daemon picks it up on its next poll.
   Queue.saveEntry entry

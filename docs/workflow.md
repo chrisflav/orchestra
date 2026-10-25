@@ -60,6 +60,9 @@ steps:
       budget: 25           # optional max spend in USD (default: 4.0)
       read-only: true      # mount repo read-only (default: false)
       identity: maintainer # optional identity to run this step under
+      # Optional image to run this step in, on the kubernetes backend (default: the listener
+      # action's execution_image, then the repository's): docs/kubernetes.md
+      execution-image: ghcr.io/acme/reviewer:1.4
       prompt: "Implement feature X."
 
       # Optional MCP tools for this step (default: none). See below.

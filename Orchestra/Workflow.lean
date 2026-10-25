@@ -95,6 +95,12 @@ structure TaskSpec where
       source and its identity's (`IOTask.kleisRoleSpec`). Not read from the YAML: set by
       `WorkflowProgram.withListenerKleis`. -/
   kleisRoleSpec      : Option String := none
+  /-- The image the step's task runs in (`execution-image`; `Config.IOTask.executionImage`). Per
+      step, like `identity`: the step that reviews and the step that implements are different
+      kinds of work and may need different tools. A step that names none takes the image of the
+      listener action that started the workflow, if it names one
+      (`WorkflowProgram.withListenerImage`). -/
+  executionImage     : Option String := none
   deriving Repr
 
 /-- The tool names a step's `tools` field may ask for: the optional MCP tools and the project
@@ -240,6 +246,18 @@ supplied as '{value}', not a whole number"
     | _ => pure s
   return { prog with steps }
 
+/-- Every task step of `prog` that names no image of its own runs in `image`: a listener action's
+    `execution_image` holds of the tasks its workflow runs, as it does of the one task a listener
+    without a workflow queues. A step's own image wins, since it is the more specific statement
+    about what that step is. -/
+def WorkflowProgram.withListenerImage (prog : WorkflowProgram) (image : Option String) :
+    WorkflowProgram :=
+  { prog with steps := prog.steps.map fun s =>
+      match s.action with
+      | .task t =>
+        { s with action := .task { t with executionImage := t.executionImage <|> image } }
+      | _ => s }
+
 namespace Workflow
 
 open Concert
@@ -330,6 +348,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       kleisToken := spec.kleisToken, kleisSpec := spec.kleisSpec
       kleisRoleSpec := spec.kleisRoleSpec
       kleisNarrow := spec.kleisNarrow
+      executionImage := spec.executionImage
     }
     StateT.lift (run ioTask ())
   else
@@ -350,6 +369,7 @@ private def execTask (prog : WorkflowProgram) (stepName : String) (spec : TaskSp
       kleisToken := spec.kleisToken, kleisSpec := spec.kleisSpec
       kleisRoleSpec := spec.kleisRoleSpec
       kleisNarrow := spec.kleisNarrow
+      executionImage := spec.executionImage
     }
     let j ← StateT.lift (run ioTask ())
     modify fun (env', ctrl) =>

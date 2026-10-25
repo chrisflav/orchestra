@@ -52,6 +52,7 @@ statement about planners, not about the listener that happens to dispatch them.
     "models": ["opus", "haiku"],
     "tools": ["create_pr", "work_issues"],
     "repos": ["acme/widgets", "acme/docs"],
+    "images": ["ghcr.io/acme/reviewer:1.4"],
     "max_tasks": 5,
     "allow_pre_claim": true,
     "max_budget": 6.0,
@@ -67,9 +68,9 @@ Three of the four choices follow one rule:
 > list for that field; an empty list means nothing may be named, so the field is inherited and
 > the agent has no say at all.
 
-That holds for `backend`, `model` and `repo` alike, which is why an empty policy —
-`"spawn_policy": {}` — is still a useful one: it lets a task queue more of *itself*, with the
-same backend, model and repository, and the tools it already holds, and nothing else.
+That holds for `backend`, `model`, `repo` and `execution_image` alike, which is why an empty
+policy — `"spawn_policy": {}` — is still a useful one: it lets a task queue more of *itself*, with
+the same backend, model, repository and image, and the tools it already holds, and nothing else.
 
 - **`backends`** / **`models`** — what may be named instead of inheriting. Models are not checked
   against the backend: orchestra holds no per-backend model list, and one written into a config
@@ -81,6 +82,16 @@ same backend, model and repository, and the tools it already holds, and nothing 
   is resolved even when the repository was inherited rather than named, so one rule decides where
   a task pushes no matter how it got there. A repository the App can neither push to nor fork is
   refused, and nothing is queued.
+- **`images`** — images the queued task may run in (`execution_image`), on a backend that runs
+  tasks in images. Inherited when omitted: a task with an image of its own queues into the same
+  one, a task without one queues a task without one, which then runs wherever its repository and
+  the operator's configuration put it. A listed image beats the operator's per-repository pin —
+  a task's image says what kind of work it is, and that work needs its tools whatever the
+  repository ([what is installed, when repositories
+  disagree](kubernetes.md#what-is-installed-when-repositories-disagree)) — which is why this is an
+  exact list rather than a prefix: it is the strongest thing a policy can let an agent say about
+  where its work runs, and the operator should be able to read off exactly what was granted.
+  Leave it empty for a repository whose pin should hold whatever an agent asks.
 - **`tools`** — by the same names a role's `permissions` use, and checked against the same
   vocabulary (`create_pr`, `comment`, `label_issue`, `manage_issues`, `work_issues`,
   `review_issues`) wherever a policy is validated (see below), so a policy cannot *list*
@@ -125,7 +136,8 @@ same backend, model and repository, and the tools it already holds, and nothing 
   "tools": ["create_pr", "work_issues"],
   "budget": 4.0,
   "issue_id": 412,
-  "pre_claim": true
+  "pre_claim": true,
+  "execution_image": "ghcr.io/acme/reviewer:1.4"
 }
 ```
 

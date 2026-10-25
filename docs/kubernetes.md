@@ -265,15 +265,20 @@ nothing that turns it off.
 
 ## what is installed, when repositories disagree
 
-Build and dev dependencies are a property of the repository, so `image` is a default rather than
-the answer. Three sources, settled in this order:
+Build and dev dependencies are a property of the repository, and the tools a kind of work needs are
+a property of the task, so `image` is a default rather than the answer. Four sources, settled in
+this order:
 
-1. **An operator's pin**, `images` in the options, keyed by `owner/name`. Deliberate, and nothing
+1. **What the task asked for**, its own `execution_image`. Set where the task is described: a task
+   file, a role, a listener action (which also covers the steps of the workflow it starts, unless a
+   step names its own), a workflow step (`execution-image`), an API client's file, and — bounded by
+   their policy's `images` — an agent's `queue_task` and an API client's request.
+2. **An operator's pin**, `images` in the options, keyed by `owner/name`. Deliberate, and nothing
    inside the repository can talk it out of it.
-2. **What the repository asked for**, `execution.image` in its own `.orchestra/config.json`. The
+3. **What the repository asked for**, `execution.image` in its own `.orchestra/config.json`. The
    repository already writes this down for its own CI, and it is the thing that knows whether its
    tests need a JDK, a browser or a database client. Set `allow_repo_image: false` to ignore it.
-3. **`image`**, for everything that has not said otherwise.
+4. **`image`**, for everything that has not said otherwise.
 
 ```json
 {
@@ -289,6 +294,51 @@ the answer. Three sources, settled in this order:
   }
 }
 ```
+
+**Why the task's image beats the pin.** A pin and a repository's request are statements about the
+repository: what it takes to build and test this code. A task's image is a statement about the
+work: a review that drives a review platform's CLI, a release that needs signing tools. That work
+needs its tools on every repository it is done on, and fails without them whatever the repository
+is — so letting a pin win would mean a pinned repository can never be reviewed by the tool that
+reviews everything else, and the operator would have to fold every kind of work into every pinned
+image instead. A role for such work names its image once, and the pins stay about building code:
+
+```json
+{ "name": "reviewer", "permissions": ["comment"], "read_only": true,
+  "execution_image": "ghcr.io/acme/reviewer:1.4",
+  "prompt_template": "Review {{pr_repo}}#{{pr_number}}. …" }
+```
+
+The image a task's image is built from is the operator's to choose. It usually starts `FROM` the
+image orchestra publishes, or from the repository's own CI image when the work also builds the
+code, and adds what the work needs; it must still have what [every image
+needs](#what-you-need), a non-root `USER` included.
+
+**Who may name one.** Everything in the first source that is configuration — a task file, a role,
+a listener action, a workflow — is written by the operator, as the pin is. The two paths an
+untrusted party can drive are bounded by a policy, like every other choice they make
+(`docs/queue-task.md`): an agent's `queue_task` and an API client's `POST /api/v1/queue` may name an
+image only if the policy's `images` lists it. Omitted, a queued task runs in the same image as the
+task that queued it — for an API client, the client file's `execution_image` — and an empty list,
+the default, means nothing may be named. Neither `allow_repo_image` nor `allowed_image_prefixes`
+applies to a task's image: they are about what a *repository* may ask for, and what bounds a
+task's image is the policy that let it be named.
+
+**Making a pin absolute.** An operator who wants a repository to run in its pinned image whatever
+the task lists no `images` in the `spawn_policy` of anything that may queue onto it and in the
+`queue_policy` of any API client whose `repos` include it, and writes no `execution_image` into
+the roles, listeners and task files that reach it. A task queued by an agent or a client then
+runs in its parent's image or in none, and with none the pin decides.
+
+**On landrun and local** there is no image to change. A task that names one says so once, in the
+daemon's log, and runs as usual on the host — so the tools its image would carry have to be
+installed there, or reachable through `additional_sandbox_paths` under landrun.
+
+**Not yet a source:** an interactive session, a resident and `orchestra prepare` take no image of
+their own, and `orchestra resume <series>` builds its task from the series' last task record, which
+does not keep one — the queue entry does, which is what a retry and a restart resume copy. Nothing
+about the order above would change for any of them; it is a matter of where the field would be
+read.
 
 Allowing a repository to name its image grants nothing that is not already granted: the agent runs
 that repository's code, with this task's credentials in the environment, either way. It is worth

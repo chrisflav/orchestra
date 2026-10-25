@@ -487,6 +487,8 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         kleisSpec        := task.ioTask.kleisSpec
         kleisRoleSpec    := task.ioTask.kleisRoleSpec
         kleisNarrow      := task.ioTask.kleisNarrow
+        -- And the image it runs in, which `orchestra run` would have used.
+        executionImage   := task.ioTask.executionImage
       }
       let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
       let _ ← daemonRequest req
@@ -1111,39 +1113,8 @@ private def queueRetryHandler (p : Parsed) : IO UInt32 := do
           | some _ => pure (if (← Queue.sessionFor tid).isSome then some tid else none)
           | none   => pure none
       | _           => pure entry.continuesFrom
-    let newEntry : Queue.QueueEntry := {
-      id, createdAt
-      repo         := entry.repo
-      mode         := entry.mode
-      prompt       := entry.prompt
-      goal         := entry.goal
-      agent        := entry.agent
-      systemPrompt := entry.systemPrompt
-      backend      := entry.backend
-      model        := entry.model
-      continuesFrom
-      series       := entry.series
-      configPath   := entry.configPath
-      priority     := entry.priority
-      -- A retry is the same work by the same somebody: without this the second half of a run is
-      -- authored by orchestra and reads a different memory than the first half did.
-      identity     := entry.identity
-      -- And under the same access: a retry that lost its source would run under the default.
-      kleisToken    := entry.kleisToken
-      kleisSpec     := entry.kleisSpec
-      kleisRoleSpec := entry.kleisRoleSpec
-      kleisNarrow   := entry.kleisNarrow
-      -- And within the same bounds. Without these a read-only review retried as the default — a
-      -- writable task holding `create_pr`, on the default budget — and an entry an API client
-      -- queued came back as one the client could neither see nor cancel.
-      tools         := entry.tools
-      readOnly      := entry.readOnly
-      budget        := entry.budget
-      memory        := entry.memory
-      issueNumber   := entry.issueNumber
-      prLabels      := entry.prLabels
-      apiClient     := entry.apiClient
-    }
+    -- The same work under the same access and bounds, image included (`Queue.retryEntryFor`).
+    let newEntry := Queue.retryEntryFor entry continuesFrom id createdAt
     Queue.saveEntry newEntry
     IO.println newEntry.id
   return (0 : UInt32)

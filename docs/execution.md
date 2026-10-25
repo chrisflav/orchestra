@@ -84,7 +84,13 @@ environment is new each time and the checkout is the one thing carried into it. 
 
 A session is opened with a `SessionSpec`, which also carries the repository and the image it asked
 for in its own `.orchestra/config.json`: what a task needs installed varies by repository, and a
-backend that runs tasks in an image of some kind is the one that has to decide which.
+backend that runs tasks in an image of some kind is the one that has to decide which. It carries the
+task's own image too (`taskImage`, the task's `execution_image`), kept apart from the repository's
+because the two rank on either side of an operator's per-repository pin — see [what is installed,
+when repositories
+disagree](kubernetes.md#what-is-installed-when-repositories-disagree). A backend that runs tasks on
+this machine cannot change images: it calls `SessionSpec.noteImageIgnored`, which says so once in
+the log, and runs the task as usual, so the tools that image would carry have to be on the host.
 
 For landrun and local there is nothing to open: the checkout is already where the daemon put it,
 and `runScript` is `bash` on this machine, exactly as the task runner did it before sessions
@@ -188,7 +194,7 @@ The mapping is mechanical, which is the point of the interface:
 | `SessionSpec.workdir` | the container's `workingDir`, on the volume the checkout is staged into |
 | `SessionSpec.grants` marked `.orchestra` | `emptyDir` volumes, filled from the daemon's disk when the session opens |
 | `SessionSpec.grants` marked `.environment` | nothing: `/usr`, `/etc` and the agent's home come from the image |
-| `SessionSpec.image` / `.repo` | which image the pod runs, and the label it carries |
+| `SessionSpec.taskImage` / `.image` / `.repo` | which image the pod runs (`Kubernetes.imageFor`), and the label it carries |
 | `Session.start` | `kubectl exec` — `-i -t` for a TUI, `-i` for a session's held-open stream, neither for a queued run |
 | `Session.runScript` | `kubectl exec ... bash <script>`, in the same pod |
 | `Session.provide` | `tar` the agent's MCP config in, creating its directory first |

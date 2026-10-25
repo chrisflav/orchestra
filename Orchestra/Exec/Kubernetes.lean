@@ -431,44 +431,59 @@ $HOME. Use task_volumes, which gives each task chain its own checkout and home"
     inst
   }
 
-/-- Whether `ref` is something that can be an image reference at all.
-
-    Not a parse of the OCI grammar — the registry is the authority on that, and a reference this
-    accepts and the registry rejects fails as an unstartable pod with the registry's own message.
-    What this is for is the one case where the string is not the operator's: a repository names its
-    own image in a file in the repository, so a name with a space, a quote or a newline in it
-    should be refused here rather than turned into a manifest field. -/
+/-- Whether `ref` is something that can be an image reference at all (`Exec.imageRefError?`). -/
 def validImageRef (ref : String) : Bool :=
-  !ref.isEmpty && ref.length ≤ 512 &&
-    ref.all fun c =>
-      c.isAlphanum || c == '.' || c == '_' || c == '-' || c == '/' || c == ':' || c == '@'
+  (imageRefError? ref).isNone
 
 /-- The image a task runs in, or why the one it asked for cannot be used.
 
-    An operator's per-repository pin first, because that is the one someone chose deliberately for
-    this repository and nothing in the repository should be able to override it. Then what the
-    repository itself asked for, which is where the answer usually belongs — the repository is what
-    knows whether its tests need a JDK or a browser. Then the configured default, for everything
-    that has not said otherwise.
+    The task's own image first (`SessionSpec.taskImage`), because it says what kind of work this
+    is — a review driving a review platform's CLI, a release that needs signing tools — and the
+    tools that work needs do not change with the repository it is done on. A per-repository pin
+    is a statement about the repository; a task's image is a statement about the task, and a task
+    that needs its tools fails without them whatever the repository is. It has also already been
+    held to somebody's say-so before it got here: written by the operator into a task file, a
+    role, a listener action or a workflow, or named by an agent or an API client from the
+    `images` their policy lists. An operator who wants a pin to be absolute lists no images in
+    the policies of what may queue onto that repository, and writes none into the configuration
+    that does.
 
-    The middle one is the only one checked, because it is the only one that did not come from this
-    daemon's own configuration. Refused rather than quietly replaced by the default: a repository
-    that asked for a JDK image and silently got one without would fail its validation script for a
-    reason nothing in the log points at. -/
+    Then the operator's per-repository pin, because that is the one someone chose deliberately
+    for this repository and nothing in the repository should be able to override it. Then what
+    the repository itself asked for, which is where the answer usually belongs — the repository
+    is what knows whether its tests need a JDK or a browser. Then the configured default, for
+    everything that has not said otherwise.
+
+    `allow_repo_image` and `allowed_image_prefixes` are about the repository's request and
+    nothing else: neither turns a task's image off or bounds it, since what bounds a task's image
+    is the policy that let it be named.
+
+    The repository's request is the only one checked here, because it is the only one that did
+    not come through this daemon's own configuration. Refused rather than quietly replaced by the
+    default: a repository that asked for a JDK image and silently got one without would fail its
+    validation script for a reason nothing in the log points at. The task's is checked again for
+    being an image reference at all — it was when it was read, but this is what goes into the
+    manifest. -/
 def imageFor (cfg : Config) (spec : SessionSpec) : Except String String :=
-  match spec.repo.bind (fun r => cfg.repoImages.find? (·.1 == r)) with
-  | some (_, pinned) => .ok pinned
+  match spec.taskImage with
+  | some image =>
+    match imageRefError? image with
+    | none   => .ok image
+    | some e => .error s!"the task asks to run in an unusable image: {e}"
   | none =>
-    match (if cfg.allowRepoImage then spec.image else none) with
-    | none          => .ok cfg.image
-    | some declared =>
-      if !validImageRef declared then
-        .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not a usable image reference"
-      else if cfg.allowedImagePrefixes.isEmpty
-              || cfg.allowedImagePrefixes.any (fun p => declared.startsWith p) then
-        .ok declared
-      else
-        .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not under any of the image prefixes this daemon allows a repository to name ({String.intercalate ", " cfg.allowedImagePrefixes.toList}). Pin the repository under execution.options.images instead, or widen allowed_image_prefixes."
+    match spec.repo.bind (fun r => cfg.repoImages.find? (·.1 == r)) with
+    | some (_, pinned) => .ok pinned
+    | none =>
+      match (if cfg.allowRepoImage then spec.image else none) with
+      | none          => .ok cfg.image
+      | some declared =>
+        if !validImageRef declared then
+          .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not a usable image reference"
+        else if cfg.allowedImagePrefixes.isEmpty
+                || cfg.allowedImagePrefixes.any (fun p => declared.startsWith p) then
+          .ok declared
+        else
+          .error s!"the repository's .orchestra/config.json asks to run in '{declared}', which is not under any of the image prefixes this daemon allows a repository to name ({String.intercalate ", " cfg.allowedImagePrefixes.toList}). Pin the repository under execution.options.images instead, or widen allowed_image_prefixes."
 
 /-! ## The pod
 

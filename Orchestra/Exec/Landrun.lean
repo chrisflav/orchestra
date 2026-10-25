@@ -130,7 +130,9 @@ def session : Session where
 def backend : Backend where
   name := "landrun"
   preflight := preflight
-  openSession _ := pure session
+  openSession spec := do
+    spec.noteImageIgnored "landrun"
+    pure session
 
 def factory : BackendFactory where
   name := "landrun"

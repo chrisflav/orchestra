@@ -711,6 +711,12 @@ Fields:
 - `spawn_policy` — what this task may itself put on the queue through the `queue_task` tool, and
   how much of it. Absent means nothing, and the tool is not offered →
   [queueing tasks from inside a task](docs/queue-task.md)
+- `execution_image` — the container image the task runs in, on the `kubernetes` backend, for work
+  that needs tools of its own. It beats the repository's own image and the operator's
+  per-repository pin; on landrun and local it is logged and the task runs on the host as usual.
+  Roles, listener actions, workflow steps (`execution-image`) and API clients take it too →
+  [what is installed, when repositories
+  disagree](docs/kubernetes.md#what-is-installed-when-repositories-disagree)
 
 ## repository-independent tasks
 
@@ -1639,6 +1645,7 @@ something that only queues work should hold. A client is a file, `<config>/clien
   "model": "sonnet",
   "read_only": true,
   "kleis_spec": "reviewer",
+  "execution_image": "ghcr.io/acme/reviewer:1.4",
   "queue_policy": {
     "repos": ["acme/widgets"],
     "models": ["opus"],
@@ -1653,6 +1660,13 @@ something that only queues work should hold. A client is a file, `<config>/clien
   characters (`openssl rand -hex 32`). The client sends it as `Authorization: Bearer <token>`.
 - `backend`, `model`, `tools`, `read_only`, `kleis_spec`, `kleis_narrow` — what a task the client
   queues gets when the request names nothing.
+- `execution_image` — the image the client's tasks run in, on the `kubernetes` backend: for work
+  that needs a tool of its own — a review platform's CLI that its review agents call, say — which
+  has no business in orchestra's default agent image. It beats the repository's image and the
+  operator's per-repository pin, because it says what kind of work this is ([what is installed,
+  when repositories disagree](docs/kubernetes.md#what-is-installed-when-repositories-disagree));
+  on landrun and local it is logged and the tools must be on the host. A request may name another
+  only from `queue_policy.images`.
 - `queue_policy` — a [`spawn_policy`](docs/queue-task.md), with the rules the `queue_task` tool is
   held to: the client's own fields play the spawning task, and the policy says what a request may
   name instead. `max_tasks` and `allow_pre_claim` are refused here: a client has no run to count
@@ -1671,7 +1685,8 @@ curl -X POST -H "Authorization: Bearer $CLIENT_TOKEN" -H 'Content-Type: applicat
 ```
 
 A request may carry `prompt` (required), `goal`, `upstream`, `backend`, `model`, `tools`,
-`budget` (at least 0.01), `issue_number`, `external_id` and `kleis_narrow`; any other field is a
+`budget` (at least 0.01), `issue_number`, `external_id`, `kleis_narrow` and `execution_image`
+(one `queue_policy.images` lists); any other field is a
 `400`, so a `priority` or a `fork` the client believes it set is never silently ignored. What it
 never chooses:
 
@@ -1698,8 +1713,8 @@ pending one. A run a daemon restart interrupted ends `unfinished` and is carried
 id (so is one `orchestra queue retry` picks up after an interrupted run); the entry's
 `continuedBy` names it, and it carries the client's name, so the client may read
 and cancel it too.
-`orchestra queue retry` keeps a client's entries the client's, with the tools, budget and
-read-only flag they were queued with. Every other route answers a client `403`,
+`orchestra queue retry` keeps a client's entries the client's, with the tools, budget, read-only
+flag and image they were queued with. Every other route answers a client `403`,
 and `POST /api/v1/queue` answers the password `403` in turn: the operator queues from a shell, and
 a request made with the password would have no policy to be held to.
 

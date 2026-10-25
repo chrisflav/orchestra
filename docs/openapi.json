@@ -729,7 +729,7 @@
       "post": {
         "tags": ["queue"],
         "summary": "Queue a task, as an API client",
-        "description": "Puts one task on the queue for the API client whose token authenticates the request. A client is a file, `<config>/clients/<name>.json`, holding a bearer token (a `{{secret}}` reference into `secrets.json`) and the bounds on what it may queue: its own `backend`, `model`, `tools`, `read_only`, `kleis_spec` and `kleis_narrow` are what a request inherits when it names nothing, and its `queue_policy` \u2014 a `spawn_policy`, held to the same rules as the `queue_task` tool \u2014 says what a request may name instead. The operator's password cannot use this route: the operator queues from a shell, and a request made with the password would have no policy to be held to.\n\nThe entry is built here and handed to the daemon over its control socket as `add_task`, the message `orchestra queue add` sends. A read-only task works in the upstream itself; a writable one has its fork resolved by the rule every other dispatch path uses. The kleis source is always the client's own; a request may add narrowings and never name another source.\n\n`external_id` makes the request idempotent: the client's id for the work, unique per client. A request naming one the client has already queued answers that entry with `200` and queues nothing, so a client that never received an answer can safely ask again.\n\n`400` for a body the client's policy refuses, naming the field. `403` for the operator's password. `409` when the daemon is not running or refused the entry, or the GitHub App can neither push to the upstream nor fork it. `429` when the client already has `max_active` entries pending or running.",
+        "description": "Puts one task on the queue for the API client whose token authenticates the request. A client is a file, `<config>/clients/<name>.json`, holding a bearer token (a `{{secret}}` reference into `secrets.json`) and the bounds on what it may queue: its own `backend`, `model`, `tools`, `read_only`, `kleis_spec`, `kleis_narrow` and `execution_image` are what a request inherits when it names nothing, and its `queue_policy` \u2014 a `spawn_policy`, held to the same rules as the `queue_task` tool \u2014 says what a request may name instead. The operator's password cannot use this route: the operator queues from a shell, and a request made with the password would have no policy to be held to.\n\nThe entry is built here and handed to the daemon over its control socket as `add_task`, the message `orchestra queue add` sends. A read-only task works in the upstream itself; a writable one has its fork resolved by the rule every other dispatch path uses. The kleis source is always the client's own; a request may add narrowings and never name another source.\n\n`external_id` makes the request idempotent: the client's id for the work, unique per client. A request naming one the client has already queued answers that entry with `200` and queues nothing, so a client that never received an answer can safely ask again.\n\n`400` for a body the client's policy refuses, naming the field. `403` for the operator's password. `409` when the daemon is not running or refused the entry, or the GitHub App can neither push to the upstream nor fork it. `429` when the client already has `max_active` entries pending or running.",
         "operationId": "queueTask",
         "requestBody": {
           "required": true,
@@ -749,7 +749,8 @@
                   "budget": { "type": "number", "minimum": 0.01, "description": "USD, at least 0.01 and at most the policy's `max_budget`, which is also the default. Refused when the policy sets none." },
                   "issue_number": { "type": "integer", "minimum": 0, "description": "The GitHub issue or pull request of `upstream` the task is about; it is the `task_issue` fact on the task's kleis token." },
                   "external_id": { "type": "string", "minLength": 1, "maxLength": 200, "description": "The client's own id for this work, unique per client." },
-                  "kleis_narrow": { "type": "array", "items": { "type": "string" }, "description": "Narrowings added to the client's own on the task's kleis token." }
+                  "kleis_narrow": { "type": "array", "items": { "type": "string" }, "description": "Narrowings added to the client's own on the task's kleis token." },
+                  "execution_image": { "type": "string", "minLength": 1, "maxLength": 512, "description": "The image the task runs in on the `kubernetes` backend: one the policy's `images` lists. Omitted, the client file's own `execution_image`, or none. A task's image beats the repository's own and the operator's per-repository pin." }
                 }
               }
             }
@@ -1884,7 +1885,7 @@
       "QueueEntry": {
         "type": "object",
         "description": "Work waiting or running. Becomes a Task when it is claimed; `taskId` is that run.",
-        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity", "apiClient", "externalId"],
+        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity", "apiClient", "externalId", "executionImage"],
         "properties": {
           "id": { "type": "string" },
           "status": { "$ref": "#/components/schemas/QueueStatus" },
@@ -1902,7 +1903,8 @@
           "spawnedBy": { "type": ["string", "null"], "description": "The task that queued this entry with the `queue_task` tool, when one did. Without it an entry that appeared out of a running agent's turn is indistinguishable from one a person added." },
           "identity": { "type": ["string", "null"], "description": "The identity this entry is performed under: the name of a directory under `<config>/identities/`. It gives the run a memory of its own and, where the record carries a taxis token, makes the run's tracker writes come from that identity rather than from orchestra." },
           "apiClient": { "type": ["string", "null"], "description": "The API client that queued this entry over HTTP (`POST /api/v1/queue`), when one did." },
-          "externalId": { "type": ["string", "null"], "description": "The client's own id for this entry, unique per client." }
+          "externalId": { "type": ["string", "null"], "description": "The client's own id for this entry, unique per client." },
+          "executionImage": { "type": ["string", "null"], "description": "The image the entry's task runs in, when whatever queued it named one. On the `kubernetes` backend it beats the repository's own image and the operator's per-repository pin; on landrun and local it is logged and the task runs on the host." }
         }
       },
       "Task": {
@@ -2076,12 +2078,13 @@
           "allow_pre_claim": { "type": "boolean", "default": false, "description": "Whether the tool may claim the issue it binds, taking it out of every dispatcher's candidate set until the queued task ends." },
           "max_budget": { "type": "number", "description": "Ceiling in USD, and the budget a queued task gets when the agent names none. A budget over it is refused with the ceiling in it rather than silently lowered. Absent means the agent may not name a budget at all \u2014 closed like every other field \u2014 and a queued task takes orchestra's own default." },
           "priority": { "type": "integer", "default": 10, "description": "Priority of the queued task. Operator-set; the agent has no say, since a priority is only meaningful against every other entry in the queue." },
-          "read_only": { "type": "boolean", "description": "Whether the queued task's workspace is mounted read-only. Absent inherits the queueing task's own answer, so an empty policy cannot hand a read-only task a read-write child." }
+          "read_only": { "type": "boolean", "description": "Whether the queued task's workspace is mounted read-only. Absent inherits the queueing task's own answer, so an empty policy cannot hand a read-only task a read-write child." },
+          "images": { "type": "array", "items": { "type": "string" }, "description": "Images (`execution_image`) a queued task may run in. Empty: only the queueing task's own. An exact list, since a task's image beats the operator's per-repository pin." }
         }
       },
       "Role": {
         "type": "object",
-        "required": ["name", "permissions", "backend", "model", "priority", "readOnly", "budgetUsd", "dispatch", "spawnPolicy"],
+        "required": ["name", "permissions", "backend", "model", "priority", "readOnly", "budgetUsd", "dispatch", "spawnPolicy", "executionImage"],
         "description": "A global role, as the API renders it.",
         "properties": {
           "name": { "type": "string" },
@@ -2092,7 +2095,8 @@
           "readOnly": { "type": "boolean" },
           "budgetUsd": { "type": ["number", "null"] },
           "dispatch": { "$ref": "#/components/schemas/DispatchPolicy" },
-          "spawnPolicy": { "$ref": "#/components/schemas/SpawnPolicy" }
+          "spawnPolicy": { "$ref": "#/components/schemas/SpawnPolicy" },
+          "executionImage": { "type": ["string", "null"], "description": "The image every task dispatched for this role runs in." }
         }
       },
       "RoleDetail": {
@@ -2182,7 +2186,7 @@
       "ListenerAction": {
         "type": "object",
         "description": "The task a listener enqueues when its source matches.",
-        "required": ["mode", "upstream", "fork", "series", "backend", "model", "workflowPath", "priority", "promptTemplate", "spawnPolicy"],
+        "required": ["mode", "upstream", "fork", "series", "backend", "model", "workflowPath", "priority", "promptTemplate", "spawnPolicy", "executionImage"],
         "properties": {
           "mode": { "type": "string", "enum": ["fork", "pr"] },
           "upstream": { "type": "string" },
@@ -2193,7 +2197,8 @@
           "workflowPath": { "type": ["string", "null"], "description": "Set when the listener enqueues a whole concert." },
           "priority": { "type": "integer" },
           "promptTemplate": { "type": "string" },
-          "spawnPolicy": { "$ref": "#/components/schemas/SpawnPolicy" }
+          "spawnPolicy": { "$ref": "#/components/schemas/SpawnPolicy" },
+          "executionImage": { "type": ["string", "null"], "description": "The image the tasks this listener queues run in, and its workflow's steps that name none." }
         }
       },
       "IssueCounts": {

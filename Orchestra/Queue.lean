@@ -232,6 +232,14 @@ structure QueueEntry where
       answers the entry already there rather than queueing a second, so a client that retries a
       request whose answer it never received cannot double the work. -/
   externalId : Option String := none
+  /-- The image the entry's task runs in (`Config.IOTask.executionImage`), when whatever queued it
+      named one: a task file, a role, a listener action, a workflow step, or — bounded by their
+      policy's `images` — an agent's `queue_task` and an API client's request.
+
+      On the entry rather than looked up again at launch, like the rest of what decides how the
+      task runs: the role or listener it came from may have been edited by then, and a retry or a
+      restart resume of the same work needs the same tools as the run it continues. -/
+  executionImage : Option String := none
 
 /-- The pool this entry draws its workspace slot from.
 
@@ -295,6 +303,7 @@ instance : ToJson QueueEntry where
     let fields := if let some r := e.scopeRoot    then fields ++ [("scope_root",    ToJson.toJson r)]  else fields
     let fields := if let some s := e.apiClient    then fields ++ [("api_client",    Json.str s)]      else fields
     let fields := if let some s := e.externalId   then fields ++ [("external_id",   Json.str s)]      else fields
+    let fields := if let some s := e.executionImage then fields ++ [("execution_image", Json.str s)]  else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -355,13 +364,15 @@ instance : FromJson QueueEntry where
     let scopeRoot    := j.getObjValAs? Taxis.IssueId "scope_root" |>.toOption
     let apiClient    := j.getObjValAs? String "api_client"       |>.toOption
     let externalId   := j.getObjValAs? String "external_id"      |>.toOption
+    let executionImage := j.getObjValAs? String "execution_image" |>.toOption
     return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec, kleisNarrow,
              authSource, resolvedAuthSource, authSources, authMode, tools,
              readOnly, priority, concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
-             listenerName, spawnPolicy, spawnedBy, scopeRoot, apiClient, externalId }
+             listenerName, spawnPolicy, spawnedBy, scopeRoot, apiClient, externalId,
+             executionImage }
 
 -- Directories and paths
 
@@ -448,7 +459,8 @@ def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
     spawned_by           := e.spawnedBy
     scope_root           := Store.issueIdColumn e.scopeRoot
     api_client           := e.apiClient
-    external_id          := e.externalId }
+    external_id          := e.externalId
+    execution_image      := e.executionImage }
 
 /-- The entry a row holds, or why this build cannot read it.
 
@@ -529,7 +541,8 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
            spawnedBy := row.spawned_by
            scopeRoot
            apiClient := row.api_client
-           externalId := row.external_id }
+           externalId := row.external_id
+           executionImage := row.execution_image }
 
 /-- The concert run as a row of the `concert_run` table. -/
 def ConcertRun.toRow (r : ConcertRun) : Store.ConcertRunRow :=
@@ -1338,10 +1351,12 @@ structure ResumeFacts where
 
     The new entry is the same work by the same somebody, as `orchestra queue retry` builds it, and
     a little more of it — the issue, project, role and tool settings too, since a resume is not a
-    new decision about any of them. `authSource` is carried, because it is what whoever queued the
-    work asked for; `resolvedAuthSource`, the account the daemon picked for the dead run, is not,
-    so a resume is not pinned to an account that may be at its limit now. `spawnPolicy` is carried
-    too: an orchestrating agent resumed without `queue_task` could not finish what it was doing.
+    new decision about any of them. `executionImage` is carried with them: the conversation being
+    resumed was had with the tools that image holds, and it would go on to call them.
+    `authSource` is carried, because it is what whoever queued the work asked for;
+    `resolvedAuthSource`, the account the daemon picked for the dead run, is not, so a resume is
+    not pinned to an account that may be at its limit now. `spawnPolicy` is carried too: an
+    orchestrating agent resumed without `queue_task` could not finish what it was doing.
     Its `max_tasks` is counted per spawning task id, so the resume — a new task id — starts a fresh
     allowance; at most `maxRestartResumes` of them a chain, which is the bound on that.
     Deliberately not carried:
@@ -1406,7 +1421,53 @@ def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (facts :
     listenerName  := entry.listenerName
     spawnPolicy   := entry.spawnPolicy
     scopeRoot     := entry.scopeRoot
-    apiClient     := entry.apiClient }
+    apiClient     := entry.apiClient
+    executionImage := entry.executionImage }
+
+/-- The entry `orchestra queue retry` queues for `entry`, continuing from `continuesFrom` — which
+    the caller decides, since it takes the task store to know whether the dead run left a
+    conversation behind.
+
+    A retry is the same work by the same somebody, under the same access and within the same
+    bounds. Without the identity the second half of a run is authored by orchestra and reads a
+    different memory than the first half did; without the kleis source it runs under the default;
+    without the tools, `read_only` and the budget a read-only review comes back as the default — a
+    writable task holding `create_pr`, on the default budget; without `apiClient` an entry a
+    client queued comes back as one the client can neither see nor cancel; and without
+    `executionImage` a task that needs a CLI only its image carries comes back in the default
+    image and fails at the first call to it.
+
+    Narrower than `resumeEntryFor`, deliberately: a retry is a person deciding to run the work
+    again, and the issue, project and role a dispatcher bound it to are the dispatcher's to bind
+    again, not the retry's. -/
+def retryEntryFor (entry : QueueEntry) (continuesFrom : Option String) (id createdAt : String) :
+    QueueEntry :=
+  { id, createdAt
+    repo         := entry.repo
+    mode         := entry.mode
+    prompt       := entry.prompt
+    goal         := entry.goal
+    agent        := entry.agent
+    systemPrompt := entry.systemPrompt
+    backend      := entry.backend
+    model        := entry.model
+    continuesFrom
+    series       := entry.series
+    configPath   := entry.configPath
+    priority     := entry.priority
+    identity     := entry.identity
+    kleisToken    := entry.kleisToken
+    kleisSpec     := entry.kleisSpec
+    kleisRoleSpec := entry.kleisRoleSpec
+    kleisNarrow   := entry.kleisNarrow
+    tools         := entry.tools
+    readOnly      := entry.readOnly
+    budget        := entry.budget
+    memory        := entry.memory
+    issueNumber   := entry.issueNumber
+    prLabels      := entry.prLabels
+    apiClient     := entry.apiClient
+    executionImage := entry.executionImage }
 
 /-- Queue a restart resume (`resumeEntryFor`) for each entry recorded in `interruptedFile`, and
     answer how many were queued. The caller decides whether to call this at all: only with

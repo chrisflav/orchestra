@@ -881,6 +881,7 @@ its workspace; it will start from a clean checkout."
         triageRemoveLabels := entry.triageRemoveLabels
         spawnPolicy        := entry.spawnPolicy
         scopeRoot          := entry.scopeRoot
+        executionImage     := entry.executionImage
       }
     }
     -- If this entry holds a pre-claimed issue, release it back to open on any
@@ -1319,6 +1320,8 @@ holding the rest of this tick until the window moves"
                   -- The action's kleis spec and narrowings hold of every task the workflow runs.
                   let prog := prog.withListenerKleis liveCfg.action.kleisSpec
                     liveCfg.action.kleisNarrow
+                  -- And its image, for the steps that name none of their own.
+                  let prog := prog.withListenerImage liveCfg.action.executionImage
                   let jsonVars := vars.map fun (k, value) => (k, Lean.Json.str value)
                   let concert := Workflow.WorkflowProgram.toConcert prog jsonVars
                   IO.println s!"  Listener '{name}': starting concert from {resolvedPath}"

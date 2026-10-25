@@ -517,7 +517,11 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     -- Provenance for an entry queued over HTTP (`Orchestra.ApiClient`), and the client's own id
     -- for it.
     ("apiClient",      optStr e.apiClient),
-    ("externalId",     optStr e.externalId)
+    ("externalId",     optStr e.externalId),
+    -- The image the entry's task runs in, where whatever queued it named one: on a cluster this
+    -- beats the repository's own and the operator's pin, so it is what explains a pod running
+    -- something other than either (`Kubernetes.imageFor`).
+    ("executionImage", optStr e.executionImage)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
@@ -948,7 +952,8 @@ private def actionJson (a : Listener.ActionConfig) : Json :=
     ("promptTemplate", a.promptTemplate),
     -- Beside the role view's own `spawnPolicy`, and for the same reason: this is the field that
     -- says what the tasks a listener queues may themselves put on the queue.
-    ("spawnPolicy",    ToJson.toJson a.spawnPolicy)
+    ("spawnPolicy",    ToJson.toJson a.spawnPolicy),
+    ("executionImage", optStr a.executionImage)
   ]
 
 private def listenerDetailApi (name : String) : IO (Option Json) := do
@@ -1015,7 +1020,8 @@ private def roleSummaryJson (r : Project.Role) : Json :=
     ("dispatch",    dispatchJson r.dispatch),
     -- Verbatim, like `dispatch` above: a client cannot edit what it cannot fetch, and this is
     -- the field that says what a role's agents may put on the queue themselves.
-    ("spawnPolicy", ToJson.toJson r.spawnPolicy)
+    ("spawnPolicy", ToJson.toJson r.spawnPolicy),
+    ("executionImage", optStr r.executionImage)
   ]
 
 private def rolesApi (p : Page) : IO Json := do

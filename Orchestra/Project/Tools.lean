@@ -426,7 +426,11 @@ def queueTaskToolDef : Json :=
         , ("kleis_narrow", strArrayProp
             ("Only under kleis: narrowings of the queued task's access, one per service, in " ++
              "the form \"mail: only read, flag\". It always has at most the access this task " ++
-             "has; this takes more away. Default: none beyond this task's own.")) ]
+             "has; this takes more away. Default: none beyond this task's own."))
+        , ("execution_image", strProp
+            ("The container image to run it in, where orchestra runs tasks in images — for " ++
+             "work that needs tools only that image has. Default: the same as this task's, " ++
+             "or else whatever its repository runs in.")) ]
         ["prompt"]) ]
 
 /-- Tool definition for `project_info`, exposed separately because it is
@@ -667,8 +671,10 @@ def tryParseToolCall (name : String) (args : Json) : Option (Except String Proje
         | .ok _     => args.getObjValAs? Bool "pre_claim"
       -- Strict too: a narrowing dropped here hands the queued task more than the agent meant to.
       let kleisNarrow ← parseKleisNarrow? args
+      -- Checked for being an image reference here, and against the policy's `images` later.
+      let executionImage ← parseExecutionImage? args
       return .queueTask { prompt, backend, model, tools, repo, budget, issueId, preClaim,
-                          kleisNarrow }
+                          kleisNarrow, executionImage }
   | "project_info" => some (.ok .projectInfo)
   | _ => none
 

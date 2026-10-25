@@ -325,4 +325,27 @@ def orchestraGrants (spec : RunSpec) : Array PathGrant :=
 
 end RunSpec
 
+/-- Why `ref` cannot be the image a task runs in, or `none` when it can.
+
+    Not a parse of the OCI grammar — the registry is the authority on that, and a reference this
+    accepts and the registry rejects fails as an unstartable pod with the registry's own message.
+    What it is for is the strings that end up in a pod manifest without an operator having typed
+    them into this daemon's configuration: what a repository asks for in its
+    `.orchestra/config.json`, and a task's own `execution_image`, which a task file, a role, a
+    listener action, a workflow step, an agent's `queue_task` or an API client's request can set.
+    A name with a space, a quote or a newline in it is refused where it is read rather than turned
+    into a manifest field.
+
+    Lives here, beside `RunSpec`, rather than with the one backend that reads images: the task
+    configuration that carries an image is read long before any backend is chosen, and checking it
+    there is what reports a typo when the task file is read instead of after the task has been
+    dispatched. -/
+def imageRefError? (ref : String) : Option String :=
+  if ref.isEmpty then some "an image reference is empty"
+  else if ref.length > 512 then
+    some s!"'{(ref.take 40).toString}…' is longer than 512 characters, which no image reference is"
+  else if ref.all (fun c => c.isAlphanum || c == '.' || c == '_' || c == '-' || c == '/' ||
+      c == ':' || c == '@') then none
+  else some s!"'{ref}' is not an image reference (letters, digits and . _ - / : @ only)"
+
 end Orchestra.Exec

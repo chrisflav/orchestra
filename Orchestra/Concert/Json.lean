@@ -34,6 +34,7 @@ instance {i o : ResultType} : ToJson (IOTask i o) where
     , ("series",        ToJson.toJson t.series)
     , ("pr_labels",     ToJson.toJson t.prLabels)
     , ("spawn_policy",  ToJson.toJson t.spawnPolicy)
+    , ("execution_image", ToJson.toJson t.executionImage)
     , ("input_type",    ToJson.toJson i)
     , ("output_type",   ToJson.toJson o)
     ]
@@ -62,9 +63,10 @@ instance {i o : ResultType} : FromJson (IOTask i o) where
       | .ok v => parseKleisSpec? (Json.mkObj [("kleis_spec", v)]) "kleis_role_spec"
       | .error _ => pure none
     let kleisNarrow  ← parseKleisNarrow? j
+    let executionImage ← parseExecutionImage? j
     return { repo, mode, prompt, agent, systemPrompt, backend, model,
              budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec, kleisNarrow,
-             authSource, tools, readOnly, series, prLabels, spawnPolicy }
+             authSource, tools, readOnly, series, prLabels, spawnPolicy, executionImage }
 
 /-- Serialize a `Concert α` to JSON.
     For `run` nodes, the task spec is computed from the current input and the continuation is

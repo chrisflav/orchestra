@@ -127,6 +127,11 @@ structure Role where
       role is also the right granularity for it — "a planner may queue implementors" is a
       statement about planners, not about the listener that happens to dispatch them. -/
   spawnPolicy    : Option SpawnPolicy := none
+  /-- The image every task dispatched for this role runs in (`Config.IOTask.executionImage`), on a
+      backend that runs tasks in images. On the role because the kind of work is what a role is:
+      a reviewer that has to drive a review platform's CLI needs it on every repository it is
+      dispatched to, which is why this beats the operator's per-repository pin. -/
+  executionImage : Option String := none
 deriving Repr, Inhabited
 
 instance : ToJson Role where
@@ -148,6 +153,7 @@ instance : ToJson Role where
     let f := if !r.kleisNarrow.isEmpty        then f ++ [("kleis_narrow",   ToJson.toJson r.kleisNarrow)] else f
     let f := if let some d := r.dispatch      then f ++ [("dispatch",       ToJson.toJson d)] else f
     let f := if let some p := r.spawnPolicy   then f ++ [("spawn_policy",   ToJson.toJson p)] else f
+    let f := if let some i := r.executionImage then f ++ [("execution_image", Json.str i)] else f
     Json.mkObj f
 
 instance : FromJson Role where
@@ -170,9 +176,10 @@ instance : FromJson Role where
     -- Strict for the same reason: each decides what the role's tasks may reach.
     let kleisSpec     ← parseKleisSpec? j
     let kleisNarrow   ← parseKleisNarrow? j
+    let executionImage ← parseExecutionImage? j
     return { name, permissions, backend, model, systemPrompt, prependPrompt
            , readOnly, priority, budget, promptTemplate, identity, kleisSpec, kleisNarrow
-           , dispatch, spawnPolicy }
+           , dispatch, spawnPolicy, executionImage }
 
 /-! ## Filesystem layout -/
 
