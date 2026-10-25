@@ -1,4 +1,5 @@
 import Orchestra.Exec.Backend
+import Orchestra.Dirs
 
 /-!
 # The landrun backend
@@ -45,6 +46,45 @@ def argv (spec : RunSpec) : Array String := Id.run do
   args := args.push spec.command
   return args ++ spec.args
 
+/-- `path` without trailing slashes, so `/a/b/` and `/a/b` compare equal. -/
+private def trimSlashes (path : String) : String :=
+  let t := (path.dropEndWhile (· == '/')).toString
+  if t.isEmpty then "/" else t
+
+/-- Whether `inner` is `outer` or lies below it, by whole path components. -/
+def pathWithin (inner outer : String) : Bool :=
+  let i := trimSlashes inner
+  let o := trimSlashes outer
+  i == o || o == "/" || i.startsWith (o ++ "/")
+
+/-- `grants` without any that would reach into one of `guarded` — orchestra's own data and
+    configuration directories — and the ones taken out, for the caller to say so.
+
+    The data directory holds every slot and cache clone of every repository (another
+    repository's code, private ones included), every task's log, the queue's control socket, the
+    dashboard's password (`dashboard.secret`) and, in a local install, the database; the
+    configuration directory holds `secrets.json`, the API clients and the GitHub App's settings.
+    An agent has no business reading any of it. A grant is taken out when it is one of those
+    directories, lies inside one, or contains one — `~/.local`, `~/.config`, `/home` — since a
+    Landlock rule on a directory covers everything below it, and Landlock has no way to carve an
+    exception out of a rule once granted. Better an agent that is missing a path, which says so,
+    than one that can read the operator's secrets.
+
+    What orchestra grants of its own (`Provenance.orchestra`) is kept: the task's own checkout,
+    its plugins and its memories live under these directories by design, and are exactly what
+    the task is meant to reach. -/
+def withoutGuarded (grants : Array PathGrant) (guarded : Array String) :
+    Array PathGrant × Array PathGrant :=
+  grants.partition fun g =>
+    g.from_ == .orchestra ||
+      !guarded.any fun d => pathWithin g.path d || pathWithin d g.path
+
+/-- The directories no agent grant may reach (`withoutGuarded`): orchestra's data and
+    configuration directories as this process resolves them. -/
+def guardedDirs : IO (Array String) := do
+  return #[(← Dirs.dataBase).toString, (← Dirs.orchestraConfigDir).toString,
+           (← Dirs.configBase).toString]
+
 /-- `spec` with its grants resolved against this machine's `$HOME` and cut down to the paths that
     are actually here.
 
@@ -54,8 +94,14 @@ def argv (spec : RunSpec) : Array String := Id.run do
     nothing in the log pointing at the cause. -/
 def usable (spec : RunSpec) (warn : Bool := true) : IO RunSpec := do
   let resolved := spec.resolveGrants (← hostHome)
+  let (allowed, refused) := withoutGuarded resolved.grants (← guardedDirs)
+  if warn then
+    for g in refused do
+      IO.eprintln s!"  [sandbox] warning: not granting {g.path}: it is or contains orchestra's \
+own data or configuration directory, which holds other repositories' clones, task logs and \
+credentials. Grant a narrower path instead."
   let mut kept : Array PathGrant := #[]
-  for g in resolved.grants do
+  for g in allowed do
     if ← System.FilePath.pathExists (System.FilePath.mk g.path) then
       kept := kept.push g
     else if g.required && warn then

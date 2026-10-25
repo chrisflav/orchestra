@@ -54,14 +54,21 @@ def opencode : AgentDef where
   command := "opencode"
   sandboxPaths := {
     rox     := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix", "/run", "/run/current-system/sw/bin"]
-    ro      := [
-      "/etc", "/run", "/dev", "/proc", "/sys",
-      -- bad, needs to probably be fixed in opencode itself
-      "/home"
-    ]
+    -- Not `/home`, which this list used to grant read-only for opencode's sake: it is every user's
+    -- home, orchestra's data and configuration directories among them, and any `~/.ssh`. The
+    -- sandbox would refuse it now anyway (`Landrun.withoutGuarded`); an opencode that needs
+    -- something there needs it named.
+    ro      := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw      := ["/dev/null"]
-    homeRox := [".local"]
-    homeRw  := [".config/opencode", ".gitconfig", ".local/share/opencode"]
+    -- `~/.local/bin` and `~/.local/lib` (an npm prefix of `~/.local`), and the per-user install
+    -- opencode's own script makes. Never `.local` whole: it holds orchestra's own data directory.
+    -- Git's global configuration is read, never written: the daemon runs `git` as the same user,
+    -- outside the sandbox, so an agent that could set `core.hooksPath` or a `url.*.insteadOf`
+    -- there would run code, or redirect a fetch, on the daemon's next clone or checkout. And no
+    -- `~/.config/gh`: its `hosts.yml` is the operator's own GitHub login, and the agent's `gh`
+    -- authenticates with the `GH_TOKEN` orchestra gives it.
+    homeRox := [".local/bin", ".local/lib", ".opencode", ".gitconfig", ".config/git"]
+    homeRw  := [".config/opencode", ".local/share/opencode"]
     homeRwx := [".elan", ".cache"]
     extraPorts := [4096]
   }
