@@ -216,7 +216,7 @@ by task {e.taskId}"
 private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : String)
     (ioTask : IOTask i o)
     (repoPath : System.FilePath) (initialRecord : TaskStore.TaskRecord)
-    (identity : Option Identity.Identity) : IO Unit := do
+    (identity : Option Identity.Identity) (scripts : Option RepoConfig.Scripts) : IO Unit := do
   IO.println "  [merger] merge backend"
   -- Bound only to be validated: the merger reaches the issue through `findIssue` below, but a
   -- task arriving here without a project is malformed and should say so rather than fail later
@@ -236,8 +236,10 @@ private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : S
     { cmd := "gh"
       args := #["pr", "checkout", toString pr.number, "--repo", pr.repo.toString]
       cwd  := repoPath
-      -- This task's own token, not whatever `gh` last had logged in globally.
-      env  := #[("GH_TOKEN", some token), ("GITHUB_TOKEN", some token)]
+      -- This task's own token, not whatever `gh` last had logged in globally; and the git it
+      -- runs in a slot an agent has had is pinned like the daemon's own (`Repo.hardeningEnv`).
+      env  := (← Repo.hardeningEnv (some repoPath)) ++
+        #[("GH_TOKEN", some token), ("GITHUB_TOKEN", some token)]
       stdout := .piped
       stderr := .piped }
   let _ ← coChild.stdout.readToEnd
@@ -251,7 +253,9 @@ private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : S
   -- The environment is opened *after* the checkout, not before it: a backend that runs things
   -- elsewhere copies the tree at that moment, and a copy taken before `gh pr checkout` would be
   -- of the branch the merger is not merging.
-  let repoConfig ← RepoConfig.loadRepoConfig repoPath
+  -- The default branch's `validation.sh` (`RepoConfig.Scripts`), copied before the checkout: the
+  -- pull request being merged must not get to decide how it is validated.
+  let repoConfig ← RepoConfig.loadRepoConfig scripts
   let session ← execBackend.openSession {
     workdir := repoPath
     grants  := #[{ path := repoPath.toString, access := .rwx, required := true
@@ -260,7 +264,7 @@ private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : S
     repo    := some pr.repo.toString
     image   := repoConfig.image }
   let (valid, validOutput) ← try
-      RepoConfig.runValidation session repoPath
+      RepoConfig.runValidation session repoPath scripts
     finally
       session.close
   if !validOutput.isEmpty then
@@ -854,8 +858,22 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
           let p ← Repo.ensureAdhocWorkspace (occupant := some taskId) (resumeFrom := continuesFrom)
           IO.println s!"  Workspace at {p}"
           pure p
-  -- A per-task checkout is this task's alone, and goes when the task does — however it ends.
-  let removeTaskCheckout : IO Unit := if taskCheckout then Repo.removeTaskDir repoPath else pure ()
+  -- The repository's scripts and `config.json`, as its default branch has them, copied where only
+  -- the daemon reaches before any agent runs (`RepoConfig.Scripts`). Everything below reads them
+  -- from the copy, never from the checkout the agent writes. A task with no repository has none:
+  -- a script an agent left in a scratch workspace is not the repository's.
+  let scripts : Option RepoConfig.Scripts ← match ioTask.repo with
+    | some _ =>
+      try RepoConfig.Scripts.prepare repoPath taskId
+      catch e => do
+        if taskCheckout then Repo.removeTaskDir repoPath
+        throw e
+    | none => pure none
+  -- A per-task checkout is this task's alone, and goes when the task does — however it ends. So
+  -- does the copy of the scripts.
+  let removeTaskCheckout : IO Unit := do
+    RepoConfig.Scripts.discard taskId
+    if taskCheckout then Repo.removeTaskDir repoPath
   -- 3. Open the environment this task runs in.
   --
   -- One session for the whole task, not one per agent launch, because a task is not one command:
@@ -880,7 +898,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- with all other backends but skips the MCP server and the agent — and opens its own
   -- environment for the validation script, once the branch it is merging is checked out.
   if ioTask.backend == some "merger" then
-    try runMerger execBackend token ioTask repoPath initialRecord identity
+    try runMerger execBackend token ioTask repoPath initialRecord identity scripts
     finally removeTaskCheckout
     return ((taskId, ← finalStatusOf taskId), none, none)
   -- What the session is opened with. The grants are the same ones the agent's own launch will be
@@ -905,7 +923,7 @@ def runIOTask {i o : ResultType} (appConfig : AppConfig) (ioTask : IOTask i o)
   -- Read before the environment is opened, because one of the things it says is which environment
   -- to open: what a task needs installed is a property of the repository, and the repository is
   -- where that is written down.
-  let repoConfig ← RepoConfig.loadRepoConfig repoPath
+  let repoConfig ← RepoConfig.loadRepoConfig scripts
   -- Where build output carried between task chains lives for this repository, on a backend that
   -- keeps workspaces. See `Exec.SessionSpec.seedDir`.
   let seedDir ← if persistent then ioTask.repo.mapM (Repo.seedPath ·.fork) else pure none
@@ -1171,7 +1189,7 @@ handed to the next daemon"
     -- that had got past it does not run it again.
     if reattach.all (·.state.phase == .init) then
       recordStep .init 0
-      RepoConfig.runInitIfNeeded session repoPath (runId := some (stepRunId "init"))
+      RepoConfig.runInitIfNeeded session repoPath scripts (runId := some (stepRunId "init"))
     -- 6. Validation loop: before.sh → agent → validation.sh, retry on failure
     let baseSystemPrompt ← loadSystemPrompt ioTask.systemPrompt
     -- Ordered: what the operator wrote, then who the agent is, then the directories it may write
@@ -1204,8 +1222,8 @@ handed to the next daemon"
     let mut lastResultSubtype : Option StreamFormat.ResultSubtype := none
     -- A task picked up at a retry needs the validation output that retry's prompt quotes. It is in
     -- the pod, in the run of the attempt before (`validate-<k>`), which this replays.
-    if firstAttempt > 0 && (← RepoConfig.hasValidationScript repoPath) then
-      let (_, out) ← RepoConfig.runValidation session repoPath
+    if firstAttempt > 0 && (← RepoConfig.hasValidationScript scripts) then
+      let (_, out) ← RepoConfig.runValidation session repoPath scripts
         (runId := some (stepRunId "validate" (some (firstAttempt - 1))))
       lastValidationOutput := out
     let mut lastAttempt := firstAttempt
@@ -1215,7 +1233,7 @@ handed to the next daemon"
       if attempt < firstAttempt then continue
       lastAttempt := attempt
       recordStep .attempt attempt
-      RepoConfig.runHook session repoPath "before.sh" (runId := some (stepRunId "before" (some attempt)))
+      RepoConfig.runHook session repoPath scripts "before.sh" (runId := some (stepRunId "before" (some attempt)))
       let prompt :=
         if attempt == 0 then baseTaskPrompt
         else repoConfig.validation.retryPrompt.replace "{{validation_output}}" lastValidationOutput
@@ -1271,11 +1289,11 @@ handed to the next daemon"
           Usage.markLimited backendName label ioTask.model "agent reported a usage limit"
             (resetHint := result.rateLimitReset)
         break
-      if !(← RepoConfig.hasValidationScript repoPath) then
+      if !(← RepoConfig.hasValidationScript scripts) then
         IO.println "  No validation script found, skipping validation."
         break
       IO.println "  Running validation script..."
-      let (valid, validationOutput) ← RepoConfig.runValidation session repoPath
+      let (valid, validationOutput) ← RepoConfig.runValidation session repoPath scripts
         (runId := some (stepRunId "validate" (some attempt)))
       lastValidationOutput := validationOutput
       if !validationOutput.isEmpty then
@@ -1289,7 +1307,7 @@ handed to the next daemon"
         IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
     -- 7. Run after hook and shut down MCP server
     recordStep .after lastAttempt
-    RepoConfig.runHook session repoPath "after.sh" (runId := some (stepRunId "after"))
+    RepoConfig.runHook session repoPath scripts "after.sh" (runId := some (stepRunId "after"))
     -- Here as well as in the `finally`, so the agent's tool endpoint is gone before the task's
     -- bookkeeping runs rather than merely by the time the task is over. `shutdownOnce` is what
     -- makes saying it twice safe.

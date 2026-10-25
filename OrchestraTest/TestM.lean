@@ -104,6 +104,13 @@ private def execOn (url stmt : String) : IO Unit := do
       Start a PostgreSQL server and create the database, or point \
       ORCHESTRA_TEST_DATABASE_URL at one."
 
+/-- `Dirs.dataBase` pointed at `root` while `act` runs, with no database behind it: for tests that
+    need only orchestra's data directory on disk (the copy of a repository's scripts, say). -/
+def withTempDataNoDb (root : System.FilePath) (act : IO α) : IO α := do
+  let previous ← Dirs.dataBaseOverride.get
+  Dirs.setDataBaseOverride (some root)
+  try act finally Dirs.setDataBaseOverride previous
+
 /-- Run `act` against an empty data root under `/tmp` and an empty database schema, both named
     after `label`, and remove both after.
 

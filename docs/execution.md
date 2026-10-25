@@ -87,8 +87,16 @@ for in its own `.orchestra/config.json`: what a task needs installed varies by r
 backend that runs tasks in an image of some kind is the one that has to decide which.
 
 For landrun and local there is nothing to open: the checkout is already where the daemon put it,
-and `runScript` is `bash` on this machine, exactly as the task runner did it before sessions
-existed. For a backend that runs the agent elsewhere the session is the whole problem — and the
+and `runScript` is `bash` on this machine (`hostRunScript`).
+
+**The scripts come from the default branch, not the checkout.** The checkout is the agent's to
+write, `.orchestra/` included, so before any agent runs the task runner copies the repository's
+script directory out of the default branch's commit into `<data>/scripts/<task>/`
+(`Repo.snapshotScripts`, `RepoConfig.Scripts`) and reads `config.json` and every script from there.
+A `ScriptSpec` still names the script by its path in the checkout, which is what a pod has, and
+carries the copy as `trusted`; a backend that runs the script on this machine must run the copy
+(`hostRunScript` does). A task checked out at some other commit gets the same treatment, so a pull
+request's head never chooses its own `validation.sh`. For a backend that runs the agent elsewhere the session is the whole problem — and the
 reason `validation.sh` gets asked its question about the tree the agent actually worked on, rather
 than about a copy on a machine with no toolchain.
 
@@ -164,7 +172,7 @@ configuration type learning about any of them.
    summary, and `make`, which builds the backend from `execution.options` or says which key is
    wrong. A backend that needs no settings ignores the argument. Its `openSession` returns the
    session everything else goes through; if the agent runs on this machine, `hostRunScript` is the
-   `runScript` you want, since that is what the task runner always did.
+   `runScript` you want, since it runs `ScriptSpec.trusted` rather than the agent-writable path.
 2. Add it to `Exec.factories` in `Orchestra/Exec.lean`. That is the whole registration: every
    launch path resolves through `Exec.resolve`.
 3. Give `preflight` a real check. It runs once per task, before the clone and the token, and it is

@@ -48,13 +48,70 @@ private def credentialArgs (token : Option String) : Array String :=
          "-c", s!"{credentialConfigKey}=",
          "-c", s!"{credentialConfigKey}={credentialHelperScript}"]
 
-private def runGit (args : Array String) (cwd : Option System.FilePath := none)
+/-! ## Git the daemon runs in a tree an agent wrote
+
+Every clone orchestra prepares is handed to an agent read-write, `.git` included, and the daemon
+runs `git` in it again afterwards, unsandboxed, as the operator: the next task's `resetSlot`, the
+merger's `gh pr checkout`, a continuation's fetch. Git executes things its configuration names —
+hooks, `core.fsmonitor`, `core.askPass`, filter and diff drivers, `ext::` transports — and the
+repository's own `.git/config` is configuration. An agent that planted `core.fsmonitor` in a slot
+ran its payload on the host three times over on the next reset (verified on this host). So two
+layers, either of which would stop that:
+
+* **Every daemon-side git runs with the dangerous settings pinned** (`hardeningArgs`,
+  `hardeningEnv`): no hooks, no fsmonitor, no askpass, no `ext::` transport, no implicit bare
+  repository, no replacement objects, no system config, no prompting, and no walking up out of the
+  directory it was pointed at. The pins go in as `-c` flags on our own invocations and through
+  `GIT_CONFIG_COUNT` in the environment, so the git that `gh` runs on our behalf gets them too.
+* **The repository's own configuration is rewritten from scratch** before the daemon works in a
+  clone an agent may have touched (`resetLocalConfig`): a handful of harmless keys are carried over
+  and everything else — includes, drivers, `core.worktree`, remotes, credential helpers — is
+  dropped, then orchestra's own remotes and helper are written back. A `.git` that is not a plain
+  directory, or that points somewhere else (`commondir`), is not reused at all (`isGitRepo`). -/
+
+/-- The settings pinned on every git the daemon runs; see the section above. -/
+def hardeningConfig : Array (String × String) := #[
+  ("core.hooksPath", "/dev/null"),
+  ("core.fsmonitor", "false"),
+  -- Empty means "do not ask": git skips an askpass program that is set to nothing.
+  ("core.askPass", ""),
+  ("protocol.ext.allow", "never"),
+  ("safe.bareRepository", "explicit")]
+
+/-- `hardeningConfig` as `-c` flags. -/
+def hardeningArgs : Array String :=
+  hardeningConfig.foldl (init := #[]) fun acc (k, v) => acc.push "-c" |>.push s!"{k}={v}"
+
+/-- The environment every daemon-side git runs with, including the git `gh` runs on our behalf:
+    `hardeningConfig` through `GIT_CONFIG_COUNT`, no system configuration, no replacement objects
+    (an agent's `refs/replace/<sha>` would otherwise change what a commit the daemon asks for
+    contains), no prompting — and, when `cwd` is given, no repository discovery above it: an agent
+    that deleted a slot's `.git` would otherwise have the next `git reset --hard` find whatever
+    repository encloses the data directory, the operator's home among them. -/
+def hardeningEnv (cwd : Option System.FilePath := none) : IO (Array (String × Option String)) := do
+  let mut env : Array (String × Option String) := #[
+    ("GIT_CONFIG_NOSYSTEM", some "1"), ("GIT_NO_REPLACE_OBJECTS", some "1"),
+    ("GIT_TERMINAL_PROMPT", some "0"), ("GIT_CONFIG_COUNT", some (toString hardeningConfig.size))]
+  for h : i in [0:hardeningConfig.size] do
+    let (k, v) := hardeningConfig[i]
+    env := env.push (s!"GIT_CONFIG_KEY_{i}", some k) |>.push (s!"GIT_CONFIG_VALUE_{i}", some v)
+  if let some dir := cwd then
+    -- Resolved, because git compares the ceiling with the real working directory.
+    let real ← try IO.FS.realPath dir catch _ => pure dir
+    if let some parent := real.parent then
+      env := env.push ("GIT_CEILING_DIRECTORIES", some parent.toString)
+  return env
+
+/-- Run `git args` in `cwd` as the daemon, with `hardeningArgs` and `hardeningEnv` and, given a
+    token, the credential helper (`credentialArgs`); its trimmed standard output, or a throw
+    carrying its standard error. Every git the daemon runs goes through here. -/
+def runGit (args : Array String) (cwd : Option System.FilePath := none)
     (token : Option String := none) : IO String := do
   let child ← IO.Process.spawn {
     cmd := "git"
-    args := credentialArgs token ++ args
+    args := hardeningArgs ++ credentialArgs token ++ args
     cwd
-    env := tokenEnv token
+    env := (← hardeningEnv cwd) ++ tokenEnv token
     stdout := .piped
     stderr := .piped
   }
@@ -81,7 +138,7 @@ private def runGh (args : Array String) (cwd : Option System.FilePath := none)
     cmd := "gh"
     args
     cwd
-    env := tokenEnv token
+    env := (← hardeningEnv cwd) ++ tokenEnv token
     stdout := .piped
     stderr := .piped
   }
@@ -147,6 +204,51 @@ private def excludeOrchestraArtifacts (repoPath : System.FilePath) : IO Unit := 
   catch e =>
     IO.eprintln s!"  Warning: could not update .git/info/exclude in {repoPath}: {e}"
 
+/-- Keys of a repository's own configuration that `resetLocalConfig` carries over. None of them
+    names a program, a path git would read or write, or a place to fetch from; everything else in
+    the file can, or could in a future git, and is dropped. -/
+private def keptLocalConfig : Array String := #[
+  "core.repositoryformatversion", "core.filemode", "core.logallrefupdates", "core.ignorecase",
+  "core.precomposeunicode", "core.symlinks", "extensions.objectformat", "extensions.refstorage",
+  "user.name", "user.email"]
+
+/-- Rewrite `path`'s own git configuration from scratch: `keptLocalConfig` carried over, `origin`
+    the fork and `upstream` the upstream over HTTPS, and nothing else. Then the credential helper
+    and the excludes are put back (`configureCredentialHelper`, `excludeOrchestraArtifacts`).
+
+    An agent has had `.git` read-write. What it may have left there for the daemon's next git to
+    find — `include.path`, `core.worktree` pointing the next `git clean -fd` at the operator's home,
+    a filter driver the next checkout runs, an askpass or credential helper, a remote URL of its
+    choosing — is in this file or in one this file names, so the file is replaced rather than
+    edited. So are the other places git reads configuration-like state from a repository:
+    `config.worktree`, `info/attributes` and `objects/info/alternates`.
+
+    Reading the old file runs nothing: `git config --file` reads one file and follows no includes.
+    The new one is written next to it and renamed over it, so a failure half way leaves the old
+    one, never a truncated one. -/
+def resetLocalConfig (path : System.FilePath) (fork upstream : Repository) : IO Unit := do
+  let gitDir := path / ".git"
+  let cfg := gitDir / "config"
+  let fresh := gitDir / "config.orchestra-new"
+  try IO.FS.removeFile fresh catch _ => pure ()
+  let set (k v : String) : IO Unit := runGit' #["config", "--file", fresh.toString, k, v]
+  for k in keptLocalConfig do
+    match ← (try some <$> runGit #["config", "--file", cfg.toString, "--get", k]
+             catch _ => pure none) with
+    | some v => set k v
+    | none   => pure ()
+  set "core.bare" "false"
+  set "remote.origin.url" (githubUrl fork)
+  set "remote.origin.fetch" "+refs/heads/*:refs/remotes/origin/*"
+  set "remote.upstream.url" (githubUrl upstream)
+  set "remote.upstream.fetch" "+refs/heads/*:refs/remotes/upstream/*"
+  IO.FS.rename fresh cfg
+  for extra in [gitDir / "config.worktree", gitDir / "info" / "attributes",
+                gitDir / "objects" / "info" / "alternates"] do
+    try IO.FS.removeFile extra catch _ => pure ()
+  configureCredentialHelper path
+  excludeOrchestraArtifacts path
+
 /--
 Ensure the fork is cloned and the upstream remote is configured.
 Returns the path to the local repository.
@@ -196,17 +298,11 @@ def ensureCloned (fork upstream : Repository) (interactive : Bool := true)
         else
           throw (IO.userError s!"Directory '{repoPath}' is not a valid git repository. Remove it manually and try again.")
       else
-        -- Make sure upstream remote exists
-        let remotes ← runGit #["remote"] repoPath
-        let hasUpstream := remotes.splitOn "\n" |>.any (· == "upstream")
-        if !hasUpstream then
-          runGit' #["remote", "add", "upstream", githubUrl upstream] repoPath
-        -- Make sure origin points at the fork HTTPS URL
-        let originUrl ← runGit #["remote", "get-url", "origin"] repoPath
-        let expectedOriginUrl := githubUrl fork
-        if originUrl != expectedOriginUrl then
-          IO.println s!"  Fixing origin URL: {originUrl} → {expectedOriginUrl}"
-          runGit' #["remote", "set-url", "origin", expectedOriginUrl] repoPath
+        -- An existing clone may be one an agent worked in (`orchestra interactive` runs it in
+        -- the cache clone itself), so its configuration is rewritten rather than trusted: the
+        -- remotes come back as the fork and the upstream over HTTPS, and nothing an agent
+        -- planted survives. See `resetLocalConfig`.
+        resetLocalConfig repoPath fork upstream
   else
     IO.FS.createDirAll repoPath
     runGh' #["repo", "clone", fork.toString, repoPath.toString] (token := token)
@@ -230,9 +326,17 @@ def clonePath (fork : Repository) : IO System.FilePath := do
 def slotPath (fork : Repository) (slot : Nat) : IO System.FilePath := do
   return (← workDir) / fork.owner / s!"{fork.name}-slot-{slot}"
 
-/-- Return true if `path` is a git repository with a real `.git` directory. -/
-private def isGitRepo (path : System.FilePath) : IO Bool :=
-  (path / ".git" / "config").pathExists
+/-- Return true if `path` is a git repository orchestra can work in: a real `.git` directory (not
+    a symlink, not a `gitdir:` file), with a real `config` file in it, that is not a linked
+    worktree of some other repository (`commondir`). Anything else in a slot was put there by an
+    agent, and the slot is cloned afresh rather than trusted. -/
+def isGitRepo (path : System.FilePath) : IO Bool := do
+  let isKind (p : System.FilePath) (k : IO.FS.FileType) : IO Bool := do
+    match ← p.symlinkMetadata.toBaseIO with
+    | .ok md => return md.type == k
+    | .error _ => return false
+  return (← isKind (path / ".git") .dir) && (← isKind (path / ".git" / "config") .file)
+    && !(← (path / ".git" / "commondir").pathExists)
 
 /-- File recording which task's working tree currently sits in a slot.
 
@@ -348,13 +452,72 @@ private def slotBaseRef (repoPath : System.FilePath) : IO (Option (String × Str
     if ← refExists repoPath ref then return some (branch, ref)
   return none
 
+/-- Copy the repository's script directory (`.orchestra/`, or the legacy `.agent/`) as the tip of
+    its default branch has it into `dest`, and return which of the two it was; `none` when the
+    default branch has neither.
+
+    The scripts — `init.sh`, `before.sh`, `validation.sh`, `after.sh` and `config.json` — are taken
+    from here and never from the working tree (`RepoConfig.Scripts`). The working tree is the
+    agent's: it can rewrite `validation.sh` to do anything it likes, and then the daemon would run
+    it. A task that checks out some other commit — a pull request's head, a past commit to be
+    scored against — has the same problem without any agent, which is why the copy is of the
+    default branch and not of `HEAD`.
+
+    Read out of the object store by commit, after the daemon's own fetch has just set the upstream
+    refs (`resetSlot`, or the fetch a kept tree gets in `ensureSlot`), with replacement objects off
+    (`hardeningEnv`): neither an edited file nor a planted `refs/replace/` changes what comes out.
+    Called before the agent starts, so there is nothing running that could move the ref between the
+    fetch and the read. `dest` should be a directory only the daemon can reach. -/
+def snapshotScripts (path dest : System.FilePath) : IO (Option String) := do
+  let some (_, ref) ← slotBaseRef path
+    | throw (.userError s!"could not determine the default branch in {path}, so the repository's \
+scripts cannot be taken from it")
+  let commit ← runGit #["rev-parse", "--verify", "--end-of-options", ref ++ "^{commit}"] path
+  for name in [".orchestra", ".agent"] do
+    let listing ← try runGit #["ls-tree", "-d", "--name-only", commit, "--", name] path
+      catch _ => pure ""
+    if listing.isEmpty then continue
+    IO.FS.createDirAll dest
+    let archive ← IO.Process.spawn {
+      cmd := "git", cwd := path, env := ← hardeningEnv path
+      args := hardeningArgs ++ #["archive", "--format=tar", commit, "--", name]
+      stdin := .null, stdout := .piped, stderr := .piped }
+    let errTask ← IO.asTask (prio := .dedicated) archive.stderr.readToEnd
+    let bytes ← archive.stdout.readBinToEnd
+    let archiveErr ← IO.ofExcept (← IO.wait errTask)
+    unless (← archive.wait) == 0 do
+      throw (.userError s!"git archive of {name} at {commit} failed: {archiveErr}")
+    -- Through a file rather than a pipe into tar: the archive is small, and a file has no
+    -- question of when the writing end is closed.
+    let tarFile := System.FilePath.mk s!"{dest}.tar"
+    IO.FS.writeBinFile tarFile bytes
+    let out ← try
+        IO.Process.output {
+          cmd := "tar", args := #["-x", "--no-same-owner", "-C", dest.toString, "-f",
+                                  tarFile.toString] }
+      finally
+        try IO.FS.removeFile tarFile catch _ => pure ()
+    unless out.exitCode == 0 do
+      throw (.userError s!"unpacking {name} at {commit} failed: {out.stderr}")
+    return some name
+  return none
+
+/-- Fetch the upstream's branches and tags into `path`, by URL rather than by remote name: what the
+    daemon fetches is decided here, not by a `remote.upstream.*` an agent may have edited since
+    `resetLocalConfig` last wrote it. -/
+private def fetchUpstream (path : System.FilePath) (upstream : Repository)
+    (token : Option String) : IO Unit :=
+  runGit' #["fetch", githubUrl upstream, "+refs/heads/*:refs/remotes/upstream/*",
+            "+refs/tags/*:refs/tags/*"] path token
+
 /-- Bring a task slot back to a clean state on an up-to-date default branch.
 
     Deliberately `git clean -fd` *without* `-x`: reusing slots rather than recreating them
     exists precisely so that gitignored build output (`.lake/`, `target/`, `node_modules/`)
     survives between tasks. The previous task's tracked modifications and untracked scratch
     files do not. -/
-private def resetSlot (slotPath : System.FilePath) (token : Option String) : IO Unit := do
+private def resetSlot (slotPath : System.FilePath) (upstream : Repository)
+    (token : Option String) : IO Unit := do
   -- Discard the previous task's work before switching branches: a leftover untracked file
   -- that also exists on the target branch would otherwise abort the checkout.
   try runGit' #["reset", "--hard"] slotPath catch _ => pure ()
@@ -367,7 +530,7 @@ private def resetSlot (slotPath : System.FilePath) (token : Option String) : IO 
   -- `upstream/<default>`, so continuing would silently start work from whatever commit the
   -- slot last saw — for a task that will open a pull request, branching off a week-old base
   -- is worse than not running at all.
-  runGit' #["fetch", "upstream"] slotPath token
+  fetchUpstream slotPath upstream token
   match ← slotBaseRef slotPath with
   | some (branch, ref) =>
     -- `-B` rather than `--detach`: a slot is an independent clone with its own ref
@@ -381,15 +544,8 @@ private def resetSlot (slotPath : System.FilePath) (token : Option String) : IO 
 /-- Point a clone made from the cache at the fork and the upstream, with the credential helper and
     the excludes every checkout orchestra prepares carries. Shared by the pooled slots and by the
     per-task checkouts of a backend that keeps workspaces itself. -/
-private def configureClone (fork upstream : Repository) (path : System.FilePath) : IO Unit := do
-  runGit' #["remote", "set-url", "origin", githubUrl fork] path
-  let remotes ← runGit #["remote"] path
-  if remotes.splitOn "\n" |>.any (· == "upstream") then
-    runGit' #["remote", "set-url", "upstream", githubUrl upstream] path
-  else
-    runGit' #["remote", "add", "upstream", githubUrl upstream] path
-  configureCredentialHelper path
-  excludeOrchestraArtifacts path
+private def configureClone (fork upstream : Repository) (path : System.FilePath) : IO Unit :=
+  resetLocalConfig path fork upstream
 
 /-- Ensure task slot `slot` of `fork` exists and is clean, and return its path.
 
@@ -456,8 +612,14 @@ its session refers to."
   if keepTree then
     let pred := assign.resumeFrom.getD "?"
     IO.println s!"  Keeping slot {slot} as-is (continuation of {pred})"
+    -- The tree stays; the upstream refs do not. They are what the repository's scripts are taken
+    -- from (`snapshotScripts`), and the predecessor's agent could have pointed them anywhere. A
+    -- failure leaves them as they were, which is no worse than before: the scripts then run
+    -- confined like the agent.
+    try fetchUpstream sPath upstream token
+    catch e => IO.eprintln s!"  Warning: could not refresh the upstream refs in slot {slot}: {e}"
   else
-    resetSlot sPath token
+    resetSlot sPath upstream token
   -- Stamped after preparation, so a task that dies during `resetSlot` does not leave the slot
   -- claiming to hold a tree it never produced.
   setSlotOccupant sPath assign.occupant
@@ -489,7 +651,7 @@ def ensureTaskCheckout (fork upstream : Repository) (taskId : String)
   IO.println s!"  Preparing a checkout for {taskId} at {path}..."
   runGit' #["clone", "--local", mainPath.toString, path.toString]
   configureClone fork upstream path
-  resetSlot path token
+  resetSlot path upstream token
   return path
 
 

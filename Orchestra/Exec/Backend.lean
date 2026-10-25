@@ -197,6 +197,12 @@ deriving Repr, BEq, Inhabited
 structure ScriptSpec where
   /-- The script, as a path in the checkout. -/
   path : String
+  /-- The daemon's own copy of the directory `path` is in, as the repository's default branch has
+      it (`RepoConfig.Scripts`), when there is one. A backend that runs the script on this machine
+      runs it from here and never from `path`: the checkout is the agent's to write, and a script
+      it rewrote would otherwise run outside its sandbox. A backend that runs the script somewhere
+      the agent is confined anyway (a pod) may run `path` as it always did. -/
+  trusted : Option System.FilePath := none
   /-- Where to run it: the checkout. -/
   workdir : System.FilePath
   /-- `.inherit` for the hooks, whose output belongs in the daemon log as it happens; `.piped` for
@@ -616,17 +622,22 @@ end Handle
     did itself before sessions existed: the hooks inherit the daemon's streams, and
     `validation.sh` has its output captured for the retry prompt. -/
 def hostRunScript (spec : ScriptSpec) : IO ScriptResult := do
+  -- The daemon's copy when there is one (`ScriptSpec.trusted`): never what the agent left in the
+  -- checkout.
+  let path := match spec.trusted, (System.FilePath.mk spec.path).fileName with
+    | some dir, some name => (dir / name).toString
+    | _, _ => spec.path
   match spec.stdio with
   | .inherit =>
     let child ← IO.Process.spawn {
-      cmd := "bash", args := #[spec.path], cwd := spec.workdir
+      cmd := "bash", args := #[path], cwd := spec.workdir
       stdout := .inherit, stderr := .inherit }
     return { exitCode := ← child.wait }
   -- `.stream` never reaches here — a repository's script is run, not conversed with — and is
   -- captured like any other output rather than being a case nobody can hit.
   | .piped | .stream =>
     let child ← IO.Process.spawn {
-      cmd := "bash", args := #[spec.path], cwd := spec.workdir
+      cmd := "bash", args := #[path], cwd := spec.workdir
       stdout := .piped, stderr := .piped }
     -- Both pipes drained at once: a build writing more than a pipe buffer to stderr would
     -- otherwise block there while stdout is read to the end, and never finish.

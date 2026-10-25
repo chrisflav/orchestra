@@ -1268,6 +1268,24 @@ The hooks run wherever the agent runs: on this machine under the default landrun
 inside the task's pod under the `kubernetes` one — `validation.sh` decides whether the agent is
 finished, so it has to see the tree the agent worked on and the toolchain that builds it.
 
+**They come from the default branch.** The checkout is the agent's to write, `.orchestra/`
+included, so the scripts and `config.json` are never read from it. Before any agent runs, orchestra
+copies the script directory out of the default branch's commit (after its own fetch, with
+replacement objects ignored) into a directory only the daemon can reach, and runs every hook from
+that copy, in the checkout as the working directory. A task working on a pull request's head, or on
+any other commit, gets the default branch's scripts too. To change what a hook does, merge the
+change to the default branch.
+
+**Git in an agent's tree.** The daemon runs `git` again in every clone an agent has had. Each of
+those runs pins `core.hooksPath=/dev/null`, `core.fsmonitor=false`, an empty `core.askPass`,
+`protocol.ext.allow=never` and `safe.bareRepository=explicit`, sets `GIT_CONFIG_NOSYSTEM`,
+`GIT_NO_REPLACE_OBJECTS` and a `GIT_CEILING_DIRECTORIES` that stops it walking up out of the clone,
+and passes the pins on to the git `gh` runs. Before reusing a clone, orchestra rewrites its
+`.git/config` from scratch: a few harmless keys are kept, then its own remotes and credential helper
+are written back. `config.worktree`, `info/attributes` and `objects/info/alternates` are removed,
+fetches name the upstream's URL rather than a remote, and a `.git` that is a symlink, a `gitdir:`
+file or a linked worktree is not reused at all.
+
 `execution.image` is how a repository says what it needs installed, for a backend that runs tasks
 in an image; the landrun backend ignores it, since what is installed on the daemon's machine is
 what is installed. It is an ordinary OCI reference, pulled by the cluster with the cluster's own
