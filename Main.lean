@@ -348,6 +348,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
     Throws if the daemon returns an "error" field. -/
 private def daemonRequest (req : Lean.Json) : IO Lean.Json := do
   let socketPath ← Queue.socketFile
+  let req ← DaemonRequest.withToken req
   let conn ← Utils.UnixSocket.Connection.connect socketPath
   conn.sendLine req.compress
   let line ← conn.recvLine

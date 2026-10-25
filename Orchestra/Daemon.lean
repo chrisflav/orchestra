@@ -91,6 +91,8 @@ def handleSocketRequest
     -- Withdraws an entry that is still pending, under the claim lock; see `run`.
     (withdrawPending  : String → IO Bool)
     (interactive      : Interactive.Manager)
+    -- The control-socket token (`Secret.ensureDaemonToken`); a request without it is refused.
+    (token            : String)
     : IO Unit := do
   let residentReply : Except String Interactive.HumanOutcome → IO DaemonRequest.DaemonResponse
     | .ok (.sent seq)        => pure (.withId (toString seq))
@@ -98,11 +100,9 @@ def handleSocketRequest
     | .error e               => pure (.error e)
   try
     let line ← conn.recvLine
-    let response : DaemonRequest.DaemonResponse ← match Lean.Json.parse line with
-      | .error e => pure (.error s!"invalid JSON: {e}")
-      | .ok j    =>
-        match (Lean.FromJson.fromJson? j : Except String DaemonRequest.DaemonRequest) with
-        | .error e => pure (.error s!"invalid request: {e}")
+    let response : DaemonRequest.DaemonResponse ←
+        match DaemonRequest.gate token line with
+        | .error e => pure (.error e)
         | .ok msg  => match msg with
         | .addTask entry =>
           Queue.saveEntry entry
@@ -120,7 +120,7 @@ def handleSocketRequest
                 |>.getD []
               let cfg ← match cfgPath with
                 | none    => pure appConfig
-                | some cp => loadAppConfig (some (System.FilePath.mk cp))
+                | some cp => loadEntryConfig appConfig cp
               let concert := Workflow.WorkflowProgram.toConcert prog varsList
               let run : Queue.ConcertRun := {
                 id           := concertId
@@ -273,7 +273,7 @@ def entrySameExecution (appConfig : AppConfig) (entry : Queue.QueueEntry) : IO B
   match entry.configPath with
   | none    => return true
   | some cp =>
-    try return sameExecutionAs (← loadAppConfig (some (System.FilePath.mk cp))) appConfig
+    try return sameExecutionAs (← loadEntryConfig appConfig cp) appConfig
     catch _ => return false
 
 /-- Forget what task `taskId` recorded for a hand-over that will not happen, revoking the kleis
@@ -614,6 +614,10 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
   -- Socket server: receives control requests (add_task, add_concert, cancel, shutdown).
   let socketPath ← Queue.socketFile
   try Utils.UnixSocket.Server.unlink socketPath catch _ => pure ()
+  -- Before the socket exists, so there is never a moment it answers without one. Every request
+  -- must carry it (`DaemonRequest.gate`): see `Secret.daemonTokenFile` for why the socket's file
+  -- permissions are no protection against an agent.
+  let socketToken ← Secret.ensureDaemonToken
   let socketServerRef ← IO.mkRef (none : Option Utils.UnixSocket.Server)
   let _socketTask ← IO.asTask (prio := .dedicated) do
     try
@@ -626,6 +630,7 @@ uncovered falls back to {if appConfig.pat.isEmpty then "an unset github.pat" els
             reapIfAbandoned
             withdrawPending
             interactive
+            socketToken
     catch _ => pure ()
   -- Signal watcher: turns SIGTERM/SIGINT into the same graceful drain as `queue shutdown`.
   -- Needed because the daemon is PID 1 in the container image, where `docker stop` is the way in
@@ -697,7 +702,7 @@ daemon where they can be, finishing the rest before shutting down."
     -- auth sources that file declares.
     let entryCfg ← match e.configPath with
       | none    => pure appConfig
-      | some cp => try loadAppConfig (some (System.FilePath.mk cp)) catch _ => pure appConfig
+      | some cp => try loadEntryConfig appConfig cp catch _ => pure appConfig
     -- `refresh := false`: this runs under `claimMutex`, and polling stale sources here held the
     -- mutex for hours at a time. The usage poller below keeps the stored numbers current for
     -- `appConfig`'s sources. A source only `entryCfg` declares is never polled here; it learns
@@ -896,7 +901,7 @@ its workspace; it will start from a clean checkout."
       -- entry rather than escaping and taking the worker down with it.
       let entryCfg ← match entry.configPath with
         | none    => pure appConfig
-        | some cp => loadAppConfig (some (System.FilePath.mk cp))
+        | some cp => loadEntryConfig appConfig cp
       -- Preparing the slot sits inside the `try` so that a failure here — a clone that
       -- cannot be created, a fetch that cannot reach GitHub — is reported through the same
       -- path as any other task failure: the entry is marked failed, a pre-claimed issue is

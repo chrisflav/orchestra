@@ -2,6 +2,7 @@ import Lean.Data.Json
 import Orchestra.Queue
 import Orchestra.Interactive.Store
 import Taxis.Domain
+import Orchestra.Secret
 
 open Lean (Json FromJson ToJson)
 
@@ -138,5 +139,33 @@ instance : ToJson DaemonResponse where
     | .withId id  => Json.mkObj [("id",    Json.str  id)]
     | .error msg  => Json.mkObj [("error", Json.str  msg)]
     | .queued i w => Json.mkObj [("queued", Lean.toJson i), ("why", Json.str w)]
+
+/-- The member of every request that carries the daemon's token (`Secret.daemonTokenFile`). -/
+def tokenField : String := "token"
+
+/-- The request on one line read from the control socket, or why it is refused.
+
+    The token is checked before anything else is read, and compared in constant time
+    (`Secret.constantTimeEq`): a request without it, or with the wrong one, is refused whatever it
+    asks for, so an unauthenticated peer learns nothing about which requests exist or how they are
+    parsed. An empty `expected` refuses everything — a daemon that has no token has nothing to
+    compare against, and must not read that as "anything goes". -/
+def gate (expected : String) (line : String) : Except String DaemonRequest := do
+  let j ← (Json.parse line).mapError (s!"invalid JSON: {·}")
+  let presented := (j.getObjValAs? String tokenField).toOption.getD ""
+  unless !expected.isEmpty && Secret.constantTimeEq presented expected do
+    throw "unauthenticated: the request does not carry the daemon's token. Clients read it from \
+daemon.token in orchestra's configuration directory."
+  (FromJson.fromJson? j : Except String DaemonRequest).mapError (s!"invalid request: {·}")
+
+/-- `req` with the daemon's token added, for sending over the control socket. Throws, naming the
+    file, when it cannot be read: a client running as another user, or on a machine whose daemon
+    has never started, gets told so instead of a refusal it cannot explain. -/
+def withToken (req : Json) : IO Json := do
+  match ← Secret.lookupDaemonToken with
+  | some t => return req.setObjVal! tokenField (.str t)
+  | none =>
+    throw (.userError s!"cannot read the queue daemon's token at {← Secret.daemonTokenFile}. It \
+is written by the daemon on its first start; run this as the user the daemon runs as.")
 
 end Orchestra.DaemonRequest

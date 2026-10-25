@@ -17,6 +17,13 @@ def orchestraDataDir : IO System.FilePath := do
   | some x => return System.FilePath.mk x / "orchestra"
   | none   => return (← getHome) / ".local" / "share" / "orchestra"
 
+/-- Optional override for the config base, for tests that need a configuration directory of their
+    own (the daemon's token, a per-entry `config_path`) without touching the operator's. -/
+initialize configBaseOverride : IO.Ref (Option System.FilePath) ← IO.mkRef none
+
+def setConfigBaseOverride (p : Option System.FilePath) : IO Unit :=
+  configBaseOverride.set p
+
 private initialize deprecationWarned : IO.Ref Bool ← IO.mkRef false
 
 /--
@@ -27,6 +34,7 @@ absent but the legacy dir is present. Returns `orchestraConfigDir` on a fresh in
 (neither exists yet).
 -/
 def configBase : IO System.FilePath := do
+  if let some p ← configBaseOverride.get then return p
   let xdgDir ← orchestraConfigDir
   if ← xdgDir.pathExists then return xdgDir
   let legacy := (← getHome) / ".agent"
