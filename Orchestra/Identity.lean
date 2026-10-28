@@ -103,6 +103,12 @@ structure ResidentSpec where
       Its tasks are not the resident: they run under no identity, so their kleis source is
       whatever a task's would be (`kleis.default_spec`), and `max_tasks` is per budget day. -/
   spawnPolicy : Option SpawnPolicy := none
+  /-- The image its pod runs in, on a backend that runs sessions in one (`execution_image`): for a
+      resident whose work needs tools the default agent image does not carry. A resident has no
+      repository to ask for an image, so without this it always runs in `execution.options.image`.
+      It is the session's task image (`SessionSpec.taskImage`), so it is held to
+      `allowed_task_images` like any task's; what the resident queues does not inherit it. -/
+  executionImage : Option String := none
 deriving Inhabited
 
 /-- A resident's settings with every default filled in. -/
@@ -115,6 +121,7 @@ structure ResidentSettings where
   tools : Option (List String)
   agent : String
   spawnPolicy : Option SpawnPolicy := none
+  executionImage : Option String := none
 deriving Inhabited, Repr
 
 /-- The block's own values, and the configuration's where it has none. -/
@@ -126,7 +133,7 @@ def ResidentSpec.settings (r : ResidentSpec) (cfg : ResidentsConfig) : ResidentS
                             (r.processIdleSeconds.getD cfg.processIdleSeconds)
     batchWindowSeconds := r.batchWindowSeconds.getD cfg.batchWindowSeconds
     model := r.model, tools := r.tools, agent := r.agent.getD "claude"
-    spawnPolicy := r.spawnPolicy }
+    spawnPolicy := r.spawnPolicy, executionImage := r.executionImage }
 
 /-- Read a `resident` block. Strict: a block that half-parsed would be a resident running on
     defaults nobody wrote — a hundred dollars a day instead of the five the operator asked for. -/
@@ -136,7 +143,7 @@ def parseResidentSpec (who : String) (j : Json) : Except String ResidentSpec := 
     if (j.getObjVal? key).isOk then
       throw s!"{who}: a resident has no repository, so its block may not set '{key}'"
   let known := ["budget_per_day", "process_idle_seconds", "pod_idle_seconds",
-    "batch_window_seconds", "model", "tools", "agent", "feeds", "spawn_policy"]
+    "batch_window_seconds", "model", "tools", "agent", "feeds", "spawn_policy", "execution_image"]
   for (k, _) in kvs.toArray do
     unless known.contains k do
       throw s!"{who}: unknown field '{k}' in 'resident' (known: {", ".intercalate known})"
@@ -174,7 +181,8 @@ def parseResidentSpec (who : String) (j : Json) : Except String ResidentSpec := 
       match p.validate Project.Role.knownPermissions with
       | .error e => throw s!"{who}: resident.{e}"
       | .ok () => pure (some p)
-  return { budgetPerDay, tools, feeds, spawnPolicy
+  let executionImage ← parseExecutionImage? j s!"{who}: resident.execution_image"
+  return { budgetPerDay, tools, feeds, spawnPolicy, executionImage
            processIdleSeconds := ← optNat "process_idle_seconds"
            podIdleSeconds     := ← optNat "pod_idle_seconds"
            batchWindowSeconds := ← optNat "batch_window_seconds"

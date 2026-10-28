@@ -327,6 +327,7 @@ needs](#what-you-need), a non-root `USER` included.
 | listener action (`execution_image`), also for its workflow's steps that name none | the operator | — |
 | workflow step (`execution-image`) | the operator: since workflows are parsed before an event is filled in, no event text can reach this field ([what an event fills in](workflow.md#what-an-event-fills-in)) | — |
 | API client file (`execution_image`) | the operator | — |
+| an identity's `resident` block (`execution_image`), for the resident's own pod; not inherited by what it queues | the operator | — |
 | an API client's request (`POST /api/v1/queue`) | the client | its `queue_policy.images` |
 | an agent's `queue_task` | the agent | its `spawn_policy.images` |
 | inheritance: a task queued by `queue_task`, or by a client, that names none | — | the parent's own image, onto any repository the policy's `repos` reaches |

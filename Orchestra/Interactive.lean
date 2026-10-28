@@ -796,6 +796,8 @@ without a repository ({e}); starting it without one"
       -- known by, and the fork is per-bot. Same key as the queue path and the merger.
       repo    := record.upstream.map (·.toString)
       image   := repoConfig.image
+      -- The resident's own image, when its block names one: it has no repository to ask for one.
+      taskImage := resident.bind (·.2.executionImage)
       resident := resident.map (·.1)
       volumeSize := if isResident then mgr.cfg.residents.volumeSize else none }
     -- Its checkout goes with it: closing the environment is the one thing every way out of a
