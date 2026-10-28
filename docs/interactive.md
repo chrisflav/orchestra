@@ -261,8 +261,12 @@ Every field is optional and falls back to the `residents` block of `config.json`
 `max_turns_per_hour` (`60`), `token_refresh_margin` (`"2h"`, or seconds; config only, below),
 `turn_timeout_seconds` (`1800`, or a span; config only, below) and
 `volume_size` (the backend's own size when absent). The block
-may carry `tools`, `agent` (the backend), `feeds` (below) and `spawn_policy`; it may not carry
-`upstream` or `fork`. A resident is reached through its inbox: its feeds, the chat, and listeners
+may carry `tools`, `agent` (the backend), `feeds` (below), `spawn_policy` and `execution_image`;
+it may not carry `upstream` or `fork`. `execution_image` is the image its pod runs in on the
+`kubernetes` backend, for a resident whose work needs tools the default agent image lacks: with no
+repository to ask for one, a resident otherwise always runs in `execution.options.image`. It is
+the session's task image, so it is held to `allowed_task_images` ([kubernetes.md](kubernetes.md));
+what the resident queues does not inherit it. A resident is reached through its inbox: its feeds, the chat, and listeners
 with `deliver_to`.
 
 **Queueing work.** With a `spawn_policy` ([queue-task.md](queue-task.md)) a resident is offered

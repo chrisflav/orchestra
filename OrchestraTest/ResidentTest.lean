@@ -107,6 +107,22 @@ def aResidentBlockMayCarryASpawnPolicy : Test := do
   | .error e => TestM.assert (mentions e "rm_rf") (msg := e)
 
 @[test]
+def aResidentBlockMayNameItsImage : Test := do
+  let body := "{\"execution_image\": \"ghcr.io/acme/resident:1\"}"
+  match Json.parse body >>= Identity.parseResidentSpec "identity 'x'" with
+  | .error e => TestM.fail e
+  | .ok spec =>
+    TestM.assertEqual (spec.settings {}).executionImage (some "ghcr.io/acme/resident:1")
+      (msg := "the image reaches the settings the session is opened with")
+  TestM.assertEqual ((Json.parse "{}" >>= Identity.parseResidentSpec "identity 'x'").toOption.bind
+      (·.settings {} |>.executionImage)) none (msg := "absent, it runs in the configured default")
+  -- Read strictly, as a task's is: an image read as absent would run it without its tools.
+  for body in ["{\"execution_image\": \"has space\"}", "{\"execution_image\": 3}"] do
+    match Json.parse body >>= Identity.parseResidentSpec "identity 'x'" with
+    | .ok _ => TestM.fail s!"{body} should be refused"
+    | .error e => TestM.assert (mentions e "execution_image") (msg := s!"{body}: {e}")
+
+@[test]
 def anIdentityFileCarriesItsResidentBlock : Test := do
   let (plain, resident) ← withIdentities do
     for (name, body) in [("plain", "{\"name\": \"plain\"}"),
