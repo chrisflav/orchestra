@@ -523,7 +523,11 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     -- something other than either (`Kubernetes.imageFor`).
     ("executionImage", optStr e.executionImage),
     -- The commit the task is checked out at instead of the default branch, where it names one.
-    ("checkout",       ToJson.toJson e.checkout)
+    ("checkout",       ToJson.toJson e.checkout),
+    -- The container resources the task's pod asks for in place of `execution.options.resources`,
+    -- where its task file named them: what explains a pod sized other than the rest, or one
+    -- waiting on the namespace's quota when the others are not.
+    ("resources",      e.resources.getD .null)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=
