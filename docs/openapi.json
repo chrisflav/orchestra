@@ -1886,7 +1886,7 @@
       "QueueEntry": {
         "type": "object",
         "description": "Work waiting or running. Becomes a Task when it is claimed; `taskId` is that run.",
-        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity", "apiClient", "externalId", "executionImage", "checkout"],
+        "required": ["id", "status", "createdAt", "priority", "upstream", "fork", "prompt", "series", "backend", "model", "taskId", "concertId", "concertStepKey", "spawnedBy", "identity", "apiClient", "externalId", "executionImage", "checkout", "resources"],
         "properties": {
           "id": { "type": "string" },
           "status": { "$ref": "#/components/schemas/QueueStatus" },
@@ -1906,6 +1906,7 @@
           "apiClient": { "type": ["string", "null"], "description": "The API client that queued this entry over HTTP (`POST /api/v1/queue`), when one did." },
           "externalId": { "type": ["string", "null"], "description": "The client's own id for this entry, unique per client." },
           "checkout": { "oneOf": [{ "$ref": "#/components/schemas/Checkout" }, { "type": "null" }], "description": "The commit the entry's task is checked out at instead of the default branch, when whatever queued it named one." },
+          "resources": { "type": ["object", "null"], "additionalProperties": true, "description": "The Kubernetes container `resources` (`requests`, `limits`) the entry's pod asks for in place of `execution.options.resources`, when its task file named them. Replaces the configured object whole; the namespace's ResourceQuota still applies. Ignored by the landrun and local backends." },
           "executionImage": { "type": ["string", "null"], "description": "The image the entry's task runs in, when whatever queued it named one. On the `kubernetes` backend it beats the repository's own image and the operator's per-repository pin unless that pin is absolute; on landrun and local it is logged and the task runs on the host." }
         }
       },

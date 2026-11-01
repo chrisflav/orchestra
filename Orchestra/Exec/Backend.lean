@@ -474,6 +474,11 @@ structure SessionSpec where
   resident : Option String := none
   /-- The size of a new workspace volume, where the backend makes one; `none` is its own default. -/
   volumeSize : Option String := none
+  /-- The container `resources` the task asked for (`Config.IOTask.resources`), verbatim, in place
+      of whatever the backend is configured to give every task. Only a backend that runs tasks in
+      containers reads it (`kubernetes`); one that runs them on this machine has nothing to size,
+      and says so (`SessionSpec.noteResourcesIgnored`). -/
+  resources : Option Lean.Json := none
 
 /-- Say, once for the task, that the image it asked for (`taskImage`) is not where it runs: for
     the backends that run tasks on this machine, which have no image to change. The task then runs
@@ -489,6 +494,14 @@ def SessionSpec.noteImageIgnored (backendName : String) (spec : SessionSpec) : I
     IO.eprintln s!"  [exec] {spec.label} asks to run in the image {image}; the '{backendName}' \
 backend runs tasks on this machine and cannot change images, so it runs here as usual and the \
 tools that image would carry have to be installed on the host"
+
+/-- Say, once for the task, that the container `resources` it asked for (`resources`) size nothing:
+    for the backends that run tasks on this machine, which have no container to size. The task
+    runs as usual, with whatever the machine has. -/
+def SessionSpec.noteResourcesIgnored (backendName : String) (spec : SessionSpec) : IO Unit := do
+  if spec.resources.isSome then
+    IO.eprintln s!"  [exec] {spec.label} asks for its own container resources; the '{backendName}' \
+backend runs tasks on this machine and has no container to size, so they are ignored"
 
 /-- What `Backend.probe` found of an environment a previous daemon left. -/
 inductive ProbeResult where

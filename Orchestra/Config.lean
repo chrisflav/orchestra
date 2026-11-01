@@ -580,6 +580,30 @@ def parseExecutionImage? (j : Json) (what : String := "execution_image")
   | .ok _ => .error s!"{what} must be a string naming an image, such as \
 \"ghcr.io/acme/reviewer:1.4\""
 
+/-! ## The resources a task's pod asks for (`docs/kubernetes.md`) -/
+
+/-- `j` as a task's `resources`, if it is one: an object, kept verbatim, or none. The one rule
+    everything that reads an override back — a queue entry's JSON and its row — applies, so the
+    two cannot come to disagree about what they keep. -/
+def taskResourcesObject? (j : Json) : Option Json :=
+  match j with
+  | .obj _ => some j
+  | _ => none
+
+/-- Read an optional `resources` out of `j`: a Kubernetes container `resources` object, kept
+    verbatim. Only its shape is checked here — an object — since the cluster is the authority on
+    what goes inside it, and refuses a malformed quantity with its own message when the pod is
+    created. Strict about the shape for the reason the image is: an override read as absent runs
+    the task with the configured default, which is what it was written to get away from, and the
+    task then dies of memory somewhere in the middle of its run. -/
+def parseTaskResources? (j : Json) (what : String := "resources") :
+    Except String (Option Json) :=
+  match j.getObjVal? "resources" with
+  | .error _ | .ok .null => .ok none
+  | .ok v@(.obj _) => .ok (some v)
+  | .ok _ => .error s!"{what} must be an object of Kubernetes container resources, such as \
+{"{"}\"requests\": {"{"}\"cpu\": \"2\", \"memory\": \"8Gi\"}, \"limits\": {"{"}\"memory\": \"28Gi\"}}"
+
 /-! ## The commit a task's workspace is checked out at (`Repo.prepareCheckout`) -/
 
 /-- Where a task's checkout should stand, when the default branch is the wrong place: a review of a
@@ -677,6 +701,11 @@ instance : FromJson CheckoutSpec where
     match ← parseCheckout? (Json.mkObj [("checkout", j)]) with
     | some c => pure c
     | none => throw "a checkout is an object with a 'commit'"
+
+/-- `Json` has no `Repr` of its own, and `IOTask` derives one; the compressed document is what a
+    reader of a printed task wants to see (as for `ExecutionConfig.options`). -/
+local instance : Repr Json where
+  reprPrec j _ := Std.Format.text j.compress
 
 /-- A typed task with phantom input type `i` and output type `o`. -/
 structure IOTask (i o : ResultType) where
@@ -825,6 +854,17 @@ structure IOTask (i o : ResultType) where
       (`CheckoutSpec`, `Repo.prepareCheckout`). Set by a task file, a queue entry, `queue_task` and
       an API client's request; meaningless, and refused, for a task with no repository. -/
   checkout : Option CheckoutSpec := none
+  /-- The container `resources` of this task's pod, on a backend that runs tasks in pods
+      (`kubernetes`), in place of the configured `execution.options.resources`: for the task
+      whose build needs more memory than the default gives, or less of the cluster than it
+      reserves. The whole object replaces the default; the two are never merged.
+
+      Set by a task file, and carried on its queue entry through retries, restart resumes and
+      continuations (`Queue.carriedForContinuation`). Not something an agent's `queue_task` or an
+      API client can ask for. Besides a task file, only what can reach the daemon's control socket
+      can set it — its `add_task` takes a whole queue entry — which is operator-only once that
+      socket is authenticated (PR #224). -/
+  resources : Option Json := none
 deriving Repr, Inhabited
 
 /-- The kind of authentication for an agent backend. -/
@@ -983,13 +1023,14 @@ instance : FromJson Task where
     let checkout ← parseCheckout? j
     if checkout.isSome && repo.isNone then
       throw "'checkout' names a commit of the task's repository, and this task has none"
+    let resources ← parseTaskResources? j
     return { i, o, ioTask := { repo, mode, prompt, goal, agent, systemPrompt, prependPrompt, backend, model,
                                 budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec,
                                 kleisNarrow, authSource, authSources, authMode, tools, readOnly,
                                 series, priority,
                                 issueNumber, projectId, issueId, role, prLabels,
                                 triageAddLabels, triageRemoveLabels, spawnPolicy, scopeRoot,
-                                executionImage, checkout } }
+                                executionImage, checkout, resources } }
 
 /-- Filesystem paths to expose inside the landrun sandbox. -/
 structure SandboxPaths where

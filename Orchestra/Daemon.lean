@@ -942,6 +942,7 @@ its workspace; it will start from a clean checkout."
         scopeRoot          := entry.scopeRoot
         executionImage     := entry.executionImage
         checkout           := entry.checkout
+        resources          := entry.resources
       }
     }
     -- If this entry holds a pre-claimed issue, release it back to open on any

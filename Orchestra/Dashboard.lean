@@ -485,7 +485,9 @@ private def cStText : Queue.ConcertStatus → String
   | .running   => "running"  | .done      => "done"
   | .failed    => "failed"   | .cancelled => "cancelled"
 
-private def queueEntryJson (e : Queue.QueueEntry) : Json :=
+/-- A queue entry as the API shows it (`QueueEntry` in `docs/openapi.json`). Not private, so the
+    fields it promises can be checked without a running dashboard. -/
+def queueEntryJson (e : Queue.QueueEntry) : Json :=
   Json.mkObj [
     ("id",             e.id),
     ("status",         qStText e.status),
@@ -523,7 +525,11 @@ private def queueEntryJson (e : Queue.QueueEntry) : Json :=
     -- something other than either (`Kubernetes.imageFor`).
     ("executionImage", optStr e.executionImage),
     -- The commit the task is checked out at instead of the default branch, where it names one.
-    ("checkout",       ToJson.toJson e.checkout)
+    ("checkout",       ToJson.toJson e.checkout),
+    -- The container resources the task's pod asks for in place of `execution.options.resources`,
+    -- where its task file named them: what explains a pod sized other than the rest, or one
+    -- waiting on the namespace's quota when the others are not.
+    ("resources",      e.resources.getD .null)
   ]
 
 private def taskRecJson (r : TaskStore.TaskRecord) : Json :=

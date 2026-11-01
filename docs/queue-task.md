@@ -160,6 +160,12 @@ back from `queue_task` at once. `tools` distinguishes
 absent (inherit the spawning task's set) from `[]` (a task with no optional tools at all), which
 is a thing worth being able to ask for.
 
+A task file's `resources` — the size of its pod on the `kubernetes` backend — is neither taken nor
+inherited here: a queued task's pod gets the configured `execution.options.resources`, whatever
+the queueing task's was. Only task files, and anything that can reach the daemon's control socket
+(operator-only once that socket is authenticated, PR #224), can name one ([sizing one task's
+pod](kubernetes.md#sizing-one-tasks-pod)).
+
 **`max_budget` is a ceiling *and* a default; `tools` is a ceiling only.** An agent that omits
 `tools` gets what the queueing task holds, not the policy's whole list — so a planner holding
 only `manage_issues`, under a policy permitting `create_pr`, queues an implementor that cannot

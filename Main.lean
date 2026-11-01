@@ -322,8 +322,9 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
     | throw (.userError s!"series '{seriesName}' not found")
   let some prevRecord ← TaskStore.loadTask prevId
     | throw (.userError s!"task '{prevId}' not found in store")
-  -- The record keeps neither the image nor the checkout; the entry that ran it does.
-  let (carriedImage, carriedCheckout) ← Queue.carriedForContinuation prevId
+  -- The record keeps none of the image, the checkout and the pod's resources; the entry that ran
+  -- it does.
+  let (carriedImage, carriedCheckout, carriedResources) ← Queue.carriedForContinuation prevId
   let task : Task := {
     i := .unit, o := .unit
     ioTask := {
@@ -340,6 +341,7 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
       priority      := prevRecord.priority
       executionImage := carriedImage
       checkout      := carriedCheckout
+      resources     := carriedResources
     }
   }
   let _ ← TaskRunner.runTask appConfig task 0 debug
@@ -390,7 +392,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       | throw (.userError s!"series '{seriesName}' not found")
     let some prevRecord ← TaskStore.loadTask prevId
       | throw (.userError s!"task '{prevId}' not found in store")
-    let (carriedImage, carriedCheckout) ← Queue.carriedForContinuation prevId
+    let (carriedImage, carriedCheckout, carriedResources) ← Queue.carriedForContinuation prevId
     let id ← TaskStore.generateId
     let createdAt ← TaskStore.currentIso8601
     let entry : Queue.QueueEntry := {
@@ -412,6 +414,7 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
       -- As for `orchestra resume`: from the entry that ran the task.
       executionImage := carriedImage
       checkout      := carriedCheckout
+      resources     := carriedResources
     }
     let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
     let _ ← daemonRequest req
@@ -507,6 +510,8 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         -- And the image it runs in, which `orchestra run` would have used.
         executionImage   := task.ioTask.executionImage
         checkout         := task.ioTask.checkout
+        -- And the resources its pod asks for (`Config.IOTask.resources`).
+        resources        := task.ioTask.resources
       }
       let req := Lean.Json.mkObj [("type", "add_task"), ("entry", Lean.ToJson.toJson entry)]
       let _ ← daemonRequest req

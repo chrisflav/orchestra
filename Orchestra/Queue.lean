@@ -244,6 +244,11 @@ structure QueueEntry where
       queued it named one. On the entry for the reason the image is: a retry or a resume of a
       review of a pull request's head has to review the same head, not the default branch. -/
   checkout : Option CheckoutSpec := none
+  /-- The container `resources` of the task's pod (`Config.IOTask.resources`), when the task file
+      named them, in place of `execution.options.resources`. On the entry for the reason the image
+      is: a retry of a build that ran out of memory needs the memory it was given, not the
+      default's. -/
+  resources : Option Json := none
 
 /-- The pool this entry draws its workspace slot from.
 
@@ -309,6 +314,7 @@ instance : ToJson QueueEntry where
     let fields := if let some s := e.externalId   then fields ++ [("external_id",   Json.str s)]      else fields
     let fields := if let some s := e.executionImage then fields ++ [("execution_image", Json.str s)]  else fields
     let fields := if let some c := e.checkout     then fields ++ [("checkout",      ToJson.toJson c)] else fields
+    let fields := if let some r := e.resources    then fields ++ [("resources",     r)]               else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -373,6 +379,10 @@ instance : FromJson QueueEntry where
     -- Strict, unlike the fields around it: a checkout dropped as unreadable would run a review of
     -- one commit on the default branch, or show a scored task the answer.
     let checkout ← parseCheckout? j
+    -- Lenient, like the fields around it: it was checked when the task file was read, and an
+    -- override that cannot be read costs the override — the task runs with the default — rather
+    -- than the whole entry. The same rule as for its row (`taskResourcesObject?`).
+    let resources := (j.getObjVal? "resources").toOption.bind taskResourcesObject?
     return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec, kleisNarrow,
@@ -380,7 +390,7 @@ instance : FromJson QueueEntry where
              readOnly, priority, concertStepKey, concertId, inputType, outputType, inputJson, outputJson,
              issueNumber, projectId, issueId, role, prLabels, triageAddLabels, triageRemoveLabels,
              listenerName, spawnPolicy, spawnedBy, scopeRoot, apiClient, externalId,
-             executionImage, checkout }
+             executionImage, checkout, resources }
 
 -- Directories and paths
 
@@ -469,7 +479,8 @@ def QueueEntry.toRow (e : QueueEntry) : Store.QueueEntryRow :=
     api_client           := e.apiClient
     external_id          := e.externalId
     execution_image      := e.executionImage
-    checkout             := e.checkout.map Store.jsonColumn }
+    checkout             := e.checkout.map Store.jsonColumn
+    resources            := Store.rawJsonColumn e.resources }
 
 /-- The entry a row holds, or why this build cannot read it.
 
@@ -515,6 +526,10 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
                               Store.jsonOfColumn? (α := CheckoutSpec) "checkout" s
   let kleisNarrow        ← (row.kleis_narrow.mapM fun s =>
                               Store.jsonOfColumn? (α := List String) "kleis_narrow" s).map (·.getD [])
+  -- Lenient, as in `FromJson QueueEntry`, and by the same rule (`taskResourcesObject?`): an
+  -- override that is not JSON, or not an object, falls back to the default.
+  let resources          := (Store.rawJsonOfColumn? "resources" row.resources).toOption.join
+                              |>.bind taskResourcesObject?
   return { id := row.id
            createdAt := row.created_at
            status, repo, mode
@@ -556,7 +571,7 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
            apiClient := row.api_client
            externalId := row.external_id
            executionImage := row.execution_image
-           checkout }
+           checkout, resources }
 
 /-- The concert run as a row of the `concert_run` table. -/
 def ConcertRun.toRow (r : ConcertRun) : Store.ConcertRunRow :=
@@ -733,15 +748,19 @@ def entryForTask (taskId : String) : IO (Option QueueEntry) := do
     continue`, which would otherwise run the second half of a piece of work without the tools, or
     on another commit than, the first half. The entry is still there for every task the daemon
     ran; a task run directly by `orchestra run` has none, and the continuation says so rather
-    than silently carrying nothing. -/
-def carriedForContinuation (taskId : String) : IO (Option String × Option CheckoutSpec) := do
+    than silently carrying nothing.
+
+    The pod's `resources` come along too: the second half of a build that needed more memory than
+    the default needs it as much as the first half did. -/
+def carriedForContinuation (taskId : String) :
+    IO (Option String × Option CheckoutSpec × Option Json) := do
   match ← entryForTask taskId with
-  | some e => return (e.executionImage, e.checkout)
+  | some e => return (e.executionImage, e.checkout, e.resources)
   | none =>
-    IO.eprintln s!"  note: no queue entry ran task {taskId}, so there is no execution_image or \
-checkout to carry; the continuation runs in whatever image its repository and the configuration \
-choose, on the default branch"
-    return (none, none)
+    IO.eprintln s!"  note: no queue entry ran task {taskId}, so there is no execution_image, \
+checkout or resources to carry; the continuation runs in whatever image its repository and the \
+configuration choose, on the default branch, with the configured resources"
+    return (none, none, none)
 
 open Db.Query.DSL in
 /-- The entry addressed by either of the two ids it answers to: its own, or the task its run
@@ -1386,7 +1405,8 @@ structure ResumeFacts where
     The new entry is the same work by the same somebody, as `orchestra queue retry` builds it, and
     a little more of it — the issue, project, role and tool settings too, since a resume is not a
     new decision about any of them. `executionImage` is carried with them: the conversation being
-    resumed was had with the tools that image holds, and it would go on to call them.
+    resumed was had with the tools that image holds, and it would go on to call them. So are
+    the pod's `resources`, which the dead run needed as much as its image.
     `authSource` is carried, because it is what whoever queued the work asked for;
     `resolvedAuthSource`, the account the daemon picked for the dead run, is not, so a resume is
     not pinned to an account that may be at its limit now. `spawnPolicy` is carried too: an
@@ -1457,7 +1477,8 @@ def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (facts :
     scopeRoot     := entry.scopeRoot
     apiClient     := entry.apiClient
     executionImage := entry.executionImage
-    checkout      := entry.checkout }
+    checkout      := entry.checkout
+    resources     := entry.resources }
 
 /-- The entry `orchestra queue retry` queues for `entry`, continuing from `continuesFrom` — which
     the caller decides, since it takes the task store to know whether the dead run left a
@@ -1470,7 +1491,8 @@ def resumeEntryFor (entry : QueueEntry) (record : TaskStore.TaskRecord) (facts :
     writable task holding `create_pr`, on the default budget; without `apiClient` an entry a
     client queued comes back as one the client can neither see nor cancel; and without
     `executionImage` a task that needs a CLI only its image carries comes back in the default
-    image and fails at the first call to it.
+    image and fails at the first call to it; without `resources` a build that was
+    given the memory it needs comes back with the default's, and runs out of it again.
 
     Narrower than `resumeEntryFor`, deliberately: a retry is a person deciding to run the work
     again, and the issue, project and role a dispatcher bound it to are the dispatcher's to bind
@@ -1503,7 +1525,8 @@ def retryEntryFor (entry : QueueEntry) (continuesFrom : Option String) (id creat
     prLabels      := entry.prLabels
     apiClient     := entry.apiClient
     executionImage := entry.executionImage
-    checkout      := entry.checkout }
+    checkout      := entry.checkout
+    resources     := entry.resources }
 
 /-- Queue a restart resume (`resumeEntryFor`) for each entry recorded in `interruptedFile`, and
     answer how many were queued. The caller decides whether to call this at all: only with

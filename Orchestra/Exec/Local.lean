@@ -82,6 +82,7 @@ def backend : Backend where
   preflight := preflight
   openSession spec := do
     spec.noteImageIgnored "local"
+    spec.noteResourcesIgnored "local"
     pure session
 
 def factory : BackendFactory where

@@ -723,6 +723,13 @@ Fields:
   and checks it out on a detached `HEAD` before the sandbox exists — which a read-only task cannot
   do for itself — and fails the task if the commit cannot be had. → [checking out a
   commit](#checking-out-a-commit)
+- `resources` — Kubernetes container `resources` for the task's pod on the `kubernetes` backend,
+  e.g. `{"requests": {"cpu": "2", "memory": "8Gi"}, "limits": {"cpu": "12", "memory": "28Gi"}}`.
+  Replaces `execution.options.resources` whole for this task, and is kept by retries, resumes and
+  continuations; it must be an object. The namespace's `ResourceQuota` still applies, so a pod
+  asking for more than it leaves room for waits and goes back to `pending`. Ignored by landrun and
+  local. Task files set it, and so can anything that reaches the daemon's control socket →
+  [sizing one task's pod](docs/kubernetes.md#sizing-one-tasks-pod)
 
 ## checking out a commit
 

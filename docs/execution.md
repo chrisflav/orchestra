@@ -110,6 +110,9 @@ when repositories
 disagree](kubernetes.md#what-is-installed-when-repositories-disagree). A backend that runs tasks on
 this machine cannot change images: it calls `SessionSpec.noteImageIgnored`, which says so once in
 the log, and runs the task as usual, so the tools that image would carry have to be on the host.
+It also carries the task's own container `resources` (`resources`, from its task file), which a
+backend that runs tasks in containers uses in place of its configured ones — see [sizing one task's
+pod](kubernetes.md#sizing-one-tasks-pod) — and one that runs them on this machine ignores.
 
 For landrun and local there is nothing to open: the checkout is already where the daemon put it,
 and `runScript` is `bash` on this machine, exactly as the task runner did it before sessions

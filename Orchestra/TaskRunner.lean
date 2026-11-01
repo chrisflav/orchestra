@@ -267,7 +267,8 @@ private def runMerger {i o : ResultType} (execBackend : Exec.Backend) (token : S
     label   := initialRecord.id
     repo    := some pr.repo.toString
     image   := repoConfig.image
-    taskImage := ioTask.executionImage }
+    taskImage := ioTask.executionImage
+    resources := ioTask.resources }
   let (valid, validOutput) ← try
       RepoConfig.runValidation session repoPath
     finally
@@ -1079,6 +1080,8 @@ toolchain file say runs as the daemon's user."
     image   := repoConfig.image
     -- What kind of work this is, which beats what the repository asked for (`Kubernetes.imageFor`).
     taskImage := ioTask.executionImage
+    -- And how much of the cluster it takes, in place of `execution.options.resources`.
+    resources := ioTask.resources
     -- Past this point the pod is gone and the task cannot be handed to another daemon: see
     -- `Exec.enterReattachable` below.
     beforeRelease := Exec.leaveReattachable taskId }
