@@ -439,6 +439,10 @@ container `resources` object, passed through verbatim:
 }
 ```
 
+**A request above the namespace's `ResourceQuota` hard limit never runs.** Orchestra cannot tell
+it from a quota that is only full for now, so the entry is put back to `pending` and tried again,
+forever. Keep every task's `resources` within the quota.
+
 - **It replaces the configured `resources` whole.** The two are not merged: a task that names only
   `requests` gets no `limits`, even if the options set some. Write the full object the pod should
   have.
@@ -448,18 +452,23 @@ container `resources` object, passed through verbatim:
 - **The namespace's `ResourceQuota` still applies.** A pod that asks for more than the quota has
   room for right now is refused at creation and waited on like any other ([a full
   quota](#operating-it)): the entry goes back to `pending` and is tried again. One that asks for
-  more than the quota allows at all is put back again and again and never runs. A quota that
+  more than the quota allows at all is put back again and again and never runs (above). A quota that
   covers `limits.cpu` or `limits.memory` also refuses a pod with no limits outright, unless a
   `LimitRange` fills them in. A pod the quota admits but no node can hold stays `Pending`
   (unschedulable) until `startup_timeout_seconds`, and then fails with the scheduler's reason.
 - **Continuations keep it**, as they keep the image: `orchestra queue retry`, a restart resume, and
   the three continuations built from a task record (`orchestra resume <series>`, `orchestra queue
   add --resume`, `orchestra issue continue`), which read it from the entry that ran the task.
-- **Only task files set it.** Roles, listener actions, workflow steps, an agent's `queue_task` and
-  API clients cannot, and a task queued with `queue_task` does not inherit its parent's: how much of
-  the cluster a task takes is the operator's decision. Interactive sessions and residents always
-  get the configured `resources`.
-- **On landrun and local** there is nothing to size, and the field is ignored.
+- **Task files set it, and so does anything that can reach the daemon's control socket.** Roles,
+  listener actions, workflow steps, an agent's `queue_task` and API clients cannot, and a task
+  queued with `queue_task` does not inherit its parent's. The control socket's `add_task` takes a
+  whole queue entry, `resources` included, and is not authenticated yet, so whoever can open the
+  socket can size a pod; it becomes operator-only once the socket is authenticated (PR #224).
+  Interactive sessions and residents always get the configured `resources`.
+- **A merger task** (`"backend": "merger"`) whose task file names `resources` gets them for the pod
+  its validation runs in, too.
+- **On landrun and local** there is nothing to size: the field is ignored, and the daemon's log
+  says so once for the task.
 
 The daemon logs the override when it creates the pod, and the dashboard's queue API shows it on the
 entry (`resources`).

@@ -861,7 +861,9 @@ structure IOTask (i o : ResultType) where
 
       Set by a task file, and carried on its queue entry through retries, restart resumes and
       continuations (`Queue.carriedForContinuation`). Not something an agent's `queue_task` or an
-      API client can ask for: how much of the cluster a task takes is the operator's to say. -/
+      API client can ask for. Besides a task file, only what can reach the daemon's control socket
+      can set it — its `add_task` takes a whole queue entry — which is operator-only once that
+      socket is authenticated (PR #224). -/
   resources : Option Json := none
 deriving Repr, Inhabited
 

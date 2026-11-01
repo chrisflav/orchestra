@@ -728,8 +728,8 @@ Fields:
   Replaces `execution.options.resources` whole for this task, and is kept by retries, resumes and
   continuations; it must be an object. The namespace's `ResourceQuota` still applies, so a pod
   asking for more than it leaves room for waits and goes back to `pending`. Ignored by landrun and
-  local; only task files set it → [sizing one task's
-  pod](docs/kubernetes.md#sizing-one-tasks-pod)
+  local. Task files set it, and so can anything that reaches the daemon's control socket →
+  [sizing one task's pod](docs/kubernetes.md#sizing-one-tasks-pod)
 
 ## checking out a commit
 

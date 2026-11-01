@@ -664,7 +664,9 @@ def labelValue (s : String) (max : Nat := 63) : String :=
 
     The task's replace the configured ones whole rather than being merged into them, so what the
     pod asks for is exactly what one document says — the task file's, or the operator's. Nothing
-    bounds them here: a task file is the operator's own, and no agent or API client can name them.
+    bounds them here: an agent's `queue_task` and an API client cannot name them, only a task file
+    and what can reach the daemon's control socket (`add_task`), which is operator-only once that
+    socket is authenticated (PR #224).
     The namespace's `ResourceQuota` still applies, as to every pod; one that asks for more than it
     leaves room for is waited on and put back like any other (`openSession`).
 
