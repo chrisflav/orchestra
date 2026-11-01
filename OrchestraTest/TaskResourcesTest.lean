@@ -106,6 +106,16 @@ def theResourcesMigrationIsTheThirteenth : Test := do
   let names := Store.migrations.map (·.name)
   TestM.assertEqual ((names.drop 11).take 2) ["0012_checkout", "0013_task_resources"]
 
+/-! ## The dashboard shows it -/
+
+@[test]
+def theQueueApiShowsAnEntrysResources : Test := do
+  let shown := Dashboard.queueEntryJson sized
+  TestM.assert ((shown.getObjVal? "resources").toOption == some big) "the entry's own"
+  let plain := Dashboard.queueEntryJson { sized with resources := none }
+  TestM.assert ((plain.getObjVal? "resources").toOption == some .null)
+    "null, not missing, for an entry without them (the spec lists it as required)"
+
 /-! ## The pod -/
 
 open Orchestra.Exec Orchestra.Exec.Kubernetes in

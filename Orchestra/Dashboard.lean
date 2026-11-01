@@ -485,7 +485,9 @@ private def cStText : Queue.ConcertStatus → String
   | .running   => "running"  | .done      => "done"
   | .failed    => "failed"   | .cancelled => "cancelled"
 
-private def queueEntryJson (e : Queue.QueueEntry) : Json :=
+/-- A queue entry as the API shows it (`QueueEntry` in `docs/openapi.json`). Not private, so the
+    fields it promises can be checked without a running dashboard. -/
+def queueEntryJson (e : Queue.QueueEntry) : Json :=
   Json.mkObj [
     ("id",             e.id),
     ("status",         qStText e.status),
