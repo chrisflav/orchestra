@@ -381,8 +381,8 @@ instance : FromJson QueueEntry where
     let checkout ← parseCheckout? j
     -- Lenient, like the fields around it: it was checked when the task file was read, and an
     -- override that cannot be read costs the override — the task runs with the default — rather
-    -- than the whole entry.
-    let resources := (parseTaskResources? j).toOption.getD none
+    -- than the whole entry. The same rule as for its row (`taskResourcesObject?`).
+    let resources := (j.getObjVal? "resources").toOption.bind taskResourcesObject?
     return { id, createdAt, status, repo, mode, prompt, goal,
              agent, systemPrompt, prependPrompt, backend, model, continuesFrom, series, taskId, configPath,
              budget, memory, identity, kleisToken, kleisSpec, kleisRoleSpec, kleisNarrow,
@@ -526,8 +526,10 @@ def QueueEntry.ofRow? (row : Store.QueueEntryRow) : Except String QueueEntry := 
                               Store.jsonOfColumn? (α := CheckoutSpec) "checkout" s
   let kleisNarrow        ← (row.kleis_narrow.mapM fun s =>
                               Store.jsonOfColumn? (α := List String) "kleis_narrow" s).map (·.getD [])
-  -- Lenient, as in `FromJson QueueEntry`: an unreadable override falls back to the default.
+  -- Lenient, as in `FromJson QueueEntry`, and by the same rule (`taskResourcesObject?`): an
+  -- override that is not JSON, or not an object, falls back to the default.
   let resources          := (Store.rawJsonOfColumn? "resources" row.resources).toOption.join
+                              |>.bind taskResourcesObject?
   return { id := row.id
            createdAt := row.created_at
            status, repo, mode

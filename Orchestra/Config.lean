@@ -582,6 +582,14 @@ def parseExecutionImage? (j : Json) (what : String := "execution_image")
 
 /-! ## The resources a task's pod asks for (`docs/kubernetes.md`) -/
 
+/-- `j` as a task's `resources`, if it is one: an object, kept verbatim, or none. The one rule
+    everything that reads an override back — a queue entry's JSON and its row — applies, so the
+    two cannot come to disagree about what they keep. -/
+def taskResourcesObject? (j : Json) : Option Json :=
+  match j with
+  | .obj _ => some j
+  | _ => none
+
 /-- Read an optional `resources` out of `j`: a Kubernetes container `resources` object, kept
     verbatim. Only its shape is checked here — an object — since the cluster is the authority on
     what goes inside it, and refuses a malformed quantity with its own message when the pod is

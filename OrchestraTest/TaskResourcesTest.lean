@@ -84,6 +84,12 @@ def anUnreadableEntryOverrideCostsOnlyTheOverride : Test := do
   match Queue.QueueEntry.ofRow? { sized.toRow with resources := some "{not json" } with
   | .error e => TestM.fail s!"the row should still read: {e}"
   | .ok back => TestM.assert back.resources.isNone "the override is dropped"
+  -- Valid JSON that is not an object is dropped from a row as it is from the JSON: the two
+  -- readers keep the same things.
+  for bad in ["\"8Gi\"", "[]", "4", "null"] do
+    match Queue.QueueEntry.ofRow? { sized.toRow with resources := some bad } with
+    | .error e => TestM.fail s!"the row with resources {bad} should still read: {e}"
+    | .ok back => TestM.assert back.resources.isNone s!"resources {bad} in a row is dropped"
 
 @[test]
 def theStoreKeepsResourcesAndAContinuationTakesThem : Test := do
