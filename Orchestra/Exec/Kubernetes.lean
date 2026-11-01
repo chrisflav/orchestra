@@ -228,7 +228,8 @@ structure Config where
   allowedImagePrefixes : Array String := #[]
   /-- `nodeSelector`, verbatim. -/
   nodeSelector : Option Json := none
-  /-- `resources` for the container, verbatim. -/
+  /-- `resources` for the container, verbatim. A task that names its own (`SessionSpec.resources`)
+      gets those instead, whole (`resourcesFor`). -/
   resources : Option Json := none
   /-- Extra `volumes`, verbatim — a PVC for a build cache, most usefully. -/
   extraVolumes : Array Json := #[]
@@ -658,6 +659,23 @@ def labelValue (s : String) (max : Nat := 63) : String :=
   let v := String.ofList (trimmed.reverse.dropWhile (!·.isAlphanum)).reverse
   if v.isEmpty then "unnamed" else v
 
+/-- The container `resources` a task's pod asks for: the task's own (`SessionSpec.resources`) when
+    it names them, otherwise the configured `resources`, otherwise none.
+
+    The task's replace the configured ones whole rather than being merged into them, so what the
+    pod asks for is exactly what one document says — the task file's, or the operator's. Nothing
+    bounds them here: a task file is the operator's own, and no agent or API client can name them.
+    The namespace's `ResourceQuota` still applies, as to every pod; one that asks for more than it
+    leaves room for is waited on and put back like any other (`openSession`).
+
+    Only an object is used. Every place a task is described checks that when it is read, but an
+    entry read back from the queue is read leniently, and what is returned here goes into the pod
+    manifest verbatim. -/
+def resourcesFor (cfg : Config) (spec : SessionSpec) : Option Json :=
+  match spec.resources with
+  | some r@(.obj _) => some r
+  | _ => cfg.resources
+
 /-- The pod manifest for a task. -/
 def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
     (staged : Array StagedPath) (workspaceClaim : Option String := none) : Json :=
@@ -724,7 +742,7 @@ def podManifest (cfg : Config) (spec : SessionSpec) (podName image : String)
     ("volumeMounts", .arr mounts)
   ] ++ (match cfg.imagePullPolicy with
         | some p => [("imagePullPolicy", Json.str p)] | none => [])
-     ++ (match cfg.resources with | some r => [("resources", r)] | none => []))
+     ++ (match resourcesFor cfg spec with | some r => [("resources", r)] | none => []))
   -- A claim's root is whatever its storage class makes it: k3s's `local-path` hands out a
   -- world-writable directory, a block-backed class an ext4 root that only root may write. The agent
   -- has to create `work` and `home` in it as its own user, so a root init container opens the
@@ -2025,6 +2043,11 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
     if asked != image then
       IO.eprintln s!"  [k8s] {spec.label} asks to run in {asked}; {spec.repo.getD "its repository"} \
 is pinned absolutely to {image} (execution.options.images), which wins"
+  -- Likewise a pod sized other than the configured default: what it asked for is in the log, for
+  -- the task that then waits on the quota or stays unscheduled.
+  if let some r := spec.resources then
+    IO.println s!"  [k8s] {spec.label} asks for its own resources {r.compress}, in place of \
+execution.options.resources"
   -- A task volume only for what asks for one (`taskId`): the merger and `prepare` have nothing
   -- to continue and nothing worth keeping, and get the throwaway pod they always had.
   let volume : Option (TaskVolumes × String × Bool) ← match cfg.taskVolumes, spec.taskId with

@@ -474,6 +474,11 @@ structure SessionSpec where
   resident : Option String := none
   /-- The size of a new workspace volume, where the backend makes one; `none` is its own default. -/
   volumeSize : Option String := none
+  /-- The container `resources` the task asked for (`Config.IOTask.resources`), verbatim, in place
+      of whatever the backend is configured to give every task. Only a backend that runs tasks in
+      containers reads it (`kubernetes`); one that runs them on this machine has nothing to size
+      and ignores it. -/
+  resources : Option Lean.Json := none
 
 /-- Say, once for the task, that the image it asked for (`taskImage`) is not where it runs: for
     the backends that run tasks on this machine, which have no image to change. The task then runs
