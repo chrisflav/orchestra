@@ -432,7 +432,7 @@ def theStoreKeepsTheCheckoutAndAContinuationTakesIt : Test := do
   let (stored, carried) ← Orchestra.withTempData "checkout" do
     Queue.saveEntry { checkedOut with status := .done }
     let stored := (← Queue.loadEntry "q-1").bind (·.checkout)
-    let carried := (← Queue.carriedForContinuation "t-1").2
+    let carried := (← Queue.carriedForContinuation "t-1").2.1
     return (stored, carried)
   TestM.assert (stored == checkedOut.checkout) "the column round-trips"
   TestM.assert (carried == checkedOut.checkout) "a continuation built from the record takes it"
