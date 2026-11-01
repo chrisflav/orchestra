@@ -2045,7 +2045,8 @@ def openSession (cfg : Config) (spec : SessionSpec) : IO Session := do
 is pinned absolutely to {image} (execution.options.images), which wins"
   -- Likewise a pod sized other than the configured default: what it asked for is in the log, for
   -- the task that then waits on the quota or stays unscheduled.
-  if let some r := spec.resources then
+  -- Only when they are used: something that is not an object falls back (`resourcesFor`).
+  if let some r@(.obj _) := spec.resources then
     IO.println s!"  [k8s] {spec.label} asks for its own resources {r.compress}, in place of \
 execution.options.resources"
   -- A task volume only for what asks for one (`taskId`): the merger and `prepare` have nothing
