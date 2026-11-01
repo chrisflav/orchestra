@@ -418,6 +418,53 @@ that install a toolchain or warm a build cache are already idempotent for their 
 check before they fetch — and that is what is expected of them here.
 
 
+## sizing one task's pod
+
+`resources` in the options sizes every task's pod the same. A task whose build needs more memory
+than that, or that should take less of the cluster, names its own in its task file — a Kubernetes
+container `resources` object, passed through verbatim:
+
+```json
+{
+  "tasks": [
+    {
+      "upstream": "acme/widgets", "fork": "acme-bot/widgets",
+      "prompt": "Build the whole library and fix what breaks.",
+      "resources": {
+        "requests": { "cpu": "2", "memory": "8Gi" },
+        "limits":   { "cpu": "12", "memory": "28Gi" }
+      }
+    }
+  ]
+}
+```
+
+- **It replaces the configured `resources` whole.** The two are not merged: a task that names only
+  `requests` gets no `limits`, even if the options set some. Write the full object the pod should
+  have.
+- **Only its shape is checked by orchestra.** `orchestra queue add` refuses a `resources` that is
+  not an object. Everything inside it — the keys and the quantities — is the cluster's to judge, and
+  a malformed quantity fails the task when its pod is created, with the API server's message.
+- **The namespace's `ResourceQuota` still applies.** A pod that asks for more than the quota has
+  room for right now is refused at creation and waited on like any other ([a full
+  quota](#operating-it)): the entry goes back to `pending` and is tried again. One that asks for
+  more than the quota allows at all is put back again and again and never runs. A quota that
+  covers `limits.cpu` or `limits.memory` also refuses a pod with no limits outright, unless a
+  `LimitRange` fills them in. A pod the quota admits but no node can hold stays `Pending`
+  (unschedulable) until `startup_timeout_seconds`, and then fails with the scheduler's reason.
+- **Continuations keep it**, as they keep the image: `orchestra queue retry`, a restart resume, and
+  the three continuations built from a task record (`orchestra resume <series>`, `orchestra queue
+  add --resume`, `orchestra issue continue`), which read it from the entry that ran the task.
+- **Only task files set it.** Roles, listener actions, workflow steps, an agent's `queue_task` and
+  API clients cannot, and a task queued with `queue_task` does not inherit its parent's: how much of
+  the cluster a task takes is the operator's decision. Interactive sessions and residents always
+  get the configured `resources`.
+- **On landrun and local** there is nothing to size, and the field is ignored.
+
+The daemon logs the override when it creates the pod, and the dashboard's queue API shows it on the
+entry (`resources`).
+
+
 ## per-task volumes
 
 `task_volumes` gives each task chain a `PersistentVolumeClaim` of its own, holding the checkout and
@@ -926,7 +973,7 @@ the cluster was actually asked for.
 | `allowed_image_prefixes` | `[]` | prefixes a repository-declared image must start with; empty allows any |
 | `allowed_task_images` | `[]` | images a task's `execution_image` must be (exact, or under a prefix ending in `/`); empty allows any |
 | `node_selector` | *(none)* | `nodeSelector`, verbatim |
-| `resources` | *(none)* | `resources` for the container, verbatim |
+| `resources` | *(none)* | `resources` for the container, verbatim; a task file's own `resources` replaces it for that task ([sizing one task's pod](#sizing-one-tasks-pod)) |
 | `volumes` / `volume_mounts` | `[]` | extra volumes and mounts, verbatim — a build cache, most usefully |
 | `home_path` | `/home/agent` | where the agent's `$HOME` is in the pod |
 | `task_volumes` | *(none)* | a claim per task chain for the checkout and `$HOME`, kept for continuations; see [per-task volumes](#per-task-volumes). Also `seed_paths` and `finish_command` |
