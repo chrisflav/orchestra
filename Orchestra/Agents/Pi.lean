@@ -112,8 +112,15 @@ def pi : AgentDef where
     rox        := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
     ro         := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw         := ["/dev/null"]
-    homeRox    := [".local"]
-    homeRw     := [".pi", ".gitconfig", ".config/gh", ".config/git"]
+    -- `~/.local/bin` and `~/.local/lib`, where an npm prefix of `~/.local` puts the CLI and its
+    -- modules. Never `.local` whole, which holds orchestra's own data directory by default.
+    -- Git's global configuration is read, never written: the daemon runs `git` as the same user,
+    -- outside the sandbox, so an agent that could set `core.hooksPath` or a `url.*.insteadOf`
+    -- there would run code, or redirect a fetch, on the daemon's next clone or checkout. And no
+    -- `~/.config/gh`: its `hosts.yml` is the operator's own GitHub login, and the agent's `gh`
+    -- authenticates with the `GH_TOKEN` orchestra gives it.
+    homeRox    := [".local/bin", ".local/lib", ".gitconfig", ".config/git"]
+    homeRw     := [".pi"]
     homeRwx    := [".elan", ".cache"]
     extraPorts := [8080]   -- llama.cpp
   }

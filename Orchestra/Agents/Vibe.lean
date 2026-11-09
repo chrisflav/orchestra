@@ -124,8 +124,16 @@ def vibe : AgentDef where
     rox     := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
     ro      := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw      := ["/dev/null"]
-    homeRox := [".local"]
-    homeRw  := [".gitconfig", ".config/gh", ".config/git"]
+    -- `~/.local/bin` and wherever a user-level Python install puts the package it runs: uv's tools,
+    -- pipx's, or `pip --user`'s site-packages. Never `.local` whole, which holds orchestra's own
+    -- data directory by default (`Claude.lean` says what is in it).
+    -- Git's global configuration is read, never written: the daemon runs `git` as the same user,
+    -- outside the sandbox, so an agent that could set `core.hooksPath` or a `url.*.insteadOf`
+    -- there would run code, or redirect a fetch, on the daemon's next clone or checkout. And no
+    -- `~/.config/gh`: its `hosts.yml` is the operator's own GitHub login, and the agent's `gh`
+    -- authenticates with the `GH_TOKEN` orchestra gives it.
+    homeRox := [".local/bin", ".local/lib", ".local/share/uv", ".local/share/pipx", ".local/pipx",
+                ".gitconfig", ".config/git"]
     homeRwx := [".elan", ".cache"]
   }
   setupMcp mcp model systemPrompt := do

@@ -165,9 +165,8 @@ RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -
 # file, and a zero-length file is not valid JSON.
 RUN mkdir -p /home/orchestra/.claude \
              /home/orchestra/.cache \
-             /home/orchestra/.local \
+             /home/orchestra/.local/bin \
              /home/orchestra/.config/claude \
-             /home/orchestra/.config/gh \
              /home/orchestra/.config/git \
     && echo '{}' > /home/orchestra/.claude.json \
     && touch /home/orchestra/.gitconfig

@@ -13,9 +13,18 @@ def claude : AgentDef where
     rox     := ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix"]
     ro      := ["/etc", "/run", "/dev", "/proc", "/sys"]
     rw      := ["/dev/null"]
-    homeRox := [".local"]
-    homeRw  := [".claude", ".claude.json", ".gitconfig",
-                ".config/claude", ".config/gh", ".config/git"]
+    -- Not `.local` as a whole: `~/.local/share` is where orchestra's own data directory lives by
+    -- default (every clone, every task's log, the dashboard password), next to whatever else the
+    -- machine keeps there — keyrings, password stores, mail. The CLI's launcher is in
+    -- `~/.local/bin` and the versions it points at in `~/.local/share/claude`; that is all of
+    -- `.local` it reads.
+    -- Git's global configuration is read, never written: the daemon runs `git` as the same user,
+    -- outside the sandbox, so an agent that could set `core.hooksPath` or a `url.*.insteadOf`
+    -- there would run code, or redirect a fetch, on the daemon's next clone or checkout. And no
+    -- `~/.config/gh`: its `hosts.yml` is the operator's own GitHub login, and the agent's `gh`
+    -- authenticates with the `GH_TOKEN` orchestra gives it.
+    homeRox := [".local/bin", ".local/share/claude", ".gitconfig", ".config/git"]
+    homeRw  := [".claude", ".claude.json", ".config/claude"]
     -- Both need write *and* execute, not the read+execute the other home paths get:
     --   .elan  — installs toolchains and then runs them from there.
     --   .cache — build caches are written, not just read. `lake exe cache get` populates it, and
