@@ -1257,7 +1257,8 @@ def parseIPv4? (s : String) : Option IPv4Addr :=
 /-- Start the MCP server. Returns (port, shutdown action).
 
     Running the shutdown action frees the port: by the time it returns, the accept loop has left
-    and nothing holds the listening socket. That matters twice over off loopback — the socket
+    and nothing holds the listening socket — the action included, so a caller may keep it as long
+    as it likes, and running it again does nothing. That matters twice over off loopback — the socket
     carries the PAT's authority behind a per-task token, and the port came out of `mcp_ports`,
     a range sized to the queue's parallelism, so one leaked listener is both a secret left
     reachable and a port no later task can have.
@@ -1323,6 +1324,14 @@ server; its agent's tools are configured for that port and no other")
   let port := match localAddr with
     | .v4 a => a.port | .v6 a => a.port
   let running ← IO.mkRef true
+  -- The shutdown's only hold on the listening socket. A closure that captured the socket itself
+  -- would keep it for as long as the closure lives, and the closure lives as long as whatever was
+  -- handed it: a session keeps its shutdown in its record, so a record kept past its session —
+  -- by a resident's runtime, or by a reference cycle, which reference counting never frees — kept
+  -- the port bound for the life of the daemon, one per session, until `mcp_ports` ran dry. The
+  -- shutdown takes the socket out of the ref, so what outlives it holds an empty ref and not the
+  -- port, and a second call finds nothing to do.
+  let listener ← IO.mkRef (some server)
   -- The connections being served, so that a shutdown ends them as well as the listener: a client
   -- still connected to a server that is gone is served by nothing, and one told so (EOF) can dial
   -- again — which is what an agent's relay does (`McpEndpoint.relayScript`).
@@ -1348,6 +1357,7 @@ server; its agent's tools are configured for that port and no other")
           clients.modify (·.filter (·.1 != n))
           log "client disconnected"
   let shutdown : IO Unit := do
+    let some sock ← listener.modifyGet fun s => (s, none) | return
     running.set false
     for (_, c) in ← clients.modifyGet fun cs => (cs, #[]) do
       -- In the background: a client that is not reading must not hold the shutdown up.
@@ -1358,7 +1368,7 @@ server; its agent's tools are configured for that port and no other")
     -- and the reference it held goes with its frame. Nothing here closes the socket by hand
     -- because the libuv binding offers no `close` — the handle goes when the last reference
     -- does, so what a shutdown has to do is make sure no reference outlives it.
-    try server.cancelAccept catch _ => pure ()
+    try sock.cancelAccept catch _ => pure ()
     try
       -- And a connection to wake it, for the case `cancelAccept` has nothing to cancel because
       -- the loop is between iterations: it then re-checks `running`, which is already false, and

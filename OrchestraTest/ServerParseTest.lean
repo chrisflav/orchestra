@@ -48,6 +48,32 @@ def start_releasesItsPortEveryTime : Test := do
       TestM.fail s!"port {port} was not released on cycle {i}: {e}"
   TestM.assert true
 
+/-- The port is free once shutdown has run, even while the shutdown closure itself is still
+    reachable.
+
+    This is the regression: the closure captured the listening socket, and the libuv binding
+    closes a socket only when its last reference goes. A session keeps its `shutdownMcp` in its
+    record, and anything that keeps the record — a resident's runtime, a reference cycle through
+    the event pump, which reference counting never frees — kept the port bound for the life of
+    the daemon, one per session, until `mcp_ports` ran dry and every later session failed with
+    "no free port". Holding the closure in a ref is the shortest stand-in for whatever keeps the
+    record. -/
+@[test]
+def start_releasesItsPortWhileShutdownIsHeld : Test := do
+  let (port, stop) ← start socketTestState (bindHost := "127.0.0.1")
+  let held ← IO.mkRef stop
+  (← held.get)
+  try
+    let (again, stop') ← start socketTestState (bindHost := "127.0.0.1")
+      (portRange := some (port, port))
+    stop'
+    TestM.assertEqual again port (msg := "the same port is taken again after shutdown")
+  catch e =>
+    TestM.fail s!"port {port} was not released while its shutdown was still held: {e}"
+  -- Called again, and from the ref, so the closure is live across the whole test; a second
+  -- call must be harmless.
+  (← held.get)
+
 -- parseToolCall: simple tools
 
 @[test]
