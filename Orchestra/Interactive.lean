@@ -132,6 +132,12 @@ structure LiveSession where
   /-- Revoke every kleis token the session holds and empty its env file: for a resident put to
       sleep warm, whose next process is started on a token of its own (`launch`). -/
   releaseCreds : IO Unit := pure ()
+  /-- Break the session's hold on itself. `launch` and the agent's event callback reach the
+      session through a ref that holds it, so the session is in a cycle, and reference counting
+      never frees one: without this, every session taken out of the table — its closures, its
+      tokens, the MCP server its `shutdownMcp` holds — stayed in memory for the life of the
+      daemon. The last thing `teardown` does. -/
+  detach : IO Unit := pure ()
   /-- Set once `teardown` has claimed the session out of the table. Something that started a
       process for it meanwhile — a warm wake that raced the teardown — reads this when the
       process is up and stops it again, revoking the token it was started on, rather than leave a
@@ -511,6 +517,7 @@ private def teardown (mgr : Manager) (s : LiveSession) (status : SessionStatus)
       else if status == .dormant || status == .paused then { r with status, error := why }
       else { r with status, endedAt := some now, error := why }
   catch _ => pure ()
+  s.detach
 
 /-- Stop a resident's agent process and keep everything else: its environment, its MCP server,
     its credentials. The session is then `warm`, and the next delivery starts a process on the
@@ -1066,6 +1073,7 @@ to you. Your memory directory and your watches (list_watches) are as they were."
         if let some loc := envFile then
           try loc.writeEnv Resident.EnvFile.emptyContents catch _ => pure ()
         revokeHeld none
+      detach := liveRef.set none
     }
     liveRef.set (some session)
     mgr.sessions.atomically do
