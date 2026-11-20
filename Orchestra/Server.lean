@@ -1350,6 +1350,14 @@ server; its agent's tools are configured for that port and no other")
         if !(← running.get) then break
         let n ← nextClient.modifyGet fun n => (n, n + 1)
         clients.modify (·.push (n, client))
+        -- Asked again now that it is on the list: a shutdown between the check above and the push
+        -- has already taken the list it would have been on, and nothing would ever end this
+        -- connection — an agent keeping the session's tools after the session. `running` goes
+        -- false before the list is taken, so one of the two always sees the other.
+        if !(← running.get) then
+          clients.modify (·.filter (·.1 != n))
+          try awaitTcp (← client.shutdown) catch _ => pure ()
+          break
         let _ ← IO.asTask (prio := .dedicated) do
           log "client connected"
           try handleClient state client
@@ -1357,7 +1365,7 @@ server; its agent's tools are configured for that port and no other")
           clients.modify (·.filter (·.1 != n))
           log "client disconnected"
   let shutdown : IO Unit := do
-    let some sock ← listener.modifyGet fun s => (s, none) | return
+    let some sock ← listener.swap none | return
     running.set false
     for (_, c) in ← clients.modifyGet fun cs => (cs, #[]) do
       -- In the background: a client that is not reading must not hold the shutdown up.
